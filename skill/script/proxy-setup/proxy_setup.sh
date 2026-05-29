@@ -225,17 +225,22 @@ warp_register_wireguard() {
 
     [ -z "$reg_resp" ] && { red "WARP API 无响应，请检查网络"; return 1; }
 
-    local peer_pub client_id v4_addr v6_addr
+    local peer_pub client_id v4_addr v6_addr endpoint_host endpoint_addr endpoint_port endpoint_v4_port
     if command -v jq >/dev/null 2>&1; then
         peer_pub=$(printf '%s' "$reg_resp" | jq -r '.config.peers[0].public_key // empty')
         client_id=$(printf '%s' "$reg_resp" | jq -r '.config.client_id // empty')
         v4_addr=$(printf '%s' "$reg_resp" | jq -r '.config.interface.addresses.v4 // empty')
         v6_addr=$(printf '%s' "$reg_resp" | jq -r '.config.interface.addresses.v6 // empty')
+        endpoint_host=$(printf '%s' "$reg_resp" | jq -r '.config.peers[0].endpoint.host // empty')
+        endpoint_addr=$(printf '%s' "$reg_resp" | jq -r '.config.peers[0].endpoint.v4 // empty')
+        endpoint_port=$(printf '%s' "$reg_resp" | jq -r '.config.peers[0].endpoint.ports[0] // empty')
     else
         peer_pub=$(printf '%s' "$reg_resp" | sed -n 's/.*"public_key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
         client_id=$(printf '%s' "$reg_resp" | sed -n 's/.*"client_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
         v4_addr=$(printf '%s' "$reg_resp" | sed -n 's/.*"v4"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
         v6_addr=$(printf '%s' "$reg_resp" | sed -n 's/.*"v6"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        endpoint_host=$(printf '%s' "$reg_resp" | sed -n 's/.*"host"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        endpoint_addr=$(printf '%s' "$reg_resp" | sed -n 's/.*"endpoint"[^{]*{[^}]*"v4"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
     fi
 
     if [ -z "$peer_pub" ] || [ -z "$v4_addr" ]; then
@@ -256,6 +261,23 @@ warp_register_wireguard() {
         fi
     fi
 
+    if [ -n "$endpoint_host" ] && [ -z "$endpoint_port" ]; then
+        endpoint_port=${endpoint_host##*:}
+    fi
+    if [ -n "$endpoint_addr" ]; then
+        endpoint_v4_port=${endpoint_addr##*:}
+        endpoint_addr=${endpoint_addr%:*}
+        if [ -z "$endpoint_port" ] && [ "$endpoint_v4_port" != "0" ]; then
+            endpoint_port=$endpoint_v4_port
+        fi
+    elif [ -n "$endpoint_host" ]; then
+        endpoint_addr=${endpoint_host%:*}
+    fi
+    : "${endpoint_addr:=engage.cloudflareclient.com}"
+    case "$endpoint_port" in
+        ''|*[!0-9]*) endpoint_port=2408 ;;
+    esac
+
     mkdir -p "$WORK_DIR"
     cat > "$(warp_wg_config_file)" <<EOWG
 {
@@ -264,8 +286,8 @@ warp_register_wireguard() {
     "reserved": [${r1}, ${r2}, ${r3}],
     "v4_address": "${v4_addr}/32",
     "v6_address": "${v6_addr}/128",
-    "endpoint": "162.159.193.10",
-    "endpoint_port": 2408
+    "endpoint": "${endpoint_addr}",
+    "endpoint_port": ${endpoint_port}
 }
 EOWG
     chmod 600 "$(warp_wg_config_file)"
@@ -273,7 +295,7 @@ EOWG
     green ">>> WARP WireGuard 注册成功!"
     echo "  IPv4: ${v4_addr}"
     echo "  IPv6: ${v6_addr}"
-    echo "  Endpoint: 162.159.193.10:2408"
+    echo "  Endpoint: ${endpoint_addr}:${endpoint_port}"
     green ">>> 配置已保存: $(warp_wg_config_file)"
 }
 
@@ -304,7 +326,7 @@ gen_wg_endpoints_block() {
     v6=$(warp_wg_read_field "v6_address")
     ep=$(warp_wg_read_field "endpoint")
     ep_port=$(warp_wg_read_field "endpoint_port")
-    : "${ep:=162.159.193.10}"
+    : "${ep:=engage.cloudflareclient.com}"
     : "${ep_port:=2408}"
     : "${reserved:=[0,0,0]}"
     cat <<EOWGEP
@@ -312,6 +334,7 @@ gen_wg_endpoints_block() {
     {
       "type":"wireguard",
       "tag":"out-warp",
+      "system":false,
       "mtu":1280,
       "address":["${v4}","${v6}"],
       "private_key":"${priv}",
@@ -330,6 +353,61 @@ gen_wg_endpoints_block() {
 EOWGEP
 }
 
+check_warp_wg_connectivity() {
+    warp_wg_config_exists || { yellow "❌ 未注册 WireGuard，可用 WARP 向导注册"; return 1; }
+    command -v sing-box >/dev/null 2>&1 || { red "sing-box 未安装"; return 1; }
+
+    local test_dir test_cfg test_log test_port curl_out curl_code
+    test_dir="/tmp/sing-box-warp-test-$$"
+    test_cfg="$test_dir/config.json"
+    test_log="$test_dir/sing-box.log"
+    test_port=$((39000 + $$ % 1000))
+    mkdir -p "$test_dir"
+
+    cat > "$test_cfg" <<EOCFG
+{
+  "log":{"level":"debug","timestamp":true},
+$(gen_wg_endpoints_block)
+  "inbounds":[
+    {"type":"mixed","tag":"test-in","listen":"127.0.0.1","listen_port":${test_port}}
+  ],
+  "outbounds":[
+    {"type":"direct","tag":"out-direct"}
+  ],
+  "route":{"final":"out-warp"}
+}
+EOCFG
+
+    if ! sing-box check -c "$test_cfg" >/dev/null 2>&1; then
+        red "❌ WireGuard 测试配置校验失败"
+        sing-box check -c "$test_cfg" || true
+        rm -rf "$test_dir"
+        return 1
+    fi
+
+    sing-box run -c "$test_cfg" >"$test_log" 2>&1 &
+    local test_pid=$!
+    sleep 2
+    curl_out=$(curl -x "socks5h://127.0.0.1:${test_port}" -sS --connect-timeout 6 --max-time 12 https://www.cloudflare.com/cdn-cgi/trace 2>&1)
+    curl_code=$?
+    kill "$test_pid" >/dev/null 2>&1 || true
+    wait "$test_pid" >/dev/null 2>&1 || true
+
+    if [ "$curl_code" -eq 0 ] && printf '%s' "$curl_out" | grep -q '^warp='; then
+        green "✅ WARP WireGuard 连通"
+        printf '%s\n' "$curl_out" | sed -n '/^ip=/p;/^colo=/p;/^warp=/p'
+        rm -rf "$test_dir"
+        return 0
+    fi
+
+    red "❌ WARP WireGuard 未连通"
+    echo "curl: $curl_out"
+    yellow "最近 sing-box 日志:"
+    sed -n '/endpoint\/wireguard/p;/router:/p;/ERROR/p;/FATAL/p;/lookup succeed/p;/exchanged A/p' "$test_log" | tail -40
+    rm -rf "$test_dir"
+    return 1
+}
+
 check_warp_wg_status() {
     echo ""
     info "===== WARP WireGuard 状态 ====="
@@ -339,6 +417,7 @@ check_warp_wg_status() {
         echo "  IPv6: $(warp_wg_read_field v6_address)"
         echo "  Endpoint: $(warp_wg_read_field endpoint):$(warp_wg_read_field endpoint_port)"
         echo "  Peer: $(warp_wg_read_field peer_public_key | cut -c1-20)..."
+        check_warp_wg_connectivity || true
     else
         yellow "❌ 未注册 WireGuard，可用 WARP 向导注册"
     fi
@@ -964,6 +1043,150 @@ open_firewall() {
     }
 }
 
+collect_proxy_ports() {
+    local ports=""
+    if [ -f "$CONFIG_FILE" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            ports=$(jq -r '.inbounds[]?.listen_port // empty' "$CONFIG_FILE" 2>/dev/null || true)
+        else
+            ports=$(sed -n 's/.*"listen_port"[[:space:]]*:[[:space:]]*\([0-9]\+\).*/\1/p' "$CONFIG_FILE" 2>/dev/null || true)
+        fi
+    fi
+    printf '%s\n' "$ports" | awk '/^[0-9]+$/ && $1 >= 1 && $1 <= 65535 {print $1}' | sort -n -u
+}
+
+close_firewall_port() {
+    local port="$1" proto=""
+    is_port "$port" || return 0
+
+    for proto in tcp udp; do
+        if command -v iptables >/dev/null 2>&1; then
+            while iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; do
+                iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1 || break
+            done
+        fi
+        if command -v ip6tables >/dev/null 2>&1; then
+            while ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1; do
+                ip6tables -D INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1 || break
+            done
+        fi
+        if command -v firewall-cmd >/dev/null 2>&1; then
+            firewall-cmd --zone=public --remove-port="$port/$proto" >/dev/null 2>&1 || true
+            firewall-cmd --zone=public --remove-port="$port/$proto" --permanent >/dev/null 2>&1 || true
+        fi
+    done
+
+    if command -v ufw >/dev/null 2>&1; then
+        ufw --force delete allow "$port" >/dev/null 2>&1 || true
+        ufw --force delete allow "$port/tcp" >/dev/null 2>&1 || true
+        ufw --force delete allow "$port/udp" >/dev/null 2>&1 || true
+    fi
+}
+
+close_proxy_firewall() {
+    local ports port
+    ports=$(collect_proxy_ports)
+    [ -z "$ports" ] && return 0
+    green ">>> 清理脚本放行过的本机防火墙端口..."
+    for port in $ports; do
+        close_firewall_port "$port"
+    done
+    command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1 || true
+}
+
+cleanup_warp_client() {
+    green ">>> 清理 Cloudflare WARP 客户端和配置..."
+
+    if command -v warp-cli >/dev/null 2>&1; then
+        warp_cli disconnect >/dev/null 2>&1 || true
+        warp_cli registration delete >/dev/null 2>&1 || true
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop warp-svc >/dev/null 2>&1 || true
+        systemctl disable warp-svc >/dev/null 2>&1 || true
+        systemctl reset-failed warp-svc >/dev/null 2>&1 || true
+    fi
+    command -v service >/dev/null 2>&1 && service warp-svc stop >/dev/null 2>&1 || true
+    pkill -x warp-svc >/dev/null 2>&1 || true
+
+    case "$OS" in
+        debian)
+            apt purge -y cloudflare-warp >/dev/null 2>&1 || true
+            rm -f /etc/apt/sources.list.d/cloudflare-client.list*
+            rm -f /etc/apt/trusted.gpg.d/cloudflare*
+            rm -f /usr/share/keyrings/cloudflare*
+            rm -f /var/cache/apt/archives/cloudflare-warp*
+            apt autoremove --purge -y >/dev/null 2>&1 || true
+            apt clean >/dev/null 2>&1 || true
+            ;;
+        centos)
+            yum remove -y cloudflare-warp >/dev/null 2>&1 || true
+            rm -f /etc/yum.repos.d/cloudflare-warp.repo*
+            yum clean all >/dev/null 2>&1 || true
+            command -v dnf >/dev/null 2>&1 && dnf clean all >/dev/null 2>&1 || true
+            ;;
+        alpine)
+            apk del cloudflare-warp >/dev/null 2>&1 || true
+            ;;
+    esac
+
+    rm -f /etc/systemd/system/warp-svc.service
+    rm -rf /etc/systemd/system/warp-svc.service.d
+    rm -f /etc/systemd/system/multi-user.target.wants/warp-svc.service
+    command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
+    rm -rf /var/lib/cloudflare-warp /var/log/cloudflare-warp /run/cloudflare-warp /etc/cloudflare-warp
+    rm -f /usr/bin/warp-cli /usr/bin/warp-svc /usr/bin/warp-diag
+    rm -f /usr/local/bin/warp-cli /usr/local/bin/warp-svc /usr/local/bin/warp-diag
+}
+
+cleanup_common_dependencies() {
+    local c
+    red "强烈不建议删除通用依赖。"
+    yellow "这些包可能被系统、SSH 运维脚本、证书更新、其他代理或自动化任务使用:"
+    yellow "ca-certificates wget tar curl openssl jq qrencode"
+    yellow "建议直接回车保留；只有你确认这台机器专门用于本脚本且不再使用时才输入 y。"
+    read -r -p "仍要强制清理这些通用依赖? (y/n) [n]: " c
+    [ "${c:-n}" = "y" ] || return 0
+
+    case "$OS" in
+        debian)
+            apt purge -y ca-certificates wget tar curl openssl jq qrencode >/dev/null 2>&1 || true
+            apt autoremove --purge -y >/dev/null 2>&1 || true
+            apt clean >/dev/null 2>&1 || true
+            ;;
+        centos)
+            yum remove -y ca-certificates wget tar curl openssl jq qrencode >/dev/null 2>&1 || true
+            yum clean all >/dev/null 2>&1 || true
+            ;;
+        alpine)
+            apk del ca-certificates wget tar curl openssl jq qrencode gcompat libc6-compat >/dev/null 2>&1 || true
+            ;;
+    esac
+}
+
+cleanup_proxy_artifacts() {
+    green ">>> 清理 sing-box 服务、二进制、配置、节点信息和临时文件..."
+    if [ "$SVC" = "openrc" ]; then
+        rc-service sing-box stop >/dev/null 2>&1 || true
+        rc-update del sing-box >/dev/null 2>&1 || true
+        rm -f /etc/init.d/sing-box
+        rm -f /etc/runlevels/default/sing-box
+    else
+        systemctl stop sing-box >/dev/null 2>&1 || true
+        systemctl disable sing-box >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/sing-box.service
+        rm -rf /etc/systemd/system/sing-box.service.d
+        rm -f /etc/systemd/system/multi-user.target.wants/sing-box.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed sing-box >/dev/null 2>&1 || true
+    fi
+    pkill -x sing-box >/dev/null 2>&1 || true
+    rm -rf "$WORK_DIR" "$INFO_DIR" "$LOG_DIR" /var/log/sing-box
+    rm -rf /tmp/sing-box-warp-test-* /tmp/singbox_install_*
+    rm -f /usr/local/bin/sing-box
+}
+
 # ==================== 第一步：选择机器类型 ====================
 select_machine_mode() {
     while true; do
@@ -1466,8 +1689,8 @@ $(gen_inbound "$WARP_PORT" "in-warp")
   ],
   "route":{
     "rules":[
-      {"inbound":["in-direct"],"outbound":"out-direct"},
-      {"inbound":["in-warp"],"outbound":"out-warp"}
+      {"inbound":["in-direct"],"action":"route","outbound":"out-direct"},
+      {"inbound":["in-warp"],"action":"route","outbound":"out-warp"}
     ],
     "final":"out-direct"
   }
@@ -1487,8 +1710,8 @@ $(gen_inbound "$WARP_PORT" "in-warp")
   ],
   "route":{
     "rules":[
-      {"inbound":["in-direct"],"outbound":"out-direct"},
-      {"inbound":["in-warp"],"outbound":"out-warp"}
+      {"inbound":["in-direct"],"action":"route","outbound":"out-direct"},
+      {"inbound":["in-warp"],"action":"route","outbound":"out-warp"}
     ],
     "final":"out-direct"
   }
@@ -2036,14 +2259,19 @@ restart_service() {
 }
 
 do_uninstall() {
-    detect_os; read -p "确认卸载? (y/n): " c; [ "$c" != "y" ] && return
-    if [ "$SVC" = "openrc" ]; then
-        rc-service sing-box stop 2>/dev/null||true; rc-update del sing-box 2>/dev/null||true; rm -f /etc/init.d/sing-box
-    else
-        systemctl stop sing-box 2>/dev/null||true; systemctl disable sing-box 2>/dev/null||true
-        rm -f /etc/systemd/system/sing-box.service; systemctl daemon-reload
-    fi
-    rm -rf "$WORK_DIR" "$INFO_DIR"; rm -f /usr/local/bin/sing-box; green "卸载完毕"
+    is_root
+    detect_os
+    yellow "将深度卸载 sing-box / 节点配置 / WARP 客户端 / Cloudflare 源 / 脚本日志 / 临时文件 / 本机防火墙放行规则。"
+    yellow "不会删除当前脚本文件；云厂商安全组仍需在控制台手动删除。"
+    read -r -p "确认深度卸载? (y/n): " c
+    [ "$c" = "y" ] || return
+
+    close_proxy_firewall
+    cleanup_proxy_artifacts
+    cleanup_warp_client
+    cleanup_common_dependencies
+
+    green ">>> 深度卸载完成"
 }
 
 # ==================== 安装主流程（带返回功能） ====================
