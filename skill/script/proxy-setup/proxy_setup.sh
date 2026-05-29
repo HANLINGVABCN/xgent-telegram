@@ -40,6 +40,7 @@ TLS_KEY=""
 WARP_SOCKS_PORT=40000
 DIRECT_PORT=""
 WARP_PORT=""
+WARP_WG_MODE=""    # wireguard / socks5
 
 # ==================== 工具函数 ====================
 is_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
@@ -174,6 +175,173 @@ install_singbox() {
     cp /usr/local/bin/sing-box "$WORK_DIR/sing-box" 2>/dev/null || true
     rm -rf "$TMP"
     green ">>> sing-box $(sing-box version 2>/dev/null | head -1) 安装完成"
+}
+
+# ==================== WARP WireGuard 原生出站 ====================
+warp_wg_config_file() { echo "$WORK_DIR/warp_wg.json"; }
+warp_wg_config_exists() { [ -f "$(warp_wg_config_file)" ]; }
+
+warp_wg_generate_keypair() {
+    local sb="/usr/local/bin/sing-box"
+    [ -x "$WORK_DIR/sing-box" ] && sb="$WORK_DIR/sing-box"
+    local kp=""
+    # sing-box generate
+    kp=$("$sb" generate wg-keypair 2>/dev/null) || true
+    if [ -n "$kp" ] && echo "$kp" | grep -q "PrivateKey"; then
+        echo "$kp"; return 0
+    fi
+    # wireguard-tools fallback
+    if command -v wg >/dev/null 2>&1; then
+        local priv pub
+        priv=$(wg genkey 2>/dev/null)
+        pub=$(echo "$priv" | wg pubkey 2>/dev/null)
+        if [ -n "$priv" ] && [ -n "$pub" ]; then
+            printf 'PrivateKey: %s\nPublicKey: %s\n' "$priv" "$pub"
+            return 0
+        fi
+    fi
+    red "无法生成 WireGuard 密钥"
+    red "请确认 sing-box >= 1.3.0 或安装 wireguard-tools"
+    return 1
+}
+
+warp_register_wireguard() {
+    green ">>> 正在注册 WARP WireGuard（无需 warp-cli）..."
+
+    local keypair wg_priv wg_pub
+    keypair=$(warp_wg_generate_keypair) || return 1
+    wg_priv=$(echo "$keypair" | awk '/PrivateKey/{print $2}')
+    wg_pub=$(echo "$keypair" | awk '/PublicKey/{print $2}')
+    [ -z "$wg_priv" ] || [ -z "$wg_pub" ] && { red "WireGuard 密钥生成失败"; return 1; }
+
+    local reg_data reg_resp
+    reg_data="{\"key\":\"${wg_pub}\",\"install_id\":\"\",\"fcm_token\":\"\",\"tos\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"model\":\"Linux\",\"serial_number\":\"\",\"locale\":\"en_US\"}"
+
+    green ">>> 正在调用 Cloudflare WARP API..."
+    reg_resp=$(curl -sS -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+        -H "Content-Type: application/json" \
+        -H "User-Agent: okhttp/3.12.1" \
+        -d "$reg_data" 2>/dev/null)
+
+    [ -z "$reg_resp" ] && { red "WARP API 无响应，请检查网络"; return 1; }
+
+    local peer_pub client_id v4_addr v6_addr
+    if command -v jq >/dev/null 2>&1; then
+        peer_pub=$(printf '%s' "$reg_resp" | jq -r '.config.peers[0].public_key // empty')
+        client_id=$(printf '%s' "$reg_resp" | jq -r '.config.client_id // empty')
+        v4_addr=$(printf '%s' "$reg_resp" | jq -r '.config.interface.addresses.v4 // empty')
+        v6_addr=$(printf '%s' "$reg_resp" | jq -r '.config.interface.addresses.v6 // empty')
+    else
+        peer_pub=$(printf '%s' "$reg_resp" | sed -n 's/.*"public_key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        client_id=$(printf '%s' "$reg_resp" | sed -n 's/.*"client_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        v4_addr=$(printf '%s' "$reg_resp" | sed -n 's/.*"v4"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        v6_addr=$(printf '%s' "$reg_resp" | sed -n 's/.*"v6"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    fi
+
+    if [ -z "$peer_pub" ] || [ -z "$v4_addr" ]; then
+        red "WARP API 返回异常:"
+        printf '%s\n' "$reg_resp" | head -20
+        return 1
+    fi
+
+    # 解码 client_id → reserved 字节
+    local r1=0 r2=0 r3=0
+    if [ -n "$client_id" ]; then
+        local hex
+        hex=$(printf '%s' "$client_id" | base64 -d 2>/dev/null | od -A n -t x1 | tr -d ' \n')
+        if [ ${#hex} -ge 6 ]; then
+            r1=$((16#${hex:0:2}))
+            r2=$((16#${hex:2:2}))
+            r3=$((16#${hex:4:2}))
+        fi
+    fi
+
+    mkdir -p "$WORK_DIR"
+    cat > "$(warp_wg_config_file)" <<EOWG
+{
+    "private_key": "${wg_priv}",
+    "peer_public_key": "${peer_pub}",
+    "reserved": [${r1}, ${r2}, ${r3}],
+    "v4_address": "${v4_addr}/32",
+    "v6_address": "${v6_addr}/128",
+    "endpoint": "162.159.193.10",
+    "endpoint_port": 2408
+}
+EOWG
+    chmod 600 "$(warp_wg_config_file)"
+
+    green ">>> WARP WireGuard 注册成功!"
+    echo "  IPv4: ${v4_addr}"
+    echo "  IPv6: ${v6_addr}"
+    echo "  Endpoint: 162.159.193.10:2408"
+    green ">>> 配置已保存: $(warp_wg_config_file)"
+}
+
+warp_wg_read_field() {
+    local field="$1"
+    if command -v jq >/dev/null 2>&1; then
+        jq -r ".${field} // empty" "$(warp_wg_config_file)" 2>/dev/null
+    else
+        sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$(warp_wg_config_file)" | head -1
+    fi
+}
+
+warp_wg_read_reserved() {
+    if command -v jq >/dev/null 2>&1; then
+        jq -c '.reserved' "$(warp_wg_config_file)" 2>/dev/null
+    else
+        sed -n 's/.*"reserved"[[:space:]]*:[[:space:]]*\(\[[^]]*\]\).*/\1/p' "$(warp_wg_config_file)" | head -1
+    fi
+}
+
+# 生成 WireGuard endpoints 配置块 (sing-box 1.11+ 格式)
+gen_wg_endpoints_block() {
+    local priv peer_pub reserved v4 v6 ep ep_port
+    priv=$(warp_wg_read_field "private_key")
+    peer_pub=$(warp_wg_read_field "peer_public_key")
+    reserved=$(warp_wg_read_reserved)
+    v4=$(warp_wg_read_field "v4_address")
+    v6=$(warp_wg_read_field "v6_address")
+    ep=$(warp_wg_read_field "endpoint")
+    ep_port=$(warp_wg_read_field "endpoint_port")
+    : "${ep:=162.159.193.10}"
+    : "${ep_port:=2408}"
+    : "${reserved:=[0,0,0]}"
+    cat <<EOWGEP
+  "endpoints":[
+    {
+      "type":"wireguard",
+      "tag":"out-warp",
+      "mtu":1280,
+      "address":["${v4}","${v6}"],
+      "private_key":"${priv}",
+      "peers":[
+        {
+          "address":"${ep}",
+          "port":${ep_port},
+          "public_key":"${peer_pub}",
+          "allowed_ips":["0.0.0.0/0","::/0"],
+          "persistent_keepalive_interval":25,
+          "reserved":${reserved}
+        }
+      ]
+    }
+  ],
+EOWGEP
+}
+
+check_warp_wg_status() {
+    echo ""
+    info "===== WARP WireGuard 状态 ====="
+    if warp_wg_config_exists; then
+        green "✅ WireGuard 配置已就绪: $(warp_wg_config_file)"
+        echo "  IPv4: $(warp_wg_read_field v4_address)"
+        echo "  IPv6: $(warp_wg_read_field v6_address)"
+        echo "  Endpoint: $(warp_wg_read_field endpoint):$(warp_wg_read_field endpoint_port)"
+        echo "  Peer: $(warp_wg_read_field peer_public_key | cut -c1-20)..."
+    else
+        yellow "❌ 未注册 WireGuard，可用 WARP 向导注册"
+    fi
 }
 
 # ==================== WARP 安装向导 ====================
@@ -648,11 +816,14 @@ install_warp_client() {
     - 无浏览器 VPS 推荐，适合 Cloudflare Access 服务令牌
  6) 检查 WARP 状态
     - 查看注册、连接、代理端口和当前出口 IP
+ 7) WireGuard 模式注册 (推荐)
+    - 不需要 warp-cli，sing-box 直连 Cloudflare
+    - 更轻量更稳定，Alpine / NAT 小鸡也能用
  0) 返回主菜单
     - 不更改 WARP 配置，回到综合管理菜单
 
 EOF
-    read -r -p "请选择 [0-6]: " warp_choice
+    read -r -p "请选择 [0-7]: " warp_choice
     trace_resume
     case "$warp_choice" in
         1) warp_login_free ;;
@@ -661,6 +832,7 @@ EOF
         4) warp_login_token_url ;;
         5) warp_login_service_token ;;
         6) check_warp_status ;;
+        7) warp_register_wireguard ;;
         0) show_manage_menu; return ;;
         *) red "无效" ;;
     esac
@@ -694,10 +866,11 @@ EOF
 }
 
 check_warp_status() {
+    check_warp_wg_status
     local cli_status="" cli_settings="" cli_registration="" port=""
     local warp_ip4="" warp_ip6="" real_ip4="" real_ip6="" mdm_org=""
     local svc_enabled="" svc_active=""
-    command -v warp-cli >/dev/null 2>&1 || { red "warp-cli 未安装"; return; }
+    command -v warp-cli >/dev/null 2>&1 || { yellow "warp-cli 未安装 (WireGuard 模式无需安装)"; return; }
     echo ""
     info "===== WARP 状态 ====="
     command -v warp-cli >/dev/null 2>&1 || { red "warp-cli 未安装"; return; }
@@ -1205,15 +1378,35 @@ collect_info() {
         read -p "WARP节点端口 [${dp2}]: " tmp; WARP_PORT="${tmp:-$dp2}"
     fi
 
-    # WARP 端口
+    # WARP 出站方式选择
     if [ "$OUTBOUND_MODE" = "warp" ] || [ "$OUTBOUND_MODE" = "dual" ]; then
-        read -p "WARP SOCKS5 本地端口 [40000]: " tmp; WARP_SOCKS_PORT="${tmp:-40000}"
-        if ! (echo > /dev/tcp/127.0.0.1/$WARP_SOCKS_PORT) >/dev/null 2>&1; then
-            yellow "⚠️  WARP 端口 ${WARP_SOCKS_PORT} 未检测到"
-            yellow "请先用主菜单第5项安装 WARP"
-            read -p "继续安装? (y/n) [y]: " tmp
-            [ "${tmp:-y}" != "y" ] && return 1
-        fi
+        echo ""
+        cat <<'EOWARPMODE'
+ WARP 出站方式:
+  1) WireGuard 直连 (推荐)
+     - 不需要安装 warp-cli，sing-box 原生支持
+     - 更轻量、更稳定，Alpine 也能用
+  2) 传统 SOCKS5 代理
+     - 需要先用主菜单第5项安装 WARP 客户端
+     - 通过 warp-cli 本地 SOCKS5 中转
+EOWARPMODE
+        read -r -p "请选择 [1/2] [1]: " warp_mode_choice
+        case "${warp_mode_choice:-1}" in
+            2)
+                WARP_WG_MODE="socks5"
+                read -p "WARP SOCKS5 本地端口 [40000]: " tmp; WARP_SOCKS_PORT="${tmp:-40000}"
+                if ! (echo > /dev/tcp/127.0.0.1/$WARP_SOCKS_PORT) >/dev/null 2>&1; then
+                    yellow "⚠️  WARP 端口 ${WARP_SOCKS_PORT} 未检测到"
+                    yellow "请先用主菜单第5项安装 WARP"
+                    read -p "继续安装? (y/n) [y]: " tmp
+                    [ "${tmp:-y}" != "y" ] && return 1
+                fi
+                ;;
+            *)
+                WARP_WG_MODE="wireguard"
+                green ">>> 已选择 WireGuard 模式，将在安装 sing-box 后自动注册"
+                ;;
+        esac
     fi
 
     return 0
@@ -1253,9 +1446,35 @@ generate_config() {
 
     local lp=${INTERNAL_PORT:-$SERVER_PORT}
 
+    # 预计算 WARP 出站
+    local use_wg="n"
+    [ "$WARP_WG_MODE" = "wireguard" ] && warp_wg_config_exists && use_wg="y"
+
     if [ "$OUTBOUND_MODE" = "dual" ]; then
         green ">>> 生成双节点配置 (直连:${DIRECT_PORT} + WARP:${WARP_PORT})"
-        cat > "$CONFIG_FILE" <<EOCFG
+        if [ "$use_wg" = "y" ]; then
+            cat > "$CONFIG_FILE" <<EOCFG
+{
+  "log":{"level":"info","timestamp":true},
+$(gen_wg_endpoints_block)
+  "inbounds":[
+$(gen_inbound "$DIRECT_PORT" "in-direct"),
+$(gen_inbound "$WARP_PORT" "in-warp")
+  ],
+  "outbounds":[
+    {"type":"direct","tag":"out-direct"}
+  ],
+  "route":{
+    "rules":[
+      {"inbound":["in-direct"],"outbound":"out-direct"},
+      {"inbound":["in-warp"],"outbound":"out-warp"}
+    ],
+    "final":"out-direct"
+  }
+}
+EOCFG
+        else
+            cat > "$CONFIG_FILE" <<EOCFG
 {
   "log":{"level":"info","timestamp":true},
   "inbounds":[
@@ -1275,8 +1494,24 @@ $(gen_inbound "$WARP_PORT" "in-warp")
   }
 }
 EOCFG
+        fi
     elif [ "$OUTBOUND_MODE" = "warp" ]; then
-        cat > "$CONFIG_FILE" <<EOCFG
+        if [ "$use_wg" = "y" ]; then
+            cat > "$CONFIG_FILE" <<EOCFG
+{
+  "log":{"level":"info","timestamp":true},
+$(gen_wg_endpoints_block)
+  "inbounds":[
+$(gen_inbound "$lp" "in-main")
+  ],
+  "outbounds":[
+    {"type":"direct","tag":"direct"}
+  ],
+  "route":{"final":"out-warp"}
+}
+EOCFG
+        else
+            cat > "$CONFIG_FILE" <<EOCFG
 {
   "log":{"level":"info","timestamp":true},
   "inbounds":[
@@ -1289,6 +1524,7 @@ $(gen_inbound "$lp" "in-main")
   "route":{"final":"out-warp"}
 }
 EOCFG
+        fi
     else
         cat > "$CONFIG_FILE" <<EOCFG
 {
@@ -1708,9 +1944,9 @@ show_manage_menu() {
  4) 🗑️  卸载
     - 删除 sing-box 服务、配置目录和已保存节点信息
  5) 🌐 WARP 安装向导
-    - 安装/登录 Cloudflare WARP，并配置本地 SOCKS 出口
+    - WireGuard 模式 (推荐) / 传统 warp-cli 登录
  6) 📊 WARP 状态检查
-    - 查看 WARP 注册状态、连接状态和出口 IP
+    - 查看 WireGuard / warp-cli 注册状态和出口 IP
  7) ❓ 知识科普
     - 解释直连、WARP、CDN、Zero Trust 等概念
 
@@ -1843,6 +2079,15 @@ do_full_install() {
 
     # 第五步：安装依赖 + sing-box
     install_singbox
+
+    # WireGuard 注册（需要 sing-box 已安装）
+    if [ "$WARP_WG_MODE" = "wireguard" ]; then
+        if ! warp_wg_config_exists; then
+            warp_register_wireguard || { red "WireGuard 注册失败，将回退到直连模式"; OUTBOUND_MODE="direct"; WARP_WG_MODE=""; }
+        else
+            green ">>> 已检测到 WireGuard 配置: $(warp_wg_config_file)"
+        fi
+    fi
 
     # 第六步：生成密钥（必须在安装依赖之后，因为需要 openssl）
     green ">>> 生成密钥..."
