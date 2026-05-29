@@ -1,0 +1,62 @@
+# Local secrets and deployment config
+.env
+.env.*
+!.env.example
+
+# Runtime data
+bot_memory.db
+bot_memory.db-*
+*.sqlite
+*.sqlite3
+bot_storage/
+bot_output.log
+bot_server.log
+bot_full_trace.log
+*.log
+*.pid
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+venv/
+.venv/
+env/
+
+# Build and package artifacts
+build/
+dist/
+*.egg-info/
+node_modules/
+
+# Editor and OS local files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.tmp
+*.bak
+*.orig
+*~
+
+# Private keys, certificates, and local archives
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z

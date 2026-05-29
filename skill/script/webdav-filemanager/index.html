@@ -1,0 +1,4233 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <meta name="description" content="WebDAV 文件管理器 - 在线文件管理与共享">
+    <title>📂 文件管理器</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📂</text></svg>">
+    <style>
+/* ============================================================
+   CSS Reset & Base
+   ============================================================ */
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+    --bg: #08080f;
+    --glass-bg: rgba(15, 23, 42, 0.65);
+    --glass-border: rgba(255, 255, 255, 0.07);
+    --glass-hover: rgba(255, 255, 255, 0.04);
+    --text-primary: #e2e8f0;
+    --text-secondary: #94a3b8;
+    --text-muted: #64748b;
+    --accent: #818cf8;
+    --accent-dim: rgba(99, 102, 241, 0.2);
+    --accent-glow: rgba(129, 140, 248, 0.3);
+    --danger: #f87171;
+    --danger-dim: rgba(248, 113, 113, 0.12);
+    --success: #34d399;
+    --success-dim: rgba(52, 211, 153, 0.12);
+    --warning: #fbbf24;
+    --warning-dim: rgba(251, 191, 36, 0.12);
+    --info: #a5b4fc;
+    --info-dim: rgba(165, 180, 252, 0.12);
+    --radius: 12px;
+    --radius-sm: 8px;
+    --radius-lg: 16px;
+    --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+}
+
+html { font-size: 16px; }
+
+body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text-primary);
+    min-height: 100vh;
+    overflow-x: hidden;
+    line-height: 1.5;
+}
+
+/* ============================================================
+   Background Ambient Light
+   ============================================================ */
+.bg-orb {
+    position: fixed;
+    border-radius: 50%;
+    filter: blur(100px);
+    pointer-events: none;
+    z-index: 0;
+}
+.bg-orb-1 {
+    width: 600px; height: 600px;
+    background: radial-gradient(circle, rgba(99, 102, 241, 0.12), transparent);
+    top: -200px; right: -100px;
+    animation: float1 25s ease-in-out infinite;
+}
+.bg-orb-2 {
+    width: 500px; height: 500px;
+    background: radial-gradient(circle, rgba(139, 92, 246, 0.1), transparent);
+    bottom: -150px; left: -100px;
+    animation: float2 30s ease-in-out infinite;
+}
+.bg-orb-3 {
+    width: 350px; height: 350px;
+    background: radial-gradient(circle, rgba(59, 130, 246, 0.07), transparent);
+    top: 40%; left: 40%;
+    animation: float3 20s ease-in-out infinite;
+}
+@keyframes float1 {
+    0%, 100% { transform: translate(0,0); }
+    33% { transform: translate(-30px, 40px); }
+    66% { transform: translate(20px, -20px); }
+}
+@keyframes float2 {
+    0%, 100% { transform: translate(0,0); }
+    33% { transform: translate(40px, -30px); }
+    66% { transform: translate(-25px, 35px); }
+}
+@keyframes float3 {
+    0%, 100% { transform: translate(-50%,-50%); }
+    33% { transform: translate(calc(-50% + 30px), calc(-50% - 25px)); }
+    66% { transform: translate(calc(-50% - 20px), calc(-50% + 20px)); }
+}
+
+/* ============================================================
+   Glass Effect
+   ============================================================ */
+.glass {
+    background: var(--glass-bg);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid var(--glass-border);
+}
+
+/* ============================================================
+   Layout
+   ============================================================ */
+.container {
+    position: relative;
+    z-index: 1;
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 16px;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+/* ============================================================
+   Header
+   ============================================================ */
+.header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 22px;
+    border-radius: var(--radius-lg);
+    flex-shrink: 0;
+}
+.header-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.header-title h1 {
+    font-size: 1.3rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, #818cf8, #c084fc);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    white-space: nowrap;
+}
+.header-logo { font-size: 1.5rem; }
+
+.header-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.header-right .disk-info { flex: 1; }
+.disk-info {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 5px;
+    min-width: 200px;
+}
+.disk-bar-outer {
+    width: 200px;
+    height: 6px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 3px;
+    overflow: hidden;
+    display: flex;
+}
+.disk-bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #818cf8, #c084fc);
+    transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+    width: 0%;
+}
+.disk-bar-free {
+    height: 100%;
+    background: rgba(52, 211, 153, 0.34);
+    transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+    width: 0%;
+}
+.disk-text {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+.logout-btn {
+    min-width: 40px;
+    height: 40px;
+    justify-content: center;
+    padding: 0;
+    font-size: 1rem;
+}
+
+/* ============================================================
+   Toolbar
+   ============================================================ */
+.toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 18px;
+    border-radius: var(--radius);
+    gap: 10px;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+}
+.breadcrumb {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    flex-wrap: wrap;
+    flex: 1;
+    min-width: 0;
+}
+.crumb {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 6px;
+    font-size: 0.82rem;
+    transition: all 0.15s;
+    white-space: nowrap;
+    border: none;
+    background: none;
+}
+.crumb:hover { color: var(--text-primary); background: var(--glass-hover); }
+.crumb.active { color: var(--accent); font-weight: 600; }
+.crumb-sep { color: #475569; font-size: 0.65rem; margin: 0 1px; user-select: none; }
+
+.toolbar-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 7px 14px;
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    background: rgba(255,255,255,0.04);
+    color: var(--text-primary);
+    font-size: 0.82rem;
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+    font-family: var(--font);
+    outline: none;
+}
+.btn:hover { background: rgba(255,255,255,0.08); border-color: rgba(255,255,255,0.15); }
+.btn:active { transform: scale(0.97); }
+.btn-primary {
+    background: var(--accent-dim);
+    border-color: var(--accent-glow);
+    color: var(--info);
+}
+.btn-primary:hover { background: rgba(99,102,241,0.3); }
+.btn-danger { color: var(--danger); }
+.btn-danger:hover { background: var(--danger-dim); border-color: rgba(248,113,113,0.3); }
+.icon-btn {
+    width: 38px;
+    height: 34px;
+    padding: 0;
+    justify-content: center;
+    font-size: 1rem;
+}
+
+.search-wrap {
+    position: relative;
+}
+.search-input {
+    padding: 7px 12px 7px 30px;
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    background: rgba(255,255,255,0.04);
+    color: var(--text-primary);
+    font-size: 0.82rem;
+    outline: none;
+    width: 160px;
+    transition: all 0.25s;
+    font-family: var(--font);
+}
+.search-input:focus { border-color: var(--accent-glow); background: rgba(255,255,255,0.07); width: 200px; }
+.search-input::placeholder { color: var(--text-muted); }
+.search-icon {
+    position: absolute;
+    left: 9px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    pointer-events: none;
+}
+
+.view-toggle {
+    display: flex;
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+}
+.view-btn {
+    padding: 6px 9px;
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: all 0.15s;
+    font-size: 0.85rem;
+    outline: none;
+}
+.view-btn:hover { color: var(--text-primary); }
+.view-btn.active { background: var(--accent-dim); color: var(--accent); }
+
+/* ============================================================
+   File Browser
+   ============================================================ */
+.file-browser {
+    flex: 1;
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+/* List header */
+.list-header {
+    display: grid;
+    grid-template-columns: 1fr 100px 160px;
+    padding: 8px 20px;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    color: var(--text-muted);
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    user-select: none;
+}
+.list-header span {
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    transition: color 0.15s;
+}
+.list-header span:hover { color: var(--text-secondary); }
+.sort-arrow { font-size: 0.65rem; }
+
+/* File list */
+.file-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 6px;
+    min-height: 200px;
+}
+.file-list::-webkit-scrollbar { width: 5px; }
+.file-list::-webkit-scrollbar-track { background: transparent; }
+.file-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 3px; }
+.file-list::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.15); }
+
+/* File item - list view */
+.file-item {
+    display: grid;
+    grid-template-columns: 1fr 100px 160px;
+    align-items: center;
+    padding: 9px 14px;
+    border-radius: 10px;
+    cursor: pointer;
+    transition: all 0.12s ease;
+    user-select: none;
+    -webkit-user-select: none;
+    border: 1px solid transparent;
+    animation: fadeSlideIn 0.25s ease-out both;
+}
+@keyframes fadeSlideIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+.file-item:hover { background: var(--glass-hover); }
+.file-item.selected {
+    background: rgba(129, 140, 248, 0.07);
+    border-color: rgba(129, 140, 248, 0.18);
+}
+.file-item.cut { opacity: 0.45; }
+
+.file-item-name {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    overflow: hidden;
+}
+.file-icon { font-size: 1.25rem; flex-shrink: 0; width: 28px; text-align: center; }
+.file-name {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 0.88rem;
+}
+.file-size { font-size: 0.78rem; color: var(--text-muted); text-align: right; }
+.file-date { font-size: 0.78rem; color: var(--text-muted); }
+
+/* File item - grid view */
+.file-list.grid-view {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 10px;
+    padding: 14px;
+}
+.file-list.grid-view .file-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    padding: 18px 10px 14px;
+    text-align: center;
+}
+.file-list.grid-view .file-icon { font-size: 2.4rem; width: auto; }
+.file-list.grid-view .file-name { font-size: 0.78rem; max-width: 100%; }
+.file-list.grid-view .file-size { display: none; }
+.file-list.grid-view .file-date { display: none; }
+
+/* Empty state */
+.empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 60px 20px;
+    color: var(--text-muted);
+    gap: 10px;
+}
+.empty-icon { font-size: 3rem; opacity: 0.4; }
+.empty-text { font-size: 0.9rem; }
+
+/* Loading */
+.loading-wrap {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 40px;
+}
+.spinner {
+    width: 28px; height: 28px;
+    border: 3px solid rgba(255,255,255,0.08);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ============================================================
+   Login
+   ============================================================ */
+.app-hidden { display: none !important; }
+
+.login-screen {
+    position: relative;
+    z-index: 1;
+    min-height: 100vh;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+}
+.login-screen.show { display: flex; }
+.login-card {
+    width: 100%;
+    max-width: 380px;
+    padding: 26px;
+    border-radius: var(--radius-lg);
+    box-shadow: 0 22px 70px rgba(0,0,0,0.34);
+}
+.login-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 20px;
+    font-size: 1.25rem;
+    font-weight: 700;
+}
+.login-field {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    margin-bottom: 13px;
+}
+.login-field label {
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+}
+.login-input {
+    width: 100%;
+    padding: 11px 13px;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: var(--radius-sm);
+    background: rgba(0,0,0,0.24);
+    color: var(--text-primary);
+    font-size: 0.95rem;
+    outline: none;
+    font-family: var(--font);
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+.login-input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(129, 140, 248, 0.12);
+}
+.login-submit {
+    width: 100%;
+    justify-content: center;
+    margin-top: 4px;
+}
+.login-error {
+    min-height: 20px;
+    margin-top: 12px;
+    color: var(--danger);
+    font-size: 0.8rem;
+}
+.login-error:empty { margin-top: 0; }
+
+/* ============================================================
+   Context Menu
+   ============================================================ */
+.ctx-menu {
+    position: fixed;
+    border-radius: var(--radius);
+    padding: 5px;
+    box-shadow: 0 16px 48px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.06);
+    z-index: 5000;
+    min-width: 190px;
+    display: none;
+    background: rgba(15, 20, 35, 0.92);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+}
+.ctx-menu.show {
+    display: block;
+    animation: ctxIn 0.12s ease-out;
+}
+@keyframes ctxIn {
+    from { opacity: 0; transform: scale(0.96) translateY(-4px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+}
+.ctx-item {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 8px 13px;
+    border-radius: 7px;
+    cursor: pointer;
+    font-size: 0.82rem;
+    transition: background 0.1s;
+    color: var(--text-primary);
+    border: none;
+    background: none;
+    width: 100%;
+    text-align: left;
+    font-family: var(--font);
+    outline: none;
+}
+.ctx-item:hover { background: rgba(129, 140, 248, 0.1); }
+.ctx-item.danger:hover { background: var(--danger-dim); color: var(--danger); }
+.ctx-item.disabled { opacity: 0.35; pointer-events: none; }
+.ctx-icon { width: 18px; text-align: center; font-size: 0.9rem; flex-shrink: 0; }
+.ctx-divider { height: 1px; background: rgba(255,255,255,0.06); margin: 3px 8px; }
+
+/* Context backdrop (mobile) */
+.ctx-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.45);
+    z-index: 4999;
+    display: none;
+}
+.ctx-backdrop.show { display: block; }
+
+/* ============================================================
+   Modals
+   ============================================================ */
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.55);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    z-index: 6000;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+}
+.modal-overlay.show {
+    display: flex;
+    animation: modalFade 0.2s ease;
+}
+@keyframes modalFade { from { opacity: 0; } to { opacity: 1; } }
+
+.modal {
+    background: #1a2035;
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: var(--radius-lg);
+    padding: 22px;
+    width: 100%;
+    max-width: 420px;
+    box-shadow: 0 25px 50px rgba(0,0,0,0.4);
+    animation: modalSlide 0.25s ease-out;
+}
+@keyframes modalSlide {
+    from { opacity: 0; transform: scale(0.96) translateY(8px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+}
+.modal-title {
+    font-size: 1.05rem;
+    font-weight: 600;
+    margin-bottom: 14px;
+    color: #f1f5f9;
+}
+.modal-input {
+    width: 100%;
+    padding: 9px 13px;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: var(--radius-sm);
+    background: rgba(0,0,0,0.25);
+    color: var(--text-primary);
+    font-size: 0.88rem;
+    outline: none;
+    transition: border-color 0.2s;
+    font-family: var(--font);
+}
+.modal-input:focus { border-color: var(--accent); }
+.modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 14px;
+}
+
+/* ============================================================
+   Upload
+   ============================================================ */
+.upload-zone {
+    border: 2px dashed rgba(129, 140, 248, 0.22);
+    border-radius: var(--radius-lg);
+    padding: 40px 20px;
+    text-align: center;
+    transition: all 0.25s ease;
+    cursor: pointer;
+    margin-bottom: 14px;
+}
+.upload-zone:hover, .upload-zone.drag-over {
+    border-color: var(--accent);
+    background: rgba(99, 102, 241, 0.06);
+}
+.upload-zone-icon { font-size: 2.2rem; margin-bottom: 8px; }
+.upload-zone-text { color: var(--text-secondary); font-size: 0.88rem; }
+.upload-zone-sub { color: var(--text-muted); font-size: 0.75rem; margin-top: 3px; }
+
+.upload-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    background: rgba(255,255,255,0.03);
+    border-radius: var(--radius-sm);
+    margin-bottom: 6px;
+}
+.upload-item-name {
+    flex: 1;
+    font-size: 0.8rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+}
+.upload-bar-outer {
+    width: 80px;
+    height: 4px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 2px;
+    overflow: hidden;
+    flex-shrink: 0;
+}
+.upload-bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #818cf8, #c084fc);
+    border-radius: 2px;
+    transition: width 0.15s;
+    width: 0%;
+}
+.upload-item-status {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    width: 40px;
+    text-align: right;
+    flex-shrink: 0;
+}
+
+/* ============================================================
+   Transfer Meter & Create Forms
+   ============================================================ */
+.modal-wide { max-width: 720px; }
+.transfer-panel {
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: var(--radius);
+    background: rgba(0,0,0,0.18);
+    padding: 12px;
+    margin-top: 12px;
+}
+.transfer-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+.transfer-title {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    word-break: break-all;
+}
+.transfer-status {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+.transfer-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px;
+}
+.transfer-metric {
+    background: rgba(255,255,255,0.035);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: var(--radius-sm);
+    padding: 8px;
+    min-width: 0;
+}
+.transfer-label {
+    color: var(--text-muted);
+    font-size: 0.7rem;
+}
+.transfer-value {
+    color: var(--text-primary);
+    font-size: 0.95rem;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.transfer-bar {
+    height: 7px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 99px;
+    overflow: hidden;
+    margin: 11px 0;
+}
+.transfer-bar-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #34d399, #818cf8, #c084fc);
+    border-radius: inherit;
+    transition: width 0.12s linear;
+}
+.transfer-chart {
+    width: 100%;
+    height: 190px;
+    display: block;
+    border-radius: var(--radius-sm);
+    background: rgba(0,0,0,0.24);
+}
+.create-tabs {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    margin-bottom: 14px;
+}
+.create-tab {
+    justify-content: center;
+}
+.create-tab.active {
+    background: var(--accent-dim);
+    border-color: var(--accent-glow);
+    color: var(--info);
+}
+.create-pane { display: none; }
+.create-pane.active { display: block; }
+.form-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+.form-field label {
+    display: block;
+    color: var(--text-muted);
+    font-size: 0.74rem;
+    margin-bottom: 5px;
+}
+.modal-textarea {
+    min-height: 150px;
+    resize: vertical;
+}
+.share-output {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+}
+.share-output input { flex: 1; }
+.page-panel {
+    display: none;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    border-radius: var(--radius-lg);
+    padding: 16px;
+}
+.page-panel.active {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+.page-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    flex-shrink: 0;
+}
+.page-title {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: var(--text-primary);
+    word-break: break-all;
+}
+.page-subtitle {
+    margin-top: 3px;
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    word-break: break-all;
+}
+.page-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+}
+.detail-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px;
+}
+.detail-cell {
+    background: rgba(255,255,255,0.035);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: var(--radius-sm);
+    padding: 9px;
+    min-width: 0;
+}
+.detail-label {
+    color: var(--text-muted);
+    font-size: 0.7rem;
+    margin-bottom: 4px;
+}
+.detail-value {
+    color: var(--text-primary);
+    font-size: 0.86rem;
+    font-variant-numeric: tabular-nums;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.download-workspace {
+    min-height: 0;
+    flex: 1;
+}
+.download-layout {
+    display: grid;
+    grid-template-columns: minmax(300px, 0.95fr) minmax(380px, 1.35fr);
+    gap: 12px;
+    min-height: 0;
+    flex: 1;
+}
+.download-list-panel,
+.download-stats-panel {
+    min-height: 0;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: var(--radius);
+    background: rgba(0,0,0,0.16);
+}
+.download-list-panel {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+.download-list-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 10px 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.07);
+}
+.download-list-title {
+    font-size: 0.86rem;
+    font-weight: 700;
+}
+.download-list-count {
+    color: var(--text-muted);
+    font-size: 0.74rem;
+}
+.download-queue-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    overflow-y: auto;
+    padding: 10px;
+    min-height: 0;
+}
+.download-task {
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: var(--radius-sm);
+    background: rgba(255,255,255,0.035);
+    padding: 10px;
+    cursor: pointer;
+}
+.download-task.active {
+    border-color: rgba(129,140,248,0.36);
+    background: rgba(129,140,248,0.11);
+}
+.download-task.dragging {
+    opacity: 0.45;
+}
+.download-task-top {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    gap: 8px;
+    align-items: center;
+}
+.download-task-drag {
+    color: var(--text-muted);
+    cursor: grab;
+    font-size: 1rem;
+}
+.download-task-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.86rem;
+    font-weight: 600;
+}
+.download-task-actions {
+    display: flex;
+    gap: 5px;
+}
+.download-task-actions .btn {
+    width: 30px;
+    height: 28px;
+    padding: 0;
+    justify-content: center;
+}
+.download-task-meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 7px;
+    color: var(--text-muted);
+    font-size: 0.73rem;
+}
+.download-task-bar {
+    height: 6px;
+    margin-top: 8px;
+    border-radius: 99px;
+    overflow: hidden;
+    background: rgba(255,255,255,0.08);
+}
+.download-task-fill {
+    height: 100%;
+    width: 0%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, #34d399, #818cf8);
+    transition: width 0.12s linear;
+}
+.download-stats-panel {
+    padding: 12px;
+    overflow-y: auto;
+}
+.download-stats-panel .transfer-panel {
+    margin-top: 0;
+}
+.unit-toggle {
+    min-width: 82px;
+    justify-content: center;
+}
+.download-total-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 10px;
+}
+.editor-shell {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: var(--radius);
+    background: rgba(0,0,0,0.18);
+    overflow: hidden;
+}
+.editor-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 9px 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.07);
+    color: var(--text-muted);
+    font-size: 0.76rem;
+}
+.editor-textarea {
+    flex: 1;
+    min-height: 360px;
+    resize: none;
+    border: 0;
+    outline: 0;
+    padding: 14px 16px;
+    background: rgba(2,6,23,0.34);
+    color: var(--text-primary);
+    font: 0.88rem/1.6 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+    tab-size: 4;
+}
+.link-list {
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-height: 0;
+}
+.link-item {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: var(--radius);
+    background: rgba(255,255,255,0.035);
+}
+.link-main {
+    min-width: 0;
+}
+.link-name {
+    font-weight: 600;
+    color: var(--text-primary);
+    word-break: break-all;
+}
+.link-url {
+    margin-top: 4px;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    word-break: break-all;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+}
+.link-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+    color: var(--text-muted);
+    font-size: 0.74rem;
+}
+.link-actions {
+    display: flex;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 6px;
+}
+@media(max-width: 640px) {
+    .transfer-grid, .form-grid, .detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .transfer-head { flex-direction: column; gap: 4px; }
+    .page-head { flex-direction: column; }
+    .page-actions { justify-content: flex-start; width: 100%; }
+    .page-actions .btn { flex: 1; justify-content: center; }
+    .download-layout { grid-template-columns: 1fr; }
+    .download-total-grid { grid-template-columns: 1fr; }
+    .link-item { grid-template-columns: 1fr; }
+    .link-actions { justify-content: flex-start; }
+    .editor-textarea { min-height: 52vh; }
+}
+
+/* ============================================================
+   Properties
+   ============================================================ */
+.prop-grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 7px 14px;
+    font-size: 0.82rem;
+}
+.prop-label { color: var(--text-muted); }
+.prop-value { color: var(--text-primary); word-break: break-all; }
+
+/* ============================================================
+   Toast
+   ============================================================ */
+.toast-container {
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    z-index: 9000;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    pointer-events: none;
+}
+.toast {
+    padding: 10px 18px;
+    border-radius: 10px;
+    font-size: 0.82rem;
+    border: 1px solid var(--glass-border);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+    transform: translateX(110%);
+    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    max-width: 340px;
+    pointer-events: auto;
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+}
+.toast.show { transform: translateX(0); }
+.toast-success { background: var(--success-dim); border-color: rgba(52,211,153,0.25); color: var(--success); }
+.toast-error   { background: var(--danger-dim); border-color: rgba(248,113,113,0.25); color: var(--danger); }
+.toast-info    { background: var(--info-dim); border-color: rgba(165,180,252,0.25); color: var(--info); }
+.toast-warning { background: var(--warning-dim); border-color: rgba(251,191,36,0.25); color: var(--warning); }
+
+/* ============================================================
+   Drag Overlay
+   ============================================================ */
+.drag-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(99, 102, 241, 0.06);
+    border: 3px dashed rgba(129, 140, 248, 0.35);
+    z-index: 8000;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+}
+.drag-overlay.show { display: flex; }
+.drag-overlay-text {
+    padding: 16px 36px;
+    background: rgba(15, 23, 42, 0.9);
+    backdrop-filter: blur(20px);
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--accent-glow);
+    color: var(--info);
+    font-size: 1.1rem;
+    font-weight: 600;
+}
+
+/* ============================================================
+   Confirm Dialog
+   ============================================================ */
+.confirm-text {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    margin-bottom: 4px;
+    line-height: 1.6;
+}
+
+/* ============================================================
+   Mobile Bottom Bar
+   ============================================================ */
+.mobile-bar {
+    display: none;
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    background: rgba(10, 12, 20, 0.92);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border-top: 1px solid var(--glass-border);
+    padding: 6px 12px;
+    padding-bottom: max(6px, env(safe-area-inset-bottom));
+    z-index: 100;
+    gap: 2px;
+    justify-content: space-around;
+}
+.mob-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1px;
+    padding: 7px 10px;
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 0.6rem;
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    transition: all 0.15s;
+    font-family: var(--font);
+    outline: none;
+}
+.mob-btn:active { background: var(--accent-dim); color: var(--accent); }
+.mob-btn-icon { font-size: 1.25rem; }
+
+
+/* ============================================================
+   Root Path Badge
+   ============================================================ */
+.settings-grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 8px 14px;
+    margin-bottom: 14px;
+    font-size: 0.82rem;
+}
+.settings-label { color: var(--text-muted); }
+.settings-value {
+    color: var(--text-primary);
+    word-break: break-all;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+}
+.settings-section-title {
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+    font-weight: 700;
+    margin: 12px 0 8px;
+}
+
+/* ============================================================
+   Responsive
+   ============================================================ */
+@media (max-width: 768px) {
+    .container { padding: 8px; padding-bottom: 72px; gap: 8px; }
+    .header { flex-direction: column; gap: 10px; padding: 12px 14px; }
+    .header-right { width: 100%; }
+    .logout-btn { flex-shrink: 0; }
+    .disk-info { width: 100%; align-items: stretch; }
+    .disk-bar-outer { width: 100%; }
+    .toolbar { flex-direction: column; align-items: stretch; gap: 8px; padding: 10px 12px; }
+    .toolbar-actions { justify-content: space-between; flex-wrap: wrap; }
+    .search-input { flex: 1; width: 100% !important; min-width: 0; }
+    .search-input:focus { width: 100% !important; }
+    .list-header { display: none; }
+    .file-item { grid-template-columns: 1fr auto; gap: 4px; }
+    .file-date { display: none; }
+    .mobile-bar { display: flex; }
+    .desktop-only { display: none !important; }
+    .ctx-menu {
+        left: 8px !important; right: 8px !important;
+        bottom: 8px !important; top: auto !important;
+        border-radius: 18px;
+        padding: 10px;
+        animation: sheetUp 0.2s ease-out;
+        width: auto !important;
+    }
+    @keyframes sheetUp {
+        from { transform: translateY(100%); opacity: 0; }
+        to { transform: translateY(0); opacity: 1; }
+    }
+    .file-list.grid-view {
+        grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+        gap: 8px;
+    }
+}
+@media (max-width: 480px) {
+    .header-title h1 { font-size: 1.1rem; }
+    .crumb { font-size: 0.75rem; padding: 3px 6px; }
+}
+    </style>
+</head>
+<body>
+
+<!-- Background effects -->
+<div class="bg-orb bg-orb-1"></div>
+<div class="bg-orb bg-orb-2"></div>
+<div class="bg-orb bg-orb-3"></div>
+
+<!-- Drag overlay -->
+<div class="drag-overlay" id="dragOverlay">
+    <div class="drag-overlay-text">📤 释放文件以上传到当前目录</div>
+</div>
+
+<!-- Toasts -->
+<div class="toast-container" id="toasts"></div>
+
+<!-- Context backdrop (mobile) -->
+<div class="ctx-backdrop" id="ctxBackdrop"></div>
+
+<!-- Login screen -->
+<div class="login-screen" id="loginScreen">
+    <form class="login-card glass" id="loginForm">
+        <div class="login-title"><span>🔐</span><span>登录云盘</span></div>
+        <div class="login-field">
+            <label for="loginUser">账号</label>
+            <input type="text" class="login-input" id="loginUser" autocomplete="username" required>
+        </div>
+        <div class="login-field">
+            <label for="loginPass">密码</label>
+            <input type="password" class="login-input" id="loginPass" autocomplete="current-password" required>
+        </div>
+        <button type="submit" class="btn btn-primary login-submit" id="loginSubmit">登录</button>
+        <div class="login-error" id="loginError" aria-live="polite"></div>
+    </form>
+</div>
+
+<!-- Main container -->
+<div class="container app-hidden" id="appContainer">
+    <!-- Header -->
+    <header class="header glass" id="header">
+        <div class="header-title">
+            <span class="header-logo">📂</span>
+            <h1>云盘文件管理器</h1>
+        </div>
+        <div class="header-right">
+            <div class="disk-info">
+                <div class="disk-bar-outer">
+                    <div class="disk-bar-fill" id="diskFill"></div>
+                    <div class="disk-bar-free" id="diskFreeFill"></div>
+                </div>
+                <span class="disk-text" id="diskText">正在加载磁盘信息...</span>
+            </div>
+            <button class="btn logout-btn" id="settingsBtn" onclick="openSettingsModal()" title="设置">⚙</button>
+        </div>
+    </header>
+
+    <!-- Toolbar -->
+    <div class="toolbar glass">
+        <div class="breadcrumb" id="breadcrumb"></div>
+        <div class="toolbar-actions">
+            <button class="btn btn-primary" id="btnUpload" onclick="openUploadModal()">📤 上传</button>
+            <button class="btn desktop-only" onclick="openCreateModal()">➕ 新建</button>
+            <button class="btn icon-btn" onclick="openDownloadPage()" title="下载列表">📥</button>
+            <button class="btn desktop-only" onclick="openLinksPage()">🔗 链接</button>
+            <div class="view-toggle">
+                <button class="view-btn" data-mode="list" onclick="setViewMode('list')" title="列表视图">☰</button>
+                <button class="view-btn" data-mode="grid" onclick="setViewMode('grid')" title="网格视图">⊞</button>
+            </div>
+            <div class="search-wrap">
+                <span class="search-icon">🔍</span>
+                <input type="text" class="search-input" id="searchInput" placeholder="搜索文件...">
+            </div>
+        </div>
+    </div>
+
+    <!-- File browser -->
+    <div class="file-browser glass" id="browserPage">
+        <div class="list-header" id="listHeader">
+            <span onclick="toggleSort('name')">名称 <span class="sort-arrow" id="sortName">↑</span></span>
+            <span onclick="toggleSort('size')">大小 <span class="sort-arrow" id="sortSize"></span></span>
+            <span onclick="toggleSort('modified')">修改时间 <span class="sort-arrow" id="sortModified"></span></span>
+        </div>
+        <div class="loading-wrap" id="loading" style="display:none;"><div class="spinner"></div></div>
+        <div class="file-list" id="fileList"></div>
+    </div>
+
+    <!-- Download detail page -->
+    <section class="page-panel glass" id="downloadPage">
+        <div class="page-head">
+            <div>
+                <div class="page-title">下载列表</div>
+                <div class="page-subtitle" id="downloadPath">浏览器内下载任务和速度统计</div>
+            </div>
+            <div class="page-actions">
+                <button class="btn" onclick="showBrowserPage()">返回</button>
+                <button class="btn unit-toggle" id="downloadUnitToggle" onclick="toggleDownloadUnit()">MB/s</button>
+                <button class="btn btn-danger" onclick="clearFinishedDownloads()">清除完成</button>
+            </div>
+        </div>
+        <div class="download-workspace download-layout">
+            <div class="download-list-panel">
+                <div class="download-list-head">
+                    <div class="download-list-title">任务</div>
+                    <div class="download-list-count" id="downloadQueueCount">0 个文件</div>
+                </div>
+                <div class="download-queue-list" id="downloadQueueList"></div>
+            </div>
+            <div class="download-stats-panel">
+                <div class="transfer-panel">
+                    <div class="transfer-head">
+                        <div class="transfer-title" id="downloadTransferName">暂无任务</div>
+                        <div class="transfer-status" id="downloadTransferStatus">等待下载</div>
+                    </div>
+                    <div class="transfer-grid">
+                        <div class="transfer-metric"><div class="transfer-label">当前速度</div><div class="transfer-value" id="dlCur">0 MB/s</div></div>
+                        <div class="transfer-metric"><div class="transfer-label">平均速度</div><div class="transfer-value" id="dlAvg">0 MB/s</div></div>
+                        <div class="transfer-metric"><div class="transfer-label">峰值速度</div><div class="transfer-value" id="dlMax">0 MB/s</div></div>
+                        <div class="transfer-metric"><div class="transfer-label">进度</div><div class="transfer-value" id="dlPct">0%</div></div>
+                        <div class="transfer-metric"><div class="transfer-label">已下载</div><div class="transfer-value" id="dlDone">0 B</div></div>
+                        <div class="transfer-metric"><div class="transfer-label">总大小</div><div class="transfer-value" id="dlTotal">未知</div></div>
+                        <div class="transfer-metric"><div class="transfer-label">耗时</div><div class="transfer-value" id="dlElapsed">0 s</div></div>
+                        <div class="transfer-metric"><div class="transfer-label">剩余</div><div class="transfer-value" id="dlEta">--</div></div>
+                    </div>
+                    <div class="transfer-bar"><div class="transfer-bar-fill" id="dlBar"></div></div>
+                    <canvas class="transfer-chart" id="downloadChart"></canvas>
+                </div>
+                <div class="download-total-grid">
+                    <div class="detail-cell"><div class="detail-label">总文件数</div><div class="detail-value" id="dlTotalFiles">0</div></div>
+                    <div class="detail-cell"><div class="detail-label">总大小</div><div class="detail-value" id="dlTotalBytes">0 B</div></div>
+                    <div class="detail-cell"><div class="detail-label">已完成</div><div class="detail-value" id="dlFinishedFiles">0</div></div>
+                    <div class="detail-cell"><div class="detail-label">队列已下载</div><div class="detail-value" id="dlQueueDone">0 B</div></div>
+                    <div class="detail-cell"><div class="detail-label">活动任务</div><div class="detail-value" id="dlActiveFiles">0</div></div>
+                    <div class="detail-cell"><div class="detail-label">错误/暂停</div><div class="detail-value" id="dlStoppedFiles">0</div></div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Text editor page -->
+    <section class="page-panel glass" id="editorPage">
+        <div class="page-head">
+            <div>
+                <div class="page-title" id="editorTitle">文本编辑器</div>
+                <div class="page-subtitle" id="editorPath"></div>
+            </div>
+            <div class="page-actions">
+                <button class="btn" onclick="showBrowserPage()">返回</button>
+                <button class="btn" onclick="reloadTextEditor()">重新载入</button>
+                <button class="btn btn-primary" onclick="saveTextEditor()">保存</button>
+            </div>
+        </div>
+        <div class="editor-shell">
+            <div class="editor-toolbar">
+                <span id="editorMeta">未载入</span>
+                <span id="editorState">--</span>
+            </div>
+            <textarea class="editor-textarea" id="editorText" spellcheck="false"></textarea>
+        </div>
+    </section>
+
+    <!-- Link management page -->
+    <section class="page-panel glass" id="linksPage">
+        <div class="page-head">
+            <div>
+                <div class="page-title">下载链接管理</div>
+                <div class="page-subtitle">管理已生成的临时下载链接</div>
+            </div>
+            <div class="page-actions">
+                <button class="btn" onclick="showBrowserPage()">返回</button>
+                <button class="btn btn-primary" onclick="loadShares()">刷新</button>
+            </div>
+        </div>
+        <div class="link-list" id="linkList"></div>
+    </section>
+</div>
+
+<!-- Context menu -->
+<div class="ctx-menu" id="ctxMenu">
+    <button class="ctx-item" id="ctxOpen" onclick="ctxOpen()"><span class="ctx-icon">📂</span>打开</button>
+    <button class="ctx-item" id="ctxDownload" onclick="ctxDownload()"><span class="ctx-icon">📥</span>下载</button>
+    <button class="ctx-item" id="ctxEdit" onclick="ctxEdit()"><span class="ctx-icon">📝</span>编辑文本</button>
+    <button class="ctx-item" id="ctxShare" onclick="ctxShare()"><span class="ctx-icon">🔗</span>生成下载链接</button>
+    <div class="ctx-divider"></div>
+    <button class="ctx-item" id="ctxCopy" onclick="ctxCopy()"><span class="ctx-icon">📋</span>复制</button>
+    <button class="ctx-item" id="ctxCut" onclick="ctxCut()"><span class="ctx-icon">✂️</span>剪切</button>
+    <button class="ctx-item" id="ctxPaste" onclick="ctxPaste()"><span class="ctx-icon">📌</span>粘贴</button>
+    <div class="ctx-divider"></div>
+    <button class="ctx-item" id="ctxRename" onclick="ctxRename()"><span class="ctx-icon">✏️</span>重命名</button>
+    <button class="ctx-item" onclick="openCreateModal(); hideCtx();"><span class="ctx-icon">➕</span>新建</button>
+    <div class="ctx-divider"></div>
+    <button class="ctx-item danger" id="ctxDelete" onclick="ctxDelete()"><span class="ctx-icon">🗑️</span>删除</button>
+    <div class="ctx-divider"></div>
+    <button class="ctx-item" id="ctxProps" onclick="ctxProps()"><span class="ctx-icon">ℹ️</span>属性</button>
+</div>
+
+<!-- Upload modal -->
+<div class="modal-overlay" id="uploadModal">
+    <div class="modal">
+        <div class="modal-title">📤 上传文件</div>
+        <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
+            <div class="upload-zone-icon">☁️</div>
+            <div class="upload-zone-text">点击选择文件，或拖拽到此处</div>
+            <div class="upload-zone-sub">支持上传任意格式文件</div>
+        </div>
+        <input type="file" id="fileInput" multiple style="display:none">
+        <div id="uploadList"></div>
+        <div class="modal-actions">
+            <button class="btn" onclick="hideModal('uploadModal')">关闭</button>
+        </div>
+    </div>
+</div>
+
+<!-- Rename modal -->
+<div class="modal-overlay" id="renameModal">
+    <div class="modal">
+        <div class="modal-title">✏️ 重命名</div>
+        <input type="text" class="modal-input" id="renameInput" placeholder="输入新名称">
+        <div class="modal-actions">
+            <button class="btn" onclick="hideModal('renameModal')">取消</button>
+            <button class="btn btn-primary" id="renameConfirm">确认</button>
+        </div>
+    </div>
+</div>
+
+<!-- Create modal -->
+<div class="modal-overlay" id="createModal">
+    <div class="modal">
+        <div class="modal-title">➕ 新建</div>
+        <div class="create-tabs">
+            <button class="btn create-tab active" data-create-tab="folder" onclick="setCreateTab('folder')">文件夹</button>
+            <button class="btn create-tab" data-create-tab="speed" onclick="setCreateTab('speed')">测速文件</button>
+            <button class="btn create-tab" data-create-tab="text" onclick="setCreateTab('text')">文本文件</button>
+        </div>
+        <div class="create-pane active" id="createPaneFolder">
+            <input type="text" class="modal-input" id="newFolderInput" placeholder="输入文件夹名称">
+        </div>
+        <div class="create-pane" id="createPaneSpeed">
+            <div class="form-grid">
+                <div class="form-field">
+                    <label>文件名</label>
+                    <input type="text" class="modal-input" id="speedFileName" value="speedtest">
+                </div>
+                <div class="form-field">
+                    <label>后缀</label>
+                    <input type="text" class="modal-input" id="speedFileExt" value="bin">
+                </div>
+                <div class="form-field">
+                    <label>大小数值</label>
+                    <input type="number" class="modal-input" id="speedFileSize" value="10" min="1" step="1">
+                </div>
+                <div class="form-field">
+                    <label>大小单位</label>
+                    <select class="modal-input" id="speedFileUnit">
+                        <option value="1073741824">GiB</option>
+                        <option value="1048576">MiB</option>
+                        <option value="1024">KiB</option>
+                        <option value="1">B</option>
+                    </select>
+                </div>
+                <div class="form-field">
+                    <label>有效时间</label>
+                    <input type="number" class="modal-input" id="speedFileTtl" value="24" min="1" step="1">
+                </div>
+                <div class="form-field">
+                    <label>时间单位</label>
+                    <select class="modal-input" id="speedFileTtlUnit">
+                        <option value="3600">小时</option>
+                        <option value="60">分钟</option>
+                        <option value="86400">天</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+        <div class="create-pane" id="createPaneText">
+            <div class="form-grid">
+                <div class="form-field">
+                    <label>文件名</label>
+                    <input type="text" class="modal-input" id="textFileName" value="note">
+                </div>
+                <div class="form-field">
+                    <label>后缀</label>
+                    <input type="text" class="modal-input" id="textFileExt" value="txt">
+                </div>
+            </div>
+            <textarea class="modal-input modal-textarea" id="textFileContent" placeholder="输入文本内容"></textarea>
+        </div>
+        <div class="modal-actions">
+            <button class="btn" onclick="hideModal('createModal')">取消</button>
+            <button class="btn btn-primary" onclick="doCreate()">创建</button>
+        </div>
+    </div>
+</div>
+
+<!-- Share modal -->
+<div class="modal-overlay" id="shareModal">
+    <div class="modal">
+        <div class="modal-title">🔗 生成下载链接</div>
+        <div class="form-grid">
+            <div class="form-field">
+                <label>有效时间</label>
+                <input type="number" class="modal-input" id="shareTtl" value="24" min="1" step="1">
+            </div>
+            <div class="form-field">
+                <label>时间单位</label>
+                <select class="modal-input" id="shareTtlUnit">
+                    <option value="3600">小时</option>
+                    <option value="60">分钟</option>
+                    <option value="86400">天</option>
+                </select>
+            </div>
+        </div>
+        <div class="share-output" id="shareOutput" style="display:none;">
+            <input type="text" class="modal-input" id="shareUrl" readonly>
+            <button class="btn" onclick="traditionalDownloadShare()">下载</button>
+            <button class="btn btn-primary" onclick="copyShareUrl()">复制</button>
+        </div>
+        <div class="modal-actions">
+            <button class="btn" onclick="hideModal('shareModal')">关闭</button>
+            <button class="btn btn-primary" id="shareGenerateBtn" onclick="doCreateShare()">生成</button>
+        </div>
+    </div>
+</div>
+
+<!-- Transfer modal -->
+<div class="modal-overlay" id="transferModal">
+    <div class="modal modal-wide">
+        <div class="modal-title" id="transferModalTitle">传输速度</div>
+        <div class="transfer-panel">
+            <div class="transfer-head">
+                <div class="transfer-title" id="transferName">等待开始</div>
+                <div class="transfer-status" id="transferStatus">未开始</div>
+            </div>
+            <div class="transfer-grid">
+                <div class="transfer-metric"><div class="transfer-label">当前速度</div><div class="transfer-value" id="trCur">0 MB/s</div></div>
+                <div class="transfer-metric"><div class="transfer-label">平均速度</div><div class="transfer-value" id="trAvg">0 MB/s</div></div>
+                <div class="transfer-metric"><div class="transfer-label">峰值速度</div><div class="transfer-value" id="trMax">0 MB/s</div></div>
+                <div class="transfer-metric"><div class="transfer-label">进度</div><div class="transfer-value" id="trPct">0%</div></div>
+                <div class="transfer-metric"><div class="transfer-label">已传输</div><div class="transfer-value" id="trDone">0 B</div></div>
+                <div class="transfer-metric"><div class="transfer-label">总大小</div><div class="transfer-value" id="trTotal">未知</div></div>
+                <div class="transfer-metric"><div class="transfer-label">耗时</div><div class="transfer-value" id="trElapsed">0 s</div></div>
+                <div class="transfer-metric"><div class="transfer-label">剩余</div><div class="transfer-value" id="trEta">--</div></div>
+            </div>
+            <div class="transfer-bar"><div class="transfer-bar-fill" id="trBar"></div></div>
+            <canvas class="transfer-chart" id="transferChart"></canvas>
+        </div>
+        <div class="modal-actions">
+            <button class="btn btn-danger" id="transferCancel" onclick="cancelTransfer()">停止</button>
+            <button class="btn" onclick="hideModal('transferModal')">关闭</button>
+        </div>
+    </div>
+</div>
+
+<!-- Confirm modal -->
+<div class="modal-overlay" id="confirmModal">
+    <div class="modal">
+        <div class="modal-title" id="confirmTitle">确认操作</div>
+        <div class="confirm-text" id="confirmText"></div>
+        <div class="modal-actions">
+            <button class="btn" onclick="hideModal('confirmModal')">取消</button>
+            <button class="btn btn-danger" id="confirmOk">确认</button>
+        </div>
+    </div>
+</div>
+
+<!-- Properties modal -->
+<div class="modal-overlay" id="propsModal">
+    <div class="modal">
+        <div class="modal-title">ℹ️ 文件属性</div>
+        <div class="prop-grid">
+            <span class="prop-label">名称</span><span class="prop-value" id="propName"></span>
+            <span class="prop-label">路径</span><span class="prop-value" id="propPath"></span>
+            <span class="prop-label">类型</span><span class="prop-value" id="propType"></span>
+            <span class="prop-label">大小</span><span class="prop-value" id="propSize"></span>
+            <span class="prop-label">修改时间</span><span class="prop-value" id="propModified"></span>
+        </div>
+        <div class="modal-actions">
+            <button class="btn" onclick="hideModal('propsModal')">关闭</button>
+        </div>
+    </div>
+</div>
+
+<!-- Settings modal -->
+<div class="modal-overlay" id="settingsModal">
+    <div class="modal">
+        <div class="modal-title">⚙ 设置</div>
+        <div class="settings-grid">
+            <span class="settings-label">当前用户</span><span class="settings-value" id="settingsUsername">--</span>
+            <span class="settings-label">磁盘总容量</span><span class="settings-value" id="settingsDiskTotal">--</span>
+            <span class="settings-label">磁盘已用</span><span class="settings-value" id="settingsDiskUsed">--</span>
+            <span class="settings-label">磁盘剩余</span><span class="settings-value" id="settingsDiskFree">--</span>
+            <span class="settings-label">根目录文件大小</span><span class="settings-value" id="settingsRootSize">--</span>
+            <span class="settings-label">根目录实际占盘</span><span class="settings-value" id="settingsRootAllocated">--</span>
+            <span class="settings-label">根目录</span><span class="settings-value" id="settingsRootPath">--</span>
+        </div>
+        <div class="settings-section-title">修改密码</div>
+        <div class="form-grid">
+            <div class="form-field">
+                <label>旧密码</label>
+                <input type="password" class="modal-input" id="oldPasswordInput" autocomplete="current-password">
+            </div>
+            <div class="form-field">
+                <label>新密码</label>
+                <input type="password" class="modal-input" id="newPasswordInput" autocomplete="new-password">
+            </div>
+            <div class="form-field">
+                <label>确认新密码</label>
+                <input type="password" class="modal-input" id="confirmPasswordInput" autocomplete="new-password">
+            </div>
+        </div>
+        <div class="modal-actions">
+            <button class="btn btn-danger" onclick="logout()">退出登录</button>
+            <button class="btn" onclick="hideModal('settingsModal')">关闭</button>
+            <button class="btn btn-primary" onclick="changePassword()">保存密码</button>
+        </div>
+    </div>
+</div>
+
+<!-- Mobile bottom bar -->
+<div class="mobile-bar app-hidden" id="mobileBar">
+    <button class="mob-btn" onclick="openUploadModal()"><span class="mob-btn-icon">📤</span>上传</button>
+    <button class="mob-btn" onclick="openCreateModal()"><span class="mob-btn-icon">➕</span>新建</button>
+    <button class="mob-btn" onclick="openDownloadPage()"><span class="mob-btn-icon">📥</span>下载</button>
+    <button class="mob-btn" onclick="openLinksPage()"><span class="mob-btn-icon">🔗</span>链接</button>
+    <button class="mob-btn" onclick="goBack()"><span class="mob-btn-icon">⬅️</span>返回</button>
+</div>
+
+<script>
+/* ============================================================
+   State
+   ============================================================ */
+let curPath = '/';
+let files = [];
+let selected = new Set();       // Set of file.path
+let clipboard = null;           // { action: 'copy'|'cut', paths: [] }
+let viewMode = localStorage.getItem('fm_view') || 'list';
+let sortBy = 'name';
+let sortOrder = 'asc';
+let searchQ = '';
+let diskInfo = null;
+let authRequired = false;
+let appStarted = false;
+let createMode = 'folder';
+let shareTargetPath = '';
+let activeTransfer = null;
+let currentView = 'browser';
+let currentDownload = null;
+let currentEditorPath = '';
+let editorDirty = false;
+let lastShareUrl = '';
+let downloadTasks = [];
+let selectedDownloadId = '';
+let downloadUnit = localStorage.getItem('fm_download_unit') || 'MB';
+let downloadDragId = '';
+let currentUsername = '';
+let navReady = false;
+let suppressHistoryPush = false;
+
+/* ============================================================
+   Init
+   ============================================================ */
+document.addEventListener('DOMContentLoaded', () => {
+    setupEvents();
+    setupLoginForm();
+    syncViewToggle();
+    initAuth();
+});
+
+/* ============================================================
+   Auth
+   ============================================================ */
+async function initAuth() {
+    try {
+        const status = await apiFetch('/api/auth/status');
+        authRequired = !!status.authRequired;
+        if (status.authenticated) startApp();
+        else showLogin();
+    } catch (e) {
+        showLogin();
+        setLoginError('无法连接服务器，请稍后重试');
+    }
+}
+
+function setupLoginForm() {
+    const form = document.getElementById('loginForm');
+    if (!form) return;
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        await login();
+    });
+}
+
+async function login() {
+    const username = document.getElementById('loginUser').value.trim();
+    const password = document.getElementById('loginPass').value;
+    if (!username || !password) return setLoginError('请输入账号和密码');
+    setLoginBusy(true);
+    setLoginError('');
+    try {
+        await apiFetch('/api/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password }),
+        });
+        document.getElementById('loginPass').value = '';
+        startApp();
+    } catch (e) {
+        setLoginError(e.message || '登录失败');
+    } finally {
+        setLoginBusy(false);
+    }
+}
+
+async function logout() {
+    try {
+        await apiFetch('/api/auth/logout', { method: 'POST' });
+    } catch (e) {
+        console.error('Logout error:', e);
+    }
+    appStarted = false;
+    curPath = '/';
+    files = [];
+    selected.clear();
+    showLogin();
+}
+
+function startApp() {
+    hideLogin();
+    setAppVisible(true);
+    document.getElementById('logoutBtn').style.display = authRequired ? 'inline-flex' : 'none';
+    if (appStarted) return;
+    appStarted = true;
+    loadDiskInfo();
+    loadFiles('/');
+}
+
+function showLogin() {
+    setAppVisible(false);
+    document.getElementById('loginScreen').classList.add('show');
+    setTimeout(() => document.getElementById('loginUser').focus(), 60);
+}
+
+function hideLogin() {
+    document.getElementById('loginScreen').classList.remove('show');
+    setLoginError('');
+}
+
+function setAppVisible(visible) {
+    ['appContainer', 'rootPathBadge', 'mobileBar'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.classList.toggle('app-hidden', !visible);
+    });
+}
+
+function setLoginBusy(busy) {
+    const btn = document.getElementById('loginSubmit');
+    btn.disabled = busy;
+    btn.textContent = busy ? '登录中...' : '登录';
+}
+
+function setLoginError(msg) {
+    document.getElementById('loginError').textContent = msg || '';
+}
+
+async function ensureAuthenticated() {
+    if (!authRequired) return true;
+    const status = await apiFetch('/api/auth/status');
+    if (status.authenticated) return true;
+    appStarted = false;
+    showLogin();
+    toast('登录已过期，请重新登录', 'warning');
+    return false;
+}
+
+/* ============================================================
+   API Helpers
+   ============================================================ */
+async function apiFetch(url, opts = {}) {
+    const res = await fetch(url, { credentials: 'same-origin', ...opts });
+    const contentType = res.headers.get('Content-Type') || '';
+    const data = contentType.includes('application/json') ? await res.json() : {};
+    if (res.status === 401 && !url.startsWith('/api/auth/')) {
+        appStarted = false;
+        showLogin();
+        throw new Error(data.error || '登录已过期，请重新登录');
+    }
+    if (!res.ok && data.error) throw new Error(data.error);
+    if (!res.ok) throw new Error('请求失败');
+    return data;
+}
+
+/* ============================================================
+   Load Data
+   ============================================================ */
+async function loadFiles(path) {
+    showLoading(true);
+    try {
+        const data = await apiFetch('/api/list?path=' + encodeURIComponent(path));
+        curPath = data.path;
+        files = data.items;
+        selected.clear();
+        renderBreadcrumb();
+        renderFiles();
+    } catch (e) {
+        toast(e.message, 'error');
+    } finally {
+        showLoading(false);
+    }
+}
+
+async function loadDiskInfo() {
+    try {
+        diskInfo = await apiFetch('/api/disk');
+        renderDisk();
+    } catch (e) {
+        console.error('Disk info error:', e);
+    }
+}
+
+/* ============================================================
+   Render Functions
+   ============================================================ */
+function renderDisk() {
+    if (!diskInfo) return;
+    const el = document.getElementById('diskFill');
+    const txt = document.getElementById('diskText');
+    const rootValue = document.getElementById('rootPathValue');
+    const rootBadge = document.getElementById('rootPathBadge');
+    el.style.width = diskInfo.percent + '%';
+    txt.textContent = `已用 ${diskInfo.usedStr} / 共 ${diskInfo.totalStr}（${diskInfo.percent}%）· 根目录占用 ${diskInfo.rootSizeStr}`;
+    if (diskInfo.rootPath) {
+        rootValue.textContent = diskInfo.rootPath;
+        rootBadge.title = `网页里的“🏠 根目录”对应服务器文件夹：${diskInfo.rootPath}`;
+    }
+}
+
+function renderBreadcrumb() {
+    const el = document.getElementById('breadcrumb');
+    const parts = curPath.split('/').filter(Boolean);
+    let html = `<button class="crumb${parts.length === 0 ? ' active' : ''}" data-nav-path="/">🏠 根目录</button>`;
+    let p = '';
+    parts.forEach((part, i) => {
+        p += '/' + part;
+        const last = i === parts.length - 1;
+        html += `<span class="crumb-sep">›</span>`;
+        html += `<button class="crumb${last ? ' active' : ''}" data-nav-path="${esc(p)}">${esc(part)}</button>`;
+    });
+    el.innerHTML = html;
+}
+
+// Breadcrumb event delegation (avoid inline onclick XSS)
+document.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('breadcrumb').addEventListener('click', (e) => {
+        const btn = e.target.closest('.crumb[data-nav-path]');
+        if (btn) loadFiles(btn.getAttribute('data-nav-path'));
+    });
+});
+
+function renderFiles() {
+    const el = document.getElementById('fileList');
+    const items = getVisibleFiles();
+
+    // Show/hide list header based on view mode
+    document.getElementById('listHeader').style.display = viewMode === 'list' ? '' : 'none';
+
+    if (items.length === 0) {
+        el.className = 'file-list';
+        el.innerHTML = `<div class="empty-state"><div class="empty-icon">📂</div><div class="empty-text">${searchQ ? '未找到匹配文件' : '此文件夹为空'}</div></div>`;
+        return;
+    }
+
+    el.className = 'file-list' + (viewMode === 'grid' ? ' grid-view' : '');
+
+    let html = '';
+    items.forEach((f, i) => {
+        const sel = selected.has(f.path) ? ' selected' : '';
+        const cut = clipboard && clipboard.action === 'cut' && clipboard.paths.includes(f.path) ? ' cut' : '';
+        const icon = fileIcon(f);
+        const size = f.isDir ? '' : fmtSize(f.size);
+        const escapedPath = esc(f.path);
+        html += `<div class="file-item${sel}${cut}" data-path="${escapedPath}" data-idx="${i}"
+            onclick="onFileClick(event,${i})" ondblclick="onFileDbl(${i})"
+            oncontextmenu="onFileCtx(event,${i})"
+            style="animation-delay:${Math.min(i * 15, 300)}ms">
+            <div class="file-item-name">
+                <span class="file-icon">${icon}</span>
+                <span class="file-name" title="${escapedPath}">${esc(f.name)}</span>
+            </div>
+            <span class="file-size">${size}</span>
+            <span class="file-date">${f.modifiedStr || ''}</span>
+        </div>`;
+    });
+    el.innerHTML = html;
+}
+
+function showLoading(v) {
+    document.getElementById('loading').style.display = v ? 'flex' : 'none';
+    document.getElementById('fileList').style.display = v ? 'none' : '';
+}
+
+/* ============================================================
+   Sorting & Filtering
+   ============================================================ */
+function getVisibleFiles() {
+    let arr = [...files];
+    if (searchQ) {
+        const q = searchQ.toLowerCase();
+        arr = arr.filter(f => f.name.toLowerCase().includes(q));
+    }
+    arr.sort((a, b) => {
+        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+        let c = 0;
+        if (sortBy === 'name') c = a.name.localeCompare(b.name, 'zh');
+        else if (sortBy === 'size') c = a.size - b.size;
+        else if (sortBy === 'modified') c = a.modified - b.modified;
+        return sortOrder === 'asc' ? c : -c;
+    });
+    return arr;
+}
+
+function toggleSort(field) {
+    if (sortBy === field) sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
+    else { sortBy = field; sortOrder = 'asc'; }
+    renderSortArrows();
+    renderFiles();
+}
+
+function renderSortArrows() {
+    document.getElementById('sortName').textContent = '';
+    document.getElementById('sortSize').textContent = '';
+    document.getElementById('sortModified').textContent = '';
+    const id = sortBy === 'name' ? 'sortName' : sortBy === 'size' ? 'sortSize' : 'sortModified';
+    document.getElementById(id).textContent = sortOrder === 'asc' ? '↑' : '↓';
+}
+
+/* ============================================================
+   File Click Handlers
+   ============================================================ */
+function onFileClick(e, idx) {
+    const f = getVisibleFiles()[idx];
+    if (!f) return;
+    if (e.ctrlKey || e.metaKey) {
+        if (selected.has(f.path)) selected.delete(f.path); else selected.add(f.path);
+    } else if (e.shiftKey && selected.size > 0) {
+        const all = getVisibleFiles();
+        const lastPath = [...selected].pop();
+        const lastIdx = all.findIndex(x => x.path === lastPath);
+        const lo = Math.min(lastIdx, idx), hi = Math.max(lastIdx, idx);
+        for (let i = lo; i <= hi; i++) selected.add(all[i].path);
+    } else {
+        selected.clear();
+        selected.add(f.path);
+    }
+    renderFiles();
+}
+
+function onFileDbl(idx) {
+    const f = getVisibleFiles()[idx];
+    if (!f) return;
+    if (f.isDir) loadFiles(f.path);
+    else downloadFile(f.path);
+}
+
+/* ============================================================
+   Context Menu
+   ============================================================ */
+function onFileCtx(e, idx) {
+    e.preventDefault();
+    e.stopPropagation();
+    const f = getVisibleFiles()[idx];
+    if (!f) return;
+    if (!selected.has(f.path)) {
+        selected.clear();
+        selected.add(f.path);
+        renderFiles();
+    }
+    showCtx(e.clientX, e.clientY);
+}
+
+function showCtx(x, y) {
+    const menu = document.getElementById('ctxMenu');
+    const n = selected.size;
+    const hasSel = n > 0;
+    const singleFile = n === 1;
+    let f = null;
+    if (singleFile) f = files.find(fi => fi.path === [...selected][0]);
+
+    setDisabled('ctxOpen', !singleFile);
+    setDisabled('ctxDownload', !hasSel || (singleFile && f && f.isDir));
+    setDisabled('ctxShare', !singleFile || !f || f.isDir);
+    setDisabled('ctxCopy', !hasSel);
+    setDisabled('ctxCut', !hasSel);
+    setDisabled('ctxPaste', !clipboard);
+    setDisabled('ctxRename', !singleFile);
+    setDisabled('ctxDelete', !hasSel);
+    setDisabled('ctxProps', !singleFile);
+
+    const isMobile = window.innerWidth <= 768;
+    if (isMobile) {
+        document.getElementById('ctxBackdrop').classList.add('show');
+        menu.style.left = ''; menu.style.right = '';
+        menu.style.bottom = ''; menu.style.top = '';
+    } else {
+        const mw = 200, mh = menu.scrollHeight || 350;
+        if (x + mw > window.innerWidth) x = window.innerWidth - mw - 8;
+        if (y + mh > window.innerHeight) y = window.innerHeight - mh - 8;
+        if (x < 0) x = 8; if (y < 0) y = 8;
+        menu.style.left = x + 'px'; menu.style.top = y + 'px';
+    }
+    menu.classList.add('show');
+}
+
+function hideCtx() {
+    document.getElementById('ctxMenu').classList.remove('show');
+    document.getElementById('ctxBackdrop').classList.remove('show');
+}
+
+function setDisabled(id, disabled) {
+    document.getElementById(id).classList.toggle('disabled', disabled);
+}
+
+/* ============================================================
+   Context Menu Actions
+   ============================================================ */
+function ctxOpen() {
+    hideCtx();
+    if (selected.size !== 1) return;
+    const path = [...selected][0];
+    const f = files.find(fi => fi.path === path);
+    if (f && f.isDir) loadFiles(f.path);
+    else if (f) downloadFile(f.path);
+}
+
+function ctxDownload() {
+    hideCtx();
+    selected.forEach(p => {
+        const f = files.find(fi => fi.path === p);
+        if (f && !f.isDir) downloadFile(p);
+    });
+}
+
+function ctxCopy() {
+    hideCtx();
+    clipboard = { action: 'copy', paths: [...selected] };
+    toast(`已复制 ${selected.size} 个项目`, 'info');
+    renderFiles();
+}
+
+function ctxCut() {
+    hideCtx();
+    clipboard = { action: 'cut', paths: [...selected] };
+    toast(`已剪切 ${selected.size} 个项目`, 'info');
+    renderFiles();
+}
+
+async function ctxPaste() {
+    hideCtx();
+    if (!clipboard) return toast('剪贴板为空', 'warning');
+    const endpoint = clipboard.action === 'copy' ? '/api/copy' : '/api/move';
+    try {
+        const data = await apiFetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sources: clipboard.paths, dest: curPath }),
+        });
+        if (data.success) {
+            toast(clipboard.action === 'copy' ? '复制成功' : '移动成功', 'success');
+            if (clipboard.action === 'cut') clipboard = null;
+        } else {
+            toast((data.errors || []).join('\n'), 'error');
+        }
+    } catch (e) { toast(e.message, 'error'); }
+    await loadFiles(curPath);
+}
+
+function ctxRename() {
+    hideCtx();
+    if (selected.size !== 1) return;
+    const path = [...selected][0];
+    const f = files.find(fi => fi.path === path);
+    if (!f) return;
+    const input = document.getElementById('renameInput');
+    input.value = f.name;
+    showModal('renameModal');
+    setTimeout(() => { input.focus(); input.select(); }, 60);
+
+    document.getElementById('renameConfirm').onclick = async () => {
+        const newName = input.value.trim();
+        if (!newName || newName === f.name) return hideModal('renameModal');
+        try {
+            await apiFetch('/api/rename', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: f.path, newName }),
+            });
+            toast('重命名成功', 'success');
+        } catch (e) { toast(e.message, 'error'); }
+        hideModal('renameModal');
+        await loadFiles(curPath);
+    };
+}
+
+function ctxDelete() {
+    hideCtx();
+    if (selected.size === 0) return;
+    const count = selected.size;
+    const names = [...selected].map(p => {
+        const f = files.find(fi => fi.path === p);
+        return f ? f.name : p;
+    });
+    const display = names.length <= 3 ? names.join('、') : names.slice(0, 3).join('、') + ` 等 ${count} 项`;
+    showConfirm('🗑️ 确认删除', `确定要删除「${display}」吗？\n此操作不可恢复。`, async () => {
+        try {
+            const data = await apiFetch('/api/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ paths: [...selected] }),
+            });
+            if (data.success) toast(`已删除 ${count} 个项目`, 'success');
+            else toast((data.errors || []).join('\n'), 'error');
+        } catch (e) { toast(e.message, 'error'); }
+        await loadFiles(curPath);
+        loadDiskInfo();
+    });
+}
+
+function ctxProps() {
+    hideCtx();
+    if (selected.size !== 1) return;
+    const path = [...selected][0];
+    const f = files.find(fi => fi.path === path);
+    if (!f) return;
+    document.getElementById('propName').textContent = f.name;
+    document.getElementById('propPath').textContent = f.path;
+    document.getElementById('propType').textContent = f.isDir ? '文件夹' : extLabel(f.name);
+    document.getElementById('propSize').textContent = f.isDir ? '—' : fmtSize(f.size);
+    document.getElementById('propModified').textContent = f.modifiedStr;
+    showModal('propsModal');
+}
+
+/* ============================================================
+   File Operations
+   ============================================================ */
+async function downloadFile(path) {
+    try {
+        if (!(await ensureAuthenticated())) return;
+    } catch (e) {
+        toast(e.message, 'error');
+        return;
+    }
+    const f = files.find(fi => fi.path === path);
+    const name = f ? f.name : path.split('/').pop();
+    const size = f ? f.size : 0;
+    await runMeasuredDownload({
+        url: '/api/download?path=' + encodeURIComponent(path),
+        name,
+        size,
+    });
+}
+
+function openCreateModal() {
+    setCreateTab(createMode || 'folder');
+    document.getElementById('newFolderInput').value = '';
+    showModal('createModal');
+    setTimeout(() => document.getElementById('newFolderInput').focus(), 60);
+}
+
+function openNewFolderModal() {
+    openCreateModal();
+}
+
+function setCreateTab(mode) {
+    createMode = mode;
+    document.querySelectorAll('.create-tab').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.createTab === mode);
+    });
+    document.querySelectorAll('.create-pane').forEach(pane => pane.classList.remove('active'));
+    const pane = document.getElementById('createPane' + mode.charAt(0).toUpperCase() + mode.slice(1));
+    if (pane) pane.classList.add('active');
+}
+
+async function doCreate() {
+    if (createMode === 'speed') return doCreateSpeedFile();
+    if (createMode === 'text') return doCreateTextFile();
+    return doCreateFolder();
+}
+
+async function doCreateFolder() {
+    const name = document.getElementById('newFolderInput').value.trim();
+    if (!name) return toast('请输入文件夹名称', 'warning');
+    try {
+        await apiFetch('/api/mkdir', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: curPath, name }),
+        });
+        toast('文件夹创建成功', 'success');
+    } catch (e) { toast(e.message, 'error'); }
+    hideModal('createModal');
+    await loadFiles(curPath);
+}
+
+async function doCreateSpeedFile() {
+    const name = document.getElementById('speedFileName').value.trim();
+    const ext = document.getElementById('speedFileExt').value.trim();
+    const amount = Number(document.getElementById('speedFileSize').value);
+    const unit = Number(document.getElementById('speedFileUnit').value);
+    const ttl = Number(document.getElementById('speedFileTtl').value) * Number(document.getElementById('speedFileTtlUnit').value);
+    const size = Math.floor(amount * unit);
+    if (!name || !size || size <= 0) return toast('请填写有效的文件名和大小', 'warning');
+    try {
+        await apiFetch('/api/create-speed-file', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: curPath, name, ext, size, ttl }),
+        });
+        toast('测速文件创建成功', 'success');
+        hideModal('createModal');
+        await loadFiles(curPath);
+        loadDiskInfo();
+    } catch (e) { toast(e.message, 'error'); }
+}
+
+async function doCreateTextFile() {
+    const name = document.getElementById('textFileName').value.trim();
+    const ext = document.getElementById('textFileExt').value.trim();
+    const content = document.getElementById('textFileContent').value;
+    if (!name) return toast('请输入文件名', 'warning');
+    try {
+        await apiFetch('/api/create-text', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: curPath, name, ext, content }),
+        });
+        toast('文本文件创建成功', 'success');
+        hideModal('createModal');
+        await loadFiles(curPath);
+        loadDiskInfo();
+    } catch (e) { toast(e.message, 'error'); }
+}
+
+function ctxShare() {
+    hideCtx();
+    if (selected.size !== 1) return;
+    const path = [...selected][0];
+    const f = files.find(fi => fi.path === path);
+    if (!f || f.isDir) return toast('只能为文件生成下载链接', 'warning');
+    shareTargetPath = path;
+    document.getElementById('shareOutput').style.display = 'none';
+    document.getElementById('shareUrl').value = '';
+    showModal('shareModal');
+}
+
+async function doCreateShare() {
+    if (!shareTargetPath) return;
+    const ttl = Number(document.getElementById('shareTtl').value) * Number(document.getElementById('shareTtlUnit').value);
+    try {
+        const data = await apiFetch('/api/share', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: shareTargetPath, ttl }),
+        });
+        document.getElementById('shareUrl').value = data.url;
+        document.getElementById('shareOutput').style.display = 'flex';
+        toast('下载链接已生成', 'success');
+    } catch (e) { toast(e.message, 'error'); }
+}
+
+async function copyShareUrl() {
+    const input = document.getElementById('shareUrl');
+    input.select();
+    try {
+        await navigator.clipboard.writeText(input.value);
+        toast('链接已复制', 'success');
+    } catch (e) {
+        document.execCommand('copy');
+        toast('链接已复制', 'success');
+    }
+}
+
+function goBack() {
+    if (curPath === '/') return;
+    const parent = curPath.split('/').slice(0, -1).join('/') || '/';
+    loadFiles(parent);
+}
+
+/* ============================================================
+   Upload
+   ============================================================ */
+function openUploadModal() {
+    document.getElementById('uploadList').innerHTML = '';
+    showModal('uploadModal');
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const fi = document.getElementById('fileInput');
+    fi.addEventListener('change', (e) => {
+        if (e.target.files.length > 0) {
+            uploadFiles(e.target.files);
+        }
+        e.target.value = '';
+    });
+
+    // Upload zone internal drag
+    const uz = document.getElementById('uploadZone');
+    uz.addEventListener('dragover', (e) => { e.preventDefault(); uz.classList.add('drag-over'); });
+    uz.addEventListener('dragleave', () => uz.classList.remove('drag-over'));
+    uz.addEventListener('drop', (e) => {
+        e.preventDefault();
+        uz.classList.remove('drag-over');
+        if (e.dataTransfer.files.length > 0) uploadFiles(e.dataTransfer.files);
+    });
+});
+
+async function uploadFiles(fileList) {
+    const listEl = document.getElementById('uploadList');
+
+    for (let i = 0; i < fileList.length; i++) {
+        const file = fileList[i];
+        const uid = 'up_' + Date.now() + '_' + i;
+        const itemEl = document.createElement('div');
+        itemEl.className = 'upload-item';
+        itemEl.innerHTML = `
+            <span class="upload-item-name">${esc(file.name)}</span>
+            <div class="upload-bar-outer"><div class="upload-bar-fill" id="bar_${uid}"></div></div>
+            <span class="upload-item-status" id="st_${uid}">0%</span>`;
+        listEl.appendChild(itemEl);
+
+        try {
+            await doUpload(file, uid);
+        } catch (e) {
+            const stEl = document.getElementById('st_' + uid);
+            if (stEl) { stEl.textContent = '失败'; stEl.style.color = 'var(--danger)'; }
+        }
+    }
+    toast('上传完成', 'success');
+    await loadFiles(curPath);
+    loadDiskInfo();
+}
+
+function doUpload(file, uid) {
+    return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        const url = '/api/upload?path=' + encodeURIComponent(curPath) + '&name=' + encodeURIComponent(file.name);
+        xhr.withCredentials = true;
+        const meter = createTransferMeter({ mode: 'upload', name: file.name, total: file.size, controller: xhr });
+        showTransferMeter(meter);
+
+        xhr.upload.addEventListener('progress', (e) => {
+            const total = e.lengthComputable ? e.total : file.size;
+            meter.update(e.loaded, total);
+            const pct = total ? Math.round(e.loaded / total * 100) : 0;
+            const bar = document.getElementById('bar_' + uid);
+            const st = document.getElementById('st_' + uid);
+            if (bar) bar.style.width = pct + '%';
+            if (st) st.textContent = `${pct}% · ${fmtSpeed(meter.lastBps)}`;
+        });
+
+        xhr.addEventListener('load', () => {
+            const st = document.getElementById('st_' + uid);
+            if (xhr.status === 200) {
+                if (st) { st.textContent = '✓'; st.style.color = 'var(--success)'; }
+                meter.finish('上传完成');
+                resolve();
+            } else if (xhr.status === 401) {
+                if (st) { st.textContent = '✗'; st.style.color = 'var(--danger)'; }
+                appStarted = false;
+                showLogin();
+                meter.finish('登录已过期', true);
+                reject(new Error('登录已过期，请重新登录'));
+            } else {
+                if (st) { st.textContent = '✗'; st.style.color = 'var(--danger)'; }
+                meter.finish('上传失败', true);
+                reject(new Error('Upload failed'));
+            }
+        });
+
+        xhr.addEventListener('error', () => {
+            meter.finish('网络错误', true);
+            reject(new Error('Network error'));
+        });
+        xhr.addEventListener('abort', () => {
+            meter.finish('已停止', true);
+            reject(new Error('Upload aborted'));
+        });
+        xhr.open('POST', url);
+        xhr.send(file);
+    });
+}
+
+async function runMeasuredDownload({ url, name, size }) {
+    if (!window.showSaveFilePicker && size > 512 * 1024 * 1024) {
+        toast('当前浏览器不支持边下载边写入磁盘，大文件将使用浏览器原生下载', 'warning');
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = name || '';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        return;
+    }
+    const controller = new AbortController();
+    const meter = createTransferMeter({ mode: 'download', name, total: size, controller });
+    showTransferMeter(meter);
+    try {
+        const resp = await fetch(url + (url.includes('?') ? '&' : '?') + '_=' + Date.now(), {
+            credentials: 'same-origin',
+            cache: 'no-store',
+            signal: controller.signal,
+        });
+        if (resp.status === 401) {
+            appStarted = false;
+            showLogin();
+            throw new Error('登录已过期，请重新登录');
+        }
+        if (!resp.ok) throw new Error('下载失败：HTTP ' + resp.status);
+        const total = Number(resp.headers.get('Content-Length')) || size || 0;
+        meter.total = total;
+        const reader = resp.body.getReader();
+        const chunks = [];
+        let writable = null;
+        let fileHandle = null;
+        if (window.showSaveFilePicker) {
+            try {
+                fileHandle = await window.showSaveFilePicker({ suggestedName: name || 'download' });
+                writable = await fileHandle.createWritable();
+            } catch (e) {
+                if (e.name === 'AbortError') throw e;
+            }
+        }
+        let loaded = 0;
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            loaded += value.byteLength;
+            if (writable) await writable.write(value);
+            else chunks.push(value);
+            meter.update(loaded, total);
+        }
+        if (writable) await writable.close();
+        else saveBlobDownload(chunks, name, resp.headers.get('Content-Type') || 'application/octet-stream');
+        meter.finish('下载完成');
+        toast('下载完成', 'success');
+    } catch (e) {
+        meter.finish(e.name === 'AbortError' ? '已停止' : e.message, true);
+        if (e.name !== 'AbortError') toast(e.message, 'error');
+    }
+}
+
+function saveBlobDownload(chunks, name, type) {
+    const blob = new Blob(chunks, { type });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name || 'download';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+function createTransferMeter({ mode, name, total, controller }) {
+    return {
+        mode,
+        name,
+        total: total || 0,
+        controller,
+        start: performance.now(),
+        lastT: performance.now(),
+        lastBytes: 0,
+        maxBps: 0,
+        lastBps: 0,
+        samples: [],
+        done: false,
+        update(bytes, nextTotal) {
+            const now = performance.now();
+            if (nextTotal) this.total = nextTotal;
+            const dt = Math.max(0.001, (now - this.lastT) / 1000);
+            if (now - this.lastT >= 250 || bytes === this.total) {
+                const cur = Math.max(0, (bytes - this.lastBytes) / dt);
+                const elapsed = Math.max(0.001, (now - this.start) / 1000);
+                const avg = bytes / elapsed;
+                this.maxBps = Math.max(this.maxBps, cur);
+                this.lastBps = cur;
+                this.samples.push({ t: elapsed, bps: cur, bytes, avg });
+                if (this.samples.length > 240) this.samples.shift();
+                this.lastT = now;
+                this.lastBytes = bytes;
+                renderTransferMeter(this, bytes, avg, cur, elapsed);
+            }
+        },
+        finish(status, isError) {
+            this.done = true;
+            document.getElementById('transferStatus').textContent = status || (isError ? '传输失败' : '完成');
+            document.getElementById('transferStatus').style.color = isError ? 'var(--danger)' : 'var(--success)';
+            document.getElementById('transferCancel').disabled = true;
+            drawTransferChart(this);
+        },
+    };
+}
+
+function showTransferMeter(meter) {
+    activeTransfer = meter;
+    document.getElementById('transferModalTitle').textContent = meter.mode === 'upload' ? '上传速度' : '下载速度';
+    document.getElementById('transferName').textContent = meter.name || '';
+    document.getElementById('transferStatus').textContent = '传输中...';
+    document.getElementById('transferStatus').style.color = 'var(--text-muted)';
+    document.getElementById('transferCancel').disabled = false;
+    ['trCur','trAvg','trMax'].forEach(id => document.getElementById(id).textContent = '0 MB/s');
+    document.getElementById('trPct').textContent = '0%';
+    document.getElementById('trDone').textContent = '0 B';
+    document.getElementById('trTotal').textContent = meter.total ? fmtSize(meter.total) : '未知';
+    document.getElementById('trElapsed').textContent = '0 s';
+    document.getElementById('trEta').textContent = '--';
+    document.getElementById('trBar').style.width = '0%';
+    showModal('transferModal');
+    setTimeout(() => drawTransferChart(meter), 0);
+}
+
+function renderTransferMeter(meter, bytes, avgBps, curBps, elapsed) {
+    const pct = meter.total ? Math.min(100, bytes / meter.total * 100) : 0;
+    const eta = meter.total && avgBps > 0 ? (meter.total - bytes) / avgBps : 0;
+    document.getElementById('trCur').textContent = fmtSpeed(curBps);
+    document.getElementById('trAvg').textContent = fmtSpeed(avgBps);
+    document.getElementById('trMax').textContent = fmtSpeed(meter.maxBps);
+    document.getElementById('trPct').textContent = meter.total ? pct.toFixed(1) + '%' : '--';
+    document.getElementById('trDone').textContent = fmtSize(bytes);
+    document.getElementById('trTotal').textContent = meter.total ? fmtSize(meter.total) : '未知';
+    document.getElementById('trElapsed').textContent = fmtDuration(elapsed);
+    document.getElementById('trEta').textContent = eta > 0 ? fmtDuration(eta) : '--';
+    document.getElementById('trBar').style.width = pct + '%';
+    drawTransferChart(meter);
+}
+
+function drawTransferChart(meter) {
+    const c = document.getElementById('transferChart');
+    if (!c) return;
+    const rect = c.getBoundingClientRect();
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    c.width = Math.max(320, Math.floor(rect.width * dpr));
+    c.height = Math.floor(190 * dpr);
+    const ctx = c.getContext('2d');
+    const w = c.width, h = c.height;
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = 'rgba(0,0,0,0.24)';
+    ctx.fillRect(0, 0, w, h);
+    const padL = 52 * dpr, padR = 12 * dpr, padT = 14 * dpr, padB = 28 * dpr;
+    const gw = w - padL - padR, gh = h - padT - padB;
+    const samples = meter.samples || [];
+    const maxSpeed = Math.max(1, ...samples.map(s => s.bps / 1048576)) * 1.2;
+    const maxT = Math.max(10, ...samples.map(s => s.t));
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = `${11 * dpr}px system-ui`;
+    for (let i = 0; i <= 4; i++) {
+        const y = padT + gh * i / 4;
+        const v = maxSpeed * (1 - i / 4);
+        ctx.beginPath();
+        ctx.moveTo(padL, y);
+        ctx.lineTo(w - padR, y);
+        ctx.stroke();
+        ctx.fillText(v.toFixed(v >= 10 ? 0 : 1), 8 * dpr, y + 4 * dpr);
+    }
+    ctx.strokeStyle = '#818cf8';
+    ctx.lineWidth = 2 * dpr;
+    ctx.beginPath();
+    samples.forEach((s, i) => {
+        const x = padL + s.t / maxT * gw;
+        const y = padT + gh - (s.bps / 1048576) / maxSpeed * gh;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.fillStyle = '#94a3b8';
+    ctx.fillText('MB/s', 8 * dpr, 13 * dpr);
+    ctx.fillText(`${maxT.toFixed(0)}s`, w - 42 * dpr, h - 8 * dpr);
+}
+
+function cancelTransfer() {
+    if (!activeTransfer || activeTransfer.done) return;
+    if (activeTransfer.controller && activeTransfer.controller.abort) activeTransfer.controller.abort();
+}
+
+function fmtSpeed(bps) {
+    const mbps = (bps || 0) / 1048576;
+    return (mbps >= 100 ? mbps.toFixed(1) : mbps.toFixed(2)) + ' MB/s';
+}
+
+function fmtDuration(sec) {
+    sec = Math.max(0, Math.floor(sec || 0));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    if (h) return `${h}h ${m}m`;
+    if (m) return `${m}m ${s}s`;
+    return `${s}s`;
+}
+
+/* ============================================================
+   Drag & Drop (page-level)
+   ============================================================ */
+function setupDragDrop() {
+    let dragCount = 0;
+    const overlay = document.getElementById('dragOverlay');
+    document.addEventListener('dragenter', (e) => {
+        e.preventDefault();
+        dragCount++;
+        if (dragCount === 1) overlay.classList.add('show');
+    });
+    document.addEventListener('dragleave', (e) => {
+        e.preventDefault();
+        dragCount--;
+        if (dragCount <= 0) { dragCount = 0; overlay.classList.remove('show'); }
+    });
+    document.addEventListener('dragover', (e) => e.preventDefault());
+    document.addEventListener('drop', (e) => {
+        e.preventDefault();
+        dragCount = 0;
+        overlay.classList.remove('show');
+        if (e.dataTransfer.files.length > 0) {
+            uploadFiles(e.dataTransfer.files);
+        }
+    });
+}
+
+/* ============================================================
+   Keyboard Shortcuts
+   ============================================================ */
+function setupKeyboard() {
+    document.addEventListener('keydown', (e) => {
+        const tag = e.target.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+        if (e.ctrlKey || e.metaKey) {
+            switch (e.key.toLowerCase()) {
+                case 'c': e.preventDefault(); if (selected.size > 0) ctxCopy(); break;
+                case 'x': e.preventDefault(); if (selected.size > 0) ctxCut(); break;
+                case 'v': e.preventDefault(); ctxPaste(); break;
+                case 'a': e.preventDefault(); files.forEach(f => selected.add(f.path)); renderFiles(); break;
+            }
+        } else {
+            switch (e.key) {
+                case 'Delete': if (selected.size > 0) ctxDelete(); break;
+                case 'F2': if (selected.size === 1) ctxRename(); break;
+                case 'Backspace': goBack(); break;
+                case 'Escape': selected.clear(); renderFiles(); hideCtx(); break;
+                case 'Enter':
+                    if (selected.size === 1) {
+                        const p = [...selected][0];
+                        const f = files.find(fi => fi.path === p);
+                        if (f && f.isDir) loadFiles(f.path);
+                        else if (f) downloadFile(f.path);
+                    }
+                    break;
+            }
+        }
+    });
+}
+
+/* ============================================================
+   Touch (mobile long-press)
+   ============================================================ */
+function setupTouch() {
+    let timer = null;
+    document.addEventListener('touchstart', (e) => {
+        const item = e.target.closest('.file-item');
+        if (!item) return;
+        timer = setTimeout(() => {
+            const idx = parseInt(item.dataset.idx);
+            const f = getVisibleFiles()[idx];
+            if (f) {
+                if (!selected.has(f.path)) { selected.clear(); selected.add(f.path); renderFiles(); }
+                showCtx(0, 0);
+            }
+        }, 500);
+    }, { passive: true });
+    document.addEventListener('touchend', () => clearTimeout(timer), { passive: true });
+    document.addEventListener('touchmove', () => clearTimeout(timer), { passive: true });
+}
+
+/* ============================================================
+   Events Setup
+   ============================================================ */
+function setupEvents() {
+    setupDragDrop();
+    setupKeyboard();
+    setupTouch();
+
+    // Click empty area to deselect
+    document.getElementById('fileList').addEventListener('click', (e) => {
+        if (!e.target.closest('.file-item')) {
+            selected.clear();
+            renderFiles();
+        }
+    });
+
+    // Right-click on empty area
+    document.getElementById('fileList').addEventListener('contextmenu', (e) => {
+        if (e.target.closest('.file-item')) return;
+        e.preventDefault();
+        selected.clear();
+        renderFiles();
+        showCtx(e.clientX, e.clientY);
+    });
+
+    // Close context menu on click elsewhere
+    document.addEventListener('click', (e) => {
+        if (!e.target.closest('.ctx-menu')) hideCtx();
+    });
+
+    // Context backdrop click
+    document.getElementById('ctxBackdrop').addEventListener('click', hideCtx);
+
+    // Search
+    document.getElementById('searchInput').addEventListener('input', (e) => {
+        searchQ = e.target.value;
+        renderFiles();
+    });
+
+    // Modal enter keys
+    document.getElementById('renameInput').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') document.getElementById('renameConfirm').click();
+        if (e.key === 'Escape') hideModal('renameModal');
+    });
+    document.getElementById('newFolderInput').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') doCreateFolder();
+        if (e.key === 'Escape') hideModal('createModal');
+    });
+
+    // Close modal on overlay click
+    document.querySelectorAll('.modal-overlay').forEach(overlay => {
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) overlay.classList.remove('show');
+        });
+    });
+}
+
+/* ============================================================
+   View Mode
+   ============================================================ */
+function setViewMode(mode) {
+    viewMode = mode;
+    localStorage.setItem('fm_view', mode);
+    syncViewToggle();
+    renderFiles();
+}
+
+function syncViewToggle() {
+    document.querySelectorAll('.view-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.mode === viewMode);
+    });
+}
+
+/* ============================================================
+   Modal & Toast
+   ============================================================ */
+function showModal(id) { document.getElementById(id).classList.add('show'); }
+function hideModal(id) { document.getElementById(id).classList.remove('show'); }
+
+function showConfirm(title, text, onOk) {
+    document.getElementById('confirmTitle').textContent = title;
+    document.getElementById('confirmText').textContent = text;
+    showModal('confirmModal');
+    document.getElementById('confirmOk').onclick = () => {
+        hideModal('confirmModal');
+        onOk();
+    };
+}
+
+function toast(msg, type = 'info') {
+    const c = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast toast-' + type;
+    el.textContent = msg;
+    c.appendChild(el);
+    requestAnimationFrame(() => el.classList.add('show'));
+    setTimeout(() => {
+        el.classList.remove('show');
+        setTimeout(() => el.remove(), 350);
+    }, 3000);
+}
+
+/* ============================================================
+   Helpers
+   ============================================================ */
+function esc(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+}
+
+function fmtSize(bytes) {
+    if (bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    while (bytes >= 1024 && i < units.length - 1) { bytes /= 1024; i++; }
+    return (bytes >= 100 ? bytes.toFixed(0) : bytes.toFixed(1)) + ' ' + units[i];
+}
+
+function extLabel(name) {
+    const ext = name.includes('.') ? name.split('.').pop().toUpperCase() : '';
+    return ext ? ext + ' 文件' : '文件';
+}
+
+function fileIcon(f) {
+    if (f.isDir) return '📁';
+    const ext = (f.name.split('.').pop() || '').toLowerCase();
+    const map = {
+        jpg:'🖼️',jpeg:'🖼️',png:'🖼️',gif:'🖼️',svg:'🖼️',webp:'🖼️',bmp:'🖼️',ico:'🖼️',tiff:'🖼️',
+        mp4:'🎬',avi:'🎬',mkv:'🎬',mov:'🎬',wmv:'🎬',flv:'🎬',webm:'🎬',m4v:'🎬',
+        mp3:'🎵',wav:'🎵',flac:'🎵',ogg:'🎵',aac:'🎵',wma:'🎵',m4a:'🎵',
+        js:'💻',ts:'💻',py:'💻',java:'💻',c:'💻',cpp:'💻',h:'💻',go:'💻',rs:'💻',rb:'💻',php:'💻',swift:'💻',kt:'💻',cs:'💻',
+        html:'🌐',css:'🎨',scss:'🎨',less:'🎨',
+        pdf:'📕',doc:'📘',docx:'📘',xls:'📊',xlsx:'📊',ppt:'📙',pptx:'📙',
+        txt:'📝',md:'📝',rtf:'📝',log:'📝',csv:'📊',
+        zip:'📦',rar:'📦','7z':'📦',tar:'📦',gz:'📦',bz2:'📦',xz:'📦',
+        json:'⚙️',xml:'⚙️',yaml:'⚙️',yml:'⚙️',toml:'⚙️',ini:'⚙️',conf:'⚙️',env:'⚙️',
+        exe:'⚡',msi:'⚡',dmg:'⚡',deb:'⚡',rpm:'⚡',sh:'⚡',bat:'⚡',
+        db:'🗃️',sqlite:'🗃️',sql:'🗃️',
+        ttf:'🔤',otf:'🔤',woff:'🔤',woff2:'🔤',
+        iso:'💿',img:'💿',vmdk:'💿',
+    };
+    return map[ext] || '📄';
+}
+
+/* ============================================================
+   Enhanced Pages: download, text editor, link manager
+   ============================================================ */
+function showView(view) {
+    currentView = view;
+    const browser = document.getElementById('browserPage');
+    if (browser) browser.style.display = view === 'browser' ? '' : 'none';
+    ['downloadPage', 'editorPage', 'linksPage'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.classList.toggle('active', id === view + 'Page');
+    });
+    if (view !== 'browser') hideCtx();
+}
+
+function showBrowserPage(force = false) {
+    if (!force && currentView === 'editor' && editorDirty) {
+        showConfirm('离开编辑器', '当前文本尚未保存，确定要离开吗？', () => showBrowserPage(true));
+        return;
+    }
+    showView('browser');
+    if (currentView !== 'editor') editorDirty = false;
+}
+
+function setAppVisible(visible) {
+    ['appContainer', 'rootPathBadge', 'mobileBar'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.classList.toggle('app-hidden', !visible);
+    });
+    if (visible) showView(currentView || 'browser');
+}
+
+function showLoading(v) {
+    const loading = document.getElementById('loading');
+    const list = document.getElementById('fileList');
+    if (loading) loading.style.display = v ? 'flex' : 'none';
+    if (list) list.style.display = v ? 'none' : '';
+}
+
+function isTextFile(f) {
+    if (!f || f.isDir) return false;
+    if (f.size > 10 * 1024 * 1024) return false;
+    const ext = (f.name.split('.').pop() || '').toLowerCase();
+    return ['txt','md','log','json','xml','yaml','yml','toml','ini','conf','env','csv','html','css','js','ts','py','sh','bat','ps1','php','go','rs','java','c','cpp','h','sql'].includes(ext);
+}
+
+function onFileDbl(idx) {
+    const f = getVisibleFiles()[idx];
+    if (!f) return;
+    if (f.isDir) loadFiles(f.path);
+    else if (isTextFile(f)) openTextEditor(f.path);
+    else downloadFile(f.path);
+}
+
+function showCtx(x, y) {
+    const menu = document.getElementById('ctxMenu');
+    const n = selected.size;
+    const hasSel = n > 0;
+    const singleFile = n === 1;
+    let f = null;
+    if (singleFile) f = files.find(fi => fi.path === [...selected][0]);
+
+    setDisabled('ctxOpen', !singleFile);
+    setDisabled('ctxDownload', !hasSel || (singleFile && f && f.isDir));
+    setDisabled('ctxEdit', !singleFile || !isTextFile(f));
+    setDisabled('ctxShare', !singleFile || !f || f.isDir);
+    setDisabled('ctxCopy', !hasSel);
+    setDisabled('ctxCut', !hasSel);
+    setDisabled('ctxPaste', !clipboard);
+    setDisabled('ctxRename', !singleFile);
+    setDisabled('ctxDelete', !hasSel);
+    setDisabled('ctxProps', !singleFile);
+
+    const isMobile = window.innerWidth <= 768;
+    if (isMobile) {
+        document.getElementById('ctxBackdrop').classList.add('show');
+        menu.style.left = ''; menu.style.right = '';
+        menu.style.bottom = ''; menu.style.top = '';
+    } else {
+        const mw = 220, mh = menu.scrollHeight || 390;
+        if (x + mw > window.innerWidth) x = window.innerWidth - mw - 8;
+        if (y + mh > window.innerHeight) y = window.innerHeight - mh - 8;
+        if (x < 0) x = 8; if (y < 0) y = 8;
+        menu.style.left = x + 'px'; menu.style.top = y + 'px';
+    }
+    menu.classList.add('show');
+}
+
+function ctxOpen() {
+    hideCtx();
+    if (selected.size !== 1) return;
+    const path = [...selected][0];
+    const f = files.find(fi => fi.path === path);
+    if (f && f.isDir) loadFiles(f.path);
+    else if (isTextFile(f)) openTextEditor(f.path);
+    else if (f) downloadFile(f.path);
+}
+
+function ctxDownload() {
+    hideCtx();
+    const first = [...selected].find(p => {
+        const f = files.find(fi => fi.path === p);
+        return f && !f.isDir;
+    });
+    if (first) downloadFile(first);
+}
+
+function ctxEdit() {
+    hideCtx();
+    if (selected.size !== 1) return;
+    const path = [...selected][0];
+    const f = files.find(fi => fi.path === path);
+    if (!isTextFile(f)) return toast('此文件不适合网页编辑', 'warning');
+    openTextEditor(path);
+}
+
+function absoluteUrl(url) {
+    return new URL(url, window.location.href).href;
+}
+
+function downloadUrlForPath(path) {
+    return '/api/download?path=' + encodeURIComponent(path);
+}
+
+function resetDownloadMeter() {
+    ['dlCur','dlAvg','dlMax'].forEach(id => document.getElementById(id).textContent = '0 MB/s');
+    document.getElementById('dlPct').textContent = '0%';
+    document.getElementById('dlDone').textContent = '0 B';
+    document.getElementById('dlTotal').textContent = currentDownload ? fmtSize(currentDownload.size) : '未知';
+    document.getElementById('dlElapsed').textContent = '0 s';
+    document.getElementById('dlEta').textContent = '--';
+    document.getElementById('dlBar').style.width = '0%';
+    document.getElementById('downloadTransferStatus').textContent = '选择一种下载方式';
+    document.getElementById('downloadTransferStatus').style.color = 'var(--text-muted)';
+    drawTransferChart({ samples: [], scope: 'downloadPage' });
+}
+
+async function downloadFile(path) {
+    try {
+        if (!(await ensureAuthenticated())) return;
+        let f = files.find(fi => fi.path === path);
+        if (!f) f = await apiFetch('/api/fileinfo?path=' + encodeURIComponent(path));
+        currentDownload = {
+            path: f.path,
+            name: f.name,
+            size: f.size,
+            modifiedStr: f.modifiedStr || '',
+            type: extLabel(f.name),
+            url: downloadUrlForPath(f.path),
+        };
+        document.getElementById('downloadTitle').textContent = f.name;
+        document.getElementById('downloadPath').textContent = f.path;
+        document.getElementById('downloadName').textContent = f.name;
+        document.getElementById('downloadSize').textContent = fmtSize(f.size);
+        document.getElementById('downloadType').textContent = extLabel(f.name);
+        document.getElementById('downloadModified').textContent = f.modifiedStr || '--';
+        document.getElementById('downloadTransferName').textContent = f.name;
+        showView('download');
+        resetDownloadMeter();
+    } catch (e) {
+        toast(e.message, 'error');
+    }
+}
+
+function traditionalDownloadUrl(url, name = '') {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name || '';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+}
+
+function traditionalDownloadCurrent() {
+    if (!currentDownload) return;
+    traditionalDownloadUrl(currentDownload.url, currentDownload.name);
+}
+
+function startFrontendDownload() {
+    if (!currentDownload) return;
+    runMeasuredDownload({
+        url: currentDownload.url,
+        name: currentDownload.name,
+        size: currentDownload.size,
+        scope: 'downloadPage',
+    });
+}
+
+async function copyCurrentDownloadLink() {
+    if (!currentDownload) return;
+    await copyText(absoluteUrl(currentDownload.url));
+}
+
+async function openTextEditor(path) {
+    try {
+        if (!(await ensureAuthenticated())) return;
+        const data = await apiFetch('/api/text?path=' + encodeURIComponent(path));
+        currentEditorPath = data.file.path;
+        editorDirty = false;
+        document.getElementById('editorTitle').textContent = data.file.name;
+        document.getElementById('editorPath').textContent = data.file.path;
+        document.getElementById('editorMeta').textContent = `${fmtSize(data.file.size)} · ${data.file.modifiedStr || ''}`;
+        document.getElementById('editorState').textContent = '已载入';
+        document.getElementById('editorText').value = data.content;
+        showView('editor');
+        setTimeout(() => document.getElementById('editorText').focus(), 50);
+    } catch (e) {
+        toast(e.message, 'error');
+    }
+}
+
+function reloadTextEditor() {
+    if (currentEditorPath) openTextEditor(currentEditorPath);
+}
+
+async function saveTextEditor() {
+    if (!currentEditorPath) return;
+    try {
+        const content = document.getElementById('editorText').value;
+        const data = await apiFetch('/api/save-text', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: currentEditorPath, content }),
+        });
+        editorDirty = false;
+        document.getElementById('editorState').textContent = '已保存';
+        if (data.file) document.getElementById('editorMeta').textContent = `${fmtSize(data.file.size)} · ${data.file.modifiedStr || ''}`;
+        toast('文本已保存', 'success');
+        await loadFiles(curPath);
+    } catch (e) {
+        toast(e.message, 'error');
+    }
+}
+
+async function doCreateTextFile() {
+    const name = document.getElementById('textFileName').value.trim();
+    const ext = document.getElementById('textFileExt').value.trim();
+    const content = document.getElementById('textFileContent').value;
+    if (!name) return toast('请输入文件名', 'warning');
+    try {
+        const data = await apiFetch('/api/create-text', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: curPath, name, ext, content }),
+        });
+        toast('文本文件创建成功', 'success');
+        hideModal('createModal');
+        await loadFiles(curPath);
+        loadDiskInfo();
+        if (data.path) openTextEditor(data.path);
+    } catch (e) { toast(e.message, 'error'); }
+}
+
+function ctxShare() {
+    hideCtx();
+    if (selected.size !== 1) return;
+    const path = [...selected][0];
+    const f = files.find(fi => fi.path === path);
+    if (!f || f.isDir) return toast('只能为文件生成下载链接', 'warning');
+    shareTargetPath = path;
+    lastShareUrl = '';
+    document.getElementById('shareOutput').style.display = 'none';
+    document.getElementById('shareUrl').value = '';
+    showModal('shareModal');
+}
+
+async function doCreateShare() {
+    if (!shareTargetPath) return;
+    const ttl = Number(document.getElementById('shareTtl').value) * Number(document.getElementById('shareTtlUnit').value);
+    try {
+        const data = await apiFetch('/api/share', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: shareTargetPath, ttl }),
+        });
+        lastShareUrl = data.url;
+        document.getElementById('shareUrl').value = data.url;
+        document.getElementById('shareOutput').style.display = 'flex';
+        toast('下载链接已生成', 'success');
+        if (currentView === 'links') loadShares();
+    } catch (e) { toast(e.message, 'error'); }
+}
+
+function traditionalDownloadShare() {
+    const url = lastShareUrl || document.getElementById('shareUrl').value;
+    if (url) traditionalDownloadUrl(url);
+}
+
+async function copyShareUrl() {
+    const input = document.getElementById('shareUrl');
+    await copyText(input.value);
+}
+
+async function openLinksPage() {
+    showView('links');
+    await loadShares();
+}
+
+async function loadShares() {
+    const el = document.getElementById('linkList');
+    el.innerHTML = '<div class="loading-wrap"><div class="spinner"></div></div>';
+    try {
+        const data = await apiFetch('/api/shares');
+        renderShareList(data.items || []);
+    } catch (e) {
+        el.innerHTML = `<div class="empty-state"><div class="empty-icon">🔗</div><div class="empty-text">${esc(e.message)}</div></div>`;
+    }
+}
+
+function renderShareList(items) {
+    const el = document.getElementById('linkList');
+    if (!items.length) {
+        el.innerHTML = '<div class="empty-state"><div class="empty-icon">🔗</div><div class="empty-text">暂无下载链接</div></div>';
+        return;
+    }
+    el.innerHTML = items.map(item => `
+        <div class="link-item">
+            <div class="link-main">
+                <div class="link-name">${esc(item.name)}${item.exists ? '' : '（文件不存在）'}</div>
+                <div class="link-url">${esc(item.url)}</div>
+                <div class="link-meta">
+                    <span>${esc(item.path)}</span>
+                    <span>${fmtSize(item.size || 0)}</span>
+                    <span>剩余 ${fmtDuration(item.remaining || 0)}</span>
+                    <span>到期 ${formatDateTime(item.expiresAt)}</span>
+                </div>
+            </div>
+            <div class="link-actions">
+                <button class="btn" data-link-copy="${escAttr(item.url)}">复制</button>
+                <button class="btn" data-link-download="${escAttr(item.url)}" data-link-name="${escAttr(item.name)}" ${item.exists ? '' : 'disabled'}>下载</button>
+                <button class="btn btn-danger" data-link-delete="${escAttr(item.token)}">删除</button>
+            </div>
+        </div>`).join('');
+    el.querySelectorAll('[data-link-copy]').forEach(btn => btn.onclick = () => copyText(btn.getAttribute('data-link-copy')));
+    el.querySelectorAll('[data-link-download]').forEach(btn => btn.onclick = () => traditionalDownloadUrl(btn.getAttribute('data-link-download'), btn.getAttribute('data-link-name') || ''));
+    el.querySelectorAll('[data-link-delete]').forEach(btn => btn.onclick = () => deleteShare(btn.getAttribute('data-link-delete')));
+}
+
+async function deleteShare(token) {
+    showConfirm('删除下载链接', '确定删除这个临时下载链接吗？文件本身不会被删除。', async () => {
+        try {
+            await apiFetch('/api/share-delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ token }),
+            });
+            toast('链接已删除', 'success');
+            await loadShares();
+        } catch (e) {
+            toast(e.message, 'error');
+        }
+    });
+}
+
+async function copyText(text) {
+    try {
+        await navigator.clipboard.writeText(text);
+    } catch (e) {
+        const input = document.createElement('input');
+        input.value = text;
+        document.body.appendChild(input);
+        input.select();
+        document.execCommand('copy');
+        input.remove();
+    }
+    toast('已复制', 'success');
+}
+
+function goBack() {
+    if (currentView !== 'browser') return showBrowserPage();
+    if (curPath === '/') return;
+    const parent = curPath.split('/').slice(0, -1).join('/') || '/';
+    loadFiles(parent);
+}
+
+async function runMeasuredDownload({ url, name, size, scope = 'modal' }) {
+    if (!window.showSaveFilePicker && size > 512 * 1024 * 1024) {
+        const msg = '当前浏览器不支持边下载边写入磁盘，大文件将使用传统下载';
+        if (scope === 'downloadPage') document.getElementById('downloadTransferStatus').textContent = msg;
+        toast(msg, 'warning');
+        traditionalDownloadUrl(url, name);
+        return;
+    }
+    const controller = new AbortController();
+    const meter = createTransferMeter({ mode: 'download', name, total: size, controller, scope });
+    if (scope === 'modal') showTransferMeter(meter);
+    else {
+        activeTransfer = meter;
+        resetDownloadMeter();
+        document.getElementById('downloadTransferStatus').textContent = '前端测速下载中...';
+        document.getElementById('downloadTransferStatus').style.color = 'var(--text-muted)';
+    }
+    try {
+        const resp = await fetch(url + (url.includes('?') ? '&' : '?') + '_=' + Date.now(), {
+            credentials: 'same-origin',
+            cache: 'no-store',
+            signal: controller.signal,
+        });
+        if (resp.status === 401) {
+            appStarted = false;
+            showLogin();
+            throw new Error('登录已过期，请重新登录');
+        }
+        if (!resp.ok) throw new Error('下载失败：HTTP ' + resp.status);
+        const total = Number(resp.headers.get('Content-Length')) || size || 0;
+        meter.total = total;
+        const reader = resp.body.getReader();
+        const chunks = [];
+        let writable = null;
+        if (window.showSaveFilePicker) {
+            try {
+                const fileHandle = await window.showSaveFilePicker({ suggestedName: name || 'download' });
+                writable = await fileHandle.createWritable();
+            } catch (e) {
+                if (e.name === 'AbortError') throw e;
+            }
+        }
+        let loaded = 0;
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            loaded += value.byteLength;
+            if (writable) await writable.write(value);
+            else chunks.push(value);
+            meter.update(loaded, total);
+        }
+        if (writable) await writable.close();
+        else saveBlobDownload(chunks, name, resp.headers.get('Content-Type') || 'application/octet-stream');
+        meter.finish('下载完成');
+        toast('下载完成', 'success');
+    } catch (e) {
+        meter.finish(e.name === 'AbortError' ? '已停止' : e.message, true);
+        if (e.name !== 'AbortError') toast(e.message, 'error');
+    }
+}
+
+function meterIds(meter) {
+    return meter.scope === 'downloadPage'
+        ? { cur:'dlCur', avg:'dlAvg', max:'dlMax', pct:'dlPct', done:'dlDone', total:'dlTotal', elapsed:'dlElapsed', eta:'dlEta', bar:'dlBar', chart:'downloadChart', status:'downloadTransferStatus' }
+        : { cur:'trCur', avg:'trAvg', max:'trMax', pct:'trPct', done:'trDone', total:'trTotal', elapsed:'trElapsed', eta:'trEta', bar:'trBar', chart:'transferChart', status:'transferStatus' };
+}
+
+function createTransferMeter({ mode, name, total, controller, scope = 'modal' }) {
+    return {
+        mode, name, total: total || 0, controller, scope,
+        start: performance.now(), lastT: performance.now(), lastBytes: 0,
+        maxBps: 0, lastBps: 0, samples: [], done: false,
+        update(bytes, nextTotal) {
+            const now = performance.now();
+            if (nextTotal) this.total = nextTotal;
+            const dt = Math.max(0.001, (now - this.lastT) / 1000);
+            if (now - this.lastT >= 250 || bytes === this.total) {
+                const cur = Math.max(0, (bytes - this.lastBytes) / dt);
+                const elapsed = Math.max(0.001, (now - this.start) / 1000);
+                const avg = bytes / elapsed;
+                this.maxBps = Math.max(this.maxBps, cur);
+                this.lastBps = cur;
+                this.samples.push({ t: elapsed, bps: cur, bytes, avg });
+                if (this.samples.length > 240) this.samples.shift();
+                this.lastT = now;
+                this.lastBytes = bytes;
+                renderTransferMeter(this, bytes, avg, cur, elapsed);
+            }
+        },
+        finish(status, isError) {
+            this.done = true;
+            const ids = meterIds(this);
+            document.getElementById(ids.status).textContent = status || (isError ? '传输失败' : '完成');
+            document.getElementById(ids.status).style.color = isError ? 'var(--danger)' : 'var(--success)';
+            const cancel = document.getElementById('transferCancel');
+            if (cancel && this.scope === 'modal') cancel.disabled = true;
+            drawTransferChart(this);
+        },
+    };
+}
+
+function showTransferMeter(meter) {
+    activeTransfer = meter;
+    document.getElementById('transferModalTitle').textContent = meter.mode === 'upload' ? '上传速度' : '下载速度';
+    document.getElementById('transferName').textContent = meter.name || '';
+    document.getElementById('transferStatus').textContent = '传输中...';
+    document.getElementById('transferStatus').style.color = 'var(--text-muted)';
+    document.getElementById('transferCancel').disabled = false;
+    ['trCur','trAvg','trMax'].forEach(id => document.getElementById(id).textContent = '0 MB/s');
+    document.getElementById('trPct').textContent = '0%';
+    document.getElementById('trDone').textContent = '0 B';
+    document.getElementById('trTotal').textContent = meter.total ? fmtSize(meter.total) : '未知';
+    document.getElementById('trElapsed').textContent = '0 s';
+    document.getElementById('trEta').textContent = '--';
+    document.getElementById('trBar').style.width = '0%';
+    showModal('transferModal');
+    setTimeout(() => drawTransferChart(meter), 0);
+}
+
+function renderTransferMeter(meter, bytes, avgBps, curBps, elapsed) {
+    const ids = meterIds(meter);
+    const pct = meter.total ? Math.min(100, bytes / meter.total * 100) : 0;
+    const eta = meter.total && avgBps > 0 ? (meter.total - bytes) / avgBps : 0;
+    document.getElementById(ids.cur).textContent = fmtSpeed(curBps);
+    document.getElementById(ids.avg).textContent = fmtSpeed(avgBps);
+    document.getElementById(ids.max).textContent = fmtSpeed(meter.maxBps);
+    document.getElementById(ids.pct).textContent = meter.total ? pct.toFixed(1) + '%' : '--';
+    document.getElementById(ids.done).textContent = fmtSize(bytes);
+    document.getElementById(ids.total).textContent = meter.total ? fmtSize(meter.total) : '未知';
+    document.getElementById(ids.elapsed).textContent = fmtDuration(elapsed);
+    document.getElementById(ids.eta).textContent = eta > 0 ? fmtDuration(eta) : '--';
+    document.getElementById(ids.bar).style.width = pct + '%';
+    drawTransferChart(meter);
+}
+
+function drawTransferChart(meter) {
+    const ids = meterIds(meter);
+    const c = document.getElementById(ids.chart);
+    if (!c) return;
+    const rect = c.getBoundingClientRect();
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    c.width = Math.max(320, Math.floor((rect.width || 320) * dpr));
+    c.height = Math.floor(190 * dpr);
+    const ctx = c.getContext('2d');
+    const w = c.width, h = c.height;
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = 'rgba(0,0,0,0.24)';
+    ctx.fillRect(0, 0, w, h);
+    const padL = 52 * dpr, padR = 12 * dpr, padT = 14 * dpr, padB = 28 * dpr;
+    const gw = w - padL - padR, gh = h - padT - padB;
+    const samples = meter.samples || [];
+    const maxSpeed = Math.max(1, ...samples.map(s => s.bps / 1048576)) * 1.2;
+    const maxT = Math.max(10, ...samples.map(s => s.t));
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = `${11 * dpr}px system-ui`;
+    for (let i = 0; i <= 4; i++) {
+        const y = padT + gh * i / 4;
+        const v = maxSpeed * (1 - i / 4);
+        ctx.beginPath();
+        ctx.moveTo(padL, y);
+        ctx.lineTo(w - padR, y);
+        ctx.stroke();
+        ctx.fillText(v.toFixed(v >= 10 ? 0 : 1), 8 * dpr, y + 4 * dpr);
+    }
+    ctx.strokeStyle = '#818cf8';
+    ctx.lineWidth = 2 * dpr;
+    ctx.beginPath();
+    samples.forEach((s, i) => {
+        const x = padL + s.t / maxT * gw;
+        const y = padT + gh - (s.bps / 1048576) / maxSpeed * gh;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.fillStyle = '#94a3b8';
+    ctx.fillText('MB/s', 8 * dpr, 13 * dpr);
+    ctx.fillText(`${maxT.toFixed(0)}s`, w - 42 * dpr, h - 8 * dpr);
+}
+
+function cancelTransfer() {
+    if (!activeTransfer || activeTransfer.done) return;
+    if (activeTransfer.controller && activeTransfer.controller.abort) activeTransfer.controller.abort();
+}
+
+function setupKeyboard() {
+    document.addEventListener('keydown', (e) => {
+        const tag = e.target.tagName;
+        if ((e.ctrlKey || e.metaKey) && currentView === 'editor' && e.key.toLowerCase() === 's') {
+            e.preventDefault();
+            saveTextEditor();
+            return;
+        }
+        if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+        if (e.ctrlKey || e.metaKey) {
+            switch (e.key.toLowerCase()) {
+                case 'c': e.preventDefault(); if (selected.size > 0) ctxCopy(); break;
+                case 'x': e.preventDefault(); if (selected.size > 0) ctxCut(); break;
+                case 'v': e.preventDefault(); ctxPaste(); break;
+                case 'a': e.preventDefault(); files.forEach(f => selected.add(f.path)); renderFiles(); break;
+            }
+        } else {
+            switch (e.key) {
+                case 'Delete': if (selected.size > 0) ctxDelete(); break;
+                case 'F2': if (selected.size === 1) ctxRename(); break;
+                case 'Backspace': goBack(); break;
+                case 'Escape':
+                    if (currentView !== 'browser') showBrowserPage();
+                    else { selected.clear(); renderFiles(); hideCtx(); }
+                    break;
+                case 'Enter':
+                    if (selected.size === 1) {
+                        const p = [...selected][0];
+                        const f = files.find(fi => fi.path === p);
+                        if (f && f.isDir) loadFiles(f.path);
+                        else if (isTextFile(f)) openTextEditor(f.path);
+                        else if (f) downloadFile(f.path);
+                    }
+                    break;
+            }
+        }
+    });
+}
+
+function formatDateTime(ts) {
+    if (!ts) return '--';
+    return new Date(ts * 1000).toLocaleString();
+}
+
+function escAttr(s) {
+    return String(s ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const editor = document.getElementById('editorText');
+    if (editor) {
+        editor.addEventListener('input', () => {
+            editorDirty = true;
+            document.getElementById('editorState').textContent = '未保存';
+        });
+    }
+});
+
+/* ============================================================
+   Download Queue
+   ============================================================ */
+function openDownloadPage() {
+    showView('download');
+    renderDownloadQueue();
+    renderDownloadDetails(selectedDownloadTask());
+}
+
+async function downloadFile(path) {
+    try {
+        if (!(await ensureAuthenticated())) return;
+        let f = files.find(fi => fi.path === path);
+        if (!f) f = await apiFetch('/api/fileinfo?path=' + encodeURIComponent(path));
+        if (!f || f.isDir) return toast('只能下载文件', 'warning');
+        const task = addDownloadTask(f);
+        selectedDownloadId = task.id;
+        if (currentView === 'download') openDownloadPage();
+        processDownloadQueue();
+    } catch (e) {
+        toast(e.message, 'error');
+    }
+}
+
+function ctxDownload() {
+    hideCtx();
+    const queue = [...selected].map(p => files.find(fi => fi.path === p)).filter(f => f && !f.isDir);
+    if (!queue.length) return;
+    const added = queue.map(f => addDownloadTask(f));
+    selectedDownloadId = added[0]?.id || selectedDownloadId;
+    if (currentView === 'download') openDownloadPage();
+    processDownloadQueue();
+}
+
+function addDownloadTask(f) {
+    const id = f.path + ':' + Date.now() + ':' + Math.random().toString(16).slice(2);
+    const task = {
+        id,
+        path: f.path,
+        name: f.name,
+        size: Number(f.size) || 0,
+        url: downloadUrlForPath(f.path),
+        status: 'queued',
+        loaded: 0,
+        chunks: [],
+        controller: null,
+        writable: null,
+        maxBps: 0,
+        lastBps: 0,
+        samples: [],
+        totalActiveMs: 0,
+        lastResumeAt: 0,
+        lastT: 0,
+        lastBytes: 0,
+        error: '',
+        contentType: 'application/octet-stream',
+    };
+    downloadTasks.push(task);
+    renderDownloadQueue();
+    toast(`已加入下载：${f.name}`, 'success');
+    return task;
+}
+
+function processDownloadQueue() {
+    if (downloadTasks.some(t => t.status === 'downloading')) return;
+    const next = downloadTasks.find(t => t.status === 'queued');
+    if (next) startDownloadTask(next);
+}
+
+async function startDownloadTask(task) {
+    task.status = 'downloading';
+    task.error = '';
+    task.controller = new AbortController();
+    task.lastResumeAt = performance.now();
+    task.lastT = performance.now();
+    task.lastBytes = task.loaded;
+    if (!selectedDownloadId) selectedDownloadId = task.id;
+    renderDownloadQueue();
+    renderDownloadDetails(selectedDownloadTask());
+    try {
+        const headers = {};
+        if (task.loaded > 0) headers.Range = `bytes=${task.loaded}-`;
+        const resp = await fetch(task.url + (task.url.includes('?') ? '&' : '?') + '_=' + Date.now(), {
+            credentials: 'same-origin',
+            cache: 'no-store',
+            signal: task.controller.signal,
+            headers,
+        });
+        if (resp.status === 401) {
+            appStarted = false;
+            showLogin();
+            throw new Error('登录已过期，请重新登录');
+        }
+        if (!resp.ok && resp.status !== 206) throw new Error('下载失败：HTTP ' + resp.status);
+        if (task.loaded > 0 && resp.status === 200) {
+            task.loaded = 0;
+            task.chunks = [];
+            task.samples = [];
+            task.maxBps = 0;
+        }
+        task.contentType = resp.headers.get('Content-Type') || task.contentType;
+        const contentLength = Number(resp.headers.get('Content-Length')) || 0;
+        if (!task.size && contentLength) task.size = task.loaded + contentLength;
+        const reader = resp.body.getReader();
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            task.loaded += value.byteLength;
+            task.chunks.push(value);
+            updateDownloadTaskSpeed(task);
+        }
+        finishDownloadActivity(task);
+        saveBlobDownload(task.chunks, task.name, task.contentType);
+        task.status = 'done';
+        task.controller = null;
+        task.lastBps = 0;
+        toast(`下载完成：${task.name}`, 'success');
+    } catch (e) {
+        finishDownloadActivity(task);
+        if (e.name === 'AbortError') {
+            if (task.status === 'downloading') task.status = 'paused';
+        } else {
+            task.status = 'error';
+            task.error = e.message;
+            toast(e.message, 'error');
+        }
+    } finally {
+        renderDownloadQueue();
+        renderDownloadDetails(selectedDownloadTask());
+        processDownloadQueue();
+    }
+}
+
+function finishDownloadActivity(task) {
+    if (task.lastResumeAt) {
+        task.totalActiveMs += performance.now() - task.lastResumeAt;
+        task.lastResumeAt = 0;
+    }
+}
+
+function updateDownloadTaskSpeed(task) {
+    const now = performance.now();
+    if (now - task.lastT < 250 && task.loaded !== task.size) return;
+    const dt = Math.max(0.001, (now - task.lastT) / 1000);
+    const cur = Math.max(0, (task.loaded - task.lastBytes) / dt);
+    const elapsed = downloadTaskElapsed(task);
+    const avg = task.loaded / Math.max(0.001, elapsed);
+    task.lastBps = cur;
+    task.maxBps = Math.max(task.maxBps, cur);
+    task.samples.push({ t: elapsed, bps: cur, bytes: task.loaded, avg });
+    if (task.samples.length > 240) task.samples.shift();
+    task.lastT = now;
+    task.lastBytes = task.loaded;
+    renderDownloadQueue();
+    if (selectedDownloadId === task.id) renderDownloadDetails(task);
+}
+
+function downloadTaskElapsed(task) {
+    const active = task.status === 'downloading' && task.lastResumeAt
+        ? task.totalActiveMs + performance.now() - task.lastResumeAt
+        : task.totalActiveMs;
+    return active / 1000;
+}
+
+function selectedDownloadTask() {
+    return downloadTasks.find(t => t.id === selectedDownloadId)
+        || downloadTasks.find(t => t.status === 'downloading')
+        || downloadTasks[0]
+        || null;
+}
+
+function renderDownloadQueue() {
+    const list = document.getElementById('downloadQueueList');
+    const count = document.getElementById('downloadQueueCount');
+    if (!list || !count) return;
+    count.textContent = `${downloadTasks.length} 个文件`;
+    if (!downloadTasks.length) {
+        list.innerHTML = '<div class="empty-state"><div class="empty-icon">📥</div><div class="empty-text">暂无下载任务</div></div>';
+        renderDownloadTotals();
+        return;
+    }
+    list.innerHTML = downloadTasks.map(task => {
+        const pct = task.size ? Math.min(100, task.loaded / task.size * 100) : 0;
+        const active = selectedDownloadId === task.id ? ' active' : '';
+        const status = downloadTaskStatusText(task);
+        const action = task.status === 'downloading'
+            ? `<button class="btn" data-download-pause="${escAttr(task.id)}" title="暂停">⏸</button>`
+            : task.status === 'done'
+                ? `<button class="btn" data-download-open="${escAttr(task.id)}" title="查看">✓</button>`
+                : `<button class="btn" data-download-resume="${escAttr(task.id)}" title="继续">▶</button>`;
+        return `<div class="download-task${active}" draggable="true" data-download-task="${escAttr(task.id)}">
+            <div class="download-task-top">
+                <span class="download-task-drag" title="拖拽排序">☰</span>
+                <div class="download-task-name" title="${escAttr(task.path)}">${esc(task.name)}</div>
+                <div class="download-task-actions">
+                    ${action}
+                    <button class="btn btn-danger" data-download-delete="${escAttr(task.id)}" title="删除">×</button>
+                </div>
+            </div>
+            <div class="download-task-meta">
+                <span>${status}</span>
+                <span>${task.size ? pct.toFixed(1) + '%' : '--'}</span>
+            </div>
+            <div class="download-task-bar"><div class="download-task-fill" style="width:${pct}%"></div></div>
+            <div class="download-task-meta">
+                <span>${fmtSize(task.loaded)} / ${task.size ? fmtSize(task.size) : '未知'}</span>
+                <span>${fmtDownloadSpeed(task.status === 'downloading' ? task.lastBps : 0)}</span>
+            </div>
+        </div>`;
+    }).join('');
+    list.querySelectorAll('[data-download-task]').forEach(el => {
+        el.onclick = (e) => {
+            if (e.target.closest('button')) return;
+            selectedDownloadId = el.getAttribute('data-download-task');
+            renderDownloadQueue();
+            renderDownloadDetails(selectedDownloadTask());
+        };
+        el.ondragstart = (e) => downloadDragStart(e, el.getAttribute('data-download-task'));
+        el.ondragover = downloadDragOver;
+        el.ondrop = (e) => downloadDrop(e, el.getAttribute('data-download-task'));
+        el.ondragend = downloadDragEnd;
+    });
+    list.querySelectorAll('[data-download-pause]').forEach(btn => btn.onclick = () => pauseDownloadTask(btn.getAttribute('data-download-pause')));
+    list.querySelectorAll('[data-download-resume]').forEach(btn => btn.onclick = () => resumeDownloadTask(btn.getAttribute('data-download-resume')));
+    list.querySelectorAll('[data-download-open]').forEach(btn => btn.onclick = () => {
+        selectedDownloadId = btn.getAttribute('data-download-open');
+        renderDownloadQueue();
+        renderDownloadDetails(selectedDownloadTask());
+    });
+    list.querySelectorAll('[data-download-delete]').forEach(btn => btn.onclick = () => deleteDownloadTask(btn.getAttribute('data-download-delete')));
+    renderDownloadTotals();
+}
+
+function renderDownloadDetails(task) {
+    const empty = !task;
+    const elapsed = task ? downloadTaskElapsed(task) : 0;
+    const avg = task && elapsed > 0 ? task.loaded / elapsed : 0;
+    const pct = task && task.size ? Math.min(100, task.loaded / task.size * 100) : 0;
+    const eta = task && task.size && avg > 0 && task.status !== 'done' ? (task.size - task.loaded) / avg : 0;
+    document.getElementById('downloadTransferName').textContent = empty ? '暂无任务' : task.name;
+    document.getElementById('downloadTransferStatus').textContent = empty ? '等待下载' : downloadTaskStatusText(task);
+    document.getElementById('downloadTransferStatus').style.color = task && task.status === 'error' ? 'var(--danger)' : task && task.status === 'done' ? 'var(--success)' : 'var(--text-muted)';
+    document.getElementById('dlCur').textContent = fmtDownloadSpeed(task && task.status === 'downloading' ? task.lastBps : 0);
+    document.getElementById('dlAvg').textContent = fmtDownloadSpeed(avg);
+    document.getElementById('dlMax').textContent = fmtDownloadSpeed(task ? task.maxBps : 0);
+    document.getElementById('dlPct').textContent = task && task.size ? pct.toFixed(1) + '%' : '--';
+    document.getElementById('dlDone').textContent = task ? fmtSize(task.loaded) : '0 B';
+    document.getElementById('dlTotal').textContent = task && task.size ? fmtSize(task.size) : '未知';
+    document.getElementById('dlElapsed').textContent = fmtDuration(elapsed);
+    document.getElementById('dlEta').textContent = eta > 0 ? fmtDuration(eta) : '--';
+    document.getElementById('dlBar').style.width = pct + '%';
+    drawDownloadChart(task);
+    renderDownloadTotals();
+}
+
+function renderDownloadTotals() {
+    const totalBytes = downloadTasks.reduce((sum, t) => sum + (t.size || 0), 0);
+    const doneBytes = downloadTasks.reduce((sum, t) => sum + (t.loaded || 0), 0);
+    const finished = downloadTasks.filter(t => t.status === 'done').length;
+    const active = downloadTasks.filter(t => t.status === 'downloading' || t.status === 'queued').length;
+    const stopped = downloadTasks.filter(t => t.status === 'paused' || t.status === 'error').length;
+    setTextIfExists('dlTotalFiles', String(downloadTasks.length));
+    setTextIfExists('dlTotalBytes', fmtSize(totalBytes));
+    setTextIfExists('dlFinishedFiles', String(finished));
+    setTextIfExists('dlQueueDone', fmtSize(doneBytes));
+    setTextIfExists('dlActiveFiles', String(active));
+    setTextIfExists('dlStoppedFiles', String(stopped));
+    const toggle = document.getElementById('downloadUnitToggle');
+    if (toggle) toggle.textContent = downloadUnit === 'MB' ? 'MB/s' : 'Mbps';
+}
+
+function setTextIfExists(id, text) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+}
+
+function downloadTaskStatusText(task) {
+    if (!task) return '等待下载';
+    const map = { queued: '等待中', downloading: '下载中', paused: '已暂停', done: '已完成', error: task.error || '失败' };
+    return map[task.status] || task.status;
+}
+
+function pauseDownloadTask(id) {
+    const task = downloadTasks.find(t => t.id === id);
+    if (!task) return;
+    if (task.status === 'downloading' && task.controller) task.controller.abort();
+    task.status = 'paused';
+    finishDownloadActivity(task);
+    renderDownloadQueue();
+    renderDownloadDetails(task);
+    processDownloadQueue();
+}
+
+function resumeDownloadTask(id) {
+    const task = downloadTasks.find(t => t.id === id);
+    if (!task || task.status === 'done') return;
+    task.status = 'queued';
+    task.error = '';
+    selectedDownloadId = task.id;
+    renderDownloadQueue();
+    renderDownloadDetails(task);
+    processDownloadQueue();
+}
+
+function deleteDownloadTask(id) {
+    const idx = downloadTasks.findIndex(t => t.id === id);
+    if (idx < 0) return;
+    const task = downloadTasks[idx];
+    if (task.status === 'downloading' && task.controller) task.controller.abort();
+    downloadTasks.splice(idx, 1);
+    if (selectedDownloadId === id) selectedDownloadId = downloadTasks[0]?.id || '';
+    renderDownloadQueue();
+    renderDownloadDetails(selectedDownloadTask());
+    processDownloadQueue();
+}
+
+function clearFinishedDownloads() {
+    downloadTasks = downloadTasks.filter(t => t.status !== 'done');
+    if (!downloadTasks.some(t => t.id === selectedDownloadId)) selectedDownloadId = downloadTasks[0]?.id || '';
+    renderDownloadQueue();
+    renderDownloadDetails(selectedDownloadTask());
+}
+
+function toggleDownloadUnit() {
+    downloadUnit = downloadUnit === 'MB' ? 'Mbps' : 'MB';
+    localStorage.setItem('fm_download_unit', downloadUnit);
+    renderDownloadQueue();
+    renderDownloadDetails(selectedDownloadTask());
+}
+
+function fmtDownloadSpeed(bps) {
+    bps = Number(bps) || 0;
+    if (downloadUnit === 'Mbps') {
+        const mbps = bps * 8 / 1000000;
+        return (mbps >= 100 ? mbps.toFixed(1) : mbps.toFixed(2)) + ' Mbps';
+    }
+    const mb = bps / 1048576;
+    return (mb >= 100 ? mb.toFixed(1) : mb.toFixed(2)) + ' MB/s';
+}
+
+function drawDownloadChart(task) {
+    const c = document.getElementById('downloadChart');
+    if (!c) return;
+    const rect = c.getBoundingClientRect();
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    c.width = Math.max(320, Math.floor((rect.width || 320) * dpr));
+    c.height = Math.floor(190 * dpr);
+    const ctx = c.getContext('2d');
+    const w = c.width, h = c.height;
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = 'rgba(0,0,0,0.24)';
+    ctx.fillRect(0, 0, w, h);
+    const samples = task?.samples || [];
+    const padL = 58 * dpr, padR = 12 * dpr, padT = 14 * dpr, padB = 28 * dpr;
+    const gw = w - padL - padR, gh = h - padT - padB;
+    const unitDiv = downloadUnit === 'Mbps' ? 125000 : 1048576;
+    const maxSpeed = Math.max(1, ...samples.map(s => s.bps / unitDiv)) * 1.2;
+    const maxT = Math.max(10, ...samples.map(s => s.t));
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = `${11 * dpr}px system-ui`;
+    for (let i = 0; i <= 4; i++) {
+        const y = padT + gh * i / 4;
+        const v = maxSpeed * (1 - i / 4);
+        ctx.beginPath();
+        ctx.moveTo(padL, y);
+        ctx.lineTo(w - padR, y);
+        ctx.stroke();
+        ctx.fillText(v.toFixed(v >= 10 ? 0 : 1), 8 * dpr, y + 4 * dpr);
+    }
+    ctx.strokeStyle = '#34d399';
+    ctx.lineWidth = 2 * dpr;
+    ctx.beginPath();
+    samples.forEach((s, i) => {
+        const x = padL + s.t / maxT * gw;
+        const y = padT + gh - (s.bps / unitDiv) / maxSpeed * gh;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.fillStyle = '#94a3b8';
+    ctx.fillText(downloadUnit === 'Mbps' ? 'Mbps' : 'MB/s', 8 * dpr, 13 * dpr);
+    ctx.fillText(`${maxT.toFixed(0)}s`, w - 42 * dpr, h - 8 * dpr);
+}
+
+function downloadDragStart(e, id) {
+    downloadDragId = id;
+    e.currentTarget.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+}
+
+function downloadDragOver(e) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+}
+
+function downloadDrop(e, targetId) {
+    e.preventDefault();
+    if (!downloadDragId || downloadDragId === targetId) return;
+    const from = downloadTasks.findIndex(t => t.id === downloadDragId);
+    const to = downloadTasks.findIndex(t => t.id === targetId);
+    if (from < 0 || to < 0) return;
+    const [item] = downloadTasks.splice(from, 1);
+    downloadTasks.splice(to, 0, item);
+    renderDownloadQueue();
+}
+
+function downloadDragEnd(e) {
+    e.currentTarget.classList.remove('dragging');
+    downloadDragId = '';
+}
+
+async function doCreateTextFile() {
+    const name = document.getElementById('textFileName').value.trim();
+    const ext = document.getElementById('textFileExt').value.trim();
+    const content = document.getElementById('textFileContent').value;
+    if (!name) return toast('请输入文件名', 'warning');
+    try {
+        await apiFetch('/api/create-text', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: curPath, name, ext, content }),
+        });
+        toast('文本文件创建成功', 'success');
+        hideModal('createModal');
+        showBrowserPage(true);
+        await loadFiles(curPath);
+        loadDiskInfo();
+    } catch (e) { toast(e.message, 'error'); }
+}
+
+function ctxShare() {
+    hideCtx();
+    if (selected.size !== 1) return;
+    const path = [...selected][0];
+    const f = files.find(fi => fi.path === path);
+    if (!f || f.isDir) return toast('只能为文件生成下载链接', 'warning');
+    shareTargetPath = path;
+    lastShareUrl = '';
+    document.getElementById('shareOutput').style.display = 'none';
+    document.getElementById('shareUrl').value = '';
+    const btn = document.getElementById('shareGenerateBtn');
+    if (btn) btn.style.display = 'inline-flex';
+    showModal('shareModal');
+}
+
+async function doCreateShare() {
+    if (!shareTargetPath) return;
+    const ttl = Number(document.getElementById('shareTtl').value) * Number(document.getElementById('shareTtlUnit').value);
+    try {
+        const data = await apiFetch('/api/share', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: shareTargetPath, ttl }),
+        });
+        lastShareUrl = data.url;
+        document.getElementById('shareUrl').value = data.url;
+        document.getElementById('shareOutput').style.display = 'flex';
+        const btn = document.getElementById('shareGenerateBtn');
+        if (btn) btn.style.display = 'none';
+        toast('下载链接已生成', 'success');
+        if (currentView === 'links') loadShares();
+    } catch (e) { toast(e.message, 'error'); }
+}
+
+/* ============================================================
+   Settings & Navigation Overrides
+   ============================================================ */
+function setAppVisible(visible) {
+    ['appContainer', 'mobileBar'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.classList.toggle('app-hidden', !visible);
+    });
+    if (visible) showView(currentView || 'browser', { skipHistory: true });
+}
+
+function startApp() {
+    hideLogin();
+    setAppVisible(true);
+    const settingsBtn = document.getElementById('settingsBtn');
+    if (settingsBtn) settingsBtn.style.display = authRequired ? 'inline-flex' : 'none';
+    if (appStarted) return;
+    appStarted = true;
+    loadDiskInfo();
+    loadFiles('/', { replaceHistory: true });
+}
+
+async function initAuth() {
+    try {
+        const status = await apiFetch('/api/auth/status');
+        authRequired = !!status.authRequired;
+        currentUsername = status.username || '';
+        if (status.authenticated) startApp();
+        else showLogin();
+    } catch (e) {
+        showLogin();
+        setLoginError('无法连接服务器，请稍后重试');
+    }
+}
+
+async function login() {
+    const username = document.getElementById('loginUser').value.trim();
+    const password = document.getElementById('loginPass').value;
+    if (!username || !password) return setLoginError('请输入账号和密码');
+    setLoginBusy(true);
+    setLoginError('');
+    try {
+        await apiFetch('/api/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password }),
+        });
+        currentUsername = username;
+        document.getElementById('loginPass').value = '';
+        startApp();
+    } catch (e) {
+        setLoginError(e.message || '登录失败');
+    } finally {
+        setLoginBusy(false);
+    }
+}
+
+function appState() {
+    return { fm: true, view: currentView || 'browser', path: curPath || '/' };
+}
+
+function pushAppHistory(replace = false) {
+    if (!navReady || suppressHistoryPush) return;
+    const state = appState();
+    const path = state.path === '/' ? '' : state.path;
+    const hash = state.view === 'browser'
+        ? '#/' + path.replace(/^\/+/, '')
+        : '#/' + state.view + path;
+    const url = window.location.pathname + window.location.search + hash;
+    if (replace) history.replaceState(state, '', url);
+    else history.pushState(state, '', url);
+}
+
+function showView(view, opts = {}) {
+    currentView = view;
+    const browser = document.getElementById('browserPage');
+    if (browser) browser.style.display = view === 'browser' ? '' : 'none';
+    ['downloadPage', 'editorPage', 'linksPage'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.classList.toggle('active', id === view + 'Page');
+    });
+    if (view !== 'browser') hideCtx();
+    if (!opts.skipHistory) pushAppHistory(!!opts.replaceHistory);
+}
+
+function showBrowserPage(force = false, opts = {}) {
+    if (!force && currentView === 'editor' && editorDirty) {
+        showConfirm('离开编辑器', '当前文本尚未保存，确定要离开吗？', () => showBrowserPage(true, opts));
+        return;
+    }
+    const wasEditor = currentView === 'editor';
+    showView('browser', opts);
+    if (wasEditor) editorDirty = false;
+}
+
+async function loadFiles(path, opts = {}) {
+    showLoading(true);
+    try {
+        const data = await apiFetch('/api/list?path=' + encodeURIComponent(path));
+        curPath = data.path;
+        files = data.items;
+        selected.clear();
+        if (currentView !== 'browser') showBrowserPage(true, { skipHistory: true });
+        renderBreadcrumb();
+        renderFiles();
+        pushAppHistory(!!opts.replaceHistory);
+    } catch (e) {
+        toast(e.message, 'error');
+    } finally {
+        showLoading(false);
+    }
+}
+
+function goBack() {
+    if (currentView !== 'browser') return showBrowserPage();
+    if (curPath === '/') return;
+    const parent = curPath.split('/').slice(0, -1).join('/') || '/';
+    loadFiles(parent);
+}
+
+function openDownloadPage() {
+    showView('download');
+    renderDownloadQueue();
+    renderDownloadDetails(selectedDownloadTask());
+}
+
+async function openLinksPage() {
+    showView('links');
+    await loadShares();
+}
+
+async function openTextEditor(path) {
+    try {
+        if (!(await ensureAuthenticated())) return;
+        const data = await apiFetch('/api/text?path=' + encodeURIComponent(path));
+        currentEditorPath = data.file.path;
+        editorDirty = false;
+        document.getElementById('editorTitle').textContent = data.file.name;
+        document.getElementById('editorPath').textContent = data.file.path;
+        document.getElementById('editorMeta').textContent = `${fmtSize(data.file.size)} · ${data.file.modifiedStr || ''}`;
+        document.getElementById('editorState').textContent = '已载入';
+        document.getElementById('editorText').value = data.content;
+        showView('editor');
+        setTimeout(() => document.getElementById('editorText').focus(), 50);
+    } catch (e) {
+        toast(e.message, 'error');
+    }
+}
+
+function renderDisk() {
+    if (!diskInfo) return;
+    const usedEl = document.getElementById('diskFill');
+    const freeEl = document.getElementById('diskFreeFill');
+    const txt = document.getElementById('diskText');
+    const total = Number(diskInfo.total) || 0;
+    const rootSize = Number(diskInfo.rootSize) || 0;
+    const free = Number(diskInfo.free) || 0;
+    const rootPct = total ? Math.min(100, rootSize / total * 100) : 0;
+    const freePct = total ? Math.min(100 - rootPct, free / total * 100) : 0;
+    if (usedEl) usedEl.style.width = rootPct + '%';
+    if (freeEl) freeEl.style.width = freePct + '%';
+    if (txt) {
+        txt.textContent = `网盘文件 ${diskInfo.rootSizeStr} / 可用 ${diskInfo.freeStr} / 总 ${diskInfo.totalStr}`;
+    }
+    renderSettingsDiskInfo();
+}
+
+function openSettingsModal() {
+    document.getElementById('settingsUsername').textContent = currentUsername || '未启用认证';
+    renderSettingsDiskInfo();
+    ['oldPasswordInput','newPasswordInput','confirmPasswordInput'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.value = '';
+    });
+    showModal('settingsModal');
+}
+
+function setSettingsValue(id, value) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value || '--';
+}
+
+function renderSettingsDiskInfo() {
+    const allocated = diskInfo?.rootAllocatedSizeStr || diskInfo?.rootSizeStr || '--';
+    setSettingsValue('settingsDiskTotal', diskInfo?.totalStr);
+    setSettingsValue('settingsDiskUsed', diskInfo ? `${diskInfo.usedStr}（${diskInfo.percent}%）` : '--');
+    setSettingsValue('settingsDiskFree', diskInfo?.freeStr);
+    setSettingsValue('settingsRootSize', diskInfo?.rootSizeStr);
+    setSettingsValue('settingsRootAllocated', allocated);
+    setSettingsValue('settingsRootPath', diskInfo?.rootPath);
+}
+
+async function changePassword() {
+    const oldPassword = document.getElementById('oldPasswordInput').value;
+    const newPassword = document.getElementById('newPasswordInput').value;
+    const confirmPassword = document.getElementById('confirmPasswordInput').value;
+    if (!oldPassword || !newPassword) return toast('请填写旧密码和新密码', 'warning');
+    if (newPassword !== confirmPassword) return toast('两次输入的新密码不一致', 'warning');
+    try {
+        await apiFetch('/api/auth/change-password', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ oldPassword, newPassword }),
+        });
+        toast('密码已修改，请重新登录', 'success');
+        hideModal('settingsModal');
+        appStarted = false;
+        showLogin();
+    } catch (e) {
+        toast(e.message, 'error');
+    }
+}
+
+async function logout() {
+    try {
+        await apiFetch('/api/auth/logout', { method: 'POST' });
+    } catch (e) {
+        console.error('Logout error:', e);
+    }
+    appStarted = false;
+    currentUsername = '';
+    curPath = '/';
+    files = [];
+    selected.clear();
+    hideModal('settingsModal');
+    showLogin();
+}
+
+function applyHistoryState(state) {
+    if (!state || !state.fm) return;
+    suppressHistoryPush = true;
+    if (state.view === 'browser') {
+        loadFiles(state.path || '/', { replaceHistory: true }).finally(() => { suppressHistoryPush = false; });
+    } else {
+        showView(state.view || 'browser', { skipHistory: true });
+        suppressHistoryPush = false;
+    }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    navReady = true;
+    history.replaceState(appState(), '', window.location.pathname + window.location.search + '#/');
+    history.pushState(appState(), '', window.location.pathname + window.location.search + '#/');
+    window.addEventListener('popstate', (e) => {
+        if (e.state && e.state.fm) {
+            applyHistoryState(e.state);
+        } else if (appStarted) {
+            history.pushState(appState(), '', window.location.href);
+            goBack();
+        }
+    });
+});
+</script>
+</body>
+</html>
