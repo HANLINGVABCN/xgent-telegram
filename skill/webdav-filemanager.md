@@ -1,5 +1,5 @@
 ```!
-WebDAV 文件管理器：一键部署私有网页网盘和 WebDAV 服务，支持文件上传下载、下载队列、临时下载链接、文本编辑和网页登录。脚本目录：skill/script/webdav-filemanager/，核心文件：install.sh、server.py、index.html。安装命令：chmod +x skill/script/webdav-filemanager/install.sh && sudo bash skill/script/webdav-filemanager/install.sh install（root 用户可去掉 sudo）。卸载命令：sudo bash skill/script/webdav-filemanager/install.sh uninstall。默认端口 8989，默认服务名 webdav-filemanager，部署后访问 http://服务器IP:端口/，WebDAV 地址 http://服务器IP:端口/dav/。
+WebDAV 文件管理器：一键部署私有网页网盘和 WebDAV 服务，支持文件上传下载、下载队列、临时下载链接、文本编辑、右键压缩/解压和网页登录。脚本目录：skill/script/webdav-filemanager/，核心文件：install.sh、server.py、index.html。安装命令：chmod +x skill/script/webdav-filemanager/install.sh && sudo bash skill/script/webdav-filemanager/install.sh install（root 用户可去掉 sudo）。卸载命令：sudo bash skill/script/webdav-filemanager/install.sh uninstall。默认端口 8989，默认服务名 webdav-filemanager，部署后访问 http://服务器IP:端口/，WebDAV 地址 http://服务器IP:端口/dav/。
 ```
 
 # 服务器网盘 + WebDAV + HTTP 测速文件管理器
@@ -18,8 +18,8 @@ skill/script/webdav-filemanager/index.html
 其中：
 
 - `install.sh`：一键安装、重新安装、卸载脚本。
-- `server.py`：零依赖 Python 文件管理服务器，提供 Web UI API、统一下载流、文本读写、临时下载链接、链接管理、测速文件自动清理、网页登录认证、改密码和 WebDAV 协议。
-- `index.html`：网页文件管理器前端界面，包含上传速度面板、下载队列、文本编辑页、链接管理页、设置页、创建文件夹/测速文件/文本文件、右键生成下载链接等功能。
+- `server.py`：零依赖 Python 文件管理服务器，提供 Web UI API、统一下载流、文本读写、临时下载链接、链接管理、测速文件自动清理、网页登录认证、改密码、WebDAV 协议和压缩/解压 API。
+- `index.html`：网页文件管理器前端界面，包含上传速度面板、下载队列、文本编辑页、链接管理页、设置页、创建文件夹/测速文件/文本文件、右键生成下载链接、右键压缩/解压等功能。
 - `webdav-filemanager.md`：当前 skill 说明文件。
 
 ## 2. 基本定位
@@ -41,6 +41,7 @@ skill/script/webdav-filemanager/index.html
 - 测速文件可自定义大小、后缀和有效时间，过期后自动删除。
 - 文本文件可在专业编辑页中读取、修改、保存，并支持自定义后缀；新建文本文件后默认回到文件列表。
 - `/dav/` 路径提供 WebDAV，可被系统文件管理器、手机文件管理器、支持 WebDAV 的客户端挂载。
+- WebDAV 客户端上传的文件会自动存放在网盘根目录下的 `webdav/` 文件夹中。
 - Web 页面使用 Cookie 登录认证。
 - WebDAV 使用 Basic Auth 认证。
 - 设置页可查看当前用户、根目录、磁盘容量、网盘文件大小、实际占盘，并支持修改密码和退出登录。
