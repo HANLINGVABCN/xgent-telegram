@@ -1285,6 +1285,56 @@ body {
     margin: 12px 0 8px;
 }
 
+/* Toggle Switch */
+.toggle-switch {
+    position: relative;
+    display: inline-block;
+    width: 44px;
+    height: 24px;
+    cursor: pointer;
+}
+.toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+.toggle-slider {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 24px;
+    transition: all 0.3s ease;
+}
+.toggle-slider:before {
+    content: "";
+    position: absolute;
+    height: 18px;
+    width: 18px;
+    left: 2px;
+    bottom: 2px;
+    background: var(--text-muted);
+    border-radius: 50%;
+    transition: all 0.3s ease;
+}
+.toggle-switch input:checked + .toggle-slider {
+    background: var(--accent-dim);
+    border-color: var(--accent);
+}
+.toggle-switch input:checked + .toggle-slider:before {
+    transform: translateX(20px);
+    background: var(--accent);
+}
+.toggle-switch:hover .toggle-slider {
+    background: rgba(255, 255, 255, 0.15);
+}
+.toggle-switch input:checked:hover + .toggle-slider {
+    background: rgba(129, 140, 248, 0.3);
+}
+
 /* ============================================================
    Responsive
    ============================================================ */
@@ -1778,14 +1828,28 @@ body {
             <span class="settings-label">根目录实际占盘</span><span class="settings-value" id="settingsRootAllocated">--</span>
             <span class="settings-label">根目录</span><span class="settings-value" id="settingsRootPath">--</span>
         </div>
-        <div class="settings-section-title">修改密码</div>
+        <div class="settings-section-title">交互设置</div>
+        <div class="settings-grid">
+            <span class="settings-label">长按震动反馈</span>
+            <span class="settings-value">
+                <label class="toggle-switch">
+                    <input type="checkbox" id="vibrateToggle" onchange="toggleVibrate(this.checked)">
+                    <span class="toggle-slider"></span>
+                </label>
+            </span>
+        </div>
+        <div class="settings-section-title">账号设置</div>
         <div class="form-grid">
             <div class="form-field">
-                <label>旧密码</label>
+                <label>登录账号</label>
+                <input type="text" class="modal-input" id="accountUsernameInput" autocomplete="username">
+            </div>
+            <div class="form-field">
+                <label>当前密码</label>
                 <input type="password" class="modal-input" id="oldPasswordInput" autocomplete="current-password">
             </div>
             <div class="form-field">
-                <label>新密码</label>
+                <label>新密码（不改可留空）</label>
                 <input type="password" class="modal-input" id="newPasswordInput" autocomplete="new-password">
             </div>
             <div class="form-field">
@@ -1796,7 +1860,7 @@ body {
         <div class="modal-actions">
             <button class="btn btn-danger" onclick="logout()">退出登录</button>
             <button class="btn" onclick="hideModal('settingsModal')">关闭</button>
-            <button class="btn btn-primary" onclick="changePassword()">保存密码</button>
+            <button class="btn btn-primary" onclick="changeAccount()">保存账号</button>
         </div>
     </div>
 </div>
@@ -1844,6 +1908,13 @@ let archiveSources = [];
 let extractSourcePath = '';
 let directoryPickerTarget = '';
 let directoryPickerPath = '/';
+
+// Drag selection state
+let dragSelecting = false;
+let dragSelectStart = null;
+let dragSelectTimer = null;
+let dragSelectInitialSelected = new Set();
+let vibrateEnabled = localStorage.getItem('fm_vibrate') !== 'false'; // Default true
 
 /* ============================================================
    Init
@@ -2070,6 +2141,7 @@ function renderFiles() {
         html += `<div class="file-item${sel}${cut}" data-path="${escapedPath}" data-idx="${i}"
             onclick="onFileClick(event,${i})" ondblclick="onFileDbl(${i})"
             oncontextmenu="onFileCtx(event,${i})"
+            onmousedown="onFileMouseDown(event,${i})" ontouchstart="onFileTouchStart(event,${i})"
             style="animation-delay:${Math.min(i * 15, 300)}ms">
             <div class="file-item-name">
                 <span class="file-icon">${icon}</span>
@@ -2126,6 +2198,12 @@ function renderSortArrows() {
    File Click Handlers
    ============================================================ */
 function onFileClick(e, idx) {
+    // Ignore click if we're in drag selection mode
+    if (dragSelecting) {
+        e.preventDefault();
+        return;
+    }
+
     const f = getVisibleFiles()[idx];
     if (!f) return;
     if (e.ctrlKey || e.metaKey) {
@@ -2148,6 +2226,117 @@ function onFileDbl(idx) {
     if (!f) return;
     if (f.isDir) loadFiles(f.path);
     else downloadFile(f.path);
+}
+
+/* ============================================================
+   Drag Selection
+   ============================================================ */
+function onFileMouseDown(e, idx) {
+    // Right mouse button (button === 2) starts drag selection
+    if (e.button === 2) {
+        e.preventDefault();
+        startDragSelection(idx);
+    }
+}
+
+function onFileTouchStart(e, idx) {
+    // Long press on mobile starts drag selection
+    if (dragSelectTimer) clearTimeout(dragSelectTimer);
+    document.addEventListener('touchend', clearDragSelectionTimer, { once: true });
+    document.addEventListener('touchcancel', clearDragSelectionTimer, { once: true });
+    document.addEventListener('touchmove', clearDragSelectionTimer, { once: true, passive: true });
+    dragSelectTimer = setTimeout(() => {
+        dragSelectTimer = null;
+        startDragSelection(idx);
+        // Vibrate if enabled and supported
+        if (vibrateEnabled && navigator.vibrate) {
+            navigator.vibrate(50);
+        }
+    }, 500); // 500ms long press
+}
+
+function clearDragSelectionTimer() {
+    if (dragSelectTimer) {
+        clearTimeout(dragSelectTimer);
+        dragSelectTimer = null;
+    }
+}
+
+function startDragSelection(idx) {
+    dragSelecting = true;
+    dragSelectStart = idx;
+    dragSelectInitialSelected = new Set(selected);
+
+    // Add global event listeners
+    document.addEventListener('mousemove', onDragSelectionMove);
+    document.addEventListener('mouseup', onDragSelectionEnd);
+    document.addEventListener('touchmove', onDragSelectionTouchMove);
+    document.addEventListener('touchend', onDragSelectionEnd);
+    document.addEventListener('touchcancel', onDragSelectionEnd);
+
+    // Prevent text selection during drag
+    document.body.style.userSelect = 'none';
+}
+
+function onDragSelectionMove(e) {
+    if (!dragSelecting) return;
+    const target = document.elementFromPoint(e.clientX, e.clientY);
+    if (!target) return;
+    const fileItem = target.closest('.file-item');
+    if (!fileItem) return;
+    const idx = parseInt(fileItem.dataset.idx);
+    if (isNaN(idx)) return;
+    updateDragSelection(idx);
+}
+
+function onDragSelectionTouchMove(e) {
+    if (!dragSelecting) return;
+    clearDragSelectionTimer();
+    const touch = e.touches[0];
+    if (!touch) return;
+    const target = document.elementFromPoint(touch.clientX, touch.clientY);
+    if (!target) return;
+    const fileItem = target.closest('.file-item');
+    if (!fileItem) return;
+    const idx = parseInt(fileItem.dataset.idx);
+    if (isNaN(idx)) return;
+    updateDragSelection(idx);
+}
+
+function updateDragSelection(currentIdx) {
+    const all = getVisibleFiles();
+    const start = dragSelectStart;
+    const lo = Math.min(start, currentIdx);
+    const hi = Math.max(start, currentIdx);
+
+    // Restore initial selection
+    selected = new Set(dragSelectInitialSelected);
+
+    // Add items in range
+    for (let i = lo; i <= hi; i++) {
+        if (all[i]) selected.add(all[i].path);
+    }
+
+    renderFiles();
+}
+
+function onDragSelectionEnd(e) {
+    clearDragSelectionTimer();
+    if (!dragSelecting) return;
+
+    dragSelecting = false;
+    dragSelectStart = null;
+    dragSelectInitialSelected.clear();
+
+    // Remove global event listeners
+    document.removeEventListener('mousemove', onDragSelectionMove);
+    document.removeEventListener('mouseup', onDragSelectionEnd);
+    document.removeEventListener('touchmove', onDragSelectionTouchMove);
+    document.removeEventListener('touchend', onDragSelectionEnd);
+    document.removeEventListener('touchcancel', onDragSelectionEnd);
+
+    // Restore text selection
+    document.body.style.userSelect = '';
 }
 
 /* ============================================================
@@ -4434,11 +4623,22 @@ function renderDisk() {
 function openSettingsModal() {
     document.getElementById('settingsUsername').textContent = currentUsername || '未启用认证';
     renderSettingsDiskInfo();
+    const usernameInput = document.getElementById('accountUsernameInput');
+    if (usernameInput) usernameInput.value = currentUsername || '';
     ['oldPasswordInput','newPasswordInput','confirmPasswordInput'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.value = '';
     });
+    // Initialize vibrate toggle
+    const vibrateToggle = document.getElementById('vibrateToggle');
+    if (vibrateToggle) vibrateToggle.checked = vibrateEnabled;
     showModal('settingsModal');
+}
+
+function toggleVibrate(enabled) {
+    vibrateEnabled = enabled;
+    localStorage.setItem('fm_vibrate', enabled ? 'true' : 'false');
+    toast(enabled ? '已启用震动反馈' : '已关闭震动反馈', 'info');
 }
 
 function setSettingsValue(id, value) {
@@ -4456,19 +4656,23 @@ function renderSettingsDiskInfo() {
     setSettingsValue('settingsRootPath', diskInfo?.rootPath);
 }
 
-async function changePassword() {
+async function changeAccount() {
+    const newUsername = document.getElementById('accountUsernameInput').value.trim();
     const oldPassword = document.getElementById('oldPasswordInput').value;
     const newPassword = document.getElementById('newPasswordInput').value;
     const confirmPassword = document.getElementById('confirmPasswordInput').value;
-    if (!oldPassword || !newPassword) return toast('请填写旧密码和新密码', 'warning');
+    if (!newUsername) return toast('请输入登录账号', 'warning');
+    if (newUsername.includes(':')) return toast('登录账号不能包含冒号', 'warning');
+    if (!oldPassword) return toast('请输入当前密码', 'warning');
     if (newPassword !== confirmPassword) return toast('两次输入的新密码不一致', 'warning');
     try {
-        await apiFetch('/api/auth/change-password', {
+        await apiFetch('/api/auth/change-account', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ oldPassword, newPassword }),
+            body: JSON.stringify({ newUsername, oldPassword, newPassword }),
         });
-        toast('密码已修改，请重新登录', 'success');
+        currentUsername = newUsername;
+        toast('账号设置已保存，请重新登录', 'success');
         hideModal('settingsModal');
         appStarted = false;
         showLogin();

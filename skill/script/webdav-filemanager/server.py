@@ -165,6 +165,12 @@ def save_auth_cred(auth):
     os.replace(tmp, AUTH_FILE)
 
 
+def valid_login_username(username):
+    if not username or ':' in username:
+        return False
+    return not any(ord(ch) < 32 or ord(ch) == 127 for ch in username)
+
+
 def clamp_ttl(value, default=24 * 60 * 60):
     try:
         ttl = int(value)
@@ -730,8 +736,8 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         })
 
     def _api_auth_POST(self, path, qs):
-        if path == '/api/auth/change-password':
-            return self._api_auth_change_password()
+        if path in ('/api/auth/change-account', '/api/auth/change-password'):
+            return self._api_auth_change_account()
         if path == '/api/auth/login':
             return self._api_auth_login()
         if path == '/api/auth/logout':
@@ -801,7 +807,7 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             headers={'Set-Cookie': self._expired_session_cookie()},
         )
 
-    def _api_auth_change_password(self):
+    def _api_auth_change_account(self):
         global AUTH_CRED
         if not AUTH_CRED:
             return self.send_err(400, '当前未启用登录认证')
@@ -812,21 +818,30 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         except Exception:
             return self.send_err(400, '请求格式不正确')
         old_password = str(data.get('oldPassword', ''))
-        new_password = str(data.get('newPassword', ''))
-        if len(new_password) < 6:
-            return self.send_err(400, '新密码至少 6 位')
         username, expected_password = self._auth_parts()
         if not self._safe_equal(old_password, expected_password):
-            return self.send_err(401, '旧密码错误')
-        AUTH_CRED = f'{username}:{new_password}'
+            return self.send_err(401, '当前密码错误')
+
+        new_username = str(data.get('newUsername', data.get('username', username))).strip()
+        if not valid_login_username(new_username):
+            return self.send_err(400, '登录账号不能为空，且不能包含冒号或控制字符')
+
+        new_password = str(data.get('newPassword', ''))
+        password = expected_password
+        if new_password:
+            if len(new_password) < 6:
+                return self.send_err(400, '新密码至少 6 位')
+            password = new_password
+
+        AUTH_CRED = f'{new_username}:{password}'
         try:
             save_auth_cred(AUTH_CRED)
         except OSError as e:
-            return self.send_err(500, f'保存密码失败: {self._sanitize_error(e)}')
+            return self.send_err(500, f'保存账号设置失败: {self._sanitize_error(e)}')
         with SESSIONS_LOCK:
             SESSIONS.clear()
         self.send_json(
-            {'success': True, 'authenticated': False, 'username': username},
+            {'success': True, 'authenticated': False, 'username': new_username},
             headers={'Set-Cookie': self._expired_session_cookie()},
         )
 

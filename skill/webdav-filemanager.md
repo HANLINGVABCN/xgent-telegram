@@ -1,5 +1,5 @@
 ```!
-WebDAV 文件管理器：一键部署私有网页网盘和 WebDAV 服务，支持文件上传下载、下载队列、临时下载链接、文本编辑、右键压缩/解压和网页登录。脚本目录：skill/script/webdav-filemanager/，核心文件：install.sh、server.py、index.html。安装命令：chmod +x skill/script/webdav-filemanager/install.sh && sudo bash skill/script/webdav-filemanager/install.sh install（root 用户可去掉 sudo）。卸载命令：sudo bash skill/script/webdav-filemanager/install.sh uninstall。默认端口 8989，默认服务名 webdav-filemanager，部署后访问 http://服务器IP:端口/，WebDAV 地址 http://服务器IP:端口/dav/。
+WebDAV 文件管理器：一键部署私有网页网盘和 WebDAV 服务，支持文件上传下载、下载队列、临时下载链接、文本编辑、右键压缩/解压和网页登录。脚本目录：skill/script/webdav-filemanager/，核心文件：install.sh、server.py、index.html。安装命令：chmod +x skill/script/webdav-filemanager/install.sh && sudo bash skill/script/webdav-filemanager/install.sh install（root 用户可去掉 sudo）。更新命令：sudo bash skill/script/webdav-filemanager/install.sh update（保留端口、账号、密码、文件根目录、网盘文件、临时链接状态，只替换程序文件）。卸载命令：sudo bash skill/script/webdav-filemanager/install.sh uninstall（删除程序和服务，保留网盘文件）。菜单模式：sudo bash skill/script/webdav-filemanager/install.sh（选项 1=安装/重装，选项 2=更新程序，选项 3=卸载）。默认端口 8989，默认服务名 webdav-filemanager，部署后访问 http://服务器IP:端口/，WebDAV 地址 http://服务器IP:端口/dav/。日常程序升级请用 update 命令，不要用 install 重装（install 会覆盖用户在网页里修改过的账号密码）。
 ```
 
 # 服务器网盘 + WebDAV + HTTP 测速文件管理器
@@ -17,8 +17,8 @@ skill/script/webdav-filemanager/index.html
 
 其中：
 
-- `install.sh`：一键安装、重新安装、卸载脚本。
-- `server.py`：零依赖 Python 文件管理服务器，提供 Web UI API、统一下载流、文本读写、临时下载链接、链接管理、测速文件自动清理、网页登录认证、改密码、WebDAV 协议和压缩/解压 API。
+- `install.sh`：一键安装、重新安装、更新、卸载脚本。
+- `server.py`：零依赖 Python 文件管理服务器，提供 Web UI API、统一下载流、文本读写、临时下载链接、链接管理、测速文件自动清理、网页登录认证、改账号/密码、WebDAV 协议和压缩/解压 API。
 - `index.html`：网页文件管理器前端界面，包含上传速度面板、下载队列、文本编辑页、链接管理页、设置页、创建文件夹/测速文件/文本文件、右键生成下载链接、右键压缩/解压等功能。
 - `webdav-filemanager.md`：当前 skill 说明文件。
 
@@ -44,7 +44,8 @@ skill/script/webdav-filemanager/index.html
 - WebDAV 客户端上传的文件会自动存放在网盘根目录下的 `webdav/` 文件夹中。
 - Web 页面使用 Cookie 登录认证。
 - WebDAV 使用 Basic Auth 认证。
-- 设置页可查看当前用户、根目录、磁盘容量、网盘文件大小、实际占盘，并支持修改密码和退出登录。
+- 设置页可查看当前用户、根目录、磁盘容量、网盘文件大小、实际占盘，并支持修改登录账号、修改密码和退出登录。
+- 桌面端支持右键拖拽批量选择，移动端支持长按拖拽批量选择；长按震动反馈可在设置页开关。
 - 浏览器返回按钮已适配应用内目录和页面切换。
 - 文件根目录可自定义，例如 `/data/files`。
 - 安装后会根据选择创建 systemd 或 pm2 服务，支持开机自启和自动重启。
@@ -77,7 +78,7 @@ bash skill/script/webdav-filemanager/install.sh install
 推荐填写示例：
 
 ```text
-进程管理方式：2 (pm2)
+进程管理方式：1 (pm2)
 端口号：8989
 登录账号：admin
 登录密码：自行设置强密码
@@ -103,17 +104,137 @@ WebDAV：    http://服务器IP:8989/dav/
 sudo bash skill/script/webdav-filemanager/install.sh
 ```
 
-菜单选项通常是：
+菜单选项：
 
 ```text
 1) 安装 / 重新安装
-2) 卸载：删除配置和项目文件，不删除存入的文件
-3) 退出
+2) 更新程序：保留端口、账号、目录和网盘文件
+3) 卸载：全面删除程序和服务，不删除存入的文件
+4) 退出
 ```
 
-Agent 帮用户部署时，如果用户没有明确说卸载，应默认选择安装 / 重新安装。
+**菜单选项说明**：
 
-## 5. 卸载
+- **选项 1（安装 / 重新安装）**：会交互式询问端口、账号、密码、文件根目录、进程管理方式。如果已经安装过，会覆盖所有配置，相当于全新安装。适合首次部署或需要更改端口、账号、文件根目录的场景。
+- **选项 2（更新程序）**：只替换程序文件（server.py、index.html），保留所有配置和数据，不会询问任何问题，自动重启服务。适合程序升级、bug 修复、功能更新的场景。**这是日常更新的推荐方式**。
+- **选项 3（卸载）**：全面删除程序、服务配置、pm2 进程记录，但保留网盘文件根目录（例如 `/data/files`）。
+- **选项 4（退出）**：退出脚本，不执行任何操作。
+
+**Agent 执行建议**：
+
+- 首次部署：选择选项 1（安装）。
+- 程序更新：选择选项 2（更新），或直接使用命令 `sudo bash skill/script/webdav-filemanager/install.sh update`。
+- 用户明确要求卸载：选择选项 3（卸载）。
+- 用户要求"重新配置端口/账号/目录"：选择选项 1（重新安装）。
+
+## 5. 更新程序（推荐方式）
+
+当项目里的 `server.py` 或 `index.html` 有新版本时，**不需要重新走安装问答，不需要重新输入端口、账号、密码**。直接执行：
+
+```bash
+sudo bash skill/script/webdav-filemanager/install.sh update
+```
+
+或者通过菜单模式选择选项 2：
+
+```bash
+sudo bash skill/script/webdav-filemanager/install.sh
+# 然后输入 2 选择"更新程序"
+```
+
+### 5.1 更新命令的完整行为
+
+**会替换的文件**（程序文件）：
+
+```text
+/opt/webdav-filemanager/server.py      ← 替换为新版本
+/opt/webdav-filemanager/index.html     ← 替换为新版本
+/opt/webdav-filemanager/config.env     ← 刷新配置（保留原有端口、目录、账号）
+/opt/webdav-filemanager/start.sh       ← 刷新启动脚本（保留原有配置）
+```
+
+**会保留的文件**（用户数据和状态）：
+
+```text
+/opt/webdav-filemanager/filemanager_auth.json    ← 网页登录账号密码持久化文件（用户在网页里修改过的账号或密码）
+/opt/webdav-filemanager/filemanager_state.json   ← 临时下载链接状态文件（用户创建的临时链接）
+/data/files（或用户自定义的文件根目录）          ← 网盘文件根目录，完全不动
+```
+
+**会保留的配置**：
+
+```text
+端口号（例如 8989）
+文件根目录（例如 /data/files）
+登录账号（例如 admin）
+登录账号和密码（优先从 filemanager_auth.json 读取，再回退 config.env/start.sh）
+进程管理方式（systemd 或 pm2）
+监听地址（通常是 0.0.0.0）
+```
+
+**自动执行的操作**：
+
+```text
+自动重启 systemd 服务（如果使用 systemd）
+自动重启 pm2 进程（如果使用 pm2）
+自动刷新 systemd daemon（systemctl daemon-reload）
+```
+
+### 5.2 更新的兼容性处理
+
+更新脚本会智能读取旧版本的配置：
+
+1. **优先读取 `config.env`**（新版本安装或更新后生成的配置文件）。
+2. **如果没有 `config.env`，会解析 `start.sh`**（老版本安装时生成的启动脚本）。
+3. **最后读取 `filemanager_auth.json` 并以它为准**（用户在网页里修改过的账号或密码）。
+
+这意味着：
+
+- 从老版本（没有 `config.env`）更新到新版本时，脚本会自动从 `start.sh` 提取配置，并生成 `config.env`。
+- 后续更新会直接复用 `config.env`，不再需要解析 `start.sh`。
+- 用户在网页里修改过的账号或密码会被保留（`filemanager_auth.json` 不会被删除），并会同步刷新到 `config.env` 和 `start.sh`。
+
+### 5.3 更新与重新安装的区别
+
+| 操作 | 更新（update） | 重新安装（install） |
+|------|----------------|---------------------|
+| 是否询问端口 | ❌ 不询问，保留原端口 | ✅ 询问 |
+| 是否询问账号密码 | ❌ 不询问，保留原账号密码 | ✅ 询问 |
+| 是否询问文件根目录 | ❌ 不询问，保留原目录 | ✅ 询问 |
+| 是否询问进程管理方式 | ❌ 不询问，保留原方式 | ✅ 询问 |
+| 是否替换 server.py | ✅ 替换 | ✅ 替换 |
+| 是否替换 index.html | ✅ 替换 | ✅ 替换 |
+| 是否保留 filemanager_auth.json | ✅ 保留 | ❌ 覆盖（使用新账号密码） |
+| 是否保留 filemanager_state.json | ✅ 保留 | ✅ 保留 |
+| 是否保留网盘文件 | ✅ 保留 | ✅ 保留 |
+| 适用场景 | 程序升级、bug 修复 | 首次部署、更改端口/账号/目录 |
+
+**重要提示**：
+
+- **日常程序更新请使用 `update` 命令**，不要使用 `install`。
+- **`install` 会覆盖 `filemanager_auth.json`**，导致用户在网页里修改过的账号密码丢失。
+- **`update` 是无损更新**，只替换程序文件，不影响用户数据和配置。
+
+### 5.4 更新示例输出
+
+执行更新命令后，脚本会输出：
+
+```text
+即将更新 WebDAV 文件管理器程序文件。
+会替换：/opt/webdav-filemanager/server.py、/opt/webdav-filemanager/index.html
+会保留：登录密码持久化文件、临时链接状态、网盘文件根目录
+当前端口：8989
+文件根目录：/data/files
+
+已刷新运行配置：/opt/webdav-filemanager/config.env
+已重启 systemd 服务：webdav-filemanager
+（或：已重启 pm2 进程：webdav-filemanager）
+
+更新完成。
+网盘文件根目录未被修改或删除。
+```
+
+## 6. 卸载
 
 卸载命令：
 
@@ -121,12 +242,13 @@ Agent 帮用户部署时，如果用户没有明确说卸载，应默认选择�
 sudo bash skill/script/webdav-filemanager/install.sh uninstall
 ```
 
-卸载脚本会自动检测使用的是 systemd 还是 pm2，并删除：
+卸载脚本会全面清理程序侧内容，并保留网盘文件根目录。会删除：
 
 ```text
-/etc/systemd/system/webdav-filemanager.service (如果存在)
-pm2 进程 webdav-filemanager (如果存在)
-/opt/webdav-filemanager
+systemd 服务 webdav-filemanager 及残留链接
+pm2 进程 webdav-filemanager 及该进程日志/PID
+残留运行进程（/opt/webdav-filemanager/start.sh 或 server.py）
+/opt/webdav-filemanager（程序配置、登录密码持久化文件、临时链接状态）
 ```
 
 卸载不会主动删除用户存入的文件根目录，例如 `/data/files`。
@@ -135,7 +257,7 @@ pm2 进程 webdav-filemanager (如果存在)
 
 注意：卸载会删除程序目录 `/opt/webdav-filemanager`，其中包含 Web 登录密码持久化文件；但不会删除安装时填写的网盘文件根目录。
 
-## 6. 安装后服务信息
+## 7. 安装后服务信息
 
 默认 systemd / pm2 服务名：
 
@@ -252,7 +374,7 @@ http://服务器IP:端口/
 - 查看文件属性
 - 查看磁盘和网盘文件统计
 - 设置中查看网页根目录对应的服务器真实目录
-- 设置中修改登录密码或退出登录
+- 设置中修改登录账号、登录密码或退出登录
 
 网页里的“根目录”对应安装时填写的文件根目录，例如：
 
@@ -299,7 +421,9 @@ http://服务器IP:端口/dav/
 
 ## 10. Agent 推荐执行流程
 
-当用户要求“搭建网盘”、“部署 WebDAV”、“做一个私有云盘”、“服务器文件管理器”、“网页文件管理”、“挂载 WebDAV”时，应优先读取本文。
+当用户要求”搭建网盘”、”部署 WebDAV”、”做一个私有云盘”、”服务器文件管理器”、”网页文件管理”、”挂载 WebDAV”时，应优先读取本文。
+
+### 10.1 首次安装流程
 
 推荐流程：
 
@@ -325,6 +449,56 @@ pm2 show webdav-filemanager
 如果当前已经是 `root` 用户，安装命令可去掉 `sudo`。
 
 如果需要长期观察安装过程，可使用交互式 shell；如果只是检查文件或状态，可使用普通 exec。
+
+### 10.2 程序更新流程（重要）
+
+当用户要求”更新网盘”、”升级 WebDAV”、”更新程序”、”修复 bug”、”应用新版本”时，**必须使用 `update` 命令，不要使用 `install` 命令**。
+
+推荐命令：
+
+```bash
+cd /path/to/telegram-ai-bot
+git pull  # 如果需要从 git 仓库拉取最新代码
+sudo bash skill/script/webdav-filemanager/install.sh update
+pm2 show webdav-filemanager
+# 或者 systemctl status webdav-filemanager --no-pager
+```
+
+**为什么不能用 `install` 更新**：
+
+- `install` 会覆盖 `filemanager_auth.json`（用户在网页里修改过的账号密码）。
+- `install` 会重新询问端口、账号、密码、文件根目录，用户体验差。
+
+**`update` 的优势**：
+
+- 无需任何交互，自动保留所有配置和数据。
+- 只替换程序文件（server.py、index.html）。
+- 自动重启服务，用户无感知。
+- 保留用户在网页里修改过的账号密码和创建的临时链接。
+
+### 10.3 重新配置流程
+
+当用户要求”更改端口”、”修改账号”、”换个目录”、”重新配置”时，使用 `install` 命令：
+
+```bash
+sudo bash skill/script/webdav-filemanager/install.sh install
+```
+
+这会重新询问所有配置项，但**不会删除网盘文件根目录**（例如 `/data/files`）。
+
+### 10.4 卸载流程
+
+当用户明确要求”卸载网盘”、”删除 WebDAV”、”移除程序”时，使用 `uninstall` 命令：
+
+```bash
+sudo bash skill/script/webdav-filemanager/install.sh uninstall
+```
+
+卸载会删除程序和服务，但**不会删除网盘文件根目录**。如果用户要求”连文件一起删除”，需要额外确认后再执行：
+
+```bash
+sudo rm -rf /data/files  # 仅在用户明确要求时执行
+```
 
 ## 11. 防火墙和安全组提醒
 
@@ -397,7 +571,7 @@ python3 server.py -H 0.0.0.0 -p 8989 -r /data/files -a admin:你的密码
 
 ### 12.4 登录失败
 
-如果仍能登录，可在网页右上角设置里修改密码。
+如果仍能登录，可在网页右上角设置里修改登录账号或密码。
 
 如果忘记密码，先检查启动命令里的 `-a 用户名:密码`：
 
@@ -405,13 +579,13 @@ python3 server.py -H 0.0.0.0 -p 8989 -r /data/files -a admin:你的密码
 cat /opt/webdav-filemanager/start.sh
 ```
 
-如果曾在网页里改过密码，实际登录密码会优先保存到：
+如果曾在网页里改过登录账号或密码，实际登录凭据会优先保存到：
 
 ```bash
 /opt/webdav-filemanager/filemanager_auth.json
 ```
 
-忘记网页里修改后的密码时，可以删除该文件并重启服务，让服务回退到 `start.sh` 里的账号密码：
+忘记网页里修改后的账号或密码时，可以删除该文件并重启服务，让服务回退到 `start.sh` 里的账号密码：
 
 ```bash
 rm -f /opt/webdav-filemanager/filemanager_auth.json
@@ -442,7 +616,8 @@ curl -i -u 用户名:密码 http://127.0.0.1:8989/dav/
 - WebDAV 使用 Basic Auth，明文 HTTP 下密码可能被中间人截获。
 - 文件删除操作不可恢复，Agent 删除文件前必须确认用户意图。
 - 卸载脚本默认保留文件根目录，这是正确行为，不要擅自删除用户数据。
-- 测速文件通常使用稀疏文件创建，文件标称大小可能很大，但真实磁盘占用可能很小；需要区分“文件大小”和“实际占盘”。
+- 测速文件通常使用稀疏文件创建，文件标称大小可能很大，但真实磁盘占用可能很小；需要区分”文件大小”和”实际占盘”。
+- **Agent 执行更新时，必须使用 `update` 命令，不要使用 `install` 命令**，否则会覆盖用户在网页里修改过的账号密码。
 
 ## 14. 推荐给用户的简短说明
 
