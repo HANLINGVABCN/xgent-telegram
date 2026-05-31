@@ -26,7 +26,7 @@ Telegram AI Bot 的提示词结构、拼接逻辑、回复流程和基础功能�
 
 - `prompts/main.txt`：主提示词，当前只定义基础身份。
 - `prompts/global_addon.txt`：全局事实层，说明运行环境、上下文读取和记忆使用规则。
-- `prompts/agent_addon.txt`：Agent 与工具能力说明，定义 `exec`、`shell`、`read`、`file:`、`sendfile`、`media` 等协议。
+- `prompts/agent_addon.txt`：Agent 与工具能力说明，定义 `run`、`shell`、`stdin:*`、`shellread:*`、`shellkill:*`、`read`、`file:`、`sendfile`、`media` 等协议。
 - `prompts/agent_disabled_addon.txt`：Agent 关闭时的补充说明。
 - `prompts/extras/idle_message.txt`：空闲提醒消息的生成提示。
 - `prompts/extras/unauthorized_reply_messages.txt`：未授权用户的拒绝回复。
@@ -84,9 +84,9 @@ skill 文件简介只读取 `!` 围栏协议块：
    - `send_non_streaming_response()`
 6. 回复成功后，写入 `global_messages` 和兼容镜像 `chat_messages`。
 7. 如果 Agent 模式开启，解析模型回复里的协议块并进入最多 10 轮工具执行循环。
-8. 工具结果会作为新的上下文回灌给模型，直到模型不再请求工具或达到轮数上限。
+8. 工具结果会作为新的上下文回灌给模型，直到模型不再请求工具或达到轮数上限。shell/stdin/shellread 会先等到命令结束、交互提示、明显长驻或等待窗口到期，再把当前结果回灌给模型继续自动判断。
 
-停止按钮会设置全局停止事件。命令、媒体生成和 Agent 续问会检查该事件并尽量中断后续流程。
+停止按钮会设置全局停止事件。命令、媒体生成和 Agent 操作会检查该事件并尽量中断后续流程。
 
 ## 5. 记忆和上下文
 
@@ -98,30 +98,30 @@ skill 文件简介只读取 `!` 围栏协议块：
 
 `get_conversation_messages(global_depth)` 会取最近若干条全局记录，并把系统操作、按钮点击、Agent 命令、Agent 结果转换成模型可读文本。
 
-文件、图片和命令结果采用路径索引式记忆：
+文件、图片、run 和 shell 结果采用路径/输出索引式记忆：
 
 - 当前工具循环可以把真实内容交给模型。
 - `read` 会把文件本体直接回灌给当前工具循环：文本/代码/JSON/Markdown 等作为完整文本，图片作为图片本体。
 - `read` 的文件本体通常不会完整写入长期记忆；长期记忆通常只保存读取提示、路径和简短说明。
-- `exec --save` 会把真实命令输出写入长期上下文记录，并保存结果文件。
+- `run` 会等待一次性命令结束，把完整输出保存到 `bot_storage/command_outputs/`，并把返回码、输出路径和截断输出写入全局记忆。
+- `shell` 用于交互式或长驻会话；长驻/日志类/等待输入的命令仍在运行时会记录当前输出并回灌给 AI，AI 可继续自动决定 `stdin`、`shellread`、`shellkill` 或回复用户。
 - 后续需要完整内容时，应按路径重新读取。
 
 ## 6. Agent 基本功能
 
 Agent 模式开启后，模型可以通过协议块调用真实工具：
 
-- `exec`：执行一次性命令，输出只回到当前工具循环，不写入长期上下文。
-- `exec --save`：执行命令，把结果保存到结果文件，并把真实命令输出写入长期上下文记录。适合测试、构建、日志、诊断、Git 操作和后续可能继续追问的结果。
+- `run`：执行会自然结束的一次性命令，适合测试、构建、诊断、Git、依赖、服务状态和只读检查；完整输出会保存到路径。
 - `shell`：启动可持续交互 shell 会话并返回会话 ID。适合交互式、阻塞式、长驻、持续输出或需要多次输入的任务。
-- `stdin` / `stdin_raw` / `stdin_keys`：向已有 shell 会话输入普通文本、精确字节或按键序列。
-- `shellread`：读取已有 shell 会话的新输出，适合观察持续日志、安装进度或服务状态。
+- `stdin`：向已有 shell 会话输入终端宏；普通文本、回车、ESC、Ctrl/Alt/Shift 组合键、方向键、原始字节和等待都走这一个协议。
+- `shellread`：快速读取已有 shell 会话的新输出，只短暂捕获当前输出，不按完整命令等待窗口长等，适合用户明确要求继续观察持续日志、安装进度或服务状态。
 - `shellkill`：关闭不再需要的 shell 会话。
 - `read`：按路径读取文件本体并直接回灌给 AI。文本/代码/JSON/Markdown 等作为完整文本上下文返回，图片作为图片本体返回，其他文件视模型通道能力返回。
 - `sendfile`：把服务器上的文件发送给用户。
 - `file:`：创建或覆盖服务器文件。
 - `media`：调用默认媒体模型生成图片或其他媒体。
 
-Agent 命令会受 `prompts/extras/agent_command_blacklist.txt` 管理。协议选择应偏向保留可追溯结果：有后续价值的命令用 `exec --save`，交互式或长驻命令用 `shell`，普通 `exec` 只用于轻量临时检查。
+Agent 命令会受 `prompts/extras/agent_command_blacklist.txt` 管理。一次性命令优先走 `run`；交互、长驻或持续输出命令走 `shell`，仍在运行时会记录当前输出并回灌给 AI 继续判断。
 
 ## 7. 更新流程
 

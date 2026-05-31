@@ -8,12 +8,52 @@
 # ==============================================================
 # 注意: 不使用 set -e，因为菜单返回功能需要用 return 1
 
-# ==================== 颜色 ====================
+# ==================== 颜色 / 输出 ====================
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[0;33m'; B='\033[0;36m'; P='\033[0;35m'; W='\033[0m'
-green()  { echo -e "${G}$*${W}"; }
-yellow() { echo -e "${Y}$*${W}"; }
-red()    { echo -e "${R}$*${W}"; }
-info()   { echo -e "${B}$*${W}"; }
+
+ui_box() {
+    local title="${1:-}" color="${2:-$B}" line
+    if [ -n "$title" ]; then
+        printf '\n%b%s%b\n' "$color" "$title" "$W"
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        printf '%s\n' "$line"
+    done
+}
+
+ui_log() {
+    local color="$1"
+    shift
+    printf '%b%s%b\n' "$color" "$*" "$W"
+}
+
+ui_box_if_text() {
+    local title="$1" color="$2" text="$3"
+    [ -n "$text" ] && printf '%s\n' "$text" | ui_box "$title" "$color"
+}
+
+ui_input_marker() {
+    printf '%b> %b' "$Y" "$W"
+}
+
+ui_read() {
+    local prompt="$1" __var="$2"
+    printf '%b%s%b' "$Y" "$prompt" "$W"
+    read -r "$__var"
+    [ -t 0 ] || printf '\n'
+}
+
+ui_read_secret() {
+    local prompt="$1" __var="$2"
+    printf '%b%s%b' "$Y" "$prompt" "$W"
+    read -r -s "$__var"
+    printf '\n'
+}
+
+green()  { ui_log "$G" "$*"; }
+yellow() { ui_log "$Y" "$*"; }
+red()    { ui_log "$R" "$*"; }
+info()   { ui_log "$B" "$*"; }
 
 # ==================== 全局变量 ====================
 WORK_DIR="/etc/sing-box"
@@ -21,6 +61,7 @@ CONFIG_FILE="$WORK_DIR/config.json"
 INFO_DIR="/root/proxy_info"
 LOG_DIR="/tmp/proxy_setup_logs"
 SCRIPT_LOG=""
+TRACE_LOG=""
 MACHINE_MODE=""    # nat / low / standard
 OUTBOUND_MODE=""   # direct / warp / dual
 PROTOCOL=""        # reality / vless-ws / vmess-ws / hysteria2 / tuic / ss2022
@@ -71,14 +112,19 @@ init_runtime_logging() {
     mkdir -p "$LOG_DIR"
     chmod 700 "$LOG_DIR" 2>/dev/null || true
     SCRIPT_LOG="$LOG_DIR/proxy_setup_$(date +%Y%m%d_%H%M%S).log"
+    TRACE_LOG="$LOG_DIR/proxy_setup_trace_$(date +%Y%m%d_%H%M%S).log"
     exec > >(tee -a "$SCRIPT_LOG") 2>&1
+    exec 9>>"$TRACE_LOG"
+    export BASH_XTRACEFD=9
     chmod 600 "$SCRIPT_LOG" 2>/dev/null || true
+    chmod 600 "$TRACE_LOG" 2>/dev/null || true
     export PS4='+ [${BASH_SOURCE##*/}:${LINENO}:${FUNCNAME[0]}] '
     __LOGGING_READY=1
     __TRACE_ACTIVE=0
     __TRACE_PAUSE_DEPTH=0
     green ">>> 实时日志已开启: $SCRIPT_LOG"
-    green ">>> 从现在开始，命令和输出都会实时显示；敏感信息会尽量隐藏"
+    green ">>> 命令跟踪日志: $TRACE_LOG"
+    green ">>> 屏幕输出使用简洁文本；详细命令跟踪写入 trace 日志"
     trace_resume
 }
 
@@ -245,7 +291,7 @@ warp_register_wireguard() {
 
     if [ -z "$peer_pub" ] || [ -z "$v4_addr" ]; then
         red "WARP API 返回异常:"
-        printf '%s\n' "$reg_resp" | head -20
+        printf '%s\n' "$reg_resp" | head -20 | ui_box "WARP API 原始返回" "$R"
         return 1
     fi
 
@@ -395,28 +441,29 @@ EOCFG
 
     if [ "$curl_code" -eq 0 ] && printf '%s' "$curl_out" | grep -q '^warp='; then
         green "✅ WARP WireGuard 连通"
-        printf '%s\n' "$curl_out" | sed -n '/^ip=/p;/^colo=/p;/^warp=/p'
+        printf '%s\n' "$curl_out" | sed -n '/^ip=/p;/^colo=/p;/^warp=/p' |
+            ui_box "Cloudflare trace" "$G"
         rm -rf "$test_dir"
         return 0
     fi
 
     red "❌ WARP WireGuard 未连通"
-    echo "curl: $curl_out"
-    yellow "最近 sing-box 日志:"
-    sed -n '/endpoint\/wireguard/p;/router:/p;/ERROR/p;/FATAL/p;/lookup succeed/p;/exchanged A/p' "$test_log" | tail -40
+    printf '%s\n' "curl: $curl_out" | ui_box "WARP 连通性错误" "$R"
+    sed -n '/endpoint\/wireguard/p;/router:/p;/ERROR/p;/FATAL/p;/lookup succeed/p;/exchanged A/p' "$test_log" | tail -40 |
+        ui_box "最近 sing-box 日志" "$Y"
     rm -rf "$test_dir"
     return 1
 }
 
 check_warp_wg_status() {
-    echo ""
-    info "===== WARP WireGuard 状态 ====="
     if warp_wg_config_exists; then
-        green "✅ WireGuard 配置已就绪: $(warp_wg_config_file)"
-        echo "  IPv4: $(warp_wg_read_field v4_address)"
-        echo "  IPv6: $(warp_wg_read_field v6_address)"
-        echo "  Endpoint: $(warp_wg_read_field endpoint):$(warp_wg_read_field endpoint_port)"
-        echo "  Peer: $(warp_wg_read_field peer_public_key | cut -c1-20)..."
+        {
+            echo "✅ WireGuard 配置已就绪: $(warp_wg_config_file)"
+            echo "IPv4: $(warp_wg_read_field v4_address)"
+            echo "IPv6: $(warp_wg_read_field v6_address)"
+            echo "Endpoint: $(warp_wg_read_field endpoint):$(warp_wg_read_field endpoint_port)"
+            echo "Peer: $(warp_wg_read_field peer_public_key | cut -c1-20)..."
+        } | ui_box "WARP WireGuard 状态" "$G"
         check_warp_wg_connectivity || true
     else
         yellow "❌ 未注册 WireGuard，可用 WARP 向导注册"
@@ -606,7 +653,7 @@ warp_prepare_relogin() {
     if printf '%s' "$registration" | grep -Eq '(^|[[:space:]])ID:|type'; then
         echo ""
         yellow "检测到当前已有 WARP 注册。继续会覆盖现有客户端登录。"
-        read -p "继续覆盖当前注册? (y/N): " confirm
+        ui_read "继续覆盖当前注册? (y/N): " confirm
         case "$confirm" in
             y|Y)
                 warp_cli disconnect || true
@@ -650,7 +697,7 @@ warp_configure_proxy_mode() {
             fi
         fi
         red "无法切换到 WARP proxy 模式，已中止连接以避免影响当前 SSH。"
-        [ -n "$mode_output" ] && echo "$mode_output"
+        ui_box_if_text "warp-cli mode 输出" "$R" "$mode_output"
         yellow "如果是 Zero Trust 组织策略限制，请改用 5) Service Token / MDM 登录，或先在后台把设备模式调整为 proxy。"
         return 1
     fi
@@ -663,12 +710,12 @@ warp_configure_proxy_mode() {
             return 0
         fi
         red "无法设置 WARP SOCKS5 端口，已中止连接。"
-        [ -n "$port_output" ] && echo "$port_output"
+        ui_box_if_text "warp-cli proxy 输出" "$R" "$port_output"
         return 1
     fi
 
-    [ -n "$mode_output" ] && echo "$mode_output"
-    [ -n "$port_output" ] && echo "$port_output"
+    ui_box_if_text "warp-cli mode 输出" "$B" "$mode_output"
+    ui_box_if_text "warp-cli proxy 输出" "$B" "$port_output"
     return 0
 }
 
@@ -695,10 +742,10 @@ warp_login_free() {
 warp_login_browser() {
     local org_name=""
     ensure_warp_client_installed || return
-    echo ""
-    yellow "浏览器授权登录 Zero Trust"
-    echo "需要在浏览器里完成 Cloudflare Zero Trust 登录。"
-    read -p "组织名: " org_name
+    printf '%s\n' \
+        "需要在浏览器里完成 Cloudflare Zero Trust 登录。" |
+        ui_box "浏览器授权登录 Zero Trust" "$Y"
+    ui_read "组织名: " org_name
     [ -z "$org_name" ] && { red "组织名不能为空"; return 1; }
     warp_prepare_relogin || return
     warp_disable_mdm_config
@@ -724,7 +771,7 @@ warp_apply_team_token() {
     token_rc=$?
     if [ "$token_rc" -ne 0 ]; then
         yellow ">>> registration token 返回:"
-        [ -n "$token_output" ] && echo "$token_output"
+        ui_box_if_text "registration token 输出" "$Y" "$token_output"
         yellow ">>> 尝试兼容旧版命令 teams-enroll-token ..."
         token_output=$(warp_cli_timeout 60s teams-enroll-token "$team_token" 2>&1)
         token_rc=$?
@@ -732,12 +779,12 @@ warp_apply_team_token() {
     if [ "$token_rc" -eq 124 ]; then
         red "Team Token 提交超时。通常不是正常现象，常见原因是 token 已过期，或当前 warp-cli 版本/环境卡在注册阶段。"
         yellow "建议先改用 4) 手动粘贴最新 Team Token URL，或者 5) Service Token / MDM 登录。"
-        [ -n "$token_output" ] && echo "$token_output"
+        ui_box_if_text "Team Token 输出" "$R" "$token_output"
         return 1
     fi
     if [ "$token_rc" -ne 0 ]; then
         red "Team Token 登录失败"
-        [ -n "$token_output" ] && echo "$token_output"
+        ui_box_if_text "Team Token 输出" "$R" "$token_output"
         yellow "如果输出里有 401，一般就是 token 过期了，需要重新获取并尽快提交。"
         return 1
     fi
@@ -746,11 +793,11 @@ warp_apply_team_token() {
 
 warp_login_token_url() {
     local team_token=""
-    echo ""
-    yellow "手动粘贴 Team Token URL"
-    echo "格式类似: com.cloudflare.warp://<team>.cloudflareaccess.com/auth?token=..."
+    printf '%s\n' \
+        "格式类似: com.cloudflare.warp://<team>.cloudflareaccess.com/auth?token=..." |
+        ui_box "手动粘贴 Team Token URL" "$Y"
     trace_pause
-    read -p "Team Token URL: " team_token
+    ui_read "Team Token URL: " team_token
     warp_apply_team_token "$team_token"
     local rc=$?
     trace_resume
@@ -761,12 +808,12 @@ warp_login_zero_trust_api() {
     local org_name="" login_email="" otp_code="" step1="" step2=""
     local cf_appsession="" cf_session="" nonce="" team_token=""
     ensure_warp_client_installed || return
-    echo ""
-    yellow "自动 Zero Trust 登录"
-    echo "流程参考 fscarmen/warp 文档: 组织名 + 邮箱 + 验证码 => Team Token"
-    echo "如果接口暂时不可用，可改用浏览器授权或手动粘贴 Team Token URL。"
-    read -p "组织名: " org_name
-    read -p "登录邮箱: " login_email
+    printf '%s\n' \
+        "流程参考 fscarmen/warp 文档: 组织名 + 邮箱 + 验证码 => Team Token" \
+        "如果接口暂时不可用，可改用浏览器授权或手动粘贴 Team Token URL。" |
+        ui_box "自动 Zero Trust 登录" "$Y"
+    ui_read "组织名: " org_name
+    ui_read "登录邮箱: " login_email
     [ -z "$org_name" ] && { red "组织名不能为空"; return 1; }
     [ -z "$login_email" ] && { red "邮箱不能为空"; return 1; }
 
@@ -787,12 +834,12 @@ warp_login_zero_trust_api() {
 
     if [ -z "$cf_appsession" ] || [ -z "$cf_session" ] || [ -z "$nonce" ]; then
         yellow "接口返回无法自动解析，原始返回如下:"
-        echo "$step1"
+        ui_box_if_text "Zero Trust 接口返回" "$Y" "$step1"
         yellow "请改用浏览器授权，或从返回内容中取值后手动处理。"
         return 1
     fi
 
-    read -p "邮箱收到的验证码: " otp_code
+    ui_read "邮箱收到的验证码: " otp_code
     [ -z "$otp_code" ] && { red "验证码不能为空"; return 1; }
     green ">>> 正在换取 Team Token..."
     trace_pause
@@ -811,7 +858,7 @@ warp_login_zero_trust_api() {
     team_token=$(warp_extract_team_token "$org_name" "$step2")
     if [ -z "$team_token" ]; then
         yellow "未能自动提取 Team Token，原始返回如下:"
-        echo "$step2"
+        ui_box_if_text "Zero Trust 接口返回" "$Y" "$step2"
         yellow "你可以从返回内容中复制 com.cloudflare.warp://... 链接，再走“手动粘贴 Team Token URL”。"
         return 1
     fi
@@ -826,17 +873,16 @@ warp_login_zero_trust_api() {
 warp_login_service_token() {
     local org_name="" client_id="" client_secret=""
     ensure_warp_client_installed || return
-    echo ""
-    yellow "Service Token / MDM 登录"
-    echo "适合无浏览器的 VPS。需要在 Cloudflare 后台先创建 Service Token。"
-    echo "路径: Access controls -> Service credentials -> Service Tokens"
-    echo "并在 Team & Resources -> Devices -> Device enrollment permissions 里把策略 Action 设为 Service Auth。"
-    read -p "组织名: " org_name
-    read -p "Client ID: " client_id
+    printf '%s\n' \
+        "适合无浏览器的 VPS。需要在 Cloudflare 后台先创建 Service Token。" \
+        "路径: Access controls -> Service credentials -> Service Tokens" \
+        "并在 Team & Resources -> Devices -> Device enrollment permissions 里把策略 Action 设为 Service Auth。" |
+        ui_box "Service Token / MDM 登录" "$Y"
+    ui_read "组织名: " org_name
+    ui_read "Client ID: " client_id
     trace_pause
-    read -s -p "Client Secret: " client_secret
+    ui_read_secret "Client Secret: " client_secret
     trace_resume
-    echo ""
     [ -z "$org_name" ] && { red "组织名不能为空"; return 1; }
     [ -z "$client_id" ] && { red "Client ID 不能为空"; return 1; }
     [ -z "$client_secret" ] && { red "Client Secret 不能为空"; return 1; }
@@ -877,32 +923,26 @@ EOF
 
 install_warp_client() {
     trace_pause
-    cat <<'EOF'
-
-============================================
-   Cloudflare WARP 安装 / 登录向导
-============================================
-
- 1) 免费 WARP 注册
-    - 普通 WARP 账号，适合只需要基础 Cloudflare 出口
- 2) Zero Trust 自动登录 (组织名 + 邮箱 + 验证码)
-    - 自动向接口换取 Team Token，适合能收邮箱验证码的场景
- 3) Zero Trust 浏览器授权 (warp-cli registration new)
-    - 在浏览器里完成授权，最接近官方交互流程
- 4) 手动粘贴 Team Token URL
-    - 已拿到 com.cloudflare.warp://... 链接时使用
- 5) Service Token / MDM 登录
-    - 无浏览器 VPS 推荐，适合 Cloudflare Access 服务令牌
- 6) 检查 WARP 状态
-    - 查看注册、连接、代理端口和当前出口 IP
- 7) WireGuard 模式注册 (推荐)
-    - 不需要 warp-cli，sing-box 直连 Cloudflare
-    - 更轻量更稳定，Alpine / NAT 小鸡也能用
- 0) 返回主菜单
-    - 不更改 WARP 配置，回到综合管理菜单
-
+    cat <<'EOF' | ui_box "Cloudflare WARP 安装 / 登录向导" "$B"
+1) 免费 WARP 注册
+   - 普通 WARP 账号，适合只需要基础 Cloudflare 出口
+2) Zero Trust 自动登录 (组织名 + 邮箱 + 验证码)
+   - 自动向接口换取 Team Token，适合能收邮箱验证码的场景
+3) Zero Trust 浏览器授权 (warp-cli registration new)
+   - 在浏览器里完成授权，最接近官方交互流程
+4) 手动粘贴 Team Token URL
+   - 已拿到 com.cloudflare.warp://... 链接时使用
+5) Service Token / MDM 登录
+   - 无浏览器 VPS 推荐，适合 Cloudflare Access 服务令牌
+6) 检查 WARP 状态
+   - 查看注册、连接、代理端口和当前出口 IP
+7) WireGuard 模式注册 (推荐)
+   - 不需要 warp-cli，sing-box 直连 Cloudflare
+   - 更轻量更稳定，Alpine / NAT 小鸡也能用
+0) 返回主菜单
+   - 不更改 WARP 配置，回到综合管理菜单
 EOF
-    read -r -p "请选择 [0-7]: " warp_choice
+    ui_read "请选择 [0-7]: " warp_choice
     trace_resume
     case "$warp_choice" in
         1) warp_login_free ;;
@@ -915,33 +955,6 @@ EOF
         0) show_manage_menu; return ;;
         *) red "无效" ;;
     esac
-    return
-    trace_pause
-    echo ""
-    info "============================================"
-    info "   Cloudflare WARP 客户端安装 / 登录向导"
-    info "============================================"
-    echo ""
-    echo -e " ${G}1)${W} 免费 WARP 注册"
-    echo -e " ${G}2)${W} Zero Trust 自动登录 (组织名 + 邮箱 + 验证码)"
-    echo -e " ${G}3)${W} Zero Trust 浏览器授权 (warp-cli registration new)"
-    echo -e " ${G}4)${W} 手动粘贴 Team Token URL"
-    echo -e " ${G}5)${W} Service Token / MDM 登录"
-    echo -e " ${G}6)${W} 检查 WARP 状态"
-    echo -e " ${Y}0)${W} 返回主菜单"
-    echo ""
-    read -p "请选择 [0-6]: " warp_choice
-    trace_resume
-    case "$warp_choice" in
-        1) warp_login_free ;;
-        2) warp_login_zero_trust_api ;;
-        3) warp_login_browser ;;
-        4) warp_login_token_url ;;
-        5) warp_login_service_token ;;
-        6) check_warp_status ;;
-        0) show_manage_menu; return ;;
-        *) red "无效" ;;
-    esac
 }
 
 check_warp_status() {
@@ -950,22 +963,22 @@ check_warp_status() {
     local warp_ip4="" warp_ip6="" real_ip4="" real_ip6="" mdm_org=""
     local svc_enabled="" svc_active=""
     command -v warp-cli >/dev/null 2>&1 || { yellow "warp-cli 未安装 (WireGuard 模式无需安装)"; return; }
-    echo ""
-    info "===== WARP 状态 ====="
     command -v warp-cli >/dev/null 2>&1 || { red "warp-cli 未安装"; return; }
 
     cli_status=$(warp_cli status 2>/dev/null || true)
     cli_settings=$(warp_cli settings 2>/dev/null || true)
     cli_registration=$(warp_cli registration show 2>/dev/null || true)
-    [ -n "$cli_status" ] && { green ">>> CLI 状态"; echo "$cli_status"; }
-    [ -n "$cli_settings" ] && { green ">>> 客户端设置"; echo "$cli_settings"; }
-    [ -n "$cli_registration" ] && { green ">>> 注册信息"; echo "$cli_registration"; }
+    [ -n "$cli_status" ] && printf '%s\n' "$cli_status" | ui_box "WARP CLI 状态" "$G"
+    [ -n "$cli_settings" ] && printf '%s\n' "$cli_settings" | ui_box "WARP 客户端设置" "$G"
+    [ -n "$cli_registration" ] && printf '%s\n' "$cli_registration" | ui_box "WARP 注册信息" "$G"
 
     if command -v systemctl >/dev/null 2>&1; then
         svc_enabled=$(systemctl is-enabled warp-svc 2>/dev/null || true)
         svc_active=$(systemctl is-active warp-svc 2>/dev/null || true)
-        [ -n "$svc_enabled" ] && echo "systemd enable: $svc_enabled"
-        [ -n "$svc_active" ] && echo "systemd active: $svc_active"
+        {
+            [ -n "$svc_enabled" ] && echo "systemd enable: $svc_enabled"
+            [ -n "$svc_active" ] && echo "systemd active: $svc_active"
+        } | ui_box "warp-svc 服务状态" "$B"
         [ "$svc_enabled" = "masked" ] && yellow ">>> warp-svc.service 当前被 masked，需先 unmask 后才能正常启动"
     fi
 
@@ -974,18 +987,19 @@ check_warp_status() {
         yellow ">>> 检测到 MDM 配置: /var/lib/cloudflare-warp/mdm.xml${mdm_org:+ (organization: ${mdm_org})}"
     fi
 
-    echo ""
     port=$(warp_detect_proxy_port)
     if (echo > /dev/tcp/127.0.0.1/$port) >/dev/null 2>&1; then
-        green "✅ WARP SOCKS5 运行中 :${port}"
         warp_ip4=$(curl -x socks5h://127.0.0.1:${port} -s4m6 ip.sb 2>/dev/null)
         warp_ip6=$(curl -x socks5h://127.0.0.1:${port} -s6m6 ipv6.ip.sb 2>/dev/null)
         real_ip4=$(curl -s4m5 ip.sb 2>/dev/null)
         real_ip6=$(curl -s6m5 ipv6.ip.sb 2>/dev/null)
-        [ -n "$real_ip4" ] && echo -e "  真实 IPv4: ${Y}${real_ip4}${W}"
-        [ -n "$real_ip6" ] && echo -e "  真实 IPv6: ${Y}${real_ip6}${W}"
-        [ -n "$warp_ip4" ] && echo -e "  WARP IPv4: ${G}${warp_ip4}${W}"
-        [ -n "$warp_ip6" ] && echo -e "  WARP IPv6: ${G}${warp_ip6}${W}"
+        {
+            echo "✅ WARP SOCKS5 运行中 :${port}"
+            [ -n "$real_ip4" ] && echo "真实 IPv4: ${real_ip4}"
+            [ -n "$real_ip6" ] && echo "真实 IPv6: ${real_ip6}"
+            [ -n "$warp_ip4" ] && echo "WARP IPv4: ${warp_ip4}"
+            [ -n "$warp_ip6" ] && echo "WARP IPv6: ${warp_ip6}"
+        } | ui_box "WARP 出口 IP" "$G"
     else
         red "❌ WARP 端口 ${port} 未开启"
     fi
@@ -1142,11 +1156,13 @@ cleanup_warp_client() {
 
 cleanup_common_dependencies() {
     local c
-    red "强烈不建议删除通用依赖。"
-    yellow "这些包可能被系统、SSH 运维脚本、证书更新、其他代理或自动化任务使用:"
-    yellow "ca-certificates wget tar curl openssl jq qrencode"
-    yellow "建议直接回车保留；只有你确认这台机器专门用于本脚本且不再使用时才输入 y。"
-    read -r -p "仍要强制清理这些通用依赖? (y/n) [n]: " c
+    cat <<'EOF' | ui_box "通用依赖清理确认" "$R"
+强烈不建议删除通用依赖。
+这些包可能被系统、SSH 运维脚本、证书更新、其他代理或自动化任务使用:
+ca-certificates wget tar curl openssl jq qrencode
+建议直接回车保留；只有你确认这台机器专门用于本脚本且不再使用时才输入 y。
+EOF
+    ui_read "仍要强制清理这些通用依赖? (y/n) [n]: " c
     [ "${c:-n}" = "y" ] || return 0
 
     case "$OS" in
@@ -1187,254 +1203,22 @@ cleanup_proxy_artifacts() {
     rm -f /usr/local/bin/sing-box
 }
 
-# ==================== 第一步：选择机器类型 ====================
-select_machine_mode() {
-    while true; do
-        trace_pause
-        cat <<'EOF'
-
-============================================
- 第一步：选择机器类型
-============================================
-
- 1) NAT 小鸡
- 2) 低配 VPS
- 3) 标准 VPS
- 0) 返回主菜单
-
-EOF
-        read -r -p "请选择 [0-3]: " mode_num
-        trace_resume
-        case "$mode_num" in
-            1) MACHINE_MODE="nat"; return 0 ;;
-            2) MACHINE_MODE="low"; return 0 ;;
-            3) MACHINE_MODE="standard"; return 0 ;;
-            0) return 1 ;;
-            *) red "无效选择，请重新选择" ;;
-        esac
-        continue
-        trace_pause
-        echo ""
-        info "╔══════════════════════════════════════════════════╗"
-        info "║       第一步：选择你的机器类型                    ║"
-        info "╚══════════════════════════════════════════════════╝"
-        echo ""
-        echo -e " ${G}1)${W} 🐣 NAT 小鸡  — 无独立IP，端口映射（Alpine/OpenRC）"
-        echo -e " ${G}2)${W} 💻 低配 VPS  — 独立IP，内存 ≤256M"
-        echo -e " ${G}3)${W} 🖥️  标准 VPS  — 独立IP，内存 ≥512M，完整功能"
-        echo ""
-        echo -e " ${Y}0)${W} 返回主菜单"
-        echo ""
-        read -p "请选择 [0-3]: " mode_num
-        trace_resume
-        case "$mode_num" in
-            1) MACHINE_MODE="nat"; return 0 ;;
-            2) MACHINE_MODE="low"; return 0 ;;
-            3) MACHINE_MODE="standard"; return 0 ;;
-            0) return 1 ;;
-            *) red "无效选择，请重新选择" ;;
-        esac
-    done
-}
-
-# ==================== 第二步：选择协议 ====================
-select_protocol() {
-    while true; do
-        trace_pause
-        cat <<'EOF'
-
-============================================
- 第二步：选择协议
-============================================
-
- 1) VLESS + Reality
- 2) Shadowsocks 2022
-EOF
-        if [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ]; then
-            cat <<'EOF'
- 3) Hysteria2
- 4) TUIC v5
- 5) VLESS + WS + TLS
- 6) VMess + WS + TLS
-EOF
-        fi
-        cat <<'EOF'
- 0) 返回上一步
-
-EOF
-        read -r -p "请选择协议 [编号]: " proto_num
-        trace_resume
-        case "$proto_num" in
-            1) PROTOCOL="reality"; return 0 ;;
-            2) PROTOCOL="ss2022"; return 0 ;;
-            3) [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ] && { PROTOCOL="hysteria2"; return 0; } || red "当前模式不可用" ;;
-            4) [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ] && { PROTOCOL="tuic"; return 0; } || red "当前模式不可用" ;;
-            5) [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ] && { PROTOCOL="vless-ws"; return 0; } || red "当前模式不可用" ;;
-            6) [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ] && { PROTOCOL="vmess-ws"; return 0; } || red "当前模式不可用" ;;
-            0) return 1 ;;
-            *) red "无效选择" ;;
-        esac
-        continue
-        trace_pause
-        echo ""
-        info "╔══════════════════════════════════════════════════╗"
-        info "║       第二步：选择协议                            ║"
-        info "╚══════════════════════════════════════════════════╝"
-        echo ""
-        echo -e " ${G}1)${W} ⭐ VLESS + Reality (TCP)"
-        echo -e "    ${Y}│ 抗封锁: ★★★★★  速度: ★★★★★  不需要域名${W}"
-        echo -e "    ${Y}└ 伪装成访问微软等正规网站的TLS连接，目前最强技术${W}"
-        echo ""
-        echo -e " ${G}2)${W} Shadowsocks 2022"
-        echo -e "    ${Y}│ 抗封锁: ★★★☆☆  速度: ★★★★☆  不需要域名${W}"
-        echo -e "    ${Y}└ 经典协议新版，配置简单兼容性好，但抗封锁能力一般${W}"
-
-        local show_udp="n" show_cdn="n"
-        if [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ]; then
-            show_udp="y"
-            echo ""
-            echo -e " ${G}3)${W} Hysteria2 (QUIC/UDP)"
-            echo -e "    ${Y}│ 抗封锁: ★★★☆☆  速度: ★★★★★  不需要域名${W}"
-            echo -e "    ${Y}└ 基于QUIC的暴力加速，下载速度极快，但用UDP可能QoS被限速${W}"
-            echo ""
-            echo -e " ${G}4)${W} TUIC v5 (QUIC/UDP)"
-            echo -e "    ${Y}│ 抗封锁: ★★★☆☆  速度: ★★★★☆  不需要域名${W}"
-            echo -e "    ${Y}└ 类似Hysteria2但更稳定，适合视频通话等实时场景${W}"
-        fi
-        if [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ]; then
-            show_cdn="y"
-            echo ""
-            echo -e " ${G}5)${W} VLESS + WS + TLS (CDN中转)"
-            echo -e "    ${Y}│ 抗封锁: ★★★★☆  速度: ★★★☆☆  ${R}需要域名${W}"
-            echo -e "    ${Y}│ 流量经CF CDN中转，VPS被GFW封了也能用${W}"
-            echo -e "    ${Y}└ ping0.cc显示什么IP取决于下一步选的出站模式${W}"
-            echo ""
-            echo -e " ${G}6)${W} VMess + WS + TLS (CDN中转)"
-            echo -e "    ${Y}│ 抗封锁: ★★★☆☆  速度: ★★★☆☆  ${R}需要域名${W}"
-            echo -e "    ${Y}│ VMess比VLESS兼容性更好，老客户端都支持${W}"
-            echo -e "    ${Y}└ ping0.cc显示什么IP取决于下一步选的出站模式${W}"
-        fi
-
-        echo ""
-        echo -e " ${Y}0)${W} 返回上一步"
-        echo ""
-        read -p "请选择协议 [编号]: " proto_num
-
-        trace_resume
-        case "$proto_num" in
-            1) PROTOCOL="reality"; return 0 ;;
-            2) PROTOCOL="ss2022"; return 0 ;;
-            3) [ "$show_udp" = "y" ] && { PROTOCOL="hysteria2"; return 0; } || red "当前模式不可用" ;;
-            4) [ "$show_udp" = "y" ] && { PROTOCOL="tuic"; return 0; } || red "当前模式不可用" ;;
-            5) [ "$show_cdn" = "y" ] && { PROTOCOL="vless-ws"; return 0; } || red "当前模式不可用" ;;
-            6) [ "$show_cdn" = "y" ] && { PROTOCOL="vmess-ws"; return 0; } || red "当前模式不可用" ;;
-            0) return 1 ;;
-            *) red "无效选择" ;;
-        esac
-    done
-}
-
-# ==================== 第三步：选择出站模式 ====================
-select_outbound_mode() {
-    while true; do
-        cat <<'EOF'
-
-============================================
- 第三步：选择出站模式
-============================================
-
- 1) 直连出站
-EOF
-        if [ "$MACHINE_MODE" != "nat" ]; then
-            cat <<'EOF'
- 2) WARP 出站
- 3) 双节点模式
-EOF
-        fi
-        cat <<'EOF'
- 0) 返回上一步
-
-EOF
-        read -r -p "请选择: " out_num
-        case "$out_num" in
-            1) OUTBOUND_MODE="direct"; return 0 ;;
-            2)
-                [ "$MACHINE_MODE" = "nat" ] && { red "NAT 小鸡不支持 WARP"; continue; }
-                OUTBOUND_MODE="warp"; return 0 ;;
-            3)
-                [ "$MACHINE_MODE" = "nat" ] && { red "NAT 小鸡不支持 WARP"; continue; }
-                OUTBOUND_MODE="dual"; return 0 ;;
-            0) return 1 ;;
-            *) red "无效选择" ;;
-        esac
-        continue
-        trace_pause
-        echo ""
-        info "╔══════════════════════════════════════════════════╗"
-        info "║       第三步：选择出站模式                        ║"
-        info "║       已选协议: ${PROTOCOL}                         ║"
-        info "╚══════════════════════════════════════════════════╝"
-        echo ""
-        yellow "这一步决定你用 ping0.cc 测 IP 时看到什么："
-        echo ""
-        echo -e " ${G}1)${W} 🚀 直连出站"
-        echo -e "    ${Y}│ ping0.cc 测到 = VPS 的 IP${W}"
-        echo -e "    ${Y}│ VPS 直接访问目标网站，速度最快，无额外跳转${W}"
-        echo -e "    ${Y}└ 适合: 只需要翻墙，不需要解锁流媒体${W}"
-        echo ""
-        if [ "$MACHINE_MODE" != "nat" ]; then
-            echo -e " ${G}2)${W} 🛡️  WARP 出站"
-            echo -e "    ${Y}│ ping0.cc 测到 = Cloudflare 的 IP${W}"
-            echo -e "    ${Y}│ VPS 出站经 WARP 隧道，网站以为你是CF用户${W}"
-            echo -e "    ${Y}│ 可解锁 ChatGPT / Netflix / Disney+ 等${W}"
-            echo -e "    ${Y}└ 前提: 需要先用主菜单第5项安装 WARP ${W}"
-            echo ""
-            echo -e " ${G}3)${W} ⭐ 双节点模式 (推荐)"
-            echo -e "    ${Y}│ 同时生成两个节点，两个端口${W}"
-            echo -e "    ${Y}│ 节点1: 直连 → 速度快，日常使用${W}"
-            echo -e "    ${Y}│ 节点2: WARP → 解锁流媒体时切换过来${W}"
-            echo -e "    ${Y}└ 客户端里两个节点按需切换，最灵活${W}"
-            echo ""
-        fi
-        echo -e " ${Y}0)${W} 返回上一步"
-        echo ""
-        read -p "请选择: " out_num
-        trace_resume
-        case "$out_num" in
-            1) OUTBOUND_MODE="direct"; return 0 ;;
-            2)
-                [ "$MACHINE_MODE" = "nat" ] && { red "NAT小鸡不支持WARP"; continue; }
-                OUTBOUND_MODE="warp"; return 0 ;;
-            3)
-                [ "$MACHINE_MODE" = "nat" ] && { red "NAT小鸡不支持WARP"; continue; }
-                OUTBOUND_MODE="dual"; return 0 ;;
-            0) return 1 ;;
-            *) red "无效选择" ;;
-        esac
-    done
-}
-
 # 重新覆盖三步菜单：保留选项说明，同时避免逐行 echo 刷屏
 select_machine_mode() {
     while true; do
         trace_pause
-        cat <<'EOF'
+        cat <<'EOF' | ui_box "第一步：选择机器类型" "$B"
+1) NAT 小鸡
+   - 无独立公网 IP，适合面板端口映射 / Alpine / OpenRC
+2) 低配 VPS
+   - 独立公网 IP，内存较小，走保守配置
+3) 标准 VPS
+   - 独立公网 IP，资源更充足，功能最完整
 
-============================================
- 第一步：选择机器类型
-============================================
-
- 1) NAT 小鸡
-    - 无独立公网 IP，适合面板端口映射 / Alpine / OpenRC
- 2) 低配 VPS
-    - 独立公网 IP，内存较小，走保守配置
- 3) 标准 VPS
-    - 独立公网 IP，资源更充足，功能最完整
-
- 0) 返回主菜单
-    - 不继续安装，回到综合管理菜单
+0) 返回主菜单
+   - 不继续安装，回到综合管理菜单
 EOF
-        read -r -p "请选择 [0-3]: " mode_num
+        ui_read "请选择 [0-3]: " mode_num
         trace_resume
         case "$mode_num" in
             1) MACHINE_MODE="nat"; return 0 ;;
@@ -1449,42 +1233,39 @@ EOF
 select_protocol() {
     while true; do
         trace_pause
-        cat <<'EOF'
-
-============================================
- 第二步：选择协议
-============================================
-
- 1) VLESS + Reality
-    - 抗封锁最强，不需要域名，优先推荐
- 2) Shadowsocks 2022
-    - 配置最简单，兼容性好
-EOF
         if [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ]; then
-            cat <<'EOF'
+            cat <<'EOF' | ui_box "第二步：选择协议" "$B"
+1) VLESS + Reality
+   - 抗封锁最强，不需要域名，优先推荐
+2) Shadowsocks 2022
+   - 配置最简单，兼容性好
+3) Hysteria2
+   - UDP / QUIC，高速下载，依赖 UDP 环境
+4) TUIC v5
+   - UDP / QUIC，更稳一些，适合实时场景
+5) VLESS + WS + TLS
+   - 走 CDN，中转稳定，需要域名
+6) VMess + WS + TLS
+   - 兼容老客户端，需要域名
 
- 3) Hysteria2
-    - UDP / QUIC，高速下载，依赖 UDP 环境
- 4) TUIC v5
-    - UDP / QUIC，更稳一些，适合实时场景
- 5) VLESS + WS + TLS
-    - 走 CDN，中转稳定，需要域名
- 6) VMess + WS + TLS
-    - 兼容老客户端，需要域名
+0) 返回上一步
+   - 回到机器类型选择
 EOF
         else
-            cat <<'EOF'
+            cat <<'EOF' | ui_box "第二步：选择协议" "$B"
+1) VLESS + Reality
+   - 抗封锁最强，不需要域名，优先推荐
+2) Shadowsocks 2022
+   - 配置最简单，兼容性好
 
- 提示:
-    - NAT 小鸡当前只支持 1) 和 2)
+提示:
+   - NAT 小鸡当前只支持 1) 和 2)
+
+0) 返回上一步
+   - 回到机器类型选择
 EOF
         fi
-        cat <<'EOF'
-
- 0) 返回上一步
-    - 回到机器类型选择
-EOF
-        read -r -p "请选择协议 [编号]: " proto_num
+        ui_read "请选择协议 [编号]: " proto_num
         trace_resume
         case "$proto_num" in
             1) PROTOCOL="reality"; return 0 ;;
@@ -1502,41 +1283,39 @@ EOF
 select_outbound_mode() {
     while true; do
         trace_pause
-        cat <<EOF
-
-============================================
- 第三步：选择出站模式
-============================================
-
- 已选协议: ${PROTOCOL}
-
- 1) 直连出站
-    - ping0.cc 显示 VPS 自己的 IP
-    - 速度最快，适合日常使用
-EOF
         if [ "$MACHINE_MODE" != "nat" ]; then
-            cat <<'EOF'
+            cat <<EOF | ui_box "第三步：选择出站模式" "$B"
+已选协议: ${PROTOCOL}
 
- 2) WARP 出站
-    - ping0.cc 显示 Cloudflare 的 IP
-    - 适合需要 WARP 出口的场景
- 3) 双节点模式
-    - 同时生成直连节点和 WARP 节点
-    - 平时走直连，需要时切到 WARP
+1) 直连出站
+   - 显示 VPS 自己的 IP
+   - 速度最快，适合日常使用
+2) WARP 出站
+   - 显示 Cloudflare 的 IP
+   - 适合需要 WARP 出口的场景
+3) 双节点模式
+   - 同时生成直连节点和 WARP 节点
+   - 平时走直连，需要时切到 WARP
+
+0) 返回上一步
+   - 回到协议选择
 EOF
         else
-            cat <<'EOF'
+            cat <<EOF | ui_box "第三步：选择出站模式" "$B"
+已选协议: ${PROTOCOL}
 
- 提示:
-    - NAT 小鸡不支持 WARP / 双节点
+1) 直连出站
+   - 显示 VPS 自己的 IP
+   - 速度最快，适合日常使用
+
+提示:
+   - NAT 小鸡不支持 WARP / 双节点
+
+0) 返回上一步
+   - 回到协议选择
 EOF
         fi
-        cat <<'EOF'
-
- 0) 返回上一步
-    - 回到协议选择
-EOF
-        read -r -p "请选择: " out_num
+        ui_read "请选择: " out_num
         trace_resume
         case "$out_num" in
             1) OUTBOUND_MODE="direct"; return 0 ;;
@@ -1554,27 +1333,24 @@ EOF
 
 # ==================== 第四步：收集信息 ====================
 collect_info() {
-    echo ""
-    info "╔══════════════════════════════════════════════════╗"
-    info "║       第四步：配置信息                            ║"
-    info "╚══════════════════════════════════════════════════╝"
-    echo ""
+    printf '%s\n' "接下来填写节点名称、监听端口、域名和 WARP 出站方式。" |
+        ui_box "第四步：配置信息" "$B"
 
-    read -p "节点备注名称 [MyProxy]: " tmp; NODE_NAME="${tmp:-MyProxy}"
+    ui_read "节点备注名称 [MyProxy]: " tmp; NODE_NAME="${tmp:-MyProxy}"
     # 清理中文标点，防止乱码（全角破折号→普通横杠，全角逗号/句号等去掉）
     NODE_NAME=$(echo "$NODE_NAME" | sed 's/——/-/g; s/—/-/g; s/，/-/g; s/。//g; s/：/-/g; s/（/(/g; s/）/)/g')
     get_ip
 
     if [ "$MACHINE_MODE" = "nat" ]; then
         yellow "NAT小鸡没有独立公网IP，填面板映射页面显示的公网IP"
-        read -p "面板映射公网IP [$SERVER_IP]: " tmp; SERVER_IP="${tmp:-$SERVER_IP}"
-        read -p "内部监听端口 [443]: " tmp; INTERNAL_PORT="${tmp:-443}"
-        read -p "外部映射端口 [443]: " tmp; SERVER_PORT="${tmp:-443}"
+        ui_read "面板映射公网IP [$SERVER_IP]: " tmp; SERVER_IP="${tmp:-$SERVER_IP}"
+        ui_read "内部监听端口 [443]: " tmp; INTERNAL_PORT="${tmp:-443}"
+        ui_read "外部映射端口 [443]: " tmp; SERVER_PORT="${tmp:-443}"
     else
-        read -p "服务器公网IP [$SERVER_IP]: " tmp; SERVER_IP="${tmp:-$SERVER_IP}"
+        ui_read "服务器公网IP [$SERVER_IP]: " tmp; SERVER_IP="${tmp:-$SERVER_IP}"
         case "$PROTOCOL" in
-            ss2022) read -p "监听端口 [8388]: " tmp; SERVER_PORT="${tmp:-8388}" ;;
-            *)      read -p "监听端口 [443]: " tmp;  SERVER_PORT="${tmp:-443}" ;;
+            ss2022) ui_read "监听端口 [8388]: " tmp; SERVER_PORT="${tmp:-8388}" ;;
+            *)      ui_read "监听端口 [443]: " tmp;  SERVER_PORT="${tmp:-443}" ;;
         esac
         INTERNAL_PORT="$SERVER_PORT"
     fi
@@ -1582,46 +1358,42 @@ collect_info() {
 
     # CDN 域名
     if [ "$PROTOCOL" = "vless-ws" ] || [ "$PROTOCOL" = "vmess-ws" ]; then
-        echo ""
         yellow "CDN中转需要一个已托管到 Cloudflare 的域名"
-        read -p "请输入域名: " DOMAIN
+        ui_read "请输入域名: " DOMAIN
         [ -z "$DOMAIN" ] && { red "域名不能为空"; exit 1; }
     fi
 
     # Reality SNI
-    [ "$PROTOCOL" = "reality" ] && { read -p "Reality 伪装 SNI [www.microsoft.com]: " tmp; SNI="${tmp:-www.microsoft.com}"; }
+    [ "$PROTOCOL" = "reality" ] && { ui_read "Reality 伪装 SNI [www.microsoft.com]: " tmp; SNI="${tmp:-www.microsoft.com}"; }
 
     # 双节点端口
     if [ "$OUTBOUND_MODE" = "dual" ]; then
-        echo ""
         yellow "双节点模式需要两个端口"
         DIRECT_PORT="$SERVER_PORT"
         local dp2=$((SERVER_PORT + 1))
-        read -p "直连节点端口 [${DIRECT_PORT}]: " tmp; DIRECT_PORT="${tmp:-$DIRECT_PORT}"
-        read -p "WARP节点端口 [${dp2}]: " tmp; WARP_PORT="${tmp:-$dp2}"
+        ui_read "直连节点端口 [${DIRECT_PORT}]: " tmp; DIRECT_PORT="${tmp:-$DIRECT_PORT}"
+        ui_read "WARP节点端口 [${dp2}]: " tmp; WARP_PORT="${tmp:-$dp2}"
     fi
 
     # WARP 出站方式选择
     if [ "$OUTBOUND_MODE" = "warp" ] || [ "$OUTBOUND_MODE" = "dual" ]; then
-        echo ""
-        cat <<'EOWARPMODE'
- WARP 出站方式:
-  1) WireGuard 直连 (推荐)
-     - 不需要安装 warp-cli，sing-box 原生支持
-     - 更轻量、更稳定，Alpine 也能用
-  2) 传统 SOCKS5 代理
-     - 需要先用主菜单第5项安装 WARP 客户端
-     - 通过 warp-cli 本地 SOCKS5 中转
+        cat <<'EOWARPMODE' | ui_box "WARP 出站方式" "$B"
+1) WireGuard 直连 (推荐)
+   - 不需要安装 warp-cli，sing-box 原生支持
+   - 更轻量、更稳定，Alpine 也能用
+2) 传统 SOCKS5 代理
+   - 需要先用主菜单第5项安装 WARP 客户端
+   - 通过 warp-cli 本地 SOCKS5 中转
 EOWARPMODE
-        read -r -p "请选择 [1/2] [1]: " warp_mode_choice
+        ui_read "请选择 [1/2] [1]: " warp_mode_choice
         case "${warp_mode_choice:-1}" in
             2)
                 WARP_WG_MODE="socks5"
-                read -p "WARP SOCKS5 本地端口 [40000]: " tmp; WARP_SOCKS_PORT="${tmp:-40000}"
+                ui_read "WARP SOCKS5 本地端口 [40000]: " tmp; WARP_SOCKS_PORT="${tmp:-40000}"
                 if ! (echo > /dev/tcp/127.0.0.1/$WARP_SOCKS_PORT) >/dev/null 2>&1; then
                     yellow "⚠️  WARP 端口 ${WARP_SOCKS_PORT} 未检测到"
                     yellow "请先用主菜单第5项安装 WARP"
-                    read -p "继续安装? (y/n) [y]: " tmp
+                    ui_read "继续安装? (y/n) [y]: " tmp
                     [ "${tmp:-y}" != "y" ] && return 1
                 fi
                 ;;
@@ -1795,18 +1567,17 @@ output_node() {
     esac
 
     # 打印
-    echo ""
-    info "━━━━━ ${name} ━━━━━"
-    echo -e "${Y}▶ 分享链接:${W}"
-    echo "$LINK"
-    echo ""
-    echo -e "${Y}▶ Clash Meta / Mihomo:${W}"
-    echo -e "proxies:\n${CY}"
-    echo ""
+    {
+        echo "分享链接:"
+        echo "$LINK"
+        echo ""
+        echo "Clash Meta / Mihomo:"
+        printf 'proxies:\n%b\n' "$CY"
+    } | ui_box "${name}" "$B"
 
     # 二维码
     if command -v qrencode >/dev/null 2>&1 && [ -n "$LINK" ]; then
-        echo -e "${Y}▶ 二维码:${W}"
+        printf '%s\n' "二维码:" | ui_box "${name}" "$Y"
         qrencode -t ANSIUTF8 "$LINK"
     fi
 
@@ -1842,38 +1613,31 @@ output_all() {
 EOH
     [ "$MACHINE_MODE" = "nat" ] && echo "# 内部端口: ${INTERNAL_PORT}" >> "$CLASH_FILE"
 
-    echo ""
-    info "╔══════════════════════════════════════════════════════╗"
-    info "║       安装完成 — ${NODE_NAME}"
-    info "╚══════════════════════════════════════════════════════╝"
-    echo "  机器: ${MACHINE_MODE} | 协议: ${PROTOCOL} | 出站: ${outmode_desc}"
-    echo "  IP: ${SERVER_IP} | 端口: ${SERVER_PORT}"
-    [ "$MACHINE_MODE" = "nat" ] && echo "  内部端口: ${INTERNAL_PORT}"
+    {
+        echo "机器: ${MACHINE_MODE} | 协议: ${PROTOCOL} | 出站: ${outmode_desc}"
+        echo "IP: ${SERVER_IP} | 端口: ${SERVER_PORT}"
+        [ "$MACHINE_MODE" = "nat" ] && echo "内部端口: ${INTERNAL_PORT}"
+    } | ui_box "安装完成 — ${NODE_NAME}" "$G"
 
     # ===== 出站模式大横幅 =====
-    echo ""
     if [ "$OUTBOUND_MODE" = "direct" ]; then
-        echo -e "${G}╔══════════════════════════════════════════════════╗${W}"
-        echo -e "${G}║  🚀 直连出站模式                                  ║${W}"
-        echo -e "${G}║  你用 ping0.cc 测到的 IP = VPS 的 IP              ║${W}"
-        echo -e "${G}║  流量路径: 你 → VPS → 网站                        ║${W}"
-        echo -e "${G}╚══════════════════════════════════════════════════╝${W}"
+        cat <<'EOF' | ui_box "直连出站模式" "$G"
+显示 VPS 的 IP
+流量路径: 你 → VPS → 网站
+EOF
     elif [ "$OUTBOUND_MODE" = "warp" ]; then
-        echo -e "${B}╔══════════════════════════════════════════════════╗${W}"
-        echo -e "${B}║  🛡️  WARP 出站模式                                ║${W}"
-        echo -e "${B}║  你用 ping0.cc 测到的 IP = Cloudflare 的 IP       ║${W}"
-        echo -e "${B}║  流量路径: 你 → VPS → WARP → CF → 网站            ║${W}"
-        echo -e "${B}║  可解锁 ChatGPT / Netflix 等                      ║${W}"
-        echo -e "${B}╚══════════════════════════════════════════════════╝${W}"
+        cat <<'EOF' | ui_box "WARP 出站模式" "$B"
+显示 Cloudflare 的 IP
+流量路径: 你 → VPS → WARP → CF → 网站
+可解锁 ChatGPT / Netflix 等
+EOF
     elif [ "$OUTBOUND_MODE" = "dual" ]; then
-        echo -e "${P}╔══════════════════════════════════════════════════╗${W}"
-        echo -e "${P}║  ⭐ 双节点模式                                    ║${W}"
-        echo -e "${P}║  节点1 (端口${DIRECT_PORT}): 直连 → ping0.cc = VPS IP      ║${W}"
-        echo -e "${P}║  节点2 (端口${WARP_PORT}): WARP → ping0.cc = CF IP       ║${W}"
-        echo -e "${P}║  客户端里两个节点按需切换                          ║${W}"
-        echo -e "${P}╚══════════════════════════════════════════════════╝${W}"
+        {
+            echo "节点1 (端口${DIRECT_PORT}): 直连 → VPS IP"
+            echo "节点2 (端口${WARP_PORT}): WARP → Cloudflare IP"
+            echo "客户端里两个节点按需切换"
+        } | ui_box "双节点模式" "$P"
     fi
-    echo ""
 
     if [ "$OUTBOUND_MODE" = "dual" ]; then
         output_node "$SERVER_IP" "$DIRECT_PORT" "${NODE_NAME}-直连" "direct"
@@ -1881,18 +1645,17 @@ EOH
     elif [ "$OUTBOUND_MODE" = "warp" ]; then
         # WARP 单节点: 节点名加后缀
         output_node "$SERVER_IP" "$SERVER_PORT" "${NODE_NAME}-WARP" "warp"
-        echo ""
-        yellow "提示: 此节点的分享链接和直连模式相同，"
-        yellow "因为区别在服务器端(出站走WARP)，客户端连接方式不变。"
-        yellow "但你访问 ping0.cc 时会看到 Cloudflare 的 IP，说明 WARP 已生效。"
+        cat <<'EOF' | ui_box "WARP 节点提示" "$Y"
+此节点的分享链接和直连模式相同。
+区别在服务器端(出站走WARP)，客户端连接方式不变。
+访问外部 IP 检测服务时会看到 Cloudflare 的 IP，说明 WARP 已生效。
+EOF
     else
         output_node "$SERVER_IP" "$SERVER_PORT" "${NODE_NAME}-直连" "direct"
     fi
 
     # ===== 生成完整 Clash Meta 配置文件 =====
-    echo ""
-    info "━━━━━ 完整 Clash Meta / Mihomo 配置 ━━━━━"
-    echo ""
+    info "完整 Clash Meta / Mihomo 配置"
 
     local CLASH_FILE="$INFO_DIR/${SAFE_NAME}_clash.yaml"
     local ws_path=""; [ -f "$WORK_DIR/ws_path.txt" ] && ws_path=$(cat "$WORK_DIR/ws_path.txt")
@@ -2066,12 +1829,9 @@ EOCLASH
 EOCMD
     chmod 600 "$CLASH_FILE" 2>/dev/null || true
 
-    echo ""
-    echo ""
-    green "================= ⬇️ 请复制下方配置 ⬇️ ================="
+    green "⬇️ 请复制下方配置 ⬇️"
     cat "$CLASH_FILE"
-    green "================= ⬆️ 请复制上方配置 ⬆️ ================="
-    echo ""
+    green "⬆️ 请复制上方配置 ⬆️"
 
     green ">>> 所有信息已保存到: ${CLASH_FILE}"
     yellow ">>> 此内容可直接全选复制，保存为 .yaml 文件导入 FlClash"
@@ -2081,103 +1841,88 @@ EOCMD
 
 # ==================== 知识科普 ====================
 show_cf_knowledge() {
-    echo ""
-    info "╔══════════════════════════════════════════════════════════════╗"
-    info "║          Cloudflare 完整知识科普                            ║"
-    info "╚══════════════════════════════════════════════════════════════╝"
+    cat <<'EOF' | ui_box "Cloudflare 完整知识科普" "$P"
+第一章: 两段路原理
 
-    echo ""
-    echo -e "${P}━━━ 第一章: 两段路原理 ━━━${W}"
-    echo ""
-    echo "  你的手机 ──①入站──→ VPS ──②出站──→ ping0.cc"
-    echo ""
-    echo "  ① 入站 = 你怎么连到VPS（Reality / CDN中转 / 直连）"
-    echo "  ② 出站 = VPS怎么访问目标网站（直连 / WARP）"
-    echo ""
-    echo "  ping0.cc 显示的 IP = 出站的 IP！"
-    echo "  你客户端连接的 IP = 入站的 IP！"
+你的手机 ──①入站──→ VPS ──②出站──→ 外部 IP 检测服务
 
-    echo ""
-    echo -e "${P}━━━ 第二章: 三种组合对比 ━━━${W}"
-    echo ""
-    echo "┌──────────────────┬──────────────┬──────────────┬────────────┐"
-    echo "│ 组合             │ ping0.cc显示 │ 客户端连的IP │ 需要域名   │"
-    echo "├──────────────────┼──────────────┼──────────────┼────────────┤"
-    echo "│ Reality+直连     │ VPS IP       │ VPS IP       │ ❌         │"
-    echo "│ Reality+WARP出站 │ CF WARP IP   │ VPS IP       │ ❌         │"
-    echo "│ CDN中转+直连     │ VPS IP       │ CF CDN IP    │ ✅         │"
-    echo "│ CDN中转+WARP出站 │ CF WARP IP   │ CF CDN IP    │ ✅ 最安全  │"
-    echo "└──────────────────┴──────────────┴──────────────┴────────────┘"
-    echo ""
-    echo "  CDN中转的价值: 隐藏VPS真实IP，GFW封不到你的VPS"
-    echo "  WARP出站的价值: 解锁ChatGPT/Netflix等，ping0.cc显示CF IP"
+① 入站 = 你怎么连到VPS（Reality / CDN中转 / 直连）
+② 出站 = VPS怎么访问目标网站（直连 / WARP）
 
-    echo ""
-    echo -e "${P}━━━ 第三章: 为什么CDN中转CF能看到明文？ ━━━${W}"
-    echo ""
-    echo "  你 ──TLS加密──→ CF边缘 ──解密,再加密──→ VPS"
-    echo "                    ↑"
-    echo "           CF是中间人，必须解密才能转发"
-    echo "           所以CF理论上能看到你的数据"
-    echo ""
-    echo "  对比 Reality:"
-    echo "  你 ──端到端TLS加密──→ VPS（中间没人能看到）"
+外部显示的 IP = 出站的 IP！
+你客户端连接的 IP = 入站的 IP！
 
-    echo ""
-    echo -e "${P}━━━ 第四章: Zero Trust / WARP 是什么 ━━━${W}"
-    echo ""
-    echo "  WARP        = CF的免费VPN (1.1.1.1 App)"
-    echo "  Zero Trust  = CF企业安全平台 (50人以下免费)"
-    echo "  Teams       = Zero Trust的旧名"
-    echo ""
-    echo "  在VPS上装WARP的流程:"
-    echo "  1. CF Dashboard → Zero Trust → 创建组织 / Device enrollment 策略"
-    echo "  2. VPS上安装 cloudflare-warp"
-    echo "  3. 登录方式 1: warp-cli registration new <组织名> → 浏览器授权"
-    echo "  4. 登录方式 2: 复制 com.cloudflare.warp://... Team Token URL → warp-cli registration token"
-    echo "  5. 登录方式 3: Service Token + MDM (auth_client_id + auth_client_secret)"
-    echo "  6. 最后切到 proxy 模式，127.0.0.1:40000 就是本地 WARP 代理"
+第二章: 三种组合对比
 
-    echo ""
-    echo -e "${P}━━━ 第五章: 流量路径图 ━━━${W}"
-    echo ""
-    echo -e "  ${G}【直连】${W}             手机 → VPS → 网站"
-    echo -e "  ${G}【WARP出站】${W}         手机 → VPS → WARP → CF → 网站"
-    echo -e "  ${G}【CDN中转】${W}          手机 → CF边缘 → VPS → 网站"
-    echo -e "  ${G}【CDN+WARP(终极)】${W}   手机 → CF边缘 → VPS → WARP → CF → 网站"
-    echo ""
+┌──────────────────┬──────────────┬──────────────┬────────────┐
+│ 组合             │ 外部显示IP   │ 客户端连的IP │ 需要域名   │
+├──────────────────┼──────────────┼──────────────┼────────────┤
+│ Reality+直连     │ VPS IP       │ VPS IP       │ 否         │
+│ Reality+WARP出站 │ CF WARP IP   │ VPS IP       │ 否         │
+│ CDN中转+直连     │ VPS IP       │ CF CDN IP    │ 是         │
+│ CDN中转+WARP出站 │ CF WARP IP   │ CF CDN IP    │ 是，最安全 │
+└──────────────────┴──────────────┴──────────────┴────────────┘
+
+CDN中转的价值: 隐藏VPS真实IP，GFW封不到你的VPS
+WARP出站的价值: 解锁ChatGPT/Netflix等，外部显示 Cloudflare IP
+
+第三章: 为什么CDN中转CF能看到明文？
+
+你 ──TLS加密──→ CF边缘 ──解密,再加密──→ VPS
+                  ↑
+         CF是中间人，必须解密才能转发
+         所以CF理论上能看到你的数据
+
+对比 Reality:
+你 ──端到端TLS加密──→ VPS（中间没人能看到）
+
+第四章: Zero Trust / WARP 是什么
+
+WARP        = CF的免费VPN (1.1.1.1 App)
+Zero Trust  = CF企业安全平台 (50人以下免费)
+Teams       = Zero Trust的旧名
+
+在VPS上装WARP的流程:
+1. CF Dashboard → Zero Trust → 创建组织 / Device enrollment 策略
+2. VPS上安装 cloudflare-warp
+3. 登录方式 1: warp-cli registration new <组织名> → 浏览器授权
+4. 登录方式 2: 复制 com.cloudflare.warp://... Team Token URL → warp-cli registration token
+5. 登录方式 3: Service Token + MDM (auth_client_id + auth_client_secret)
+6. 最后切到 proxy 模式，127.0.0.1:40000 就是本地 WARP 代理
+
+第五章: 流量路径图
+
+【直连】             手机 → VPS → 网站
+【WARP出站】         手机 → VPS → WARP → CF → 网站
+【CDN中转】          手机 → CF边缘 → VPS → 网站
+【CDN+WARP(终极)】   手机 → CF边缘 → VPS → WARP → CF → 网站
+EOF
 }
 
 # ==================== 管理菜单 ====================
 show_manage_menu() {
     while true; do
         trace_pause
-        cat <<'EOF'
+        cat <<'EOF' | ui_box "综合代理部署脚本 v3.0" "$B"
+1) 全新安装 / 重置
+   - 从机器类型、协议、出站模式开始重新部署 sing-box
+2) 查看当前节点信息
+   - 打印已保存的节点链接、Clash/FlClash 配置和导入提示
+3) 重启服务
+   - 重启 sing-box，让现有配置重新生效
+4) 卸载
+   - 删除 sing-box 服务、配置目录和已保存节点信息
+5) WARP 安装向导
+   - WireGuard 模式 (推荐) / 传统 warp-cli 登录
+6) WARP 状态检查
+   - 查看 WireGuard / warp-cli 注册状态和出口 IP
+7) 知识科普
+   - 解释直连、WARP、CDN、Zero Trust 等概念
 
-╔══════════════════════════════════════════════════╗
-║       综合代理部署脚本 v3.0                      ║
-╚══════════════════════════════════════════════════╝
-
- 1) 📦 全新安装 / 重置
-    - 从机器类型、协议、出站模式开始重新部署 sing-box
- 2) 📋 查看当前节点信息
-    - 打印已保存的节点链接、Clash/FlClash 配置和导入提示
- 3) 🔄 重启服务
-    - 重启 sing-box，让现有配置重新生效
- 4) 🗑️  卸载
-    - 删除 sing-box 服务、配置目录和已保存节点信息
- 5) 🌐 WARP 安装向导
-    - WireGuard 模式 (推荐) / 传统 warp-cli 登录
- 6) 📊 WARP 状态检查
-    - 查看 WireGuard / warp-cli 注册状态和出口 IP
- 7) ❓ 知识科普
-    - 解释直连、WARP、CDN、Zero Trust 等概念
-
- 0) 退出
-    - 关闭脚本，不做额外操作
-
+0) 退出
+   - 关闭脚本，不做额外操作
 EOF
-        read -r -p "请选择 [0-7]: " action
+        ui_read "请选择 [0-7]: " action
         trace_resume
         case "$action" in
             1) do_full_install ;;
@@ -2191,35 +1936,6 @@ EOF
             *) red "无效" ;;
         esac
         continue
-        trace_pause
-        echo ""
-        info "╔══════════════════════════════════════════════════╗"
-        info "║       综合代理部署脚本 v3.0                      ║"
-        info "╚══════════════════════════════════════════════════╝"
-        echo ""
-        echo -e " ${G}1)${W} 📦 全新安装 / 重置"
-        echo -e " ${G}2)${W} 📋 查看当前节点信息"
-        echo -e " ${G}3)${W} 🔄 重启服务"
-        echo -e " ${G}4)${W} 🗑️  卸载"
-        echo -e " ${G}5)${W} 🌐 WARP 安装向导"
-        echo -e " ${G}6)${W} 📊 WARP 状态检查"
-        echo -e " ${G}7)${W} ❓ 知识科普"
-        echo ""
-        echo -e " ${Y}0)${W} 退出"
-        echo ""
-        read -p "请选择 [0-7]: " action
-        trace_resume
-        case "$action" in
-            1) do_full_install ;;
-            2) show_saved_info ;;
-            3) restart_service ;;
-            4) do_uninstall ;;
-            5) install_warp_client ;;
-            6) check_warp_status ;;
-            7) show_cf_knowledge ;;
-            0) exit 0 ;;
-            *) red "无效" ;;
-        esac
     done
 }
 
@@ -2230,21 +1946,21 @@ show_saved_info() {
         for f in "$INFO_DIR"/*.yaml; do
             [ -f "$f" ] || continue
             found=1
-            echo ""
-            info "━━━ 配置文件: $f ━━━"
+            printf '%s\n' "$f" | ui_box "配置文件" "$B"
             # 打印全部内容（包括注释里的节点链接和下面的规则）
-            green "================= ⬇️ 配置文件内容 ⬇️ ================="
+            green "⬇️ 配置文件内容 ⬇️"
             cat "$f"
-            green "================= ⬆️ 配置文件内容 ⬆️ ================="
-            echo ""
+            green "⬆️ 配置文件内容 ⬆️"
             green "完整文件路径: $f"
             yellow "导入方式: 直接复制上方所有内容（或者下载文件），导入到 FlClash"
-            echo ""
         done
         # 兼容旧版 txt
         for f in "$INFO_DIR"/*.txt; do
             [ -f "$f" ] || continue
-            found=1; cat "$f"; echo ""
+            found=1
+            printf '%s\n' "$f" | ui_box "旧版节点信息" "$B"
+            cat "$f"
+            green "⬆️ 旧版节点信息结束 ⬆️"
         done
         [ $found -eq 0 ] && red "未找到节点信息"
     else
@@ -2261,9 +1977,11 @@ restart_service() {
 do_uninstall() {
     is_root
     detect_os
-    yellow "将深度卸载 sing-box / 节点配置 / WARP 客户端 / Cloudflare 源 / 脚本日志 / 临时文件 / 本机防火墙放行规则。"
-    yellow "不会删除当前脚本文件；云厂商安全组仍需在控制台手动删除。"
-    read -r -p "确认深度卸载? (y/n): " c
+    cat <<'EOF' | ui_box "深度卸载确认" "$Y"
+将深度卸载 sing-box / 节点配置 / WARP 客户端 / Cloudflare 源 / 脚本日志 / 临时文件 / 本机防火墙放行规则。
+不会删除当前脚本文件；云厂商安全组仍需在控制台手动删除。
+EOF
+    ui_read "确认深度卸载? (y/n): " c
     [ "$c" = "y" ] || return
 
     close_proxy_firewall

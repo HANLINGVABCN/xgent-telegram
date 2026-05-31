@@ -21,7 +21,7 @@ cd /opt && sudo git clone https://github.com/HANLINGVABCN/telegram-ai-bot.git &&
 - 流式回复：支持流式和非流式两种模型请求方式。
 - 文件与图片处理：可接收文件、图片、贴纸，并按路径索引保存上下文。
 - Prompt 管理：主提示词、全局附加提示词、Agent 提示词均可通过文件维护。
-- Agent 模式：可执行命令、读写文件、发送服务器文件、管理交互式 shell 会话、调用媒体生成。
+- Agent 模式：通过 shell 会话执行命令、读写文件、发送服务器文件、管理交互式 shell 会话、调用媒体生成。
 - 命令黑名单：Agent 命令可通过 `prompts/extras/agent_command_blacklist.txt` 管理拦截规则。
 
 ## 项目结构
@@ -182,7 +182,7 @@ UPDATE_ZIP_URL=https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot/zipball
 1. 主提示词。
 2. 全局附加提示词。
 3. Agent 提示词。
-4. 当前运行目录、上传目录、命令结果目录等绝对路径信息。
+4. 当前运行目录、上传目录、命令输出目录等绝对路径信息。
 5. `skill/` 文件索引。
 6. 如果 Agent 关闭，追加 Agent 关闭说明。
 
@@ -203,14 +203,15 @@ skill 文件简介只使用 `!` 围栏协议块；同一文件内多个 `!` 块�
 
 Agent 模式开启后，模型可以通过协议块调用真实工具能力：
 
-- 执行一次性命令。
-- 启动和管理交互式 shell 会话。
+- 通过 run 协议执行一次性命令并保存结果。
+- 通过 shell 协议管理长驻、持续输出和交互式命令。
+- 管理交互式 shell 会话。
 - 读取服务器文件。
 - 创建或覆盖服务器文件。
 - 发送服务器文件给用户。
 - 调用默认媒体模型生成媒体。
 
-Agent 命令会受到自定义黑名单影响。黑名单文件位于：
+Agent 命令会受到自定义黑名单影响。一次性命令优先使用 `run`，完整输出会保存到 `bot_storage/command_outputs/`；交互式、长驻或持续输出命令使用 `shell`。黑名单文件位于：
 
 ```text
 prompts/extras/agent_command_blacklist.txt

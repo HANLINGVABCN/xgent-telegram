@@ -6,8 +6,8 @@
 # - 单用户访问控制与未授权用户处理。
 # - 异步 SQLite 记忆、提供商/模型配置、提示词管理。
 # - 支持流式/非流式聊天，并处理文件、图片、贴纸与媒体上下文。
-# - Agent 模式支持命令执行、可管理 Shell 会话、文件读写、
-#   自定义命令黑名单、停止/继续流程与媒体生成。
+# - Agent 模式支持 shell 命令、可管理 Shell 会话、文件读写、
+#   自定义命令黑名单、停止控制与媒体生成。
 # - 外部媒体模块负责生成、保存、发送、记录，并把结果回灌给对话，
 #   同时避免重复拼接路径提示。
 
@@ -45,7 +45,7 @@ from collections import OrderedDict
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from telegram import BotCommand, Update, constants, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-from telegram.error import BadRequest, InvalidToken, RetryAfter
+from telegram.error import BadRequest, InvalidToken, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -115,6 +115,7 @@ UPDATE_SKIP_SUFFIXES = (
 )
 UPDATE_LOCAL_CUSTOM_DIRS = ("prompts", "skill")
 UPDATE_BACKUP_DIR = os.path.join(PROJECT_ROOT, "bot_storage", "update_backups")
+COMMAND_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "bot_storage", "command_outputs")
 FULL_TRACE_LOG_FILE = os.path.join(PROJECT_ROOT, "bot_full_trace.log")
 FULL_TRACE_LOCK = threading.Lock()
 DEFAULT_AGENT_COMMAND_TIMEOUT = 30
@@ -177,13 +178,13 @@ def normalize_stream_timeout(value: Any, default: float = 0) -> float:
 
 def normalize_command_timeout(value: Any, default: int = DEFAULT_AGENT_COMMAND_TIMEOUT) -> int:
     if isinstance(value, str) and value.strip().lower() in {"∞", "inf", "infinite", "none", "no", "unlimited", "无限"}:
-        return 0
+        return int(default)
     try:
         seconds = int(float(value))
     except (TypeError, ValueError):
         seconds = int(default)
     if seconds <= 0:
-        return 0
+        seconds = int(default)
     if seconds < MIN_AGENT_COMMAND_TIMEOUT:
         return MIN_AGENT_COMMAND_TIMEOUT
     if seconds > MAX_AGENT_COMMAND_TIMEOUT:
@@ -493,13 +494,10 @@ class MessageType:
     SYSTEM_OP = 'system_op'
     BUTTON_CLICK = 'button_click'
     COMMAND = 'command'
-    AGENT_CMD = 'agent_cmd'           # Agent执行的命令
-    AGENT_RESULT = 'agent_result'     # Agent命令结果
+    AGENT_CMD = 'agent_cmd'           # Agent 请求的工具动作
+    AGENT_RESULT = 'agent_result'     # Agent 工具结果
 
-REDUNDANT_AGENT_COMMAND_PREFIXES = (
-    "[Agent执行命令] ",
-    "[Agent执行命令保存] ",
-)
+REDUNDANT_AGENT_COMMAND_PREFIXES: Tuple[str, ...] = ()
 
 def is_redundant_agent_command_record(msg_type: str, content: Any) -> bool:
     text = str(content or "")
@@ -1233,7 +1231,6 @@ class UserDataManager:
             'temp_back_callback': None,
             'prompt_buffer': '',
             'editing_prompt_key': '',
-            'pending_agent_result': None,
         }
     
     @classmethod
@@ -1291,7 +1288,6 @@ class AgentExecutor:
     """安全地执行 AI 请求的 shell 命令"""
     
     TIMEOUT = DEFAULT_AGENT_COMMAND_TIMEOUT  # 秒
-    MAX_OUTPUT = 3000  # 字符
     MAX_FILE_SIZE = 50 * 1024 * 1024
     WORK_DIR = os.path.dirname(os.path.abspath(__file__))
     MEDIA_INLINE_MAX_BYTES = 8 * 1024 * 1024
@@ -1304,15 +1300,6 @@ class AgentExecutor:
         '.java', '.c', '.h', '.cpp', '.hpp', '.cs', '.go', '.rs', '.php',
     }
     
-    # 内置危险命令关键词不再强制拦截；仅用户自定义黑名单会拦截。
-    DANGEROUS_PATTERNS: List[str] = []
-    INTERACTIVE_COMMAND_PATTERNS = [
-        r'(^|[\s;&|])(top|htop|btop|vim|vi|nano|less|more|watch|man|tmux|screen|ssh|mysql|psql)(?=$|[\s;&|])',
-        r'(^|[\s;&|])tail\s+-f(?=$|[\s;&|])',
-        r'(^|[\s;&|])journalctl\s+-f(?=$|[\s;&|])',
-        r'(^|[\s;&|])docker\s+logs\s+-f(?=$|[\s;&|])',
-    ]
-
     @classmethod
     def get_timeout(cls) -> int:
         return normalize_command_timeout(
@@ -1337,8 +1324,11 @@ class AgentExecutor:
         '^[': b'\x1b',
         'tab': b'\t',
         'space': b' ',
+        'sp': b' ',
         'backspace': b'\x7f',
         'bs': b'\x7f',
+        'insert': b'\x1b[2~',
+        'ins': b'\x1b[2~',
         'delete': b'\x1b[3~',
         'del': b'\x1b[3~',
         'up': b'\x1b[A',
@@ -1348,8 +1338,69 @@ class AgentExecutor:
         'home': b'\x1b[H',
         'end': b'\x1b[F',
         'pageup': b'\x1b[5~',
+        'page-up': b'\x1b[5~',
+        'pgup': b'\x1b[5~',
         'pagedown': b'\x1b[6~',
+        'page-down': b'\x1b[6~',
+        'pgdn': b'\x1b[6~',
+        'f1': b'\x1bOP',
+        'f2': b'\x1bOQ',
+        'f3': b'\x1bOR',
+        'f4': b'\x1bOS',
+        'f5': b'\x1b[15~',
+        'f6': b'\x1b[17~',
+        'f7': b'\x1b[18~',
+        'f8': b'\x1b[19~',
+        'f9': b'\x1b[20~',
+        'f10': b'\x1b[21~',
+        'f11': b'\x1b[23~',
+        'f12': b'\x1b[24~',
     }
+    MACRO_MODIFIER_ALIASES = {
+        'ctrl': 'ctrl',
+        'control': 'ctrl',
+        'c': 'ctrl',
+        'alt': 'alt',
+        'meta': 'alt',
+        'option': 'alt',
+        'shift': 'shift',
+    }
+    MACRO_CSI_FINAL_KEYS = {
+        'up': 'A',
+        'down': 'B',
+        'right': 'C',
+        'left': 'D',
+        'home': 'H',
+        'end': 'F',
+    }
+    MACRO_CSI_TILDE_KEYS = {
+        'insert': 2,
+        'ins': 2,
+        'delete': 3,
+        'del': 3,
+        'pageup': 5,
+        'page-up': 5,
+        'pgup': 5,
+        'pagedown': 6,
+        'page-down': 6,
+        'pgdn': 6,
+        'f5': 15,
+        'f6': 17,
+        'f7': 18,
+        'f8': 19,
+        'f9': 20,
+        'f10': 21,
+        'f11': 23,
+        'f12': 24,
+    }
+    MACRO_FKEY_FINALS = {
+        'f1': 'P',
+        'f2': 'Q',
+        'f3': 'R',
+        'f4': 'S',
+    }
+    MAX_STDIN_MACRO_REPEAT = 200
+    MAX_STDIN_MACRO_WAIT_SECONDS = 60.0
 
     @staticmethod
     def _bytes_from_ints(values: Any) -> bytes:
@@ -1412,7 +1463,7 @@ class AgentExecutor:
             if text.startswith('['):
                 parsed = json.loads(text)
                 if not isinstance(parsed, list):
-                    raise ValueError("stdin_keys JSON payload must be a list")
+                    raise ValueError("keys JSON payload must be a list")
                 tokens = parsed
             else:
                 tokens = [token for token in re.split(r'[\s,]+', text) if token]
@@ -1471,72 +1522,346 @@ class AgentExecutor:
 
         return bytes(out)
 
+    @staticmethod
+    def _append_macro_bytes(steps: List[Dict[str, Any]], payload: bytes):
+        if not payload:
+            return
+        if steps and steps[-1].get('type') == 'bytes':
+            steps[-1]['payload'] += payload
+        else:
+            steps.append({'type': 'bytes', 'payload': payload})
+
+    @staticmethod
+    def _unescape_macro_text(text: str) -> str:
+        out: List[str] = []
+        i = 0
+        while i < len(text):
+            char = text[i]
+            if char == '\\' and i + 1 < len(text) and text[i + 1] in {'[', ']', '\\'}:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            out.append(char)
+            i += 1
+        return ''.join(out)
+
+    @staticmethod
+    def _unescape_macro_brackets(text: str) -> str:
+        out: List[str] = []
+        i = 0
+        while i < len(text):
+            char = text[i]
+            if char == '\\' and i + 1 < len(text) and text[i + 1] in {'[', ']'}:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            out.append(char)
+            i += 1
+        return ''.join(out)
+
+    @staticmethod
+    def _read_macro_bracket(text: str, start: int) -> Tuple[str, int]:
+        command_match = re.match(r'\s*([A-Za-z][A-Za-z0-9_-]*)\s*:', text[start + 1:])
+        flat_commands = {
+            'raw', 'escape', 'escaped',
+            'base64', 'b64', 'hex',
+            'wait', 'sleep', 'delay',
+        }
+        if command_match and command_match.group(1).lower() in flat_commands:
+            out: List[str] = []
+            i = start + 1
+            while i < len(text):
+                char = text[i]
+                if char == '\\' and i + 1 < len(text):
+                    out.append(char)
+                    out.append(text[i + 1])
+                    i += 2
+                    continue
+                if char == ']':
+                    return ''.join(out), i
+                out.append(char)
+                i += 1
+            raise ValueError("stdin 宏语法中的 [] 未闭合；若要输入字面量 [ 或 ]，请写成 \\[ 或 \\]")
+
+        depth = 1
+        out: List[str] = []
+        i = start + 1
+        while i < len(text):
+            char = text[i]
+            if char == '\\' and i + 1 < len(text):
+                out.append(char)
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if char == '[':
+                depth += 1
+                out.append(char)
+                i += 1
+                continue
+            if char == ']':
+                depth -= 1
+                if depth == 0:
+                    return ''.join(out), i
+                out.append(char)
+                i += 1
+                continue
+            out.append(char)
+            i += 1
+        raise ValueError("stdin 宏语法中的 [] 未闭合；若要输入字面量 [ 或 ]，请写成 \\[ 或 \\]")
+
+    @staticmethod
+    def _skip_macro_space(text: str, index: int) -> int:
+        while index < len(text) and text[index] in ' \t\r\n':
+            index += 1
+        return index
+
+    @staticmethod
+    def _parse_macro_duration_seconds(value: str) -> float:
+        text = value.strip().lower()
+        if not text:
+            raise ValueError("[wait:] 需要指定等待时长")
+        multiplier = 0.001
+        if text.endswith('ms'):
+            number = text[:-2].strip()
+            multiplier = 0.001
+        elif text.endswith('s'):
+            number = text[:-1].strip()
+            multiplier = 1.0
+        else:
+            number = text
+        try:
+            seconds = float(number) * multiplier
+        except ValueError as exc:
+            raise ValueError(f"无法解析等待时长: {value}") from exc
+        if seconds < 0:
+            raise ValueError("[wait:] 不能使用负数")
+        if seconds > AgentExecutor.MAX_STDIN_MACRO_WAIT_SECONDS:
+            raise ValueError(f"[wait:] 单次等待不能超过 {AgentExecutor.MAX_STDIN_MACRO_WAIT_SECONDS:g} 秒")
+        return seconds
+
+    @staticmethod
+    def _modifier_code(modifiers: set) -> int:
+        code = 1
+        if 'shift' in modifiers:
+            code += 1
+        if 'alt' in modifiers:
+            code += 2
+        if 'ctrl' in modifiers:
+            code += 4
+        return code
+
+    @staticmethod
+    def _ctrl_char_to_bytes(key: str) -> bytes:
+        token = key.strip()
+        lowered = token.lower()
+        aliases = {
+            'space': ' ',
+            'sp': ' ',
+            'leftbracket': '[',
+            'rightbracket': ']',
+            'backslash': '\\',
+            'slash': '/',
+            'question': '?',
+        }
+        token = aliases.get(lowered, token)
+        if len(token) != 1:
+            raise ValueError(f"Ctrl 组合键需要单字符或可识别按键: {key}")
+        char = token.upper()
+        if char == '?':
+            return b'\x7f'
+        if char == ' ':
+            return b'\x00'
+        if '@' <= char <= '_':
+            return bytes([ord(char) & 0x1f])
+        raise ValueError(f"无法转换 Ctrl 组合键: {key}")
+
     @classmethod
-    def parse_raw_stdin_payload(cls, payload: str) -> bytes:
-        text = payload or ''
-        stripped = text.strip()
-        lower = stripped.lower()
+    def _modified_key_to_bytes(cls, modifiers: set, key: str) -> bytes:
+        normalized = key.strip().lower()
+        if not normalized:
+            return b''
 
-        if not stripped:
-            return text.encode('utf-8')
+        if not modifiers:
+            return cls._key_name_to_bytes(key)
 
-        if stripped.startswith('{') or stripped.startswith('['):
-            parsed = json.loads(stripped)
-            if isinstance(parsed, list):
-                if all(isinstance(item, int) and not isinstance(item, bool) for item in parsed):
-                    return cls._bytes_from_ints(parsed)
-                return cls.parse_key_sequence(parsed)
-            if not isinstance(parsed, dict):
-                raise ValueError("raw stdin JSON payload must be an object or list")
+        if normalized in cls.MACRO_CSI_FINAL_KEYS:
+            code = cls._modifier_code(modifiers)
+            return f"\x1b[1;{code}{cls.MACRO_CSI_FINAL_KEYS[normalized]}".encode('ascii')
 
-            if 'bytes' in parsed:
-                return cls._bytes_from_ints(parsed['bytes'])
-            if 'keys' in parsed:
-                return cls.parse_key_sequence(parsed['keys'])
+        if normalized in cls.MACRO_CSI_TILDE_KEYS:
+            code = cls._modifier_code(modifiers)
+            number = cls.MACRO_CSI_TILDE_KEYS[normalized]
+            return f"\x1b[{number};{code}~".encode('ascii')
 
-            encoding = str(parsed.get('encoding') or '').lower()
-            data = parsed.get('data')
-            if encoding in {'base64', 'b64'}:
-                if not isinstance(data, str):
-                    raise ValueError("base64 raw stdin data must be a string")
-                return base64.b64decode(''.join(data.split()), validate=True)
-            if encoding == 'hex':
-                if not isinstance(data, str):
-                    raise ValueError("hex raw stdin data must be a string")
-                return bytes.fromhex(data.replace(',', ' ').replace('0x', '').replace('0X', ''))
-            if encoding in {'escape', 'escaped'}:
-                if not isinstance(data, str):
-                    raise ValueError("escape raw stdin data must be a string")
-                return cls.parse_escape_bytes(data)
-            raise ValueError("raw stdin JSON payload needs bytes, keys, or encoding/data")
+        if normalized in cls.MACRO_FKEY_FINALS:
+            code = cls._modifier_code(modifiers)
+            return f"\x1b[1;{code}{cls.MACRO_FKEY_FINALS[normalized]}".encode('ascii')
 
-        for prefix in ('base64:', 'b64:'):
-            if lower.startswith(prefix):
-                data = stripped[len(prefix):]
-                return base64.b64decode(''.join(data.split()), validate=True)
+        if normalized == 'tab' and modifiers == {'shift'}:
+            return b'\x1b[Z'
 
-        if lower.startswith('hex:'):
-            data = stripped[4:]
-            return bytes.fromhex(data.replace(',', ' ').replace('0x', '').replace('0X', ''))
+        if 'ctrl' in modifiers:
+            payload = cls._ctrl_char_to_bytes(key)
+        elif 'shift' in modifiers and len(key) == 1:
+            payload = key.upper().encode('utf-8')
+        else:
+            payload = cls._key_name_to_bytes(key)
 
-        if lower.startswith('bytes:'):
-            return cls._bytes_from_ints(json.loads(stripped[6:].strip()))
+        if 'alt' in modifiers:
+            payload = b'\x1b' + payload
+        return payload
 
-        if lower.startswith('keys:'):
-            return cls.parse_key_sequence(stripped[5:])
-
-        if lower.startswith('escape:'):
-            return cls.parse_escape_bytes(text[text.lower().find('escape:') + 7:])
-
-        return cls.parse_escape_bytes(text)
-    
     @classmethod
-    def extract_command(cls, ai_response: str) -> Optional[str]:
-        """从 AI 回复中提取 ```exec 命令块"""
-        for block in cls.extract_protocol_blocks(ai_response):
-            if block['type'] == 'exec':
-                return block['body']
-        return None
+    def _macro_key_parts_to_bytes(cls, parts: List[str]) -> bytes:
+        if not parts:
+            return b''
+        if len(parts) == 1:
+            token = cls._unescape_macro_text(parts[0].strip())
+            if '+' in token:
+                return cls._macro_key_parts_to_bytes([part for part in re.split(r'\s*\+\s*', token) if part])
+            return cls._key_name_to_bytes(token)
+
+        modifiers = set()
+        key_parts: List[str] = []
+        for part in parts:
+            token = cls._unescape_macro_text(part.strip())
+            lowered = token.lower()
+            modifier = cls.MACRO_MODIFIER_ALIASES.get(lowered)
+            if modifier:
+                modifiers.add(modifier)
+            else:
+                key_parts.append(token)
+        if not key_parts:
+            return b''
+        if len(key_parts) != 1:
+            raise ValueError(f"组合键只能有一个主键: {'+'.join(parts)}")
+        return cls._modified_key_to_bytes(modifiers, key_parts[0])
+
+    @classmethod
+    def _macro_command_to_steps(cls, content: str) -> List[Dict[str, Any]]:
+        leading_trimmed = content.lstrip()
+        command_match = re.match(r'([A-Za-z][A-Za-z0-9_-]*)\s*:(.*)\Z', leading_trimmed, re.DOTALL)
+        if not command_match:
+            return [{'type': 'bytes', 'payload': cls._macro_key_parts_to_bytes([content])}]
+
+        name = command_match.group(1).lower()
+        value = command_match.group(2)
+
+        if name in {'type', 'text', 'paste'}:
+            return [{'type': 'bytes', 'payload': cls._unescape_macro_text(value).encode('utf-8')}]
+        if name in {'raw', 'escape', 'escaped'}:
+            return [{'type': 'bytes', 'payload': cls.parse_escape_bytes(cls._unescape_macro_brackets(value))}]
+        if name in {'base64', 'b64'}:
+            data = ''.join(cls._unescape_macro_brackets(value).split())
+            return [{'type': 'bytes', 'payload': base64.b64decode(data, validate=True)}]
+        if name == 'hex':
+            data = cls._unescape_macro_brackets(value).replace(',', ' ').replace('0x', '').replace('0X', '')
+            return [{'type': 'bytes', 'payload': bytes.fromhex(data)}]
+        if name == 'bytes':
+            data = cls._unescape_macro_brackets(value).strip()
+            if data.startswith('['):
+                payload = cls._bytes_from_ints(json.loads(data))
+            else:
+                values = [int(item, 0) for item in re.split(r'[\s,]+', data) if item]
+                payload = cls._bytes_from_ints(values)
+            return [{'type': 'bytes', 'payload': payload}]
+        if name == 'keys':
+            return [{'type': 'bytes', 'payload': cls.parse_key_sequence(cls._unescape_macro_brackets(value))}]
+        if name in {'wait', 'sleep', 'delay'}:
+            return [{'type': 'wait', 'seconds': cls._parse_macro_duration_seconds(value)}]
+        if name == 'repeat':
+            repeat_match = re.match(r'\s*(\d+)\s*(?::|\s)\s*(.*?)\s*\Z', value, re.DOTALL)
+            if not repeat_match:
+                raise ValueError("[repeat:] 格式应为 [repeat:次数 内容]，例如 [repeat:3 [up]]")
+            count = int(repeat_match.group(1))
+            if count < 0 or count > cls.MAX_STDIN_MACRO_REPEAT:
+                raise ValueError(f"[repeat:] 次数必须在 0 到 {cls.MAX_STDIN_MACRO_REPEAT} 之间")
+            nested_steps = cls.parse_stdin_macro(repeat_match.group(2))
+            out: List[Dict[str, Any]] = []
+            for _ in range(count):
+                for step in nested_steps:
+                    if step['type'] == 'bytes':
+                        cls._append_macro_bytes(out, step['payload'])
+                    else:
+                        out.append(dict(step))
+            return out
+
+        raise ValueError(f"未知 stdin 宏指令: [{name}:...]")
+
+    @staticmethod
+    def _parse_macro_postfix_repeat(text: str, index: int) -> Tuple[int, int]:
+        start = AgentExecutor._skip_macro_space(text, index)
+        if start >= len(text) or text[start] != '*':
+            return 1, index
+        i = AgentExecutor._skip_macro_space(text, start + 1)
+        begin = i
+        while i < len(text) and text[i].isdigit():
+            i += 1
+        if begin == i:
+            return 1, index
+        count = int(text[begin:i])
+        if count < 0 or count > AgentExecutor.MAX_STDIN_MACRO_REPEAT:
+            raise ValueError(f"重复次数必须在 0 到 {AgentExecutor.MAX_STDIN_MACRO_REPEAT} 之间")
+        return count, i
+
+    @classmethod
+    def parse_stdin_macro(cls, macro: str) -> List[Dict[str, Any]]:
+        text = macro or ''
+        steps: List[Dict[str, Any]] = []
+        text_buf: List[str] = []
+        i = 0
+
+        def flush_text(strip_right: bool = False):
+            if not text_buf:
+                return
+            payload_text = ''.join(text_buf)
+            if strip_right:
+                payload_text = payload_text.rstrip(' \t\r\n')
+            text_buf.clear()
+            if payload_text:
+                cls._append_macro_bytes(steps, payload_text.encode('utf-8'))
+
+        while i < len(text):
+            char = text[i]
+            if char == '\\' and i + 1 < len(text) and text[i + 1] in {'[', ']', '\\'}:
+                text_buf.append(text[i + 1])
+                i += 2
+                continue
+            if char != '[':
+                text_buf.append(char)
+                i += 1
+                continue
+
+            content, end_index = cls._read_macro_bracket(text, i)
+            parts = [content]
+            cursor = end_index + 1
+            while True:
+                plus_index = cls._skip_macro_space(text, cursor)
+                if plus_index >= len(text) or text[plus_index] != '+':
+                    break
+                next_index = cls._skip_macro_space(text, plus_index + 1)
+                if next_index >= len(text) or text[next_index] != '[':
+                    break
+                next_content, next_end = cls._read_macro_bracket(text, next_index)
+                parts.append(next_content)
+                cursor = next_end + 1
+
+            repeat_count, after_repeat = cls._parse_macro_postfix_repeat(text, cursor)
+            flush_text(strip_right=True)
+            if len(parts) > 1:
+                part_steps = [{'type': 'bytes', 'payload': cls._macro_key_parts_to_bytes(parts)}]
+            else:
+                part_steps = cls._macro_command_to_steps(parts[0])
+            for _ in range(repeat_count):
+                for step in part_steps:
+                    if step['type'] == 'bytes':
+                        cls._append_macro_bytes(steps, step['payload'])
+                    else:
+                        steps.append(dict(step))
+            i = cls._skip_macro_space(text, after_repeat)
+
+        flush_text(strip_right=False)
+        return steps
 
     @classmethod
     def extract_protocol_blocks(cls, ai_response: str) -> List[Dict[str, Any]]:
@@ -1544,7 +1869,7 @@ class AgentExecutor:
         import re
 
         pattern = re.compile(
-            r'```(?P<tag>exec(?:[ \t]+--save)?|shell|stdin_raw:[^\n]+|stdin_keys:[^\n]+|stdin:[^\n]+|shellread:[^\n]+|shellkill:[^\n]+|sendfile|read|media|file:[^\n]+)\s*\n(?P<body>.*?)\n\s*```',
+            r'```(?P<tag>run|shell|stdin:[^\n]+|shellread:[^\n]+|shellkill:[^\n]+|sendfile|read|media|file:[^\n]+)\s*\n(?P<body>.*?)\n\s*```',
             re.DOTALL
         )
 
@@ -1557,25 +1882,6 @@ class AgentExecutor:
                 blocks.append({
                     'type': 'file',
                     'path': raw_tag[5:].strip(),
-                    'body': body,
-                })
-            elif raw_tag.startswith('exec'):
-                blocks.append({
-                    'type': 'exec',
-                    'path': '',
-                    'body': body,
-                    'save': '--save' in raw_tag
-                })
-            elif raw_tag.startswith('stdin_raw:'):
-                blocks.append({
-                    'type': 'stdin_raw',
-                    'path': raw_tag[10:].strip(),
-                    'body': raw_body,
-                })
-            elif raw_tag.startswith('stdin_keys:'):
-                blocks.append({
-                    'type': 'stdin_keys',
-                    'path': raw_tag[11:].strip(),
                     'body': body,
                 })
             elif raw_tag.startswith('stdin:'):
@@ -1603,27 +1909,6 @@ class AgentExecutor:
                     'body': body,
                 })
         return blocks
-    
-    @classmethod
-    def get_clean_response(cls, ai_response: str) -> str:
-        """获取 AI 回复中除命令块以外的文本"""
-        import re
-        cleaned = re.sub(r'```exec(?:[ \t]+--save)?\s*\n.*?\n\s*```', '', ai_response, flags=re.DOTALL)
-        return cleaned.strip()
-    
-    @classmethod
-    def is_dangerous(cls, command: str) -> Tuple[bool, str]:
-        """检查命令是否危险"""
-        import re
-
-        cmd_lower = command.lower().strip()
-        custom_blocked, custom_pattern = AgentCommandBlacklist.check(command)
-        if custom_blocked:
-            return True, f"命令匹配用户黑名单: {custom_pattern}"
-        for pattern in cls.INTERACTIVE_COMMAND_PATTERNS:
-            if re.search(pattern, cmd_lower):
-                return True, "交互/阻塞命令禁止使用 exec，请改用 shell 协议"
-        return False, ""
 
     @classmethod
     def resolve_file_path(cls, requested_path: str) -> str:
@@ -1724,7 +2009,7 @@ class AgentExecutor:
             if file_size > cls.TEXT_INLINE_MAX_BYTES:
                 raise ValueError(
                     f"文本文件过大，不能一次性完整塞进上下文: {display_path} ({file_size} bytes)。"
-                    "请改用 exec --save 配合 sed/head/tail 分段查看。"
+                    "请改用 shell 配合 sed/head/tail 分段查看。"
                 )
             if text_content is None:
                 raise ValueError(f"文件看起来是文本类型，但无法稳定解码: {display_path}")
@@ -1791,23 +2076,49 @@ class AgentExecutor:
         )
     
     @classmethod
-    async def execute(cls, command: str, stop_event: Optional[asyncio.Event] = None) -> Dict[str, Any]:
-        """执行命令并返回结果"""
-        # 安全检查
-        is_danger, reason = cls.is_dangerous(command)
-        if is_danger:
-            logger.warning(f"🚫 Agent 拦截危险命令: {command} ({reason})")
+    def extract_file_block(cls, ai_response: str) -> Optional[Tuple[str, str]]:
+        """从 AI 回复中提取 ```file:filename 文件块（创建新文件）"""
+        for block in cls.extract_protocol_blocks(ai_response):
+            if block['type'] == 'file':
+                return block['path'], block['body']
+        return None
+
+    @classmethod
+    def extract_sendfile(cls, ai_response: str) -> Optional[str]:
+        """从 AI 回复中提取 ```sendfile 块（发送已有服务器文件）"""
+        for block in cls.extract_protocol_blocks(ai_response):
+            if block['type'] == 'sendfile':
+                return block['body']
+        return None
+
+    @classmethod
+    def extract_media_prompt(cls, ai_response: str) -> Optional[str]:
+        """从 AI 回复中提取 ```media 媒体生成提示词块"""
+        for block in cls.extract_protocol_blocks(ai_response):
+            if block['type'] == 'media':
+                prompt = block['body'].strip()
+                return prompt or None
+        return None
+
+    @classmethod
+    async def run_command(cls, command: str,
+                          stop_event: Optional[asyncio.Event] = None) -> Dict[str, Any]:
+        """执行一次性命令，等待结束并保存完整输出。"""
+        command = command.strip()
+        if not command:
+            return {'success': False, 'output': 'run 命令为空', 'return_code': -1}
+
+        blocked, pattern = AgentCommandBlacklist.check(command)
+        if blocked:
             return {
                 'success': False,
-                'output': f'⛔ 命令被安全系统拦截: {reason}',
+                'output': f'⛔ 命令被安全系统拦截: 命令匹配用户黑名单: {pattern}',
                 'return_code': -1,
-                'timed_out': False,
             }
-        
-        logger.info(f"🤖 Agent 执行命令: {command}")
-        command_timeout = cls.get_timeout()
-        
+
+        timeout = cls.get_timeout()
         process = None
+        started_at = time.monotonic()
         try:
             kwargs: Dict[str, Any] = {}
             if os.name != 'nt':
@@ -1825,163 +2136,94 @@ class AgentExecutor:
             )
 
             communicate_task = asyncio.create_task(process.communicate())
-            timeout_task = (
-                asyncio.create_task(asyncio.sleep(command_timeout))
-                if command_timeout > 0 else None
-            )
-            wait_tasks = {communicate_task}
-            if timeout_task is not None:
-                wait_tasks.add(timeout_task)
-            stop_task = None
-            if stop_event is not None:
-                stop_task = asyncio.create_task(stop_event.wait())
+            stop_task = asyncio.create_task(stop_event.wait()) if stop_event else None
+            timeout_task = asyncio.create_task(asyncio.sleep(timeout))
+            wait_tasks = {communicate_task, timeout_task}
+            if stop_task:
                 wait_tasks.add(stop_task)
 
             done, pending = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
 
-            if stop_task is not None and stop_task in done and stop_event and stop_event.is_set():
-                await cls._terminate_process(process)
-                with contextlib.suppress(Exception):
-                    if not communicate_task.done():
-                        await asyncio.wait_for(communicate_task, timeout=2)
-                if timeout_task is not None:
-                    timeout_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await timeout_task
-                return {
-                    'success': False,
-                    'output': '⏹️ 命令已被用户手动停止',
-                    'return_code': -1,
-                    'timed_out': False,
-                    'stopped': True,
-                }
+            stopped = bool(stop_task and stop_task in done and stop_event and stop_event.is_set())
+            timed_out = timeout_task in done
+            if stopped or timed_out:
+                await terminate_async_process(process)
 
-            if timeout_task is not None and timeout_task in done:
-                await cls._terminate_process(process)
-                with contextlib.suppress(Exception):
-                    if not communicate_task.done():
-                        await asyncio.wait_for(communicate_task, timeout=2)
-                if stop_task:
-                    stop_task.cancel()
+            for task in (timeout_task, stop_task):
+                if task and not task.done():
+                    task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
-                        await stop_task
-                logger.warning(f"⏰ Agent 命令超时({command_timeout}秒): {command}")
-                return {
-                    'success': False,
-                    'output': f'⏰ 命令超时 ({command_timeout}秒)',
-                    'return_code': -1,
-                    'timed_out': True,
-                }
+                        await task
 
-            if stop_task:
-                stop_task.cancel()
+            stdout = b''
+            stderr = b''
+            if communicate_task.done():
+                with contextlib.suppress(Exception):
+                    stdout, stderr = communicate_task.result()
+            elif stopped or timed_out:
+                with contextlib.suppress(Exception):
+                    stdout, stderr = await asyncio.wait_for(communicate_task, timeout=2)
+                if not communicate_task.done():
+                    communicate_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await communicate_task
+            else:
+                communicate_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-                    await stop_task
-            if timeout_task is not None:
-                timeout_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await timeout_task
-            stdout, stderr = await communicate_task
+                    await communicate_task
+
             stdout_text = stdout.decode('utf-8', errors='replace') if isinstance(stdout, (bytes, bytearray)) else (stdout or '')
             stderr_text = stderr.decode('utf-8', errors='replace') if isinstance(stderr, (bytes, bytearray)) else (stderr or '')
-            
-            output = ""
-            if stdout_text:
-                output += stdout_text
+            output = stdout_text
             if stderr_text:
                 output += ("\n--- stderr ---\n" + stderr_text) if output else stderr_text
-            
-            # 截断过长输出
-            truncated = False
-            if len(output) > cls.MAX_OUTPUT:
-                output = output[:cls.MAX_OUTPUT] + f"\n\n... (输出已截断，共 {len(output)} 字符)"
-                truncated = True
-            
+            if stopped:
+                output = (output + "\n" if output else "") + "⏹️ 命令已被用户手动停止"
+            elif timed_out:
+                output = (output + "\n" if output else "") + f"⏰ 命令超过等待窗口 ({timeout}秒)，已停止。需要长驻/日志/交互任务时请使用 shell。"
+            output = output or '(无输出)'
+
+            elapsed_seconds = round(max(0.0, time.monotonic() - started_at), 2)
+            saved = save_command_output(command, output)
+            rc = process.returncode if process else -1
             return {
-                'success': process.returncode == 0,
-                'output': output or '(无输出)',
-                'return_code': process.returncode,
-                'timed_out': False,
-                'truncated': truncated,
-            }
-            
-        except subprocess.TimeoutExpired:
-            logger.warning(f"⏰ Agent 命令超时({command_timeout}秒): {command}")
-            return {
-                'success': False,
-                'output': f'⏰ 命令超时 ({command_timeout}秒)',
-                'return_code': -1,
-                'timed_out': True,
+                'success': bool(not stopped and not timed_out and rc == 0),
+                'command': command,
+                'output': output,
+                'display_output': format_shell_context_output(output, running=False),
+                'return_code': rc if rc is not None else -1,
+                'timed_out': timed_out,
+                'stopped': stopped,
+                'output_path': saved['path'],
+                'output_bytes': saved['bytes'],
+                'elapsed_seconds': elapsed_seconds,
             }
         except Exception as e:
-            logger.error(f"Agent 命令执行异常: {e}")
+            if process is not None:
+                await terminate_async_process(process)
+            logger.error(f"run 命令执行异常: {e}")
+            output = f"执行异常: {str(e)[:200]}"
+            elapsed_seconds = round(max(0.0, time.monotonic() - started_at), 2)
+            saved = save_command_output(command, output)
             return {
                 'success': False,
-                'output': f'执行异常: {str(e)[:200]}',
+                'command': command,
+                'output': output,
+                'display_output': output,
                 'return_code': -1,
                 'timed_out': False,
+                'stopped': False,
+                'output_path': saved['path'],
+                'output_bytes': saved['bytes'],
+                'elapsed_seconds': elapsed_seconds,
             }
-
-    @classmethod
-    async def _terminate_process(cls, process: Any):
-        if process is None or process.returncode is not None:
-            return
-        try:
-            if os.name != 'nt':
-                import signal
-
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            else:
-                process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=3)
-            except asyncio.TimeoutError:
-                if os.name != 'nt':
-                    import signal
-
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                else:
-                    process.kill()
-                await process.wait()
-        except ProcessLookupError:
-            pass
-        except Exception as e:
-            logger.warning(f"终止 Agent 命令进程失败: {e}")
-    
-    @classmethod
-    def extract_file_block(cls, ai_response: str) -> Optional[Tuple[str, str]]:
-        """从 AI 回复中提取 ```file:filename 文件块（创建新文件）"""
-        for block in cls.extract_protocol_blocks(ai_response):
-            if block['type'] == 'file':
-                return block['path'], block['body']
-        return None
-    
-    @classmethod
-    def extract_sendfile(cls, ai_response: str) -> Optional[str]:
-        """从 AI 回复中提取 ```sendfile 块（发送已有服务器文件）"""
-        for block in cls.extract_protocol_blocks(ai_response):
-            if block['type'] == 'sendfile':
-                return block['body']
-        return None
-
-    @classmethod
-    def extract_media_prompt(cls, ai_response: str) -> Optional[str]:
-        """从 AI 回复中提取 ```media 媒体生成提示词块"""
-        for block in cls.extract_protocol_blocks(ai_response):
-            if block['type'] == 'media':
-                prompt = block['body'].strip()
-                return prompt or None
-        return None
     
     @classmethod
     def get_clean_response_all(cls, ai_response: str) -> str:
         """获取 AI 回复中除命令块、文件块、发送块以外的文本"""
         import re
-        cleaned = re.sub(r'```exec\s*\n.*?\n\s*```', '', ai_response, flags=re.DOTALL)
-        cleaned = re.sub(r'```exec_direct\s*\n.*?\n\s*```', '', cleaned, flags=re.DOTALL)
+        cleaned = re.sub(r'```run\s*\n.*?\n\s*```', '', ai_response, flags=re.DOTALL)
         cleaned = re.sub(r'```shell\s*\n.*?\n\s*```', '', cleaned, flags=re.DOTALL)
-        cleaned = re.sub(r'```stdin_raw:[^\n]+\s*\n.*?\n\s*```', '', cleaned, flags=re.DOTALL)
-        cleaned = re.sub(r'```stdin_keys:[^\n]+\s*\n.*?\n\s*```', '', cleaned, flags=re.DOTALL)
         cleaned = re.sub(r'```stdin:[^\n]+\s*\n.*?\n\s*```', '', cleaned, flags=re.DOTALL)
         cleaned = re.sub(r'```shellread:[^\n]+\s*\n.*?\n\s*```', '', cleaned, flags=re.DOTALL)
         cleaned = re.sub(r'```shellkill:[^\n]+\s*\n.*?\n\s*```', '', cleaned, flags=re.DOTALL)
@@ -1993,6 +2235,113 @@ class AgentExecutor:
 
 
 # --- ☆ Agent 交互 Shell 会话管理器 ☆ ---
+def clip_middle_text(text: str, limit: int, label: str = "内容") -> str:
+    if len(text) <= limit:
+        return text
+    marker = f"\n... ({label}已省略 {len(text) - limit} 字符，保留开头和末尾) ...\n"
+    available = limit - len(marker)
+    if available < 80:
+        return text[:limit]
+    head_len = max(1, available // 3)
+    tail_len = max(1, available - head_len)
+    return text[:head_len].rstrip() + marker + text[-tail_len:].lstrip()
+
+
+def strip_terminal_control_sequences(text: str) -> str:
+    cleaned = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text or '')
+    cleaned = re.sub(r'\x1b\][^\x07]*(?:\x07|\x1b\\)', '', cleaned)
+    return cleaned
+
+
+def looks_like_interactive_prompt(text: str) -> bool:
+    if not text:
+        return False
+    sample = strip_terminal_control_sequences(text[-3000:])
+    lower = sample.lower()
+    prompt_markers = (
+        "(y/n", "[y/n", "yes/no", "password", "username", "enter ", "press ",
+        "select", "choice", "confirm", "continue?", "input",
+        "请输入", "输入", "选择", "选项", "确认", "继续?", "按任意键", "菜单", "序号",
+    )
+    if any(marker in lower for marker in prompt_markers):
+        return True
+    lines = [line.rstrip() for line in sample.splitlines() if line.strip()]
+    if not lines:
+        return False
+    recent = lines[-12:]
+    if any(re.match(r'^\s*(\d+|[a-zA-Z])[\).\、:：]\s+\S+', line) for line in recent):
+        return True
+    last = recent[-1]
+    if re.search(r'(^|\s)(?:[\w.-]+@[\w.-]+(?::[^\r\n]*)?|bash-[\d.]+|sh|zsh|fish|root)(?:[#>$])\s*$', last):
+        return True
+    return bool(re.search(r'([?:：>]\s*|\]\s*|\)\s*)$', last))
+
+
+def looks_like_long_running_command(command: str) -> bool:
+    cmd = (command or '').lower()
+    patterns = (
+        r'(^|[\s;&|])tail\b(?=[^;&|]*?(?:\s|=)(?:-f|--follow(?:=[^\s;&|]+)?)(?:\s|=|$))',
+        r'(^|[\s;&|])journalctl\b(?=[^;&|]*?(?:\s|=)(?:-f|--follow)(?:\s|=|$))',
+        r'(^|[\s;&|])docker\s+logs\b(?=[^;&|]*?(?:\s|=)(?:-f|--follow)(?:\s|=|$|[a-z]))',
+        r'(^|[\s;&|])kubectl\s+logs\b(?=[^;&|]*?(?:\s|=)(?:-f|--follow)(?:\s|=|$|[a-z]))',
+        r'(^|[\s;&|])(pm2)\s+logs\b',
+        r'(^|[\s;&|])(watch|top|htop|btop|less|more|man|vim|vi|nano|ssh|tmux|screen)(\s|$)',
+        r'(^|[\s;&|])(bash|sh|zsh|fish)(\s+(-i|--login|-l))*\s*$',
+        r'(^|[\s;&|])(python|python3|node|ipython)\s*$',
+        r'(^|[\s;&|])(mysql|psql|sqlite3|redis-cli)(\s|$)',
+        r'(^|[\s;&|])(cmd|cmd\.exe)\b.*\s/[qdkc]*k\b',
+        r'(^|[\s;&|])(powershell|powershell\.exe|pwsh|pwsh\.exe)\b.*\s-(noexit|noe)\b',
+        r'(^|[\s;&|])(python|python3|node|npm|pnpm|yarn|bun|uvicorn|gunicorn)\b.*\b(serve|server|dev|start|runserver)\b',
+    )
+    return any(re.search(pattern, cmd) for pattern in patterns)
+
+
+def save_command_output(command: str, output: str) -> Dict[str, Any]:
+    now = datetime.now()
+    dated_dir = os.path.join(COMMAND_OUTPUT_DIR, now.strftime("%Y-%m-%d"))
+    os.makedirs(dated_dir, exist_ok=True)
+    name = f"{now.strftime('%H%M%S')}_{uuid.uuid4().hex[:8]}.txt"
+    path = os.path.join(dated_dir, name)
+    content = (
+        f"Command:\n{command}\n\n"
+        f"Captured at: {now.isoformat(timespec='seconds')}\n\n"
+        "Output:\n"
+        f"{output}"
+    )
+    with open(path, 'w', encoding='utf-8', errors='replace') as f:
+        f.write(content)
+    return {
+        'path': to_display_path(path),
+        'bytes': len(content.encode('utf-8', errors='replace')),
+    }
+
+
+async def terminate_async_process(process: Any):
+    if process is None or process.returncode is not None:
+        return
+    try:
+        if os.name != 'nt':
+            import signal
+
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        else:
+            process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=3)
+        except asyncio.TimeoutError:
+            if os.name != 'nt':
+                import signal
+
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            else:
+                process.kill()
+            await process.wait()
+    except ProcessLookupError:
+        pass
+    except Exception as e:
+        logger.warning(f"终止命令进程失败: {e}")
+
+
 class AgentShellSession:
     """一个可持续读写的 shell 进程；Linux/macOS 使用 PTY，Windows 使用管道降级。"""
 
@@ -2002,10 +2351,15 @@ class AgentShellSession:
         self.session_id = session_id
         self.command = command
         self.started_at = time.time()
+        self.started_monotonic = time.monotonic()
         self.last_output_at = self.started_at
+        self.last_output_monotonic = self.started_monotonic
+        self.first_output_at: Optional[float] = None
+        self.first_output_monotonic: Optional[float] = None
         self.lock = threading.RLock()
         self.output = ""
         self.read_index = 0
+        self.output_chunks = 0
         self.process: Optional[subprocess.Popen] = None
         self.controller_fd: Optional[int] = None
         self.reader_thread: Optional[threading.Thread] = None
@@ -2048,8 +2402,14 @@ class AgentShellSession:
         if not text:
             return
         with self.lock:
+            if self.first_output_at is None:
+                self.first_output_at = time.time()
+            if self.first_output_monotonic is None:
+                self.first_output_monotonic = time.monotonic()
+            self.output_chunks += 1
             self.output += text
             self.last_output_at = time.time()
+            self.last_output_monotonic = time.monotonic()
             overflow = len(self.output) - self.MAX_BUFFER
             if overflow > 0:
                 self.output = self.output[overflow:]
@@ -2069,14 +2429,15 @@ class AgentShellSession:
     def _read_pipe_loop(self):
         if not self.process or not self.process.stdout:
             return
+        fd = self.process.stdout.fileno()
         while True:
-            chunk = self.process.stdout.read(4096)
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
             if not chunk:
                 break
-            if isinstance(chunk, str):
-                self._append_output(chunk)
-            else:
-                self._append_output(chunk.decode('utf-8', errors='replace'))
+            self._append_output(chunk.decode('utf-8', errors='replace'))
 
     def is_running(self) -> bool:
         return bool(self.process and self.process.poll() is None)
@@ -2085,10 +2446,6 @@ class AgentShellSession:
         if not self.process:
             return None
         return self.process.poll()
-
-    def write(self, text: str):
-        payload = text if text.endswith('\n') else text + '\n'
-        self.write_bytes(payload.encode('utf-8', errors='replace'))
 
     def write_bytes(self, payload: bytes):
         if self.pty_enabled:
@@ -2112,6 +2469,27 @@ class AgentShellSession:
     def read_recent(self, max_chars: int = 4000) -> str:
         with self.lock:
             return self.output[-max_chars:]
+
+    def read_snapshot(self, max_chars: int = 4000) -> str:
+        with self.lock:
+            snapshot = self.output
+            self.read_index = len(self.output)
+        return clip_middle_text(snapshot, max_chars, "shell 输出")
+
+    def output_activity(self) -> Tuple[int, float, int, float]:
+        with self.lock:
+            output_chars = len(self.output)
+            idle_seconds = max(0.0, time.monotonic() - self.last_output_monotonic)
+            output_chunks = self.output_chunks
+            if self.first_output_monotonic is None:
+                active_seconds = 0.0
+            else:
+                active_seconds = max(0.0, time.monotonic() - self.first_output_monotonic)
+        return output_chars, idle_seconds, output_chunks, active_seconds
+
+    def wait_reader_drain(self, timeout: float = 0.5):
+        if self.reader_thread and self.reader_thread.is_alive():
+            self.reader_thread.join(timeout=timeout)
 
     def terminate(self):
         if not self.process:
@@ -2146,29 +2524,99 @@ class AgentShellSession:
 
 
 class AgentShellSessionManager:
-    """Codex/Claude Code 风格的长驻 shell 会话层，不影响普通 exec。"""
+    """Codex/Claude Code 风格的可等待、可交互 shell 会话层。"""
 
     MAX_SESSIONS = 4
+    CONTEXT_OUTPUT_LIMIT = 12000
     START_CAPTURE_SECONDS = 1.0
     AFTER_INPUT_CAPTURE_SECONDS = 0.6
+    WAIT_POLL_SECONDS = 0.25
+    QUIET_AFTER_OUTPUT_SECONDS = 2.5
+    QUIET_AFTER_OUTPUT_LONGRUN_SECONDS = 5.0
+    STALLED_AFTER_OUTPUT_SECONDS = 5.0
+    STALLED_AFTER_OUTPUT_LONGRUN_SECONDS = 10.0
+    SILENT_RUNNING_SECONDS = 4.0
+    SILENT_RUNNING_LONGRUN_SECONDS = 8.0
+    ACTIVE_OUTPUT_SECONDS = 8.0
+    ACTIVE_OUTPUT_LONGRUN_SECONDS = 12.0
+    ACTIVE_OUTPUT_MIN_CHUNKS = 3
+    ACTIVE_OUTPUT_MIN_LONGRUN_CHUNKS = 4
     _sessions: Dict[str, AgentShellSession] = {}
     _lock = threading.RLock()
+
+    @classmethod
+    def _shell_state_thresholds(cls, long_running_hint: bool, wait_timeout: float) -> Dict[str, float]:
+        return {
+            'quiet_after_output': min(
+                cls.QUIET_AFTER_OUTPUT_LONGRUN_SECONDS if long_running_hint else cls.QUIET_AFTER_OUTPUT_SECONDS,
+                max(1.0, wait_timeout * (0.20 if long_running_hint else 0.12))
+            ),
+            'stalled_after_output': min(
+                cls.STALLED_AFTER_OUTPUT_LONGRUN_SECONDS if long_running_hint else cls.STALLED_AFTER_OUTPUT_SECONDS,
+                max(2.0, wait_timeout * (0.45 if long_running_hint else 0.20))
+            ),
+            'silent_running_after': min(
+                cls.SILENT_RUNNING_LONGRUN_SECONDS if long_running_hint else cls.SILENT_RUNNING_SECONDS,
+                max(1.5, wait_timeout * (0.35 if long_running_hint else 0.15))
+            ),
+            'active_output_after': min(
+                cls.ACTIVE_OUTPUT_LONGRUN_SECONDS if long_running_hint else cls.ACTIVE_OUTPUT_SECONDS,
+                max(3.0, wait_timeout * (0.45 if long_running_hint else 0.35))
+            ),
+            'active_min_chunks': cls.ACTIVE_OUTPUT_MIN_LONGRUN_CHUNKS if long_running_hint else cls.ACTIVE_OUTPUT_MIN_CHUNKS,
+        }
+
+    @classmethod
+    def _classify_running_state(cls, session: AgentShellSession, output: str,
+                                wait_timeout: float, elapsed_total: float = 0.0,
+                                long_running_hint: bool = False) -> str:
+        if not session.is_running():
+            return 'completed'
+        if output and looks_like_interactive_prompt(output):
+            return 'interactive_prompt'
+
+        output_chars, output_idle_seconds, output_chunks, output_active_seconds = session.output_activity()
+        thresholds = cls._shell_state_thresholds(long_running_hint, wait_timeout)
+
+        if output_chars > 0:
+            if (
+                output_chunks >= thresholds['active_min_chunks']
+                and output_active_seconds >= thresholds['active_output_after']
+                and output_idle_seconds < thresholds['quiet_after_output']
+            ):
+                return 'active_output'
+            if output_chunks >= 2 and output_idle_seconds >= thresholds['stalled_after_output']:
+                return 'output_stalled'
+            if output_idle_seconds >= thresholds['quiet_after_output']:
+                return 'output_quiet'
+
+        if elapsed_total >= thresholds['silent_running_after']:
+            return 'long_running_command' if long_running_hint else 'silent_running'
+
+        return 'still_running'
 
     @classmethod
     def _format_result(cls, session: AgentShellSession, output: str, action: str) -> Dict[str, Any]:
         running = session.is_running()
         rc = session.return_code()
         status = "running" if running else f"exited:{rc}"
+        output_chars, output_idle_seconds, output_chunks, output_active_seconds = session.output_activity()
         return {
             'success': True,
             'session_id': session.session_id,
             'action': action,
             'command': session.command,
+            'command_hint_long_running': looks_like_long_running_command(session.command),
             'running': running,
             'return_code': rc,
             'output': output or '(暂无新输出)',
             'status': status,
             'pty': session.pty_enabled,
+            'output_chars': output_chars,
+            'output_idle_seconds': round(output_idle_seconds, 1),
+            'output_chunks': output_chunks,
+            'output_active_seconds': round(output_active_seconds, 1),
+            'interactive_prompt': running and looks_like_interactive_prompt(output),
         }
 
     @classmethod
@@ -2190,7 +2638,99 @@ class AgentShellSessionManager:
                 cls._sessions.pop(sid, None)
 
     @classmethod
-    async def start(cls, command: str) -> Dict[str, Any]:
+    async def _wait_for_useful_state(cls, session: AgentShellSession, already_waited: float = 0.0,
+                                     stop_event: Optional[asyncio.Event] = None,
+                                     long_running_hint: bool = False) -> Tuple[bool, float, float, str]:
+        wait_timeout = float(AgentExecutor.get_timeout())
+        started = time.monotonic()
+        remaining = max(0.0, wait_timeout - max(0.0, already_waited))
+        state = 'timeout'
+
+        while session.is_running() and remaining > 0:
+            if stop_event and stop_event.is_set():
+                state = 'stopped'
+                break
+            output_chars, output_idle_seconds, output_chunks, output_active_seconds = session.output_activity()
+            now = time.monotonic()
+            recent_output = session.read_recent(3000)
+            if recent_output and looks_like_interactive_prompt(recent_output):
+                state = 'interactive_prompt'
+                break
+            elapsed_total = max(0.0, already_waited) + (now - started)
+            thresholds = cls._shell_state_thresholds(long_running_hint, wait_timeout)
+            if output_chars > 0:
+                if (
+                    output_chunks >= thresholds['active_min_chunks']
+                    and output_active_seconds >= thresholds['active_output_after']
+                    and output_idle_seconds < thresholds['quiet_after_output']
+                ):
+                    state = 'active_output'
+                    break
+                if output_chunks >= 2 and output_idle_seconds >= thresholds['stalled_after_output']:
+                    state = 'output_stalled'
+                    break
+                if output_idle_seconds >= thresholds['quiet_after_output']:
+                    state = 'output_quiet'
+                    break
+            if output_chars == 0 and elapsed_total >= thresholds['silent_running_after']:
+                state = 'long_running_command' if long_running_hint else 'silent_running'
+                break
+            if long_running_hint and elapsed_total >= thresholds['active_output_after']:
+                state = 'long_running_command'
+                break
+            sleep_for = min(cls.WAIT_POLL_SECONDS, remaining)
+            if stop_event:
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
+                    state = 'stopped'
+                    break
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(sleep_for)
+            remaining = max(0.0, wait_timeout - max(0.0, already_waited) - (time.monotonic() - started))
+
+        waited = min(wait_timeout, max(0.0, already_waited) + (time.monotonic() - started))
+        completed = not session.is_running()
+        if completed:
+            state = 'completed'
+            await asyncio.sleep(0.1)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: session.wait_reader_drain(0.5))
+        return completed, waited, wait_timeout, state
+
+    @classmethod
+    def _attach_wait_info(cls, result: Dict[str, Any], completed: bool,
+                          waited: float, wait_timeout: float, wait_state: str = ""):
+        result['completed_during_wait'] = completed
+        result['waited_seconds'] = round(waited, 1)
+        result['wait_state'] = wait_state
+        if result.get('running'):
+            result['paused_for_running'] = True
+            if result.get('interactive_prompt') or wait_state == 'interactive_prompt':
+                result['pause_reason'] = 'interactive_prompt'
+            elif wait_state == 'long_running_command':
+                result['pause_reason'] = 'long_running_command'
+            elif wait_state == 'active_output':
+                result['pause_reason'] = 'active_output'
+            elif wait_state == 'output_quiet':
+                result['pause_reason'] = 'output_quiet'
+            elif wait_state == 'output_stalled':
+                result['pause_reason'] = 'output_stalled'
+            elif wait_state == 'silent_running':
+                result['pause_reason'] = 'silent_running'
+            elif wait_state == 'timeout':
+                result['pause_reason'] = 'wait_timeout'
+            elif wait_state == 'read_capture':
+                result['pause_reason'] = 'read_capture'
+            elif wait_state == 'stopped':
+                result['pause_reason'] = 'stopped'
+            else:
+                result['pause_reason'] = 'still_running'
+
+    @classmethod
+    async def start(cls, command: str,
+                    stop_event: Optional[asyncio.Event] = None) -> Dict[str, Any]:
         command = command.strip()
         if not command:
             return {'success': False, 'output': 'shell 命令为空', 'return_code': -1}
@@ -2220,7 +2760,20 @@ class AgentShellSessionManager:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, session.start)
             await asyncio.sleep(cls.START_CAPTURE_SECONDS)
-            return cls._format_result(session, session.read_delta(), 'start')
+            long_running_hint = looks_like_long_running_command(command)
+            completed, waited, wait_timeout, wait_state = await cls._wait_for_useful_state(
+                session,
+                cls.START_CAPTURE_SECONDS,
+                stop_event,
+                long_running_hint=long_running_hint
+            )
+            if completed:
+                output = session.read_snapshot(cls.CONTEXT_OUTPUT_LIMIT)
+            else:
+                output = session.read_delta(cls.CONTEXT_OUTPUT_LIMIT)
+            result = cls._format_result(session, output, 'start')
+            cls._attach_wait_info(result, completed, waited, wait_timeout, wait_state)
+            return result
         except Exception as e:
             with cls._lock:
                 cls._sessions.pop(session_id, None)
@@ -2228,45 +2781,95 @@ class AgentShellSessionManager:
             return {'success': False, 'output': f'启动 shell 会话失败: {str(e)[:200]}', 'return_code': -1}
 
     @classmethod
-    async def send_input(cls, session_id: str, text: str) -> Dict[str, Any]:
+    async def send_input(cls, session_id: str, steps: List[Dict[str, Any]],
+                         stop_event: Optional[asyncio.Event] = None) -> Dict[str, Any]:
         try:
             session = cls._get(session_id)
             if not session.is_running():
                 return cls._format_result(session, session.read_delta(), 'stdin')
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, lambda: session.write(text))
+            input_bytes = 0
+            for step in steps:
+                if stop_event and stop_event.is_set():
+                    break
+                step_type = step.get('type')
+                if step_type == 'bytes':
+                    payload = step.get('payload') or b''
+                    if payload:
+                        await loop.run_in_executor(None, lambda data=payload: session.write_bytes(data))
+                        input_bytes += len(payload)
+                elif step_type == 'wait':
+                    seconds = float(step.get('seconds') or 0)
+                    if stop_event:
+                        try:
+                            await asyncio.wait_for(stop_event.wait(), timeout=seconds)
+                        except asyncio.TimeoutError:
+                            pass
+                    else:
+                        await asyncio.sleep(seconds)
+                else:
+                    raise ValueError(f"unknown stdin macro step: {step_type}")
             await asyncio.sleep(cls.AFTER_INPUT_CAPTURE_SECONDS)
-            return cls._format_result(session, session.read_delta(), 'stdin')
+            long_running_hint = looks_like_long_running_command(session.command)
+            completed, waited, wait_timeout, wait_state = await cls._wait_for_useful_state(
+                session,
+                cls.AFTER_INPUT_CAPTURE_SECONDS,
+                stop_event,
+                long_running_hint=long_running_hint
+            )
+            if completed:
+                output = session.read_snapshot(cls.CONTEXT_OUTPUT_LIMIT)
+            else:
+                output = session.read_delta(cls.CONTEXT_OUTPUT_LIMIT)
+                if not output:
+                    output = session.read_recent(cls.CONTEXT_OUTPUT_LIMIT)
+            result = cls._format_result(session, output, 'stdin')
+            cls._attach_wait_info(result, completed, waited, wait_timeout, wait_state)
+            result['input_bytes'] = input_bytes
+            return result
         except Exception as e:
             logger.error(f"写入 shell 会话失败: {e}")
             return {'success': False, 'session_id': session_id, 'output': f'写入 shell 会话失败: {str(e)[:200]}', 'return_code': -1}
 
     @classmethod
-    async def send_raw_input(cls, session_id: str, payload: bytes, action: str = 'stdin_raw') -> Dict[str, Any]:
+    async def read(cls, session_id: str,
+                   stop_event: Optional[asyncio.Event] = None) -> Dict[str, Any]:
         try:
             session = cls._get(session_id)
-            if not session.is_running():
-                result = cls._format_result(session, session.read_delta(), action)
-                result['input_bytes'] = 0
-                return result
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, lambda: session.write_bytes(payload))
-            await asyncio.sleep(cls.AFTER_INPUT_CAPTURE_SECONDS)
-            result = cls._format_result(session, session.read_delta(), action)
-            result['input_bytes'] = len(payload)
+            capture_seconds = min(1.0, cls.AFTER_INPUT_CAPTURE_SECONDS)
+            if stop_event:
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=capture_seconds)
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(capture_seconds)
+            completed = not session.is_running()
+            waited = capture_seconds
+            wait_timeout = capture_seconds
+            long_running_hint = looks_like_long_running_command(session.command)
+            if completed:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, lambda: session.wait_reader_drain(0.2))
+            if completed:
+                output = session.read_snapshot(cls.CONTEXT_OUTPUT_LIMIT)
+            else:
+                output = session.read_delta(cls.CONTEXT_OUTPUT_LIMIT)
+                if not output:
+                    output = session.read_recent(cls.CONTEXT_OUTPUT_LIMIT)
+            if completed:
+                wait_state = 'completed'
+            else:
+                wait_state = cls._classify_running_state(
+                    session,
+                    output,
+                    float(AgentExecutor.get_timeout()),
+                    time.monotonic() - session.started_monotonic,
+                    long_running_hint=long_running_hint
+                )
+            result = cls._format_result(session, output, 'read')
+            cls._attach_wait_info(result, completed, waited, wait_timeout, wait_state)
             return result
-        except Exception as e:
-            logger.error(f"写入 shell 会话原始输入失败: {e}")
-            return {'success': False, 'session_id': session_id, 'output': f'写入 shell 会话原始输入失败: {str(e)[:200]}', 'return_code': -1}
-
-    @classmethod
-    async def read(cls, session_id: str) -> Dict[str, Any]:
-        try:
-            session = cls._get(session_id)
-            output = session.read_delta()
-            if not output:
-                output = session.read_recent()
-            return cls._format_result(session, output, 'read')
         except Exception as e:
             return {'success': False, 'session_id': session_id, 'output': f'读取 shell 会话失败: {str(e)[:200]}', 'return_code': -1}
 
@@ -3460,35 +4063,122 @@ def get_editing_prompt_key(state: Any) -> str:
         return 'global_prompt_addon'
     return UserDataManager.get('editing_prompt_key', 'assistant_prompt')
 
-def is_continue_request(text: str) -> bool:
-    normalized = text.strip().lower()
-    exact_matches = {
-        '继续', '接着', '继续刚才', '接着刚才', '继续上次', '继续执行',
-        'go on', 'continue', 'cont', 'resume'
+def build_shell_notice(action_label: str, shell_result: Dict[str, Any],
+                       session_id: Any, command: str, output: str) -> str:
+    pause_reason = shell_result.get('pause_reason') or ''
+    stored_output = format_shell_context_output(output, bool(shell_result.get('running')))
+    waited_seconds = shell_result.get('waited_seconds')
+    output_chars = shell_result.get('output_chars')
+    output_idle_seconds = shell_result.get('output_idle_seconds')
+    output_chunks = shell_result.get('output_chunks')
+    output_active_seconds = shell_result.get('output_active_seconds')
+    wait_state = shell_result.get('wait_state') or ''
+    elapsed_line = f"本次等待/捕获耗时: {waited_seconds} 秒\n" if waited_seconds is not None else ""
+    output_line = ""
+    if output_chars is not None or output_idle_seconds is not None or output_chunks is not None:
+        output_line = (
+            f"输出字符数: {output_chars}\n"
+            f"输出块数: {output_chunks}\n"
+            f"输出活跃时长: {output_active_seconds} 秒\n"
+            f"距今无新输出: {output_idle_seconds} 秒\n"
+        )
+    return (
+        f"[Agent shell {action_label}]\n"
+        f"会话: {session_id}\n"
+        f"命令: {command}\n"
+        f"长驻预判: {shell_result.get('command_hint_long_running')}\n"
+        f"判定状态: {wait_state}\n"
+        f"运行中: {shell_result.get('running')}\n"
+        f"暂停原因: {pause_reason}\n"
+        f"返回码: {shell_result.get('return_code')}\n"
+        f"{elapsed_line}"
+        f"{output_line}"
+        f"输出:\n{stored_output}"
+    )
+
+
+def get_shell_pause_messages(pause_reason: str) -> Tuple[str, str]:
+    mapping = {
+        'interactive_prompt': (
+            "会话大概率在等待输入；当前输出会交给 AI 继续判断。",
+            "⏳ Shell 会话大概率在等待输入，正在交给 AI 继续判断。",
+        ),
+        'active_output': (
+            "会话大概率仍在持续输出；当前输出会交给 AI 继续判断。",
+            "⏳ Shell 会话大概率仍在持续输出，正在交给 AI 继续判断。",
+        ),
+        'output_quiet': (
+            "会话输出可能已安静下来，但进程仍在运行；当前输出会交给 AI 继续判断。",
+            "⏳ Shell 会话输出可能已安静下来但进程仍在运行，正在交给 AI 继续判断。",
+        ),
+        'output_stalled': (
+            "会话输出疑似停滞一段时间，但进程仍在运行；当前输出会交给 AI 继续判断。",
+            "⏳ Shell 会话输出疑似停滞一段时间，正在交给 AI 继续判断。",
+        ),
+        'silent_running': (
+            "会话可能仍在运行，但尚未产生可见输出；当前输出会交给 AI 继续判断。",
+            "⏳ Shell 会话可能仍在运行但尚未产生可见输出，正在交给 AI 继续判断。",
+        ),
+        'long_running_command': (
+            "会话看起来大概率是长驻任务；当前输出会交给 AI 继续判断。",
+            "⏳ Shell 会话看起来大概率是长驻任务，正在交给 AI 继续判断。",
+        ),
+        'wait_timeout': (
+            "会话超过等待窗口仍可能在运行；当前输出会交给 AI 继续判断。",
+            "⏳ Shell 会话超过等待窗口仍可能在运行，正在交给 AI 继续判断。",
+        ),
+        'read_capture': (
+            "已快速读取当前会话输出；结果会交给 AI 继续判断。",
+            "⏳ 已快速读取 Shell 会话输出，正在交给 AI 继续判断。",
+        ),
+        'stopped': (
+            "会话已停止；当前结果会交给 AI 继续判断。",
+            "⏹️ Shell 会话已停止，正在整理给 AI 的结果。",
+        ),
     }
-    if normalized in exact_matches:
-        return True
-    return normalized.startswith(('继续 ', '继续，', '继续。', '接着 ', '接着，', '接着。'))
+    default = (
+        "会话仍在运行；当前输出会交给 AI 继续判断。",
+        "⏳ Shell 会话仍在运行，正在交给 AI 继续判断。",
+    )
+    return mapping.get(pause_reason, default)
 
-def stash_pending_agent_result(content: str, reason: str):
-    if not content:
-        return
-    max_chars = 12000
-    clipped = content if len(content) <= max_chars else content[-max_chars:]
-    UserDataManager.set('pending_agent_result', {
-        'content': clipped,
-        'reason': reason,
-        'timestamp': time.time(),
-    })
 
-def consume_pending_agent_result_if_requested(text: str) -> Optional[Dict[str, Any]]:
-    if not is_continue_request(text):
-        return None
-    pending = UserDataManager.get('pending_agent_result')
-    if not pending:
-        return None
-    UserDataManager.set('pending_agent_result', None)
-    return pending
+def build_run_notice(run_result: Dict[str, Any]) -> str:
+    output = str(run_result.get('output') or '(无输出)')
+    stored_output = format_shell_context_output(output, running=False)
+    return (
+        "[Agent run]\n"
+        f"命令: {run_result.get('command') or ''}\n"
+        f"成功: {run_result.get('success')}\n"
+        f"返回码: {run_result.get('return_code')}\n"
+        f"超时: {run_result.get('timed_out')}\n"
+        f"停止: {run_result.get('stopped')}\n"
+        f"耗时: {run_result.get('elapsed_seconds')} 秒\n"
+        f"完整输出文件: {run_result.get('output_path')}\n"
+        f"完整输出大小: {run_result.get('output_bytes')} bytes\n"
+        f"上下文输出:\n{stored_output}"
+    )
+
+
+def format_shell_display_output(output: str, running: bool, limit: int = 1600) -> str:
+    if len(output) <= limit:
+        return output
+    if running:
+        return output[-limit:].lstrip() + "\n... (仅显示最新 shell 输出)"
+    return clip_middle_text(output, limit, "shell 输出")
+
+
+def format_shell_context_output(output: str, running: bool, limit: int = 12000) -> str:
+    """Trim shell output before storing/feeding it to the model."""
+    if len(output) <= limit:
+        return output
+    if running:
+        return (
+            f"... (shell 输出过长，已省略开头 {len(output) - limit} 字符，保留最新输出) ...\n"
+            f"{output[-limit:].lstrip()}"
+        )
+    return clip_middle_text(output, limit, "shell 输出")
+
 
 MODEL_TARGETS = {
     'chat': {
@@ -3727,14 +4417,12 @@ def build_absolute_path_prompt_section() -> str:
     project_root = to_display_path(os.path.dirname(os.path.abspath(__file__)))
     skill_dir = to_display_path(SKILL_DIR)
     upload_dir = to_display_path(os.path.join(project_root, 'bot_storage', 'uploads'))
-    command_output_dir = to_display_path(os.path.join(project_root, 'bot_storage', 'command_outputs'))
     return (
         "\n\n---\n"
         "【当前运行目录绝对路径】\n"
         f"- 项目根目录: {project_root}\n"
         f"- skill 目录: {skill_dir}\n"
         f"- 上传目录: {upload_dir}\n"
-        f"- 命令结果目录: {command_output_dir}\n"
         "---\n"
     )
 
@@ -3750,7 +4438,6 @@ def get_agent_runtime_prompt(agent_mode: bool) -> str:
 class ArtifactManager:
     ROOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bot_storage')
     UPLOAD_DIR = os.path.join(ROOT_DIR, 'uploads')
-    COMMAND_OUTPUT_DIR = os.path.join(ROOT_DIR, 'command_outputs')
     GENERATED_MEDIA_DIR = os.path.join(ROOT_DIR, 'generated_media')
     MAX_INLINE_TEXT_BYTES = 120 * 1024
     MAX_INLINE_TEXT_CHARS = 12000
@@ -3813,29 +4500,6 @@ class ArtifactManager:
         }
 
     @classmethod
-    def save_command_output(cls, command: str, result: Dict[str, Any]) -> Dict[str, Any]:
-        abs_path, rel_path = cls._build_relative_path('command_outputs', 'command_result.txt', 'command_result')
-        body = (
-            f"command: {command}\n"
-            f"return_code: {result.get('return_code')}\n"
-            f"success: {result.get('success')}\n"
-            f"timed_out: {result.get('timed_out', False)}\n"
-            f"truncated: {result.get('truncated', False)}\n"
-            f"timestamp: {datetime.now().isoformat(timespec='seconds')}\n"
-            "\n"
-            "output:\n"
-            f"{result.get('output', '')}"
-        )
-        with open(abs_path, 'w', encoding='utf-8') as f:
-            f.write(body)
-
-        return {
-            'abs_path': abs_path,
-            'rel_path': rel_path,
-            'size': len(body.encode('utf-8')),
-        }
-
-    @classmethod
     def get_generated_media_root(cls) -> str:
         os.makedirs(cls.GENERATED_MEDIA_DIR, exist_ok=True)
         return cls.GENERATED_MEDIA_DIR
@@ -3879,60 +4543,6 @@ class ArtifactManager:
         if note:
             message += f"。说明：{note}"
         return message
-
-    @staticmethod
-    def build_command_notice(command: str, rel_path: str, result: Dict[str, Any]) -> str:
-        summary = f"返回码 {result.get('return_code')}"
-        if result.get('timed_out'):
-            summary += "，命令超时"
-        elif result.get('success'):
-            summary += "，命令执行成功"
-        else:
-            summary += "，命令执行失败"
-        return (
-            f"[执行结果文件] 命令 `{command[:80]}` 的完整结果已保存到 {rel_path}。"
-            f"{summary}。如果后面只想临时查看结果、不想再生成新结果文件，优先使用默认 `exec`。"
-        )
-
-    @staticmethod
-    def build_command_context_notice(command: str, result: Dict[str, Any], rel_path: Optional[str] = None) -> str:
-        summary = f"返回码: {result.get('return_code')}"
-        if result.get('timed_out'):
-            summary += "，命令超时"
-        elif result.get('success'):
-            summary += "，命令执行成功"
-        else:
-            summary += "，命令执行失败"
-        if result.get('truncated'):
-            summary += "，输出已截断"
-
-        output = result.get('output') or '(无输出)'
-        path_line = f"结果文件: {rel_path}\n" if rel_path else ""
-        return (
-            "[执行结果上下文]\n"
-            f"命令: {command}\n"
-            f"{path_line}"
-            f"{summary}\n"
-            "输出:\n"
-            f"{output}\n"
-            "说明: 这是 exec --save 的真实命令输出，已经写入长期上下文记录；"
-            "后续轮次可直接基于这段结果继续判断。"
-        )
-
-    @staticmethod
-    def build_direct_command_notice(command: str, result: Dict[str, Any]) -> str:
-        summary = f"返回码 {result.get('return_code')}"
-        if result.get('timed_out'):
-            summary += "，命令超时"
-        elif result.get('success'):
-            summary += "，命令执行成功"
-        else:
-            summary += "，命令执行失败"
-        return (
-            f"[直接执行结果] 命令 `{command[:80]}` 已直接返回输出，未保存到结果文件。"
-            f"{summary}。如果后面还需要长期回忆这份结果，应改用 `exec --save`。"
-        )
-
 
 EXTERNAL_MEDIA_SPEAKER = "外部媒体模块"
 MEDIA_GENERATION_TIMEOUT = 180
@@ -4488,8 +5098,6 @@ def _fmt_timeout(val):
 
 def _fmt_command_timeout(val):
     val = normalize_command_timeout(val)
-    if val == 0:
-        return "∞"
     return f"{val}s"
 
 def get_main_menu():
@@ -4532,7 +5140,7 @@ def get_timeout_settings_menu():
     command_timeout = UserDataManager.get('agent_command_timeout', DEFAULT_AGENT_COMMAND_TIMEOUT)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"💬 AI回复超时：{_fmt_timeout(ai_timeout)}", callback_data="cmd_set_ai_timeout")],
-        [InlineKeyboardButton(f"⌨️ 命令超时：{_fmt_command_timeout(command_timeout)}", callback_data="cmd_set_command_timeout")],
+        [InlineKeyboardButton(f"⌨️ 命令等待：{_fmt_command_timeout(command_timeout)}", callback_data="cmd_set_command_timeout")],
         [InlineKeyboardButton("🔙 返回", callback_data="menu_more_settings")]
     ])
 
@@ -4543,8 +5151,8 @@ def build_timeout_settings_text() -> str:
         "⏱️ <b>超时设置</b>\n"
         "━━━━━━━━━━━━━━\n"
         f"💬 AI回复超时：<b>{_fmt_timeout(ai_timeout)}</b>\n"
-        f"⌨️ 命令执行超时：<b>{_fmt_command_timeout(command_timeout)}</b>\n\n"
-        "AI回复超时控制等待模型响应的时间；命令超时控制 Agent 命令最多运行多久。"
+        f"⌨️ 命令等待窗口：<b>{_fmt_command_timeout(command_timeout)}</b>\n\n"
+        "AI回复超时控制等待模型响应的时间；命令等待窗口控制 run 的最长等待，也是 shell 状态判断的硬上限。"
     )
 
 def get_ai_timeout_menu():
@@ -4564,8 +5172,7 @@ def get_command_timeout_menu():
          InlineKeyboardButton("120s", callback_data="set_command_timeout_120")],
         [InlineKeyboardButton("300s", callback_data="set_command_timeout_300"),
          InlineKeyboardButton("600s", callback_data="set_command_timeout_600")],
-        [InlineKeyboardButton("∞ 无限", callback_data="set_command_timeout_0"),
-         InlineKeyboardButton("✍️ 自定义", callback_data="set_command_timeout_custom")],
+        [InlineKeyboardButton("✍️ 自定义", callback_data="set_command_timeout_custom")],
         [InlineKeyboardButton("🔙 返回", callback_data="menu_timeout_settings")]
     ])
 
@@ -4885,6 +5492,57 @@ def split_text_for_telegram(text: str, limit: int = 4000) -> List[str]:
 
     return chunks
 
+def plain_text_from_html(text: str) -> str:
+    cleaned = re.sub(r'</(p|div|br|pre|blockquote|li|h[1-6])\s*>', '\n', str(text), flags=re.I)
+    cleaned = re.sub(r'<[^>]+>', '', cleaned)
+    return html.unescape(cleaned)
+
+async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: Any,
+                            limit: int = 3900, **kwargs: Any) -> List[Any]:
+    """Send text without letting Telegram's per-message limit break the handler."""
+    raw_text = str(text if text is not None else "")
+    if not raw_text:
+        raw_text = " "
+    parse_mode = kwargs.get('parse_mode')
+    chunks = split_text_for_telegram(raw_text, limit)
+    sent: List[Any] = []
+
+    for index, chunk in enumerate(chunks):
+        send_kwargs = dict(kwargs)
+        if index > 0:
+            send_kwargs.pop('reply_markup', None)
+        try:
+            sent.append(await context.bot.send_message(chat_id=chat_id, text=chunk, **send_kwargs))
+        except RetryAfter as e:
+            await asyncio.sleep(_retry_after_seconds(e) + 0.1)
+            sent.append(await context.bot.send_message(chat_id=chat_id, text=chunk, **send_kwargs))
+        except BadRequest as e:
+            message = str(e).lower()
+            if parse_mode and ("message is too long" in message or "can't parse entities" in message):
+                fallback_kwargs = dict(send_kwargs)
+                fallback_kwargs.pop('parse_mode', None)
+                fallback_text = plain_text_from_html(chunk)
+                for fallback_chunk in split_text_for_telegram(fallback_text, limit):
+                    sent.append(await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=fallback_chunk,
+                        **fallback_kwargs
+                    ))
+                continue
+            if "message is too long" in message:
+                fallback_kwargs = dict(send_kwargs)
+                fallback_kwargs.pop('parse_mode', None)
+                for fallback_chunk in split_text_for_telegram(plain_text_from_html(chunk), 3000):
+                    sent.append(await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=fallback_chunk,
+                        **fallback_kwargs
+                    ))
+                continue
+            raise
+
+    return sent
+
 async def finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: Any,
                                  response: str, limit: int = 4000):
     chunks = split_text_for_telegram(response, limit)
@@ -4894,7 +5552,7 @@ async def finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     )
     await safe_edit_text(msg, chunks[0], reply_markup=None)
     for extra_chunk in chunks[1:]:
-        await context.bot.send_message(chat_id=chat_id, text=extra_chunk)
+        await safe_send_message(context, chat_id, extra_chunk)
 
 def _retry_after_seconds(exc: RetryAfter) -> float:
     retry_after = getattr(exc, 'retry_after', 1.0)
@@ -5396,6 +6054,16 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
             if contains_inline_generated_media(response):
                 response, media_artifacts = extract_inline_generated_media(response)
             response = append_external_media_notices_to_response(response, extra_media_artifacts)
+            write_model_trace("model_response", {
+                "trace_id": trace_id,
+                "provider": prov_name,
+                "provider_format": prov_data.get('api_format', 'openai'),
+                "model": model,
+                "stream": False,
+                "response": response,
+                "usage": usage_sink[0] if usage_sink else None,
+                "elapsed_seconds": time.monotonic() - generation_started_at,
+            })
             if media_artifacts:
                 try:
                     await send_generated_media_artifacts(context, chat_id, media_artifacts, caption=response)
@@ -6013,10 +6681,10 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif data == "cmd_set_command_timeout":
             current_timeout = UserDataManager.get('agent_command_timeout', DEFAULT_AGENT_COMMAND_TIMEOUT)
             await query.message.edit_text(
-                f"⌨️ <b>命令执行超时</b>\n\n"
+                f"⌨️ <b>命令等待窗口</b>\n\n"
                 f"当前: <b>{_fmt_command_timeout(current_timeout)}</b>\n"
-                f"这决定 Agent 命令最多运行多久。\n"
-                f"交互式、阻塞式、持续输出命令仍建议使用 <code>shell</code> 协议。",
+                f"run 命令会最多等待这个时间；shell/stdin 会结合输出活跃度、静默、交互提示和长驻预判决定何时回灌，等待窗口是硬上限。\n"
+                f"系统会把有判断价值的 shell 结果交给 AI，AI 可继续自动执行下一步协议。",
                 reply_markup=get_command_timeout_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
@@ -6024,7 +6692,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif data == "set_command_timeout_custom":
             UserDataManager.set('state', BotState.SET_COMMAND_TIMEOUT)
             await query.message.reply_text(
-                f"⌨️ 请输入自定义命令执行超时秒数 ({MIN_AGENT_COMMAND_TIMEOUT}-{MAX_AGENT_COMMAND_TIMEOUT})。\n"
+                f"⌨️ 请输入自定义命令等待窗口秒数 ({MIN_AGENT_COMMAND_TIMEOUT}-{MAX_AGENT_COMMAND_TIMEOUT})。\n"
                 "例如: 90、300、600s。发送 cancel 取消。"
             )
 
@@ -6032,9 +6700,9 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             timeout_val = normalize_command_timeout(data.rsplit("_", 1)[1])
             UserDataManager.set('agent_command_timeout', timeout_val)
             await UserDataManager.save_config('agent_command_timeout', timeout_val)
-            await GlobalRecorder.record_system_op(f"设置命令执行超时: {_fmt_command_timeout(timeout_val)}")
+            await GlobalRecorder.record_system_op(f"设置命令等待窗口: {_fmt_command_timeout(timeout_val)}")
             await query.message.edit_text(
-                f"✅ 命令执行超时已设为 <b>{_fmt_command_timeout(timeout_val)}</b>。",
+                f"✅ 命令等待窗口已设为 <b>{_fmt_command_timeout(timeout_val)}</b>。",
                 reply_markup=get_timeout_settings_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
@@ -6831,86 +7499,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.message.reply_text("操作失败，请稍后重试。")
 
 # --- ☆ 文档消息处理 ☆ ---
-async def handle_document_message_legacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_authorized_user_middleware(update, context):
-        return
-    
-    await UserDataManager.init()
-    state = UserDataManager.get('state')
-    
-    # 记录文件消息
-    doc = update.message.document
-    await GlobalRecorder.record_user_message(
-        f"[文件] {doc.file_name}",
-        MessageType.USER_FILE,
-        update.effective_chat.id
-    )
-    
-    if is_prompt_edit_state(state):
-        if not (doc.file_name.endswith('.txt') or doc.file_name.endswith('.md') or 
-                (doc.mime_type and 'text' in doc.mime_type)):
-            await update.message.reply_text(
-                "⚠️ 仅支持 .txt 或 .md 文本文件。"
-            )
-            return
-
-        status_msg = await update.message.reply_text("📥 正在读取用户提供的文件...")
-        try:
-            file_obj = await doc.get_file()
-            content_bytes = await file_obj.download_as_bytearray()
-            try:
-                text_content = content_bytes.decode('utf-8')
-            except UnicodeDecodeError:
-                text_content = content_bytes.decode('gbk', errors='ignore')
-            
-            prompt_key = get_editing_prompt_key(state)
-            if prompt_key in {'assistant_prompt', 'global_prompt_addon'}:
-                await save_runtime_prompt(prompt_key, text_content)
-            else:
-                PromptFileManager.set(prompt_key, text_content)
-            
-            UserDataManager.set('state', BotState.IDLE)
-            UserDataManager.set('editing_prompt_key', "")
-            UserDataManager.set('prompt_buffer', "")
-            
-            prompt_type = PromptFileManager.get_label(prompt_key)
-            await GlobalRecorder.record_system_op(f"通过文件更新{prompt_type}提示词", {"length": len(text_content)})
-            await status_msg.edit_text(
-                f"✅ 已读取。{prompt_type}提示词已更新，共 {len(text_content)} 字。",
-                reply_markup=get_main_menu()
-            )
-            
-        except Exception as e:
-            logger.error(f"Read File Error: {e}")
-            await status_msg.edit_text("读取失败。")
-    else:
-        # 非提示词模式下：尝试读取文本文件内容并转发给AI
-        is_text_file = (
-            doc.file_name.endswith(('.txt', '.md', '.py', '.json', '.csv', '.log', '.xml', '.html', '.css', '.js')) or
-            (doc.mime_type and 'text' in doc.mime_type)
-        )
-        if is_text_file and doc.file_size and doc.file_size < 50000:  # 限刖50KB
-            try:
-                file_obj = await doc.get_file()
-                content_bytes = await file_obj.download_as_bytearray()
-                try:
-                    text_content = content_bytes.decode('utf-8')
-                except UnicodeDecodeError:
-                    text_content = content_bytes.decode('gbk', errors='ignore')
-                
-                truncated_content = text_content[:3000]  # 限制3000字符
-                suffix = "\n...(文件已截断)" if len(text_content) > 3000 else ""
-                file_msg = f"[用户发送了文件: {doc.file_name}]\n文件内容:\n{truncated_content}{suffix}"
-                await process_conversation(update, context, file_msg)
-            except Exception as e:
-                logger.error(f"读取文件并转发AI失败: {e}")
-                await update.message.reply_text(f"📄 用户发了文件 {safe_text(doc.file_name)}  系统未能解析该文件 ><")
-        else:
-            await update.message.reply_text(
-                f"📄 用户发了文件 {safe_text(doc.file_name)}  系统已记录该文件"
-            )
-
-# --- ☆ 文本消息处理 ☆ ---
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
         return
@@ -7189,9 +7777,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         UserDataManager.set('agent_command_timeout', timeout_val)
         UserDataManager.set('state', BotState.IDLE)
         await UserDataManager.save_config('agent_command_timeout', timeout_val)
-        await GlobalRecorder.record_system_op(f"设置命令执行超时: {_fmt_command_timeout(timeout_val)}")
+        await GlobalRecorder.record_system_op(f"设置命令等待窗口: {_fmt_command_timeout(timeout_val)}")
         await update.message.reply_text(
-            f"✅ 命令执行超时已设为 {_fmt_command_timeout(timeout_val)}。",
+            f"✅ 命令等待窗口已设为 {_fmt_command_timeout(timeout_val)}。",
             reply_markup=get_timeout_settings_menu()
         )
         return
@@ -7440,8 +8028,6 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     agent_mode = UserDataManager.get('agent_mode', False)
     stream_mode = normalize_bool(UserDataManager.get('stream_mode', True), True)
     db = await BotMemoryDB.get_instance()
-    pending_agent_result = consume_pending_agent_result_if_requested(text) if content_override is None else None
-
     cid, cdata = await get_or_create_chat_session()
     model = cdata.get('model') or UserDataManager.get('default_model')
     prov_name, prov_data = get_current_provider()
@@ -7467,25 +8053,13 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     system_prompt = base_prompt + global_addon
     history = await db.get_conversation_messages(global_depth)
     if content_override is not None:
+        # 文件/图片本体只在本轮临时喂给模型；长期记忆和导出仍只保留路径索引。
         for msg in reversed(history):
             if msg.get('role') == 'user':
                 msg['content'] = content_override
                 break
         else:
             history.append({'role': 'user', 'content': content_override})
-    elif pending_agent_result:
-        pending_content = str(pending_agent_result.get('content') or '')
-        pending_reason = str(pending_agent_result.get('reason') or '上一次 Agent 工具结果')
-        history.append({
-            'role': 'user',
-            'content': (
-                f"[系统暂存: {pending_reason}]\n"
-                f"{pending_content}\n\n"
-                f"[用户本轮消息]\n{text}\n"
-                "说明: 用户说“继续”，请先基于这段暂存的真实工具输出接着判断下一步。"
-            )
-        })
-
     # Agent 提示词始终保留，只切换执行权限状态
     system_prompt += get_agent_runtime_prompt(agent_mode)
     
@@ -7510,6 +8084,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     # 保存 AI 回复
     await GlobalRecorder.record_ai_reply(response, update.effective_chat.id)
     await db.add_chat_message(cid, 'assistant', response)
+    agent_turn_history: List[Dict[str, Any]] = list(history)
+    agent_turn_history.append({'role': 'assistant', 'content': response})
     
     # --- Agent 模式：命令 / 读文件 / 发文件 / 写文件 / 媒体协议循环 ---
     if agent_mode:
@@ -7519,22 +8095,23 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
         
         while iteration < MAX_AGENT_ITERATIONS:
             if is_stop_requested():
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=(
+                await safe_send_message(
+                    context,
+                    update.effective_chat.id,
+                    (
                         "⏹️ 已停止当前回合，后续 Agent 操作不会继续执行。\n"
-                        "若已有最后一次工具结果，已暂存；用户发“继续”即可接上。"
+                        "已经产生的工具结果会保留在全局记忆里。"
                     )
                 )
                 break
             protocol_blocks = AgentExecutor.extract_protocol_blocks(response)
             if not protocol_blocks:
-                UserDataManager.set('pending_agent_result', None)
                 break  # AI 没有请求任何操作
             
             iteration += 1
             continuation_messages: List[Dict[str, Any]] = []
             should_continue = False
+            pause_agent_message: Optional[str] = None
             provider_api_format = str(prov_data.get('api_format', 'openai'))
             agent_stop_msg = await context.bot.send_message(
                 chat_id=update.effective_chat.id,
@@ -7553,14 +8130,16 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     try:
                         resolved_sendfile_path = AgentExecutor.resolve_file_path(sendfile_path)
                         if not os.path.exists(resolved_sendfile_path):
-                            await context.bot.send_message(
-                                chat_id=update.effective_chat.id,
-                                text=f"❌ 文件不存在: {safe_text(resolved_sendfile_path)}"
+                            await safe_send_message(
+                                context,
+                                update.effective_chat.id,
+                                f"❌ 文件不存在: {safe_text(resolved_sendfile_path)}"
                             )
                         elif os.path.getsize(resolved_sendfile_path) > AgentExecutor.MAX_FILE_SIZE:
-                            await context.bot.send_message(
-                                chat_id=update.effective_chat.id,
-                                text=f"❌ 文件超过50MB限制: {safe_text(resolved_sendfile_path)}"
+                            await safe_send_message(
+                                context,
+                                update.effective_chat.id,
+                                f"❌ 文件超过50MB限制: {safe_text(resolved_sendfile_path)}"
                             )
                         else:
                             fname = os.path.basename(resolved_sendfile_path)
@@ -7578,15 +8157,12 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                 content=f"[Agent发送服务器文件] {resolved_sendfile_path} ({fsize} bytes)",
                                 chat_id=update.effective_chat.id
                             )
-                            stash_pending_agent_result(
-                                f"[Agent发送服务器文件] {resolved_sendfile_path} ({fsize} bytes)",
-                                "上一次 Agent 发送文件结果"
-                            )
                     except Exception as e:
                         logger.error(f"Agent发送服务器文件失败: {e}")
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text=f"❌ 发送文件失败: {safe_text(str(e)[:200])}"
+                        await safe_send_message(
+                            context,
+                            update.effective_chat.id,
+                            f"❌ 发送文件失败: {safe_text(str(e)[:200])}"
                         )
                     continue
 
@@ -7603,7 +8179,6 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         )
                         await db.add_chat_message(cid, 'user', read_notice)
                         continuation_messages.append(read_result['message'])
-                        stash_pending_agent_result(read_notice, "上一次 Agent 读取结果")
                     except Exception as e:
                         logger.error(f"Agent读取路径失败: {read_path} ({e})")
                         read_notice = f"[read结果] 读取失败: {read_path}。错误: {str(e)[:200]}"
@@ -7618,7 +8193,6 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             'role': 'user',
                             'content': read_notice
                         })
-                        stash_pending_agent_result(read_notice, "上一次 Agent 读取失败结果")
                     should_continue = True
                     continue
 
@@ -7639,9 +8213,10 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                     caption=f"📄 已写入服务器并发送: {safe_filename}"
                                 )
                         else:
-                            await context.bot.send_message(
-                                chat_id=update.effective_chat.id,
-                                text=(
+                            await safe_send_message(
+                                context,
+                                update.effective_chat.id,
+                                (
                                     f"✅ 文件已写入服务器，但超过发送大小限制。\n"
                                     f"路径: <code>{safe_text(saved_path)}</code>\n"
                                     f"大小: {saved_size} bytes"
@@ -7658,49 +8233,71 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             ),
                             chat_id=update.effective_chat.id
                         )
-                        stash_pending_agent_result(
-                            f"[Agent写入文件] {saved_path} ({saved_size} bytes, {'覆盖' if file_result['existed'] else '新建'})",
-                            "上一次 Agent 写入文件结果"
-                        )
                     except Exception as e:
                         logger.error(f"Agent写入文件失败: {e}")
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text=f"❌ 文件写入失败: {safe_text(str(e)[:200])}"
+                        await safe_send_message(
+                            context,
+                            update.effective_chat.id,
+                            f"❌ 文件写入失败: {safe_text(str(e)[:200])}"
                         )
                     continue
 
-                if block_type in {'shell', 'stdin', 'stdin_raw', 'stdin_keys', 'shellread', 'shellkill'}:
+                if block_type == 'run':
+                    run_result = await AgentExecutor.run_command(block['body'], get_or_create_stop_event())
+                    run_notice = build_run_notice(run_result)
+                    display_output = format_shell_display_output(
+                        str(run_result.get('output') or '(无输出)'),
+                        running=False,
+                    )
+                    status_emoji = "✅" if run_result.get('success') else "❌"
+                    await safe_send_message(
+                        context,
+                        update.effective_chat.id,
+                        (
+                            f"⌨️ <b>Agent Run</b>\n"
+                            f"{status_emoji} 返回码: <code>{safe_text(run_result.get('return_code'))}</code>\n"
+                            f"完整输出: <code>{safe_text(run_result.get('output_path'))}</code>\n"
+                            f"<pre>{safe_text(display_output)}</pre>"
+                        ),
+                        parse_mode=constants.ParseMode.HTML
+                    )
+                    await GlobalRecorder.record(
+                        msg_type=MessageType.AGENT_RESULT,
+                        role='system',
+                        content=run_notice,
+                        chat_id=update.effective_chat.id
+                    )
+                    continuation_messages.append({
+                        'role': 'user',
+                        'content': (
+                            run_notice + "\n"
+                            "说明: 这是一次性命令 run 的真实结果；完整原始输出已经保存到路径。"
+                            "请基于返回码、上下文输出和完整输出路径继续判断。"
+                        )
+                    })
+                    should_continue = True
+                    continue
+
+                if block_type in {'shell', 'stdin', 'shellread', 'shellkill'}:
                     if block_type == 'shell':
-                        shell_result = await AgentShellSessionManager.start(block['body'])
+                        shell_result = await AgentShellSessionManager.start(block['body'], get_or_create_stop_event())
                     elif block_type == 'stdin':
-                        shell_result = await AgentShellSessionManager.send_input(block['path'], block['body'])
-                    elif block_type == 'stdin_raw':
                         try:
-                            raw_payload = AgentExecutor.parse_raw_stdin_payload(block['body'])
-                            shell_result = await AgentShellSessionManager.send_raw_input(block['path'], raw_payload, 'stdin_raw')
+                            macro_steps = AgentExecutor.parse_stdin_macro(block['body'])
                         except Exception as e:
                             shell_result = {
                                 'success': False,
                                 'session_id': block.get('path'),
-                                'output': f'解析 stdin_raw payload 失败: {str(e)[:200]}',
+                                'output': f'解析 stdin 宏语法失败: {str(e)[:200]}',
                                 'return_code': -1,
                                 'status': 'parse_error',
                             }
-                    elif block_type == 'stdin_keys':
-                        try:
-                            key_payload = AgentExecutor.parse_key_sequence(block['body'])
-                            shell_result = await AgentShellSessionManager.send_raw_input(block['path'], key_payload, 'stdin_keys')
-                        except Exception as e:
-                            shell_result = {
-                                'success': False,
-                                'session_id': block.get('path'),
-                                'output': f'解析 stdin_keys payload 失败: {str(e)[:200]}',
-                                'return_code': -1,
-                                'status': 'parse_error',
-                            }
+                        else:
+                            shell_result = await AgentShellSessionManager.send_input(
+                                block['path'], macro_steps, get_or_create_stop_event()
+                            )
                     elif block_type == 'shellread':
-                        shell_result = await AgentShellSessionManager.read(block['path'])
+                        shell_result = await AgentShellSessionManager.read(block['path'], get_or_create_stop_event())
                     else:
                         shell_result = await AgentShellSessionManager.kill(block['path'])
 
@@ -7712,9 +8309,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         shell_result['output'] = (shell_result.get('output') or '') + "\n⏹️ 会话已随当前回合停止而关闭。"
                     command = shell_result.get('command') or block.get('body') or ''
                     output = shell_result.get('output') or '(无输出)'
-                    display_output = output
-                    if len(display_output) > 1600:
-                        display_output = display_output[:1600].rstrip() + "\n... (shell 输出已截短显示)"
+                    display_output = format_shell_display_output(output, bool(shell_result.get('running')))
 
                     status_emoji = "✅" if shell_result.get('success') else "❌"
                     running_note = "运行中" if shell_result.get('running') else "已结束"
@@ -7724,30 +8319,39 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     action_label = {
                         'shell': '启动会话',
                         'stdin': '输入会话',
-                        'stdin_raw': '原始输入会话',
-                        'stdin_keys': '按键输入会话',
                         'shellread': '读取会话',
                         'shellkill': '关闭会话',
                     }[block_type]
+                    wait_seconds = shell_result.get('waited_seconds')
+                    wait_note = ""
+                    if wait_seconds is not None:
+                        wait_note = f"\n本次等待/捕获耗时: {safe_text(wait_seconds)} 秒"
+                    pause_note = ""
+                    pause_display_text, pause_agent_message = get_shell_pause_messages(
+                        str(shell_result.get('pause_reason') or '')
+                    )
+                    if shell_result.get('running'):
+                        pause_note = "\n" + pause_display_text
 
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=(
+                    await safe_send_message(
+                        context,
+                        update.effective_chat.id,
+                        (
                             f"🖥️ <b>Agent Shell {safe_text(action_label)}</b>\n"
                             f"会话: <code>{safe_text(session_id)}</code> · {safe_text(running_note)} · {safe_text(pty_note)}\n"
-                            f"{status_emoji} 状态: <code>{safe_text(shell_result.get('status') or shell_result.get('return_code') or '')}</code>\n"
+                            f"{status_emoji} 状态: <code>{safe_text(shell_result.get('status') or shell_result.get('return_code') or '')}</code>"
+                            f"{wait_note}{safe_text(pause_note)}\n"
                             f"<pre>{safe_text(display_output)}</pre>"
                         ),
                         parse_mode=constants.ParseMode.HTML
                     )
 
-                    shell_notice = (
-                        f"[Agent shell {action_label}]\n"
-                        f"会话: {session_id}\n"
-                        f"命令: {command}\n"
-                        f"运行中: {shell_result.get('running')}\n"
-                        f"返回码: {shell_result.get('return_code')}\n"
-                        f"输出:\n{output}"
+                    shell_notice = build_shell_notice(
+                        action_label,
+                        shell_result,
+                        session_id,
+                        command,
+                        output
                     )
                     await GlobalRecorder.record(
                         msg_type=MessageType.AGENT_RESULT,
@@ -7755,131 +8359,28 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         content=shell_notice,
                         chat_id=update.effective_chat.id
                     )
-                    stash_pending_agent_result(shell_notice, "上一次 Agent shell 结果")
+                    if shell_result.get('running'):
+                        continuation_messages.append({
+                            'role': 'user',
+                            'content': (
+                                shell_notice + "\n"
+                                "说明: 这是仍在运行的 shell 会话当前真实输出。"
+                                "系统已经根据输出活跃度、静默时长、交互提示和长驻预判做过判断后才回传。"
+                                "请基于这份结果继续判断；需要输入、读取、关闭或继续执行时，可以直接输出相应协议。"
+                                "如果这是持续输出、日志流、服务进程等场景，请不要无意义轮询；"
+                                "应基于当前输出给用户结论，必要时说明会话仍保留。"
+                            )
+                        })
+                        should_continue = True
+                        break
                     continuation_messages.append({
                         'role': 'user',
                         'content': (
                             shell_notice + "\n"
-                            "说明: 这是可持续交互 shell 会话的真实输出；如果会话仍在运行，"
-                            "后续可继续用 stdin:<会话ID> 输入文本，stdin_raw:<会话ID> 输入原始字节，"
-                            "stdin_keys:<会话ID> 输入按键，shellread:<会话ID> 读取，shellkill:<会话ID> 关闭。"
+                            "说明: 这是可持续交互 shell 会话的真实输出；会话已经结束或本次操作已经得到确定结果，"
+                            "请基于这份结果继续判断。"
                         )
                     })
-                    should_continue = True
-                    continue
-
-                if block_type == 'exec':
-                    command = block['body']
-                    should_save = block.get('save', False)
-
-                    result = await AgentExecutor.execute(command, get_or_create_stop_event())
-
-                    if result.get('stopped'):
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text=(
-                                f"⏹️ <b>Agent 命令已停止</b>\n"
-                                f"<code>$ {safe_text(command[:100])}</code>\n"
-                                f"<pre>{safe_text(result.get('output') or '')}</pre>"
-                            ),
-                            parse_mode=constants.ParseMode.HTML
-                        )
-                        await GlobalRecorder.record(
-                            msg_type=MessageType.AGENT_RESULT,
-                            role='system',
-                            content=f"[Agent命令被手动停止] {command}",
-                            chat_id=update.effective_chat.id
-                        )
-                        stash_pending_agent_result(
-                            (
-                                "[Agent命令被手动停止]\n"
-                                f"命令: {command}\n"
-                                f"输出:\n{result.get('output') or '(无输出)'}"
-                            ),
-                            "上一次 Agent 命令停止结果"
-                        )
-                        should_continue = False
-                        break
-
-                    if not should_save:
-                        # Direct execution: default exec returns output to this turn without archiving.
-                        result_notice = ArtifactManager.build_direct_command_notice(command, result)
-                        status_emoji = "✅" if result['success'] else "❌"
-                        timeout_note = " (超时)" if result.get('timed_out') else ""
-                        display_output = result.get('output') or '(无输出)'
-                        if len(display_output) > 1600:
-                            display_output = display_output[:1600].rstrip() + "\n... (直接输出已截短显示)"
-
-                        result_msg = (
-                            f"🤖 <b>Agent 直接执行{timeout_note}</b>\n"
-                            f"<code>$ {safe_text(command[:100])}</code>\n"
-                            f"{status_emoji} 返回码: {result['return_code']}\n"
-                            f"<pre>{safe_text(display_output)}</pre>\n"
-                            "🪶 本次结果未保存为结果文件。"
-                        )
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text=result_msg,
-                            parse_mode=constants.ParseMode.HTML
-                        )
-                        await GlobalRecorder.record(
-                            msg_type=MessageType.AGENT_RESULT,
-                            role='system',
-                            content=result_notice,
-                            chat_id=update.effective_chat.id
-                        )
-                        direct_notice = (
-                            "[执行结果]\n"
-                            f"命令: {command}\n"
-                            f"返回码: {result['return_code']}\n"
-                            f"输出:\n{result.get('output') or '(无输出)'}\n"
-                            "说明: 这是系统直接返回的命令输出，没有写入新的结果文件。"
-                        )
-                        stash_pending_agent_result(direct_notice, "上一次 Agent 命令结果")
-                        continuation_messages.append({
-                            'role': 'user',
-                            'content': direct_notice
-                        })
-                    else:
-                        # Saved execution: archive the output and also feed the real result back into context.
-                        saved_result = ArtifactManager.save_command_output(command, result)
-                        result_notice = ArtifactManager.build_command_notice(command, saved_result['rel_path'], result)
-                        context_notice = ArtifactManager.build_command_context_notice(
-                            command,
-                            result,
-                            saved_result['rel_path']
-                        )
-
-                        status_emoji = "✅" if result['success'] else "❌"
-                        timeout_note = " (超时)" if result.get('timed_out') else ""
-                        display_output = result_notice
-                        if len(display_output) > 500:
-                            display_output = display_output[:500] + "\n... (系统提示已截短显示)"
-                        
-                        result_msg = (
-                            f"🤖 <b>Agent 命令执行存档{timeout_note}</b>\n"
-                            f"<code>$ {safe_text(command[:100])}</code>\n"
-                            f"{status_emoji} 返回码: {result['return_code']}\n"
-                            f"<pre>{safe_text(display_output)}</pre>"
-                        )
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text=result_msg,
-                            parse_mode=constants.ParseMode.HTML
-                        )
-                        await GlobalRecorder.record(
-                            msg_type=MessageType.AGENT_RESULT,
-                            role='system',
-                            content=context_notice,
-                            chat_id=update.effective_chat.id
-                        )
-                        await db.add_chat_message(cid, 'user', context_notice)
-                        continuation_messages.append({
-                            'role': 'user',
-                            'content': context_notice
-                        })
-                        stash_pending_agent_result(context_notice, "上一次 Agent 命令存档结果")
-                    
                     should_continue = True
                     continue
 
@@ -7945,37 +8446,44 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             )
                         except Exception as e:
                             logger.error(f"发送生成媒体失败: {e}")
-                            await context.bot.send_message(
-                                chat_id=update.effective_chat.id,
-                                text=f"⚠️ 媒体已经生成，但发送给用户时出了点问题: {safe_text(str(e)[:200])}"
+                            await safe_send_message(
+                                context,
+                                update.effective_chat.id,
+                                f"⚠️ 媒体已经生成，但发送给用户时出了点问题: {safe_text(str(e)[:200])}"
                             )
                     else:
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text=f"⚠️ 媒体生成失败: {safe_text(str(media_result.get('error') or '未知错误'))}"
+                        await safe_send_message(
+                            context,
+                            update.effective_chat.id,
+                            f"⚠️ 媒体生成失败: {safe_text(str(media_result.get('error') or '未知错误'))}"
                         )
 
                     await GlobalRecorder.record_media_reply(media_notice, update.effective_chat.id)
                     await db.add_chat_message(cid, 'user', f"[外部媒体模块回复]\n{media_notice}")
                     continuation_messages.append(build_media_continuation_message(media_result, media_prompt))
-                    stash_pending_agent_result(media_notice, "上一次 Agent 媒体生成结果")
                     should_continue = True
             
             if not should_continue:
+                end_text = (
+                    "⏹️ Agent 操作已停止。"
+                    if is_stop_requested()
+                    else (pause_agent_message or "🛠️ Agent 操作阶段已结束。")
+                )
                 with contextlib.suppress(Exception):
                     await safe_edit_text(
                         agent_stop_msg,
-                        "⏹️ Agent 操作已停止。" if is_stop_requested() else "🛠️ Agent 操作阶段已结束。",
+                        end_text,
                         reply_markup=None
                     )
                 break  # 只有发送文件/写文件，无需继续循环
 
             if is_stop_requested():
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=(
-                        "⏹️ 已停止当前回合，后续 Agent 续问不会继续。\n"
-                        "最后一次工具结果已暂存；用户发“继续”即可接上。"
+                await safe_send_message(
+                    context,
+                    update.effective_chat.id,
+                    (
+                        "⏹️ 已停止当前回合，后续 Agent 操作不会继续。\n"
+                        "已经产生的工具结果会保留在全局记忆里。"
                     )
                 )
                 with contextlib.suppress(Exception):
@@ -7985,22 +8493,24 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             with contextlib.suppress(Exception):
                 await safe_edit_text(agent_stop_msg, f"🛠️ 第 {iteration} 轮Agent操作完成，正在整理结果...", reply_markup=None)
 
-            # 重新获取历史并让 AI 继续
-            history = await db.get_conversation_messages(global_depth)
-            if continuation_messages:
-                history.extend(continuation_messages)
+            # Continue from this turn's in-memory transcript. Re-reading global history here would
+            # duplicate just-recorded Agent results and make prompt caching worse.
+            if not continuation_messages:
+                break
+            next_history = list(agent_turn_history)
+            next_history.extend(continuation_messages)
 
             if stream_mode:
                 response = await send_streaming_response(
                     update, context,
                     prov_name, prov_data, model,
-                    system_prompt, history
+                    system_prompt, next_history
                 )
             else:
                 response = await send_non_streaming_response(
                     update, context,
                     prov_name, prov_data, model,
-                    system_prompt, history
+                    system_prompt, next_history
                 )
             
             if not response:
@@ -8008,16 +8518,19 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
 
             await GlobalRecorder.record_ai_reply(response, update.effective_chat.id)
             await db.add_chat_message(cid, 'assistant', response)
+            agent_turn_history = next_history
+            agent_turn_history.append({'role': 'assistant', 'content': response})
 
         if iteration >= MAX_AGENT_ITERATIONS and AgentExecutor.extract_protocol_blocks(response):
             reached_agent_limit = True
 
         if reached_agent_limit:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=(
-                    "⚠️ Agent 已达到最大执行次数 (10次)，最后一次工具结果已暂存。\n"
-                    "用户发“继续”，系统会把这段结果附给 AI 接着处理。"
+            await safe_send_message(
+                context,
+                update.effective_chat.id,
+                (
+                    "⚠️ Agent 已达到最大执行次数 (10次)，本轮 Agent 操作已停止。\n"
+                    "已经产生的 AI 回复和工具结果都保留在全局记忆里。"
                 )
             )
 
@@ -8147,6 +8660,8 @@ async def cmd_export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     db = await BotMemoryDB.get_instance()
     global_msgs = await db.get_global_messages(10000)  # 获取更多记录
+    global_depth = max(1, int(UserDataManager.get('global_depth', 30)))
+    ai_context_current = await db.get_conversation_messages(global_depth)
     unauthorized_access_logs = await db.get_unauthorized_access_logs(1000)
     
     if not global_msgs and not unauthorized_access_logs:
@@ -8159,16 +8674,35 @@ async def cmd_export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-        # 1. 导出全局记忆.txt - 包含所有全局记录
-        if global_msgs:
-            global_content = "\n".join([
-                f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(m.get('timestamp', 0)))}] "
-                f"[{m['role']}] {m.get('content')}"
-                for m in global_msgs
-            ])
-            zf.writestr("全局记忆.txt", global_content)
+        def _format_ai_context(messages: List[Dict[str, Any]]) -> str:
+            parts = []
+            for idx, msg in enumerate(messages, start=1):
+                parts.append(
+                    f"--- message {idx} ---\n"
+                    f"role: {msg.get('role')}\n"
+                    "content:\n"
+                    f"{msg.get('content')}"
+                )
+            return "\n\n".join(parts)
+
+        base_prompt = get_runtime_prompt('assistant_prompt')
+        global_addon = get_runtime_prompt('global_prompt_addon')
+        agent_mode = bool(UserDataManager.get('agent_mode', False))
+        actual_system_prompt = base_prompt + global_addon + get_agent_runtime_prompt(agent_mode)
+
+        def _format_global_memory_context(messages: List[Dict[str, Any]]) -> str:
+            return (
+                "说明:\n"
+                "这是一份导出时按当前配置拼出来的 AI 历史上下文视图，便于核对 AI 大概看到了哪些历史消息。\n"
+                f"当前历史深度: {global_depth} 条。\n"
+                "不同接口会再转换成各自 JSON/parts 格式；临时文件/图片本体和过长命令原文可能只保留索引或截断结果。\n\n"
+                "================ HISTORY ================\n"
+                f"{_format_ai_context(messages)}"
+            )
+
+        zf.writestr("提示词.txt", actual_system_prompt)
+        zf.writestr("全局记忆.txt", _format_global_memory_context(ai_context_current))
         
-        # 2. 导出未授权用户记录.txt
         if unauthorized_access_logs:
             unauthorized_lines = []
             for log in unauthorized_access_logs:
@@ -8176,7 +8710,9 @@ async def cmd_export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 line = f"[{ts}]\n用户: {log.get('full_name')}(@{log.get('username') or '无'}) ID:{log.get('user_id')}\n行为: {log.get('action_type')}\n内容: {log.get('content')}\nBot回复: {log.get('bot_reply')}"
                 unauthorized_lines.append(line)
             unauthorized_content = "\n\n".join(unauthorized_lines)
-            zf.writestr("未授权用户记录.txt", unauthorized_content)
+        else:
+            unauthorized_content = "暂无陌生人拦截记录。"
+        zf.writestr("陌生人拦截记录.txt", unauthorized_content)
     
     zip_buffer.seek(0)
     await GlobalRecorder.record_system_op("导出全部数据")
@@ -8464,9 +9000,10 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     # 尝试通知用户
     try:
         if update and hasattr(update, 'effective_chat') and update.effective_chat:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"系统处理时出现异常，请稍后重试。\n<i>({str(context.error)[:80]})</i>",
+            await safe_send_message(
+                context,
+                update.effective_chat.id,
+                f"系统处理时出现异常，请稍后重试。\n<i>({safe_text(str(context.error)[:80])}</i>",
                 parse_mode=constants.ParseMode.HTML
             )
     except Exception:

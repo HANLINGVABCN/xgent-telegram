@@ -355,6 +355,8 @@ body {
     overflow-y: auto;
     padding: 6px;
     min-height: 200px;
+    user-select: none;
+    -webkit-user-select: none;
 }
 .file-list::-webkit-scrollbar { width: 5px; }
 .file-list::-webkit-scrollbar-track { background: transparent; }
@@ -1214,6 +1216,17 @@ body {
     font-size: 1.1rem;
     font-weight: 600;
 }
+.selection-rect {
+    position: fixed;
+    z-index: 4500;
+    display: none;
+    pointer-events: none;
+    border: 1px solid rgba(129, 140, 248, 0.82);
+    background: rgba(129, 140, 248, 0.16);
+    border-radius: 4px;
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.08) inset;
+}
+.selection-rect.show { display: block; }
 
 /* ============================================================
    Confirm Dialog
@@ -1388,6 +1401,7 @@ body {
 <div class="drag-overlay" id="dragOverlay">
     <div class="drag-overlay-text">📤 释放文件以上传到当前目录</div>
 </div>
+<div class="selection-rect" id="selectionRect"></div>
 
 <!-- Toasts -->
 <div class="toast-container" id="toasts"></div>
@@ -1914,6 +1928,13 @@ let dragSelecting = false;
 let dragSelectStart = null;
 let dragSelectTimer = null;
 let dragSelectInitialSelected = new Set();
+let dragSelectAdditive = false;
+let dragSelectMoved = false;
+let dragSelectTouchId = null;
+let dragSelectPendingTouch = null;
+let dragSelectSuppressClick = false;
+let dragSelectSuppressTimer = null;
+let dragSelectOriginalUserSelect = '';
 let vibrateEnabled = localStorage.getItem('fm_vibrate') !== 'false'; // Default true
 
 /* ============================================================
@@ -2137,11 +2158,10 @@ function renderFiles() {
         const cut = clipboard && clipboard.action === 'cut' && clipboard.paths.includes(f.path) ? ' cut' : '';
         const icon = fileIcon(f);
         const size = f.isDir ? '' : fmtSize(f.size);
-        const escapedPath = esc(f.path);
+        const escapedPath = escAttr(f.path);
         html += `<div class="file-item${sel}${cut}" data-path="${escapedPath}" data-idx="${i}"
             onclick="onFileClick(event,${i})" ondblclick="onFileDbl(${i})"
             oncontextmenu="onFileCtx(event,${i})"
-            onmousedown="onFileMouseDown(event,${i})" ontouchstart="onFileTouchStart(event,${i})"
             style="animation-delay:${Math.min(i * 15, 300)}ms">
             <div class="file-item-name">
                 <span class="file-icon">${icon}</span>
@@ -2199,8 +2219,9 @@ function renderSortArrows() {
    ============================================================ */
 function onFileClick(e, idx) {
     // Ignore click if we're in drag selection mode
-    if (dragSelecting) {
+    if (dragSelecting || dragSelectSuppressClick) {
         e.preventDefault();
+        dragSelectSuppressClick = false;
         return;
     }
 
@@ -2231,112 +2252,215 @@ function onFileDbl(idx) {
 /* ============================================================
    Drag Selection
    ============================================================ */
-function onFileMouseDown(e, idx) {
-    // Right mouse button (button === 2) starts drag selection
-    if (e.button === 2) {
-        e.preventDefault();
-        startDragSelection(idx);
-    }
-}
-
-function onFileTouchStart(e, idx) {
-    // Long press on mobile starts drag selection
-    if (dragSelectTimer) clearTimeout(dragSelectTimer);
-    document.addEventListener('touchend', clearDragSelectionTimer, { once: true });
-    document.addEventListener('touchcancel', clearDragSelectionTimer, { once: true });
-    document.addEventListener('touchmove', clearDragSelectionTimer, { once: true, passive: true });
-    dragSelectTimer = setTimeout(() => {
-        dragSelectTimer = null;
-        startDragSelection(idx);
-        // Vibrate if enabled and supported
-        if (vibrateEnabled && navigator.vibrate) {
-            navigator.vibrate(50);
-        }
-    }, 500); // 500ms long press
-}
-
 function clearDragSelectionTimer() {
     if (dragSelectTimer) {
         clearTimeout(dragSelectTimer);
         dragSelectTimer = null;
     }
+    dragSelectPendingTouch = null;
 }
 
-function startDragSelection(idx) {
-    dragSelecting = true;
-    dragSelectStart = idx;
-    dragSelectInitialSelected = new Set(selected);
+function isFileListBlankTarget(target) {
+    const list = document.getElementById('fileList');
+    if (!list || !target || !list.contains(target)) return false;
+    if (target.closest('.file-item')) return false;
+    return true;
+}
 
-    // Add global event listeners
+function pointFromMouseEvent(e) {
+    return { x: e.clientX, y: e.clientY };
+}
+
+function pointFromTouch(touch) {
+    return { x: touch.clientX, y: touch.clientY };
+}
+
+function findTouchById(list, id) {
+    for (let i = 0; i < list.length; i++) {
+        if (list[i].identifier === id) return list[i];
+    }
+    return null;
+}
+
+function rectFromPoints(a, b) {
+    const left = Math.min(a.x, b.x);
+    const top = Math.min(a.y, b.y);
+    return {
+        left,
+        top,
+        right: Math.max(a.x, b.x),
+        bottom: Math.max(a.y, b.y),
+        width: Math.abs(a.x - b.x),
+        height: Math.abs(a.y - b.y),
+    };
+}
+
+function rectsIntersect(a, b) {
+    return a.left <= b.right && a.right >= b.left && a.top <= b.bottom && a.bottom >= b.top;
+}
+
+function setDragSelectSuppressClick() {
+    dragSelectSuppressClick = true;
+    if (dragSelectSuppressTimer) clearTimeout(dragSelectSuppressTimer);
+    dragSelectSuppressTimer = setTimeout(() => {
+        dragSelectSuppressClick = false;
+        dragSelectSuppressTimer = null;
+    }, 180);
+}
+
+function syncSelectedFileItems() {
+    document.querySelectorAll('#fileList .file-item').forEach(item => {
+        item.classList.toggle('selected', selected.has(item.dataset.path));
+    });
+}
+
+function showSelectionRect(rect) {
+    const el = document.getElementById('selectionRect');
+    if (!el) return;
+    el.style.left = rect.left + 'px';
+    el.style.top = rect.top + 'px';
+    el.style.width = rect.width + 'px';
+    el.style.height = rect.height + 'px';
+    el.classList.add('show');
+}
+
+function hideSelectionRect() {
+    const el = document.getElementById('selectionRect');
+    if (el) el.classList.remove('show');
+}
+
+function startDragSelection(point, additive = false, touchId = null) {
+    dragSelecting = true;
+    dragSelectStart = point;
+    dragSelectAdditive = additive;
+    dragSelectMoved = false;
+    dragSelectTouchId = touchId;
+    dragSelectInitialSelected = new Set(selected);
+    if (!additive) selected.clear();
+    syncSelectedFileItems();
+    hideCtx();
+
     document.addEventListener('mousemove', onDragSelectionMove);
     document.addEventListener('mouseup', onDragSelectionEnd);
-    document.addEventListener('touchmove', onDragSelectionTouchMove);
+    document.addEventListener('touchmove', onDragSelectionTouchMove, { passive: false });
     document.addEventListener('touchend', onDragSelectionEnd);
     document.addEventListener('touchcancel', onDragSelectionEnd);
 
-    // Prevent text selection during drag
+    dragSelectOriginalUserSelect = document.body.style.userSelect;
     document.body.style.userSelect = 'none';
 }
 
 function onDragSelectionMove(e) {
     if (!dragSelecting) return;
-    const target = document.elementFromPoint(e.clientX, e.clientY);
-    if (!target) return;
-    const fileItem = target.closest('.file-item');
-    if (!fileItem) return;
-    const idx = parseInt(fileItem.dataset.idx);
-    if (isNaN(idx)) return;
-    updateDragSelection(idx);
+    e.preventDefault();
+    updateDragSelection(pointFromMouseEvent(e));
 }
 
 function onDragSelectionTouchMove(e) {
     if (!dragSelecting) return;
     clearDragSelectionTimer();
-    const touch = e.touches[0];
+    const touch = dragSelectTouchId === null ? e.touches[0] : findTouchById(e.touches, dragSelectTouchId);
     if (!touch) return;
-    const target = document.elementFromPoint(touch.clientX, touch.clientY);
-    if (!target) return;
-    const fileItem = target.closest('.file-item');
-    if (!fileItem) return;
-    const idx = parseInt(fileItem.dataset.idx);
-    if (isNaN(idx)) return;
-    updateDragSelection(idx);
+    e.preventDefault();
+    updateDragSelection(pointFromTouch(touch));
 }
 
-function updateDragSelection(currentIdx) {
-    const all = getVisibleFiles();
-    const start = dragSelectStart;
-    const lo = Math.min(start, currentIdx);
-    const hi = Math.max(start, currentIdx);
+function updateDragSelection(point) {
+    if (!dragSelectStart) return;
+    const rect = rectFromPoints(dragSelectStart, point);
+    if (rect.width > 3 || rect.height > 3) dragSelectMoved = true;
+    if (dragSelectMoved) showSelectionRect(rect);
+    else hideSelectionRect();
 
-    // Restore initial selection
-    selected = new Set(dragSelectInitialSelected);
+    const next = dragSelectAdditive ? new Set(dragSelectInitialSelected) : new Set();
+    document.querySelectorAll('#fileList .file-item').forEach(item => {
+        if (dragSelectMoved && rectsIntersect(rect, item.getBoundingClientRect())) {
+            next.add(item.dataset.path);
+        }
+    });
+    selected = next;
+    syncSelectedFileItems();
+}
 
-    // Add items in range
-    for (let i = lo; i <= hi; i++) {
-        if (all[i]) selected.add(all[i].path);
-    }
+function onFileListMouseDown(e) {
+    if (e.button !== 0 || !isFileListBlankTarget(e.target)) return;
+    e.preventDefault();
+    clearDragSelectionTimer();
+    startDragSelection(pointFromMouseEvent(e), e.ctrlKey || e.metaKey);
+}
 
-    renderFiles();
+function onFileListTouchStart(e) {
+    if (e.touches.length !== 1 || !isFileListBlankTarget(e.target)) return;
+    const touch = e.touches[0];
+    clearDragSelectionTimer();
+    dragSelectPendingTouch = {
+        id: touch.identifier,
+        point: pointFromTouch(touch),
+    };
+    dragSelectTimer = setTimeout(() => {
+        if (!dragSelectPendingTouch) return;
+        const pending = dragSelectPendingTouch;
+        dragSelectPendingTouch = null;
+        dragSelectTimer = null;
+        startDragSelection(pending.point, false, pending.id);
+        setDragSelectSuppressClick();
+        if (vibrateEnabled && navigator.vibrate) navigator.vibrate(35);
+    }, 450);
+}
+
+function onFileListTouchMove(e) {
+    if (dragSelecting) return;
+    if (!dragSelectPendingTouch) return;
+    const touch = findTouchById(e.touches, dragSelectPendingTouch.id);
+    if (!touch) return clearDragSelectionTimer();
+    const point = pointFromTouch(touch);
+    const dx = Math.abs(point.x - dragSelectPendingTouch.point.x);
+    const dy = Math.abs(point.y - dragSelectPendingTouch.point.y);
+    if (dx > 10 || dy > 10) clearDragSelectionTimer();
+}
+
+function onFileListTouchEnd() {
+    if (!dragSelecting) clearDragSelectionTimer();
+}
+
+function isDragSelectionEndEvent(e) {
+    if (dragSelectTouchId === null || !e.changedTouches) return true;
+    return !!findTouchById(e.changedTouches, dragSelectTouchId);
 }
 
 function onDragSelectionEnd(e) {
+    if (e && !isDragSelectionEndEvent(e)) return;
     clearDragSelectionTimer();
     if (!dragSelecting) return;
 
     dragSelecting = false;
     dragSelectStart = null;
+    dragSelectTouchId = null;
     dragSelectInitialSelected.clear();
+    hideSelectionRect();
 
-    // Remove global event listeners
     document.removeEventListener('mousemove', onDragSelectionMove);
     document.removeEventListener('mouseup', onDragSelectionEnd);
     document.removeEventListener('touchmove', onDragSelectionTouchMove);
     document.removeEventListener('touchend', onDragSelectionEnd);
     document.removeEventListener('touchcancel', onDragSelectionEnd);
 
-    // Restore text selection
-    document.body.style.userSelect = '';
+    document.body.style.userSelect = dragSelectOriginalUserSelect;
+    dragSelectOriginalUserSelect = '';
+    setDragSelectSuppressClick();
+}
+
+function onFileListClick(e) {
+    if (dragSelectSuppressClick) {
+        e.preventDefault();
+        e.stopPropagation();
+        dragSelectSuppressClick = false;
+        return;
+    }
+    if (!e.target.closest('.file-item')) {
+        selected.clear();
+        renderFiles();
+    }
 }
 
 /* ============================================================
@@ -3077,16 +3201,16 @@ function setupEvents() {
     setupKeyboard();
     setupTouch();
 
-    // Click empty area to deselect
-    document.getElementById('fileList').addEventListener('click', (e) => {
-        if (!e.target.closest('.file-item')) {
-            selected.clear();
-            renderFiles();
-        }
-    });
+    const fileList = document.getElementById('fileList');
+    fileList.addEventListener('mousedown', onFileListMouseDown);
+    fileList.addEventListener('touchstart', onFileListTouchStart, { passive: true });
+    fileList.addEventListener('touchmove', onFileListTouchMove, { passive: true });
+    fileList.addEventListener('touchend', onFileListTouchEnd, { passive: true });
+    fileList.addEventListener('touchcancel', onFileListTouchEnd, { passive: true });
+    fileList.addEventListener('click', onFileListClick);
 
     // Right-click on empty area
-    document.getElementById('fileList').addEventListener('contextmenu', (e) => {
+    fileList.addEventListener('contextmenu', (e) => {
         if (e.target.closest('.file-item')) return;
         e.preventDefault();
         selected.clear();
