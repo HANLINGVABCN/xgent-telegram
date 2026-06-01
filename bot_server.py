@@ -60,6 +60,7 @@ load_dotenv()
 # --- ☆ 全局控制状态 ☆ ---
 _stop_generation_event: Optional[asyncio.Event] = None   # 停止生成事件
 _is_processing = False                                    # 处理中锁
+_conversation_processing_lock = asyncio.Lock()
 _startup_commands_synced = False
 _startup_menu_sent = False
 
@@ -528,6 +529,108 @@ class MessageType:
     COMMAND = 'command'
     AGENT_CMD = 'agent_cmd'           # Agent 请求的工具动作
     AGENT_RESULT = 'agent_result'     # Agent 工具结果
+
+def _read_int_env(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        value = int(float(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+TEXT_STITCH_MODE_AUTO = "auto"
+TEXT_STITCH_MODE_FORCE = "force"
+TEXT_STITCH_MODE_OFF = "off"
+TEXT_STITCH_MODES = {TEXT_STITCH_MODE_AUTO, TEXT_STITCH_MODE_FORCE, TEXT_STITCH_MODE_OFF}
+DEFAULT_TEXT_STITCH_MODE = TEXT_STITCH_MODE_AUTO
+TELEGRAM_TEXT_LIMIT_CHARS = 4096
+TEXT_STITCH_SPLIT_HINT_CHARS = _read_int_env("TEXT_STITCH_SPLIT_HINT_CHARS", 3800)
+
+
+class PendingTextConversation:
+    """Collect Telegram text fragments until the user taps Done."""
+
+    def __init__(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+        self.update = update
+        self.context = context
+        self.parts: List[str] = [text]
+        self.first_at = time.monotonic()
+        self.last_at = self.first_at
+        self.prompt_message: Optional[Any] = None
+
+    def append(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+        self.update = update
+        self.context = context
+        self.parts.append(text)
+        self.last_at = time.monotonic()
+
+    def total_chars(self) -> int:
+        return sum(len(part) for part in self.parts)
+
+
+_pending_text_conversations: Dict[Tuple[int, int], PendingTextConversation] = {}
+_pending_text_conversations_lock = threading.RLock()
+
+
+def merge_text_conversation_parts(parts: List[str]) -> str:
+    """Merge text parts while treating near-limit chunks as Telegram auto-splits."""
+    cleaned_parts = [str(part or "") for part in parts if str(part or "").strip()]
+    if not cleaned_parts:
+        return ""
+
+    merged = cleaned_parts[0]
+    previous = cleaned_parts[0]
+    for part in cleaned_parts[1:]:
+        if len(previous) >= TEXT_STITCH_SPLIT_HINT_CHARS:
+            merged += part
+        elif merged.endswith("\n") or part.startswith("\n"):
+            merged += part
+        else:
+            merged += "\n\n" + part
+        previous = part
+
+    return merged.strip()
+
+
+def normalize_text_stitch_mode(value: Any) -> str:
+    mode = str(value or DEFAULT_TEXT_STITCH_MODE).strip().lower()
+    if mode in {"on", "true", "1", "always", "force_on", "强制", "开启"}:
+        return TEXT_STITCH_MODE_FORCE
+    if mode in {"none", "false", "0", "disabled", "close", "closed", "关闭"}:
+        return TEXT_STITCH_MODE_OFF
+    if mode not in TEXT_STITCH_MODES:
+        return DEFAULT_TEXT_STITCH_MODE
+    return mode
+
+
+def get_text_stitch_mode_label(mode: Optional[str] = None) -> str:
+    mode = normalize_text_stitch_mode(mode if mode is not None else UserDataManager.get('text_stitch_mode'))
+    if mode == TEXT_STITCH_MODE_FORCE:
+        return "强制开"
+    if mode == TEXT_STITCH_MODE_OFF:
+        return "关闭"
+    return "自动"
+
+
+def should_stitch_text_message(text: str, mode: Optional[str] = None) -> bool:
+    mode = normalize_text_stitch_mode(mode if mode is not None else UserDataManager.get('text_stitch_mode'))
+    if mode == TEXT_STITCH_MODE_OFF:
+        return False
+    if mode == TEXT_STITCH_MODE_FORCE:
+        return True
+    return len(text or "") >= TEXT_STITCH_SPLIT_HINT_CHARS
+
+
+def get_text_conversation_buffer_key(update: Update) -> Tuple[int, int]:
+    chat_id = update.effective_chat.id if update.effective_chat else BotConfig.AUTHORIZED_USER_ID
+    user_id = update.effective_user.id if update.effective_user else BotConfig.AUTHORIZED_USER_ID
+    return chat_id, user_id
+
+
+def has_pending_text_conversation(update: Update) -> bool:
+    key = get_text_conversation_buffer_key(update)
+    with _pending_text_conversations_lock:
+        return key in _pending_text_conversations
+
 
 REDUNDANT_AGENT_COMMAND_PREFIXES: Tuple[str, ...] = ()
 
@@ -1245,6 +1348,9 @@ class UserDataManager:
             'agent_mode': await cls._require_db().get_config('agent_mode', False),
             'agent_confirm': await cls._require_db().get_config('agent_confirm', False),
             'stream_mode': normalize_bool(await cls._require_db().get_config('stream_mode', True), True),
+            'text_stitch_mode': normalize_text_stitch_mode(
+                await cls._require_db().get_config('text_stitch_mode', DEFAULT_TEXT_STITCH_MODE)
+            ),
             'stream_timeout': normalize_stream_timeout(await cls._require_db().get_config('stream_timeout', 0)),
             'agent_command_timeout': normalize_command_timeout(
                 await cls._require_db().get_config('agent_command_timeout', DEFAULT_AGENT_COMMAND_TIMEOUT)
@@ -1358,10 +1464,25 @@ class AgentExecutor:
         'c-[': b'\x1b',
         '^[': b'\x1b',
         'tab': b'\t',
+        'ctrl-i': b'\t',
+        'c-i': b'\t',
+        '^i': b'\t',
+        'ctrl-d': b'\x04',
+        'c-d': b'\x04',
+        '^d': b'\x04',
+        'eot': b'\x04',
+        'eof': b'\x04',
+        'ctrl-c': b'\x03',
+        'c-c': b'\x03',
+        '^c': b'\x03',
+        'interrupt': b'\x03',
+        'sigint': b'\x03',
+        'cancel': b'\x03',
         'space': b' ',
         'sp': b' ',
         'backspace': b'\x7f',
         'bs': b'\x7f',
+        'rubout': b'\x7f',
         'insert': b'\x1b[2~',
         'ins': b'\x1b[2~',
         'delete': b'\x1b[3~',
@@ -1390,6 +1511,45 @@ class AgentExecutor:
         'f10': b'\x1b[21~',
         'f11': b'\x1b[23~',
         'f12': b'\x1b[24~',
+        'f13': b'\x1b[25~',
+        'f14': b'\x1b[26~',
+        'f15': b'\x1b[28~',
+        'f16': b'\x1b[29~',
+        'f17': b'\x1b[31~',
+        'f18': b'\x1b[32~',
+        'f19': b'\x1b[33~',
+        'f20': b'\x1b[34~',
+        'f21': b'\x1b[1;2P',
+        'f22': b'\x1b[1;2Q',
+        'f23': b'\x1b[1;2R',
+        'f24': b'\x1b[1;2S',
+        'kp-enter': b'\r',
+        'numpad-enter': b'\r',
+        'kp-plus': b'+',
+        'kp-minus': b'-',
+        'kp-multiply': b'*',
+        'kp-divide': b'/',
+        'kp-decimal': b'.',
+        'kp0': b'0',
+        'kp1': b'1',
+        'kp2': b'2',
+        'kp3': b'3',
+        'kp4': b'4',
+        'kp5': b'5',
+        'kp6': b'6',
+        'kp7': b'7',
+        'kp8': b'8',
+        'kp9': b'9',
+        'numpad0': b'0',
+        'numpad1': b'1',
+        'numpad2': b'2',
+        'numpad3': b'3',
+        'numpad4': b'4',
+        'numpad5': b'5',
+        'numpad6': b'6',
+        'numpad7': b'7',
+        'numpad8': b'8',
+        'numpad9': b'9',
     }
     MACRO_MODIFIER_ALIASES = {
         'ctrl': 'ctrl',
@@ -1426,6 +1586,14 @@ class AgentExecutor:
         'f10': 21,
         'f11': 23,
         'f12': 24,
+        'f13': 25,
+        'f14': 26,
+        'f15': 28,
+        'f16': 29,
+        'f17': 31,
+        'f18': 32,
+        'f19': 33,
+        'f20': 34,
     }
     MACRO_FKEY_FINALS = {
         'f1': 'P',
@@ -1576,28 +1744,21 @@ class AgentExecutor:
             steps.append(dict(step))
 
     @staticmethod
-    def _normalize_stdin_text_value(value: str) -> str:
-        if value[:1] in {' ', '\t'}:
-            return value[1:]
-        return value
-
-    @staticmethod
     def _normalize_stdin_command_value(value: str) -> str:
         return value.lstrip(' \t')
 
     @staticmethod
-    def _looks_like_stdin_line_mode(text: str) -> bool:
-        return bool(re.search(
-            r'(?m)^\s*(?:text|type|paste|key|wait|sleep|delay|raw|escape|escaped|base64|b64|hex|bytes|keys|repeat)\s*:',
-            text or '',
-        ))
+    def _normalize_stdin_text_value(value: str) -> str:
+        if value[:1] in {' ', '\t'}:
+            return value[1:]
+        return value
 
     @classmethod
     def _parse_stdin_key_line(cls, value: str) -> List[Dict[str, Any]]:
         normalized_value = cls._normalize_stdin_command_value(value)
         if not normalized_value.strip():
             raise ValueError("key: 需要指定按键内容")
-        if '[' in normalized_value or ']' in normalized_value:
+        if re.search(r'\[[^\]]*\]', normalized_value):
             return cls._parse_inline_stdin_macro(normalized_value)
         return [
             cls._macro_key_parts_to_step([token])
@@ -1609,30 +1770,69 @@ class AgentExecutor:
     def _parse_stdin_line_mode(cls, macro: str) -> List[Dict[str, Any]]:
         text = macro or ''
         steps: List[Dict[str, Any]] = []
-        line_pattern = re.compile(r'\s*([A-Za-z][A-Za-z0-9_-]*)\s*:(.*)\Z')
+        line_pattern = re.compile(r'([A-Za-z][A-Za-z0-9_-]*)\s*:(.*)\Z')
+        command_names = {
+            'key',
+            'line', 'paste',
+            'wait', 'sleep', 'delay',
+            'raw', 'escape', 'escaped',
+            'base64', 'b64', 'hex', 'bytes', 'keys',
+            'repeat',
+        }
 
-        for raw_line in text.splitlines():
+        lines = text.splitlines()
+        i = 0
+        while i < len(lines):
+            raw_line = lines[i]
+            i += 1
             if not raw_line.strip():
                 continue
 
-            line = raw_line.lstrip()
-            match = line_pattern.match(line)
+            escaped_line = raw_line[1:] if raw_line.startswith('\\') else ''
+            escaped_match = line_pattern.match(escaped_line) if escaped_line else None
+            if escaped_match and escaped_match.group(1).lower() in command_names:
+                cls._append_macro_bytes(steps, escaped_line.encode('utf-8'))
+                continue
+
+            match = line_pattern.match(raw_line)
             if not match:
                 cls._append_macro_bytes(steps, raw_line.encode('utf-8'))
                 continue
 
             name = match.group(1).lower()
             value = match.group(2)
-            if name in {'text', 'type', 'paste'}:
-                payload_text = cls._unescape_macro_text(cls._normalize_stdin_text_value(value))
-                cls._append_macro_bytes(steps, payload_text.encode('utf-8'))
-                continue
             if name == 'key':
                 key_steps = cls._parse_stdin_key_line(value)
                 for step in key_steps:
                     cls._append_macro_step(steps, step)
                 continue
-            if name in {'wait', 'sleep', 'delay', 'raw', 'escape', 'escaped', 'base64', 'b64', 'hex', 'bytes', 'keys', 'repeat'}:
+            if name in {'line', 'paste'}:
+                normalized_value = cls._normalize_stdin_text_value(value)
+                heredoc_match = re.fullmatch(r'<<\s*([A-Za-z0-9_-]+)', normalized_value.strip())
+                if name == 'paste' and heredoc_match:
+                    marker = heredoc_match.group(1)
+                    block_lines: List[str] = []
+                    found_marker = False
+                    while i < len(lines):
+                        block_line = lines[i]
+                        i += 1
+                        if block_line == marker:
+                            found_marker = True
+                            break
+                        block_lines.append(block_line)
+                    if not found_marker:
+                        raise ValueError(f"paste heredoc 未找到结束标记: {marker}")
+                    payload_text = "\n".join(block_lines)
+                    if block_lines:
+                        payload_text += "\n"
+                    payload = payload_text.encode('utf-8')
+                    cls._append_macro_bytes(steps, payload)
+                    continue
+                command_steps = cls._macro_command_to_steps(f'{name}:{normalized_value}')
+                for step in command_steps:
+                    cls._append_macro_step(steps, step)
+                continue
+            if name in command_names:
                 normalized_value = cls._normalize_stdin_command_value(value)
                 command_steps = cls._macro_command_to_steps(f'{name}:{normalized_value}')
                 for step in command_steps:
@@ -1766,6 +1966,16 @@ class AgentExecutor:
             index += 1
         return index
 
+    @classmethod
+    def _normalize_macro_key_part(cls, part: str) -> str:
+        token = cls._unescape_macro_text(part)
+        stripped = token.strip()
+        if stripped:
+            return stripped
+        if token and all(char in ' \t' for char in token):
+            return 'space'
+        return ''
+
     @staticmethod
     def _parse_macro_duration_seconds(value: str) -> float:
         text = value.strip().lower()
@@ -1867,14 +2077,15 @@ class AgentExecutor:
         if not parts:
             return b''
         if len(parts) == 1:
-            token = cls._unescape_macro_text(parts[0].strip())
+            token = cls._normalize_macro_key_part(parts[0])
             if '+' in token:
                 return cls._macro_key_parts_to_bytes([part for part in re.split(r'\s*\+\s*', token) if part])
             return cls._key_name_to_bytes(token)
 
         modifiers = set()
         key_parts: List[str] = []
-        tokens = [cls._unescape_macro_text(part.strip()) for part in parts if part.strip()]
+        tokens = [cls._normalize_macro_key_part(part) for part in parts]
+        tokens = [token for token in tokens if token]
         for token in tokens:
             lowered = token.lower()
             modifier = cls.MACRO_MODIFIER_ALIASES.get(lowered)
@@ -1897,7 +2108,7 @@ class AgentExecutor:
         payload = cls._macro_key_parts_to_bytes(parts)
         step: Dict[str, Any] = {'type': 'bytes', 'payload': payload}
         if len(parts) == 1:
-            token = cls._unescape_macro_text(parts[0].strip()).lower()
+            token = cls._normalize_macro_key_part(parts[0]).lower()
             if token in {'enter', 'return'}:
                 step['pipe_payload'] = b'\n'
         return step
@@ -1912,8 +2123,11 @@ class AgentExecutor:
         name = command_match.group(1).lower()
         value = command_match.group(2)
 
-        if name in {'type', 'text', 'paste'}:
+        if name == 'paste':
             return [{'type': 'bytes', 'payload': cls._unescape_macro_text(value).encode('utf-8')}]
+        if name == 'line':
+            payload = cls._unescape_macro_text(value).encode('utf-8')
+            return [{'type': 'bytes', 'payload': payload + b'\r', 'pipe_payload': payload + b'\n'}]
         if name in {'raw', 'escape', 'escaped'}:
             return [{'type': 'bytes', 'payload': cls.parse_escape_bytes(cls._unescape_macro_brackets(value))}]
         if name in {'base64', 'b64'}:
@@ -1941,7 +2155,7 @@ class AgentExecutor:
             count = int(repeat_match.group(1))
             if count < 0 or count > cls.MAX_STDIN_MACRO_REPEAT:
                 raise ValueError(f"[repeat:] 次数必须在 0 到 {cls.MAX_STDIN_MACRO_REPEAT} 之间")
-            nested_steps = cls.parse_stdin_macro(repeat_match.group(2))
+            nested_steps = cls._parse_inline_stdin_macro(repeat_match.group(2))
             cls._validate_stdin_steps(nested_steps, count)
             out: List[Dict[str, Any]] = []
             for _ in range(count):
@@ -1949,7 +2163,7 @@ class AgentExecutor:
                     cls._append_macro_step(out, step)
             return out
 
-        raise ValueError(f"未知 stdin 宏指令: [{name}:...]")
+        return [cls._macro_key_parts_to_step([content])]
 
     @staticmethod
     def _parse_macro_postfix_repeat(text: str, index: int) -> Tuple[int, int]:
@@ -2026,10 +2240,7 @@ class AgentExecutor:
 
     @classmethod
     def parse_stdin_macro(cls, macro: str) -> List[Dict[str, Any]]:
-        text = macro or ''
-        if cls._looks_like_stdin_line_mode(text):
-            return cls._parse_stdin_line_mode(text)
-        return cls._parse_inline_stdin_macro(text)
+        return cls._parse_stdin_line_mode(macro or '')
 
     @classmethod
     def extract_protocol_blocks(cls, ai_response: str) -> List[Dict[str, Any]]:
@@ -2045,8 +2256,8 @@ class AgentExecutor:
         for match in pattern.finditer(ai_response):
             raw_tag = match.group('tag').strip()
             raw_body = match.group('body')
-            body = raw_body.strip()
             if raw_tag.startswith('file:'):
+                body = raw_body.strip()
                 blocks.append({
                     'type': 'file',
                     'path': raw_tag[5:].strip(),
@@ -2056,21 +2267,24 @@ class AgentExecutor:
                 blocks.append({
                     'type': 'stdin',
                     'path': raw_tag[6:].strip(),
-                    'body': body,
+                    'body': raw_body,
                 })
             elif raw_tag.startswith('shellread:'):
+                body = raw_body.strip()
                 blocks.append({
                     'type': 'shellread',
                     'path': raw_tag[10:].strip(),
                     'body': body,
                 })
             elif raw_tag.startswith('shellkill:'):
+                body = raw_body.strip()
                 blocks.append({
                     'type': 'shellkill',
                     'path': raw_tag[10:].strip(),
                     'body': body,
                 })
             else:
+                body = raw_body.strip()
                 blocks.append({
                     'type': raw_tag,
                     'path': '',
@@ -5294,15 +5508,60 @@ def _fmt_agent_max_iterations(val):
 def get_main_menu():
     agent_on = UserDataManager.get('agent_mode', False)
     stream_on = normalize_bool(UserDataManager.get('stream_mode', True), True)
+    stitch_label = get_text_stitch_mode_label()
     
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔌 提供商", callback_data="menu_providers"),
          InlineKeyboardButton("🎯 模型", callback_data="menu_default_models")],
         [InlineKeyboardButton(f"🤖 Agent:{'开' if agent_on else '关'}", callback_data="toggle_agent_mode"),
          InlineKeyboardButton(f"🌊 流式:{'开' if stream_on else '关'}", callback_data="toggle_stream_mode")],
+        [InlineKeyboardButton(f"🧩 拼接:{stitch_label}", callback_data="menu_text_stitch_mode")],
         [InlineKeyboardButton("📝 提示词", callback_data="menu_prompts"),
          InlineKeyboardButton("⚙️ 更多", callback_data="menu_more_settings")]
     ])
+
+
+def get_text_stitch_mode_menu():
+    mode = normalize_text_stitch_mode(UserDataManager.get('text_stitch_mode'))
+
+    def label(mode_key: str, text: str) -> str:
+        return f"✅ {text}" if mode == mode_key else text
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label(TEXT_STITCH_MODE_AUTO, "自动判断"), callback_data="set_text_stitch_mode:auto")],
+        [InlineKeyboardButton(label(TEXT_STITCH_MODE_FORCE, "强制开启拼接"), callback_data="set_text_stitch_mode:force")],
+        [InlineKeyboardButton(label(TEXT_STITCH_MODE_OFF, "强制不拼接"), callback_data="set_text_stitch_mode:off")],
+        [InlineKeyboardButton("🔙 返回", callback_data="act_main_menu")]
+    ])
+
+
+def build_text_stitch_mode_text() -> str:
+    mode = get_text_stitch_mode_label()
+    return (
+        "🧩 <b>文字拼接模式</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"当前模式: <b>{safe_text(mode)}</b>\n\n"
+        f"自动判断：短消息直接问 AI；单条接近 Telegram 上限（约 {TEXT_STITCH_SPLIT_HINT_CHARS} 字）时进入拼接，点完成后发送。\n"
+        "强制开启：每条普通文本都会先累计，适合连续发多段内容。\n"
+        "强制不拼接：所有普通文本都直接发送给 AI。"
+    )
+
+
+def get_text_stitch_pending_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ 完成，发送给AI", callback_data="act_finish_text_stitch")],
+        [InlineKeyboardButton("🧹 清空拼接", callback_data="act_cancel_text_stitch")]
+    ])
+
+
+def build_text_stitch_pending_text(pending: PendingTextConversation) -> str:
+    return (
+        "🧩 <b>正在拼接文字</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"已累计: <b>{len(pending.parts)} 段</b>\n"
+        f"总字数: <b>{pending.total_chars()}</b>\n\n"
+        "继续发送文字会追加到本次内容；全部发送完后点“完成，发送给AI”。"
+    )
 
 def get_more_settings_menu():
     global_depth = UserDataManager.get('global_depth', 30)
@@ -6343,6 +6602,7 @@ def build_start_menu_text() -> str:
     media_model = format_model_target_summary('media')
     global_depth = UserDataManager.get('global_depth', 30)
     agent_mode = "开启 🟢" if UserDataManager.get('agent_mode', False) else "关闭 🔴"
+    stitch_mode = get_text_stitch_mode_label()
 
     welcome_msg = (
         f"<b>Telegram AI Bot 已就绪</b>\n"
@@ -6353,6 +6613,7 @@ def build_start_menu_text() -> str:
         f"🖼️ 媒体模型: <b>{safe_text(media_model)}</b>\n"
         f"🌐 全局模式: <b>常驻开启</b>\n"
         f"🤖 Agent模式: <b>{agent_mode}</b>\n"
+        f"🧩 文字拼接: <b>{safe_text(stitch_mode)}</b>\n"
         f"📊 全局记忆深度: <b>{global_depth}条</b>\n"
         f"💾 记忆系统: <b>异步SQLite + 内存缓存</b>\n"
         f"━━━━━━━━━━━━━━\n"
@@ -6670,6 +6931,16 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             await query.answer("当前没有正在生成的回答")
         return
+
+    if data == "act_finish_text_stitch":
+        await UserDataManager.init()
+        await finish_text_conversation(update, context)
+        return
+
+    if data == "act_cancel_text_stitch":
+        await UserDataManager.init()
+        await cancel_text_conversation(update)
+        return
     
     await UserDataManager.init()
     await query.answer()
@@ -6692,7 +6963,35 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=get_more_settings_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
-        
+
+        elif data == "menu_text_stitch_mode":
+            await query.message.edit_text(
+                build_text_stitch_mode_text(),
+                reply_markup=get_text_stitch_mode_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data.startswith("set_text_stitch_mode:"):
+            mode = normalize_text_stitch_mode(data.split(":", 1)[1])
+            UserDataManager.set('text_stitch_mode', mode)
+            await UserDataManager.save_config('text_stitch_mode', mode)
+            if mode == TEXT_STITCH_MODE_OFF:
+                key = get_text_conversation_buffer_key(update)
+                with _pending_text_conversations_lock:
+                    pending = _pending_text_conversations.pop(key, None)
+                if pending and pending.prompt_message is not None:
+                    with contextlib.suppress(Exception):
+                        await pending.prompt_message.edit_text("🧹 已关闭文字拼接，并清空本次拼接内容。")
+            await GlobalRecorder.record_system_op(
+                f"文字拼接模式切换为: {get_text_stitch_mode_label(mode)}",
+                {"text_stitch_mode": mode}
+            )
+            await query.message.edit_text(
+                build_text_stitch_mode_text(),
+                reply_markup=get_text_stitch_mode_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
         elif data == "noop":
             return
 
@@ -7900,9 +8199,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     await UserDataManager.init()
     state = UserDataManager.get('state')
     text = update.message.text.strip()
-    
-    # 始终记录用户发送的每条消息到全局记忆
-    await GlobalRecorder.record_user_message(text, MessageType.USER_TEXT, update.effective_chat.id)
+
+    # 普通聊天按拼接模式决定：直接发送，或累计到“完成”按钮后再写入记忆。
+    if state != BotState.IDLE:
+        await GlobalRecorder.record_user_message(text, MessageType.USER_TEXT, update.effective_chat.id)
     
     # 取消操作
     if text.lower() == 'cancel' and state != BotState.IDLE:
@@ -8260,20 +8560,120 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     # --- 正常对话处理 ---
-    await process_conversation(update, context, text)
+    await handle_normal_text_conversation(update, context, text)
+
+
+async def handle_normal_text_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    if has_pending_text_conversation(update):
+        await queue_text_conversation(update, context, text)
+        return
+
+    if not should_stitch_text_message(text):
+        await GlobalRecorder.record_user_message(text, MessageType.USER_TEXT, update.effective_chat.id)
+        await process_conversation(update, context, text)
+        return
+
+    await queue_text_conversation(update, context, text)
+
+
+async def queue_text_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    key = get_text_conversation_buffer_key(update)
+
+    with _pending_text_conversations_lock:
+        pending = _pending_text_conversations.get(key)
+        if pending is None:
+            pending = PendingTextConversation(update, context, text)
+            _pending_text_conversations[key] = pending
+        else:
+            pending.append(update, context, text)
+
+    await show_or_update_text_stitch_prompt(pending)
+
+
+async def show_or_update_text_stitch_prompt(pending: PendingTextConversation):
+    text = build_text_stitch_pending_text(pending)
+    reply_markup = get_text_stitch_pending_keyboard()
+
+    if pending.prompt_message is not None:
+        try:
+            await pending.prompt_message.edit_text(
+                text,
+                reply_markup=reply_markup,
+                parse_mode=constants.ParseMode.HTML
+            )
+            return
+        except Exception as e:
+            logger.debug(f"更新拼接提示失败，将重新发送提示: {e}")
+
+    try:
+        pending.prompt_message = await pending.update.message.reply_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=constants.ParseMode.HTML
+        )
+    except Exception as e:
+        logger.warning(f"发送拼接提示失败: {e}")
+
+
+async def finish_text_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    key = get_text_conversation_buffer_key(update)
+    with _pending_text_conversations_lock:
+        pending = _pending_text_conversations.pop(key, None)
+
+    if pending is None:
+        if update.callback_query:
+            await update.callback_query.answer("没有正在拼接的内容", show_alert=True)
+        return
+
+    text = merge_text_conversation_parts(pending.parts)
+    if not text:
+        if update.callback_query:
+            await update.callback_query.answer("拼接内容为空", show_alert=True)
+        return
+
+    if pending.prompt_message is not None:
+        with contextlib.suppress(Exception):
+            await pending.prompt_message.edit_text(
+                f"✅ 已完成拼接，正在发送给 AI。\n累计 {len(pending.parts)} 段，{len(text)} 字。"
+            )
+
+    await GlobalRecorder.record_user_message(text, MessageType.USER_TEXT, pending.update.effective_chat.id)
+    logger.info(
+        f"Finished stitched text conversation: parts={len(pending.parts)}, "
+        f"chars={len(text)}, chat_id={key[0]}"
+    )
+    await process_conversation(pending.update, pending.context, text)
+
+
+async def cancel_text_conversation(update: Update):
+    key = get_text_conversation_buffer_key(update)
+    with _pending_text_conversations_lock:
+        pending = _pending_text_conversations.pop(key, None)
+
+    if pending is None:
+        if update.callback_query:
+            await update.callback_query.answer("没有正在拼接的内容", show_alert=True)
+        return
+
+    try:
+        if pending.prompt_message is not None:
+            await pending.prompt_message.edit_text("🧹 已清空本次拼接内容。")
+    except Exception as e:
+        logger.debug(f"清空拼接提示更新失败: {e}")
 
 async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
                                content_override: Optional[Any] = None):
     """处理对话（全局模式 + Agent 协议执行：命令 / 读文件 / 发文件 / 写文件 / 媒体）"""
     global _is_processing, _stop_generation_event
-    _is_processing = True
-    _stop_generation_event = asyncio.Event()
-    
-    try:
-        await _process_conversation_inner(update, context, text, content_override)
-    finally:
-        _stop_generation_event = None
-        _is_processing = False
+    async with _conversation_processing_lock:
+        _is_processing = True
+        _stop_generation_event = asyncio.Event()
+
+        try:
+            await _process_conversation_inner(update, context, text, content_override)
+        finally:
+            _stop_generation_event = None
+            _is_processing = False
 
 
 async def _process_conversation_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
@@ -8287,7 +8687,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     prov_name, prov_data = get_current_provider()
     
     if not prov_data or not model:
-        await update.message.reply_text(
+        message = update.message or update.callback_query.message
+        await message.reply_text(
             "对话能力尚未配置。请先在【提供商】添加线路，并在【默认模型】中选择对话模型。",
             reply_markup=get_main_menu()
         )

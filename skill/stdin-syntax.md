@@ -1,261 +1,325 @@
 ```!
-stdin 协议完整语法参考。说明 `text:` / `key:` 行式语法、旧 inline 宏语法、按键名、组合键、等待、重复、raw/hex/base64/bytes 精确字节、转义规则、限制和常见示例。
+stdin 协议完整语法参考。普通文本直接写；明确控制前缀包括 `key:`、`line:`、`paste:`、`wait:`、`raw:`、`hex:`、`base64:`、`bytes:`、`keys:`、`repeat:`。高层语法覆盖常见人类终端操作，精确字节语法可兜底表达理论上任意 stdin 输入。
 ```
 
 # stdin 语法大全
 
-本文说明 Agent 的 `stdin:会话ID` 协议。`stdin` 用来给已有 `shell` 会话发送输入：普通文本、回车、方向键、Ctrl/Alt/Shift 组合键、等待、重复和精确字节都走这个协议。
+本文说明 Agent 的 `stdin:会话ID` 协议。它用于给已有 `shell` 会话发送输入：普通文字、回车、方向键、Ctrl/Alt/Shift 组合键、EOF、Ctrl-C、等待、重复、粘贴文本和任意字节。
 
-## 1. 基本结构
+设计目标：
 
-````text
-```stdin:会话ID
-text: 普通文本
-key: [enter]
-```
-````
+- 普通文本像普通文本一样写。
+- 常见按键用易读的 `key:` 表达。
+- 大段文本可以显式 `paste:`。
+- 需要提交一行时可以用 `line:`。
+- 任何高层语法没覆盖的输入，都能用 `raw:` / `hex:` / `base64:` / `bytes:` 兜底。
 
-`stdin` 不会自动补回车。需要提交命令、确认输入或换行时，必须显式写 `key: [enter]`。
+## 1. 总规则
 
-## 2. 推荐格式：按行写步骤
+顶层始终按行解析。
 
-优先使用行式语法。它比旧 inline 语法更清楚，也更适合 AI 稳定输出。
+- 普通文本行：直接输入该行内容，不自动加换行。
+- 控制行：只有顶格出现的明确控制前缀才有特殊含义。
+- 旧顶层 inline 语法已删除，`npm run dev [enter]` 只是普通文本。
+- `text:`、`type:` 没有特殊语义，会作为普通文本输入。
+- `paste:` 是控制前缀；如果要输入字面量 `paste:`，写 `\paste:`。
 
-```text
-text: 你好
-key: [ctrl]+[a]
-key: [ctrl]+[c]
-```
+支持的控制前缀：
 
-每一行是一个步骤：
-
-- `text:` 输入普通文本。
 - `key:` 发送按键或组合键。
+- `line:` 输入文本并发送回车。
+- `paste:` 显式粘贴一段普通文本。
 - `wait:` / `sleep:` / `delay:` 等待。
-- `raw:` / `hex:` / `base64:` / `bytes:` / `keys:` 发送精确字节或旧式按键序列。
-- `repeat:` 重复一段 inline 宏。
+- `raw:` / `escape:` / `escaped:` 发送转义字节。
+- `hex:` 发送十六进制字节。
+- `base64:` / `b64:` 发送 Base64 字节。
+- `bytes:` 发送字节数组。
+- `keys:` 发送旧式按键序列。
+- `repeat:` 重复一段括号宏。
 
-触发规则：
+## 2. 最常用写法
 
-- 只要 stdin 里任一行以 `text:`、`key:`、`wait:`、`raw:` 等行首标记开头，整段就按行式语法解析。
-- 只有整段没有任何行首标记时，才按旧 inline 语法解析。
-- 在行式语法中，裸行或未知前缀会作为字面文本输入，不解析 `[enter]`，也不保留该行行尾换行。
-- 为减少歧义，普通文本始终写 `text:`，按键始终写 `key:`。
-
-## 3. text 行
-
-`text:` 后面的内容会作为普通文本输入，不会把 `[enter]` 当成按键。
+输入命令并执行：
 
 ```text
-text: npm run dev
+npm run dev
 key: [enter]
 ```
 
-`text:` 后如果有一个分隔空格，会去掉这个分隔空格：
+也可以写成一行：
+
+```text
+line: npm run dev
+```
+
+确认提示：
+
+```text
+y
+key: [enter]
+```
+
+输入字面量 `text: hello`：
 
 ```text
 text: hello
-```
-
-输入的是 `hello`，不是前面带空格的 ` hello`。如果确实要以空格开头，可以多写一个空格：
-
-```text
-text:  hello
-```
-
-`type:` 和 `paste:` 是 `text:` 的别名。
-
-`text:` 只输入这一行冒号后面的文本，不自动附带行尾换行。需要输入多行或提交时，显式加 `key: [enter]`：
-
-```text
-text: 第一行
-key: [enter]
-text: 第二行
 key: [enter]
 ```
 
-## 4. key 行
+输入字面量 `paste:`：
 
-`key:` 用来发送按键。推荐仍然保留方括号，因为最不容易歧义：
+```text
+\paste: hello
+key: [enter]
+```
+
+## 3. 普通文本
+
+不是控制前缀的行，都会作为普通文本输入。
+
+```text
+hello
+world
+```
+
+这会输入 `helloworld`，中间不会自动插入换行。需要换行或提交时写 `key: [enter]`、`line:` 或 `raw: \n`。
+
+普通文本可以包含冒号、方括号、加号、中文、Emoji、空格等：
+
+```text
+foo: bar
+a+a+d
+[enter]
+你好 🙂
+```
+
+如果普通文本刚好以控制前缀开头，加反斜杠转义：
+
+```text
+\key: [enter]
+\wait: 1s
+\repeat: 3 [up]
+\paste: hello
+```
+
+这会输入字面量 `key: [enter]wait: 1srepeat: 3 [up]paste: hello`。
+
+## 4. line 和 paste
+
+`line:` 输入冒号后的文本，并自动发送回车。适合命令、菜单项、yes/no 回答：
+
+```text
+line: git status
+line: y
+```
+
+冒号后面紧跟的一个空格或 Tab 会当作分隔符去掉。需要让内容本身以空格开头时，多写一个空格：
+
+```text
+line:  indented
+```
+
+这会输入一个开头空格，然后输入 `indented` 并回车。
+
+`paste:` 显式输入普通文本，不解析其中的按键名。适合 AI 表达“这里是文本，不是按键”：
+
+```text
+paste: npm run dev [enter]
+key: [enter]
+```
+
+这会先输入字面量 `npm run dev [enter]`，再发送真实回车。
+
+`paste:` 和 `line:` 支持轻量转义：
+
+- `\[` 输入 `[`
+- `\]` 输入 `]`
+- `\\` 输入反斜杠
+
+多行文本用 heredoc 形式，最适合代码、配置、带缩进文本和包含控制前缀字样的内容：
+
+```text
+paste: <<EOF
+line 1
+key: [enter] 只是文字
+  缩进会保留
+EOF
+key: [enter]
+```
+
+规则：
+
+- `paste: <<EOF` 后面的行都会作为字面文本输入，直到遇到单独一行 `EOF`。
+- 结束标记可以换成任意字母/数字/下划线/短横线组合，例如 `END`、`PY`、`CONFIG_1`、`123`。
+- heredoc 内容里的 `key:`、`wait:`、`paste:`、`[enter]` 都是普通文字，不会被解析。
+- 非空 heredoc 会保留内部换行，并在末尾保留一个换行；空 heredoc 不写入字节。
+- 结束标记必须顶格、独占一行。
+
+## 5. key
+
+`key:` 发送按键。推荐使用方括号，最不容易歧义：
 
 ```text
 key: [enter]
 key: [esc]
 key: [up]
+key: [ctrl]+[c]
+key: [ctrl]+[d]
 ```
 
-也支持更短写法：
+短写也支持：
 
 ```text
 key: enter
-key: ctrl+a
+key: ctrl+c
+key: ctrl+d
 key: alt+left
-key: ctrl+a b
+key: shift+tab
 ```
 
-在 `key:` 行里，`+` 表示同一拍组合按键，空格或换行表示按顺序一个个按：
+规则：
 
-```text
-key: ctrl+a b
-```
+- `+` 表示同一拍组合键。
+- 空格表示按顺序发送多个按键。
+- 一组组合键最多只能有一个主键，其他必须是修饰键。
 
-等价于先按 `Ctrl+A`，再按 `b`，也等价于分两行写：
-
-```text
-key: ctrl+a
-key: b
-```
-
-不要用 `key: ctrl+a+c`；它会被理解成同一拍里有两个主键，这个协议不支持。要先 `Ctrl+A` 再按 `c`，写：
+顺序按键：
 
 ```text
 key: ctrl+a c
 ```
 
-`key:` 行一旦写了，就不会回退成普通文本。非法组合会报错，例如：
+表示先 `Ctrl+A`，再按 `c`。
 
-```text
-key: ctrl+a+c
-key: a+a+d
-```
-
-如果要输入字面量 `a+a+d`，写：
-
-```text
-text: a+a+d
-```
-
-如果要按顺序发送 `a`、`a`、`d`，写：
-
-```text
-key: a a d
-```
-
-常用按键：
-
-- 回车与换行：`[enter]`、`[return]`、`[cr]`、`[lf]`
-- 控制键：`[esc]`、`[tab]`、`[backspace]`、`[delete]`、`[insert]`
-- 方向与导航：`[up]`、`[down]`、`[left]`、`[right]`、`[home]`、`[end]`、`[pageup]`、`[pagedown]`
-- 功能键：`[f1]` 到 `[f12]`
-- 空格：`[space]` 或 `[sp]`
-
-Linux/PTY/TUI 场景默认用 `[enter]`。如果明确要发送 LF，用 `[lf]` 或 `raw:\n`；如果明确要发送 CR，用 `[cr]` 或 `raw:\r`。
-
-## 5. 组合键
-
-组合键推荐写成：
-
-```text
-key: [ctrl]+[c]
-key: [ctrl]+[a]
-key: [alt]+[left]
-key: [shift]+[tab]
-```
-
-也支持紧凑写法：
-
-```text
-key: ctrl+c
-key: c-c
-key: ^c
-key: ctrl-a
-```
-
-支持的修饰键别名：
-
-- Ctrl：`ctrl`、`control`
-- Alt：`alt`、`meta`、`option`
-- Shift：`shift`
-
-组合键由若干修饰键和一个主键组成。例如 `key: [ctrl]+[alt]+[delete]` 表示同一拍按下 `Ctrl+Alt+Delete`。
-
-规则是：一组由 `+` 连接的组合键里，最多只能有一个主键；其他部分必须是修饰键。
-
-可以：
+组合键：
 
 ```text
 key: [ctrl]+[alt]+[delete]
-key: ctrl+c
-key: shift+tab
 ```
 
-不可以：
+非法例子：
 
 ```text
 key: ctrl+a+c
 key: a+a+d
 ```
 
-如果要表达顺序按键，用空格分开：
+如果要输入字面量 `a+a+d`，直接写普通文本：
 
 ```text
-key: ctrl+a b
+a+a+d
 ```
 
-这表示先按 `Ctrl+A`，再按 `b`，也等价于分两行写 `key: ctrl+a` 和 `key: b`。如果要先 `Ctrl+A` 再 `Ctrl+B`，写：
+## 6. 常用按键名
+
+控制键：
+
+- `enter` / `return` / `cr`
+- `lf` / `newline` / `linefeed`
+- `esc` / `escape`
+- `tab`
+- `backspace` / `bs` / `rubout`
+- `delete` / `del`
+- `insert` / `ins`
+- `space` / `sp`
+- `eof` / `eot` / `ctrl+d`
+- `interrupt` / `sigint` / `cancel` / `ctrl+c`
+
+方向与导航：
+
+- `up`
+- `down`
+- `left`
+- `right`
+- `home`
+- `end`
+- `pageup` / `page-up` / `pgup`
+- `pagedown` / `page-down` / `pgdn`
+
+功能键：
+
+- `f1` 到 `f24`
+
+小键盘常用别名：
+
+- `kp-enter` / `numpad-enter`
+- `kp-plus`
+- `kp-minus`
+- `kp-multiply`
+- `kp-divide`
+- `kp-decimal`
+- `kp0` 到 `kp9`
+- `numpad0` 到 `numpad9`
+
+修饰键：
+
+- Ctrl: `ctrl` / `control`
+- Alt: `alt` / `meta` / `option`
+- Shift: `shift`
+
+## 7. 重复
+
+`key:` 的方括号片段支持后缀重复：
 
 ```text
-key: ctrl+a ctrl+b
+key: [up]*3
+key: [ctrl]+[a]*2
 ```
 
-`key: ctrl+a+c` 不表示顺序按键；它会被理解为试图同一拍按 `Ctrl+A+C`，这种写法不支持。顺序按键请用空格或多行 `key:`。
-
-如果要全选后复制，写成两个顺序步骤：
+`repeat:` 重复一段内部括号宏：
 
 ```text
-key: [ctrl]+[a]
-key: [ctrl]+[c]
+repeat: 3 [up] [enter]
+repeat: 2 [tab]
 ```
 
-也可以写在一行，用空格隔开两个组合键：
+`repeat:` 重复的是括号片段，不是整行语法。
 
-```text
-key: ctrl+a ctrl+c
-```
+## 8. 等待
 
-## 6. 等待
-
-等待用 `wait:`，单位默认是毫秒，也支持秒：
+等待默认单位是毫秒，也支持秒：
 
 ```text
 wait: 500
-wait: 1s
 wait: 250ms
+wait: 1s
+sleep: 1s
+delay: 500
 ```
-
-别名：`sleep:`、`delay:`。
 
 限制：
 
 - 单次等待最多 60 秒。
 - 一个 stdin 宏总等待最多 120 秒。
 
-## 7. 精确字节
+## 9. 精确字节：理论完备兜底
 
-需要发送非普通按键或终端转义序列时，用精确字节语法。
+只要人类能通过终端 stdin 发送某个字节序列，就可以用精确字节语法表达。
 
-Raw 转义：
+`raw:` 使用转义：
 
 ```text
 raw: \r
 raw: \n
+raw: \t
+raw: \e[31m
 raw: \x1b\x5bA
 ```
 
-支持的 raw 转义：
+支持：
 
-- `\\` 反斜杠
-- `\r` CR
-- `\n` LF
-- `\t` Tab
-- `\b` Backspace
-- `\f` Form feed
-- `\v` Vertical tab
-- `\0` NUL
-- `\e` / `\E` ESC
-- `\xHH` 两位十六进制字节
+- `\\`
+- `\r`
+- `\n`
+- `\t`
+- `\b`
+- `\f`
+- `\v`
+- `\0`
+- `\e` / `\E`
+- `\xHH`
 
-Hex：
+`hex:`：
 
 ```text
 hex: 1b5b41
@@ -263,13 +327,13 @@ hex: 1b 5b 41
 hex: 0x1b,0x5b,0x41
 ```
 
-Base64：
+`base64:`：
 
 ```text
 base64: SGVsbG8K
 ```
 
-Bytes：
+`bytes:`：
 
 ```text
 bytes: 13 10
@@ -277,91 +341,36 @@ bytes: [13,10]
 bytes: 0x1b 0x5b 0x41
 ```
 
-Keys 旧式序列：
+任意 0-255 字节都能用 `bytes:` 表达。
+
+注意：语法层面可以表达任意字节，但 PTY/终端的当前模式仍会影响前台程序实际收到什么。典型 cooked mode 下，`Ctrl-C` 可能先被终端驱动转换成 SIGINT，`Ctrl-D` 可能作为 EOF，回车也可能经历 CR/LF 转换；这是终端行为，不是语法缺口。需要验证原始控制字节时，让目标程序进入 raw mode。
+
+`keys:` 是兼容式按键序列入口，适合旧配置或 JSON 列表：
 
 ```text
 keys: ctrl-c enter
-keys: ["ctrl-c", "enter"]
+keys: ["ctrl-c", "enter", 27]
 ```
 
-## 8. 旧 inline 语法
-
-如果不使用行首标记，整段按 inline 宏解析。
-
-```text
-npm run dev [enter]
-```
-
-inline 里不在 `[]` 中的内容是普通文本，`[]` 中的是按键或特殊动作：
-
-```text
-[ctrl]+[c]
-[up]*2 [enter]
-[repeat:3 [up] [enter]]
-[raw:\x1b\x5bA]
-```
-
-行式语法中的 `key:` 可以嵌入 inline 按键写法。只要 `key:` 的内容含 `[` 或 `]`，这一行会按 inline 片段解析：
-
-```text
-key: [ctrl]+[c]
-key: [up]*2
-key: [ctrl]+[a] [b]
-```
-
-因此 `key: [up]*2` 是重复两次上箭头；`key: up up` 是两个顺序按键。简单按键推荐写成多行，复杂重复或组合可用这种 inline 片段。
-
-## 9. 重复
-
-inline 后缀重复：
-
-```text
-key: [up]*3
-```
-
-重复一段宏：
-
-```text
-repeat: 3 [up] [enter]
-```
-
-限制：重复次数必须在 0 到 200 之间。
-
-## 10. 转义普通文本
-
-在 inline 普通文本中，如果要输入字面量 `[`、`]`、`\`，写：
-
-```text
-\[
-\]
-\\
-```
-
-在 `text:` 行中，`[` 和 `]` 不会被当成按键；一般不需要转义，除非你希望统一保守写法。
-
-行式语法中的裸行也会作为字面文本输入，但不建议依赖裸行：它不会解析 `[enter]`，也不会保留行尾换行。需要文本就写 `text:`，需要按键就写 `key:`。
-
-## 11. 常见场景
-
-确认提示：
-
-```text
-text: y
-key: [enter]
-```
+## 10. 复杂场景
 
 发送 Ctrl-C：
 
 ```text
-key: [ctrl]+[c]
+key: [interrupt]
 ```
 
-在 Vim 保存退出：
+发送 EOF / Ctrl-D：
+
+```text
+key: [eof]
+```
+
+Vim 保存退出：
 
 ```text
 key: [esc]
-text: :wq
-key: [enter]
+line: :wq
 ```
 
 选择历史命令并执行：
@@ -372,37 +381,46 @@ key: [up]
 key: [enter]
 ```
 
-输入命令并提交：
+全选、复制：
 
 ```text
-text: npm run dev
+key: [ctrl]+[a]
+key: [ctrl]+[c]
+```
+
+输入带方括号的文字并提交：
+
+```text
+paste: npm run dev [enter]
 key: [enter]
 ```
 
-全选并复制：
+粘贴多行 Python 代码并用 EOF 结束：
 
 ```text
-key: [ctrl]+[a]
-key: [ctrl]+[c]
+line: python -
+paste: <<PY
+print("hello")
+print("key: [enter] is text")
+PY
+key: [eof]
 ```
 
-输入中文后全选复制：
-
-```text
-text: 你好
-key: [ctrl]+[a]
-key: [ctrl]+[c]
-```
-
-发送上方向键的原始终端序列：
+发送 ANSI 上箭头原始序列：
 
 ```text
 raw: \x1b\x5bA
 ```
 
-## 12. 限制与安全边界
+发送 0 到 255 的所有字节：
 
-当前实现会限制 stdin 宏规模：
+```text
+bytes: 0 1 2 3 4 5 6 7 8 9 ... 255
+```
+
+## 11. 限制
+
+当前实现限制：
 
 - 单个 `wait:` 最多 60 秒。
 - 总等待最多 120 秒。
@@ -410,11 +428,12 @@ raw: \x1b\x5bA
 - 总输入最多 1048576 字节。
 - `repeat` 次数最多 200。
 
-这些限制用于避免一次 stdin 操作让会话长时间卡住或写入过大数据。
+这些限制用于避免一次 stdin 操作让会话卡住或写入过大数据。
 
-## 13. 选择建议
+## 12. 选择建议
 
-- 普通输入和按键混合时，优先用 `text:` / `key:`。
-- TUI、编辑器、确认提示、REPL 场景，优先显式写 `key: [enter]`、`key: [esc]`、`key: [ctrl]+[c]`。
-- 需要精确终端序列时，用 `raw:`、`hex:`、`bytes:`。
-- 需要文件内容时，不要靠 `sendfile` 或 `file:` 的结果推断文件本体；用 `read` 读取。
+- 普通输入直接写文本行。
+- 输入一行并提交，用 `line:`。
+- 明确粘贴一段文字，用 `paste:`。
+- 操作 TUI、编辑器、REPL，用 `key:`。
+- 高层语法表达不了时，用 `raw:` / `hex:` / `base64:` / `bytes:`。
