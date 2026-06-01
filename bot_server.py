@@ -121,6 +121,9 @@ FULL_TRACE_LOCK = threading.Lock()
 DEFAULT_AGENT_COMMAND_TIMEOUT = 30
 MIN_AGENT_COMMAND_TIMEOUT = 5
 MAX_AGENT_COMMAND_TIMEOUT = 3600
+DEFAULT_AGENT_MAX_ITERATIONS = 10
+MIN_AGENT_MAX_ITERATIONS = 1
+MAX_AGENT_MAX_ITERATIONS = 50
 
 
 def redact_sensitive_text(text: str) -> str:
@@ -190,6 +193,34 @@ def normalize_command_timeout(value: Any, default: int = DEFAULT_AGENT_COMMAND_T
     if seconds > MAX_AGENT_COMMAND_TIMEOUT:
         return MAX_AGENT_COMMAND_TIMEOUT
     return seconds
+
+
+def normalize_agent_max_iterations(value: Any, default: int = DEFAULT_AGENT_MAX_ITERATIONS) -> int:
+    try:
+        iterations = int(float(value))
+    except (TypeError, ValueError):
+        iterations = int(default)
+    if iterations <= 0:
+        iterations = int(default)
+    if iterations < MIN_AGENT_MAX_ITERATIONS:
+        return MIN_AGENT_MAX_ITERATIONS
+    if iterations > MAX_AGENT_MAX_ITERATIONS:
+        return MAX_AGENT_MAX_ITERATIONS
+    return iterations
+
+
+def parse_agent_max_iterations(text: str) -> int:
+    cleaned = str(text or "").strip().lower()
+    cleaned = re.sub(r"(轮|次|rounds?|iterations?|iters?)$", "", cleaned).strip()
+    try:
+        iterations = int(float(cleaned))
+    except (TypeError, ValueError):
+        raise ValueError("iterations must be a number")
+    if iterations < MIN_AGENT_MAX_ITERATIONS:
+        raise ValueError(f"iterations must be at least {MIN_AGENT_MAX_ITERATIONS}")
+    if iterations > MAX_AGENT_MAX_ITERATIONS:
+        raise ValueError(f"iterations must be at most {MAX_AGENT_MAX_ITERATIONS}")
+    return iterations
 
 
 def parse_timeout_seconds(text: str, minimum: int = 1, maximum: Optional[int] = None,
@@ -481,6 +512,7 @@ class BotState:
     SET_GLOBAL_DEPTH = 'set_global_depth'
     SET_AI_TIMEOUT = 'set_ai_timeout'
     SET_COMMAND_TIMEOUT = 'set_command_timeout'
+    SET_AGENT_MAX_ITERATIONS = 'set_agent_max_iterations'
     SET_COMMAND_BLACKLIST = 'set_command_blacklist'
 
 # --- ☆ 消息类型定义（用于全局记录）☆ ---
@@ -1216,6 +1248,9 @@ class UserDataManager:
             'stream_timeout': normalize_stream_timeout(await cls._require_db().get_config('stream_timeout', 0)),
             'agent_command_timeout': normalize_command_timeout(
                 await cls._require_db().get_config('agent_command_timeout', DEFAULT_AGENT_COMMAND_TIMEOUT)
+            ),
+            'agent_max_iterations': normalize_agent_max_iterations(
+                await cls._require_db().get_config('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
             ),
             # 临时数据（不需要持久化）
             'temp_viewing_prov': None,
@@ -5252,6 +5287,10 @@ def _fmt_command_timeout(val):
     val = normalize_command_timeout(val)
     return f"{val}s"
 
+def _fmt_agent_max_iterations(val):
+    val = normalize_agent_max_iterations(val)
+    return f"{val}轮"
+
 def get_main_menu():
     agent_on = UserDataManager.get('agent_mode', False)
     stream_on = normalize_bool(UserDataManager.get('stream_mode', True), True)
@@ -5290,21 +5329,26 @@ def build_settings_menu_text() -> str:
 def get_timeout_settings_menu():
     ai_timeout = UserDataManager.get('stream_timeout', 0)
     command_timeout = UserDataManager.get('agent_command_timeout', DEFAULT_AGENT_COMMAND_TIMEOUT)
+    agent_max_iterations = UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"💬 AI回复超时：{_fmt_timeout(ai_timeout)}", callback_data="cmd_set_ai_timeout")],
         [InlineKeyboardButton(f"⌨️ 命令等待：{_fmt_command_timeout(command_timeout)}", callback_data="cmd_set_command_timeout")],
+        [InlineKeyboardButton(f"🔁 Agent轮数：{_fmt_agent_max_iterations(agent_max_iterations)}", callback_data="cmd_set_agent_max_iterations")],
         [InlineKeyboardButton("🔙 返回", callback_data="menu_more_settings")]
     ])
 
 def build_timeout_settings_text() -> str:
     ai_timeout = UserDataManager.get('stream_timeout', 0)
     command_timeout = UserDataManager.get('agent_command_timeout', DEFAULT_AGENT_COMMAND_TIMEOUT)
+    agent_max_iterations = UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
     return (
         "⏱️ <b>超时设置</b>\n"
         "━━━━━━━━━━━━━━\n"
         f"💬 AI回复超时：<b>{_fmt_timeout(ai_timeout)}</b>\n"
-        f"⌨️ 命令等待窗口：<b>{_fmt_command_timeout(command_timeout)}</b>\n\n"
-        "AI回复超时控制等待模型响应的时间；命令等待窗口控制 run 的最长等待，也是 shell 状态判断的硬上限。"
+        f"⌨️ 命令等待窗口：<b>{_fmt_command_timeout(command_timeout)}</b>\n"
+        f"🔁 Agent最大轮数：<b>{_fmt_agent_max_iterations(agent_max_iterations)}</b>\n\n"
+        "AI回复超时控制等待模型响应的时间；命令等待窗口控制 run 的最长等待，也是 shell 状态判断的硬上限；"
+        "Agent最大轮数控制本轮对话中 AI 自动执行工具并继续思考的最多次数。"
     )
 
 def get_ai_timeout_menu():
@@ -5325,6 +5369,16 @@ def get_command_timeout_menu():
         [InlineKeyboardButton("300s", callback_data="set_command_timeout_300"),
          InlineKeyboardButton("600s", callback_data="set_command_timeout_600")],
         [InlineKeyboardButton("✍️ 自定义", callback_data="set_command_timeout_custom")],
+        [InlineKeyboardButton("🔙 返回", callback_data="menu_timeout_settings")]
+    ])
+
+def get_agent_max_iterations_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("5轮", callback_data="set_agent_max_iterations_5"),
+         InlineKeyboardButton("10轮", callback_data="set_agent_max_iterations_10")],
+        [InlineKeyboardButton("20轮", callback_data="set_agent_max_iterations_20"),
+         InlineKeyboardButton("30轮", callback_data="set_agent_max_iterations_30")],
+        [InlineKeyboardButton("✍️ 自定义", callback_data="set_agent_max_iterations_custom")],
         [InlineKeyboardButton("🔙 返回", callback_data="menu_timeout_settings")]
     ])
 
@@ -6858,6 +6912,35 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=get_timeout_settings_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
+
+        elif data == "cmd_set_agent_max_iterations":
+            current_iterations = UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
+            await query.message.edit_text(
+                f"🔁 <b>Agent最大轮数</b>\n\n"
+                f"当前: <b>{_fmt_agent_max_iterations(current_iterations)}</b>\n"
+                f"这决定每次用户消息里，Agent 最多自动执行多少轮工具操作并继续思考。\n"
+                f"轮数太低会更快停下，轮数较高适合多步骤任务。",
+                reply_markup=get_agent_max_iterations_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "set_agent_max_iterations_custom":
+            UserDataManager.set('state', BotState.SET_AGENT_MAX_ITERATIONS)
+            await query.message.reply_text(
+                f"🔁 请输入自定义 Agent 最大轮数 ({MIN_AGENT_MAX_ITERATIONS}-{MAX_AGENT_MAX_ITERATIONS})。\n"
+                "例如: 8、15、25轮。发送 cancel 取消。"
+            )
+
+        elif data.startswith("set_agent_max_iterations_"):
+            iterations = normalize_agent_max_iterations(data.rsplit("_", 1)[1])
+            UserDataManager.set('agent_max_iterations', iterations)
+            await UserDataManager.save_config('agent_max_iterations', iterations)
+            await GlobalRecorder.record_system_op(f"设置 Agent 最大轮数: {_fmt_agent_max_iterations(iterations)}")
+            await query.message.edit_text(
+                f"✅ Agent最大轮数已设为 <b>{_fmt_agent_max_iterations(iterations)}</b>。",
+                reply_markup=get_timeout_settings_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
         
         # --- 记忆深度设置 ---
         elif data == "cmd_set_global_depth":
@@ -7935,6 +8018,25 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=get_timeout_settings_menu()
         )
         return
+
+    if state == BotState.SET_AGENT_MAX_ITERATIONS:
+        try:
+            iterations = parse_agent_max_iterations(text)
+        except ValueError:
+            await update.message.reply_text(
+                f"⚠️ 请输入 {MIN_AGENT_MAX_ITERATIONS}-{MAX_AGENT_MAX_ITERATIONS} 之间的轮数，"
+                "例如 8、15、25轮。"
+            )
+            return
+        UserDataManager.set('agent_max_iterations', iterations)
+        UserDataManager.set('state', BotState.IDLE)
+        await UserDataManager.save_config('agent_max_iterations', iterations)
+        await GlobalRecorder.record_system_op(f"设置 Agent 最大轮数: {_fmt_agent_max_iterations(iterations)}")
+        await update.message.reply_text(
+            f"✅ Agent最大轮数已设为 {_fmt_agent_max_iterations(iterations)}。",
+            reply_markup=get_timeout_settings_menu()
+        )
+        return
     
     if state == BotState.SET_GLOBAL_DEPTH:
         if text.isdigit() and 1 <= int(text) <= 500:
@@ -8241,11 +8343,13 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     
     # --- Agent 模式：命令 / 读文件 / 发文件 / 写文件 / 媒体协议循环 ---
     if agent_mode:
-        MAX_AGENT_ITERATIONS = 10
+        max_agent_iterations = normalize_agent_max_iterations(
+            UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
+        )
         iteration = 0
         reached_agent_limit = False
         
-        while iteration < MAX_AGENT_ITERATIONS:
+        while iteration < max_agent_iterations:
             if is_stop_requested():
                 await safe_send_message(
                     context,
@@ -8712,7 +8816,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             agent_turn_history = next_history
             agent_turn_history.append({'role': 'assistant', 'content': response})
 
-        if iteration >= MAX_AGENT_ITERATIONS and AgentExecutor.extract_protocol_blocks(response):
+        if iteration >= max_agent_iterations and AgentExecutor.extract_protocol_blocks(response):
             reached_agent_limit = True
 
         if reached_agent_limit:
@@ -8720,7 +8824,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 context,
                 update.effective_chat.id,
                 (
-                    "⚠️ Agent 已达到最大执行次数 (10次)，本轮 Agent 操作已停止。\n"
+                    f"⚠️ Agent 已达到最大执行次数 ({max_agent_iterations}次)，本轮 Agent 操作已停止。\n"
                     "已经产生的 AI 回复和工具结果都保留在全局记忆里。"
                 )
             )
