@@ -1359,7 +1359,6 @@ class AgentExecutor:
     MACRO_MODIFIER_ALIASES = {
         'ctrl': 'ctrl',
         'control': 'ctrl',
-        'c': 'ctrl',
         'alt': 'alt',
         'meta': 'alt',
         'option': 'alt',
@@ -1401,6 +1400,9 @@ class AgentExecutor:
     }
     MAX_STDIN_MACRO_REPEAT = 200
     MAX_STDIN_MACRO_WAIT_SECONDS = 60.0
+    MAX_STDIN_MACRO_TOTAL_WAIT_SECONDS = 120.0
+    MAX_STDIN_MACRO_STEPS = 1000
+    MAX_STDIN_MACRO_BYTES = 1024 * 1024
 
     @staticmethod
     def _bytes_from_ints(values: Any) -> bytes:
@@ -1526,10 +1528,124 @@ class AgentExecutor:
     def _append_macro_bytes(steps: List[Dict[str, Any]], payload: bytes):
         if not payload:
             return
-        if steps and steps[-1].get('type') == 'bytes':
+        if steps and steps[-1].get('type') == 'bytes' and 'pipe_payload' not in steps[-1]:
             steps[-1]['payload'] += payload
         else:
             steps.append({'type': 'bytes', 'payload': payload})
+
+    @classmethod
+    def _append_macro_step(cls, steps: List[Dict[str, Any]], step: Dict[str, Any]):
+        if step.get('type') == 'bytes' and 'pipe_payload' not in step:
+            cls._append_macro_bytes(steps, step.get('payload') or b'')
+        else:
+            steps.append(dict(step))
+
+    @staticmethod
+    def _normalize_stdin_text_value(value: str) -> str:
+        if value[:1] in {' ', '\t'}:
+            return value[1:]
+        return value
+
+    @staticmethod
+    def _normalize_stdin_command_value(value: str) -> str:
+        return value.lstrip(' \t')
+
+    @staticmethod
+    def _looks_like_stdin_line_mode(text: str) -> bool:
+        return bool(re.search(
+            r'(?m)^\s*(?:text|type|paste|key|wait|sleep|delay|raw|escape|escaped|base64|b64|hex|bytes|keys|repeat)\s*:',
+            text or '',
+        ))
+
+    @classmethod
+    def _parse_stdin_key_line(cls, value: str) -> List[Dict[str, Any]]:
+        normalized_value = cls._normalize_stdin_command_value(value)
+        if not normalized_value.strip():
+            raise ValueError("key: 需要指定按键内容")
+        if '[' in normalized_value or ']' in normalized_value:
+            return cls._parse_inline_stdin_macro(normalized_value)
+        return [
+            cls._macro_key_parts_to_step([token])
+            for token in re.split(r'\s+', normalized_value.strip())
+            if token
+        ]
+
+    @classmethod
+    def _parse_stdin_line_mode(cls, macro: str) -> List[Dict[str, Any]]:
+        text = macro or ''
+        steps: List[Dict[str, Any]] = []
+        line_pattern = re.compile(r'\s*([A-Za-z][A-Za-z0-9_-]*)\s*:(.*)\Z')
+
+        for raw_line in text.splitlines():
+            if not raw_line.strip():
+                continue
+
+            line = raw_line.lstrip()
+            match = line_pattern.match(line)
+            if not match:
+                cls._append_macro_bytes(steps, raw_line.encode('utf-8'))
+                continue
+
+            name = match.group(1).lower()
+            value = match.group(2)
+            if name in {'text', 'type', 'paste'}:
+                payload_text = cls._unescape_macro_text(cls._normalize_stdin_text_value(value))
+                cls._append_macro_bytes(steps, payload_text.encode('utf-8'))
+                continue
+            if name == 'key':
+                key_steps = cls._parse_stdin_key_line(value)
+                for step in key_steps:
+                    cls._append_macro_step(steps, step)
+                continue
+            if name in {'wait', 'sleep', 'delay', 'raw', 'escape', 'escaped', 'base64', 'b64', 'hex', 'bytes', 'keys', 'repeat'}:
+                normalized_value = cls._normalize_stdin_command_value(value)
+                command_steps = cls._macro_command_to_steps(f'{name}:{normalized_value}')
+                for step in command_steps:
+                    cls._append_macro_step(steps, step)
+                continue
+
+            cls._append_macro_bytes(steps, raw_line.encode('utf-8'))
+
+        cls._validate_stdin_steps(steps)
+        return steps
+
+    @classmethod
+    def _summarize_stdin_steps(cls, steps: List[Dict[str, Any]]) -> Tuple[int, int, float]:
+        byte_count = 0
+        wait_seconds = 0.0
+        for step in steps:
+            step_type = step.get('type')
+            if step_type == 'bytes':
+                payload = step.get('payload') or b''
+                if not isinstance(payload, (bytes, bytearray)):
+                    raise ValueError("stdin bytes step payload must be bytes")
+                pipe_payload = step.get('pipe_payload')
+                if pipe_payload is not None and not isinstance(pipe_payload, (bytes, bytearray)):
+                    raise ValueError("stdin pipe payload must be bytes")
+                byte_count += max(len(payload), len(pipe_payload or b''))
+            elif step_type == 'wait':
+                seconds = float(step.get('seconds') or 0)
+                if seconds < 0:
+                    raise ValueError("stdin wait step cannot be negative")
+                wait_seconds += seconds
+            else:
+                raise ValueError(f"unknown stdin macro step: {step_type}")
+        return len(steps), byte_count, wait_seconds
+
+    @classmethod
+    def _validate_stdin_steps(cls, steps: List[Dict[str, Any]], repeat_count: int = 1):
+        step_count, byte_count, wait_seconds = cls._summarize_stdin_steps(steps)
+        total_steps = step_count * repeat_count
+        total_bytes = byte_count * repeat_count
+        total_wait_seconds = wait_seconds * repeat_count
+        if total_steps > cls.MAX_STDIN_MACRO_STEPS:
+            raise ValueError(f"stdin 宏步骤数不能超过 {cls.MAX_STDIN_MACRO_STEPS}")
+        if total_bytes > cls.MAX_STDIN_MACRO_BYTES:
+            raise ValueError(f"stdin 宏输入不能超过 {cls.MAX_STDIN_MACRO_BYTES} 字节")
+        if total_wait_seconds > cls.MAX_STDIN_MACRO_TOTAL_WAIT_SECONDS:
+            raise ValueError(
+                f"stdin 宏总等待不能超过 {cls.MAX_STDIN_MACRO_TOTAL_WAIT_SECONDS:g} 秒"
+            )
 
     @staticmethod
     def _unescape_macro_text(text: str) -> str:
@@ -1723,8 +1839,8 @@ class AgentExecutor:
 
         modifiers = set()
         key_parts: List[str] = []
-        for part in parts:
-            token = cls._unescape_macro_text(part.strip())
+        tokens = [cls._unescape_macro_text(part.strip()) for part in parts if part.strip()]
+        for token in tokens:
             lowered = token.lower()
             modifier = cls.MACRO_MODIFIER_ALIASES.get(lowered)
             if modifier:
@@ -1733,16 +1849,30 @@ class AgentExecutor:
                 key_parts.append(token)
         if not key_parts:
             return b''
-        if len(key_parts) != 1:
-            raise ValueError(f"组合键只能有一个主键: {'+'.join(parts)}")
+        if len(key_parts) > 1:
+            raise ValueError(
+                f"组合键 {'+'.join(tokens)} 表示同一拍按下多个普通键 ({'+'.join(key_parts)})；"
+                "终端 stdin 只能编码“修饰键 + 一个主键”，不能表达多个普通主键同时按下。"
+                "如果要按顺序发送多个键，请用空格分隔，例如 key: ctrl+a c"
+            )
         return cls._modified_key_to_bytes(modifiers, key_parts[0])
+
+    @classmethod
+    def _macro_key_parts_to_step(cls, parts: List[str]) -> Dict[str, Any]:
+        payload = cls._macro_key_parts_to_bytes(parts)
+        step: Dict[str, Any] = {'type': 'bytes', 'payload': payload}
+        if len(parts) == 1:
+            token = cls._unescape_macro_text(parts[0].strip()).lower()
+            if token in {'enter', 'return'}:
+                step['pipe_payload'] = b'\n'
+        return step
 
     @classmethod
     def _macro_command_to_steps(cls, content: str) -> List[Dict[str, Any]]:
         leading_trimmed = content.lstrip()
         command_match = re.match(r'([A-Za-z][A-Za-z0-9_-]*)\s*:(.*)\Z', leading_trimmed, re.DOTALL)
         if not command_match:
-            return [{'type': 'bytes', 'payload': cls._macro_key_parts_to_bytes([content])}]
+            return [cls._macro_key_parts_to_step([content])]
 
         name = command_match.group(1).lower()
         value = command_match.group(2)
@@ -1777,13 +1907,11 @@ class AgentExecutor:
             if count < 0 or count > cls.MAX_STDIN_MACRO_REPEAT:
                 raise ValueError(f"[repeat:] 次数必须在 0 到 {cls.MAX_STDIN_MACRO_REPEAT} 之间")
             nested_steps = cls.parse_stdin_macro(repeat_match.group(2))
+            cls._validate_stdin_steps(nested_steps, count)
             out: List[Dict[str, Any]] = []
             for _ in range(count):
                 for step in nested_steps:
-                    if step['type'] == 'bytes':
-                        cls._append_macro_bytes(out, step['payload'])
-                    else:
-                        out.append(dict(step))
+                    cls._append_macro_step(out, step)
             return out
 
         raise ValueError(f"未知 stdin 宏指令: [{name}:...]")
@@ -1805,7 +1933,7 @@ class AgentExecutor:
         return count, i
 
     @classmethod
-    def parse_stdin_macro(cls, macro: str) -> List[Dict[str, Any]]:
+    def _parse_inline_stdin_macro(cls, macro: str) -> List[Dict[str, Any]]:
         text = macro or ''
         steps: List[Dict[str, Any]] = []
         text_buf: List[str] = []
@@ -1849,19 +1977,24 @@ class AgentExecutor:
             repeat_count, after_repeat = cls._parse_macro_postfix_repeat(text, cursor)
             flush_text(strip_right=True)
             if len(parts) > 1:
-                part_steps = [{'type': 'bytes', 'payload': cls._macro_key_parts_to_bytes(parts)}]
+                part_steps = [cls._macro_key_parts_to_step(parts)]
             else:
                 part_steps = cls._macro_command_to_steps(parts[0])
             for _ in range(repeat_count):
                 for step in part_steps:
-                    if step['type'] == 'bytes':
-                        cls._append_macro_bytes(steps, step['payload'])
-                    else:
-                        steps.append(dict(step))
+                    cls._append_macro_step(steps, step)
             i = cls._skip_macro_space(text, after_repeat)
 
         flush_text(strip_right=False)
+        cls._validate_stdin_steps(steps)
         return steps
+
+    @classmethod
+    def parse_stdin_macro(cls, macro: str) -> List[Dict[str, Any]]:
+        text = macro or ''
+        if cls._looks_like_stdin_line_mode(text):
+            return cls._parse_stdin_line_mode(text)
+        return cls._parse_inline_stdin_macro(text)
 
     @classmethod
     def extract_protocol_blocks(cls, ai_response: str) -> List[Dict[str, Any]]:
@@ -2357,6 +2490,7 @@ class AgentShellSession:
         self.first_output_at: Optional[float] = None
         self.first_output_monotonic: Optional[float] = None
         self.lock = threading.RLock()
+        self.input_lock = threading.Lock()
         self.output = ""
         self.read_index = 0
         self.output_chunks = 0
@@ -2448,15 +2582,24 @@ class AgentShellSession:
         return self.process.poll()
 
     def write_bytes(self, payload: bytes):
-        if self.pty_enabled:
-            if self.controller_fd is None:
-                raise RuntimeError("shell session has no PTY")
-            os.write(self.controller_fd, payload)
+        if not payload:
             return
-        if not self.process or not self.process.stdin:
-            raise RuntimeError("shell session stdin is closed")
-        self.process.stdin.write(payload)
-        self.process.stdin.flush()
+        with self.input_lock:
+            if self.pty_enabled:
+                if self.controller_fd is None:
+                    raise RuntimeError("shell session has no PTY")
+                view = memoryview(payload)
+                offset = 0
+                while offset < len(view):
+                    written = os.write(self.controller_fd, view[offset:])
+                    if written <= 0:
+                        raise RuntimeError("shell session PTY write returned no bytes")
+                    offset += written
+                return
+            if not self.process or not self.process.stdin:
+                raise RuntimeError("shell session stdin is closed")
+            self.process.stdin.write(payload)
+            self.process.stdin.flush()
 
     def read_delta(self, max_chars: int = 4000) -> str:
         with self.lock:
@@ -2784,6 +2927,7 @@ class AgentShellSessionManager:
     async def send_input(cls, session_id: str, steps: List[Dict[str, Any]],
                          stop_event: Optional[asyncio.Event] = None) -> Dict[str, Any]:
         try:
+            AgentExecutor._validate_stdin_steps(steps)
             session = cls._get(session_id)
             if not session.is_running():
                 return cls._format_result(session, session.read_delta(), 'stdin')
@@ -2795,6 +2939,14 @@ class AgentShellSessionManager:
                 step_type = step.get('type')
                 if step_type == 'bytes':
                     payload = step.get('payload') or b''
+                    if not isinstance(payload, (bytes, bytearray)):
+                        raise ValueError("stdin bytes step payload must be bytes")
+                    if not session.pty_enabled:
+                        pipe_payload = step.get('pipe_payload')
+                        if pipe_payload is not None:
+                            if not isinstance(pipe_payload, (bytes, bytearray)):
+                                raise ValueError("stdin pipe payload must be bytes")
+                            payload = pipe_payload
                     if payload:
                         await loop.run_in_executor(None, lambda data=payload: session.write_bytes(data))
                         input_bytes += len(payload)
@@ -8127,43 +8279,67 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
 
                 if block_type == 'sendfile':
                     sendfile_path = block['body']
+                    sendfile_notice = ""
                     try:
                         resolved_sendfile_path = AgentExecutor.resolve_file_path(sendfile_path)
                         if not os.path.exists(resolved_sendfile_path):
+                            sendfile_notice = f"[sendfile结果] 发送失败: 文件不存在: {resolved_sendfile_path}"
                             await safe_send_message(
                                 context,
                                 update.effective_chat.id,
                                 f"❌ 文件不存在: {safe_text(resolved_sendfile_path)}"
                             )
-                        elif os.path.getsize(resolved_sendfile_path) > AgentExecutor.MAX_FILE_SIZE:
-                            await safe_send_message(
-                                context,
-                                update.effective_chat.id,
-                                f"❌ 文件超过50MB限制: {safe_text(resolved_sendfile_path)}"
-                            )
                         else:
-                            fname = os.path.basename(resolved_sendfile_path)
                             fsize = os.path.getsize(resolved_sendfile_path)
-                            with open(resolved_sendfile_path, 'rb') as sendfile:
-                                await context.bot.send_document(
-                                    chat_id=update.effective_chat.id,
-                                    document=sendfile,
-                                    filename=fname,
-                                    caption=f"📄 {fname} ({fsize} bytes)"
+                            if fsize > AgentExecutor.MAX_FILE_SIZE:
+                                sendfile_notice = (
+                                    f"[sendfile结果] 发送失败: 文件超过50MB限制: "
+                                    f"{resolved_sendfile_path} ({fsize} bytes)"
                                 )
-                            await GlobalRecorder.record(
-                                msg_type=MessageType.AGENT_RESULT,
-                                role='system',
-                                content=f"[Agent发送服务器文件] {resolved_sendfile_path} ({fsize} bytes)",
-                                chat_id=update.effective_chat.id
-                            )
+                                await safe_send_message(
+                                    context,
+                                    update.effective_chat.id,
+                                    f"❌ 文件超过50MB限制: {safe_text(resolved_sendfile_path)}"
+                                )
+                            else:
+                                fname = os.path.basename(resolved_sendfile_path)
+                                with open(resolved_sendfile_path, 'rb') as sendfile:
+                                    await context.bot.send_document(
+                                        chat_id=update.effective_chat.id,
+                                        document=sendfile,
+                                        filename=fname,
+                                        caption=f"📄 {fname} ({fsize} bytes)"
+                                    )
+                                sendfile_notice = (
+                                    f"[sendfile结果] 已发送服务器文件给用户: "
+                                    f"{resolved_sendfile_path} ({fsize} bytes)"
+                                )
                     except Exception as e:
                         logger.error(f"Agent发送服务器文件失败: {e}")
+                        sendfile_notice = f"[sendfile结果] 发送失败: {sendfile_path}。错误: {str(e)[:200]}"
                         await safe_send_message(
                             context,
                             update.effective_chat.id,
                             f"❌ 发送文件失败: {safe_text(str(e)[:200])}"
                         )
+
+                    if sendfile_notice:
+                        await GlobalRecorder.record(
+                            msg_type=MessageType.AGENT_RESULT,
+                            role='system',
+                            content=sendfile_notice,
+                            chat_id=update.effective_chat.id
+                        )
+                        await db.add_chat_message(cid, 'user', sendfile_notice)
+                        continuation_messages.append({
+                            'role': 'user',
+                            'content': (
+                                sendfile_notice + "\n"
+                                "说明: sendfile 已执行；这里回灌的是发送结果、路径和大小，"
+                                "不包含文件本体。若需要查看文件内容，请使用 read。"
+                            )
+                        })
+                        should_continue = True
                     continue
 
                 if block_type == 'read':
@@ -8198,6 +8374,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
 
                 if block_type == 'file':
                     filename, file_content = block['path'], block['body']
+                    file_notice = ""
                     try:
                         file_result = await AgentExecutor.write_file(filename, file_content)
                         saved_path = file_result['path']
@@ -8224,22 +8401,36 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                 parse_mode=constants.ParseMode.HTML
                             )
 
-                        await GlobalRecorder.record(
-                            msg_type=MessageType.AGENT_RESULT,
-                            role='system',
-                            content=(
-                                f"[Agent写入文件] {saved_path} "
-                                f"({saved_size} bytes, {'覆盖' if file_result['existed'] else '新建'})"
-                            ),
-                            chat_id=update.effective_chat.id
+                        file_notice = (
+                            f"[file结果] 已写入服务器文件: {saved_path} "
+                            f"({saved_size} bytes, {'覆盖' if file_result['existed'] else '新建'})"
                         )
                     except Exception as e:
                         logger.error(f"Agent写入文件失败: {e}")
+                        file_notice = f"[file结果] 写入失败: {filename}。错误: {str(e)[:200]}"
                         await safe_send_message(
                             context,
                             update.effective_chat.id,
                             f"❌ 文件写入失败: {safe_text(str(e)[:200])}"
                         )
+
+                    if file_notice:
+                        await GlobalRecorder.record(
+                            msg_type=MessageType.AGENT_RESULT,
+                            role='system',
+                            content=file_notice,
+                            chat_id=update.effective_chat.id
+                        )
+                        await db.add_chat_message(cid, 'user', file_notice)
+                        continuation_messages.append({
+                            'role': 'user',
+                            'content': (
+                                file_notice + "\n"
+                                "说明: file 已执行；这里回灌的是写入结果、路径和大小，"
+                                "不包含文件本体。若需要查看文件内容，请使用 read。"
+                            )
+                        })
+                        should_continue = True
                     continue
 
                 if block_type == 'run':
