@@ -1602,8 +1602,6 @@ class AgentExecutor:
         'f4': 'S',
     }
     MAX_STDIN_MACRO_REPEAT = 200
-    MAX_STDIN_MACRO_WAIT_SECONDS = 60.0
-    MAX_STDIN_MACRO_TOTAL_WAIT_SECONDS = 120.0
     MAX_STDIN_MACRO_STEPS = 1000
     MAX_STDIN_MACRO_BYTES = 1024 * 1024
 
@@ -1877,10 +1875,8 @@ class AgentExecutor:
             raise ValueError(f"stdin 宏步骤数不能超过 {cls.MAX_STDIN_MACRO_STEPS}")
         if total_bytes > cls.MAX_STDIN_MACRO_BYTES:
             raise ValueError(f"stdin 宏输入不能超过 {cls.MAX_STDIN_MACRO_BYTES} 字节")
-        if total_wait_seconds > cls.MAX_STDIN_MACRO_TOTAL_WAIT_SECONDS:
-            raise ValueError(
-                f"stdin 宏总等待不能超过 {cls.MAX_STDIN_MACRO_TOTAL_WAIT_SECONDS:g} 秒"
-            )
+        if not math.isfinite(total_wait_seconds):
+            raise ValueError("stdin 宏等待时长必须是有限数字")
 
     @staticmethod
     def _unescape_macro_text(text: str) -> str:
@@ -1994,10 +1990,10 @@ class AgentExecutor:
             seconds = float(number) * multiplier
         except ValueError as exc:
             raise ValueError(f"无法解析等待时长: {value}") from exc
+        if not math.isfinite(seconds):
+            raise ValueError("[wait:] 等待时长必须是有限数字")
         if seconds < 0:
             raise ValueError("[wait:] 不能使用负数")
-        if seconds > AgentExecutor.MAX_STDIN_MACRO_WAIT_SECONDS:
-            raise ValueError(f"[wait:] 单次等待不能超过 {AgentExecutor.MAX_STDIN_MACRO_WAIT_SECONDS:g} 秒")
         return seconds
 
     @staticmethod
