@@ -19,6 +19,7 @@ import json
 import shutil
 import argparse
 import urllib.parse
+import urllib.request
 import mimetypes
 import base64
 import hmac
@@ -28,6 +29,7 @@ import time
 import threading
 import zipfile
 import tarfile
+import re
 from http import cookies
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -53,6 +55,14 @@ MAX_TTL_SECONDS = 10 * 365 * 24 * 60 * 60
 MAX_SPARSE_FILE_SIZE = 100 * 1024 * 1024 * 1024
 MAX_TEXT_EDIT_SIZE = 10 * 1024 * 1024
 WEBDAV_DIR_NAME = 'webdav'
+DOWNLOAD_DIR_NAME = 'download'
+REMOTE_TASK_SAMPLE_LIMIT = 240
+REMOTE_TASKS = {}
+REMOTE_TASKS_LOCK = threading.Lock()
+UPLOAD_BATCH_DIRS = {}
+UPLOAD_BATCH_UPDATED = {}
+UPLOAD_BATCH_DIRS_LOCK = threading.Lock()
+UPLOAD_BATCH_TTL_SECONDS = 2 * 60 * 60
 
 # Login rate limiter: { ip: { 'fails': int, 'locked_until': float } }
 _login_attempts = {}
@@ -61,7 +71,14 @@ LOGIN_MAX_FAILS = 5
 LOGIN_LOCKOUT_SECONDS = 60
 
 # Background cache for root directory size calculation
-_root_size_cache = {'size': 0, 'lock': threading.Lock(), 'started': False}
+_root_size_cache = {
+    'size': 0,
+    'logical': 0,
+    'allocated': 0,
+    'updated': 0,
+    'lock': threading.Lock(),
+    'started': False,
+}
 
 # ============================================================
 # Utility Functions
@@ -121,7 +138,7 @@ def get_file_info(root, rel_path, full_path):
 
 
 def _empty_state():
-    return {'shares': {}, 'tempFiles': {}}
+    return {'shares': {}, 'shareTrash': {}, 'tempFiles': {}}
 
 
 def load_state():
@@ -132,6 +149,7 @@ def load_state():
         except Exception:
             data = _empty_state()
         data.setdefault('shares', {})
+        data.setdefault('shareTrash', {})
         data.setdefault('tempFiles', {})
         return data
 
@@ -183,6 +201,32 @@ def valid_leaf_name(name):
     if not name:
         return False
     return not (name.startswith('.') or '/' in name or '\\' in name or '..' in name)
+
+
+def safe_upload_relpath(value):
+    rel = str(value or '').replace('\\', '/').strip('/')
+    if not rel:
+        return ''
+    parts = []
+    for part in rel.split('/'):
+        if not part or part in ('.', '..') or '\x00' in part:
+            return ''
+        if part.startswith('.') or '/' in part or '\\' in part or '..' in part:
+            return ''
+        parts.append(part)
+    return '/'.join(parts)
+
+
+def cleanup_upload_batches(now=None):
+    now = now or time.time()
+    with UPLOAD_BATCH_DIRS_LOCK:
+        expired = [
+            batch_id for batch_id, updated in UPLOAD_BATCH_UPDATED.items()
+            if now - float(updated or 0) > UPLOAD_BATCH_TTL_SECONDS
+        ]
+        for batch_id in expired:
+            UPLOAD_BATCH_UPDATED.pop(batch_id, None)
+            UPLOAD_BATCH_DIRS.pop(batch_id, None)
 
 
 def normalize_extension(ext):
@@ -278,6 +322,162 @@ def ensure_webdav_storage():
         return None
     os.makedirs(base, exist_ok=True)
     return base
+
+
+def ensure_download_storage():
+    base = safe_join(ROOT_DIR, DOWNLOAD_DIR_NAME) if ROOT_DIR else None
+    if not base:
+        return None
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def safe_download_filename(name, fallback='download.bin'):
+    name = urllib.parse.unquote(str(name or '')).replace('\\', '/').split('/')[-1].strip()
+    name = ''.join('_' if ord(ch) < 32 or ch in '<>:"|?*' else ch for ch in name)
+    name = name.strip(' .')
+    if not name or name in ('.', '..') or name.startswith('.'):
+        name = fallback
+    return name[:180] or fallback
+
+
+def filename_from_content_disposition(header):
+    header = str(header or '')
+    m = re.search(r"filename\*=([^']*)''([^;]+)", header, re.I)
+    if m:
+        try:
+            return urllib.parse.unquote(m.group(2), encoding=m.group(1) or 'utf-8')
+        except LookupError:
+            return urllib.parse.unquote(m.group(2))
+    m = re.search(r'filename="?([^";]+)"?', header, re.I)
+    return m.group(1).strip() if m else ''
+
+
+def remote_url_filename(url):
+    path = urllib.parse.urlparse(url).path
+    return safe_download_filename(os.path.basename(path), 'remote-download.bin')
+
+
+def remote_task_snapshot(task):
+    public = {}
+    for key in (
+        'id', 'url', 'name', 'status', 'size', 'loaded', 'createdAt', 'startedAt',
+        'finishedAt', 'path', 'error', 'lastBps', 'maxBps', 'samples'
+    ):
+        public[key] = task.get(key)
+    return public
+
+
+def remote_task_speed_update(task, now=None, force=False):
+    now = now or time.time()
+    last_t = float(task.get('lastT') or now)
+    if not force and now - last_t < 0.25:
+        return
+    loaded = int(task.get('loaded') or 0)
+    last_bytes = int(task.get('lastBytes') or 0)
+    dt = max(0.001, now - last_t)
+    cur = max(0.0, (loaded - last_bytes) / dt)
+    started = float(task.get('startedAt') or now)
+    elapsed = max(0.001, now - started)
+    avg = loaded / elapsed
+    task['lastBps'] = cur
+    task['maxBps'] = max(float(task.get('maxBps') or 0), cur)
+    samples = task.setdefault('samples', [])
+    samples.append({'t': elapsed, 'bps': cur, 'bytes': loaded, 'avg': avg})
+    if len(samples) > REMOTE_TASK_SAMPLE_LIMIT:
+        del samples[:-REMOTE_TASK_SAMPLE_LIMIT]
+    task['lastT'] = now
+    task['lastBytes'] = loaded
+
+
+def remote_download_worker(task_id):
+    temp_path = ''
+    try:
+        with REMOTE_TASKS_LOCK:
+            task = REMOTE_TASKS.get(task_id)
+            if not task:
+                return
+            task['status'] = 'downloading'
+            task['startedAt'] = time.time()
+            task['lastT'] = task['startedAt']
+            task['lastBytes'] = 0
+            url = task['url']
+
+        req = urllib.request.Request(url, headers={'User-Agent': 'WebDAV-FileManager/1.0'})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            header_name = filename_from_content_disposition(resp.headers.get('Content-Disposition'))
+            filename = safe_download_filename(header_name or remote_url_filename(url), 'remote-download.bin')
+            download_dir = ensure_download_storage()
+            if not download_dir:
+                raise OSError('下载目录不可用')
+            target = make_unique_path(download_dir, filename)
+            temp_path = target + '.part'
+            total = int(resp.headers.get('Content-Length') or 0)
+            rel = root_relative_path(target)
+            with REMOTE_TASKS_LOCK:
+                task = REMOTE_TASKS.get(task_id)
+                if not task:
+                    return
+                task['name'] = os.path.basename(target)
+                task['size'] = total
+                task['path'] = rel
+                task['tempPath'] = temp_path
+
+            with open(temp_path, 'wb') as out:
+                while True:
+                    with REMOTE_TASKS_LOCK:
+                        task = REMOTE_TASKS.get(task_id)
+                        if not task:
+                            return
+                        if task.get('cancel'):
+                            raise InterruptedError('已取消')
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    with REMOTE_TASKS_LOCK:
+                        task = REMOTE_TASKS.get(task_id)
+                        if task:
+                            task['loaded'] = int(task.get('loaded') or 0) + len(chunk)
+                            remote_task_speed_update(task)
+
+            os.replace(temp_path, target)
+            with REMOTE_TASKS_LOCK:
+                task = REMOTE_TASKS.get(task_id)
+                if task:
+                    task['loaded'] = os.path.getsize(target)
+                    task['size'] = task['loaded'] if not task.get('size') else task['size']
+                    task['status'] = 'done'
+                    task['finishedAt'] = time.time()
+                    task['lastBps'] = 0
+                    task['error'] = ''
+                    remote_task_speed_update(task, task['finishedAt'], force=True)
+    except InterruptedError as e:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        with REMOTE_TASKS_LOCK:
+            task = REMOTE_TASKS.get(task_id)
+            if task:
+                task['status'] = 'canceled'
+                task['finishedAt'] = time.time()
+                task['lastBps'] = 0
+                task['error'] = str(e)
+    except Exception as e:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        with REMOTE_TASKS_LOCK:
+            task = REMOTE_TASKS.get(task_id)
+            if task:
+                task['status'] = 'error'
+                task['finishedAt'] = time.time()
+                task['lastBps'] = 0
+                task['error'] = str(e)
 
 
 def archive_member_path(name):
@@ -856,6 +1056,8 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             '/api/fileinfo': self._api_fileinfo,
             '/api/text': self._api_text_get,
             '/api/shares': self._api_shares,
+            '/api/share-detail': self._api_share_detail,
+            '/api/remote-downloads': self._api_remote_downloads,
         }
         handler = routes.get(path)
         if handler:
@@ -863,9 +1065,45 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         else:
             self.send_err(404, 'API not found')
 
+    def _client_ip(self):
+        forwarded = self.headers.get('X-Forwarded-For', '')
+        if forwarded:
+            return forwarded.split(',', 1)[0].strip() or self.client_address[0]
+        real_ip = self.headers.get('X-Real-IP', '').strip()
+        return real_ip or self.client_address[0]
+
+    def _record_share_access(self, state, token, meta, full):
+        now = time.time()
+        ip = self._client_ip()
+        ua = self.headers.get('User-Agent', '')[:240]
+        size = os.path.getsize(full) if full and os.path.isfile(full) else 0
+        stats = meta.setdefault('accessStats', {})
+        item = stats.setdefault(ip, {
+            'ip': ip,
+            'count': 0,
+            'bytes': 0,
+            'firstAt': now,
+            'lastAt': 0,
+            'userAgent': '',
+        })
+        item['count'] = int(item.get('count') or 0) + 1
+        item['bytes'] = int(item.get('bytes') or 0) + size
+        item['lastAt'] = now
+        item['userAgent'] = ua
+        meta['downloadCount'] = int(meta.get('downloadCount') or 0) + 1
+        meta['downloadBytes'] = int(meta.get('downloadBytes') or 0) + size
+        meta['lastAccessAt'] = now
+        save_state(state)
+
+    def _share_token_from_path(self, path):
+        tail = path[len('/s/'):].strip('/') if path.startswith('/s/') else ''
+        return tail.split('/', 1)[0] if tail else ''
+
     def _public_share_download(self, path, qs, head_only=False):
         cleanup_expired_temp_files()
-        token = path.rsplit('/', 1)[-1]
+        token = self._share_token_from_path(path)
+        if not token:
+            return self.send_err(404, '链接不存在或已过期')
         state = load_state()
         meta = state.get('shares', {}).get(token)
         if not meta:
@@ -877,6 +1115,8 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         full = safe_join(ROOT_DIR, meta.get('path', ''))
         if not full or not os.path.isfile(full):
             return self.send_err(404, '文件不存在')
+        if not head_only:
+            self._record_share_access(state, token, meta, full)
         self._stream_file(full, head_only=head_only)
 
     def _api_list(self, qs):
@@ -899,15 +1139,19 @@ class FileManagerHandler(BaseHTTPRequestHandler):
 
     def _api_disk(self, qs=None):
         cleanup_expired_temp_files()
+        _ensure_root_size_worker()
         u = shutil.disk_usage(ROOT_DIR)
-        root_size = _calculate_root_logical_size()
-        root_allocated_size = _calculate_root_allocated_size()
+        with _root_size_cache['lock']:
+            root_size = int(_root_size_cache.get('logical') or _root_size_cache.get('size') or 0)
+            root_allocated_size = int(_root_size_cache.get('allocated') or _root_size_cache.get('size') or 0)
+            root_updated = float(_root_size_cache.get('updated') or 0)
         self.send_json({
             'total': u.total,
             'used': u.used,
             'free': u.free,
             'rootSize': root_size,
             'rootAllocatedSize': root_allocated_size,
+            'rootSizeUpdatedAt': root_updated,
             'rootPath': ROOT_DIR,
             'totalStr': format_size(u.total),
             'usedStr': format_size(u.used),
@@ -945,6 +1189,61 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         info = get_file_info(ROOT_DIR, req_path, full)
         self.send_json({'success': True, 'file': info, 'content': content})
 
+    def _share_item(self, token, meta, trashed=False):
+        req_path = meta.get('path', '')
+        full = safe_join(ROOT_DIR, req_path)
+        exists = bool(full and os.path.isfile(full))
+        size = os.path.getsize(full) if exists else int(meta.get('size') or 0)
+        expires_at = float(meta.get('expiresAt') or 0)
+        stats = meta.get('accessStats') or {}
+        unique_ips = len(stats)
+        downloads = int(meta.get('downloadCount') or sum(int(v.get('count') or 0) for v in stats.values()))
+        name = os.path.basename(req_path.rstrip('/')) or req_path
+        return {
+            'token': token,
+            'path': req_path,
+            'name': name,
+            'size': size,
+            'exists': exists,
+            'createdAt': float(meta.get('createdAt') or 0),
+            'expiresAt': expires_at,
+            'remaining': max(0, int(expires_at - time.time())) if expires_at and not trashed else 0,
+            'deletedAt': float(meta.get('deletedAt') or 0),
+            'lastAccessAt': float(meta.get('lastAccessAt') or 0),
+            'downloadCount': downloads,
+            'downloadBytes': int(meta.get('downloadBytes') or 0),
+            'uniqueIpCount': unique_ips,
+            'url': self._share_url(token, name),
+            'plainUrl': self._share_url(token),
+            'trashed': trashed,
+        }
+
+    def _share_detail_payload(self, token, meta, trashed=False):
+        item = self._share_item(token, meta, trashed)
+        stats = []
+        total_count = 0
+        total_bytes = 0
+        for row in (meta.get('accessStats') or {}).values():
+            total_count += int(row.get('count') or 0)
+            total_bytes += int(row.get('bytes') or 0)
+        for ip, row in (meta.get('accessStats') or {}).items():
+            count = int(row.get('count') or 0)
+            byte_count = int(row.get('bytes') or 0)
+            stats.append({
+                'ip': ip,
+                'count': count,
+                'bytes': byte_count,
+                'avgBytes': int(byte_count / count) if count else 0,
+                'countPercent': round(count / total_count * 100, 1) if total_count else 0,
+                'bytePercent': round(byte_count / total_bytes * 100, 1) if total_bytes else 0,
+                'firstAt': float(row.get('firstAt') or 0),
+                'lastAt': float(row.get('lastAt') or 0),
+                'userAgent': row.get('userAgent') or '',
+            })
+        stats.sort(key=lambda x: x['lastAt'], reverse=True)
+        item['ipStats'] = stats
+        return item
+
     def _api_shares(self, qs):
         cleanup_expired_temp_files()
         state = load_state()
@@ -953,26 +1252,39 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             req_path = meta.get('path', '')
             full = safe_join(ROOT_DIR, req_path)
             exists = bool(full and os.path.isfile(full))
-            size = os.path.getsize(full) if exists else 0
-            expires_at = float(meta.get('expiresAt') or 0)
-            items.append({
-                'token': token,
-                'path': req_path,
-                'name': os.path.basename(req_path.rstrip('/')) or req_path,
-                'size': size,
-                'exists': exists,
-                'createdAt': float(meta.get('createdAt') or 0),
-                'expiresAt': expires_at,
-                'remaining': max(0, int(expires_at - time.time())) if expires_at else 0,
-                'url': self._share_url(token),
-            })
-        items.sort(key=lambda x: x['expiresAt'])
+            if exists and not meta.get('size'):
+                meta['size'] = os.path.getsize(full)
+            items.append(self._share_item(token, meta, False))
+        trash = [self._share_item(token, meta, True) for token, meta in state.get('shareTrash', {}).items()]
+        items.sort(key=lambda x: x['expiresAt'] or 0)
+        trash.sort(key=lambda x: x['deletedAt'] or 0, reverse=True)
+        self.send_json({'success': True, 'items': items, 'trash': trash})
+
+    def _api_share_detail(self, qs):
+        token = str(qs.get('token', [''])[0]).strip()
+        in_trash = str(qs.get('trash', ['0'])[0]).lower() in ('1', 'true', 'yes')
+        if not token:
+            return self.send_err(400, '缺少链接 token')
+        state = load_state()
+        source = state.get('shareTrash' if in_trash else 'shares', {})
+        meta = source.get(token)
+        if not meta:
+            return self.send_err(404, '链接不存在')
+        self.send_json({'success': True, 'item': self._share_detail_payload(token, meta, in_trash)})
+
+    def _api_remote_downloads(self, qs=None):
+        with REMOTE_TASKS_LOCK:
+            items = [remote_task_snapshot(task) for task in REMOTE_TASKS.values()]
+        items.sort(key=lambda x: x.get('createdAt') or 0, reverse=True)
         self.send_json({'success': True, 'items': items})
 
-    def _share_url(self, token):
+    def _share_url(self, token, filename=None):
         host = self.headers.get('Host') or ''
         proto = self.headers.get('X-Forwarded-Proto') or 'http'
-        return f'{proto}://{host}/s/{token}' if host else f'/s/{token}'
+        suffix = ''
+        if filename:
+            suffix = '/' + urllib.parse.quote(filename, safe='')
+        return f'{proto}://{host}/s/{token}{suffix}' if host else f'/s/{token}{suffix}'
 
     def _api_download(self, qs):
         cleanup_expired_temp_files()
@@ -1045,6 +1357,12 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             '/api/create-speed-file': self._api_create_speed_file,
             '/api/share': self._api_share,
             '/api/share-delete': self._api_share_delete,
+            '/api/share-restore': self._api_share_restore,
+            '/api/share-purge': self._api_share_purge,
+            '/api/share-trash-clear': self._api_share_trash_clear,
+            '/api/remote-download': self._api_remote_download_start,
+            '/api/remote-download-cancel': self._api_remote_download_cancel,
+            '/api/remote-download-delete': self._api_remote_download_delete,
             '/api/save-text': self._api_save_text,
             '/api/delete': self._api_delete,
             '/api/rename': self._api_rename,
@@ -1067,25 +1385,69 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         return msg
 
     def _api_upload(self, qs):
+        cleanup_upload_batches()
         target_dir = qs.get('path', ['/'])[0]
         raw_filename = qs.get('name', [''])[0]
+        raw_relpath = qs.get('relpath', [''])[0]
+        batch_id = str(qs.get('batch', [''])[0]).strip()
+        if batch_id:
+            with UPLOAD_BATCH_DIRS_LOCK:
+                UPLOAD_BATCH_UPDATED[batch_id] = time.time()
         if not raw_filename:
             return self.send_err(400, '缺少文件名')
-        # Security: strip path components to prevent directory traversal
-        filename = os.path.basename(raw_filename)
+        relpath = safe_upload_relpath(raw_relpath)
+        if raw_relpath and not relpath:
+            return self.send_err(400, '相对路径无效')
+        if relpath:
+            filename = os.path.basename(relpath)
+        else:
+            filename = os.path.basename(raw_filename)
+            if not valid_leaf_name(filename):
+                return self.send_err(400, '文件名无效')
+            relpath = filename
         if not filename or filename.startswith('.'):
             return self.send_err(400, '文件名无效')
         dir_path = safe_join(ROOT_DIR, target_dir)
         if not dir_path or not os.path.isdir(dir_path):
             return self.send_err(400, '目标目录不存在')
-        file_path = os.path.join(dir_path, filename)
+        file_path = os.path.realpath(os.path.join(dir_path, *relpath.split('/')))
         # Verify final path is within ROOT_DIR
-        if not os.path.realpath(file_path).startswith(os.path.realpath(ROOT_DIR) + os.sep) and \
-           os.path.realpath(file_path) != os.path.realpath(ROOT_DIR):
+        root_real = os.path.realpath(ROOT_DIR)
+        if not (file_path == root_real or file_path.startswith(root_real + os.sep)):
             return self.send_err(403, '路径非法')
+        rel_parts = relpath.split('/')
+        top_name = rel_parts[0]
+        top_path = os.path.realpath(os.path.join(dir_path, top_name))
+        if not (top_path == root_real or top_path.startswith(root_real + os.sep)):
+            return self.send_err(403, '路径非法')
+        with UPLOAD_BATCH_DIRS_LOCK:
+            batch_dirs = UPLOAD_BATCH_DIRS.setdefault(batch_id, set()) if batch_id else set()
+            top_created_by_batch = top_path in batch_dirs
+        if os.path.exists(top_path) and not top_created_by_batch:
+            conflict_type = 'folder' if os.path.isdir(top_path) else 'file'
+            return self.send_json({
+                'error': '当前目录已存在同名文件或文件夹，请重命名后再上传',
+                'conflict': conflict_type,
+                'name': top_name,
+            }, 409)
         content_length = int(self.headers.get('Content-Length', 0))
         try:
-            with open(file_path, 'wb') as f:
+            parent_dirs = rel_parts[:-1]
+            current_dir = os.path.realpath(dir_path)
+            for part in parent_dirs:
+                current_dir = os.path.realpath(os.path.join(current_dir, part))
+                if not (current_dir == root_real or current_dir.startswith(root_real + os.sep)):
+                    return self.send_err(403, '路径非法')
+                if os.path.exists(current_dir):
+                    if not os.path.isdir(current_dir):
+                        return self.send_err(400, '目标路径已有同名文件，无法创建文件夹')
+                else:
+                    os.mkdir(current_dir)
+                    if batch_id:
+                        with UPLOAD_BATCH_DIRS_LOCK:
+                            UPLOAD_BATCH_DIRS.setdefault(batch_id, set()).add(current_dir)
+                            UPLOAD_BATCH_UPDATED[batch_id] = time.time()
+            with open(file_path, 'xb') as f:
                 remaining = content_length
                 while remaining > 0:
                     chunk = self.rfile.read(min(remaining, 65536))
@@ -1094,6 +1456,15 @@ class FileManagerHandler(BaseHTTPRequestHandler):
                     f.write(chunk)
                     remaining -= len(chunk)
             self.send_ok('上传成功')
+        except (FileExistsError, IsADirectoryError):
+            if os.path.exists(top_path) and not top_created_by_batch:
+                conflict_type = 'folder' if os.path.isdir(top_path) else 'file'
+                return self.send_json({
+                    'error': '当前目录已存在同名文件或文件夹，请重命名后再上传',
+                    'conflict': conflict_type,
+                    'name': top_name,
+                }, 409)
+            return self.send_err(400, '上传失败: 目标路径已存在同名项目')
         except OSError as e:
             self.send_err(500, f'上传失败: {self._sanitize_error(e)}')
 
@@ -1188,13 +1559,17 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         state = load_state()
         state.setdefault('shares', {})[token] = {
             'path': req_path,
+            'size': os.path.getsize(full),
             'createdAt': time.time(),
             'expiresAt': expires_at,
+            'downloadCount': 0,
+            'downloadBytes': 0,
+            'accessStats': {},
         }
         save_state(state)
         self.send_json({
             'success': True,
-            'url': self._share_url(token),
+            'url': self._share_url(token, os.path.basename(full)),
             'token': token,
             'path': req_path,
             'name': os.path.basename(full),
@@ -1210,11 +1585,104 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         if not token:
             return self.send_err(400, '缺少链接 token')
         state = load_state()
-        if token not in state.get('shares', {}):
+        meta = state.get('shares', {}).pop(token, None)
+        if not meta:
             return self.send_err(404, '链接不存在或已过期')
-        state['shares'].pop(token, None)
+        meta['deletedAt'] = time.time()
+        state.setdefault('shareTrash', {})[token] = meta
         save_state(state)
-        self.send_ok('链接已删除')
+        self.send_ok('链接已移动到回收站')
+
+    def _api_share_restore(self):
+        data = self.read_json()
+        token = str(data.get('token', '')).strip()
+        if not token:
+            return self.send_err(400, '缺少链接 token')
+        state = load_state()
+        meta = state.get('shareTrash', {}).pop(token, None)
+        if not meta:
+            return self.send_err(404, '回收站里没有这个链接')
+        meta.pop('deletedAt', None)
+        state.setdefault('shares', {})[token] = meta
+        save_state(state)
+        self.send_ok('链接已还原')
+
+    def _api_share_purge(self):
+        data = self.read_json()
+        token = str(data.get('token', '')).strip()
+        if not token:
+            return self.send_err(400, '缺少链接 token')
+        state = load_state()
+        if token not in state.get('shareTrash', {}):
+            return self.send_err(404, '回收站里没有这个链接')
+        state['shareTrash'].pop(token, None)
+        save_state(state)
+        self.send_ok('链接已彻底删除')
+
+    def _api_share_trash_clear(self):
+        state = load_state()
+        state['shareTrash'] = {}
+        save_state(state)
+        self.send_ok('回收站已清空')
+
+    def _api_remote_download_start(self):
+        data = self.read_json()
+        url = str(data.get('url', '')).strip()
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+            return self.send_err(400, '请输入有效的 http/https 链接')
+        task_id = secrets.token_urlsafe(16)
+        now = time.time()
+        task = {
+            'id': task_id,
+            'url': url,
+            'name': remote_url_filename(url),
+            'status': 'queued',
+            'size': 0,
+            'loaded': 0,
+            'createdAt': now,
+            'startedAt': 0,
+            'finishedAt': 0,
+            'path': '/' + DOWNLOAD_DIR_NAME,
+            'error': '',
+            'lastBps': 0,
+            'maxBps': 0,
+            'samples': [],
+            'lastT': 0,
+            'lastBytes': 0,
+            'cancel': False,
+        }
+        with REMOTE_TASKS_LOCK:
+            REMOTE_TASKS[task_id] = task
+        t = threading.Thread(target=remote_download_worker, args=(task_id,), daemon=True)
+        t.start()
+        self.send_json({'success': True, 'task': remote_task_snapshot(task)})
+
+    def _api_remote_download_cancel(self):
+        data = self.read_json()
+        task_id = str(data.get('id', '')).strip()
+        with REMOTE_TASKS_LOCK:
+            task = REMOTE_TASKS.get(task_id)
+            if not task:
+                return self.send_err(404, '任务不存在')
+            if task.get('status') in ('done', 'error', 'canceled'):
+                return self.send_json({'success': True, 'message': '任务已结束'})
+            task['cancel'] = True
+        self.send_ok('任务已取消')
+
+    def _api_remote_download_delete(self):
+        data = self.read_json()
+        task_id = str(data.get('id', '')).strip()
+        with REMOTE_TASKS_LOCK:
+            task = REMOTE_TASKS.get(task_id)
+            if not task:
+                return self.send_err(404, '任务不存在')
+            if task.get('status') == 'downloading':
+                task['cancel'] = True
+                task['status'] = 'canceled'
+                task['finishedAt'] = time.time()
+            REMOTE_TASKS.pop(task_id, None)
+        self.send_ok('任务已删除')
 
     def _api_save_text(self):
         data = self.read_json()
@@ -1304,11 +1772,8 @@ class FileManagerHandler(BaseHTTPRequestHandler):
                 continue
             target = os.path.join(dp, os.path.basename(sp))
             if os.path.exists(target):
-                base, ext = os.path.splitext(os.path.basename(sp))
-                i = 1
-                while os.path.exists(target):
-                    target = os.path.join(dp, f'{base}_副本{i}{ext}')
-                    i += 1
+                errs.append(f'{s}: 目标目录已存在同名文件或文件夹')
+                continue
             try:
                 if os.path.isdir(sp):
                     shutil.copytree(sp, target)
@@ -1342,6 +1807,9 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             target_real = os.path.realpath(target)
             if not (target_real == root_real or target_real.startswith(root_real + os.sep)):
                 errs.append(f'{s}: 目标路径非法')
+                continue
+            if os.path.exists(target):
+                errs.append(f'{s}: 目标目录已存在同名文件或文件夹')
                 continue
             try:
                 shutil.move(sp, target)
@@ -1791,11 +2259,15 @@ def _calculate_root_allocated_size():
 
 
 def _calc_root_size():
-    """Compatibility worker: periodically calculate ROOT_DIR allocated size."""
+    """Periodically calculate ROOT_DIR size without blocking API requests."""
     while True:
-        total = _calculate_root_allocated_size()
+        logical = _calculate_root_logical_size()
+        allocated = _calculate_root_allocated_size()
         with _root_size_cache['lock']:
-            _root_size_cache['size'] = total
+            _root_size_cache['logical'] = logical
+            _root_size_cache['allocated'] = allocated
+            _root_size_cache['size'] = allocated
+            _root_size_cache['updated'] = time.time()
         time.sleep(60)
 
 
