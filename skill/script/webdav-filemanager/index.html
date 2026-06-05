@@ -1231,6 +1231,16 @@ body {
     display: flex;
     gap: 8px;
     flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+}
+.link-tab-group {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.link-trash-action {
+    margin-left: auto;
 }
 .link-tab.active {
     background: var(--accent-dim);
@@ -1335,7 +1345,9 @@ body {
     .page-head { flex-direction: column; }
     .page-actions { justify-content: flex-start; width: 100%; }
     .page-actions .btn { flex: 1; justify-content: center; }
-    .transfer-options, .remote-form { grid-template-columns: 1fr; }
+    .transfer-options { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .transfer-option { padding-left: 8px; padding-right: 8px; }
+    .remote-form { grid-template-columns: 1fr; }
     .download-layout { grid-template-columns: 1fr; }
     .download-total-grid { grid-template-columns: 1fr; }
     .link-item { grid-template-columns: 1fr; }
@@ -1700,7 +1712,7 @@ body {
         </div>
         <div class="remote-form" id="remoteDownloadForm">
             <input type="url" class="modal-input" id="remoteDownloadUrl" placeholder="输入 http/https 链接，文件会保存到 /download">
-            <button class="btn btn-primary" onclick="startRemoteDownload()">开始远程下载</button>
+            <button class="btn" onclick="startRemoteDownload()">开始远程下载</button>
         </div>
         <div class="remote-hint">远程下载会由服务器后台执行，完成后自动保存到根目录下的 download 文件夹。</div>
         <div class="upload-transfer-actions" id="uploadTransferActions">
@@ -1709,7 +1721,7 @@ body {
                     <div class="upload-action-title">添加上传任务</div>
                     <div class="upload-action-sub">选择文件或整个文件夹，任务会进入下方上传队列后台执行。</div>
                 </div>
-                <button class="btn btn-primary" onclick="openUploadModal()">📤 上传文件 / 文件夹</button>
+                <button class="btn" onclick="openUploadModal()">📤 上传文件 / 文件夹</button>
             </div>
         </div>
         <div class="download-workspace download-layout">
@@ -1782,13 +1794,15 @@ body {
             </div>
             <div class="page-actions">
                 <button class="btn" onclick="showBrowserPage()">返回</button>
-                <button class="btn btn-primary" onclick="loadShares()">刷新</button>
+                <button class="btn" onclick="loadShares()">刷新</button>
             </div>
         </div>
         <div class="link-tabs">
-            <button class="btn link-tab active" id="linkTabActive" onclick="setLinkTab('active')">有效链接</button>
-            <button class="btn link-tab" id="linkTabTrash" onclick="setLinkTab('trash')">回收站</button>
-            <button class="btn btn-danger" id="clearTrashBtn" onclick="clearShareTrash()" style="display:none;">清空回收站</button>
+            <div class="link-tab-group">
+                <button class="btn link-tab active" id="linkTabActive" onclick="setLinkTab('active')">有效链接</button>
+                <button class="btn link-tab" id="linkTabTrash" onclick="setLinkTab('trash')">回收站</button>
+            </div>
+            <button class="btn btn-danger link-trash-action" id="clearTrashBtn" onclick="clearShareTrash()" style="display:none;">清空回收站</button>
         </div>
         <div class="link-list" id="linkList"></div>
     </section>
@@ -1829,7 +1843,7 @@ body {
             <div class="upload-zone-sub">也可以使用下方按钮选择文件或文件夹</div>
         </div>
         <div class="upload-pickers">
-            <button class="btn btn-primary" onclick="chooseUploadFiles()">📄 选择文件</button>
+            <button class="btn" onclick="chooseUploadFiles()">📄 选择文件</button>
             <button class="btn" onclick="chooseUploadFolder()">📁 选择文件夹</button>
         </div>
         <input type="file" id="fileInput" class="file-input-hidden" multiple>
@@ -1842,7 +1856,7 @@ body {
             <div class="upload-empty">还没有选择文件</div>
         </div>
         <div class="modal-actions">
-            <button class="btn btn-primary" onclick="continueUploadInBackground()">后台继续</button>
+            <button class="btn" onclick="continueUploadInBackground()">后台继续</button>
             <button class="btn" onclick="hideModal('uploadModal')">关闭</button>
         </div>
     </div>
