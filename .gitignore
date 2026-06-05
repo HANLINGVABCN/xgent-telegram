@@ -17,6 +17,7 @@ bot_full_trace.log
 
 # Python
 __pycache__/
+tests/
 *.py[cod]
 *$py.class
 .python-version
