@@ -39,8 +39,8 @@ import aiosqlite
 import json
 import hashlib
 from datetime import datetime
-from typing import Optional, Tuple, List, Dict, Any, cast
-from collections import OrderedDict
+from typing import Optional, Tuple, List, Dict, Any, Deque, cast
+from collections import OrderedDict, deque
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -2635,24 +2635,66 @@ def looks_like_interactive_prompt(text: str) -> bool:
     if not text:
         return False
     sample = strip_terminal_control_sequences(text[-3000:])
-    lower = sample.lower()
-    prompt_markers = (
-        "(y/n", "[y/n", "yes/no", "password", "username", "enter ", "press ",
-        "select", "choice", "confirm", "continue?", "input",
-        "请输入", "输入", "选择", "选项", "确认", "继续?", "按任意键", "菜单", "序号",
-    )
-    if any(marker in lower for marker in prompt_markers):
-        return True
-    lines = [line.rstrip() for line in sample.splitlines() if line.strip()]
+    lines = [line.rstrip() for line in sample.replace('\r', '\n').splitlines() if line.strip()]
     if not lines:
-        return False
+        stripped = sample.strip()
+        if not stripped:
+            return False
+        lines = [stripped]
+
     recent = lines[-12:]
-    if any(re.match(r'^\s*(\d+|[a-zA-Z])[\).\、:：]\s+\S+', line) for line in recent):
+    tail = "\n".join(recent)
+    tail_lower = tail.lower()
+    prompt_patterns = (
+        r'[\(\[]\s*y(?:es)?\s*/\s*n(?:o)?\s*[\)\]]',
+        r'\byes\s*/\s*no\b',
+        r'\bare\s+you\s+sure\b',
+        r'\bdo\s+you\s+want\b',
+        r'\bcontinue\?',
+        r'\bconfirm(?:ation)?\b',
+        r'\bpress\s+(?:any\s+)?key\b',
+        r'\bpassword\s*[:：]?\s*$',
+        r'\bpassphrase\s*[:：]?\s*$',
+        r'\busername\s*[:：]?\s*$',
+        r'\blogin\s*[:：]?\s*$',
+        r'请输入',
+        r'请选择',
+        r'是否',
+        r'确认',
+        r'按任意键',
+    )
+    if any(re.search(pattern, tail_lower, re.IGNORECASE | re.MULTILINE) for pattern in prompt_patterns):
         return True
-    last = recent[-1]
+
+    menu_item_count = sum(
+        1 for line in recent
+        if re.match(r'^\s*(?:\d+|[a-zA-Z])[\).\、:：]\s+\S+', line)
+    )
+    if menu_item_count >= 2 and re.search(r'(select|choice|choose|输入|选择|选项|序号|菜单)', tail_lower):
+        return True
+
+    last = recent[-1].strip()
+    lower_last = last.lower()
     if re.search(r'(^|\s)(?:[\w.-]+@[\w.-]+(?::[^\r\n]*)?|bash-[\d.]+|sh|zsh|fish|root)(?:[#>$])\s*$', last):
         return True
-    return bool(re.search(r'([?:：>]\s*|\]\s*|\)\s*)$', last))
+    repl_prompt_patterns = (
+        r'^\s*(?:>>>|\.\.\.|>)\s*$',
+        r'^\s*In\s+\[\d+\]:\s*$',
+        r'^\s*(?:mysql|sqlite|redis|psql|node)(?:\s*\([^)]*\))?>\s*$',
+    )
+    if any(re.search(pattern, last, re.IGNORECASE) for pattern in repl_prompt_patterns):
+        return True
+    if re.search(r'(?:password|passphrase|username|login)\s*[:：]\s*$', lower_last):
+        return True
+    if re.search(
+        r'(?:enter|input|select|choose|choice|confirm|continue|press|type|'
+        r'请输入|输入|选择|选项|确认|继续|按).{0,80}(?:[?:：>]|$)\s*$',
+        lower_last,
+    ):
+        return True
+    if last.endswith('?') and len(last) <= 180:
+        return True
+    return False
 
 
 def looks_like_long_running_command(command: str) -> bool:
@@ -2667,6 +2709,15 @@ def looks_like_long_running_command(command: str) -> bool:
         r'(^|[\s;&|])(bash|sh|zsh|fish)(\s+(-i|--login|-l))*\s*$',
         r'(^|[\s;&|])(python|python3|node|ipython)\s*$',
         r'(^|[\s;&|])(mysql|psql|sqlite3|redis-cli)(\s|$)',
+        r'(^|[\s;&|])ping\b(?![^;&|]*\s-(?:c|n)\s*\d)',
+        r'(^|[\s;&|])sleep\s+(?:infinity|inf)\b',
+        r'(^|[\s;&|])yes\b',
+        r'\bwhile\s+true\b',
+        r'\bfor\s+;;\s+do\b',
+        r'(^|[\s;&|])python(?:3)?\s+-m\s+http\.server\b',
+        r'(^|[\s;&|])(flask|streamlit)\s+run\b',
+        r'(^|[\s;&|])(celery|rq)\s+worker\b',
+        r'(^|[\s;&|])(vite|next|nuxt|astro)\b.*\b(dev|start|preview)\b',
         r'(^|[\s;&|])(cmd|cmd\.exe)\b.*\s/[qdkc]*k\b',
         r'(^|[\s;&|])(powershell|powershell\.exe|pwsh|pwsh\.exe)\b.*\s-(noexit|noe)\b',
         r'(^|[\s;&|])(python|python3|node|npm|pnpm|yarn|bun|uvicorn|gunicorn)\b.*\b(serve|server|dev|start|runserver)\b',
@@ -2739,6 +2790,7 @@ class AgentShellSession:
         self.output = ""
         self.read_index = 0
         self.output_chunks = 0
+        self.output_events: Deque[Tuple[float, int]] = deque(maxlen=300)
         self.process: Optional[subprocess.Popen] = None
         self.controller_fd: Optional[int] = None
         self.reader_thread: Optional[threading.Thread] = None
@@ -2780,15 +2832,18 @@ class AgentShellSession:
     def _append_output(self, text: str):
         if not text:
             return
+        now_wall = time.time()
+        now_monotonic = time.monotonic()
         with self.lock:
             if self.first_output_at is None:
-                self.first_output_at = time.time()
+                self.first_output_at = now_wall
             if self.first_output_monotonic is None:
-                self.first_output_monotonic = time.monotonic()
+                self.first_output_monotonic = now_monotonic
             self.output_chunks += 1
+            self.output_events.append((now_monotonic, len(text)))
             self.output += text
-            self.last_output_at = time.time()
-            self.last_output_monotonic = time.monotonic()
+            self.last_output_at = now_wall
+            self.last_output_monotonic = now_monotonic
             overflow = len(self.output) - self.MAX_BUFFER
             if overflow > 0:
                 self.output = self.output[overflow:]
@@ -2875,6 +2930,36 @@ class AgentShellSession:
                 active_seconds = max(0.0, time.monotonic() - self.first_output_monotonic)
         return output_chars, idle_seconds, output_chunks, active_seconds
 
+    def output_activity_snapshot(self, recent_window_seconds: float = 15.0) -> Dict[str, Any]:
+        now = time.monotonic()
+        with self.lock:
+            output_chars = len(self.output)
+            idle_seconds = max(0.0, now - self.last_output_monotonic)
+            output_chunks = self.output_chunks
+            if self.first_output_monotonic is None:
+                active_seconds = 0.0
+            else:
+                active_seconds = max(0.0, now - self.first_output_monotonic)
+            events = list(self.output_events)
+
+        window = max(0.5, float(recent_window_seconds or 0.5))
+        recent_events = [(ts, size) for ts, size in events if now - ts <= window]
+        recent_chunks = len(recent_events)
+        recent_chars = sum(size for _, size in recent_events)
+        recent_span = 0.0
+        if recent_chunks >= 2:
+            recent_span = max(0.0, recent_events[-1][0] - recent_events[0][0])
+        return {
+            'output_chars': output_chars,
+            'output_idle_seconds': idle_seconds,
+            'output_chunks': output_chunks,
+            'output_active_seconds': active_seconds,
+            'recent_output_window_seconds': window,
+            'recent_output_chunks': recent_chunks,
+            'recent_output_chars': recent_chars,
+            'recent_output_span_seconds': recent_span,
+        }
+
     def wait_reader_drain(self, timeout: float = 0.5):
         if self.reader_thread and self.reader_thread.is_alive():
             self.reader_thread.join(timeout=timeout)
@@ -2929,8 +3014,26 @@ class AgentShellSessionManager:
     ACTIVE_OUTPUT_LONGRUN_SECONDS = 12.0
     ACTIVE_OUTPUT_MIN_CHUNKS = 3
     ACTIVE_OUTPUT_MIN_LONGRUN_CHUNKS = 4
+    RECENT_OUTPUT_WINDOW_SECONDS = 10.0
+    ACTIVE_OUTPUT_RECENT_CHUNKS = 3
+    ACTIVE_OUTPUT_RECENT_LONGRUN_CHUNKS = 4
+    ACTIVE_OUTPUT_RECENT_MIN_CHARS = 80
     _sessions: Dict[str, AgentShellSession] = {}
     _lock = threading.RLock()
+
+    STATE_DESCRIPTIONS = {
+        'completed': '进程已经退出，输出已尽量收尾。',
+        'interactive_prompt': '最近输出看起来像菜单、确认、密码、REPL 或 shell 提示符，可能在等待输入。',
+        'active_output': '最近仍有多次输出且空闲时间很短，进程大概率还在持续产生日志或进度。',
+        'output_quiet': '已经有输出，但最近一段时间没有新输出；进程还活着，可能在后台继续或等待某个步骤。',
+        'output_stalled': '曾经有多次输出，但已超过停滞阈值没有新输出；进程可能卡住、等待资源或进入长步骤。',
+        'silent_running': '进程仍在运行但还没有可见输出，可能是静默任务、阻塞或启动阶段。',
+        'long_running_command': '命令形态像长驻/交互/服务/日志任务，进程仍在运行。',
+        'still_running': '进程仍在运行，但还没有达到更明确的判定阈值。',
+        'read_capture': '这是一次快速读取，不代表命令已结束。',
+        'timeout': '已达到等待窗口，进程仍在运行。',
+        'stopped': '用户停止事件已经触发。',
+    }
 
     @classmethod
     def _shell_state_thresholds(cls, long_running_hint: bool, wait_timeout: float) -> Dict[str, float]:
@@ -2952,43 +3055,152 @@ class AgentShellSessionManager:
                 max(3.0, wait_timeout * (0.45 if long_running_hint else 0.35))
             ),
             'active_min_chunks': cls.ACTIVE_OUTPUT_MIN_LONGRUN_CHUNKS if long_running_hint else cls.ACTIVE_OUTPUT_MIN_CHUNKS,
+            'active_recent_min_chunks': cls.ACTIVE_OUTPUT_RECENT_LONGRUN_CHUNKS if long_running_hint else cls.ACTIVE_OUTPUT_RECENT_CHUNKS,
+            'active_recent_min_chars': cls.ACTIVE_OUTPUT_RECENT_MIN_CHARS,
+            'recent_window': min(
+                cls.RECENT_OUTPUT_WINDOW_SECONDS,
+                max(3.0, wait_timeout * (0.50 if long_running_hint else 0.35))
+            ),
+        }
+
+    @classmethod
+    def _state_description(cls, state: str) -> str:
+        return cls.STATE_DESCRIPTIONS.get(state, cls.STATE_DESCRIPTIONS['still_running'])
+
+    @classmethod
+    def _state_confidence(cls, state: str) -> str:
+        if state in {'completed', 'stopped'}:
+            return 'high'
+        if state in {'interactive_prompt', 'active_output', 'output_stalled', 'timeout'}:
+            return 'medium'
+        return 'low'
+
+    @classmethod
+    def _evaluate_running_state(cls, session: AgentShellSession, output: str,
+                                wait_timeout: float, elapsed_total: float = 0.0,
+                                long_running_hint: bool = False) -> Dict[str, Any]:
+        if not session.is_running():
+            return {
+                'state': 'completed',
+                'reason': 'process exited',
+                'confidence': cls._state_confidence('completed'),
+            }
+
+        thresholds = cls._shell_state_thresholds(long_running_hint, wait_timeout)
+        activity = session.output_activity_snapshot(thresholds['recent_window'])
+        output_chars = int(activity['output_chars'])
+        output_idle_seconds = float(activity['output_idle_seconds'])
+        output_chunks = int(activity['output_chunks'])
+        output_active_seconds = float(activity['output_active_seconds'])
+        recent_chunks = int(activity['recent_output_chunks'])
+        recent_chars = int(activity['recent_output_chars'])
+        recent_span = float(activity['recent_output_span_seconds'])
+
+        inspected_output = output or session.read_recent(3000)
+        if inspected_output and looks_like_interactive_prompt(inspected_output):
+            state = 'interactive_prompt'
+            return {
+                'state': state,
+                'reason': 'recent output matches an interactive prompt pattern',
+                'confidence': cls._state_confidence(state),
+                **activity,
+            }
+
+        if output_chars > 0:
+            recent_active = (
+                recent_chunks >= thresholds['active_recent_min_chunks']
+                and recent_chars >= thresholds['active_recent_min_chars']
+                and output_idle_seconds < thresholds['quiet_after_output']
+            )
+            sustained_active = (
+                output_chunks >= thresholds['active_min_chunks']
+                and output_active_seconds >= thresholds['active_output_after']
+                and output_idle_seconds < thresholds['quiet_after_output']
+            )
+            if recent_active or sustained_active:
+                state = 'active_output'
+                return {
+                    'state': state,
+                    'reason': (
+                        f"recent_chunks={recent_chunks}, recent_chars={recent_chars}, "
+                        f"recent_span={recent_span:.1f}s, idle={output_idle_seconds:.1f}s"
+                    ),
+                    'confidence': cls._state_confidence(state),
+                    **activity,
+                }
+            if (
+                output_chunks >= 2
+                and output_idle_seconds >= thresholds['stalled_after_output']
+            ):
+                state = 'output_stalled'
+                return {
+                    'state': state,
+                    'reason': (
+                        f"output_chunks={output_chunks}, idle={output_idle_seconds:.1f}s "
+                        f">= stalled_threshold={thresholds['stalled_after_output']:.1f}s"
+                    ),
+                    'confidence': cls._state_confidence(state),
+                    **activity,
+                }
+            if output_idle_seconds >= thresholds['quiet_after_output']:
+                state = 'output_quiet'
+                return {
+                    'state': state,
+                    'reason': (
+                        f"idle={output_idle_seconds:.1f}s "
+                        f">= quiet_threshold={thresholds['quiet_after_output']:.1f}s"
+                    ),
+                    'confidence': cls._state_confidence(state),
+                    **activity,
+                }
+
+        if elapsed_total >= thresholds['silent_running_after']:
+            state = 'long_running_command' if long_running_hint else 'silent_running'
+            return {
+                'state': state,
+                'reason': (
+                    f"elapsed={elapsed_total:.1f}s >= "
+                    f"silent_threshold={thresholds['silent_running_after']:.1f}s; "
+                    f"long_running_hint={long_running_hint}"
+                ),
+                'confidence': cls._state_confidence(state),
+                **activity,
+            }
+
+        if long_running_hint and elapsed_total >= thresholds['active_output_after']:
+            state = 'long_running_command'
+            return {
+                'state': state,
+                'reason': (
+                    f"command matches long-running patterns and elapsed={elapsed_total:.1f}s "
+                    f">= handoff_threshold={thresholds['active_output_after']:.1f}s"
+                ),
+                'confidence': cls._state_confidence(state),
+                **activity,
+            }
+
+        state = 'still_running'
+        return {
+            'state': state,
+            'reason': 'no terminal or useful intermediate state reached yet',
+            'confidence': cls._state_confidence(state),
+            **activity,
         }
 
     @classmethod
     def _classify_running_state(cls, session: AgentShellSession, output: str,
                                 wait_timeout: float, elapsed_total: float = 0.0,
                                 long_running_hint: bool = False) -> str:
-        if not session.is_running():
-            return 'completed'
-        if output and looks_like_interactive_prompt(output):
-            return 'interactive_prompt'
-
-        output_chars, output_idle_seconds, output_chunks, output_active_seconds = session.output_activity()
-        thresholds = cls._shell_state_thresholds(long_running_hint, wait_timeout)
-
-        if output_chars > 0:
-            if (
-                output_chunks >= thresholds['active_min_chunks']
-                and output_active_seconds >= thresholds['active_output_after']
-                and output_idle_seconds < thresholds['quiet_after_output']
-            ):
-                return 'active_output'
-            if output_chunks >= 2 and output_idle_seconds >= thresholds['stalled_after_output']:
-                return 'output_stalled'
-            if output_idle_seconds >= thresholds['quiet_after_output']:
-                return 'output_quiet'
-
-        if elapsed_total >= thresholds['silent_running_after']:
-            return 'long_running_command' if long_running_hint else 'silent_running'
-
-        return 'still_running'
+        return str(cls._evaluate_running_state(
+            session, output, wait_timeout, elapsed_total, long_running_hint
+        ).get('state') or 'still_running')
 
     @classmethod
     def _format_result(cls, session: AgentShellSession, output: str, action: str) -> Dict[str, Any]:
         running = session.is_running()
         rc = session.return_code()
         status = "running" if running else f"exited:{rc}"
-        output_chars, output_idle_seconds, output_chunks, output_active_seconds = session.output_activity()
+        activity = session.output_activity_snapshot()
         return {
             'success': True,
             'session_id': session.session_id,
@@ -3000,10 +3212,13 @@ class AgentShellSessionManager:
             'output': output or '(暂无新输出)',
             'status': status,
             'pty': session.pty_enabled,
-            'output_chars': output_chars,
-            'output_idle_seconds': round(output_idle_seconds, 1),
-            'output_chunks': output_chunks,
-            'output_active_seconds': round(output_active_seconds, 1),
+            'output_chars': activity['output_chars'],
+            'output_idle_seconds': round(float(activity['output_idle_seconds']), 1),
+            'output_chunks': activity['output_chunks'],
+            'output_active_seconds': round(float(activity['output_active_seconds']), 1),
+            'recent_output_chunks': activity['recent_output_chunks'],
+            'recent_output_chars': activity['recent_output_chars'],
+            'recent_output_span_seconds': round(float(activity['recent_output_span_seconds']), 1),
             'interactive_prompt': running and looks_like_interactive_prompt(output),
         }
 
@@ -3028,49 +3243,45 @@ class AgentShellSessionManager:
     @classmethod
     async def _wait_for_useful_state(cls, session: AgentShellSession, already_waited: float = 0.0,
                                      stop_event: Optional[asyncio.Event] = None,
-                                     long_running_hint: bool = False) -> Tuple[bool, float, float, str]:
+                                     long_running_hint: bool = False) -> Tuple[bool, float, float, Dict[str, Any]]:
         wait_timeout = float(AgentExecutor.get_timeout())
         started = time.monotonic()
         remaining = max(0.0, wait_timeout - max(0.0, already_waited))
-        state = 'timeout'
+        state_info: Dict[str, Any] = {
+            'state': 'timeout',
+            'reason': cls._state_description('timeout'),
+            'confidence': cls._state_confidence('timeout'),
+        }
 
         while session.is_running() and remaining > 0:
             if stop_event and stop_event.is_set():
-                state = 'stopped'
+                state_info = {
+                    'state': 'stopped',
+                    'reason': 'stop event was set while waiting',
+                    'confidence': cls._state_confidence('stopped'),
+                }
                 break
-            output_chars, output_idle_seconds, output_chunks, output_active_seconds = session.output_activity()
             now = time.monotonic()
-            recent_output = session.read_recent(3000)
-            if recent_output and looks_like_interactive_prompt(recent_output):
-                state = 'interactive_prompt'
-                break
             elapsed_total = max(0.0, already_waited) + (now - started)
-            thresholds = cls._shell_state_thresholds(long_running_hint, wait_timeout)
-            if output_chars > 0:
-                if (
-                    output_chunks >= thresholds['active_min_chunks']
-                    and output_active_seconds >= thresholds['active_output_after']
-                    and output_idle_seconds < thresholds['quiet_after_output']
-                ):
-                    state = 'active_output'
-                    break
-                if output_chunks >= 2 and output_idle_seconds >= thresholds['stalled_after_output']:
-                    state = 'output_stalled'
-                    break
-                if output_idle_seconds >= thresholds['quiet_after_output']:
-                    state = 'output_quiet'
-                    break
-            if output_chars == 0 and elapsed_total >= thresholds['silent_running_after']:
-                state = 'long_running_command' if long_running_hint else 'silent_running'
+            state_info = cls._evaluate_running_state(
+                session,
+                session.read_recent(3000),
+                wait_timeout,
+                elapsed_total,
+                long_running_hint,
+            )
+            if state_info.get('state') != 'still_running':
                 break
-            if long_running_hint and elapsed_total >= thresholds['active_output_after']:
-                state = 'long_running_command'
-                break
+
             sleep_for = min(cls.WAIT_POLL_SECONDS, remaining)
             if stop_event:
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
-                    state = 'stopped'
+                    state_info = {
+                        'state': 'stopped',
+                        'reason': 'stop event was set during poll sleep',
+                        'confidence': cls._state_confidence('stopped'),
+                    }
                     break
                 except asyncio.TimeoutError:
                     pass
@@ -3081,37 +3292,80 @@ class AgentShellSessionManager:
         waited = min(wait_timeout, max(0.0, already_waited) + (time.monotonic() - started))
         completed = not session.is_running()
         if completed:
-            state = 'completed'
+            state_info = {
+                'state': 'completed',
+                'reason': 'process exited during wait',
+                'confidence': cls._state_confidence('completed'),
+            }
             await asyncio.sleep(0.1)
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, lambda: session.wait_reader_drain(0.5))
-        return completed, waited, wait_timeout, state
+        elif remaining <= 0 and state_info.get('state') == 'still_running':
+            state_info = cls._evaluate_running_state(
+                session,
+                session.read_recent(3000),
+                wait_timeout,
+                waited,
+                long_running_hint,
+            )
+            if state_info.get('state') == 'still_running':
+                state_info = {
+                    **state_info,
+                    'state': 'timeout',
+                    'reason': f"waited {waited:.1f}s and reached wait_timeout={wait_timeout:.1f}s",
+                    'confidence': cls._state_confidence('timeout'),
+                }
+        return completed, waited, wait_timeout, state_info
 
     @classmethod
     def _attach_wait_info(cls, result: Dict[str, Any], completed: bool,
-                          waited: float, wait_timeout: float, wait_state: str = ""):
+                          waited: float, wait_timeout: float, wait_state: Any = ""):
+        if isinstance(wait_state, dict):
+            state_info = wait_state
+            wait_state_name = str(state_info.get('state') or '')
+        else:
+            wait_state_name = str(wait_state or "")
+            state_info = {
+                'state': wait_state_name,
+                'reason': cls._state_description(wait_state_name),
+                'confidence': cls._state_confidence(wait_state_name),
+            }
         result['completed_during_wait'] = completed
         result['waited_seconds'] = round(waited, 1)
-        result['wait_state'] = wait_state
+        result['wait_state'] = wait_state_name
+        result['wait_state_description'] = cls._state_description(wait_state_name)
+        result['wait_state_reason'] = state_info.get('reason') or result['wait_state_description']
+        result['wait_state_confidence'] = state_info.get('confidence') or cls._state_confidence(wait_state_name)
+        for key in (
+            'recent_output_chunks',
+            'recent_output_chars',
+            'recent_output_span_seconds',
+            'recent_output_window_seconds',
+        ):
+            if key in state_info:
+                value = state_info[key]
+                if isinstance(value, float):
+                    value = round(value, 1)
+                result[key] = value
         if result.get('running'):
             result['paused_for_running'] = True
-            if result.get('interactive_prompt') or wait_state == 'interactive_prompt':
+            if result.get('interactive_prompt') or wait_state_name == 'interactive_prompt':
                 result['pause_reason'] = 'interactive_prompt'
-            elif wait_state == 'long_running_command':
+            elif wait_state_name == 'long_running_command':
                 result['pause_reason'] = 'long_running_command'
-            elif wait_state == 'active_output':
+            elif wait_state_name == 'active_output':
                 result['pause_reason'] = 'active_output'
-            elif wait_state == 'output_quiet':
+            elif wait_state_name == 'output_quiet':
                 result['pause_reason'] = 'output_quiet'
-            elif wait_state == 'output_stalled':
+            elif wait_state_name == 'output_stalled':
                 result['pause_reason'] = 'output_stalled'
-            elif wait_state == 'silent_running':
+            elif wait_state_name == 'silent_running':
                 result['pause_reason'] = 'silent_running'
-            elif wait_state == 'timeout':
+            elif wait_state_name == 'timeout':
                 result['pause_reason'] = 'wait_timeout'
-            elif wait_state == 'read_capture':
+            elif wait_state_name == 'read_capture':
                 result['pause_reason'] = 'read_capture'
-            elif wait_state == 'stopped':
+            elif wait_state_name == 'stopped':
                 result['pause_reason'] = 'stopped'
             else:
                 result['pause_reason'] = 'still_running'
@@ -3255,9 +3509,13 @@ class AgentShellSessionManager:
                 if not output:
                     output = session.read_recent(cls.CONTEXT_OUTPUT_LIMIT)
             if completed:
-                wait_state = 'completed'
+                wait_state = {
+                    'state': 'completed',
+                    'reason': 'process exited before or during read capture',
+                    'confidence': cls._state_confidence('completed'),
+                }
             else:
-                wait_state = cls._classify_running_state(
+                wait_state = cls._evaluate_running_state(
                     session,
                     output,
                     float(AgentExecutor.get_timeout()),
@@ -4469,7 +4727,13 @@ def build_shell_notice(action_label: str, shell_result: Dict[str, Any],
     output_idle_seconds = shell_result.get('output_idle_seconds')
     output_chunks = shell_result.get('output_chunks')
     output_active_seconds = shell_result.get('output_active_seconds')
+    recent_output_chunks = shell_result.get('recent_output_chunks')
+    recent_output_chars = shell_result.get('recent_output_chars')
+    recent_output_span_seconds = shell_result.get('recent_output_span_seconds')
     wait_state = shell_result.get('wait_state') or ''
+    wait_state_description = shell_result.get('wait_state_description') or ''
+    wait_state_reason = shell_result.get('wait_state_reason') or ''
+    wait_state_confidence = shell_result.get('wait_state_confidence') or ''
     elapsed_line = f"本次等待/捕获耗时: {waited_seconds} 秒\n" if waited_seconds is not None else ""
     output_line = ""
     if output_chars is not None or output_idle_seconds is not None or output_chunks is not None:
@@ -4479,12 +4743,26 @@ def build_shell_notice(action_label: str, shell_result: Dict[str, Any],
             f"输出活跃时长: {output_active_seconds} 秒\n"
             f"距今无新输出: {output_idle_seconds} 秒\n"
         )
+        if recent_output_chunks is not None or recent_output_chars is not None:
+            output_line += (
+                f"最近输出块数: {recent_output_chunks}\n"
+                f"最近输出字符数: {recent_output_chars}\n"
+                f"最近输出跨度: {recent_output_span_seconds} 秒\n"
+            )
+    state_line = ""
+    if wait_state_description or wait_state_reason or wait_state_confidence:
+        state_line = (
+            f"判定说明: {wait_state_description}\n"
+            f"判定依据: {wait_state_reason}\n"
+            f"判定置信度: {wait_state_confidence}\n"
+        )
     return (
         f"[Agent shell {action_label}]\n"
         f"会话: {session_id}\n"
         f"命令: {command}\n"
         f"长驻预判: {shell_result.get('command_hint_long_running')}\n"
         f"判定状态: {wait_state}\n"
+        f"{state_line}"
         f"运行中: {shell_result.get('running')}\n"
         f"暂停原因: {pause_reason}\n"
         f"返回码: {shell_result.get('return_code')}\n"
