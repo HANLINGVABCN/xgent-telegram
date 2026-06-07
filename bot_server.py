@@ -125,6 +125,14 @@ MAX_AGENT_COMMAND_TIMEOUT = 3600
 DEFAULT_AGENT_MAX_ITERATIONS = 10
 MIN_AGENT_MAX_ITERATIONS = 1
 MAX_AGENT_MAX_ITERATIONS = 50
+PROVIDER_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 def redact_sensitive_text(text: str) -> str:
@@ -1409,7 +1417,19 @@ class PortalManager:
         
         import httpx
         client_timeout = httpx.Timeout(connect=20.0, read=read_timeout_value, write=60.0, pool=60.0)
-        new_client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=client_timeout, max_retries=2)
+        http_client = httpx.AsyncClient(
+            timeout=client_timeout,
+            headers=PROVIDER_HTTP_HEADERS,
+            follow_redirects=True,
+        )
+        new_client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=client_timeout,
+            max_retries=2,
+            default_headers=PROVIDER_HTTP_HEADERS,
+            http_client=http_client,
+        )
         cls._portals[provider_name] = {'client': new_client, 'hash': config_hash}
         return new_client
     
@@ -3848,7 +3868,7 @@ class ModelClient:
         import httpx
 
         url = f"{base_url.rstrip('/')}/models/{model}:generateContent?key={api_key}"
-        headers = {"Accept": "application/json"}
+        headers = {**PROVIDER_HTTP_HEADERS, "Accept": "application/json"}
         try:
             async with httpx.AsyncClient(timeout=ModelClient._build_stream_timeout()) as client:
                 generation_config = {"temperature": 0.7}
@@ -3938,6 +3958,7 @@ class ModelClient:
 
         url = f"{base_url.rstrip('/')}/messages"
         headers = {
+            **PROVIDER_HTTP_HEADERS,
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
@@ -4044,7 +4065,7 @@ class ModelClient:
         try:
             url = f"{base_url.rstrip('/')}/models?key={api_key}"
             async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(url)
+                resp = await client.get(url, headers=PROVIDER_HTTP_HEADERS)
                 if resp.status_code != 200:
                     logger.error(f"Gemini models list error: {resp.status_code}")
                     return []
@@ -4167,7 +4188,7 @@ class ModelClient:
                 contents.append({"role": role, "parts": parts})
         
         url = f"{base_url.rstrip('/')}/models/{model}:streamGenerateContent?alt=sse&key={api_key}"
-        headers = {"Accept": "text/event-stream"}
+        headers = {**PROVIDER_HTTP_HEADERS, "Accept": "text/event-stream"}
         body = {
             "contents": contents,
             "generationConfig": {
@@ -4282,6 +4303,7 @@ class ModelClient:
         
         url = f"{base_url.rstrip('/')}/messages"
         headers = {
+            **PROVIDER_HTTP_HEADERS,
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json"
