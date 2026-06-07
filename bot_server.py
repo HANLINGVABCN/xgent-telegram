@@ -3830,6 +3830,260 @@ class ModelClient:
         return httpx.Timeout(connect=20.0, read=read_timeout, write=60.0, pool=60.0)
 
     @staticmethod
+    def _openai_compatible_headers(api_key: str, accept: str = "application/json") -> Dict[str, str]:
+        return {
+            **PROVIDER_HTTP_HEADERS,
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": accept,
+        }
+
+    @staticmethod
+    def _build_openai_messages(system_prompt: str, history: list) -> List[Dict[str, Any]]:
+        messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
+        for msg in ModelClient.clean_memories(history):
+            messages.append({
+                "role": msg['role'],
+                "content": ModelClient._to_openai_content(msg['content'])
+            })
+        return messages
+
+    @staticmethod
+    def _extract_openai_compatible_text(data: Dict[str, Any]) -> str:
+        texts: List[str] = []
+        for choice in data.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message") or {}
+            delta = choice.get("delta") or {}
+            for value in (message.get("content"), delta.get("content"), choice.get("text")):
+                text = ModelClient._model_content_to_text(value)
+                if text:
+                    texts.append(text)
+        return "".join(texts)
+
+    @staticmethod
+    def _extract_openai_compatible_sse_text(text: str, usage_sink: Optional[List[Dict[str, int]]] = None) -> str:
+        texts: List[str] = []
+        for raw_line in (text or "").splitlines():
+            line = raw_line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            record_token_usage(usage_sink, data.get("usage"))
+            chunk_text = ModelClient._extract_openai_compatible_text(data)
+            if chunk_text:
+                texts.append(chunk_text)
+        return "".join(texts)
+
+    @staticmethod
+    async def _fetch_openai_compatible_models(api_key: str, base_url: str) -> list:
+        import httpx
+        url = f"{base_url.rstrip('/')}/models"
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                resp = await client.get(url, headers=ModelClient._openai_compatible_headers(api_key))
+            if resp.status_code >= 400:
+                logger.error(f"OpenAI compatible models list error: {resp.status_code}: {redact_sensitive_text(resp.text or '')[:500]}")
+                return []
+            data = resp.json()
+            model_ids = []
+            for m in data.get("data") or data.get("models") or []:
+                if isinstance(m, dict):
+                    model_id = m.get("id") or m.get("name")
+                else:
+                    model_id = str(m)
+                if model_id and 'embedding' not in str(model_id).lower() and 'audio' not in str(model_id).lower():
+                    model_ids.append(str(model_id).split('/')[-1])
+            return sorted(model_ids)
+        except Exception as e:
+            logger.error(f"OpenAI compatible fetch error: {format_provider_exception(e)}")
+            return []
+
+    @staticmethod
+    async def _complete_openai_compatible_http(api_key: str, base_url: str, model: str,
+                                              system_prompt: str, history: list,
+                                              max_tokens: Optional[int] = None,
+                                              usage_sink: Optional[List[Dict[str, int]]] = None,
+                                              trace_id: Optional[str] = None,
+                                              prov_name: str = "") -> Tuple[Optional[str], Optional[str]]:
+        import httpx
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        body: Dict[str, Any] = {
+            "model": model,
+            "messages": ModelClient._build_openai_messages(system_prompt, history),
+            "temperature": 0.7,
+            "stream": False,
+        }
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
+
+        write_model_trace("model_request", {
+            "trace_id": trace_id,
+            "provider": prov_name,
+            "provider_format": "openai_compatible_http",
+            "model": model,
+            "stream": False,
+            "request": body,
+        })
+
+        try:
+            async with httpx.AsyncClient(timeout=ModelClient._build_stream_timeout(), follow_redirects=True) as client:
+                resp = await client.post(
+                    url,
+                    json=body,
+                    headers=ModelClient._openai_compatible_headers(api_key),
+                )
+            if resp.status_code >= 400:
+                error_text = redact_sensitive_text(resp.text or '')
+                write_model_trace("model_error", {
+                    "trace_id": trace_id,
+                    "provider": prov_name,
+                    "provider_format": "openai_compatible_http",
+                    "model": model,
+                    "stream": False,
+                    "status_code": resp.status_code,
+                    "error": error_text,
+                })
+                return None, f"OpenAI compatible API error ({resp.status_code}): {error_text}"
+
+            raw_text = resp.text or ""
+            if raw_text.lstrip().startswith("data:"):
+                text = ModelClient._extract_openai_compatible_sse_text(raw_text, usage_sink)
+                if text:
+                    write_model_trace("model_response", {
+                        "trace_id": trace_id,
+                        "provider": prov_name,
+                        "provider_format": "openai_compatible_http",
+                        "model": model,
+                        "stream": False,
+                        "response": text,
+                        "usage": usage_sink[0] if usage_sink else None,
+                    })
+                    return text, None
+                return None, raw_text[:2000] or "对方暂时没反应，用户稍后再试试？"
+
+            data = resp.json()
+            record_token_usage(usage_sink, data.get("usage"))
+            text = ModelClient._extract_openai_compatible_text(data)
+            if text:
+                write_model_trace("model_response", {
+                    "trace_id": trace_id,
+                    "provider": prov_name,
+                    "provider_format": "openai_compatible_http",
+                    "model": model,
+                    "stream": False,
+                    "response": text,
+                    "usage": usage_sink[0] if usage_sink else None,
+                })
+                return text, None
+            return None, json.dumps(data, ensure_ascii=False)[:2000] or "对方暂时没反应，用户稍后再试试？"
+        except httpx.ReadTimeout:
+            return None, "网络超时了，用户稍后再试试"
+        except Exception as e:
+            write_model_trace("model_error", {
+                "trace_id": trace_id,
+                "provider": prov_name,
+                "provider_format": "openai_compatible_http",
+                "model": model,
+                "stream": False,
+                "error": format_provider_exception(e),
+            })
+            return None, format_provider_exception(e)
+
+    @staticmethod
+    async def _stream_openai_compatible_http(api_key: str, base_url: str, model: str,
+                                            system_prompt: str, history: list,
+                                            max_tokens: Optional[int] = None,
+                                            usage_sink: Optional[List[Dict[str, int]]] = None,
+                                            trace_id: Optional[str] = None,
+                                            prov_name: str = ""):
+        import httpx
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        body: Dict[str, Any] = {
+            "model": model,
+            "messages": ModelClient._build_openai_messages(system_prompt, history),
+            "temperature": 0.7,
+            "stream": True,
+        }
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
+
+        write_model_trace("model_request", {
+            "trace_id": trace_id,
+            "provider": prov_name,
+            "provider_format": "openai_compatible_http",
+            "model": model,
+            "stream": True,
+            "request": body,
+        })
+
+        yielded_any_text = False
+        try:
+            async with httpx.AsyncClient(timeout=ModelClient._build_stream_timeout(), follow_redirects=True) as client:
+                async with client.stream(
+                    "POST",
+                    url,
+                    json=body,
+                    headers=ModelClient._openai_compatible_headers(api_key, "text/event-stream"),
+                ) as resp:
+                    if resp.status_code >= 400:
+                        error_body = await resp.aread()
+                        error_text = redact_sensitive_text(error_body.decode(errors='replace'))
+                        write_model_trace("model_error", {
+                            "trace_id": trace_id,
+                            "provider": prov_name,
+                            "provider_format": "openai_compatible_http",
+                            "model": model,
+                            "stream": True,
+                            "status_code": resp.status_code,
+                            "error": error_text,
+                        })
+                        yield f"OpenAI compatible API error ({resp.status_code}): {error_text}"
+                        return
+
+                    async for payload in ModelClient._iter_sse_payloads(resp):
+                        if payload == '[DONE]':
+                            break
+                        try:
+                            data = json.loads(payload)
+                        except json.JSONDecodeError:
+                            logger.debug(f"OpenAI compatible SSE parse failed: {payload[:200]}")
+                            continue
+                        record_token_usage(usage_sink, data.get("usage"))
+                        text = ModelClient._extract_openai_compatible_text(data)
+                        if text:
+                            yielded_any_text = True
+                            yield text
+
+            if not yielded_any_text:
+                text, error = await ModelClient._complete_openai_compatible_http(
+                    api_key, base_url, model, system_prompt, history, max_tokens, usage_sink, trace_id, prov_name
+                )
+                if text:
+                    yield text
+                elif error:
+                    yield error
+        except httpx.ReadTimeout:
+            yield "网络超时了，用户稍后再试试"
+        except Exception as e:
+            write_model_trace("model_error", {
+                "trace_id": trace_id,
+                "provider": prov_name,
+                "provider_format": "openai_compatible_http",
+                "model": model,
+                "stream": True,
+                "error": format_provider_exception(e),
+            })
+            yield format_provider_exception(e)
+
+    @staticmethod
     async def _iter_sse_payloads(resp: Any):
         event_lines: List[str] = []
 
@@ -4041,6 +4295,8 @@ class ModelClient:
             return await ModelClient._fetch_gemini_models(api_key, base_url)
         elif api_format == 'claude':
             return await ModelClient._fetch_claude_models()
+        elif api_format == 'openai_compatible':
+            return await ModelClient._fetch_openai_compatible_models(api_key, base_url)
         
         try:
             client = PortalManager.get_portal(prov_name, api_key, base_url)
@@ -4109,6 +4365,10 @@ class ModelClient:
             return
         elif api_format == 'claude':
             async for chunk in ModelClient._stream_claude(api_key, base_url, model, system_prompt, history, max_tokens, usage_sink, trace_id):
+                yield chunk
+            return
+        elif api_format == 'openai_compatible':
+            async for chunk in ModelClient._stream_openai_compatible_http(api_key, base_url, model, system_prompt, history, max_tokens, usage_sink, trace_id, prov_name):
                 yield chunk
             return
         
@@ -4391,6 +4651,10 @@ class ModelClient:
         if api_format == 'claude':
             return await ModelClient._complete_claude(
                 api_key, base_url, model, system_prompt, history, max_tokens, usage_sink, trace_id
+            )
+        if api_format == 'openai_compatible':
+            return await ModelClient._complete_openai_compatible_http(
+                api_key, base_url, model, system_prompt, history, max_tokens, usage_sink, trace_id, prov_name
             )
 
         client = PortalManager.get_portal(prov_name, api_key, base_url)
