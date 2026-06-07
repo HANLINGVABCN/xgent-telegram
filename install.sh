@@ -15,7 +15,11 @@ VENV_DIR="$SCRIPT_DIR/venv"
 VENV_ACTIVATE="$VENV_DIR/bin/activate"
 VENV_PYTHON="$VENV_DIR/bin/python3"
 APP_ENTRY="bot_server.py"
+PM2_APP_NAME="telegram-ai-bot"
+STATE_DIR="$SCRIPT_DIR/.install-state"
+APT_STATE_FILE="$STATE_DIR/apt-packages.txt"
 APT_UPDATED=0
+SKIP_CONFIRM=0
 
 print_banner() {
     echo -e "${CYAN}"
@@ -46,6 +50,10 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+ensure_state_dir() {
+    mkdir -p "$STATE_DIR"
+}
+
 run_privileged() {
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
@@ -65,8 +73,45 @@ ensure_apt_available() {
     fi
 }
 
+apt_package_installed() {
+    command_exists dpkg-query || return 1
+    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
+}
+
+record_apt_packages() {
+    local package
+
+    [ "$#" -gt 0 ] || return
+    ensure_state_dir
+    touch "$APT_STATE_FILE"
+
+    for package in "$@"; do
+        if ! grep -Fxq "$package" "$APT_STATE_FILE"; then
+            printf '%s\n' "$package" >> "$APT_STATE_FILE"
+        fi
+    done
+}
+
 ensure_apt_packages() {
+    local package
+    local missing_packages=()
+    local newly_installed=()
+    local before_file=""
+    local after_file=""
+
     ensure_apt_available
+
+    for package in "$@"; do
+        if ! apt_package_installed "$package"; then
+            missing_packages+=("$package")
+        fi
+    done
+
+    if command_exists dpkg-query; then
+        before_file="$(mktemp)"
+        after_file="$(mktemp)"
+        dpkg-query -W -f='${Package}\n' 2>/dev/null | sort > "$before_file" || true
+    fi
 
     if [ "$APT_UPDATED" -eq 0 ]; then
         info "[信息] 正在执行 apt-get update..."
@@ -76,6 +121,20 @@ ensure_apt_packages() {
 
     info "[信息] 正在安装系统依赖: $*"
     run_privileged apt-get install -y "$@"
+
+    if [ -n "$before_file" ] && [ -f "$before_file" ]; then
+        dpkg-query -W -f='${Package}\n' 2>/dev/null | sort > "$after_file" || true
+        while IFS= read -r package; do
+            [ -n "$package" ] && newly_installed+=("$package")
+        done < <(comm -13 "$before_file" "$after_file" 2>/dev/null || true)
+        rm -f "$before_file" "$after_file"
+    fi
+
+    if [ "${#newly_installed[@]}" -gt 0 ]; then
+        record_apt_packages "${newly_installed[@]}"
+    elif [ "${#missing_packages[@]}" -gt 0 ]; then
+        record_apt_packages "${missing_packages[@]}"
+    fi
 }
 
 fix_line_endings() {
@@ -136,6 +195,177 @@ safe_remove_venv() {
     fi
 
     rm -rf -- "$resolved"
+}
+
+confirm_uninstall() {
+    local answer
+
+    if [ "$SKIP_CONFIRM" -eq 1 ]; then
+        return
+    fi
+
+    warn "即将卸载本安装脚本创建的运行环境和服务记录。"
+    echo "   会清理: venv、本项目 nohup/PM2 进程、bot.pid、脚本记录的 apt 下载包。"
+    echo "   会保留: 项目文件、.env、数据库、日志、skill/ 下脚本服务、PM2 程序本体。"
+    echo ""
+    read -r -p "确认继续？输入 y 继续: " answer
+    if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
+        warn "已取消卸载。"
+        exit 0
+    fi
+}
+
+stop_background_process() {
+    local pid cmdline
+    local found_extra=0
+
+    if [ -f "bot.pid" ]; then
+        pid="$(cat bot.pid 2>/dev/null || true)"
+        if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+            warn "   bot.pid 内容不是有效 PID，已移除 PID 文件。"
+            rm -f bot.pid
+        elif ! ps -p "$pid" >/dev/null 2>&1; then
+            rm -f bot.pid
+            success "已清理过期 bot.pid"
+        else
+            cmdline="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+            if [[ "$cmdline" == *"$APP_ENTRY"* ]] && { [[ "$cmdline" == *"$SCRIPT_DIR"* ]] || [[ "$cmdline" == *"$VENV_PYTHON"* ]]; }; then
+                info "[卸载] 正在停止 nohup 后台进程: $pid"
+                kill "$pid" 2>/dev/null || true
+                sleep 2
+                if ps -p "$pid" >/dev/null 2>&1; then
+                    kill -TERM "$pid" 2>/dev/null || true
+                fi
+                rm -f bot.pid
+                success "nohup 后台进程已停止"
+            else
+                warn "   bot.pid 指向的进程不像本项目进程，已跳过停止: $pid"
+            fi
+        fi
+    fi
+
+    while IFS= read -r line; do
+        pid="${line%% *}"
+        cmdline="${line#* }"
+
+        if ! [[ "$pid" =~ ^[0-9]+$ ]] || [ "$pid" -eq "$$" ]; then
+            continue
+        fi
+
+        if [[ "$cmdline" == *"$APP_ENTRY"* ]] && { [[ "$cmdline" == *"$SCRIPT_DIR"* ]] || [[ "$cmdline" == *"$VENV_PYTHON"* ]]; }; then
+            found_extra=1
+            info "[卸载] 正在停止残留进程: $pid"
+            kill "$pid" 2>/dev/null || true
+        fi
+    done < <(ps -eo pid=,args= 2>/dev/null | sed 's/^ *//' || true)
+
+    if [ "$found_extra" -eq 1 ]; then
+        sleep 2
+        success "残留进程已处理"
+    fi
+}
+
+remove_pm2_process() {
+    if ! command_exists pm2; then
+        warn "   未检测到 PM2，跳过 PM2 进程清理。"
+        return
+    fi
+
+    if pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
+        info "[卸载] 正在移除 PM2 进程: $PM2_APP_NAME"
+        pm2 delete "$PM2_APP_NAME" >/dev/null 2>&1 || warn "   PM2 进程移除失败，请手动执行: pm2 delete $PM2_APP_NAME"
+        if pm2 save >/dev/null 2>&1; then
+            success "PM2 进程记录已更新"
+        else
+            warn "   PM2 进程列表保存失败，请手动执行: pm2 save"
+        fi
+    else
+        echo "   未发现 PM2 进程: $PM2_APP_NAME"
+    fi
+}
+
+remove_virtualenv() {
+    if [ -e "$VENV_DIR" ]; then
+        info "[卸载] 正在删除虚拟环境: $VENV_DIR"
+        safe_remove_venv
+        success "虚拟环境已删除"
+    else
+        echo "   未发现虚拟环境: $VENV_DIR"
+    fi
+}
+
+remove_recorded_apt_packages() {
+    local package
+    local packages=()
+    local kept_packages=()
+
+    if [ ! -f "$APT_STATE_FILE" ]; then
+        warn "   未发现 apt 安装记录，跳过系统包卸载。"
+        echo "   说明: 只有本脚本记录过的新装 apt 包才会被卸载。"
+        rmdir "$STATE_DIR" 2>/dev/null || true
+        return
+    fi
+
+    if ! command_exists apt-get; then
+        warn "   当前系统没有 apt-get，跳过系统包卸载。"
+        return
+    fi
+
+    while IFS= read -r package; do
+        if [ -z "$package" ] || ! [[ "$package" =~ ^[A-Za-z0-9.+:-]+$ ]] || ! apt_package_installed "$package"; then
+            continue
+        fi
+
+        case "$package" in
+            pm2|nodejs|npm|node-*|libnode*|libuv*|libc-ares*)
+                kept_packages+=("$package")
+                ;;
+            *)
+                packages+=("$package")
+                ;;
+        esac
+    done < <(sort -u "$APT_STATE_FILE")
+
+    if [ "${#kept_packages[@]}" -gt 0 ]; then
+        warn "   为保留 PM2，已跳过这些 Node/npm 相关包:"
+        printf '   %s\n' "${kept_packages[@]}"
+    fi
+
+    if [ "${#packages[@]}" -eq 0 ]; then
+        echo "   apt 安装记录中没有仍处于安装状态的包。"
+        rm -f "$APT_STATE_FILE"
+        rmdir "$STATE_DIR" 2>/dev/null || true
+        return
+    fi
+
+    info "[卸载] 正在卸载本脚本记录的新装 apt 包:"
+    printf '   %s\n' "${packages[@]}"
+    run_privileged apt-get purge -y "${packages[@]}" || warn "   部分 apt 包卸载失败，请根据上方输出手动检查。"
+    run_privileged apt-get autoremove --purge -y || true
+    run_privileged apt-get clean || true
+
+    rm -f "$APT_STATE_FILE"
+    rmdir "$STATE_DIR" 2>/dev/null || true
+    success "已处理 apt 安装记录"
+}
+
+uninstall_app() {
+    if [ "${1:-}" != "--no-banner" ]; then
+        print_banner
+    fi
+
+    confirm_uninstall
+
+    remove_pm2_process
+    stop_background_process
+    remove_virtualenv
+    remove_recorded_apt_packages
+
+    echo ""
+    echo -e "${CYAN}========================================================${NC}"
+    echo -e "${CYAN} Telegram AI Bot 主安装内容已卸载。${NC}"
+    echo -e "${CYAN} 已保留项目文件、配置、数据库、日志、skill 服务和 PM2 本体。${NC}"
+    echo -e "${CYAN}========================================================${NC}"
 }
 
 ensure_virtualenv() {
@@ -423,9 +653,9 @@ start_with_pm2() {
     ensure_pm2
 
     info "[运行] 正在使用 PM2 启动 Telegram AI Bot..."
-    pm2 delete telegram-ai-bot 2>/dev/null || true
+    pm2 delete "$PM2_APP_NAME" 2>/dev/null || true
     pm2 start "$SCRIPT_DIR/$APP_ENTRY" \
-        --name "telegram-ai-bot" \
+        --name "$PM2_APP_NAME" \
         --cwd "$SCRIPT_DIR" \
         --interpreter "$VENV_PYTHON" \
         --stop-exit-codes 78 \
@@ -433,9 +663,9 @@ start_with_pm2() {
         --exp-backoff-restart-delay=100
 
     echo "   PM2 启动成功。"
-    echo "   查看日志: pm2 logs telegram-ai-bot"
-    echo "   停止命令: pm2 stop telegram-ai-bot"
-    echo "   重启命令: pm2 restart telegram-ai-bot"
+    echo "   查看日志: pm2 logs $PM2_APP_NAME"
+    echo "   停止命令: pm2 stop $PM2_APP_NAME"
+    echo "   重启命令: pm2 restart $PM2_APP_NAME"
     setup_pm2_startup
 
     if pm2 save >/dev/null; then
@@ -447,17 +677,41 @@ start_with_pm2() {
 
 show_menu() {
     echo ""
-    echo "请选择启动方式:"
+    echo "请选择操作:"
     echo "  1) 前台运行"
     echo "  2) 后台运行 (nohup)"
     echo "  3) PM2 守护运行 (未安装时自动补齐)"
     echo "  4) 仅检查环境"
-    echo "  q) 退出"
+    echo "  5) 卸载本脚本安装的运行内容"
+    echo "  6) 退出"
     echo ""
 }
 
-main() {
-    print_banner
+show_usage() {
+    echo "用法:"
+    echo "  ./install.sh                 打开数字菜单"
+    echo "  ./install.sh install         打开数字菜单"
+    echo "  ./install.sh uninstall       卸载本脚本安装的运行内容"
+    echo "  ./install.sh uninstall -y    跳过确认直接卸载"
+}
+
+parse_uninstall_options() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -y)
+                SKIP_CONFIRM=1
+                ;;
+            *)
+                error "[错误] 未知卸载参数: $1"
+                show_usage
+                exit 1
+                ;;
+        esac
+        shift
+    done
+}
+
+prepare_environment() {
     fix_line_endings
     ensure_python
     ensure_virtualenv
@@ -466,24 +720,36 @@ main() {
     ensure_env_file
     validate_telegram_token
     check_database
+}
+
+main() {
+    print_banner
 
     show_menu
-    read -r -p "请输入选项 [1/2/3/4/q]: " choice
+    read -r -p "请输入选项 [1/2/3/4/5/6，默认 1]: " choice
 
     case "$choice" in
-        1)
+        ""|1)
+            prepare_environment
             start_foreground
             ;;
         2)
+            prepare_environment
             start_background
             ;;
         3)
+            prepare_environment
             start_with_pm2
             ;;
         4)
+            prepare_environment
             success "环境检查完成，未启动任何服务。"
             ;;
-        q|Q)
+        5)
+            uninstall_app --no-banner
+            exit 0
+            ;;
+        6)
             warn "已退出。"
             exit 0
             ;;
@@ -500,4 +766,24 @@ main() {
     echo -e "${CYAN}========================================================${NC}"
 }
 
-main "$@"
+case "${1:-}" in
+    install|--install)
+        main
+        ;;
+    uninstall|--uninstall|remove|--remove)
+        shift
+        parse_uninstall_options "$@"
+        uninstall_app
+        ;;
+    help|--help|-h)
+        show_usage
+        ;;
+    "")
+        main
+        ;;
+    *)
+        error "[错误] 未知参数: $1"
+        show_usage
+        exit 1
+        ;;
+esac
