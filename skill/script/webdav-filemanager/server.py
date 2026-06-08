@@ -277,6 +277,39 @@ def build_content_disposition(filename):
     return f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{enc_name}'
 
 
+def clean_forwarded_value(value):
+    value = str(value or '').strip().strip('"')
+    value = value.replace('\r', '').replace('\n', '')
+    return value
+
+
+def forwarded_header_params(header):
+    first = str(header or '').split(',', 1)[0]
+    params = {}
+    for part in first.split(';'):
+        key, sep, value = part.partition('=')
+        if sep:
+            params[key.strip().lower()] = clean_forwarded_value(value)
+    return params
+
+
+def normalize_external_host(host, port=''):
+    host = clean_forwarded_value(str(host or '').split(',', 1)[0])
+    port = clean_forwarded_value(str(port or '').split(',', 1)[0])
+    if not host:
+        return ''
+    if port and ':' not in host and port.isdigit():
+        host = f'{host}:{port}'
+    return host
+
+
+def normalize_external_proto(proto):
+    proto = clean_forwarded_value(str(proto or '').split(',', 1)[0]).lower()
+    if proto in ('http', 'https'):
+        return proto
+    return ''
+
+
 def read_text_file(full):
     with open(full, 'rb') as f:
         raw = f.read(MAX_TEXT_EDIT_SIZE + 1)
@@ -1213,8 +1246,7 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             'downloadCount': downloads,
             'downloadBytes': int(meta.get('downloadBytes') or 0),
             'uniqueIpCount': unique_ips,
-            'url': self._share_url(token, name),
-            'plainUrl': self._share_url(token),
+            'url': self._share_url(token),
             'trashed': trashed,
         }
 
@@ -1278,13 +1310,28 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         items.sort(key=lambda x: x.get('createdAt') or 0, reverse=True)
         self.send_json({'success': True, 'items': items})
 
+    def _external_origin(self):
+        forwarded = forwarded_header_params(self.headers.get('Forwarded', ''))
+        proto = (
+            normalize_external_proto(forwarded.get('proto'))
+            or normalize_external_proto(self.headers.get('X-Forwarded-Proto'))
+            or normalize_external_proto(self.headers.get('X-Url-Scheme'))
+        )
+        if not proto:
+            ssl_hint = clean_forwarded_value(self.headers.get('X-Forwarded-Ssl')).lower()
+            proto = 'https' if ssl_hint == 'on' else 'http'
+        host = normalize_external_host(
+            forwarded.get('host') or self.headers.get('X-Forwarded-Host') or self.headers.get('Host'),
+            self.headers.get('X-Forwarded-Port'),
+        )
+        return f'{proto}://{host}' if host else ''
+
     def _share_url(self, token, filename=None):
-        host = self.headers.get('Host') or ''
-        proto = self.headers.get('X-Forwarded-Proto') or 'http'
         suffix = ''
         if filename:
             suffix = '/' + urllib.parse.quote(filename, safe='')
-        return f'{proto}://{host}/s/{token}{suffix}' if host else f'/s/{token}{suffix}'
+        origin = self._external_origin()
+        return f'{origin}/s/{token}{suffix}' if origin else f'/s/{token}{suffix}'
 
     def _api_download(self, qs):
         cleanup_expired_temp_files()
@@ -1323,6 +1370,7 @@ class FileManagerHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     start, end, status = 0, file_size - 1, 200
         length = max(0, end - start + 1)
+        st = os.stat(full)
         self.send_response(status)
         self.send_header('Content-Type', guess_mime(full))
         self.send_header('Accept-Ranges', 'bytes')
@@ -1330,6 +1378,11 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         if status == 206:
             self.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
         self.send_header('Content-Disposition', build_content_disposition(filename))
+        self.send_header('Content-Transfer-Encoding', 'binary')
+        self.send_header('Last-Modified', rfc1123_date(st.st_mtime))
+        self.send_header('ETag', f'"{int(st.st_mtime)}-{file_size}"')
+        self.send_header('Cache-Control', 'private, no-transform')
+        self.send_header('X-Content-Type-Options', 'nosniff')
         self.end_headers()
         if head_only:
             return
@@ -1569,7 +1622,7 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         save_state(state)
         self.send_json({
             'success': True,
-            'url': self._share_url(token, os.path.basename(full)),
+            'url': self._share_url(token),
             'token': token,
             'path': req_path,
             'name': os.path.basename(full),
