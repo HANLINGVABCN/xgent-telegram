@@ -86,9 +86,13 @@ class BotConfig:
     TOKEN = os.getenv("BOT_TOKEN", "")
     AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
     DB_FILE = "bot_memory.db"
-    UPDATE_ZIP_URL = os.getenv(
-        "UPDATE_ZIP_URL",
-        "https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot/zipball/main"
+    DEFAULT_UPDATE_ZIP_URL = "https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot-test/zipball/main"
+    LEGACY_DEFAULT_UPDATE_ZIP_URL = "https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot/zipball/main"
+    _ENV_UPDATE_ZIP_URL = (os.getenv("UPDATE_ZIP_URL") or "").strip()
+    UPDATE_ZIP_URL = (
+        DEFAULT_UPDATE_ZIP_URL
+        if not _ENV_UPDATE_ZIP_URL or _ENV_UPDATE_ZIP_URL == LEGACY_DEFAULT_UPDATE_ZIP_URL
+        else _ENV_UPDATE_ZIP_URL
     )
     UPDATE_GITHUB_TOKEN = (
         os.getenv("UPDATE_GITHUB_TOKEN")
@@ -523,6 +527,7 @@ class BotState:
     SET_COMMAND_TIMEOUT = 'set_command_timeout'
     SET_AGENT_MAX_ITERATIONS = 'set_agent_max_iterations'
     SET_COMMAND_BLACKLIST = 'set_command_blacklist'
+    SET_UPDATE_TOKEN = 'set_update_token'
 
 # --- ☆ 消息类型定义（用于全局记录）☆ ---
 class MessageType:
@@ -4862,6 +4867,50 @@ def backup_local_custom_dirs() -> Optional[str]:
         shutil.copytree(source_dir, os.path.join(backup_dir, dir_name))
     return to_display_path(backup_dir)
 
+def update_env_values(values: Dict[str, str]):
+    env_path = os.path.join(PROJECT_ROOT, ".env")
+    existing_lines: List[str] = []
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8", errors="ignore") as f:
+            existing_lines = f.read().splitlines()
+
+    keys = set(values)
+    next_lines = []
+    for line in existing_lines:
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            next_lines.append(line)
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key not in keys:
+            next_lines.append(line)
+
+    if next_lines and next_lines[-1].strip():
+        next_lines.append("")
+    for key, value in values.items():
+        clean_value = str(value or "").replace("\r", "").replace("\n", "").strip()
+        next_lines.append(f"{key}={clean_value}")
+
+    tmp_path = env_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(next_lines).rstrip() + "\n")
+    with contextlib.suppress(Exception):
+        os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, env_path)
+
+def persist_update_github_token(token: str):
+    token = str(token or "").replace("\r", "").replace("\n", "").strip()
+    if not token:
+        raise ValueError("GitHub Token 不能为空")
+    BotConfig.UPDATE_GITHUB_TOKEN = token
+    BotConfig.UPDATE_ZIP_URL = BotConfig.UPDATE_ZIP_URL or BotConfig.DEFAULT_UPDATE_ZIP_URL
+    os.environ["UPDATE_GITHUB_TOKEN"] = token
+    os.environ["UPDATE_ZIP_URL"] = BotConfig.UPDATE_ZIP_URL
+    update_env_values({
+        "UPDATE_GITHUB_TOKEN": token,
+        "UPDATE_ZIP_URL": BotConfig.UPDATE_ZIP_URL,
+    })
+
 def should_send_github_update_token(update_url: str) -> bool:
     host = (urllib.parse.urlparse(update_url).hostname or "").lower()
     return host == "github.com" or host == "api.github.com" or host.endswith(".github.com")
@@ -7236,12 +7285,34 @@ async def cmd_update_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and update.message.text:
         await GlobalRecorder.record_user_message(update.message.text, MessageType.COMMAND, update.effective_chat.id)
 
+    await UserDataManager.init()
+    if not BotConfig.UPDATE_GITHUB_TOKEN:
+        UserDataManager.set('state', BotState.SET_UPDATE_TOKEN)
+        message = update.message or update.callback_query.message
+        await message.reply_text(
+            "🔐 <b>需要 GitHub Token</b>\n\n"
+            "更新源是私有仓库：\n"
+            f"<code>{safe_text(BotConfig.UPDATE_ZIP_URL)}</code>\n\n"
+            "请发送一个 Fine-grained GitHub Token，权限只需要该仓库 <b>Contents: Read-only</b>。\n"
+            "收到后会写入项目根目录的 <code>.env</code>，然后继续更新确认。\n\n"
+            "<i>发送 cancel 可取消。</i>",
+            parse_mode=constants.ParseMode.HTML
+        )
+        return
+
+    await show_update_confirmation(update, context)
+
+async def show_update_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message or update.callback_query.message
+    await send_update_confirmation_message(message)
+
+async def send_update_confirmation_message(message: Any):
     await message.reply_text(
         "⬆️ <b>更新确认</b>\n\n"
-        "更新会从配置的更新源下载最新代码并覆盖当前项目文件，然后自动重启。\n"
+        "更新会从私有更新源下载最新代码并覆盖当前项目文件，然后自动重启。\n"
+        f"更新源：<code>{safe_text(BotConfig.UPDATE_ZIP_URL)}</code>\n"
         "运行数据、数据库、日志、存储目录、虚拟环境和 Git 目录会保留。\n\n"
-        "如果更新源是私有 GitHub 仓库，请确保 .env 已配置 <code>UPDATE_GITHUB_TOKEN</code>。\n\n"
+        "已检测到 <code>UPDATE_GITHUB_TOKEN</code>，将用于本次 GitHub 下载请求。\n\n"
         "请选择是否覆盖 <code>prompts/</code> 提示词与 <code>skill/</code> 技能文件：\n"
         "• 保留：继续使用服务器当前提示词和 skill 文件。\n"
         "• 覆盖：使用 GitHub 最新版本，覆盖前会把 prompts/ 与 skill/ 一起备份到新文件夹。\n\n"
@@ -8762,7 +8833,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # 普通聊天按拼接模式决定：直接发送，或累计到“完成”按钮后再写入记忆。
     if state != BotState.IDLE:
-        await GlobalRecorder.record_user_message(text, MessageType.USER_TEXT, update.effective_chat.id)
+        recorded_text = (
+            "[已填入 UPDATE_GITHUB_TOKEN，内容已隐藏]"
+            if state == BotState.SET_UPDATE_TOKEN
+            else text
+        )
+        await GlobalRecorder.record_user_message(recorded_text, MessageType.USER_TEXT, update.effective_chat.id)
     
     # 取消操作
     if text.lower() == 'cancel' and state != BotState.IDLE:
@@ -8777,6 +8853,36 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # --- 状态机处理 ---
+    if state == BotState.SET_UPDATE_TOKEN:
+        token = text.strip()
+        if not token:
+            await update.message.reply_text("⚠️ GitHub Token 不能为空。请重新发送，或发送 cancel 取消。")
+            return
+        try:
+            await asyncio.to_thread(persist_update_github_token, token)
+        except Exception as e:
+            logger.exception("保存更新 token 失败")
+            await update.message.reply_text(
+                f"❌ 保存 GitHub Token 失败：<code>{safe_text(format_provider_exception(e))}</code>",
+                parse_mode=constants.ParseMode.HTML
+            )
+            return
+
+        UserDataManager.set('state', BotState.IDLE)
+        await GlobalRecorder.record_system_op(
+            "保存 UPDATE_GITHUB_TOKEN 并继续更新确认",
+            {"update_source": BotConfig.UPDATE_ZIP_URL},
+            update.effective_chat.id
+        )
+        status_msg = await update.message.reply_text(
+            "✅ GitHub Token 已写入 <code>.env</code>。",
+            parse_mode=constants.ParseMode.HTML
+        )
+        with contextlib.suppress(Exception):
+            await update.message.delete()
+        await send_update_confirmation_message(status_msg)
+        return
+
     if state == BotState.SET_PROMPT:
         current_buffer = UserDataManager.get('prompt_buffer', "")
         current_buffer = current_buffer + "\n" + text if current_buffer else text
