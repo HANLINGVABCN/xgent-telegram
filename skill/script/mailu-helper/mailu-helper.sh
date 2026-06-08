@@ -2230,7 +2230,27 @@ write_wildcard_rule_files_from_list() {
 
 ensure_postfix_cf_managed() {
   local postfix_cf="$POSTFIX_OVERRIDE_DIR/postfix.cf"
+  local tmp_postfix_cf
   if [ -f "$postfix_cf" ] && grep -q 'BEGIN MAILU_HELPER_WILDCARD' "$postfix_cf"; then
+    if grep -Fq '${podop}' "$postfix_cf"; then
+      warn "检测到旧版 \${podop} 配置，将自动替换为 podop socketmap。"
+      backup_file "$postfix_cf"
+      tmp_postfix_cf="$postfix_cf.tmp.$$"
+      awk '
+        /^virtual_mailbox_domains = regexp:\/overrides\/wildcard_domains, .*podop.*domain$/ {
+          print "virtual_mailbox_domains = regexp:/overrides/wildcard_domains, socketmap:unix:/tmp/podop.socket:domain"
+          next
+        }
+        /^virtual_alias_maps = regexp:\/overrides\/wildcard_aliases, .*podop.*alias$/ {
+          print "virtual_alias_maps = regexp:/overrides/wildcard_aliases, socketmap:unix:/tmp/podop.socket:alias"
+          next
+        }
+        { print }
+      ' "$postfix_cf" > "$tmp_postfix_cf" || { rm -f "$tmp_postfix_cf"; return 1; }
+      mv "$tmp_postfix_cf" "$postfix_cf"
+      chmod 0644 "$postfix_cf"
+      ok "已修复 postfix.cf 管理块"
+    fi
     return 0
   fi
   if [ -f "$postfix_cf" ]; then
@@ -2242,8 +2262,8 @@ ensure_postfix_cf_managed() {
   cat >> "$postfix_cf" <<'EOF'
 
 # BEGIN MAILU_HELPER_WILDCARD
-virtual_mailbox_domains = regexp:/overrides/wildcard_domains, ${podop}domain
-virtual_alias_maps = regexp:/overrides/wildcard_aliases, ${podop}alias
+virtual_mailbox_domains = regexp:/overrides/wildcard_domains, socketmap:unix:/tmp/podop.socket:domain
+virtual_alias_maps = regexp:/overrides/wildcard_aliases, socketmap:unix:/tmp/podop.socket:alias
 # END MAILU_HELPER_WILDCARD
 EOF
   ok "已写入 postfix.cf 管理块"
@@ -2363,8 +2383,8 @@ add_temporary_subdomain_catchall() {
   chmod 0644 "$POSTFIX_OVERRIDE_DIR/wildcard_domains.tmp" "$POSTFIX_OVERRIDE_DIR/wildcard_aliases.tmp"
 
   warn "临时配置通过 postconf 写入正在运行的 smtp 容器；容器重建/重启后会失效。"
-  dc exec smtp postconf -e 'virtual_mailbox_domains=regexp:/overrides/wildcard_domains.tmp, ${podop}domain'
-  dc exec smtp postconf -e 'virtual_alias_maps=regexp:/overrides/wildcard_aliases.tmp, ${podop}alias'
+  dc exec smtp postconf -e 'virtual_mailbox_domains=regexp:/overrides/wildcard_domains.tmp, socketmap:unix:/tmp/podop.socket:domain'
+  dc exec smtp postconf -e 'virtual_alias_maps=regexp:/overrides/wildcard_aliases.tmp, socketmap:unix:/tmp/podop.socket:alias'
   dc exec smtp postfix reload
   ok "临时 catch-all 已尝试启用"
 }
