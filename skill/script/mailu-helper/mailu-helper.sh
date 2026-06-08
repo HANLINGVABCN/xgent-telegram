@@ -2334,6 +2334,12 @@ test_wildcard_postmap_rule() {
   else
     printf '    未命中\n'
   fi
+
+  if [ -n "$domain_result" ] && [ -n "$alias_result" ]; then
+    ok "测试通过：$domain 的任意子域名 catch-all 会转发到 $alias_result"
+  else
+    warn "测试未完全通过：请检查 $domain 的 wildcard_domains / wildcard_aliases 规则。"
+  fi
 }
 
 add_temporary_subdomain_catchall() {
