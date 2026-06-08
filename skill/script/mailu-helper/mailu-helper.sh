@@ -2305,9 +2305,34 @@ add_long_lived_subdomain_catchall() {
   fi
   if confirm "是否用 postmap 测试规则？"; then
     for domain in "${SELECTED_DOMAINS[@]}"; do
-      dc exec smtp postmap -q "test.$domain" regexp:/overrides/wildcard_domains || true
-      dc exec smtp postmap -q "anything@test.$domain" regexp:/overrides/wildcard_aliases || true
+      test_wildcard_postmap_rule "$domain" "test.$domain" "anything@test.$domain"
     done
+  fi
+}
+
+test_wildcard_postmap_rule() {
+  local domain="$1"
+  local domain_query="$2"
+  local alias_query="$3"
+  local domain_result alias_result
+
+  printf '\n测试域名：%s\n' "$domain"
+  printf '  wildcard_domains:\n'
+  printf '    输入：%s\n' "$domain_query"
+  domain_result="$(dc exec -T smtp postmap -q "$domain_query" regexp:/overrides/wildcard_domains 2>/dev/null || true)"
+  if [ -n "$domain_result" ]; then
+    printf '    命中：%s\n' "$domain_result"
+  else
+    printf '    未命中\n'
+  fi
+
+  printf '  wildcard_aliases:\n'
+  printf '    输入：%s\n' "$alias_query"
+  alias_result="$(dc exec -T smtp postmap -q "$alias_query" regexp:/overrides/wildcard_aliases 2>/dev/null || true)"
+  if [ -n "$alias_result" ]; then
+    printf '    命中：%s\n' "$alias_result"
+  else
+    printf '    未命中\n'
   fi
 }
 
