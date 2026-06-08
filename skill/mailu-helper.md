@@ -265,6 +265,8 @@ subdomain-catchall.list
 postfix.cf 中的 MAILU_HELPER_WILDCARD 管理块
 ```
 
+注意：`postfix.cf` 中直接使用 `socketmap:unix:/tmp/podop.socket:domain` / `socketmap:unix:/tmp/podop.socket:alias`，避免 `${podop}` 在 SMTP 容器启动处理 override 时被当作环境变量展开为空。
+
 可选择临时开启或长效开启。长效方式会写 overrides 文件并重启 `smtp` 服务。
 
 重要边界：
