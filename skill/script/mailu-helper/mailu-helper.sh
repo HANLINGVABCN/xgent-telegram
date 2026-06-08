@@ -2030,15 +2030,15 @@ root_catchall() {
   target="$(ask "转发到哪个邮箱" "admin@$domain")"
 
   printf '\n后台方式：\n'
-  printf '  Mailu 后台 -> Aliases -> 添加：*@%s -> %s\n' "$domain" "$target"
+  printf '  Mailu 后台 -> Aliases -> 添加：*@%s -> %s，并开启 wildcard / catch-all\n' "$domain" "$target"
   printf '\nDNS 提醒：\n'
   printf '  根域名 catch-all 不需要额外 DNS。邮箱前缀不参与 DNS 查询，*@%s 仍然只看 %s 的 MX/SPF/DKIM/DMARC。\n' "$domain" "$domain"
   printf '  如果你要收 *@任意子域.%s，才需要额外添加 *.%s 的通配 MX/SPF。\n' "$domain" "$domain"
   printf '\n命令方式：\n'
-  printf "  docker compose exec admin flask mailu alias '*' %s %s\n" "$domain" "$target"
+  printf "  docker compose exec admin flask mailu alias -w '*' %s %s\n" "$domain" "$target"
 
   if confirm "是否现在执行命令方式？"; then
-    dc exec admin flask mailu alias '*' "$domain" "$target"
+    dc exec admin flask mailu alias -w '*' "$domain" "$target"
   fi
 }
 

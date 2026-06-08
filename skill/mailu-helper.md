@@ -247,7 +247,7 @@ docker compose exec admin flask mailu user 用户名 域名 密码
 脚本会提示 Mailu 后台方式：
 
 ```text
-Aliases -> 添加 *@example.com -> admin@example.com
+Aliases -> 添加 *@example.com -> admin@example.com，并开启 wildcard / catch-all
 ```
 
 任意子域名 catch-all 使用菜单第 8 项或：
