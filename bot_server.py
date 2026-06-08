@@ -86,14 +86,11 @@ class BotConfig:
     TOKEN = os.getenv("BOT_TOKEN", "")
     AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
     DB_FILE = "bot_memory.db"
-    DEFAULT_UPDATE_ZIP_URL = "https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot-test/zipball/main"
-    LEGACY_DEFAULT_UPDATE_ZIP_URL = "https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot/zipball/main"
+    NORMAL_UPDATE_ZIP_URL = "https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot/zipball/main"
+    TEST_UPDATE_ZIP_URL = "https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot-test/zipball/main"
+    DEFAULT_UPDATE_ZIP_URL = NORMAL_UPDATE_ZIP_URL
     _ENV_UPDATE_ZIP_URL = (os.getenv("UPDATE_ZIP_URL") or "").strip()
-    UPDATE_ZIP_URL = (
-        DEFAULT_UPDATE_ZIP_URL
-        if not _ENV_UPDATE_ZIP_URL or _ENV_UPDATE_ZIP_URL == LEGACY_DEFAULT_UPDATE_ZIP_URL
-        else _ENV_UPDATE_ZIP_URL
-    )
+    UPDATE_ZIP_URL = _ENV_UPDATE_ZIP_URL or DEFAULT_UPDATE_ZIP_URL
     UPDATE_GITHUB_TOKEN = (
         os.getenv("UPDATE_GITHUB_TOKEN")
         or os.getenv("GITHUB_TOKEN")
@@ -4898,17 +4895,31 @@ def update_env_values(values: Dict[str, str]):
         os.chmod(tmp_path, 0o600)
     os.replace(tmp_path, env_path)
 
-def persist_update_github_token(token: str):
+def set_update_source(update_url: str):
+    update_url = str(update_url or "").replace("\r", "").replace("\n", "").strip()
+    BotConfig.UPDATE_ZIP_URL = update_url or BotConfig.DEFAULT_UPDATE_ZIP_URL
+    os.environ["UPDATE_ZIP_URL"] = BotConfig.UPDATE_ZIP_URL
+
+def is_test_update_source(update_url: str) -> bool:
+    return str(update_url or "").strip() == BotConfig.TEST_UPDATE_ZIP_URL
+
+def get_update_source_label(update_url: str) -> str:
+    if is_test_update_source(update_url):
+        return "test 私有目录"
+    if str(update_url or "").strip() == BotConfig.NORMAL_UPDATE_ZIP_URL:
+        return "正常 bot 项目"
+    return "自定义更新源"
+
+def persist_update_github_token(token: str, update_url: Optional[str] = None):
     token = str(token or "").replace("\r", "").replace("\n", "").strip()
     if not token:
         raise ValueError("GitHub Token 不能为空")
+    if update_url:
+        set_update_source(update_url)
     BotConfig.UPDATE_GITHUB_TOKEN = token
-    BotConfig.UPDATE_ZIP_URL = BotConfig.UPDATE_ZIP_URL or BotConfig.DEFAULT_UPDATE_ZIP_URL
     os.environ["UPDATE_GITHUB_TOKEN"] = token
-    os.environ["UPDATE_ZIP_URL"] = BotConfig.UPDATE_ZIP_URL
     update_env_values({
         "UPDATE_GITHUB_TOKEN": token,
-        "UPDATE_ZIP_URL": BotConfig.UPDATE_ZIP_URL,
     })
 
 def should_send_github_update_token(update_url: str) -> bool:
@@ -7271,10 +7282,12 @@ async def restart_current_process(chat_id: int):
     db = await BotMemoryDB.get_instance()
     await db.set_config('restart_notify_chat_id', chat_id)
     await db.close()
-    
-    # 尝试自重启：先试 os.execv，失败则 sys.exit(0) 交给 pm2
+
+    restart_env = os.environ.copy()
+    for key in ("UPDATE_GITHUB_TOKEN", "GITHUB_TOKEN", "UPDATE_ZIP_URL"):
+        restart_env.pop(key, None)
     try:
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        os.execve(sys.executable, [sys.executable] + sys.argv, restart_env)
     except Exception:
         sys.exit(0)
 
@@ -7286,33 +7299,54 @@ async def cmd_update_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await GlobalRecorder.record_user_message(update.message.text, MessageType.COMMAND, update.effective_chat.id)
 
     await UserDataManager.init()
-    if not BotConfig.UPDATE_GITHUB_TOKEN:
-        UserDataManager.set('state', BotState.SET_UPDATE_TOKEN)
-        message = update.message or update.callback_query.message
-        await message.reply_text(
-            "🔐 <b>需要 GitHub Token</b>\n\n"
-            "更新源是私有仓库：\n"
-            f"<code>{safe_text(BotConfig.UPDATE_ZIP_URL)}</code>\n\n"
-            "请发送一个 Fine-grained GitHub Token，权限只需要该仓库 <b>Contents: Read-only</b>。\n"
-            "收到后会写入项目根目录的 <code>.env</code>，然后继续更新确认。\n\n"
-            "<i>发送 cancel 可取消。</i>",
-            parse_mode=constants.ParseMode.HTML
-        )
-        return
+    message = update.message or update.callback_query.message
+    await send_update_source_menu(message)
 
-    await show_update_confirmation(update, context)
+async def send_update_source_menu(message: Any):
+    await message.reply_text(
+        "⬆️ <b>选择更新来源</b>\n\n"
+        "请选择这次要从哪里拉取最新代码：\n"
+        "1. 正常更新：从 <code>telegram-ai-bot</code> 项目拉取。\n"
+        "2. Test 更新：从 <code>telegram-ai-bot-test</code> 私有目录拉取，需要 GitHub Token。",
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("1 正常更新（bot 项目）", callback_data="select_update_source_normal")],
+            [InlineKeyboardButton("2 Test 更新（私有，需要 Token）", callback_data="select_update_source_test")],
+            [InlineKeyboardButton("取消", callback_data="menu_more_settings")]
+        ])
+    )
+
+async def request_update_github_token(message: Any, update_url: str):
+    set_update_source(update_url)
+    UserDataManager.set('state', BotState.SET_UPDATE_TOKEN)
+    UserDataManager.set('pending_update_zip_url', BotConfig.UPDATE_ZIP_URL)
+    await message.reply_text(
+        "🔐 <b>需要 GitHub Token</b>\n\n"
+        "你选择的是 test 私有目录：\n"
+        f"<code>{safe_text(BotConfig.UPDATE_ZIP_URL)}</code>\n\n"
+        "请发送一个 Fine-grained GitHub Token，权限只需要该仓库 <b>Contents: Read-only</b>。\n"
+        "收到后会写入项目根目录的 <code>.env</code>，然后继续更新确认。\n\n"
+        "<i>发送 cancel 可取消。</i>",
+        parse_mode=constants.ParseMode.HTML
+    )
 
 async def show_update_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message or update.callback_query.message
     await send_update_confirmation_message(message)
 
 async def send_update_confirmation_message(message: Any):
+    source_label = get_update_source_label(BotConfig.UPDATE_ZIP_URL)
+    auth_text = (
+        "已检测到 <code>UPDATE_GITHUB_TOKEN</code>，将用于本次 GitHub 下载请求。\n\n"
+        if is_test_update_source(BotConfig.UPDATE_ZIP_URL)
+        else "正常更新源不需要 GitHub Token。\n\n"
+    )
     await message.reply_text(
         "⬆️ <b>更新确认</b>\n\n"
-        "更新会从私有更新源下载最新代码并覆盖当前项目文件，然后自动重启。\n"
+        f"更新会从 <b>{safe_text(source_label)}</b> 下载最新代码并覆盖当前项目文件，然后自动重启。\n"
         f"更新源：<code>{safe_text(BotConfig.UPDATE_ZIP_URL)}</code>\n"
         "运行数据、数据库、日志、存储目录、虚拟环境和 Git 目录会保留。\n\n"
-        "已检测到 <code>UPDATE_GITHUB_TOKEN</code>，将用于本次 GitHub 下载请求。\n\n"
+        f"{auth_text}"
         "请选择是否覆盖 <code>prompts/</code> 提示词与 <code>skill/</code> 技能文件：\n"
         "• 保留：继续使用服务器当前提示词和 skill 文件。\n"
         "• 覆盖：使用 GitHub 最新版本，覆盖前会把 prompts/ 与 skill/ 一起备份到新文件夹。\n\n"
@@ -7624,6 +7658,31 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
         elif data == "noop":
+            return
+
+        elif data == "select_update_source_normal":
+            set_update_source(BotConfig.NORMAL_UPDATE_ZIP_URL)
+            UserDataManager.set('pending_update_zip_url', "")
+            await GlobalRecorder.record_system_op(
+                "选择正常 bot 项目更新源",
+                {"update_source": BotConfig.UPDATE_ZIP_URL},
+                update.effective_chat.id
+            )
+            await send_update_confirmation_message(query.message)
+            return
+
+        elif data == "select_update_source_test":
+            set_update_source(BotConfig.TEST_UPDATE_ZIP_URL)
+            await GlobalRecorder.record_system_op(
+                "选择 test 私有目录更新源",
+                {"update_source": BotConfig.UPDATE_ZIP_URL},
+                update.effective_chat.id
+            )
+            if not BotConfig.UPDATE_GITHUB_TOKEN:
+                await request_update_github_token(query.message, BotConfig.TEST_UPDATE_ZIP_URL)
+                return
+            UserDataManager.set('pending_update_zip_url', "")
+            await send_update_confirmation_message(query.message)
             return
 
         elif data == "do_update_keep_custom_files":
@@ -8648,6 +8707,27 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await cmd_export_all(update, context)
         elif data == "cmd_update":
             await cmd_update_system(update, context)
+        elif data == "select_update_source_normal":
+            set_update_source(BotConfig.NORMAL_UPDATE_ZIP_URL)
+            UserDataManager.set('pending_update_zip_url', "")
+            await GlobalRecorder.record_system_op(
+                "选择正常 bot 项目更新源",
+                {"update_source": BotConfig.UPDATE_ZIP_URL},
+                update.effective_chat.id
+            )
+            await send_update_confirmation_message(query.message)
+        elif data == "select_update_source_test":
+            set_update_source(BotConfig.TEST_UPDATE_ZIP_URL)
+            await GlobalRecorder.record_system_op(
+                "选择 test 私有目录更新源",
+                {"update_source": BotConfig.UPDATE_ZIP_URL},
+                update.effective_chat.id
+            )
+            if not BotConfig.UPDATE_GITHUB_TOKEN:
+                await request_update_github_token(query.message, BotConfig.TEST_UPDATE_ZIP_URL)
+            else:
+                UserDataManager.set('pending_update_zip_url', "")
+                await send_update_confirmation_message(query.message)
         elif data in {"do_update_keep_custom_files", "do_update_keep_prompts"}:
             await perform_update_system(update, context, overwrite_local_custom_files=False)
         elif data in {"do_update_overwrite_custom_files", "do_update_overwrite_prompts"}:
@@ -8843,6 +8923,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 取消操作
     if text.lower() == 'cancel' and state != BotState.IDLE:
         UserDataManager.set('state', BotState.IDLE)
+        UserDataManager.set('pending_update_zip_url', "")
         UserDataManager.set('editing_prompt_key', "")
         UserDataManager.set('prompt_buffer', "")
         UserDataManager.set('command_blacklist_buffer', "")
@@ -8858,8 +8939,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not token:
             await update.message.reply_text("⚠️ GitHub Token 不能为空。请重新发送，或发送 cancel 取消。")
             return
+        pending_update_url = UserDataManager.get('pending_update_zip_url', "") or BotConfig.TEST_UPDATE_ZIP_URL
         try:
-            await asyncio.to_thread(persist_update_github_token, token)
+            await asyncio.to_thread(persist_update_github_token, token, pending_update_url)
         except Exception as e:
             logger.exception("保存更新 token 失败")
             await update.message.reply_text(
@@ -8869,17 +8951,16 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         UserDataManager.set('state', BotState.IDLE)
+        UserDataManager.set('pending_update_zip_url', "")
         await GlobalRecorder.record_system_op(
             "保存 UPDATE_GITHUB_TOKEN 并继续更新确认",
             {"update_source": BotConfig.UPDATE_ZIP_URL},
             update.effective_chat.id
         )
         status_msg = await update.message.reply_text(
-            "✅ GitHub Token 已写入 <code>.env</code>。",
+            "✅ Token 已保存，信息已加密",
             parse_mode=constants.ParseMode.HTML
         )
-        with contextlib.suppress(Exception):
-            await update.message.delete()
         await send_update_confirmation_message(status_msg)
         return
 
