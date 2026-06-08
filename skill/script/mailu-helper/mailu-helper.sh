@@ -1916,55 +1916,44 @@ dig_or_nslookup() {
 }
 
 show_catchall_dns_records() {
-  load_config
+  ensure_context || return 1
   load_env_defaults
   printf '\n%s\n' "${BOLD}catch-all / 任意子域名 DNS 记录说明${RESET}"
-  local domain host random
-  domain="$(ask "根域名" "${MAIL_DOMAIN:-}")"
+  select_catchall_domains "选择要查看 DNS 记录的域名" || return 1
+  local domain host random do_check
+  domain="${SELECTED_DOMAINS[0]}"
   host="$(ask "邮件主机名" "${MAIL_HOST:-mail.$domain}")"
-  random="mh-$(date +%s).$domain"
   MAIL_DOMAIN="$domain"
   MAIL_HOST="$host"
   save_config
 
-  printf '\n1. 根域名任意前缀 catch-all，例如 *@%s\n' "$domain"
-  printf '   DNS 不认识邮箱前缀，user、abc、anything 都是同一个域名 %s。\n' "$domain"
-  printf '   所以只需要 Mailu 后台给出的正常根域名记录：\n'
-  printf '   - %s.        MX   10 %s.\n' "$domain" "$host"
-  printf '   - %s.        TXT  Mailu 后台给你的 SPF\n' "$domain"
-  printf '   - selector._domainkey.%s. TXT  Mailu 后台给你的 DKIM\n' "$domain"
-  printf '   - _dmarc.%s. TXT  你的 DMARC 策略\n' "$domain"
+  printf '\n说明：根域名 catch-all（例如 *@example.com）不需要额外 DNS；任意子域名 catch-all（例如 *@*.example.com）需要通配 MX/SPF。\n'
+  for domain in "${SELECTED_DOMAINS[@]}"; do
+    printf '\n%s\n' "${BOLD}${domain}${RESET}"
+    printf '  根域名：\n'
+    printf '    %s.        MX   10 %s.\n' "$domain" "$host"
+    printf '    %s.        TXT  Mailu 后台给你的 SPF\n' "$domain"
+    printf '    selector._domainkey.%s. TXT  Mailu 后台 DKIM\n' "$domain"
+    printf '    _dmarc.%s. TXT  \"v=DMARC1; p=none; sp=none; rua=mailto:admin@%s\"\n' "$domain" "$domain"
+    printf '  任意子域名 catch-all 额外添加：\n'
+    printf '    *.%s.      MX   10 %s.\n' "$domain" "$host"
+    printf '    *.%s.      TXT  \"v=spf1 mx a:%s ~all\"\n' "$domain" "$host"
+  done
+  printf '\n注意：通配记录 *.example.com 不包含 example.com 本身；本体记录和通配记录都要有。\n'
+  printf 'PTR 反向解析仍然要在服务器/VPS 商后台设置到 %s。\n' "$host"
 
-  printf '\n2. 任意子域名 catch-all，例如 *@*.%s\n' "$domain"
-  printf '   Mailu 后台通常不会自动告诉你这些通配记录，但你需要自己加：\n'
-  printf '   - *.%s.      MX   10 %s.\n' "$domain" "$host"
-  printf '   - *.%s.      TXT  \"v=spf1 mx a:%s ~all\"\n' "$domain" "$host"
-  printf '\n   注意：通配记录 *.%s 不包含根域名 %s，本体记录和通配记录要同时存在。\n' "$domain" "$domain"
-
-  printf '\n3. DKIM / DMARC 提醒\n'
-  printf '   - DKIM 优先使用 Mailu 后台给根域名生成的 DKIM。\n'
-  printf '   - 每个域名的 DKIM 都要从 Mailu 对应域名页面复制，不要拿别的域名复用。\n'
-  printf '   - 如果 From 是 a@sub.%s，DKIM d=%s 在 relaxed alignment 下通常可以对齐。\n' "$domain" "$domain"
-  printf '   - 不建议依赖“通配 DKIM”，DNS 通配很难覆盖 selector._domainkey.任意子域名这种结构。\n'
-  printf '   - DMARC 建议在 _dmarc.%s 设置，并包含 sp= 给子域名策略，例如 p=none; sp=none 先观察。\n' "$domain"
-  printf '   - DMARC 报告建议发回本域名，例如 rua=mailto:admin@%s。\n' "$domain"
-  printf '   - 如果报告发到别的域名，要在接收报告域名加授权：%s._report._dmarc.接收报告域名 TXT \"v=DMARC1;\"\n' "$domain"
-
-  printf '\n4. 推荐最小模板\n'
-  printf '   @              MX   10 %s.\n' "$host"
-  printf '   mail           A    你的服务器公网 IPv4\n'
-  printf '   *              MX   10 %s.\n' "$host"
-  printf '   @              TXT  Mailu 后台 SPF\n'
-  printf '   *              TXT  \"v=spf1 mx a:%s ~all\"\n' "$host"
-  printf '   _dmarc         TXT  \"v=DMARC1; p=none; sp=none; rua=mailto:admin@%s\"\n' "$domain"
-  printf '   selector._domainkey TXT Mailu 后台 DKIM\n'
-  printf '   autoconfig     CNAME %s.  （如 Mailu 后台提示）\n' "$host"
-  printf '   autodiscover   CNAME %s.  （如 Mailu 后台提示）\n' "$host"
-  printf '\n   PTR 反向解析仍然要在服务器/VPS 商后台设置到 %s。\n' "$host"
-
-  if confirm "是否现在检查通配 MX/SPF 是否生效？"; then
-    dig_or_nslookup MX "$random"
-    dig_or_nslookup TXT "$random"
+  if confirm "是否现在检查所选域名的通配 MX/SPF 是否生效？"; then
+    do_check="yes"
+  else
+    do_check="no"
+  fi
+  if [ "$do_check" = "yes" ]; then
+    for domain in "${SELECTED_DOMAINS[@]}"; do
+      random="mh-$(date +%s).$domain"
+      printf '\n检查 %s\n' "$random"
+      dig_or_nslookup MX "$random"
+      dig_or_nslookup TXT "$random"
+    done
   fi
 }
 
@@ -2058,8 +2047,155 @@ escape_regex() {
 }
 
 ensure_postfix_override_dir() {
-  POSTFIX_OVERRIDE_DIR="$(ask "Postfix overrides 目录" "${POSTFIX_OVERRIDE_DIR:-/mailu/overrides/postfix}")"
+  if [ -z "${POSTFIX_OVERRIDE_DIR:-}" ]; then
+    POSTFIX_OVERRIDE_DIR="$(ask "Postfix overrides 目录" "/mailu/overrides/postfix")"
+  else
+    ok "Postfix overrides 目录：$POSTFIX_OVERRIDE_DIR"
+  fi
   safe_mkdir "$POSTFIX_OVERRIDE_DIR"
+}
+
+collect_mailu_domain_names() {
+  local domain
+  while IFS= read -r domain; do
+    domain="${domain%%#*}"
+    domain="$(printf '%s' "$domain" | sed "s/^[[:space:]]*//;s/[[:space:]]*$//;s/^['\"]//;s/['\"]$//")"
+    is_valid_domain "$domain" || continue
+    printf '%s\n' "$domain"
+  done < <(
+    {
+      dc exec -T admin flask mailu config-export domain.name 2>/dev/null || true
+      dc exec -T admin flask mailu config-export domain 2>/dev/null || true
+      dc exec -T admin flask mailu domain 2>/dev/null || true
+    } \
+      | sed -nE \
+          -e 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' \
+          -e 's/^[[:space:]]*-[[:space:]]*name:[[:space:]]*"?([^"#[:space:]]+)"?.*/\1/p' \
+          -e 's/^[[:space:]]*name:[[:space:]]*"?([^"#[:space:]]+)"?.*/\1/p' \
+          -e 's/^[[:space:]]*([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})[[:space:]]*$/\1/p'
+  ) | sort -u
+}
+
+collect_known_domain_names() {
+  local list="${POSTFIX_OVERRIDE_DIR:-}/subdomain-catchall.list"
+  {
+    collect_mailu_domain_names
+    if [ -f "$list" ]; then
+      awk -F'|' '{print $1}' "$list"
+    fi
+  } | while IFS= read -r domain; do
+    is_valid_domain "$domain" || continue
+    printf '%s\n' "$domain"
+  done | sort -u
+}
+
+AVAILABLE_DOMAINS=()
+SELECTED_DOMAINS=()
+SELECTED_ALL="no"
+
+select_catchall_domains() {
+  local prompt="${1:-选择域名}"
+  local domain selection token idx found
+  AVAILABLE_DOMAINS=()
+  SELECTED_DOMAINS=()
+  SELECTED_ALL="no"
+
+  while IFS= read -r domain; do
+    AVAILABLE_DOMAINS+=("$domain")
+  done < <(collect_known_domain_names)
+
+  if [ "${#AVAILABLE_DOMAINS[@]}" -eq 0 ]; then
+    fail "没有读取到 Mailu 域名。请确认 admin 容器正常，或先在 Mailu 后台添加域名。"
+    return 1
+  fi
+
+  printf '\nMailu 域名列表：\n'
+  idx=1
+  for domain in "${AVAILABLE_DOMAINS[@]}"; do
+    printf '  %s) %s\n' "$idx" "$domain"
+    idx=$((idx + 1))
+  done
+
+  selection="$(ask "$prompt（输入 all 或编号，例如 1 2 4）" "all")"
+  selection="${selection//,/ }"
+  selection="$(printf '%s' "$selection" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+  if [ -z "$selection" ] || [ "$selection" = "all" ] || [ "$selection" = "ALL" ] || [ "$selection" = "全部" ]; then
+    SELECTED_DOMAINS=("${AVAILABLE_DOMAINS[@]}")
+    SELECTED_ALL="yes"
+    return 0
+  fi
+
+  for token in $selection; do
+    case "$token" in
+      ''|*[!0-9]*)
+        if is_valid_domain "$token"; then
+          SELECTED_DOMAINS+=("$token")
+        else
+          warn "忽略无效选择：$token"
+        fi
+        ;;
+      *)
+        if [ "$token" -ge 1 ] && [ "$token" -le "${#AVAILABLE_DOMAINS[@]}" ]; then
+          SELECTED_DOMAINS+=("${AVAILABLE_DOMAINS[$((token - 1))]}")
+        else
+          warn "忽略超出范围的编号：$token"
+        fi
+        ;;
+    esac
+  done
+
+  if [ "${#SELECTED_DOMAINS[@]}" -eq 0 ]; then
+    fail "没有选中任何域名。"
+    return 1
+  fi
+
+  # 去重但保持原顺序。
+  local unique=()
+  for domain in "${SELECTED_DOMAINS[@]}"; do
+    found=0
+    for token in "${unique[@]}"; do
+      [ "$token" = "$domain" ] && found=1 && break
+    done
+    [ "$found" -eq 0 ] && unique+=("$domain")
+  done
+  SELECTED_DOMAINS=("${unique[@]}")
+}
+
+append_wildcard_rule_line() {
+  local base="$1"
+  local target="$2"
+  local include_root="$3"
+  local domains_file="$4"
+  local aliases_file="$5"
+  local escaped domain_regex alias_regex
+  escaped="$(escape_regex "$base")"
+  if [ "$include_root" = "yes" ]; then
+    domain_regex="/^(.+\\.)?${escaped}\$/"
+    alias_regex="/^.+@(.+\\.)?${escaped}\$/"
+  else
+    domain_regex="/^.+\\.${escaped}\$/"
+    alias_regex="/^.+@.+\\.${escaped}\$/"
+  fi
+  printf '%s %s\n' "$domain_regex" "$base" >> "$domains_file"
+  printf '%s %s\n' "$alias_regex" "$target" >> "$aliases_file"
+}
+
+ask_target_for_domain() {
+  local domain="$1"
+  ask "目标邮箱：$domain" "admin@$domain"
+}
+
+ensure_subdomain_catchall_list() {
+  local list="$POSTFIX_OVERRIDE_DIR/subdomain-catchall.list"
+  if [ -f "$list" ] && grep -Eq '^[^#|]+[|][^|]+' "$list"; then
+    return 0
+  fi
+
+  warn "catch-all 列表不存在或为空：$list"
+  warn "将尝试从 Mailu 后台现有域名生成列表。"
+
+  rebuild_subdomain_catchall_list_from_selection
 }
 
 write_wildcard_rule_files_from_list() {
@@ -2073,21 +2209,17 @@ write_wildcard_rule_files_from_list() {
   : > "$tmp_domains"
   : > "$tmp_aliases"
 
-  if [ -f "$list" ]; then
-    while IFS='|' read -r base target include_root; do
-      [ -n "${base:-}" ] || continue
-      case "$base" in \#*) continue ;; esac
-      escaped="$(escape_regex "$base")"
-      if [ "${include_root:-no}" = "yes" ]; then
-        domain_regex="/^(.+\\.)?${escaped}\$/"
-        alias_regex="/^.+@(.+\\.)?${escaped}\$/"
-      else
-        domain_regex="/^.+\\.${escaped}\$/"
-        alias_regex="/^.+@.+\\.${escaped}\$/"
-      fi
-      printf '%s %s\n' "$domain_regex" "$base" >> "$tmp_domains"
-      printf '%s %s\n' "$alias_regex" "$target" >> "$tmp_aliases"
-    done < "$list"
+  [ -f "$list" ] || { rm -f "$tmp_domains" "$tmp_aliases"; fail "列表不存在：$list"; return 1; }
+  while IFS='|' read -r base target include_root; do
+    [ -n "${base:-}" ] || continue
+    case "$base" in \#*) continue ;; esac
+    append_wildcard_rule_line "$base" "$target" "${include_root:-no}" "$tmp_domains" "$tmp_aliases"
+  done < "$list"
+
+  if [ ! -s "$tmp_domains" ] || [ ! -s "$tmp_aliases" ]; then
+    rm -f "$tmp_domains" "$tmp_aliases"
+    fail "列表为空，没有生成任何规则。"
+    return 1
   fi
 
   mv "$tmp_domains" "$domains"
@@ -2117,30 +2249,53 @@ EOF
   ok "已写入 postfix.cf 管理块"
 }
 
+rebuild_subdomain_catchall_list_from_selection() {
+  select_catchall_domains "选择要写入长效 catch-all 列表的域名" || return 1
+  local list="$POSTFIX_OVERRIDE_DIR/subdomain-catchall.list"
+  local tmp_list="$list.tmp.$$"
+  local domain target include
+  if confirm "是否同时包含根域名本身（例如 *@example.com）？"; then
+    include="yes"
+  else
+    include="no"
+  fi
+  confirm "确认重建 catch-all 列表？未选中的旧条目会被移除。" "Y" || return 1
+  [ -f "$list" ] && backup_file "$list"
+  : > "$tmp_list"
+  for domain in "${SELECTED_DOMAINS[@]}"; do
+    target="$(ask_target_for_domain "$domain")"
+    printf '%s|%s|%s\n' "$domain" "$target" "$include" >> "$tmp_list"
+  done
+  mv "$tmp_list" "$list"
+  chmod 0644 "$list"
+  ok "已重建 subdomain-catchall.list（${#SELECTED_DOMAINS[@]} 个域名）"
+}
+
 add_long_lived_subdomain_catchall() {
   ensure_context || return 1
   ensure_postfix_override_dir || return 1
-  local domain target include answer list
-  domain="$(ask "要开启任意子域名 catch-all 的根域名" "${MAIL_DOMAIN:-}")"
-  target="$(ask "目标邮箱" "admin@$domain")"
-  if confirm "是否同时包含根域名本身（*@${domain}）？"; then
+  select_catchall_domains "选择要长效开启 catch-all 的域名" || return 1
+  local domain target include list tmp_list next_tmp
+  if confirm "是否同时包含根域名本身（例如 *@example.com）？"; then
     include="yes"
   else
     include="no"
   fi
   list="$POSTFIX_OVERRIDE_DIR/subdomain-catchall.list"
   touch "$list"
-  if grep -Fq "$domain|" "$list"; then
-    warn "$domain 已在列表中。"
-    if confirm "是否替换这一行？"; then
-      backup_file "$list"
-      grep -Fv "$domain|" "$list" > "$list.tmp.$$"
-      mv "$list.tmp.$$" "$list"
-    else
-      return 0
-    fi
-  fi
-  printf '%s|%s|%s\n' "$domain" "$target" "$include" >> "$list"
+  backup_file "$list"
+  tmp_list="$list.tmp.$$"
+  cp "$list" "$tmp_list"
+  for domain in "${SELECTED_DOMAINS[@]}"; do
+    next_tmp="$list.tmp.$$.next"
+    grep -Fv "$domain|" "$tmp_list" > "$next_tmp" || true
+    mv "$next_tmp" "$tmp_list"
+  done
+  for domain in "${SELECTED_DOMAINS[@]}"; do
+    target="$(ask_target_for_domain "$domain")"
+    printf '%s|%s|%s\n' "$domain" "$target" "$include" >> "$tmp_list"
+  done
+  mv "$tmp_list" "$list"
   chmod 0644 "$list"
   ensure_postfix_cf_managed
   write_wildcard_rule_files_from_list
@@ -2149,33 +2304,31 @@ add_long_lived_subdomain_catchall() {
     dc restart smtp
   fi
   if confirm "是否用 postmap 测试规则？"; then
-    dc exec smtp postmap -q "test.$domain" regexp:/overrides/wildcard_domains || true
-    dc exec smtp postmap -q "anything@test.$domain" regexp:/overrides/wildcard_aliases || true
+    for domain in "${SELECTED_DOMAINS[@]}"; do
+      dc exec smtp postmap -q "test.$domain" regexp:/overrides/wildcard_domains || true
+      dc exec smtp postmap -q "anything@test.$domain" regexp:/overrides/wildcard_aliases || true
+    done
   fi
 }
 
 add_temporary_subdomain_catchall() {
   ensure_context || return 1
   ensure_postfix_override_dir || return 1
-  local domain target include escaped domain_regex alias_regex suffix
-  domain="$(ask "临时开启的根域名" "${MAIL_DOMAIN:-}")"
-  target="$(ask "目标邮箱" "admin@$domain")"
-  if confirm "是否同时包含根域名本身（*@${domain}）？"; then
+  select_catchall_domains "选择要临时开启 catch-all 的域名" || return 1
+  local domain target include domains_tmp aliases_tmp
+  if confirm "是否同时包含根域名本身（例如 *@example.com）？"; then
     include="yes"
   else
     include="no"
   fi
-  escaped="$(escape_regex "$domain")"
-  if [ "$include" = "yes" ]; then
-    domain_regex="/^(.+\\.)?${escaped}\$/"
-    alias_regex="/^.+@(.+\\.)?${escaped}\$/"
-  else
-    domain_regex="/^.+\\.${escaped}\$/"
-    alias_regex="/^.+@.+\\.${escaped}\$/"
-  fi
-
-  printf '%s %s\n' "$domain_regex" "$domain" > "$POSTFIX_OVERRIDE_DIR/wildcard_domains.tmp"
-  printf '%s %s\n' "$alias_regex" "$target" > "$POSTFIX_OVERRIDE_DIR/wildcard_aliases.tmp"
+  domains_tmp="$POSTFIX_OVERRIDE_DIR/wildcard_domains.tmp"
+  aliases_tmp="$POSTFIX_OVERRIDE_DIR/wildcard_aliases.tmp"
+  : > "$domains_tmp"
+  : > "$aliases_tmp"
+  for domain in "${SELECTED_DOMAINS[@]}"; do
+    target="$(ask_target_for_domain "$domain")"
+    append_wildcard_rule_line "$domain" "$target" "$include" "$domains_tmp" "$aliases_tmp"
+  done
   chmod 0644 "$POSTFIX_OVERRIDE_DIR/wildcard_domains.tmp" "$POSTFIX_OVERRIDE_DIR/wildcard_aliases.tmp"
 
   warn "临时配置通过 postconf 写入正在运行的 smtp 容器；容器重建/重启后会失效。"
@@ -2187,34 +2340,67 @@ add_temporary_subdomain_catchall() {
 
 show_subdomain_catchall_list() {
   ensure_context || return 1
+  ensure_postfix_override_dir || return 1
   local list="${POSTFIX_OVERRIDE_DIR:-}/subdomain-catchall.list"
   printf '\n%s\n' "${BOLD}任意子域名 catch-all 列表${RESET}"
+  printf '\nMailu 后台现有域名：\n'
+  if ! collect_mailu_domain_names | awk '{printf "  %d) %s\n", NR, $0; found=1} END {exit found ? 0 : 1}'; then
+    warn "未能从 Mailu 后台读取到域名。"
+  fi
+  printf '\nhelper 已配置 catch-all：\n'
   if [ -f "$list" ]; then
     awk -F'|' '{printf "域名: %-30s 目标: %-30s 包含根域名: %s\n", $1, $2, $3}' "$list"
   else
     warn "列表不存在：$list"
+    printf '\n如果要为这些域名生成任意子域名 catch-all，请选择菜单 3。\n'
   fi
 }
 
 remove_helper_wildcard_config() {
   ensure_context || return 1
   ensure_postfix_override_dir || return 1
-  printf '\n将删除 mailu-helper 创建的 wildcard_domains、wildcard_aliases、subdomain-catchall.list，并清理 postfix.cf 管理块。\n'
-  confirm "确认删除这些辅助配置？" || return 0
+  select_catchall_domains "选择要删除 catch-all 配置的域名；输入 all 删除全部 helper 配置" || return 1
   local postfix_cf="$POSTFIX_OVERRIDE_DIR/postfix.cf"
-  rm -f "$POSTFIX_OVERRIDE_DIR/wildcard_domains" \
-        "$POSTFIX_OVERRIDE_DIR/wildcard_aliases" \
-        "$POSTFIX_OVERRIDE_DIR/wildcard_domains.tmp" \
-        "$POSTFIX_OVERRIDE_DIR/wildcard_aliases.tmp" \
-        "$POSTFIX_OVERRIDE_DIR/subdomain-catchall.list"
-  if [ -f "$postfix_cf" ]; then
-    if grep -q '^# Generated by mailu-helper.sh$' "$postfix_cf"; then
-      rm -f "$postfix_cf"
-      ok "已删除 mailu-helper 生成的 postfix.cf"
-    elif grep -q 'BEGIN MAILU_HELPER_WILDCARD' "$postfix_cf"; then
-      backup_file "$postfix_cf"
-      sed -i '/# BEGIN MAILU_HELPER_WILDCARD/,/# END MAILU_HELPER_WILDCARD/d' "$postfix_cf"
-      ok "已清理 postfix.cf 管理块"
+  local list="$POSTFIX_OVERRIDE_DIR/subdomain-catchall.list"
+  local domain tmp_list next_tmp
+
+  if [ "$SELECTED_ALL" = "yes" ]; then
+    printf '\n将删除 mailu-helper 创建的 wildcard_domains、wildcard_aliases、subdomain-catchall.list，并清理 postfix.cf 管理块。\n'
+    confirm "确认删除这些辅助配置？" || return 0
+    rm -f "$POSTFIX_OVERRIDE_DIR/wildcard_domains" \
+          "$POSTFIX_OVERRIDE_DIR/wildcard_aliases" \
+          "$POSTFIX_OVERRIDE_DIR/wildcard_domains.tmp" \
+          "$POSTFIX_OVERRIDE_DIR/wildcard_aliases.tmp" \
+          "$POSTFIX_OVERRIDE_DIR/subdomain-catchall.list"
+    if [ -f "$postfix_cf" ]; then
+      if grep -q '^# Generated by mailu-helper.sh$' "$postfix_cf"; then
+        rm -f "$postfix_cf"
+        ok "已删除 mailu-helper 生成的 postfix.cf"
+      elif grep -q 'BEGIN MAILU_HELPER_WILDCARD' "$postfix_cf"; then
+        backup_file "$postfix_cf"
+        sed -i '/# BEGIN MAILU_HELPER_WILDCARD/,/# END MAILU_HELPER_WILDCARD/d' "$postfix_cf"
+        ok "已清理 postfix.cf 管理块"
+      fi
+    fi
+  else
+    [ -f "$list" ] || { warn "helper 列表不存在，没有可按域名删除的配置：$list"; return 0; }
+    backup_file "$list"
+    tmp_list="$list.tmp.$$"
+    cp "$list" "$tmp_list"
+    for domain in "${SELECTED_DOMAINS[@]}"; do
+      next_tmp="$list.tmp.$$.next"
+      grep -Fv "$domain|" "$tmp_list" > "$next_tmp" || true
+      mv "$next_tmp" "$tmp_list"
+      ok "已从 helper 列表移除：$domain"
+    done
+    mv "$tmp_list" "$list"
+    chmod 0644 "$list"
+    if [ -s "$list" ]; then
+      ensure_postfix_cf_managed
+      write_wildcard_rule_files_from_list
+    else
+      rm -f "$POSTFIX_OVERRIDE_DIR/wildcard_domains" "$POSTFIX_OVERRIDE_DIR/wildcard_aliases"
+      warn "helper 列表已为空，已删除 wildcard_domains / wildcard_aliases。"
     fi
   fi
   if confirm "是否重启 smtp？"; then
@@ -2238,7 +2424,7 @@ manage_subdomain_catchall() {
       1) add_temporary_subdomain_catchall ;;
       2) add_long_lived_subdomain_catchall ;;
       3)
-        ensure_context && ensure_postfix_override_dir && ensure_postfix_cf_managed && write_wildcard_rule_files_from_list
+        ensure_context && ensure_postfix_override_dir && ensure_subdomain_catchall_list && ensure_postfix_cf_managed && write_wildcard_rule_files_from_list
         confirm "是否重启 smtp？" "Y" && dc restart smtp
         ;;
       4) remove_helper_wildcard_config ;;
