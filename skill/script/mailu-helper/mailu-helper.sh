@@ -55,6 +55,11 @@ is_valid_domain() {
   printf '%s' "$value" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$'
 }
 
+is_valid_email() {
+  local value="$1"
+  printf '%s' "$value" | grep -Eq '^[^@[:space:]]+@[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$'
+}
+
 pause() {
   printf '\n按 Enter 继续...'
   IFS= read -r _ || true
@@ -2021,13 +2026,33 @@ admin_accounts() {
   dc exec admin flask mailu "$cmd" "$user" "$domain" "$pass"
 }
 
+ask_catchall_target() {
+  local domain="$1"
+  local target target_domain
+  while true; do
+    target="$(ask "目标邮箱：$domain（直接转发到外部邮箱请填 QQ/Gmail，不要直接回车）" "")"
+    if ! is_valid_email "$target"; then
+      warn "请输入完整邮箱地址，例如 1543876284@qq.com。"
+      continue
+    fi
+    target_domain="${target##*@}"
+    if [ "$target_domain" = "$domain" ]; then
+      warn "你填的是本地域名邮箱：$target"
+      warn "catch-all 会先投递到这个本地邮箱；这不是直接外转到 QQ/Gmail。"
+      confirm "确认仍然使用这个本地邮箱作为 catch-all 目标？" || continue
+    fi
+    printf '%s' "$target"
+    return 0
+  done
+}
+
 root_catchall() {
   ensure_context || return 1
   load_env_defaults
   printf '\n%s\n' "${BOLD}根域名 catch-all 引导${RESET}"
   local domain target
   domain="$(ask "根域名" "${MAIL_DOMAIN:-}")"
-  target="$(ask "转发到哪个邮箱" "admin@$domain")"
+  target="$(ask_catchall_target "$domain")"
 
   printf '\n后台方式：\n'
   printf '  Mailu 后台 -> Aliases -> 添加：*@%s -> %s，并开启 wildcard / catch-all\n' "$domain" "$target"
@@ -2183,7 +2208,7 @@ append_wildcard_rule_line() {
 
 ask_target_for_domain() {
   local domain="$1"
-  ask "目标邮箱：$domain" "admin@$domain"
+  ask_catchall_target "$domain"
 }
 
 ensure_subdomain_catchall_list() {
