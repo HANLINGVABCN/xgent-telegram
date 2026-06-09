@@ -2022,24 +2022,11 @@ admin_accounts() {
 }
 
 root_catchall() {
-  ensure_context || return 1
-  load_env_defaults
   printf '\n%s\n' "${BOLD}根域名 catch-all 引导${RESET}"
-  local domain target
-  domain="$(ask "根域名" "${MAIL_DOMAIN:-}")"
-  target="$(ask "本地接收邮箱" "admin@$domain")"
-
-  printf '\n后台方式：\n'
-  printf '  Mailu 后台 -> Aliases -> 添加：*@%s -> %s，并开启 wildcard / catch-all\n' "$domain" "$target"
-  printf '\nDNS 提醒：\n'
-  printf '  根域名 catch-all 不需要额外 DNS。邮箱前缀不参与 DNS 查询，*@%s 仍然只看 %s 的 MX/SPF/DKIM/DMARC。\n' "$domain" "$domain"
-  printf '  如果你要收 *@任意子域.%s，才需要额外添加 *.%s 的通配 MX/SPF。\n' "$domain" "$domain"
-  printf '\n命令方式：\n'
-  printf "  docker compose exec admin flask mailu alias -w '*' %s %s\n" "$domain" "$target"
-
-  if confirm "是否现在执行命令方式？"; then
-    dc exec admin flask mailu alias -w '*' "$domain" "$target"
-  fi
+  printf '根域名 catch-all 不需要额外 DNS。\n'
+  printf '请在 Mailu 后台添加别名：名称填 *，域名选择对应根域名，目标填本地接收邮箱（例如 admin@example.com）。\n'
+  printf '如果要转发到 QQ/Gmail/Outlook，请到这个本地接收邮箱的用户设置里配置转发。\n'
+  printf '如果要收任意子域名邮箱（例如 anything@sub.example.com），请使用菜单 8。\n'
 }
 
 escape_regex() {
