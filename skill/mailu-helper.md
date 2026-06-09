@@ -250,7 +250,9 @@ docker compose exec admin flask mailu user 用户名 域名 密码
 Aliases -> 添加 *@example.com -> admin@example.com，并开启 wildcard / catch-all
 ```
 
-如果希望 catch-all 直接转发到外部邮箱，请把目标直接填成外部邮箱（例如 QQ/Gmail）。填 `admin@example.com` 这类本地域名邮箱时，邮件会先投递并保存在 Mailu 本地邮箱，是否继续外转取决于该本地用户自己的转发设置。
+catch-all 负责把不存在的地址收进本地接收邮箱；转发到 QQ/Gmail 等外部邮箱，需要在该本地用户的 Mailu 后台转发设置里配置。
+
+看到日志 `to=<admin@example.com> ... status=sent (Saved)` 只表示 catch-all 已经投递到本地接收邮箱。要确认外转是否执行，需要继续查看是否有发往外部邮箱的后续投递日志，以及该用户的 `forward_enabled` / `forward_destination` 设置。
 
 任意子域名 catch-all 使用菜单第 8 项或：
 
