@@ -888,6 +888,27 @@ start_with_pm2() {
     fi
 }
 
+restart_app() {
+    info "[重启] 正在重启 Telegram AI Bot..."
+
+    if command_exists pm2 && pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
+        echo "   检测到 PM2 进程，将按当前脚本配置重新创建。"
+        start_with_pm2
+        return
+    fi
+
+    if [ -f "bot.pid" ]; then
+        echo "   未检测到 PM2 进程，将按 nohup 后台模式重启。"
+        stop_background_process
+        start_background
+        return
+    fi
+
+    warn "   未检测到正在运行的 PM2/nohup 进程。"
+    echo "   请先选择 2) 后台运行 或 3) PM2 守护运行 启动一次。"
+    return 1
+}
+
 show_menu() {
     echo ""
     echo "请选择操作:"
@@ -895,9 +916,10 @@ show_menu() {
     echo "  2) 后台运行 (nohup)"
     echo "  3) PM2 守护运行 (未安装时自动补齐)"
     echo "  4) 仅检查环境"
-    echo "  5) IP 出站模式 ($(ip_mode_label))"
-    echo "  6) 卸载本脚本安装的运行内容"
-    echo "  7) 退出"
+    echo "  5) 重启 Bot"
+    echo "  6) IP 出站模式 ($(ip_mode_label))"
+    echo "  7) 卸载本脚本安装的运行内容"
+    echo "  8) 退出"
     echo ""
 }
 
@@ -905,6 +927,7 @@ show_usage() {
     echo "用法:"
     echo "  ./install.sh                 打开数字菜单"
     echo "  ./install.sh install         打开数字菜单"
+    echo "  ./install.sh restart         重启当前 PM2/nohup Bot 进程"
     echo "  ./install.sh uninstall       卸载本脚本安装的运行内容"
     echo "  ./install.sh uninstall -y    跳过确认直接卸载"
 }
@@ -940,7 +963,7 @@ main() {
     print_banner
 
     show_menu
-    read -r -p "请输入选项 [1/2/3/4/5/6/7，默认 1]: " choice
+    read -r -p "请输入选项 [1/2/3/4/5/6/7/8，默认 1]: " choice
 
     case "$choice" in
         ""|1)
@@ -960,14 +983,18 @@ main() {
             success "环境检查完成，未启动任何服务。"
             ;;
         5)
+            prepare_environment
+            restart_app
+            ;;
+        6)
             configure_ip_mode
             exit 0
             ;;
-        6)
+        7)
             uninstall_app --no-banner
             exit 0
             ;;
-        7)
+        8)
             warn "已退出。"
             exit 0
             ;;
@@ -987,6 +1014,11 @@ main() {
 case "${1:-}" in
     install|--install)
         main
+        ;;
+    restart|--restart)
+        print_banner
+        prepare_environment
+        restart_app
         ;;
     uninstall|--uninstall|remove|--remove)
         shift
