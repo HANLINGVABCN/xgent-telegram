@@ -120,9 +120,9 @@ run_bot_python() {
     app_entry="${TELEGRAM_AI_BOT_APP_ENTRY:-$APP_ENTRY}"
 
     if [ "$mode" = "default" ]; then
-        TELEGRAM_AI_BOT_IP_MODE= TELEGRAM_AI_BOT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
+        env -u TELEGRAM_AI_BOT_IP_MODE TELEGRAM_AI_BOT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
     else
-        TELEGRAM_AI_BOT_IP_MODE="$mode" TELEGRAM_AI_BOT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
+        env TELEGRAM_AI_BOT_IP_MODE="$mode" TELEGRAM_AI_BOT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
     fi
 }
 
@@ -837,9 +837,9 @@ start_background() {
     pythonpath="$(pythonpath_with_project)"
     code="$(bot_python_code)"
     if [ "$mode" = "default" ]; then
-        TELEGRAM_AI_BOT_IP_MODE= TELEGRAM_AI_BOT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" nohup "$VENV_PYTHON" -c "$code" > bot_output.log 2>&1 &
+        env -u TELEGRAM_AI_BOT_IP_MODE TELEGRAM_AI_BOT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" nohup "$VENV_PYTHON" -c "$code" > bot_output.log 2>&1 &
     else
-        TELEGRAM_AI_BOT_IP_MODE="$mode" TELEGRAM_AI_BOT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" nohup "$VENV_PYTHON" -c "$code" > bot_output.log 2>&1 &
+        env TELEGRAM_AI_BOT_IP_MODE="$mode" TELEGRAM_AI_BOT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" nohup "$VENV_PYTHON" -c "$code" > bot_output.log 2>&1 &
     fi
     local pid=$!
     echo "$pid" > bot.pid
@@ -888,12 +888,44 @@ start_with_pm2() {
     fi
 }
 
+restart_pm2_detached() {
+    local helper log_file mode
+    helper="/tmp/${PM2_APP_NAME}-restart-$(date +%Y%m%d%H%M%S)-$$.sh"
+    log_file="/tmp/${PM2_APP_NAME}-restart.log"
+    mode="$(get_ip_mode)"
+
+    cat > "$helper" <<EOF
+#!/usr/bin/env bash
+set -u
+{
+  echo "===== $PM2_APP_NAME detached restart started at \$(date '+%F %T') ====="
+  cd "$SCRIPT_DIR" || exit 1
+  if [ "$mode" = "default" ]; then
+    unset TELEGRAM_AI_BOT_IP_MODE || true
+  else
+    export TELEGRAM_AI_BOT_IP_MODE="$mode"
+  fi
+  bash "$SCRIPT_DIR/install.sh" pm2-start-internal
+  status=\$?
+  pm2 save || true
+  echo "===== $PM2_APP_NAME detached restart finished with status \$status at \$(date '+%F %T') ====="
+  exit \$status
+} >> "$log_file" 2>&1
+EOF
+    chmod +x "$helper"
+
+    nohup bash -c "sleep 2; '$helper'" >/dev/null 2>&1 &
+    echo "   已启动脱离当前会话的 PM2 重建任务。"
+    echo "   日志文件: $log_file"
+    echo "   如果当前 Bot 短暂断开，请等待 5-10 秒后重新 /start。"
+}
+
 restart_app() {
     info "[重启] 正在重启 Telegram AI Bot..."
 
     if command_exists pm2 && pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
-        echo "   检测到 PM2 进程，将按当前脚本配置重新创建。"
-        start_with_pm2
+        echo "   检测到 PM2 进程，将按当前脚本配置脱离当前会话重新创建。"
+        restart_pm2_detached
         return
     fi
 
@@ -1014,6 +1046,10 @@ main() {
 case "${1:-}" in
     install|--install)
         main
+        ;;
+    pm2-start-internal)
+        prepare_environment
+        start_with_pm2
         ;;
     restart|--restart)
         print_banner
