@@ -18,6 +18,7 @@ APP_ENTRY="bot_server.py"
 PM2_APP_NAME="telegram-ai-bot"
 STATE_DIR="$SCRIPT_DIR/.install-state"
 APT_STATE_FILE="$STATE_DIR/apt-packages.txt"
+IP_MODE_FILE="$STATE_DIR/ip-mode"
 APT_UPDATED=0
 SKIP_CONFIRM=0
 
@@ -52,6 +53,191 @@ command_exists() {
 
 ensure_state_dir() {
     mkdir -p "$STATE_DIR"
+}
+
+get_ip_mode() {
+    local mode=""
+
+    if [ -f "$IP_MODE_FILE" ]; then
+        mode="$(tr -d '[:space:]' < "$IP_MODE_FILE" 2>/dev/null || true)"
+    fi
+
+    case "$mode" in
+        ipv4|ipv6)
+            printf '%s\n' "$mode"
+            ;;
+        *)
+            printf 'default\n'
+            ;;
+    esac
+}
+
+ip_mode_label() {
+    case "$(get_ip_mode)" in
+        ipv4)
+            printf '仅 IPv4'
+            ;;
+        ipv6)
+            printf '仅 IPv6'
+            ;;
+        *)
+            printf '服务器默认'
+            ;;
+    esac
+}
+
+set_ip_mode() {
+    local mode="$1"
+
+    case "$mode" in
+        ipv4|ipv6)
+            ensure_state_dir
+            printf '%s\n' "$mode" > "$IP_MODE_FILE"
+            ;;
+        default)
+            rm -f "$IP_MODE_FILE"
+            rmdir "$STATE_DIR" 2>/dev/null || true
+            ;;
+        *)
+            error "[错误] 无效 IP 模式: $mode"
+            exit 1
+            ;;
+    esac
+}
+
+pythonpath_with_project() {
+    if [ -n "${PYTHONPATH:-}" ]; then
+        printf '%s:%s\n' "$SCRIPT_DIR" "$PYTHONPATH"
+    else
+        printf '%s\n' "$SCRIPT_DIR"
+    fi
+}
+
+run_bot_python() {
+    local mode pythonpath app_entry
+    mode="$(get_ip_mode)"
+    pythonpath="$(pythonpath_with_project)"
+    app_entry="${TELEGRAM_AI_BOT_APP_ENTRY:-$APP_ENTRY}"
+
+    if [ "$mode" = "default" ]; then
+        TELEGRAM_AI_BOT_IP_MODE= TELEGRAM_AI_BOT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
+    else
+        TELEGRAM_AI_BOT_IP_MODE="$mode" TELEGRAM_AI_BOT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
+    fi
+}
+
+ip_family_restrictor_python() {
+    cat <<'PY'
+import errno
+import os
+import socket
+
+_ip_mode = (os.environ.get("TELEGRAM_AI_BOT_IP_MODE") or "").strip().lower()
+_allowed_family = None
+_blocked_family = None
+
+if _ip_mode in {"ipv4", "4", "only_ipv4", "ipv4_only"}:
+    _allowed_family = socket.AF_INET
+    _blocked_family = socket.AF_INET6
+elif _ip_mode in {"ipv6", "6", "only_ipv6", "ipv6_only"}:
+    _allowed_family = socket.AF_INET6
+    _blocked_family = socket.AF_INET
+
+if _allowed_family is not None and _blocked_family is not None:
+    _original_getaddrinfo = socket.getaddrinfo
+    _original_socket = socket.socket
+
+    def _family_name(family):
+        if family == socket.AF_INET:
+            return "IPv4"
+        if family == socket.AF_INET6:
+            return "IPv6"
+        return str(family)
+
+    def _blocked_error():
+        return OSError(
+            errno.EAFNOSUPPORT,
+            f"{_family_name(_blocked_family)} is disabled by TELEGRAM_AI_BOT_IP_MODE={_ip_mode}",
+        )
+
+    def _restricted_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        if family in (0, socket.AF_UNSPEC):
+            family = _allowed_family
+        elif family == _blocked_family:
+            raise socket.gaierror(socket.EAI_NONAME, str(_blocked_error()))
+
+        results = _original_getaddrinfo(host, port, family, type, proto, flags)
+        filtered = [item for item in results if item and item[0] == _allowed_family]
+        if not filtered:
+            raise socket.gaierror(
+                socket.EAI_NONAME,
+                f"no {_family_name(_allowed_family)} address available for {host!r}",
+            )
+        return filtered
+
+    class _RestrictedSocket(_original_socket):
+        def __init__(self, family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0, fileno=None):
+            if family == _blocked_family:
+                raise _blocked_error()
+            if fileno is None:
+                super().__init__(family, type, proto)
+            else:
+                super().__init__(family, type, proto, fileno=fileno)
+
+    socket.getaddrinfo = _restricted_getaddrinfo
+    socket.socket = _RestrictedSocket
+PY
+}
+
+bot_python_code() {
+    ip_family_restrictor_python
+    cat <<'PY'
+import os
+import runpy
+from pathlib import Path
+
+_app_entry = os.environ.get("TELEGRAM_AI_BOT_APP_ENTRY") or "bot_server.py"
+_app_path = Path(_app_entry)
+if not _app_path.is_absolute():
+    _app_path = Path.cwd() / _app_path
+runpy.run_path(str(_app_path), run_name="__main__")
+PY
+}
+
+configure_ip_mode() {
+    local choice
+
+    echo ""
+    echo "当前 IP 限制: $(ip_mode_label)"
+    echo "请选择 IP 出站模式:"
+    echo "  1) 仅 IPv4 - 禁用 IPv6，Telegram 和 AI 服务等运行期请求只解析/连接 IPv4"
+    echo "  2) 仅 IPv6 - 禁用 IPv4，Telegram 和 AI 服务等运行期请求只解析/连接 IPv6"
+    echo "  3) 撤回修改 - 取消限制，恢复服务器默认网络栈"
+    echo "  4) 返回主菜单"
+    echo ""
+    read -r -p "请输入选项 [1/2/3/4，默认 4]: " choice
+
+    case "$choice" in
+        1)
+            set_ip_mode ipv4
+            success "已设置为仅 IPv4。请重启 Bot 后生效。"
+            ;;
+        2)
+            set_ip_mode ipv6
+            success "已设置为仅 IPv6。请重启 Bot 后生效。"
+            ;;
+        3)
+            set_ip_mode default
+            success "已撤回 IP 限制，恢复服务器默认状态。请重启 Bot 后生效。"
+            ;;
+        ""|4)
+            warn "已返回主菜单。"
+            ;;
+        *)
+            error "[错误] 无效选项。"
+            exit 1
+            ;;
+    esac
 }
 
 run_privileged() {
@@ -252,7 +438,7 @@ stop_background_process() {
             continue
         fi
 
-        if [[ "$cmdline" == *"$APP_ENTRY"* ]] && { [[ "$cmdline" == *"$SCRIPT_DIR"* ]] || [[ "$cmdline" == *"$VENV_PYTHON"* ]]; }; then
+        if [[ "$cmdline" == *"$APP_ENTRY"* ]] && { [[ "$cmdline" == *"$SCRIPT_DIR"* ]] || [[ "$cmdline" == *"$VENV_PYTHON"* ]] || [[ "$cmdline" == *"TELEGRAM_AI_BOT_APP_ENTRY"* ]]; }; then
             found_extra=1
             info "[卸载] 正在停止残留进程: $pid"
             kill "$pid" 2>/dev/null || true
@@ -349,6 +535,15 @@ remove_recorded_apt_packages() {
     success "已处理 apt 安装记录"
 }
 
+remove_ip_mode_state() {
+    if [ -f "$IP_MODE_FILE" ]; then
+        info "[卸载] 正在清理 IP 出站模式设置"
+        rm -f "$IP_MODE_FILE"
+        rmdir "$STATE_DIR" 2>/dev/null || true
+        success "IP 出站模式设置已清理"
+    fi
+}
+
 uninstall_app() {
     if [ "${1:-}" != "--no-banner" ]; then
         print_banner
@@ -360,6 +555,7 @@ uninstall_app() {
     stop_background_process
     remove_virtualenv
     remove_recorded_apt_packages
+    remove_ip_mode_state
 
     echo ""
     echo -e "${CYAN}========================================================${NC}"
@@ -474,7 +670,8 @@ validate_telegram_token() {
 
     local status
     set +e
-    status=$(python - <<'PY'
+    status=$(run_bot_python python - <<PY
+$(ip_family_restrictor_python)
 import asyncio
 import sys
 from pathlib import Path
@@ -616,10 +813,13 @@ setup_pm2_startup() {
 
 start_foreground() {
     info "[运行] 正在前台启动 Telegram AI Bot..."
-    python "$APP_ENTRY"
+    echo "   IP 出站模式: $(ip_mode_label)"
+    run_bot_python python -c "$(bot_python_code)"
 }
 
 start_background() {
+    local mode pythonpath code
+
     info "[运行] 正在后台启动 Telegram AI Bot..."
 
     if [ -f "bot.pid" ]; then
@@ -632,7 +832,15 @@ start_background() {
         fi
     fi
 
-    nohup "$VENV_PYTHON" "$APP_ENTRY" > bot_output.log 2>&1 &
+    echo "   IP 出站模式: $(ip_mode_label)"
+    mode="$(get_ip_mode)"
+    pythonpath="$(pythonpath_with_project)"
+    code="$(bot_python_code)"
+    if [ "$mode" = "default" ]; then
+        TELEGRAM_AI_BOT_IP_MODE= TELEGRAM_AI_BOT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" nohup "$VENV_PYTHON" -c "$code" > bot_output.log 2>&1 &
+    else
+        TELEGRAM_AI_BOT_IP_MODE="$mode" TELEGRAM_AI_BOT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" nohup "$VENV_PYTHON" -c "$code" > bot_output.log 2>&1 &
+    fi
     local pid=$!
     echo "$pid" > bot.pid
     sleep 2
@@ -650,17 +858,22 @@ start_background() {
 }
 
 start_with_pm2() {
+    local code
+
     ensure_pm2
 
     info "[运行] 正在使用 PM2 启动 Telegram AI Bot..."
+    echo "   IP 出站模式: $(ip_mode_label)"
     pm2 delete "$PM2_APP_NAME" 2>/dev/null || true
-    pm2 start "$SCRIPT_DIR/$APP_ENTRY" \
+    code="$(bot_python_code)"
+    run_bot_python pm2 start "$VENV_PYTHON" \
         --name "$PM2_APP_NAME" \
         --cwd "$SCRIPT_DIR" \
-        --interpreter "$VENV_PYTHON" \
+        --interpreter none \
         --stop-exit-codes 78 \
         --max-memory-restart 500M \
-        --exp-backoff-restart-delay=100
+        --exp-backoff-restart-delay=100 \
+        -- -c "$code"
 
     echo "   PM2 启动成功。"
     echo "   查看日志: pm2 logs $PM2_APP_NAME"
@@ -682,8 +895,9 @@ show_menu() {
     echo "  2) 后台运行 (nohup)"
     echo "  3) PM2 守护运行 (未安装时自动补齐)"
     echo "  4) 仅检查环境"
-    echo "  5) 卸载本脚本安装的运行内容"
-    echo "  6) 退出"
+    echo "  5) IP 出站模式 ($(ip_mode_label))"
+    echo "  6) 卸载本脚本安装的运行内容"
+    echo "  7) 退出"
     echo ""
 }
 
@@ -726,7 +940,7 @@ main() {
     print_banner
 
     show_menu
-    read -r -p "请输入选项 [1/2/3/4/5/6，默认 1]: " choice
+    read -r -p "请输入选项 [1/2/3/4/5/6/7，默认 1]: " choice
 
     case "$choice" in
         ""|1)
@@ -746,10 +960,14 @@ main() {
             success "环境检查完成，未启动任何服务。"
             ;;
         5)
-            uninstall_app --no-banner
+            configure_ip_mode
             exit 0
             ;;
         6)
+            uninstall_app --no-banner
+            exit 0
+            ;;
+        7)
             warn "已退出。"
             exit 0
             ;;
