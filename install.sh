@@ -822,6 +822,7 @@ start_background() {
 
     info "[运行] 正在后台启动 Telegram AI Bot..."
 
+    # 彻底停止旧进程
     if [ -f "bot.pid" ]; then
         local old_pid
         old_pid="$(cat bot.pid)"
@@ -829,7 +830,11 @@ start_background() {
             echo "   正在停止旧进程: $old_pid"
             kill "$old_pid" 2>/dev/null || true
             sleep 2
+            if ps -p "$old_pid" >/dev/null 2>&1; then
+                kill -9 "$old_pid" 2>/dev/null || true
+            fi
         fi
+        rm -f bot.pid
     fi
 
     echo "   IP 出站模式: $(ip_mode_label)"
@@ -850,6 +855,7 @@ start_background() {
         echo "   日志文件: bot_output.log"
         echo "   停止命令: kill \$(cat bot.pid)"
         echo "   查看日志: tail -f bot_output.log"
+        echo "   彻底重启: bash install.sh restart"
     else
         error "[错误] 后台启动失败，请查看 bot_output.log。"
         tail -20 bot_output.log || true
@@ -864,7 +870,11 @@ start_with_pm2() {
 
     info "[运行] 正在使用 PM2 启动 Telegram AI Bot..."
     echo "   IP 出站模式: $(ip_mode_label)"
+
+    # 彻底删除旧进程，确保不会保留旧配置
     pm2 delete "$PM2_APP_NAME" 2>/dev/null || true
+    sleep 1
+
     code="$(bot_python_code)"
     run_bot_python pm2 start "$VENV_PYTHON" \
         --name "$PM2_APP_NAME" \
@@ -879,6 +889,7 @@ start_with_pm2() {
     echo "   查看日志: pm2 logs $PM2_APP_NAME"
     echo "   停止命令: pm2 stop $PM2_APP_NAME"
     echo "   重启命令: pm2 restart $PM2_APP_NAME"
+    echo "   彻底重启: bash install.sh restart"
     setup_pm2_startup
 
     if pm2 save >/dev/null; then
@@ -900,11 +911,22 @@ set -u
 {
   echo "===== $PM2_APP_NAME detached restart started at \$(date '+%F %T') ====="
   cd "$SCRIPT_DIR" || exit 1
+
+  # 彻底停止旧进程
+  if pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
+    echo "Stopping PM2 process: $PM2_APP_NAME"
+    pm2 delete "$PM2_APP_NAME" >/dev/null 2>&1 || true
+    sleep 1
+  fi
+
+  # 设置 IP 模式环境变量
   if [ "$mode" = "default" ]; then
     unset TELEGRAM_AI_BOT_IP_MODE || true
   else
     export TELEGRAM_AI_BOT_IP_MODE="$mode"
   fi
+
+  # 彻底重启：重新准备环境并启动
   bash "$SCRIPT_DIR/install.sh" pm2-start-internal
   status=\$?
   pm2 save || true
@@ -915,23 +937,24 @@ EOF
     chmod +x "$helper"
 
     nohup bash -c "sleep 2; '$helper'" >/dev/null 2>&1 &
-    echo "   已启动脱离当前会话的 PM2 重建任务。"
+    echo "   已启动脱离当前会话的 PM2 彻底重启任务。"
     echo "   日志文件: $log_file"
     echo "   如果当前 Bot 短暂断开，请等待 5-10 秒后重新 /start。"
 }
 
 restart_app() {
-    info "[重启] 正在重启 Telegram AI Bot..."
+    info "[重启] 正在彻底重启 Telegram AI Bot..."
 
     if command_exists pm2 && pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
-        echo "   检测到 PM2 进程，将按当前脚本配置脱离当前会话重新创建。"
+        echo "   检测到 PM2 进程，将彻底删除并重新创建以确保加载最新配置。"
         restart_pm2_detached
         return
     fi
 
     if [ -f "bot.pid" ]; then
-        echo "   未检测到 PM2 进程，将按 nohup 后台模式重启。"
+        echo "   检测到 nohup 进程，将彻底停止并重新启动以确保加载最新配置。"
         stop_background_process
+        sleep 1
         start_background
         return
     fi

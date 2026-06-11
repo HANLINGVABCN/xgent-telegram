@@ -7279,17 +7279,35 @@ async def cmd_restart_system(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await restart_current_process(update.effective_chat.id)
 
 async def restart_current_process(chat_id: int):
+    """彻底重启进程，确保重新加载所有配置"""
     db = await BotMemoryDB.get_instance()
     await db.set_config('restart_notify_chat_id', chat_id)
     await db.close()
 
-    restart_env = os.environ.copy()
-    for key in ("UPDATE_GITHUB_TOKEN", "GITHUB_TOKEN", "UPDATE_ZIP_URL"):
-        restart_env.pop(key, None)
-    try:
-        os.execve(sys.executable, [sys.executable] + sys.argv, restart_env)
-    except Exception:
-        sys.exit(0)
+    # 检测是否在 PM2 下运行
+    is_pm2 = any(k in os.environ for k in ('PM2_HOME', 'pm_id', 'PM2_USAGE'))
+
+    if is_pm2:
+        # PM2 模式：调用 install.sh 脱离重启
+        install_sh = os.path.join(PROJECT_ROOT, 'install.sh')
+        if os.path.exists(install_sh):
+            logger.info("检测到 PM2 环境，调用 install.sh restart 彻底重启")
+            try:
+                subprocess.Popen(
+                    ['bash', install_sh, 'restart'],
+                    cwd=PROJECT_ROOT,
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.warning(f"调用 install.sh restart 失败: {e}，回退到直接退出")
+
+    # 彻底退出进程，让外层管理器（PM2/systemd/nohup）重新启动
+    # 这样确保重新加载 .env 和所有配置文件
+    logger.info("进程即将退出以完成重启")
+    sys.exit(0)
 
 async def cmd_update_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
