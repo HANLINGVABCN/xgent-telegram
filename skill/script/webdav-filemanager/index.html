@@ -177,6 +177,12 @@ body {
     transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1);
     width: 0%;
 }
+.disk-bar-other {
+    height: 100%;
+    background: rgba(251, 191, 36, 0.28);
+    transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+    width: 0%;
+}
 .disk-text {
     font-size: 0.72rem;
     color: var(--text-muted);
@@ -1656,6 +1662,7 @@ body {
                 <div class="disk-bar-outer">
                     <div class="disk-bar-fill" id="diskFill"></div>
                     <div class="disk-bar-free" id="diskFreeFill"></div>
+                    <div class="disk-bar-other" id="diskOtherFill"></div>
                 </div>
                 <span class="disk-text" id="diskText">正在加载磁盘信息...</span>
             </div>
@@ -5053,16 +5060,22 @@ function renderDisk() {
     if (!diskInfo) return;
     const usedEl = document.getElementById('diskFill');
     const freeEl = document.getElementById('diskFreeFill');
+    const otherEl = document.getElementById('diskOtherFill');
     const txt = document.getElementById('diskText');
     const total = Number(diskInfo.total) || 0;
     const rootSize = Number(diskInfo.rootSize) || 0;
     const free = Number(diskInfo.free) || 0;
+    const used = Number(diskInfo.used) || 0;
+    const other = used - rootSize;
     const rootPct = total ? Math.min(100, rootSize / total * 100) : 0;
     const freePct = total ? Math.min(100 - rootPct, free / total * 100) : 0;
+    const otherPct = total ? Math.min(100 - rootPct - freePct, other / total * 100) : 0;
     if (usedEl) usedEl.style.width = rootPct + '%';
     if (freeEl) freeEl.style.width = freePct + '%';
+    if (otherEl) otherEl.style.width = otherPct + '%';
     if (txt) {
-        txt.textContent = `网盘文件 ${diskInfo.rootSizeStr} / 可用 ${diskInfo.freeStr} / 总 ${diskInfo.totalStr}`;
+        const otherStr = formatSize(other);
+        txt.textContent = `网盘文件 ${diskInfo.rootSizeStr} / 可用 ${diskInfo.freeStr} / 其他 ${otherStr} / 总 ${diskInfo.totalStr}`;
     }
     renderSettingsDiskInfo();
 }
