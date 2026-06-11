@@ -5074,8 +5074,7 @@ function renderDisk() {
     if (freeEl) freeEl.style.width = freePct + '%';
     if (otherEl) otherEl.style.width = otherPct + '%';
     if (txt) {
-        const otherStr = formatSize(other);
-        txt.textContent = `网盘文件 ${diskInfo.rootSizeStr} / 可用 ${diskInfo.freeStr} / 其他 ${otherStr} / 总 ${diskInfo.totalStr}`;
+        txt.textContent = `网盘文件 ${diskInfo.rootSizeStr} / 可用 ${diskInfo.freeStr} / 其他 ${diskInfo.usedStr} / 总 ${diskInfo.totalStr}`;
     }
     renderSettingsDiskInfo();
 }
