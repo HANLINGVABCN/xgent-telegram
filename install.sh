@@ -58,8 +58,8 @@ ensure_state_dir() {
 get_ip_mode() {
     local mode=""
 
-    if [ -f "$IP_MODE_FILE" ]; then
-        mode="$(tr -d '[:space:]' < "$IP_MODE_FILE" 2>/dev/null || true)"
+    if [ -f ".env" ]; then
+        mode="$(grep -E "^TELEGRAM_AI_BOT_IP_MODE=" .env 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '[:space:]' || true)"
     fi
 
     case "$mode" in
@@ -88,15 +88,23 @@ ip_mode_label() {
 
 set_ip_mode() {
     local mode="$1"
+    local tmp_file
 
     case "$mode" in
         ipv4|ipv6)
-            ensure_state_dir
-            printf '%s\n' "$mode" > "$IP_MODE_FILE"
+            tmp_file="$(mktemp)"
+            if [ -f ".env" ]; then
+                grep -v "^TELEGRAM_AI_BOT_IP_MODE=" .env > "$tmp_file" || true
+            fi
+            printf 'TELEGRAM_AI_BOT_IP_MODE=%s\n' "$mode" >> "$tmp_file"
+            mv "$tmp_file" .env
             ;;
         default)
-            rm -f "$IP_MODE_FILE"
-            rmdir "$STATE_DIR" 2>/dev/null || true
+            if [ -f ".env" ]; then
+                tmp_file="$(mktemp)"
+                grep -v "^TELEGRAM_AI_BOT_IP_MODE=" .env > "$tmp_file" || true
+                mv "$tmp_file" .env
+            fi
             ;;
         *)
             error "[错误] 无效 IP 模式: $mode"
@@ -206,9 +214,10 @@ PY
 
 configure_ip_mode() {
     local choice
+    local current_label="$(ip_mode_label)"
 
     echo ""
-    echo "当前 IP 限制: $(ip_mode_label)"
+    echo "当前 IP 限制: $current_label"
     echo "请选择 IP 出站模式:"
     echo "  1) 仅 IPv4 - 禁用 IPv6，Telegram 和 AI 服务等运行期请求只解析/连接 IPv4"
     echo "  2) 仅 IPv6 - 禁用 IPv4，Telegram 和 AI 服务等运行期请求只解析/连接 IPv6"
@@ -965,14 +974,15 @@ restart_app() {
 }
 
 show_menu() {
+    local current_mode_label="$(ip_mode_label)"
     echo ""
     echo "请选择操作:"
     echo "  1) 前台运行"
     echo "  2) 后台运行 (nohup)"
     echo "  3) PM2 守护运行 (未安装时自动补齐)"
     echo "  4) 仅检查环境"
-    echo "  5) 重启 Bot"
-    echo "  6) IP 出站模式 ($(ip_mode_label))"
+    echo "  5) 重启 Bot (当前: $current_mode_label)"
+    echo "  6) IP 出站模式 (当前: $current_mode_label)"
     echo "  7) 卸载本脚本安装的运行内容"
     echo "  8) 退出"
     echo ""
