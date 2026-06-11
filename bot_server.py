@@ -102,7 +102,6 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 UPDATE_SKIP_NAMES = {
     ".env",
     ".git",
-    ".install-state",
     "bot_memory.db",
     "bot_output.log",
     "bot_server.log",
