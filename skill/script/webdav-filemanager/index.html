@@ -5066,10 +5066,10 @@ function renderDisk() {
     const rootSize = Number(diskInfo.rootSize) || 0;
     const free = Number(diskInfo.free) || 0;
     const used = Number(diskInfo.used) || 0;
-    const other = used - rootSize;
+    const other = Math.max(0, used - rootSize);
     const rootPct = total ? Math.min(100, rootSize / total * 100) : 0;
     const freePct = total ? Math.min(100 - rootPct, free / total * 100) : 0;
-    const otherPct = total ? Math.min(100 - rootPct - freePct, other / total * 100) : 0;
+    const otherPct = total ? Math.max(0, Math.min(100 - rootPct - freePct, other / total * 100)) : 0;
     if (usedEl) usedEl.style.width = rootPct + '%';
     if (freeEl) freeEl.style.width = freePct + '%';
     if (otherEl) otherEl.style.width = otherPct + '%';
