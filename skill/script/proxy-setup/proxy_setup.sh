@@ -72,6 +72,7 @@ NODE_NAME="MyProxy"
 DOMAIN=""
 UUID=""
 PASSWORD=""
+OBFS_PASSWORD=""
 SNI="www.microsoft.com"
 PRIVATE_KEY=""
 PUBLIC_KEY=""
@@ -362,8 +363,23 @@ warp_wg_read_reserved() {
     fi
 }
 
+# ==================== WireGuard MTU 自动探测 ====================
+detect_optimal_mtu() {
+    local target="1.1.1.1"
+    local mtu
+    for mtu in 1500 1492 1420 1400 1380 1280; do
+        if ping -c 1 -W 2 -M do -s $((mtu - 28)) "$target" >/dev/null 2>&1; then
+            echo $((mtu - 80))  # WireGuard 开销 (IPv6 worst case)
+            return 0
+        fi
+    done
+    echo 1420  # 兜底: WireGuard 推荐默认值
+}
+
 # 生成 WireGuard endpoints 配置块 (sing-box 1.11+ 格式)
 gen_wg_endpoints_block() {
+    local optimal_mtu
+    optimal_mtu=$(detect_optimal_mtu)
     local priv peer_pub reserved v4 v6 ep ep_port
     priv=$(warp_wg_read_field "private_key")
     peer_pub=$(warp_wg_read_field "peer_public_key")
@@ -381,7 +397,7 @@ gen_wg_endpoints_block() {
       "type":"wireguard",
       "tag":"out-warp",
       "system":false,
-      "mtu":1280,
+      "mtu":${optimal_mtu},
       "address":["${v4}","${v6}"],
       "private_key":"${priv}",
       "peers":[
@@ -1032,7 +1048,7 @@ User=root
 ExecStart=/usr/local/bin/sing-box run -c $CONFIG_FILE
 Restart=on-failure
 RestartSec=3
-LimitNOFILE=65535
+LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOSVC
@@ -1408,9 +1424,78 @@ EOWARPMODE
 }
 
 # ==================== 配置生成 ====================
-gen_inbound_reality()   { local p=$1 t=$2; echo '    { "type":"vless","tag":"'$t'","listen":"0.0.0.0","listen_port":'$p',"users":[{"uuid":"'$UUID'","flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":"'$SNI'","reality":{"enabled":true,"handshake":{"server":"'$SNI'","server_port":443},"private_key":"'$PRIVATE_KEY'","short_id":["'$SHORT_ID'"]}}}'; }
-gen_inbound_hysteria2() { local p=$1 t=$2; echo '    { "type":"hysteria2","tag":"'$t'","listen":"0.0.0.0","listen_port":'$p',"up_mbps":200,"down_mbps":1000,"users":[{"password":"'$PASSWORD'"}],"tls":{"enabled":true,"certificate_path":"'$TLS_CERT'","key_path":"'$TLS_KEY'"}}'; }
-gen_inbound_tuic()      { local p=$1 t=$2; echo '    { "type":"tuic","tag":"'$t'","listen":"0.0.0.0","listen_port":'$p',"users":[{"uuid":"'$UUID'","password":"'$PASSWORD'"}],"congestion_control":"bbr","tls":{"enabled":true,"alpn":["h3"],"certificate_path":"'$TLS_CERT'","key_path":"'$TLS_KEY'"}}'; }
+gen_inbound_reality() {
+    local p=$1 t=$2
+    cat <<EOREAL
+    {
+      "type": "vless",
+      "tag": "$t",
+      "listen": "0.0.0.0",
+      "listen_port": $p,
+      "users": [{"uuid": "$UUID", "flow": "xtls-rprx-vision"}],
+      "tls": {
+        "enabled": true,
+        "server_name": "$SNI",
+        "reality": {
+          "enabled": true,
+          "handshake": {"server": "$SNI", "server_port": 443},
+          "private_key": "$PRIVATE_KEY",
+          "short_id": ["$SHORT_ID"]
+        }
+      },
+      "multiplex": {
+        "enabled": true,
+        "padding": true
+      }
+    }
+EOREAL
+}
+gen_inbound_hysteria2() {
+    local p=$1 t=$2
+    cat <<EOHYST
+    {
+      "type": "hysteria2",
+      "tag": "$t",
+      "listen": "0.0.0.0",
+      "listen_port": $p,
+      "up_mbps": 1000,
+      "down_mbps": 1000,
+      "ignore_client_bandwidth": true,
+      "obfs": {
+        "type": "salamander",
+        "password": "$OBFS_PASSWORD"
+      },
+      "users": [{"password": "$PASSWORD"}],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "$TLS_CERT",
+        "key_path": "$TLS_KEY"
+      }
+    }
+EOHYST
+}
+gen_inbound_tuic() {
+    local p=$1 t=$2
+    cat <<EOTUIC
+    {
+      "type": "tuic",
+      "tag": "$t",
+      "listen": "0.0.0.0",
+      "listen_port": $p,
+      "users": [{"uuid": "$UUID", "password": "$PASSWORD"}],
+      "congestion_control": "bbr",
+      "auth_timeout": "3s",
+      "zero_rtt_handshake": true,
+      "heartbeat": "10s",
+      "tls": {
+        "enabled": true,
+        "alpn": ["h3"],
+        "certificate_path": "$TLS_CERT",
+        "key_path": "$TLS_KEY"
+      }
+    }
+EOTUIC
+}
 gen_inbound_ss2022()    { local p=$1 t=$2; local k=$(echo "$PASSWORD"|sed 's/^2022-blake3-aes-256-gcm://'); echo '    { "type":"shadowsocks","tag":"'$t'","listen":"0.0.0.0","listen_port":'$p',"method":"2022-blake3-aes-256-gcm","password":"'$k'"}'; }
 gen_inbound_vless_ws()  { local p=$1 t=$2; local wp=$(cat "$WORK_DIR/ws_path.txt" 2>/dev/null); echo '    { "type":"vless","tag":"'$t'","listen":"0.0.0.0","listen_port":'$p',"users":[{"uuid":"'$UUID'"}],"transport":{"type":"ws","path":"'$wp'"},"tls":{"enabled":true,"server_name":"'$DOMAIN'","acme":{"domain":["'$DOMAIN'"],"email":"admin@'$DOMAIN'"}}}'; }
 gen_inbound_vmess_ws()  { local p=$1 t=$2; local wp=$(cat "$WORK_DIR/ws_path.txt" 2>/dev/null); echo '    { "type":"vmess","tag":"'$t'","listen":"0.0.0.0","listen_port":'$p',"users":[{"uuid":"'$UUID'","alterId":0}],"transport":{"type":"ws","path":"'$wp'"},"tls":{"enabled":true,"server_name":"'$DOMAIN'","acme":{"domain":["'$DOMAIN'"],"email":"admin@'$DOMAIN'"}}}'; }
@@ -1427,11 +1512,69 @@ gen_inbound() {
     esac
 }
 
+# ==================== DNS 配置 ====================
+gen_dns_config() {
+    cat <<EODNS
+  "dns": {
+    "servers": [
+      {"tag": "dns-doh", "address": "https://1.1.1.1/dns-query"}
+    ],
+    "final": "dns-doh",
+    "strategy": "prefer_ipv4"
+  },
+EODNS
+}
+
+# ==================== 系统性能优化 ====================
+optimize_tcp_stack() {
+    green ">>> 优化 TCP 内核参数..."
+    if grep -q "# TCP 优化 (by proxy script)" /etc/sysctl.conf 2>/dev/null; then
+        yellow ">>> TCP 内核参数已优化过，跳过"
+        return 0
+    fi
+    cat >> /etc/sysctl.conf <<'EOSYS'
+
+# TCP 优化 (by proxy script)
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_window_scaling = 1
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 16384
+EOSYS
+    sysctl -p >/dev/null 2>&1 || true
+    green "✅ TCP BBR 已启用，窗口已放大"
+}
+
+optimize_system_limits() {
+    green ">>> 优化系统资源限制..."
+    if grep -q "# 文件描述符优化 (by proxy script)" /etc/security/limits.conf 2>/dev/null; then
+        yellow ">>> 系统资源限制已优化过，跳过"
+        return 0
+    fi
+    cat >> /etc/security/limits.conf <<'EOLIM'
+
+# 文件描述符优化 (by proxy script)
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+EOLIM
+    ulimit -n 1048576 2>/dev/null || true
+    green "✅ 文件描述符已提升到 1048576"
+}
+
 generate_config() {
     mkdir -p "$WORK_DIR"
     trace_pause
     [ "$PROTOCOL" = "reality" ] && gen_reality_keys
     [[ "$PROTOCOL" =~ ^(hysteria2|tuic)$ ]] && gen_self_signed_cert
+    [ "$PROTOCOL" = "hysteria2" ] && OBFS_PASSWORD=$(openssl rand -hex 8)
     if [ "$PROTOCOL" = "ss2022" ]; then
         PASSWORD="2022-blake3-aes-256-gcm:$(openssl rand -base64 32)"
     fi
@@ -1451,6 +1594,7 @@ generate_config() {
             cat > "$CONFIG_FILE" <<EOCFG
 {
   "log":{"level":"info","timestamp":true},
+$(gen_dns_config)
 $(gen_wg_endpoints_block)
   "inbounds":[
 $(gen_inbound "$DIRECT_PORT" "in-direct"),
@@ -1472,6 +1616,7 @@ EOCFG
             cat > "$CONFIG_FILE" <<EOCFG
 {
   "log":{"level":"info","timestamp":true},
+$(gen_dns_config)
   "inbounds":[
 $(gen_inbound "$DIRECT_PORT" "in-direct"),
 $(gen_inbound "$WARP_PORT" "in-warp")
@@ -1495,6 +1640,7 @@ EOCFG
             cat > "$CONFIG_FILE" <<EOCFG
 {
   "log":{"level":"info","timestamp":true},
+$(gen_dns_config)
 $(gen_wg_endpoints_block)
   "inbounds":[
 $(gen_inbound "$lp" "in-main")
@@ -1509,6 +1655,7 @@ EOCFG
             cat > "$CONFIG_FILE" <<EOCFG
 {
   "log":{"level":"info","timestamp":true},
+$(gen_dns_config)
   "inbounds":[
 $(gen_inbound "$lp" "in-main")
   ],
@@ -1524,6 +1671,7 @@ EOCFG
         cat > "$CONFIG_FILE" <<EOCFG
 {
   "log":{"level":"info","timestamp":true},
+$(gen_dns_config)
   "inbounds":[
 $(gen_inbound "$lp" "in-main")
   ],
@@ -1548,7 +1696,7 @@ output_node() {
     local LINK=""
     case "$PROTOCOL" in
         reality)  LINK="vless://${UUID}@${addr}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${name}" ;;
-        hysteria2) LINK="hysteria2://${PASSWORD}@${addr}:${port}?insecure=1&sni=bing.com#${name}" ;;
+        hysteria2) LINK="hysteria2://${PASSWORD}@${addr}:${port}?insecure=1&sni=bing.com&obfs=salamander&obfs-password=${OBFS_PASSWORD}#${name}" ;;
         tuic)     LINK="tuic://${UUID}:${PASSWORD}@${addr}:${port}?congestion_control=bbr&alpn=h3&allow_insecure=1#${name}" ;;
         ss2022)   local E=$(echo -n "$PASSWORD"|base64 -w0 2>/dev/null||echo -n "$PASSWORD"|base64); LINK="ss://${E}@${addr}:${port}#${name}" ;;
         vless-ws) LINK="vless://${UUID}@${srv}:${port}?encryption=none&security=tls&sni=${DOMAIN}&type=ws&host=${DOMAIN}&path=${ws_path}#${name}" ;;
@@ -1559,8 +1707,8 @@ output_node() {
     local CY=""
     case "$PROTOCOL" in
         reality)  CY="  - name: ${name}\n    type: vless\n    server: ${srv}\n    port: ${port}\n    uuid: ${UUID}\n    network: tcp\n    tls: true\n    udp: true\n    flow: xtls-rprx-vision\n    servername: ${SNI}\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: ${PUBLIC_KEY}\n      short-id: ${SHORT_ID}" ;;
-        hysteria2) CY="  - name: ${name}\n    type: hysteria2\n    server: ${srv}\n    port: ${port}\n    password: ${PASSWORD}\n    sni: bing.com\n    skip-cert-verify: true" ;;
-        tuic)     CY="  - name: ${name}\n    type: tuic\n    server: ${srv}\n    port: ${port}\n    uuid: ${UUID}\n    password: ${PASSWORD}\n    alpn: [h3]\n    congestion-controller: bbr\n    skip-cert-verify: true" ;;
+        hysteria2) CY="  - name: ${name}\n    type: hysteria2\n    server: ${srv}\n    port: ${port}\n    password: ${PASSWORD}\n    sni: bing.com\n    skip-cert-verify: true\n    obfs: salamander\n    obfs-password: ${OBFS_PASSWORD}" ;;
+        tuic)     CY="  - name: ${name}\n    type: tuic\n    server: ${srv}\n    port: ${port}\n    uuid: ${UUID}\n    password: ${PASSWORD}\n    alpn: [h3]\n    congestion-controller: bbr\n    reduce-rtt: true\n    skip-cert-verify: true" ;;
         ss2022)   local SP=$(echo "$PASSWORD"|sed 's/^2022-blake3-aes-256-gcm://'); CY="  - name: ${name}\n    type: ss\n    server: ${srv}\n    port: ${port}\n    cipher: 2022-blake3-aes-256-gcm\n    password: ${SP}" ;;
         vless-ws) CY="  - name: ${name}\n    type: vless\n    server: ${srv}\n    port: ${port}\n    uuid: ${UUID}\n    network: ws\n    tls: true\n    servername: ${DOMAIN}\n    ws-opts:\n      path: ${ws_path}\n      headers:\n        Host: ${DOMAIN}" ;;
         vmess-ws) CY="  - name: ${name}\n    type: vmess\n    server: ${srv}\n    port: ${port}\n    uuid: ${UUID}\n    alterId: 0\n    cipher: auto\n    network: ws\n    tls: true\n    servername: ${DOMAIN}\n    ws-opts:\n      path: ${ws_path}\n      headers:\n        Host: ${DOMAIN}" ;;
@@ -1696,7 +1844,9 @@ EOF
     port: ${p}
     password: ${PASSWORD}
     sni: bing.com
-    skip-cert-verify: true" ;;
+    skip-cert-verify: true
+    obfs: salamander
+    obfs-password: ${OBFS_PASSWORD}" ;;
             tuic) echo "  - name: ${n}
     type: tuic
     server: ${s}
@@ -1705,6 +1855,7 @@ EOF
     password: ${PASSWORD}
     alpn: [h3]
     congestion-controller: bbr
+    reduce-rtt: true
     skip-cert-verify: true" ;;
             ss2022) local SP=$(echo "$PASSWORD"|sed 's/^2022-blake3-aes-256-gcm://'); echo "  - name: ${n}
     type: ss
@@ -2041,7 +2192,11 @@ do_full_install() {
     gen_uuid; gen_password; gen_short_id
     trace_resume
 
-    # 第七步：生成配置
+    # 第七步：系统性能优化
+    optimize_tcp_stack
+    optimize_system_limits
+
+    # 第八步：生成配置
     generate_config
     /usr/local/bin/sing-box check -c "$CONFIG_FILE" || { red "配置校验失败"; cat "$CONFIG_FILE"; exit 1; }
     setup_service
