@@ -1578,6 +1578,9 @@ EOWARPMODE
     fi
 
     green ">>> 已选择 ${#MULTI_PROTOCOLS[@]} 个节点"
+    for i in "${!MULTI_PROTOCOLS[@]}"; do
+        yellow "  节点$((i+1)): ${MULTI_PROTOCOLS[$i]} - 端口 ${MULTI_PORTS[$i]}"
+    done
     return 0
 }
 
@@ -1858,7 +1861,7 @@ EOCFG
 
 # 自由全协议模式：生成多协议配置
 generate_free_multi_config() {
-    local ORIGINAL_PROTOCOL=\"$PROTOCOL\"
+    local ORIGINAL_PROTOCOL="$PROTOCOL"
     local inbounds_json=""
     local rules_json=""
     local use_wg="n"
@@ -2008,6 +2011,9 @@ EOCFG
     fi
 
     chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+
+    # 恢复原始PROTOCOL值
+    PROTOCOL="$ORIGINAL_PROTOCOL"
 }
 
 # 生成分享链接（不打印UI，只返回链接字符串）
@@ -2388,10 +2394,14 @@ output_free_multi_all() {
 所有节点信息已合并到一个文件中
 EOF
 
+    green ">>> 开始生成 ${#MULTI_PROTOCOLS[@]} 个节点的配置..."
+
     # 1. 写入所有节点分享链接作为注释
     for i in "${!MULTI_PROTOCOLS[@]}"; do
         local proto="${MULTI_PROTOCOLS[$i]}"
         local port="${MULTI_PORTS[$i]}"
+
+        green ">>> 正在处理节点 $((i+1))/${#MULTI_PROTOCOLS[@]}: ${proto} (端口 ${port})"
 
         # 恢复密钥
         eval "UUID=\$MULTI_UUID_${i}"
