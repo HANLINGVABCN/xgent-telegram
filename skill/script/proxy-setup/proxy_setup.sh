@@ -1046,8 +1046,7 @@ After=network.target
 [Service]
 User=root
 ExecStart=/usr/local/bin/sing-box run -c $CONFIG_FILE
-Restart=on-failure
-RestartSec=3
+Restart=no
 LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
@@ -1056,7 +1055,38 @@ EOSVC
         systemctl enable sing-box
         systemctl restart sing-box
     fi
-    sleep 1; green ">>> 服务已启动"
+    
+    green ">>> 服务已尝试启动，正在进行 8 秒稳定性与证书申请安全验证，请稍候..."
+    sleep 8
+    
+    # 严格状态检查
+    if [ "$SVC" = "openrc" ]; then
+        if ! rc-service sing-box status | grep -q "started"; then
+            red "❌ [一票否决] sing-box 服务启动失败！正在自动清理所有节点和配置..."
+            cleanup_proxy_artifacts
+            red ">>> 清理完成。安装已终止。"
+            exit 1
+        fi
+    else
+        if ! systemctl is-active --quiet sing-box; then
+            red "❌ [一票否决] sing-box 服务启动失败！"
+            red "================== 失败原因分析 =================="
+            # 提取具体的错误信息或 FATAL 日志
+            journalctl -u sing-box --no-pager -n 20 | grep -E -i "fatal|error|failed" | sed 's/^/  /' || true
+            red "=================================================="
+            red ">>> 正在自动执行深度清理，不保留任何残余节点..."
+            
+            # 关闭并彻底清理
+            close_proxy_firewall
+            cleanup_proxy_artifacts
+            cleanup_warp_client
+            cleanup_common_dependencies
+            
+            red ">>> 深度清理完成。所有配置和节点已完全删除，安装已安全终止。"
+            exit 1
+        fi
+    fi
+    green ">>> 服务已完美启动并成功通过安全验证！"
 }
 
 open_firewall() {
@@ -1263,6 +1293,9 @@ select_protocol() {
    - 走 CDN，中转稳定，需要域名
 6) VMess + WS + TLS
    - 兼容老客户端，需要域名
+7) 自由全协议模式
+   - 6种直连协议 + 1个WARP节点 = 7个节点
+   - 每个协议单独询问是否安装，需要域名的协议可跳过
 
 0) 返回上一步
    - 回到机器类型选择
@@ -1290,6 +1323,7 @@ EOF
             4) [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ] && { PROTOCOL="tuic"; return 0; } || red "当前模式不可用" ;;
             5) [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ] && { PROTOCOL="vless-ws"; return 0; } || red "当前模式不可用" ;;
             6) [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ] && { PROTOCOL="vmess-ws"; return 0; } || red "当前模式不可用" ;;
+            7) [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ] && { PROTOCOL="free-multi"; return 0; } || red "当前模式不可用" ;;
             0) return 1 ;;
             *) red "无效选择" ;;
         esac
@@ -1366,11 +1400,18 @@ collect_info() {
         ui_read "服务器公网IP [$SERVER_IP]: " tmp; SERVER_IP="${tmp:-$SERVER_IP}"
         case "$PROTOCOL" in
             ss2022) ui_read "监听端口 [8388]: " tmp; SERVER_PORT="${tmp:-8388}" ;;
+            free-multi) ui_read "起始端口 [443]: " tmp; SERVER_PORT="${tmp:-443}" ;;
             *)      ui_read "监听端口 [443]: " tmp;  SERVER_PORT="${tmp:-443}" ;;
         esac
         INTERNAL_PORT="$SERVER_PORT"
     fi
     [ -z "$SERVER_IP" ] && { red "IP 不能为空"; exit 1; }
+
+    # 自由全协议模式
+    if [ "$PROTOCOL" = "free-multi" ]; then
+        collect_free_multi_protocols
+        return $?
+    fi
 
     # CDN 域名
     if [ "$PROTOCOL" = "vless-ws" ] || [ "$PROTOCOL" = "vmess-ws" ]; then
@@ -1420,6 +1461,123 @@ EOWARPMODE
         esac
     fi
 
+    return 0
+}
+
+# 自由全协议模式：逐个询问协议
+collect_free_multi_protocols() {
+    # 协议数组
+    MULTI_PROTOCOLS=()
+    MULTI_PORTS=()
+    MULTI_DOMAINS=()
+
+    local current_port=$SERVER_PORT
+
+    cat <<'EOF' | ui_box "自由全协议模式" "$Y"
+将逐个询问6种直连协议 + 1个WARP节点
+每个协议可选择安装(y)或跳过(n)，默认y
+需要域名的协议可以输入域名或输入skip跳过
+EOF
+
+    # 1. VLESS + Reality
+    ui_read "安装 VLESS+Reality? (y/n) [y]: " tmp
+    if [ "${tmp:-y}" = "y" ]; then
+        MULTI_PROTOCOLS+=("reality")
+        MULTI_PORTS+=("$current_port")
+        MULTI_DOMAINS+=("")
+        current_port=$((current_port + 1))
+    fi
+
+    # 2. Shadowsocks 2022
+    ui_read "安装 Shadowsocks 2022? (y/n) [y]: " tmp
+    if [ "${tmp:-y}" = "y" ]; then
+        MULTI_PROTOCOLS+=("ss2022")
+        MULTI_PORTS+=("$current_port")
+        MULTI_DOMAINS+=("")
+        current_port=$((current_port + 1))
+    fi
+
+    # 3. Hysteria2
+    ui_read "安装 Hysteria2? (y/n) [y]: " tmp
+    if [ "${tmp:-y}" = "y" ]; then
+        MULTI_PROTOCOLS+=("hysteria2")
+        MULTI_PORTS+=("$current_port")
+        MULTI_DOMAINS+=("")
+        current_port=$((current_port + 1))
+    fi
+
+    # 4. TUIC v5
+    ui_read "安装 TUIC v5? (y/n) [y]: " tmp
+    if [ "${tmp:-y}" = "y" ]; then
+        MULTI_PROTOCOLS+=("tuic")
+        MULTI_PORTS+=("$current_port")
+        MULTI_DOMAINS+=("")
+        current_port=$((current_port + 1))
+    fi
+
+    # 5. VLESS + WS + TLS
+    ui_read "安装 VLESS+WS+TLS? (y/n) [y]: " tmp
+    if [ "${tmp:-y}" = "y" ]; then
+        yellow "需要一个已托管到 Cloudflare 的域名"
+        ui_read "请输入域名 (或输入skip跳过): " domain_input
+        if [ "$domain_input" != "skip" ] && [ -n "$domain_input" ]; then
+            MULTI_PROTOCOLS+=("vless-ws")
+            MULTI_PORTS+=("$current_port")
+            MULTI_DOMAINS+=("$domain_input")
+            current_port=$((current_port + 1))
+        else
+            yellow "已跳过 VLESS+WS+TLS"
+        fi
+    fi
+
+    # 6. VMess + WS + TLS
+    ui_read "安装 VMess+WS+TLS? (y/n) [y]: " tmp
+    if [ "${tmp:-y}" = "y" ]; then
+        yellow "需要一个已托管到 Cloudflare 的域名"
+        ui_read "请输入域名 (或输入skip跳过): " domain_input
+        if [ "$domain_input" != "skip" ] && [ -n "$domain_input" ]; then
+            MULTI_PROTOCOLS+=("vmess-ws")
+            MULTI_PORTS+=("$current_port")
+            MULTI_DOMAINS+=("$domain_input")
+            current_port=$((current_port + 1))
+        else
+            yellow "已跳过 VMess+WS+TLS"
+        fi
+    fi
+
+    # 7. WARP (使用VLESS+Reality协议)
+    ui_read "安装 WARP节点 (VLESS+Reality)? (y/n) [y]: " tmp
+    if [ "${tmp:-y}" = "y" ]; then
+        MULTI_PROTOCOLS+=("reality-warp")
+        MULTI_PORTS+=("$current_port")
+        MULTI_DOMAINS+=("")
+
+        # WARP 出站方式选择
+        cat <<'EOWARPMODE' | ui_box "WARP 出站方式" "$B"
+1) WireGuard 直连 (推荐)
+   - 不需要安装 warp-cli，sing-box 原生支持
+2) 传统 SOCKS5 代理
+   - 需要先用主菜单第5项安装 WARP 客户端
+EOWARPMODE
+        ui_read "请选择 [1/2] [1]: " warp_mode_choice
+        case "${warp_mode_choice:-1}" in
+            2)
+                WARP_WG_MODE="socks5"
+                ui_read "WARP SOCKS5 本地端口 [40000]: " tmp; WARP_SOCKS_PORT="${tmp:-40000}"
+                ;;
+            *)
+                WARP_WG_MODE="wireguard"
+                green ">>> 已选择 WireGuard 模式"
+                ;;
+        esac
+    fi
+
+    if [ ${#MULTI_PROTOCOLS[@]} -eq 0 ]; then
+        red "未选择任何协议"
+        return 1
+    fi
+
+    green ">>> 已选择 ${#MULTI_PROTOCOLS[@]} 个节点"
     return 0
 }
 
@@ -1517,7 +1675,11 @@ gen_dns_config() {
     cat <<EODNS
   "dns": {
     "servers": [
-      {"tag": "dns-doh", "address": "https://1.1.1.1/dns-query"}
+      {
+        "type": "https",
+        "tag": "dns-doh",
+        "server": "1.1.1.1"
+      }
     ],
     "final": "dns-doh",
     "strategy": "prefer_ipv4"
@@ -1572,6 +1734,14 @@ EOLIM
 generate_config() {
     mkdir -p "$WORK_DIR"
     trace_pause
+
+    # 自由全协议模式
+    if [ "$PROTOCOL" = "free-multi" ]; then
+        generate_free_multi_config
+        trace_resume
+        return
+    fi
+
     [ "$PROTOCOL" = "reality" ] && gen_reality_keys
     [[ "$PROTOCOL" =~ ^(hysteria2|tuic)$ ]] && gen_self_signed_cert
     [ "$PROTOCOL" = "hysteria2" ] && OBFS_PASSWORD=$(openssl rand -hex 8)
@@ -1686,15 +1856,207 @@ EOCFG
     chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 }
 
+# 自由全协议模式：生成多协议配置
+generate_free_multi_config() {
+    local ORIGINAL_PROTOCOL=\"$PROTOCOL\"
+    local inbounds_json=""
+    local rules_json=""
+    local use_wg="n"
+    [ "$WARP_WG_MODE" = "wireguard" ] && warp_wg_config_exists && use_wg="y"
+
+    green ">>> 生成自由全协议配置 (${#MULTI_PROTOCOLS[@]}个节点)..."
+
+    # 为每个协议生成密钥和inbound
+    for i in "${!MULTI_PROTOCOLS[@]}"; do
+        local proto="${MULTI_PROTOCOLS[$i]}"
+        local port="${MULTI_PORTS[$i]}"
+        local domain="${MULTI_DOMAINS[$i]}"
+        local tag="in-${proto}-${port}"
+
+        # 生成UUID（每个协议独立）
+        gen_uuid
+        local current_uuid="$UUID"
+
+        # 准备协议特定参数
+        local current_password=""
+        local current_private_key=""
+        local current_public_key=""
+        local current_short_id=""
+        local current_obfs_password=""
+        local current_tls_cert=""
+        local current_tls_key=""
+        local current_domain=""
+
+        case "$proto" in
+            reality|reality-warp)
+                gen_reality_keys
+                gen_short_id
+                current_private_key="$PRIVATE_KEY"
+                current_public_key="$PUBLIC_KEY"
+                current_short_id="$SHORT_ID"
+                SNI="www.microsoft.com"
+                ;;
+            hysteria2)
+                gen_self_signed_cert
+                gen_password
+                current_password="$PASSWORD"
+                current_obfs_password=$(openssl rand -hex 8)
+                current_tls_cert="$TLS_CERT"
+                current_tls_key="$TLS_KEY"
+                ;;
+            tuic)
+                gen_self_signed_cert
+                gen_password
+                current_password="$PASSWORD"
+                current_tls_cert="$TLS_CERT"
+                current_tls_key="$TLS_KEY"
+                ;;
+            ss2022)
+                current_password="2022-blake3-aes-256-gcm:$(openssl rand -base64 32)"
+                ;;
+            vless-ws)
+                current_domain="$domain"
+                echo "/ws-$(openssl rand -hex 4)" > "$WORK_DIR/ws_path_${port}.txt"
+                DOMAIN="$current_domain"
+                ;;
+            vmess-ws)
+                current_domain="$domain"
+                echo "/vmws-$(openssl rand -hex 4)" > "$WORK_DIR/ws_path_${port}.txt"
+                DOMAIN="$current_domain"
+                ;;
+        esac
+
+        # 保存每个协议的密钥信息（用于后续输出）
+        eval "MULTI_UUID_${i}='$current_uuid'"
+        eval "MULTI_PASSWORD_${i}='$current_password'"
+        eval "MULTI_PRIVATE_KEY_${i}='$current_private_key'"
+        eval "MULTI_PUBLIC_KEY_${i}='$current_public_key'"
+        eval "MULTI_SHORT_ID_${i}='$current_short_id'"
+        eval "MULTI_OBFS_PASSWORD_${i}='$current_obfs_password'"
+        eval "MULTI_TLS_CERT_${i}='$current_tls_cert'"
+        eval "MULTI_TLS_KEY_${i}='$current_tls_key'"
+        eval "MULTI_DOMAIN_${i}='$current_domain'"
+
+        # 临时设置全局变量用于gen_inbound
+        UUID="$current_uuid"
+        PASSWORD="$current_password"
+        PRIVATE_KEY="$current_private_key"
+        PUBLIC_KEY="$current_public_key"
+        SHORT_ID="$current_short_id"
+        OBFS_PASSWORD="$current_obfs_password"
+        TLS_CERT="$current_tls_cert"
+        TLS_KEY="$current_tls_key"
+
+        # 生成inbound（去除reality-warp的-warp后缀）
+        local proto_for_gen="${proto%-warp}"
+        PROTOCOL="$proto_for_gen"
+
+        local inbound_json=$(gen_inbound "$port" "$tag")
+
+        # 追加逗号（除了第一个）
+        [ $i -gt 0 ] && inbounds_json+=","
+        inbounds_json+=$'\n'"$inbound_json"
+
+        # 生成路由规则
+        if [[ "$proto" == *"-warp"* ]]; then
+            rules_json+=$'\n'"      {\"inbound\":[\"$tag\"],\"action\":\"route\",\"outbound\":\"out-warp\"},"
+        else
+            rules_json+=$'\n'"      {\"inbound\":[\"$tag\"],\"action\":\"route\",\"outbound\":\"out-direct\"},"
+        fi
+    done
+
+    # 去除最后一个逗号
+    rules_json="${rules_json%,}"
+
+    # 生成完整配置
+    if [ "$use_wg" = "y" ]; then
+        cat > "$CONFIG_FILE" <<EOCFG
+{
+  "log":{"level":"info","timestamp":true},
+$(gen_dns_config)
+$(gen_wg_endpoints_block)
+  "inbounds":[${inbounds_json}
+  ],
+  "outbounds":[
+    {"type":"direct","tag":"out-direct"}
+  ],
+  "route":{
+    "rules":[${rules_json}
+    ],
+    "final":"out-direct"
+  }
+}
+EOCFG
+    else
+        cat > "$CONFIG_FILE" <<EOCFG
+{
+  "log":{"level":"info","timestamp":true},
+$(gen_dns_config)
+  "inbounds":[${inbounds_json}
+  ],
+  "outbounds":[
+    {"type":"direct","tag":"out-direct"},
+    {"type":"socks","tag":"out-warp","server":"127.0.0.1","server_port":$WARP_SOCKS_PORT}
+  ],
+  "route":{
+    "rules":[${rules_json}
+    ],
+    "final":"out-direct"
+  }
+}
+EOCFG
+    fi
+
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+}
+
+# 生成分享链接（不打印UI，只返回链接字符串）
+generate_share_link() {
+    local addr="$1" port="$2" name="$3" proto="$4"
+    [ "$proto" = "reality-warp" ] && proto="reality"
+
+    local ws_path=""
+    if [ -f "$WORK_DIR/ws_path_${port}.txt" ]; then
+        ws_path=$(cat "$WORK_DIR/ws_path_${port}.txt")
+    elif [ -f "$WORK_DIR/ws_path.txt" ]; then
+        ws_path=$(cat "$WORK_DIR/ws_path.txt")
+    fi
+
+    local srv="$addr"
+    [[ "$proto" =~ ws$ ]] && srv="$DOMAIN"
+
+    local LINK=""
+    case "$proto" in
+        reality)  LINK="vless://${UUID}@${addr}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${name}" ;;
+        hysteria2) LINK="hysteria2://${PASSWORD}@${addr}:${port}?insecure=1&sni=bing.com&obfs=salamander&obfs-password=${OBFS_PASSWORD}#${name}" ;;
+        tuic)     LINK="tuic://${UUID}:${PASSWORD}@${addr}:${port}?congestion_control=bbr&alpn=h3&allow_insecure=1#${name}" ;;
+        ss2022)   local E=$(echo -n "$PASSWORD"|base64 -w0 2>/dev/null||echo -n "$PASSWORD"|base64); LINK="ss://${E}@${addr}:${port}#${name}" ;;
+        vless-ws) LINK="vless://${UUID}@${srv}:${port}?encryption=none&security=tls&sni=${DOMAIN}&type=ws&host=${DOMAIN}&path=${ws_path}#${name}" ;;
+        vmess-ws) local J="{\"v\":\"2\",\"ps\":\"${name}\",\"add\":\"${srv}\",\"port\":\"${port}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"host\":\"${DOMAIN}\",\"path\":\"${ws_path}\",\"tls\":\"tls\",\"sni\":\"${DOMAIN}\"}"; LINK="vmess://$(echo -n "$J"|base64 -w0 2>/dev/null||echo -n "$J"|base64)" ;;
+    esac
+
+    echo "$LINK"
+}
+
 # ==================== 多格式输出 ====================
 output_node() {
     local addr="$1" port="$2" name="$3" suffix="$4"
-    local ws_path=""; [ -f "$WORK_DIR/ws_path.txt" ] && ws_path=$(cat "$WORK_DIR/ws_path.txt")
-    local srv="$addr"; [[ "$PROTOCOL" =~ ws$ ]] && srv="$DOMAIN"
+    local proto="${suffix:-$PROTOCOL}"
+    [ "$proto" = "reality-warp" ] && proto="reality"
+
+    local ws_path=""
+    if [ -f "$WORK_DIR/ws_path_${port}.txt" ]; then
+        ws_path=$(cat "$WORK_DIR/ws_path_${port}.txt")
+    elif [ -f "$WORK_DIR/ws_path.txt" ]; then
+        ws_path=$(cat "$WORK_DIR/ws_path.txt")
+    fi
+
+    local srv="$addr"
+    [[ "$proto" =~ ws$ ]] && srv="$DOMAIN"
 
     # 分享链接
     local LINK=""
-    case "$PROTOCOL" in
+    case "$proto" in
         reality)  LINK="vless://${UUID}@${addr}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${name}" ;;
         hysteria2) LINK="hysteria2://${PASSWORD}@${addr}:${port}?insecure=1&sni=bing.com&obfs=salamander&obfs-password=${OBFS_PASSWORD}#${name}" ;;
         tuic)     LINK="tuic://${UUID}:${PASSWORD}@${addr}:${port}?congestion_control=bbr&alpn=h3&allow_insecure=1#${name}" ;;
@@ -1705,7 +2067,7 @@ output_node() {
 
     # Clash Meta
     local CY=""
-    case "$PROTOCOL" in
+    case "$proto" in
         reality)  CY="  - name: ${name}\n    type: vless\n    server: ${srv}\n    port: ${port}\n    uuid: ${UUID}\n    network: tcp\n    tls: true\n    udp: true\n    flow: xtls-rprx-vision\n    servername: ${SNI}\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: ${PUBLIC_KEY}\n      short-id: ${SHORT_ID}" ;;
         hysteria2) CY="  - name: ${name}\n    type: hysteria2\n    server: ${srv}\n    port: ${port}\n    password: ${PASSWORD}\n    sni: bing.com\n    skip-cert-verify: true\n    obfs: salamander\n    obfs-password: ${OBFS_PASSWORD}" ;;
         tuic)     CY="  - name: ${name}\n    type: tuic\n    server: ${srv}\n    port: ${port}\n    uuid: ${UUID}\n    password: ${PASSWORD}\n    alpn: [h3]\n    congestion-controller: bbr\n    reduce-rtt: true\n    skip-cert-verify: true" ;;
@@ -1730,11 +2092,13 @@ output_node() {
     fi
 
     # 写入文件（追加到 yaml 注释区）
-    cat >> "$CLASH_FILE" <<EONODE
+    if [ -n "$CLASH_FILE" ]; then
+        cat >> "$CLASH_FILE" <<EONODE
 
 # ━━━ ${name} ━━━
 # 分享链接: ${LINK}
 EONODE
+    fi
 }
 
 output_all() {
@@ -1744,6 +2108,12 @@ output_all() {
     local clean_name=$(echo "$SAFE_NAME" | tr -d '-._')
     if [ -z "$clean_name" ]; then
         SAFE_NAME="node_$(date '+%m%d_%H%M')"
+    fi
+
+    # 自由全协议模式
+    if [ "$PROTOCOL" = "free-multi" ]; then
+        output_free_multi_all
+        return
     fi
 
     local outmode_desc="直连出站"
@@ -1805,7 +2175,7 @@ EOF
     # ===== 生成完整 Clash Meta 配置文件 =====
     info "完整 Clash Meta / Mihomo 配置"
 
-    local CLASH_FILE="$INFO_DIR/${SAFE_NAME}_clash.yaml"
+    # local CLASH_FILE=\"$INFO_DIR/${SAFE_NAME}_clash.yaml\" # 已合并到主文件
     local ws_path=""; [ -f "$WORK_DIR/ws_path.txt" ] && ws_path=$(cat "$WORK_DIR/ws_path.txt")
     local srv="$SERVER_IP"; [[ "$PROTOCOL" =~ ws$ ]] && srv="$DOMAIN"
 
@@ -1990,7 +2360,282 @@ EOCMD
     [ "$MACHINE_MODE" = "nat" ] && yellow ">>> 面板需映射 TCP ${SERVER_PORT} -> ${INTERNAL_PORT}"
 }
 
-# ==================== 知识科普 ====================
+# 自由全协议模式：输出所有节点
+output_free_multi_all() {
+    mkdir -p "$INFO_DIR"
+    SAFE_NAME=$(echo "$NODE_NAME"|tr ' ' '_'|tr -cd 'A-Za-z0-9._-')
+    local clean_name=$(echo "$SAFE_NAME" | tr -d '-._')
+    if [ -z "$clean_name" ]; then
+        SAFE_NAME="node_$(date '+%m%d_%H%M')"
+    fi
+
+    local COMBINED_FILE="$INFO_DIR/${SAFE_NAME}_all.yaml"
+    echo "# ============================================" > "$COMBINED_FILE"
+    echo "# 节点: ${NODE_NAME} (全协议模式)" >> "$COMBINED_FILE"
+    echo "# IP: ${SERVER_IP}" >> "$COMBINED_FILE"
+    echo "# 共 ${#MULTI_PROTOCOLS[@]} 个节点" >> "$COMBINED_FILE"
+    echo "# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')" >> "$COMBINED_FILE"
+    echo "# ============================================" >> "$COMBINED_FILE"
+    echo "" >> "$COMBINED_FILE"
+
+    {
+        echo "机器: ${MACHINE_MODE} | 模式: 自由全协议"
+        echo "IP: ${SERVER_IP} | 节点数: ${#MULTI_PROTOCOLS[@]}"
+    } | ui_box "安装完成 — ${NODE_NAME}" "$G"
+
+    cat <<'EOF' | ui_box "自由全协议模式" "$P"
+已生成多个独立节点，每个协议一个端口
+所有节点信息已合并到一个文件中
+EOF
+
+    # 1. 写入所有节点分享链接作为注释
+    for i in "${!MULTI_PROTOCOLS[@]}"; do
+        local proto="${MULTI_PROTOCOLS[$i]}"
+        local port="${MULTI_PORTS[$i]}"
+
+        # 恢复密钥
+        eval "UUID=\$MULTI_UUID_${i}"
+        eval "PASSWORD=\$MULTI_PASSWORD_${i}"
+        eval "PRIVATE_KEY=\$MULTI_PRIVATE_KEY_${i}"
+        eval "PUBLIC_KEY=\$MULTI_PUBLIC_KEY_${i}"
+        eval "SHORT_ID=\$MULTI_SHORT_ID_${i}"
+        eval "OBFS_PASSWORD=\$MULTI_OBFS_PASSWORD_${i}"
+        eval "DOMAIN=\$MULTI_DOMAIN_${i}"
+
+        # 设置协议特定变量
+        local proto_clean="${proto%-warp}"
+        case "$proto_clean" in
+            reality) SNI="www.microsoft.com" ;;
+            vless-ws|vmess-ws) ;; # DOMAIN已恢复
+            *) ;;
+        esac
+
+        local proto_display="${proto}"
+        case "$proto" in
+            reality) proto_display="Reality" ;;
+            ss2022) proto_display="SS2022" ;;
+            hysteria2) proto_display="Hysteria2" ;;
+            tuic) proto_display="TUIC" ;;
+            vless-ws) proto_display="VLESS-WS" ;;
+            vmess-ws) proto_display="VMess-WS" ;;
+            reality-warp) proto_display="Reality-WARP"; SNI="www.microsoft.com" ;;
+        esac
+
+        local node_name="${NODE_NAME}-${proto_display}"
+
+        # 生成分享链接
+        local link=$(generate_share_link "$SERVER_IP" "$port" "$node_name" "$proto")
+
+        echo "# ━━━ ${node_name} ━━━" >> "$COMBINED_FILE"
+        echo "# 协议: ${proto_display} | 端口: ${port}" >> "$COMBINED_FILE"
+        echo "# 分享链接: ${link}" >> "$COMBINED_FILE"
+        echo "" >> "$COMBINED_FILE"
+    done
+
+    echo "# ============================================" >> "$COMBINED_FILE"
+    echo "# 以下为 Clash Meta / Mihomo 完整配置" >> "$COMBINED_FILE"
+    echo "# ============================================" >> "$COMBINED_FILE"
+    echo "" >> "$COMBINED_FILE"
+
+    # 2. 生成并追加完整 Clash 配置
+    generate_free_multi_clash_config >> "$COMBINED_FILE"
+
+    CLASH_FILE="$COMBINED_FILE"
+    chmod 600 "$CLASH_FILE" 2>/dev/null || true
+
+    green "⬇️ 请复制下方配置 ⬇️"
+    cat "$CLASH_FILE"
+    green "⬆️ 请复制上方配置 ⬆️"
+
+    green ">>> 所有节点链接与 Clash 配置已完美合并保存至: ${CLASH_FILE}"
+    yellow ">>> 此文件可直接导入 FlClash，也可复制单节点链接（在文件开头注释区）"
+}
+generate_free_multi_clash_config() {
+    # 不再创建独立文件，直接输出到stdout，让调用者追加到COMBINED_FILE
+    local proxies_yaml=""
+    local proxy_list=""
+
+    # 生成所有节点的proxies和列表
+    for i in "${!MULTI_PROTOCOLS[@]}"; do
+        local proto="${MULTI_PROTOCOLS[$i]}"
+        local port="${MULTI_PORTS[$i]}"
+
+        # 恢复密钥
+        eval "UUID=\$MULTI_UUID_${i}"
+        eval "PASSWORD=\$MULTI_PASSWORD_${i}"
+        eval "PRIVATE_KEY=\$MULTI_PRIVATE_KEY_${i}"
+        eval "PUBLIC_KEY=\$MULTI_PUBLIC_KEY_${i}"
+        eval "SHORT_ID=\$MULTI_SHORT_ID_${i}"
+        eval "OBFS_PASSWORD=\$MULTI_OBFS_PASSWORD_${i}"
+        eval "DOMAIN=\$MULTI_DOMAIN_${i}"
+
+        local proto_display="${proto}"
+        case "$proto" in
+            reality) proto_display="Reality" ;;
+            ss2022) proto_display="SS2022" ;;
+            hysteria2) proto_display="Hysteria2" ;;
+            tuic) proto_display="TUIC" ;;
+            vless-ws) proto_display="VLESS-WS" ;;
+            vmess-ws) proto_display="VMess-WS" ;;
+            reality-warp) proto_display="Reality-WARP"; SNI="www.microsoft.com" ;;
+        esac
+
+        local node_name="${NODE_NAME}-${proto_display}"
+        local srv="$SERVER_IP"
+        [[ "$proto" =~ ws$ ]] && srv="$DOMAIN"
+
+        # 生成proxy配置
+        case "$proto" in
+            reality|reality-warp)
+                SNI="www.microsoft.com"
+                [ $i -gt 0 ] && proxies_yaml+=$'\n'
+                proxies_yaml+="  - name: ${node_name}
+    type: vless
+    server: ${srv}
+    port: ${port}
+    uuid: ${UUID}
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: ${SNI}
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: ${PUBLIC_KEY}
+      short-id: ${SHORT_ID}"
+                ;;
+            hysteria2)
+                [ $i -gt 0 ] && proxies_yaml+=$'\n'
+                proxies_yaml+="  - name: ${node_name}
+    type: hysteria2
+    server: ${srv}
+    port: ${port}
+    password: ${PASSWORD}
+    sni: bing.com
+    skip-cert-verify: true
+    obfs: salamander
+    obfs-password: ${OBFS_PASSWORD}"
+                ;;
+            tuic)
+                [ $i -gt 0 ] && proxies_yaml+=$'\n'
+                proxies_yaml+="  - name: ${node_name}
+    type: tuic
+    server: ${srv}
+    port: ${port}
+    uuid: ${UUID}
+    password: ${PASSWORD}
+    alpn: [h3]
+    congestion-controller: bbr
+    reduce-rtt: true
+    skip-cert-verify: true"
+                ;;
+            ss2022)
+                local SP=$(echo "$PASSWORD"|sed 's/^2022-blake3-aes-256-gcm://')
+                [ $i -gt 0 ] && proxies_yaml+=$'\n'
+                proxies_yaml+="  - name: ${node_name}
+    type: ss
+    server: ${srv}
+    port: ${port}
+    cipher: 2022-blake3-aes-256-gcm
+    password: ${SP}"
+                ;;
+            vless-ws)
+                local ws_path=$(cat "$WORK_DIR/ws_path_${port}.txt" 2>/dev/null)
+                [ $i -gt 0 ] && proxies_yaml+=$'\n'
+                proxies_yaml+="  - name: ${node_name}
+    type: vless
+    server: ${srv}
+    port: ${port}
+    uuid: ${UUID}
+    network: ws
+    tls: true
+    servername: ${DOMAIN}
+    ws-opts:
+      path: ${ws_path}
+      headers:
+        Host: ${DOMAIN}"
+                ;;
+            vmess-ws)
+                local ws_path=$(cat "$WORK_DIR/ws_path_${port}.txt" 2>/dev/null)
+                [ $i -gt 0 ] && proxies_yaml+=$'\n'
+                proxies_yaml+="  - name: ${node_name}
+    type: vmess
+    server: ${srv}
+    port: ${port}
+    uuid: ${UUID}
+    alterId: 0
+    cipher: auto
+    network: ws
+    tls: true
+    servername: ${DOMAIN}
+    ws-opts:
+      path: ${ws_path}
+      headers:
+        Host: ${DOMAIN}"
+                ;;
+        esac
+
+        proxy_list+="      - ${node_name}"$'\n'
+    done
+
+    # 去除最后的换行
+    proxy_list="${proxy_list%$'\n'}"
+
+    # 输出完整Clash配置到stdout
+    cat <<EOCLASH
+mixed-port: 7890
+allow-lan: true
+mode: rule
+log-level: info
+unified-delay: true
+find-process-mode: strict
+
+dns:
+  enable: true
+  listen: :1053
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  fallback:
+    - https://1.1.1.1/dns-query
+    - https://8.8.8.8/dns-query
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+
+proxies:
+${proxies_yaml}
+
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies:
+${proxy_list}
+      - DIRECT
+
+rules:
+  # 国内直连
+  - GEOIP,LAN,DIRECT
+  - GEOIP,CN,DIRECT
+  - DOMAIN-SUFFIX,cn,DIRECT
+  - DOMAIN-KEYWORD,baidu,DIRECT
+  - DOMAIN-KEYWORD,bilibili,DIRECT
+  - DOMAIN-SUFFIX,qq.com,DIRECT
+  - DOMAIN-SUFFIX,taobao.com,DIRECT
+  - DOMAIN-SUFFIX,jd.com,DIRECT
+  - DOMAIN-SUFFIX,163.com,DIRECT
+  - DOMAIN-SUFFIX,zhihu.com,DIRECT
+  - DOMAIN-SUFFIX,douyin.com,DIRECT
+
+  # 其余全部走代理
+  - MATCH,Proxy
+EOCLASH
+}
+
+# ====================知识科普 ====================
 show_cf_knowledge() {
     cat <<'EOF' | ui_box "Cloudflare 完整知识科普" "$P"
 第一章: 两段路原理
@@ -2158,18 +2803,23 @@ do_full_install() {
         select_machine_mode || return
     done
 
-    # 第三步：出站模式（可返回→回到第二步）
-    while true; do
-        select_outbound_mode
-        local ret=$?
-        [ $ret -eq 0 ] && break
+    # 自由全协议模式跳过第三步（出站模式选择）
+    if [ "$PROTOCOL" = "free-multi" ]; then
+        OUTBOUND_MODE="direct"  # 占位，实际由每个协议决定
+    else
+        # 第三步：出站模式（可返回→回到第二步）
         while true; do
-            select_protocol
-            local ret2=$?
-            [ $ret2 -eq 0 ] && break
-            select_machine_mode || return
+            select_outbound_mode
+            local ret=$?
+            [ $ret -eq 0 ] && break
+            while true; do
+                select_protocol
+                local ret2=$?
+                [ $ret2 -eq 0 ] && break
+                select_machine_mode || return
+            done
         done
-    done
+    fi
 
     # 第四步：收集信息
     collect_info || return
@@ -2187,10 +2837,13 @@ do_full_install() {
     fi
 
     # 第六步：生成密钥（必须在安装依赖之后，因为需要 openssl）
-    green ">>> 生成密钥..."
-    trace_pause
-    gen_uuid; gen_password; gen_short_id
-    trace_resume
+    # 自由全协议模式在 generate_free_multi_config 中生成
+    if [ "$PROTOCOL" != "free-multi" ]; then
+        green ">>> 生成密钥..."
+        trace_pause
+        gen_uuid; gen_password; gen_short_id
+        trace_resume
+    fi
 
     # 第七步：系统性能优化
     optimize_tcp_stack

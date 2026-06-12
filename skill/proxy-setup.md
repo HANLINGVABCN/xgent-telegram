@@ -1,5 +1,5 @@
 ```!
-当用户要在 Linux VPS 部署/重装/卸载代理节点、sing-box、Reality、Hysteria2、TUIC、Shadowsocks、Cloudflare WARP 或 Clash/Mihomo 配置时使用本技能。脚本一定随项目位于 skill/script/proxy-setup/proxy_setup.sh；本地执行：chmod +x skill/script/proxy-setup/proxy_setup.sh && sudo bash skill/script/proxy-setup/proxy_setup.sh。默认推荐路线：主菜单 1 全新安装 -> 机器类型 3 标准 VPS -> 协议 1 VLESS + Reality -> 出站 3 双节点 -> WARP 方式 1 WireGuard 直连。WireGuard 模式无需 warp-cli；WARP 异常先用主菜单 6 状态检查看 endpoint/wireguard 握手与出站日志。脚本会尝试开放本机防火墙端口，但云厂商安全组必须让用户手动放行。卸载用主菜单 4 深度卸载；不会删除脚本自身或云安全组规则；通用依赖 ca-certificates/wget/tar/curl/openssl/jq/qrencode 强烈不建议删除，默认保留。
+当用户要在 Linux VPS 部署/重装/卸载代理节点、sing-box、Reality、Hysteria2、TUIC、Shadowsocks、Cloudflare WARP 或 Clash/Mihomo 配置时使用本技能。脚本一定随项目位于 skill/script/proxy-setup/proxy_setup.sh；本地执行：chmod +x skill/script/proxy-setup/proxy_setup.sh && sudo bash skill/script/proxy-setup/proxy_setup.sh。默认推荐路线：主菜单 1 全新安装 -> 机器类型 3 标准 VPS -> 协议 1 VLESS + Reality -> 出站 3 双节点 -> WARP 方式 1 WireGuard 直连。新增自由全协议模式（协议 7）：一次性部署最多7个节点（6种直连协议+1个WARP），逐个询问是否安装，需域名的协议可输入skip跳过，自动递增端口。WireGuard 模式无需 warp-cli；WARP 异常先用主菜单 6 状态检查看 endpoint/wireguard 握手与出站日志。脚本会尝试开放本机防火墙端口，但云厂商安全组必须让用户手动放行。卸载用主菜单 4 深度卸载；不会删除脚本自身或云安全组规则；通用依赖 ca-certificates/wget/tar/curl/openssl/jq/qrencode 强烈不建议删除，默认保留。
 ```
 
 # proxy_setup.sh 使用说明
@@ -17,6 +17,7 @@ skill/script/proxy-setup/proxy_setup.sh
 - 安装并配置 `sing-box`。
 - 支持 NAT 小鸡、低配 VPS、标准 VPS 三种机器类型。
 - 支持 VLESS + Reality、Shadowsocks 2022、Hysteria2、TUIC v5、VLESS + WS + TLS、VMess + WS + TLS。
+- **新增自由全协议模式**：一次性部署多个协议（最多7个节点：6种直连 + 1个WARP），每个协议单独询问是否安装。
 - 支持直连出站、WARP 出站、双节点模式。
 - WARP 出站支持两种方式：
   - **WireGuard 直连（推荐）**：sing-box 原生 WireGuard 出站，无需安装 warp-cli，自动通过 WARP API 注册并获取密钥。
@@ -82,14 +83,29 @@ ss -lntup | grep sing-box
 
 ```text
 1) VLESS + Reality
+2) Shadowsocks 2022
+3) Hysteria2
+4) TUIC v5
+5) VLESS + WS + TLS
+6) VMess + WS + TLS
+7) 自由全协议模式  ← 新增：一次性部署多个协议
 ```
 
-出站模式选择（根据需要）：
+**如果选择 1-6 单个协议**，继续出站模式选择：
 
 ```text
 1) 直连出站        ← 不需要 WARP
 3) 双节点模式      ← 推荐，同时生成直连和 WARP 节点
 ```
+
+**如果选择 7 自由全协议模式**，会跳过出站模式选择，直接进入协议选择流程：
+
+- 逐个询问每个协议是否安装（y/n，默认 y）
+- 6种直连协议：Reality、SS2022、Hysteria2、TUIC、VLESS-WS、VMess-WS
+- 1个WARP节点（使用VLESS+Reality协议，出站走WARP）
+- 需要域名的协议（VLESS-WS、VMess-WS）可以输入域名或输入 `skip` 跳过
+- 自动递增端口号（起始端口、起始+1、起始+2...）
+- 节点名称格式：`{节点名}-{协议名}`，例如 `MyProxy-Reality`、`MyProxy-WARP`
 
 如果选了 WARP 或双节点，会出现 WARP 出站方式选择：
 
@@ -102,8 +118,14 @@ ss -lntup | grep sing-box
 
 ### 推荐一句话流程
 
+**单协议双节点（推荐）：**
 ```text
 主菜单 1 -> 机器类型 3 -> 协议 1 -> 出站模式 3 -> WARP 方式 1 (WireGuard)
+```
+
+**多协议自由组合（新增）：**
+```text
+主菜单 1 -> 机器类型 3 -> 协议 7 -> 逐个选择要安装的协议 -> WARP 方式 1 (WireGuard)
 ```
 
 ### 传统 SOCKS5 流程（备选）
@@ -113,6 +135,56 @@ ss -lntup | grep sing-box
 ```text
 主菜单 5 -> WARP 菜单 1 (免费注册) -> 返回主菜单 -> 主菜单 1 -> ... -> WARP 方式 2 (SOCKS5)
 ```
+
+## 自由全协议模式（第7个选项）
+
+自由全协议模式允许一次性部署多个协议节点，最多7个：
+
+- **6种直连协议**：Reality、SS2022、Hysteria2、TUIC、VLESS-WS、VMess-WS
+- **1个WARP节点**：使用VLESS+Reality协议，出站走WARP
+
+### 使用流程
+
+1. 选择机器类型（标准VPS或低配VPS）
+2. 选择协议：`7) 自由全协议模式`
+3. 输入节点名称和起始端口（默认443）
+4. 逐个询问每个协议是否安装：
+   - VLESS + Reality：`y/n` [默认y]
+   - Shadowsocks 2022：`y/n` [默认y]
+   - Hysteria2：`y/n` [默认y]
+   - TUIC v5：`y/n` [默认y]
+   - VLESS + WS + TLS：`y/n` [默认y]，需要域名或输入 `skip` 跳过
+   - VMess + WS + TLS：`y/n` [默认y]，需要域名或输入 `skip` 跳过
+   - WARP节点（VLESS+Reality）：`y/n` [默认y]，选择WireGuard或SOCKS5模式
+
+### 特点
+
+- **端口自动递增**：起始端口443，后续端口444、445、446...
+- **独立配置**：每个协议生成独立的UUID、密码、证书
+- **灵活组合**：可以只选部分协议安装，不需要全部安装
+- **域名可选**：VLESS-WS和VMess-WS如果没有域名可以输入 `skip` 跳过
+- **节点命名**：自动添加协议后缀，如 `MyProxy-Reality`、`MyProxy-WARP`
+
+### 输出结果
+
+- 所有节点的分享链接和二维码
+- 完整的Clash Meta/Mihomo配置文件（包含所有节点）
+- 配置文件路径：`/root/proxy_info/{节点名}_multi_clash.yaml`
+
+### 适用场景
+
+- 需要多种协议备用
+- 不同场景切换不同协议（高速、稳定、隐蔽等）
+- 测试各协议性能和兼容性
+- 为多个客户端提供不同协议选择
+
+### 注意事项
+
+- NAT小鸡不支持此模式
+- 需要域名的协议如果跳过，该协议不会安装
+- 建议至少安装3-4个协议
+- 所有协议共用同一个sing-box配置文件
+- 云厂商安全组需要放行所有使用的端口
 
 ## WARP 安装向导
 
