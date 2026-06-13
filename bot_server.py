@@ -85,6 +85,8 @@ def build_stop_keyboard() -> InlineKeyboardMarkup:
 class BotConfig:
     TOKEN = os.getenv("BOT_TOKEN", "")
     AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
+    # 本地 Telegram Bot API server 支持（不配置则用官方 api.telegram.org）
+    API_BASE_URL = (os.getenv("TELEGRAM_API_URL") or "").strip().rstrip("/")
     DB_FILE = "bot_memory.db"
     NORMAL_UPDATE_ZIP_URL = "https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot/zipball/main"
     TEST_UPDATE_ZIP_URL = "https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot-test/zipball/main"
@@ -2261,54 +2263,192 @@ class AgentExecutor:
         return cls._parse_stdin_line_mode(macro or '')
 
     @classmethod
+    def _collect_fenced_body(cls, lines: List[str], start: int):
+        """收集到下一个独占一行的 ``` 为止，返回 (body_lines, end_index)。
+        与旧正则语义一致：允许 fence 行前后有空白。未闭合返回 ([], None)。"""
+        body: List[str] = []
+        i = start
+        while i < len(lines):
+            if lines[i].strip() == '```':
+                return body, i
+            body.append(lines[i])
+            i += 1
+        return body, None
+
+    @classmethod
+    def _collect_heredoc_body(cls, lines: List[str], start: int, marker: str):
+        """收集到独占一行、等于 marker（去掉行尾空白后）的行。
+        未闭合返回 ([], None)。内容里可含任意 fence 或特殊字符。"""
+        body: List[str] = []
+        i = start
+        while i < len(lines):
+            if lines[i].rstrip() == marker:
+                return body, i
+            body.append(lines[i])
+            i += 1
+        return body, None
+
+    @classmethod
     def extract_protocol_blocks(cls, ai_response: str) -> List[Dict[str, Any]]:
-        """按出现顺序提取 Agent 协议块，支持同一回复里出现多个协议。"""
+        """按出现顺序提取 Agent 协议块，支持同一回复里出现多个协议。
+
+        支持的 file 写入形式：
+          - 普通 file:/path + 三反引号（向后兼容）
+          - heredoc: file:/path <<MARKER ... MARKER（内容可含 ```，推荐）
+          - file:base64:/path + base64 body（二进制安全）
+        """
         import re
 
-        pattern = re.compile(
-            r'```(?P<tag>run|shell|stdin:[^\n]+|shellread:[^\n]+|shellkill:[^\n]+|sendfile|read|media|file:[^\n]+)\s*\n(?P<body>.*?)\n\s*```',
-            re.DOTALL
+        blocks: List[Dict[str, Any]] = []
+        lines = ai_response.split('\n')
+        i = 0
+        n = len(lines)
+
+        std_tag_re = re.compile(
+            r'^```(?P<tag>run|shell|stdin:[^\n]+|shellread:[^\n]+|shellkill:[^\n]+|'
+            r'sendfile|read|media|file:[^\n]+)\s*$'
         )
 
-        blocks: List[Dict[str, Any]] = []
-        for match in pattern.finditer(ai_response):
-            raw_tag = match.group('tag').strip()
-            raw_body = match.group('body')
-            if raw_tag.startswith('file:'):
-                body = raw_body.strip()
+        while i < n:
+            m = std_tag_re.match(lines[i])
+            if not m:
+                i += 1
+                continue
+
+            tag = m.group('tag').strip()
+            block_start = i
+
+            # file:base64:/path  —— 二进制安全写入
+            if tag.startswith('file:base64:'):
+                path = tag[len('file:base64:'):].strip()
+                body_lines, end_i = cls._collect_fenced_body(lines, i + 1)
+                if end_i is None:
+                    i += 1
+                    continue
+                blocks.append({
+                    'type': 'file_base64',
+                    'path': path,
+                    'body': '\n'.join(body_lines),
+                    'start_line': block_start,
+                    'end_line': end_i,
+                })
+                i = end_i + 1
+                continue
+
+            # file:  —— 可能是 heredoc 或普通三反引号
+            if tag.startswith('file:'):
+                rest = tag[5:]
+                hm = re.match(r'^(\S+)\s*<<\s*([A-Za-z0-9_-]+)\s*$', rest)
+                if hm:
+                    # heredoc 形式：内容到独占一行的 marker 结束
+                    path = hm.group(1).strip()
+                    marker = hm.group(2)
+                    body_lines, end_i = cls._collect_heredoc_body(lines, i + 1, marker)
+                    if end_i is None:
+                        i += 1
+                        continue
+                    blocks.append({
+                        'type': 'file',
+                        'path': path,
+                        'body': '\n'.join(body_lines),
+                        'start_line': block_start,
+                        'end_line': end_i,
+                    })
+                    # heredoc 结束行后可能还有一个收尾 ```，跳过它避免被当成下一个块的开头
+                    ni = end_i + 1
+                    if ni < n and lines[ni].strip() == '```':
+                        ni += 1
+                    i = ni
+                    continue
+                # 普通三反引号形式（向后兼容）
+                path = rest.strip()
+                body_lines, end_i = cls._collect_fenced_body(lines, i + 1)
+                if end_i is None:
+                    i += 1
+                    continue
                 blocks.append({
                     'type': 'file',
-                    'path': raw_tag[5:].strip(),
-                    'body': body,
+                    'path': path,
+                    'body': '\n'.join(body_lines).strip(),
+                    'start_line': block_start,
+                    'end_line': end_i,
                 })
-            elif raw_tag.startswith('stdin:'):
+                i = end_i + 1
+                continue
+
+            # 其余标准协议（run/shell/stdin:/shellread:/shellkill:/sendfile/read/media）
+            body_lines, end_i = cls._collect_fenced_body(lines, i + 1)
+            if end_i is None:
+                i += 1
+                continue
+            raw_body = '\n'.join(body_lines)
+            if tag.startswith('stdin:'):
                 blocks.append({
                     'type': 'stdin',
-                    'path': raw_tag[6:].strip(),
+                    'path': tag[6:].strip(),
                     'body': raw_body,
+                    'start_line': block_start,
+                    'end_line': end_i,
                 })
-            elif raw_tag.startswith('shellread:'):
-                body = raw_body.strip()
+            elif tag.startswith('shellread:'):
                 blocks.append({
                     'type': 'shellread',
-                    'path': raw_tag[10:].strip(),
-                    'body': body,
+                    'path': tag[10:].strip(),
+                    'body': raw_body.strip(),
+                    'start_line': block_start,
+                    'end_line': end_i,
                 })
-            elif raw_tag.startswith('shellkill:'):
-                body = raw_body.strip()
+            elif tag.startswith('shellkill:'):
                 blocks.append({
                     'type': 'shellkill',
-                    'path': raw_tag[10:].strip(),
-                    'body': body,
+                    'path': tag[10:].strip(),
+                    'body': raw_body.strip(),
+                    'start_line': block_start,
+                    'end_line': end_i,
                 })
             else:
-                body = raw_body.strip()
                 blocks.append({
-                    'type': raw_tag,
+                    'type': tag,
                     'path': '',
-                    'body': body,
+                    'body': raw_body.strip(),
+                    'start_line': block_start,
+                    'end_line': end_i,
                 })
+            i = end_i + 1
+
         return blocks
+
+    @classmethod
+    def strip_protocol_blocks(cls, ai_response: str) -> str:
+        """从 AI 回复中剔除所有协议块，避免文件内容被当成普通文本发回。
+        与 extract_protocol_blocks 共用同一套行扫描逻辑，单一真相源。"""
+        blocks = cls.extract_protocol_blocks(ai_response)
+        if not blocks:
+            return ai_response
+
+        lines = ai_response.split('\n')
+        keep = [True] * len(lines)
+        for block in blocks:
+            start = block.get('start_line')
+            end = block.get('end_line')
+            if start is None or end is None:
+                continue
+            for k in range(start, min(end + 1, len(lines))):
+                keep[k] = False
+            ni = end + 1
+            if ni < len(lines) and lines[ni].strip() == '```':
+                keep[ni] = False
+
+        result = [lines[k] for k in range(len(lines)) if keep[k]]
+        cleaned: List[str] = []
+        prev_blank = False
+        for ln in result:
+            is_blank = ln.strip() == ''
+            if is_blank and prev_blank:
+                continue
+            cleaned.append(ln)
+            prev_blank = is_blank
+        return '\n'.join(cleaned)
 
     @classmethod
     def resolve_file_path(cls, requested_path: str) -> str:
@@ -2620,18 +2760,10 @@ class AgentExecutor:
     
     @classmethod
     def get_clean_response_all(cls, ai_response: str) -> str:
-        """获取 AI 回复中除命令块、文件块、发送块以外的文本"""
-        import re
-        cleaned = re.sub(r'```run\s*\n.*?\n\s*```', '', ai_response, flags=re.DOTALL)
-        cleaned = re.sub(r'```shell\s*\n.*?\n\s*```', '', cleaned, flags=re.DOTALL)
-        cleaned = re.sub(r'```stdin:[^\n]+\s*\n.*?\n\s*```', '', cleaned, flags=re.DOTALL)
-        cleaned = re.sub(r'```shellread:[^\n]+\s*\n.*?\n\s*```', '', cleaned, flags=re.DOTALL)
-        cleaned = re.sub(r'```shellkill:[^\n]+\s*\n.*?\n\s*```', '', cleaned, flags=re.DOTALL)
-        cleaned = re.sub(r'```file:[^\n]+\s*\n.*?\n\s*```', '', cleaned, flags=re.DOTALL)
-        cleaned = re.sub(r'```sendfile\s*\n.*?\n\s*```', '', cleaned, flags=re.DOTALL)
-        cleaned = re.sub(r'```read\s*\n.*?\n\s*```', '', cleaned, flags=re.DOTALL)
-        cleaned = re.sub(r'```media\s*\n.*?\n\s*```', '', cleaned, flags=re.DOTALL)
-        return cleaned.strip()
+        """获取 AI 回复中除命令块、文件块、发送块以外的文本。
+        复用 strip_protocol_blocks 的行扫描逻辑，确保与 extract_protocol_blocks
+        对 heredoc / file:base64: 的识别完全一致。"""
+        return AgentExecutor.strip_protocol_blocks(ai_response).strip()
 
 
 # --- ☆ Agent 交互 Shell 会话管理器 ☆ ---
@@ -9703,6 +9835,81 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         should_continue = True
                     continue
 
+                if block_type == 'file_base64':
+                    filename, b64_content = block['path'], block['body']
+                    file_notice = ""
+                    try:
+                        import base64
+                        clean_b64 = re.sub(r'\s+', '', b64_content)
+                        if not clean_b64:
+                            raise ValueError("base64 内容为空")
+                        raw_bytes = base64.b64decode(clean_b64, validate=False)
+                        b64_target_path = AgentExecutor.resolve_file_path(filename)
+                        b64_existed = os.path.exists(b64_target_path)
+
+                        def _write_b64_bytes(path=b64_target_path, data=raw_bytes):
+                            parent = os.path.dirname(path)
+                            if parent:
+                                os.makedirs(parent, exist_ok=True)
+                            with open(path, 'wb') as f:
+                                f.write(data)
+
+                        await asyncio.get_running_loop().run_in_executor(None, _write_b64_bytes)
+                        b64_saved_size = os.path.getsize(b64_target_path)
+                        b64_safe_filename = os.path.basename(b64_target_path) or f"bot_file_{uuid.uuid4().hex[:8]}.bin"
+
+                        if b64_saved_size <= AgentExecutor.MAX_FILE_SIZE:
+                            with open(b64_target_path, 'rb') as b64_saved_file:
+                                await context.bot.send_document(
+                                    chat_id=update.effective_chat.id,
+                                    document=b64_saved_file,
+                                    filename=b64_safe_filename,
+                                    caption=f"📄 已写入服务器并发送 (base64): {b64_safe_filename}"
+                                )
+                        else:
+                            await safe_send_message(
+                                context,
+                                update.effective_chat.id,
+                                (
+                                    f"✅ base64 文件已写入服务器，但超过发送大小限制。\n"
+                                    f"路径: <code>{safe_text(b64_target_path)}</code>\n"
+                                    f"大小: {b64_saved_size} bytes"
+                                ),
+                                parse_mode=constants.ParseMode.HTML
+                            )
+
+                        file_notice = (
+                            f"[file:base64结果] 已写入服务器文件: {b64_target_path} "
+                            f"({b64_saved_size} bytes, {'覆盖' if b64_existed else '新建'})"
+                        )
+                    except Exception as e:
+                        logger.error(f"Agent base64 写入文件失败: {e}")
+                        file_notice = f"[file:base64结果] 写入失败: {filename}。错误: {str(e)[:200]}"
+                        await safe_send_message(
+                            context,
+                            update.effective_chat.id,
+                            f"❌ base64 文件写入失败: {safe_text(str(e)[:200])}"
+                        )
+
+                    if file_notice:
+                        await GlobalRecorder.record(
+                            msg_type=MessageType.AGENT_RESULT,
+                            role='system',
+                            content=file_notice,
+                            chat_id=update.effective_chat.id
+                        )
+                        await db.add_chat_message(cid, 'user', file_notice)
+                        continuation_messages.append({
+                            'role': 'user',
+                            'content': (
+                                file_notice + "\n"
+                                "说明: file:base64 已执行；这里回灌的是写入结果、路径和大小，"
+                                "不包含文件本体。若需要查看文件内容，请使用 read。"
+                            )
+                        })
+                        should_continue = True
+                    continue
+
                 if block_type == 'run':
                     run_result = await AgentExecutor.run_command(block['body'], get_or_create_stop_event())
                     run_notice = build_run_notice(run_result)
@@ -10554,10 +10761,12 @@ if __name__ == '__main__':
     try:
         print("=" * 60)
         print("Telegram AI Bot starting...")
+        if BotConfig.API_BASE_URL:
+            print(f"Using LOCAL Telegram Bot API: {BotConfig.API_BASE_URL}")
         print("=" * 60)
         
         # 创建应用
-        app = (
+        _app_builder = (
             Application.builder()
             .token(BotConfig.TOKEN)
             .post_init(setup_bot_commands)
@@ -10566,8 +10775,17 @@ if __name__ == '__main__':
             .connect_timeout(15)
             .pool_timeout(10)
             .concurrent_updates(True)
-            .build()
         )
+        if BotConfig.API_BASE_URL:
+            # 走本地 Telegram Bot API server：base_url / base_file_url 同源，开 local_mode
+            _app_builder = _app_builder.base_url(
+                f"{BotConfig.API_BASE_URL}/bot{BotConfig.TOKEN}"
+            )
+            _app_builder = _app_builder.base_file_url(
+                f"{BotConfig.API_BASE_URL}/file{BotConfig.TOKEN}"
+            )
+            _app_builder = _app_builder.local_mode(True)
+        app = _app_builder.build()
         
         # 注册关闭钩子 - 正确清理数据库连接
         app.post_shutdown = on_shutdown
