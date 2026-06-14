@@ -119,24 +119,22 @@ async def download_telegram_file(telegram_obj) -> bytes:
     """
     file_obj = await telegram_obj.get_file()
 
-    # 【DEBUG】临时排查日志：打印 file_obj 的所有可能路径字段，定位本地模式真实格式
-    _debug_fp = getattr(file_obj, 'file_path', None)
-    _debug_fid = getattr(file_obj, 'file_id', None)
-    _debug_fuid = getattr(file_obj, 'file_unique_id', None)
-    logger.info(f"【DEBUG download_telegram_file】API_BASE_URL={BotConfig.API_BASE_URL!r}")
-    logger.info(f"【DEBUG download_telegram_file】file_path={_debug_fp!r}")
-    logger.info(f"【DEBUG download_telegram_file】file_id={_debug_fid!r} file_unique_id={_debug_fuid!r}")
-    logger.info(f"【DEBUG download_telegram_file】file_obj 类型={type(file_obj).__name__}")
-
     if BotConfig.API_BASE_URL:
-        # 本地模式：file_path 是容器内绝对路径，翻译到宿主机
-        container_path = getattr(file_obj, 'file_path', '') or ''
-        if container_path.startswith(_LOCAL_API_CONTAINER_DATA_DIR):
+        # 本地模式：PTB 把 base_file_url + token + 容器内绝对路径拼成混合 URL，
+        # 例如 http://localhost:8081/file/bot<TOKEN>//var/lib/telegram-bot-api/<TOKEN>/documents/file_X.zip
+        # 从中提取 /var/lib/telegram-bot-api/... 这段容器路径，翻译到宿主机数据目录直接读取。
+        raw_path = getattr(file_obj, 'file_path', '') or ''
+        marker = _LOCAL_API_CONTAINER_DATA_DIR + '/'
+        idx = raw_path.find(marker)
+        if idx != -1:
+            container_path = raw_path[idx:]
             host_path = _LOCAL_API_HOST_DATA_DIR + container_path[len(_LOCAL_API_CONTAINER_DATA_DIR):]
-            with open(host_path, 'rb') as f:
-                return f.read()
-        # 路径不符合预期，回退到 PTB 原生下载
-        logger.warning(f"【DEBUG】file_path 不匹配容器前缀，回退原生下载。file_path={container_path!r}")
+            try:
+                with open(host_path, 'rb') as f:
+                    return f.read()
+            except FileNotFoundError:
+                logger.warning(f"本地 API 文件宿主机路径不存在，回退原生下载: {host_path}")
+        # 路径不符合预期或宿主机文件不存在，回退到 PTB 原生下载
         return bytes(await file_obj.download_as_bytearray())
 
     # 官方模式：PTB 原生 HTTP 下载
