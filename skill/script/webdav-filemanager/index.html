@@ -1053,6 +1053,22 @@ body {
     border-color: var(--accent-glow);
     color: var(--info);
 }
+.transfer-filter {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 8px 2px 4px;
+}
+.filter-chip {
+    font-size: 0.78rem;
+    padding: 4px 14px;
+    line-height: 1.4;
+}
+.filter-chip.active {
+    background: var(--accent-dim);
+    border-color: var(--accent-glow);
+    color: var(--info);
+}
 .remote-form {
     display: grid;
     grid-template-columns: 1fr auto;
@@ -1717,6 +1733,11 @@ body {
             <button class="btn transfer-option" id="transferTabUpload" onclick="setTransferTab('upload')">📤 上传</button>
             <button class="btn transfer-option" id="transferTabDownload" onclick="setTransferTab('download')">📥 下载</button>
         </div>
+        <div class="transfer-filter" id="transferFilterRow">
+            <button class="btn filter-chip active" id="transferFilterAll" onclick="setTransferFilter('all')">全部</button>
+            <button class="btn filter-chip" id="transferFilterActive" onclick="setTransferFilter('active')">进行中</button>
+            <button class="btn filter-chip" id="transferFilterDone" onclick="setTransferFilter('done')">已完成</button>
+        </div>
         <div class="remote-form" id="remoteDownloadForm">
             <input type="url" class="modal-input" id="remoteDownloadUrl" placeholder="输入 http/https 链接，文件会保存到 /download">
             <button class="btn" onclick="startRemoteDownload()">开始远程下载</button>
@@ -2203,6 +2224,75 @@ let editorDirty = false;
 let lastShareUrl = '';
 let downloadTasks = [];
 let selectedDownloadId = '';
+const LOCAL_TASKS_KEY = 'fm_local_tasks_v1';
+
+function persistLocalTasks() {
+    // Persist lightweight metadata for download/upload tasks so the record
+    // (including paused/failed) survives a page refresh. Live remote tasks are
+    // tracked server-side; we still snapshot them here as a fallback.
+    try {
+        const snap = downloadTasks.map(t => ({
+            id: t.id,
+            kind: t.kind || 'download',
+            remoteId: t.remoteId,
+            serverTaskId: t.serverTaskId,
+            name: t.name,
+            path: t.path,
+            url: t.url,
+            status: t.status,
+            loaded: t.loaded || 0,
+            size: t.size || 0,
+            error: t.error || '',
+            maxBps: t.maxBps || 0,
+            samples: (t.samples || []).slice(-60),
+            createdAt: t.createdAt || (Date.now() / 1000),
+            needsFile: !!t.needsFile,
+        }));
+        localStorage.setItem(LOCAL_TASKS_KEY, JSON.stringify(snap));
+    } catch (e) {}
+}
+
+function loadLocalTasks() {
+    try {
+        const raw = localStorage.getItem(LOCAL_TASKS_KEY);
+        if (!raw) return;
+        const snap = JSON.parse(raw);
+        if (!Array.isArray(snap)) return;
+        // Reset any in-flight tasks to paused/error states (we lost the live
+        // controller + chunk buffers on refresh). Remote tasks will be reconciled
+        // by loadAllTasks() afterward.
+        snap.forEach(s => {
+            if (downloadTasks.find(t => t.id === s.id)) return;  // already present
+            const status = (s.kind === 'remote') ? s.status
+                : (s.status === 'downloading' ? 'paused' : s.status);
+            downloadTasks.push({
+                id: s.id,
+                kind: s.kind || 'download',
+                remoteId: s.remoteId,
+                serverTaskId: s.serverTaskId,
+                name: s.name || '未命名',
+                path: s.path || '',
+                url: s.url || '',
+                status: status,
+                loaded: s.loaded || 0,
+                size: s.size || 0,
+                error: s.error || (s.kind !== 'remote' && status === 'paused' ? '刷新后需重新开始' : ''),
+                maxBps: s.maxBps || 0,
+                lastBps: 0,
+                samples: s.samples || [],
+                controller: null,
+                chunks: [],
+                totalActiveMs: 0,
+                lastResumeAt: 0,
+                lastT: 0,
+                lastBytes: s.loaded || 0,
+                file: null,
+                needsFile: (s.kind === 'upload' && ['paused', 'error', 'queued'].includes(status)) || !!s.needsFile,
+                createdAt: s.createdAt,
+            });
+        });
+    } catch (e) {}
+}
 let downloadUnit = localStorage.getItem('fm_download_unit') || 'MB';
 let downloadDragId = '';
 let currentUsername = '';
@@ -5187,6 +5277,7 @@ var currentLinkTab = 'active';
 var shareCache = { items: [], trash: [] };
 var remotePollTimer = null;
 var currentTransferTab = 'remote';
+var currentTransferFilter = 'all';  // all | active | done
 var ignoredRemoteTaskIds = new Set();
 
 function transferTabText(tab = currentTransferTab) {
@@ -5203,8 +5294,38 @@ function taskKind(task) {
     return task?.kind || 'download';
 }
 
+function taskMatchesFilter(task) {
+    // active: queued + downloading + paused + error (进行中含失败和暂停)
+    // done: done (已完成不含 canceled，因为 canceled 是用户主动取消)
+    if (currentTransferFilter === 'all') return true;
+    if (currentTransferFilter === 'active') {
+        return ['queued', 'downloading', 'paused', 'error'].includes(task.status);
+    }
+    if (currentTransferFilter === 'done') {
+        return task.status === 'done';
+    }
+    return true;
+}
+
+function setTransferFilter(filter) {
+    currentTransferFilter = ['all', 'active', 'done'].includes(filter) ? filter : 'all';
+    [
+        ['transferFilterAll', 'all'],
+        ['transferFilterActive', 'active'],
+        ['transferFilterDone', 'done'],
+    ].forEach(([id, value]) => {
+        const el = document.getElementById(id);
+        if (el) el.classList.toggle('active', currentTransferFilter === value);
+    });
+    if (!visibleTransferTasks().some(t => t.id === selectedDownloadId)) {
+        selectedDownloadId = visibleTransferTasks()[0]?.id || '';
+    }
+    renderDownloadQueue();
+    renderDownloadDetails(selectedDownloadTask());
+}
+
 function visibleTransferTasks() {
-    return downloadTasks.filter(t => taskKind(t) === currentTransferTab);
+    return downloadTasks.filter(t => taskKind(t) === currentTransferTab && taskMatchesFilter(t));
 }
 
 function canResumeTransferTask(task) {
@@ -5291,9 +5412,9 @@ function continueUploadInBackground() {
 function openDownloadPage() {
     showView('download');
     setTransferTab(currentTransferTab);
+    loadAllTasks();
     renderDownloadQueue();
     renderDownloadDetails(selectedDownloadTask());
-    pollRemoteDownloads();
 }
 
 async function startRemoteDownload() {
@@ -5322,7 +5443,7 @@ async function startRemoteDownload() {
 
 function startRemotePolling() {
     if (remotePollTimer) return;
-    remotePollTimer = setInterval(pollRemoteDownloads, 1500);
+    remotePollTimer = setInterval(pollAllTasks, 1500);
 }
 
 function stopRemotePollingIfIdle() {
@@ -5333,16 +5454,112 @@ function stopRemotePollingIfIdle() {
     }
 }
 
-async function pollRemoteDownloads() {
+async function pollAllTasks() {
     try {
-        const data = await apiFetch('/api/remote-downloads');
-        (data.items || []).forEach(mergeRemoteTask);
+        const data = await apiFetch('/api/tasks');
+        const serverIds = new Set();
+        (data.items || []).forEach(raw => {
+            if (!raw || !raw.id) return;
+            serverIds.add(raw.id);
+            const kind = raw.kind || 'remote';
+            if (kind === 'remote') {
+                mergeRemoteTask(raw);
+            } else {
+                mergePersistedTask(raw);
+            }
+        });
         renderDownloadQueue();
         renderDownloadDetails(selectedDownloadTask());
         stopRemotePollingIfIdle();
         if (downloadTasks.some(t => t.kind === 'remote' && ['queued', 'downloading'].includes(t.status))) startRemotePolling();
     } catch (e) {
         stopRemotePollingIfIdle();
+    }
+}
+
+async function loadAllTasks() {
+    // Initial fetch of all persisted tasks (called once on page load / opening transfer center)
+    try {
+        const data = await apiFetch('/api/tasks');
+        (data.items || []).forEach(raw => {
+            if (!raw || !raw.id) return;
+            const kind = raw.kind || 'remote';
+            if (kind === 'remote') mergeRemoteTask(raw);
+            else mergePersistedTask(raw);
+        });
+        renderDownloadQueue();
+        renderDownloadDetails(selectedDownloadTask());
+        // If any remote task is active, keep polling
+        if (downloadTasks.some(t => t.kind === 'remote' && ['queued', 'downloading'].includes(t.status))) startRemotePolling();
+    } catch (e) { /* ignore on first load */ }
+}
+
+async function pollRemoteDownloads() {
+    // Backward-compatible alias -> unified polling
+    return pollAllTasks();
+}
+
+function mergePersistedTask(raw) {
+    // Merge an upload/download snapshot from /api/tasks into downloadTasks.
+    // These are display-only records (no live execution after refresh); the live
+    // upload/download tasks keep their own state and bypass this merge.
+    if (!raw || !raw.id) return;
+    // Match by id, or by (kind + path) to reconcile local-id vs server-taskId
+    // differences after a page refresh.
+    let task = downloadTasks.find(t => t.id === raw.id)
+        || downloadTasks.find(t => (t.kind || 'download') === (raw.kind || 'download')
+            && t.path === raw.path && t.path);
+    if (task && task.controller) {
+        // Live in-progress task: only refresh progress fields, don't clobber status
+        task.loaded = Number(raw.loaded) || task.loaded;
+        task.size = Number(raw.size) || task.size || 0;
+        // Adopt the server task id so subsequent chunk/cancel calls use it
+        if (!task.serverTaskId && raw.kind === 'upload') task.serverTaskId = raw.id;
+        return;
+    }
+    if (task) {
+        // Existing display record: refresh fields, adopt server id
+        if (!task.serverTaskId && raw.kind === 'upload') task.serverTaskId = raw.id;
+    } else {
+        task = {
+            id: raw.id,
+            kind: raw.kind || 'download',
+            remoteId: raw.id,
+            name: raw.name || (raw.kind === 'upload' ? '上传任务' : '下载任务'),
+            path: raw.path || '',
+            url: raw.url || '',
+            status: normalizeTaskStatus(raw.status),
+            loaded: Number(raw.loaded) || 0,
+            size: Number(raw.size) || 0,
+            controller: null,
+            maxBps: Number(raw.maxBps) || 0,
+            lastBps: Number(raw.lastBps) || 0,
+            samples: raw.samples || [],
+            totalActiveMs: 0,
+            lastResumeAt: 0,
+            lastT: 0,
+            lastBytes: 0,
+            error: raw.error || '',
+            // For upload tasks refreshed from server (no local file handle), mark as needing re-select to resume
+            needsFile: (raw.kind === 'upload' && ['paused', 'error', 'queued'].includes(normalizeTaskStatus(raw.status))),
+        };
+        downloadTasks.push(task);
+        if (!selectedDownloadId) selectedDownloadId = task.id;
+        updateTransferBadge();
+        return;
+    }
+    task.name = raw.name || task.name;
+    task.path = raw.path || task.path;
+    task.url = raw.url || task.url;
+    task.status = normalizeTaskStatus(raw.status);
+    task.loaded = Number(raw.loaded) || 0;
+    task.size = Number(raw.size) || task.size || 0;
+    task.lastBps = Number(raw.lastBps) || 0;
+    task.maxBps = Number(raw.maxBps) || task.maxBps || 0;
+    task.samples = raw.samples || task.samples || [];
+    task.error = raw.error || '';
+    if (task.kind === 'upload' && ['paused', 'error', 'queued'].includes(task.status)) {
+        task.needsFile = true;
     }
 }
 
@@ -5624,6 +5841,7 @@ function addUploadTask(file, uid, relativePathOverride = '', uploadBatchId = '')
         targetDir,
         relativePath,
         uploadBatchId,
+        serverTaskId: '',
         path: targetDir.replace(/\/$/, '') + '/' + relativePath,
         name: file.name,
         size: file.size,
@@ -5638,6 +5856,7 @@ function addUploadTask(file, uid, relativePathOverride = '', uploadBatchId = '')
         lastT: 0,
         lastBytes: 0,
         error: '',
+        needsFile: false,
     };
     downloadTasks.push(task);
     updateTransferBadge();
@@ -5652,101 +5871,155 @@ function processDownloadQueue() {
     else startDownloadTask(next);
 }
 
-function startUploadTask(task) {
+const UPLOAD_CHUNK_SIZE = 2 * 1024 * 1024; // 2 MB per chunk
+
+async function startUploadTask(task) {
+    // Resumable chunked upload: /api/upload-init -> /api/upload-chunk* -> /api/upload-complete
+    if (!task.file) {
+        // Refreshed-from-server record without a local file handle: needs re-select
+        task.status = 'paused';
+        task.needsFile = true;
+        task.error = '刷新后需重新选择文件才能继续';
+        renderDownloadQueue();
+        renderDownloadDetails(selectedDownloadTask());
+        return;
+    }
     task.status = 'downloading';
     task.error = '';
-    task.loaded = task.loaded && task.status === 'paused' ? task.loaded : 0;
-    task.controller = new XMLHttpRequest();
     task.lastResumeAt = performance.now();
     task.lastT = performance.now();
     task.lastBytes = task.loaded || 0;
-    const xhr = task.controller;
-    xhr.withCredentials = true;
-    const targetDir = task.targetDir || parentDir(task.path || '/') || '/';
-    const url = '/api/upload?path=' + encodeURIComponent(targetDir)
-        + '&name=' + encodeURIComponent(task.name)
-        + '&relpath=' + encodeURIComponent(task.relativePath || task.name)
-        + '&batch=' + encodeURIComponent(task.uploadBatchId || '');
-    xhr.upload.addEventListener('progress', (e) => {
-        const total = e.lengthComputable ? e.total : task.size;
-        task.size = total || task.size;
-        task.loaded = e.loaded;
-        updateDownloadTaskSpeed(task);
-        const pct = task.size ? Math.round(task.loaded / task.size * 100) : 0;
-        const bar = document.getElementById('bar_' + task.uid);
-        const st = document.getElementById('st_' + task.uid);
-        if (bar) bar.style.width = pct + '%';
-        if (st) st.textContent = `${pct}%`;
-    });
-    xhr.addEventListener('load', async () => {
-        finishDownloadActivity(task);
-        if (xhr.status === 200) {
-            task.status = 'done';
-            task.loaded = task.size;
-            task.lastBps = 0;
-            const st = document.getElementById('st_' + task.uid);
-            if (st) { st.textContent = '完成'; st.style.color = 'var(--success)'; }
-            if (curPath === (task.path.split('/').slice(0, -1).join('/') || '/')) {
-                try { await loadFiles(curPath); } catch (e) {}
-            }
-            loadDiskInfo();
-        } else if (xhr.status === 401) {
-            task.status = 'error';
-            task.error = '登录已过期，请重新登录';
-            appStarted = false;
-            showLogin();
-        } else if (xhr.status === 409) {
-            task.status = 'paused';
-            task.loaded = 0;
-            task.lastBps = 0;
-            task.error = '目标已存在';
-            let conflict = {};
-            try { conflict = JSON.parse(xhr.responseText || '{}'); } catch (e) {}
-            const conflictName = conflict.name || uploadLeafName(task.relativePath || task.name);
-            const conflictKind = conflict.conflict === 'folder' ? '文件夹' : '文件';
-            const renamed = await promptUploadRename({
-                title: '上传重名',
-                text: `${conflictKind}“${conflictName}”已经存在。请重命名后继续，或取消该任务。`,
-                currentName: conflictName,
-            });
-            if (renamed) {
-                task.relativePath = replaceUploadConflictName(task.relativePath || task.name, conflictName, renamed);
-                task.name = uploadLeafName(task.relativePath);
-                task.path = task.targetDir.replace(/\/$/, '') + '/' + task.relativePath;
-                task.status = 'queued';
-                task.error = '';
-            } else {
-                task.status = 'canceled';
-            }
-        } else {
-            task.status = 'error';
-            task.error = '上传失败：HTTP ' + xhr.status;
-        }
-        task.controller = null;
-        renderDownloadQueue();
-        renderDownloadDetails(selectedDownloadTask());
-        processDownloadQueue();
-    });
-    xhr.addEventListener('error', () => {
-        finishDownloadActivity(task);
-        task.status = 'error';
-        task.error = '网络错误';
-        renderDownloadQueue();
-        renderDownloadDetails(selectedDownloadTask());
-        processDownloadQueue();
-    });
-    xhr.addEventListener('abort', () => {
-        finishDownloadActivity(task);
-        if (task.status === 'downloading') task.status = 'paused';
-        task.controller = null;
-        renderDownloadQueue();
-        renderDownloadDetails(selectedDownloadTask());
-        processDownloadQueue();
-    });
+    task.controller = new AbortController();
     renderDownloadQueue();
     renderDownloadDetails(task);
-    xhr.open('POST', url);
-    xhr.send(task.file);
+
+    const targetDir = task.targetDir || parentDir(task.path || '/') || '/';
+    try {
+        // 1. init (gets taskId + resume offset)
+        const initResp = await apiFetch('/api/upload-init', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                path: targetDir,
+                name: task.name,
+                relpath: task.relativePath || task.name,
+                size: task.size,
+                batch: task.uploadBatchId || '',
+            }),
+            signal: task.controller.signal,
+        });
+        task.serverTaskId = initResp.taskId;
+        let offset = Number(initResp.offset) || 0;
+        task.loaded = offset;
+        task.lastBytes = offset;
+
+        // 2. upload chunks
+        while (offset < task.size) {
+            if (task.controller.signal.aborted) throw new DOMException('aborted', 'AbortError');
+            const end = Math.min(offset + UPLOAD_CHUNK_SIZE, task.size);
+            const chunk = task.file.slice(offset, end);
+            const chunkResp = await apiFetchRaw(
+                '/api/upload-chunk?taskId=' + encodeURIComponent(task.serverTaskId)
+                    + '&offset=' + offset + '&total=' + task.size,
+                { method: 'POST', body: chunk, signal: task.controller.signal },
+            );
+            if (chunkResp.status !== 200) {
+                let detail = '';
+                try { detail = (await chunkResp.json()).error || ''; } catch (e) {}
+                throw new Error('分片上传失败：' + (detail || ('HTTP ' + chunkResp.status)));
+            }
+            const data = await chunkResp.json();
+            offset = Number(data.offset) || (offset + (end - offset));
+            task.loaded = offset;
+            updateDownloadTaskSpeed(task);
+            const pct = task.size ? Math.round(task.loaded / task.size * 100) : 0;
+            const bar = document.getElementById('bar_' + task.uid);
+            const st = document.getElementById('st_' + task.uid);
+            if (bar) bar.style.width = pct + '%';
+            if (st) st.textContent = pct + '%';
+            renderDownloadQueue();
+        }
+
+        // 3. complete
+        await apiFetch('/api/upload-complete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ taskId: task.serverTaskId }),
+            signal: task.controller.signal,
+        });
+        finishDownloadActivity(task);
+        task.status = 'done';
+        task.loaded = task.size;
+        task.lastBps = 0;
+        task.needsFile = false;
+        const st = document.getElementById('st_' + task.uid);
+        if (st) { st.textContent = '完成'; st.style.color = 'var(--success)'; }
+        if (curPath === (task.path.split('/').slice(0, -1).join('/') || '/')) {
+            try { await loadFiles(curPath); } catch (e) {}
+        }
+        loadDiskInfo();
+        toast(`上传完成：${task.name}`, 'success');
+    } catch (e) {
+        finishDownloadActivity(task);
+        const isCancel = task._cancelRequested;
+        if (e && e.name === 'AbortError') {
+            if (isCancel) {
+                // User chose cancel: drop .part + server record
+                task.status = 'canceled';
+                if (task.serverTaskId) {
+                    try {
+                        await apiFetch('/api/upload-cancel', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ taskId: task.serverTaskId, action: 'cancel' }),
+                        });
+                    } catch (ce) {}
+                }
+            } else {
+                // Pause: keep .part for resume
+                if (task.status === 'downloading') task.status = 'paused';
+                if (task.serverTaskId) {
+                    try {
+                        await apiFetch('/api/upload-cancel', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ taskId: task.serverTaskId, action: 'pause' }),
+                        });
+                    } catch (ce) {}
+                }
+            }
+            task._pauseRequested = false;
+            task._cancelRequested = false;
+        } else if (e && e.message && e.message.includes('已存在')) {
+            task.status = 'paused';
+            task.error = e.message;
+        } else {
+            task.status = 'error';
+            task.error = (e && e.message) || '上传失败';
+            // Mark as paused on server so the record survives a refresh
+            if (task.serverTaskId) {
+                try {
+                    await apiFetch('/api/upload-cancel', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ taskId: task.serverTaskId, action: 'pause' }),
+                    });
+                } catch (ce) {}
+            }
+        }
+    } finally {
+        task.controller = null;
+        renderDownloadQueue();
+        renderDownloadDetails(selectedDownloadTask());
+        processDownloadQueue();
+    }
+}
+
+async function apiFetchRaw(url, opts = {}) {
+    // Like apiFetch but returns the raw Response so callers can read status / non-JSON body.
+    if (!(await ensureAuthenticated())) throw new Error('未登录');
+    const resp = await fetch(url, { credentials: 'same-origin', ...opts });
+    return resp;
 }
 
 function selectedDownloadTask() {
@@ -5830,6 +6103,7 @@ function renderDownloadQueue() {
     list.querySelectorAll('[data-download-cancel]').forEach(btn => btn.onclick = () => cancelDownloadTask(btn.getAttribute('data-download-cancel')));
     list.querySelectorAll('[data-download-delete]').forEach(btn => btn.onclick = () => deleteDownloadTask(btn.getAttribute('data-download-delete')));
     renderDownloadTotals();
+    persistLocalTasks();
 }
 
 function renderDownloadDetails(task) {
@@ -5910,17 +6184,34 @@ async function pauseDownloadTask(id) {
     if (['done', 'error', 'canceled'].includes(task.status)) return;
     if (task.kind === 'remote') {
         try {
-            await apiFetch('/api/remote-download-cancel', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ id: task.remoteId || task.id }) });
-            ignoredRemoteTaskIds.add(task.remoteId || task.id);
-            try {
-                await apiFetch('/api/remote-download-delete', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ id: task.remoteId || task.id }) });
-            } catch (e) {}
-            task.localPaused = true;
+            // action=pause keeps the .part file for resume
+            await apiFetch('/api/remote-download-cancel', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: task.remoteId || task.id, action: 'pause' }),
+            });
             task.status = 'paused';
             task.lastBps = 0;
         } catch (e) {
             task.error = e.message;
             task.status = 'error';
+        }
+    } else if (task.kind === 'upload') {
+        // Abort the in-flight chunk; startUploadTask's catch will mark paused on server
+        if (task.status === 'downloading' && task.controller) {
+            task._pauseRequested = true;
+            task.controller.abort();
+        } else {
+            task.status = 'paused';
+            if (task.serverTaskId) {
+                try {
+                    await apiFetch('/api/upload-cancel', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ taskId: task.serverTaskId, action: 'pause' }),
+                    });
+                } catch (e) {}
+            }
         }
     } else if (task.status === 'downloading' && task.controller) {
         task.controller.abort();
@@ -5938,21 +6229,51 @@ async function cancelDownloadTask(id) {
     const task = downloadTasks[idx];
     if (task.kind === 'remote') {
         try {
-            ignoredRemoteTaskIds.add(task.remoteId || task.id);
+            // action=cancel drops the .part file
             await apiFetch('/api/remote-download-cancel', {
-                method:'POST',
-                headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({ id: task.remoteId || task.id }),
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: task.remoteId || task.id, action: 'cancel' }),
             });
             await apiFetch('/api/remote-download-delete', {
-                method:'POST',
-                headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({ id: task.remoteId || task.id }),
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: task.remoteId || task.id }),
             });
         } catch (e) {}
+    } else if (task.kind === 'upload') {
+        // Stop local chunk + drop server .part and record
+        if (task.status === 'downloading' && task.controller) {
+            task._cancelRequested = true;
+            task.controller.abort();
+        }
+        if (task.serverTaskId) {
+            try {
+                await apiFetch('/api/upload-cancel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ taskId: task.serverTaskId, action: 'cancel' }),
+                });
+            } catch (e) {}
+        } else {
+            try {
+                await apiFetch('/api/tasks-delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id: task.id }),
+                });
+            } catch (e) {}
+        }
     } else if (task.status === 'downloading' && task.controller) {
         task.status = 'canceled';
         task.controller.abort();
+        try {
+            await apiFetch('/api/tasks-delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: task.id }),
+            });
+        } catch (e) {}
     }
     finishDownloadActivity(task);
     downloadTasks.splice(idx, 1);
@@ -5966,19 +6287,16 @@ async function resumeDownloadTask(id) {
     const task = downloadTasks.find(t => t.id === id);
     if (!task || task.status === 'done') return;
     if (task.kind === 'remote') {
-        if (!task.url) return;
         try {
-            const idx = downloadTasks.findIndex(t => t.id === id);
-            const data = await apiFetch('/api/remote-download', {
-                method:'POST',
-                headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({ url: task.url }),
+            const data = await apiFetch('/api/remote-download-resume', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: task.remoteId || task.id }),
             });
-            if (idx >= 0) downloadTasks.splice(idx, 1);
             mergeRemoteTask(data.task);
-            currentTransferTab = 'remote';
-            selectedDownloadId = data.task.id;
-            setTransferTab('remote');
+            task.localPaused = false;
+            task.status = normalizeTaskStatus(data.task.status);
+            selectedDownloadId = task.id;
             startRemotePolling();
         } catch (e) {
             task.error = e.message;
@@ -5988,7 +6306,24 @@ async function resumeDownloadTask(id) {
         renderDownloadDetails(selectedDownloadTask());
         return;
     }
-    if (task.kind === 'upload') task.loaded = 0;
+    if (task.kind === 'upload') {
+        if (task.needsFile || !task.file) {
+            // Refreshed from server: ask user to re-select the same file
+            const reselected = await pickFileForResume(task);
+            if (!reselected) return;
+            task.file = reselected;
+            task.size = reselected.size;
+            task.needsFile = false;
+        }
+        task.status = 'queued';
+        task.error = '';
+        selectedDownloadId = task.id;
+        renderDownloadQueue();
+        renderDownloadDetails(task);
+        processDownloadQueue();
+        return;
+    }
+    // download task (within same session)
     task.status = 'queued';
     task.error = '';
     selectedDownloadId = task.id;
@@ -5997,13 +6332,47 @@ async function resumeDownloadTask(id) {
     processDownloadQueue();
 }
 
+function pickFileForResume(task) {
+    return new Promise(resolve => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.onchange = () => {
+            const f = input.files && input.files[0];
+            if (!f) return resolve(null);
+            if (task.size && f.size !== task.size) {
+                toast(`所选文件大小（${fmtSize(f.size)}）与原任务（${fmtSize(task.size)}）不一致，无法续传`, 'error');
+                return resolve(null);
+            }
+            resolve(f);
+        };
+        input.click();
+    });
+}
+
 async function deleteDownloadTask(id) {
     const idx = downloadTasks.findIndex(t => t.id === id);
     if (idx < 0) return;
     const task = downloadTasks[idx];
     if (task.status === 'downloading') await pauseDownloadTask(id);
+    // Remove server record + .part for any kind
+    try {
+        const serverId = task.serverTaskId || task.remoteId || task.id;
+        await apiFetch('/api/tasks-delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: serverId }),
+        });
+    } catch (e) {}
+    // Also clear any live remote task
     if (task.kind === 'remote') {
-        try { await apiFetch('/api/remote-download-delete', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ id: task.remoteId || task.id }) }); } catch (e) {}
+        try {
+            await apiFetch('/api/remote-download-delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: task.remoteId || task.id }),
+            });
+        } catch (e) {}
+        ignoredRemoteTaskIds.add(task.remoteId || task.id);
     }
     downloadTasks.splice(idx, 1);
     if (selectedDownloadId === id) selectedDownloadId = visibleTransferTasks()[0]?.id || '';
@@ -6012,8 +6381,22 @@ async function deleteDownloadTask(id) {
     processDownloadQueue();
 }
 
-function clearFinishedDownloads() {
-    downloadTasks = downloadTasks.filter(t => t.status !== 'done' && t.status !== 'canceled');
+async function clearFinishedDownloads() {
+    // Collect finished task ids in the current view to delete server-side
+    const finishedTasks = downloadTasks.filter(t => taskKind(t) === currentTransferTab && (t.status === 'done' || t.status === 'canceled'));
+    const ids = finishedTasks
+        .map(t => t.serverTaskId || t.remoteId || t.id)
+        .filter(Boolean);
+    if (ids.length) {
+        try {
+            await apiFetch('/api/tasks-delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ids }),
+            });
+        } catch (e) {}
+    }
+    downloadTasks = downloadTasks.filter(t => !(taskKind(t) === currentTransferTab && (t.status === 'done' || t.status === 'canceled')));
     if (!visibleTransferTasks().some(t => t.id === selectedDownloadId)) selectedDownloadId = visibleTransferTasks()[0]?.id || '';
     renderDownloadQueue();
     renderDownloadDetails(selectedDownloadTask());
@@ -6168,6 +6551,11 @@ document.addEventListener('DOMContentLoaded', () => {
             if (e.key === 'Enter') startRemoteDownload();
         });
     }
+    // Restore local task records (download/upload history incl. failed/paused)
+    loadLocalTasks();
+    // Pull persisted task records (remote/upload/download) so they show up
+    // even before opening the transfer center.
+    loadAllTasks();
 });
 </script>
 </body>

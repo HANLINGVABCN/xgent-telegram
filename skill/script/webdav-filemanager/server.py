@@ -63,6 +63,9 @@ UPLOAD_BATCH_DIRS = {}
 UPLOAD_BATCH_UPDATED = {}
 UPLOAD_BATCH_DIRS_LOCK = threading.Lock()
 UPLOAD_BATCH_TTL_SECONDS = 2 * 60 * 60
+# In-memory metadata for active chunked uploads (taskId -> {partPath, finalPath, size, ...})
+UPLOAD_TASKS = {}
+UPLOAD_TASKS_LOCK = threading.Lock()
 
 # Login rate limiter: { ip: { 'fails': int, 'locked_until': float } }
 _login_attempts = {}
@@ -138,7 +141,7 @@ def get_file_info(root, rel_path, full_path):
 
 
 def _empty_state():
-    return {'shares': {}, 'shareTrash': {}, 'tempFiles': {}}
+    return {'shares': {}, 'shareTrash': {}, 'tempFiles': {}, 'tasks': {}}
 
 
 def load_state():
@@ -151,6 +154,7 @@ def load_state():
         data.setdefault('shares', {})
         data.setdefault('shareTrash', {})
         data.setdefault('tempFiles', {})
+        data.setdefault('tasks', {})
         return data
 
 
@@ -160,6 +164,53 @@ def save_state(data):
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, STATE_FILE)
+
+
+# ---- Task persistence helpers ----
+# Persisted task snapshot fields (shared by remote/upload/download kinds):
+# id, kind, name, status, size, loaded, error, url, path, createdAt,
+# startedAt, finishedAt, lastBps, maxBps, samples
+TASK_SNAPSHOT_FIELDS = (
+    'id', 'kind', 'name', 'status', 'size', 'loaded', 'error', 'url', 'path',
+    'createdAt', 'startedAt', 'finishedAt', 'lastBps', 'maxBps', 'samples',
+)
+
+
+def task_snapshot(task):
+    """Build a JSON-serializable snapshot from a task dict (live or remote)."""
+    snap = {'kind': task.get('kind') or 'remote'}
+    for key in TASK_SNAPSHOT_FIELDS:
+        if key in task:
+            snap[key] = task[key]
+    # samples can be large; cap to REMOTE_TASK_SAMPLE_LIMIT for storage
+    samples = snap.get('samples') or []
+    if len(samples) > REMOTE_TASK_SAMPLE_LIMIT:
+        snap['samples'] = samples[-REMOTE_TASK_SAMPLE_LIMIT:]
+    return snap
+
+
+def save_task(task):
+    """Persist a single task snapshot into state['tasks'][id] (atomic)."""
+    if not task or not task.get('id'):
+        return
+    snap = task_snapshot(task)
+    state = load_state()
+    state.setdefault('tasks', {})[snap['id']] = snap
+    save_state(state)
+
+
+def delete_persisted_task(task_id):
+    """Remove a task from the persistent state."""
+    if not task_id:
+        return
+    state = load_state()
+    if state.get('tasks', {}).pop(task_id, None) is not None:
+        save_state(state)
+
+
+def load_persisted_tasks():
+    """Return all persisted task snapshots as a dict id -> snapshot."""
+    return load_state().get('tasks', {}) or {}
 
 
 def load_auth_cred():
@@ -392,7 +443,7 @@ def remote_url_filename(url):
 
 
 def remote_task_snapshot(task):
-    public = {}
+    public = {'kind': 'remote'}
     for key in (
         'id', 'url', 'name', 'status', 'size', 'loaded', 'createdAt', 'startedAt',
         'finishedAt', 'path', 'error', 'lastBps', 'maxBps', 'samples'
@@ -425,85 +476,151 @@ def remote_task_speed_update(task, now=None, force=False):
 
 def remote_download_worker(task_id):
     temp_path = ''
+    last_save = 0.0
+    resp = None
     try:
         with REMOTE_TASKS_LOCK:
             task = REMOTE_TASKS.get(task_id)
             if not task:
                 return
             task['status'] = 'downloading'
-            task['startedAt'] = time.time()
+            if not task.get('startedAt'):
+                task['startedAt'] = time.time()
             task['lastT'] = task['startedAt']
-            task['lastBytes'] = 0
+            task['lastBytes'] = int(task.get('loaded') or 0)
             url = task['url']
+            temp_path = task.get('tempPath') or ''
 
-        req = urllib.request.Request(url, headers={'User-Agent': 'WebDAV-FileManager/1.0'})
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        download_dir = ensure_download_storage()
+        if not download_dir:
+            raise OSError('下载目录不可用')
+
+        # Determine resume offset from any pre-existing .part file
+        existing = 0
+        if temp_path and os.path.exists(temp_path):
+            try:
+                existing = os.path.getsize(temp_path)
+            except OSError:
+                existing = 0
+
+        # Single request with Range if we have existing bytes
+        headers = {'User-Agent': 'WebDAV-FileManager/1.0'}
+        if existing > 0:
+            headers['Range'] = f'bytes={existing}-'
+        req = urllib.request.Request(url, headers=headers)
+        resp = urllib.request.urlopen(req, timeout=30)
+        status = getattr(resp, 'status', None) or resp.getcode()
+        is_resume = (status == 206)
+        content_total = int(resp.headers.get('Content-Length') or 0)
+
+        # Resolve filename + target path from this request (first run only)
+        if not temp_path:
             header_name = filename_from_content_disposition(resp.headers.get('Content-Disposition'))
             filename = safe_download_filename(header_name or remote_url_filename(url), 'remote-download.bin')
-            download_dir = ensure_download_storage()
-            if not download_dir:
-                raise OSError('下载目录不可用')
             target = make_unique_path(download_dir, filename)
             temp_path = target + '.part'
-            total = int(resp.headers.get('Content-Length') or 0)
             rel = root_relative_path(target)
             with REMOTE_TASKS_LOCK:
-                task = REMOTE_TASKS.get(task_id)
-                if not task:
-                    return
-                task['name'] = os.path.basename(target)
-                task['size'] = total
-                task['path'] = rel
-                task['tempPath'] = temp_path
+                t2 = REMOTE_TASKS.get(task_id)
+                if t2:
+                    t2['name'] = os.path.basename(target)
+                    t2['path'] = rel
+                    t2['tempPath'] = temp_path
+        else:
+            target = temp_path[:-5] if temp_path.endswith('.part') else temp_path + '.final'
 
-            with open(temp_path, 'wb') as out:
-                while True:
-                    with REMOTE_TASKS_LOCK:
-                        task = REMOTE_TASKS.get(task_id)
-                        if not task:
-                            return
-                        if task.get('cancel'):
-                            raise InterruptedError('已取消')
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    with REMOTE_TASKS_LOCK:
-                        task = REMOTE_TASKS.get(task_id)
-                        if task:
-                            task['loaded'] = int(task.get('loaded') or 0) + len(chunk)
-                            remote_task_speed_update(task)
-
-            os.replace(temp_path, target)
+        if is_resume and existing > 0:
             with REMOTE_TASKS_LOCK:
-                task = REMOTE_TASKS.get(task_id)
-                if task:
-                    task['loaded'] = os.path.getsize(target)
-                    task['size'] = task['loaded'] if not task.get('size') else task['size']
-                    task['status'] = 'done'
-                    task['finishedAt'] = time.time()
-                    task['lastBps'] = 0
-                    task['error'] = ''
-                    remote_task_speed_update(task, task['finishedAt'], force=True)
-    except InterruptedError as e:
-        if temp_path and os.path.exists(temp_path):
+                t2 = REMOTE_TASKS.get(task_id)
+                if t2:
+                    t2['loaded'] = existing
+                    t2['lastBytes'] = existing
+                    t2['size'] = (existing + content_total) if content_total else t2.get('size') or 0
+        else:
+            # Fresh start (server ignored Range or no existing bytes)
+            existing = 0
+            with REMOTE_TASKS_LOCK:
+                t2 = REMOTE_TASKS.get(task_id)
+                if t2:
+                    t2['loaded'] = 0
+                    t2['lastBytes'] = 0
+                    t2['size'] = content_total or t2.get('size') or 0
+
+        mode = 'ab' if (is_resume and existing > 0) else 'wb'
+        if mode == 'wb' and os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
             except OSError:
                 pass
+
+        save_task(merge_remote_task_for_persist(REMOTE_TASKS.get(task_id)))
+
+        with open(temp_path, mode) as out:
+            while True:
+                with REMOTE_TASKS_LOCK:
+                    task = REMOTE_TASKS.get(task_id)
+                    if not task:
+                        return
+                    if task.get('cancel'):
+                        if task.get('pauseRequested'):
+                            raise InterruptedError('paused')
+                        raise InterruptedError('已取消')
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                out.write(chunk)
+                with REMOTE_TASKS_LOCK:
+                    task = REMOTE_TASKS.get(task_id)
+                    if task:
+                        task['loaded'] = int(task.get('loaded') or 0) + len(chunk)
+                        remote_task_speed_update(task)
+                # Throttled persistence (~ every 1s)
+                now = time.time()
+                if now - last_save > 1.0:
+                    last_save = now
+                    try:
+                        save_task(merge_remote_task_for_persist(REMOTE_TASKS.get(task_id)))
+                    except Exception:
+                        pass
+
+        os.replace(temp_path, target)
         with REMOTE_TASKS_LOCK:
             task = REMOTE_TASKS.get(task_id)
             if task:
-                task['status'] = 'canceled'
+                task['loaded'] = os.path.getsize(target)
+                task['size'] = task['loaded'] if not task.get('size') else task['size']
+                task['status'] = 'done'
                 task['finishedAt'] = time.time()
                 task['lastBps'] = 0
-                task['error'] = str(e)
+                task['error'] = ''
+                remote_task_speed_update(task, task['finishedAt'], force=True)
+        save_task(merge_remote_task_for_persist(REMOTE_TASKS.get(task_id)))
+    except InterruptedError as e:
+        msg = str(e)
+        is_pause = (msg == 'paused')
+        # Keep .part file for both pause and cancel-with-resume; only remove on hard cancel
+        with REMOTE_TASKS_LOCK:
+            task = REMOTE_TASKS.get(task_id)
+            if task:
+                if is_pause:
+                    task['status'] = 'paused'
+                    task['pauseRequested'] = False
+                    task['lastBps'] = 0
+                    task['error'] = ''
+                else:
+                    # Hard cancel: remove .part
+                    if temp_path and os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except OSError:
+                            pass
+                    task['status'] = 'canceled'
+                    task['lastBps'] = 0
+                    task['error'] = msg
+                task['finishedAt'] = time.time()
+        save_task(merge_remote_task_for_persist(REMOTE_TASKS.get(task_id)))
     except Exception as e:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
+        # Keep .part for resume on transient errors
         with REMOTE_TASKS_LOCK:
             task = REMOTE_TASKS.get(task_id)
             if task:
@@ -511,6 +628,76 @@ def remote_download_worker(task_id):
                 task['finishedAt'] = time.time()
                 task['lastBps'] = 0
                 task['error'] = str(e)
+        save_task(merge_remote_task_for_persist(REMOTE_TASKS.get(task_id)))
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+
+def merge_remote_task_for_persist(task):
+    """Convert a live remote task (with private fields) into a persistable dict."""
+    if not task:
+        return None
+    return task_snapshot(task)
+
+
+def start_remote_worker(task_id):
+    """Launch the download worker thread for an existing task (resume/start)."""
+    t = threading.Thread(target=remote_download_worker, args=(task_id,), daemon=True)
+    t.start()
+
+
+def resume_persisted_remote_tasks():
+    """On server boot, re-launch workers for unfinished remote tasks."""
+    try:
+        tasks = load_persisted_tasks()
+    except Exception:
+        return
+    for task_id, snap in list(tasks.items()):
+        if not snap or snap.get('kind') != 'remote':
+            continue
+        status = snap.get('status')
+        if status not in ('downloading', 'queued', 'paused'):
+            continue
+        # Rebuild in-memory task from snapshot
+        task = {
+            'id': snap.get('id') or task_id,
+            'url': snap.get('url') or '',
+            'name': snap.get('name') or 'remote-download',
+            'status': 'queued',
+            'size': int(snap.get('size') or 0),
+            'loaded': int(snap.get('loaded') or 0),
+            'createdAt': float(snap.get('createdAt') or time.time()),
+            'startedAt': float(snap.get('startedAt') or 0),
+            'finishedAt': 0,
+            'path': snap.get('path') or '/' + DOWNLOAD_DIR_NAME,
+            'error': '',
+            'lastBps': 0,
+            'maxBps': float(snap.get('maxBps') or 0),
+            'samples': [],
+            'lastT': 0,
+            'lastBytes': 0,
+            'cancel': False,
+            'pauseRequested': False,
+            'kind': 'remote',
+        }
+        # Recover tempPath from path
+        path_rel = snap.get('path') or ''
+        if path_rel and path_rel != '/' + DOWNLOAD_DIR_NAME:
+            base = safe_join(ROOT_DIR, path_rel)
+            if base:
+                task['tempPath'] = base + '.part'
+        if not task['url']:
+            # Cannot resume without a URL; mark as error
+            task['status'] = 'error'
+            task['error'] = '重启后缺少 URL，无法继续'
+        with REMOTE_TASKS_LOCK:
+            REMOTE_TASKS[task_id] = task
+        if task['status'] == 'queued':
+            start_remote_worker(task_id)
 
 
 def archive_member_path(name):
@@ -1091,6 +1278,7 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             '/api/shares': self._api_shares,
             '/api/share-detail': self._api_share_detail,
             '/api/remote-downloads': self._api_remote_downloads,
+            '/api/tasks': self._api_tasks,
         }
         handler = routes.get(path)
         if handler:
@@ -1310,6 +1498,28 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         items.sort(key=lambda x: x.get('createdAt') or 0, reverse=True)
         self.send_json({'success': True, 'items': items})
 
+    def _api_tasks(self, qs=None):
+        """Unified task list: merge live remote tasks + persisted upload/download records.
+
+        Live remote tasks take precedence over stale persisted snapshots.
+        Returns {success, items} sorted by createdAt desc.
+        """
+        persisted = load_persisted_tasks()
+        items_by_id = {}
+        # Start from persisted snapshots (covers upload/download history + remote)
+        for task_id, snap in persisted.items():
+            snap = dict(snap or {})
+            snap.setdefault('id', task_id)
+            snap.setdefault('kind', 'remote')
+            items_by_id[task_id] = snap
+        # Live remote tasks override their persisted counterparts (fresher progress)
+        with REMOTE_TASKS_LOCK:
+            for task_id, task in REMOTE_TASKS.items():
+                items_by_id[task_id] = remote_task_snapshot(task)
+        items = list(items_by_id.values())
+        items.sort(key=lambda x: x.get('createdAt') or 0, reverse=True)
+        self.send_json({'success': True, 'items': items})
+
     def _external_origin(self):
         forwarded = forwarded_header_params(self.headers.get('Forwarded', ''))
         proto = (
@@ -1405,6 +1615,10 @@ class FileManagerHandler(BaseHTTPRequestHandler):
     def _api_POST(self, path, qs):
         routes = {
             '/api/upload': lambda: self._api_upload(qs),
+            '/api/upload-init': self._api_upload_init,
+            '/api/upload-chunk': lambda: self._api_upload_chunk(qs),
+            '/api/upload-complete': self._api_upload_complete,
+            '/api/upload-cancel': self._api_upload_cancel,
             '/api/mkdir': self._api_mkdir,
             '/api/create-text': self._api_create_text,
             '/api/create-speed-file': self._api_create_speed_file,
@@ -1415,7 +1629,9 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             '/api/share-trash-clear': self._api_share_trash_clear,
             '/api/remote-download': self._api_remote_download_start,
             '/api/remote-download-cancel': self._api_remote_download_cancel,
+            '/api/remote-download-resume': self._api_remote_download_resume,
             '/api/remote-download-delete': self._api_remote_download_delete,
+            '/api/tasks-delete': self._api_tasks_delete,
             '/api/save-text': self._api_save_text,
             '/api/delete': self._api_delete,
             '/api/rename': self._api_rename,
@@ -1520,6 +1736,312 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             return self.send_err(400, '上传失败: 目标路径已存在同名项目')
         except OSError as e:
             self.send_err(500, f'上传失败: {self._sanitize_error(e)}')
+
+    # ---- Upload (resumable chunked) ----
+    def _api_upload_init(self):
+        """Initialize a resumable upload. Returns {taskId, offset}.
+        Body: { path, name, relpath, size, batch }
+        - If the final target already exists -> 409 conflict.
+        - If a .part file exists, offset = its size (resume point).
+        """
+        cleanup_upload_batches()
+        data = self.read_json()
+        target_dir = data.get('path', '/')
+        raw_filename = str(data.get('name', '')).strip()
+        raw_relpath = str(data.get('relpath', '') or '')
+        size = int(data.get('size', 0) or 0)
+        batch_id = str(data.get('batch', '') or '').strip()
+        if batch_id:
+            with UPLOAD_BATCH_DIRS_LOCK:
+                UPLOAD_BATCH_UPDATED[batch_id] = time.time()
+        if not raw_filename:
+            return self.send_err(400, '缺少文件名')
+        relpath = safe_upload_relpath(raw_relpath) if raw_relpath else raw_filename
+        if raw_relpath and not relpath:
+            return self.send_err(400, '相对路径无效')
+        if not relpath:
+            relpath = raw_filename
+        filename = os.path.basename(relpath) if '/' in relpath else relpath
+        if not filename or not valid_leaf_name(filename):
+            # valid_leaf_name rejects dotfiles; allow normal names only
+            if not filename or filename.startswith('.') or '/' in filename or '\\' in filename or '..' in filename:
+                return self.send_err(400, '文件名无效')
+        dir_path = safe_join(ROOT_DIR, target_dir)
+        if not dir_path or not os.path.isdir(dir_path):
+            return self.send_err(400, '目标目录不存在')
+        file_path = os.path.realpath(os.path.join(dir_path, *relpath.split('/')))
+        root_real = os.path.realpath(ROOT_DIR)
+        if not (file_path == root_real or file_path.startswith(root_real + os.sep)):
+            return self.send_err(403, '路径非法')
+        # Conflict check: if final file already exists (and not part of current batch), 409
+        rel_parts = relpath.split('/')
+        top_name = rel_parts[0]
+        top_path = os.path.realpath(os.path.join(dir_path, top_name))
+        if not (top_path == root_real or top_path.startswith(root_real + os.sep)):
+            return self.send_err(403, '路径非法')
+        with UPLOAD_BATCH_DIRS_LOCK:
+            batch_dirs = UPLOAD_BATCH_DIRS.setdefault(batch_id, set()) if batch_id else set()
+            top_created_by_batch = top_path in batch_dirs
+        if os.path.exists(top_path) and not top_created_by_batch:
+            conflict_type = 'folder' if os.path.isdir(top_path) else 'file'
+            return self.send_json({
+                'error': '当前目录已存在同名文件或文件夹，请重命名后再上传',
+                'conflict': conflict_type,
+                'name': top_name,
+            }, 409)
+        # Ensure parent dirs exist
+        try:
+            parent_dirs = rel_parts[:-1]
+            current_dir = os.path.realpath(dir_path)
+            for part in parent_dirs:
+                current_dir = os.path.realpath(os.path.join(current_dir, part))
+                if not (current_dir == root_real or current_dir.startswith(root_real + os.sep)):
+                    return self.send_err(403, '路径非法')
+                if os.path.exists(current_dir):
+                    if not os.path.isdir(current_dir):
+                        return self.send_err(400, '目标路径已有同名文件，无法创建文件夹')
+                else:
+                    os.mkdir(current_dir)
+                    if batch_id:
+                        with UPLOAD_BATCH_DIRS_LOCK:
+                            UPLOAD_BATCH_DIRS.setdefault(batch_id, set()).add(current_dir)
+                            UPLOAD_BATCH_UPDATED[batch_id] = time.time()
+        except OSError as e:
+            return self.send_err(500, f'创建目录失败: {self._sanitize_error(e)}')
+        # Determine resume offset from existing .part
+        part_path = file_path + '.part'
+        offset = 0
+        if os.path.exists(part_path):
+            try:
+                offset = os.path.getsize(part_path)
+            except OSError:
+                offset = 0
+        # Reuse an existing unfinished upload task for the same target path (avoids
+        # leaving zombie 'paused' records each time the user pauses & resumes).
+        rel_path = root_relative_path(file_path)
+        existing_task_id = None
+        for tid_key, snap in load_persisted_tasks().items():
+            if (snap.get('kind') == 'upload'
+                    and snap.get('path') == rel_path
+                    and snap.get('status') in ('queued', 'downloading', 'paused', 'error')):
+                existing_task_id = tid_key
+                break
+        if existing_task_id:
+            task_id = existing_task_id
+        else:
+            task_id = 'up:' + secrets.token_urlsafe(12)
+        now = time.time()
+        task = {
+            'id': task_id,
+            'kind': 'upload',
+            'name': os.path.basename(file_path),
+            'status': 'paused' if offset > 0 else 'queued',
+            'size': size,
+            'loaded': offset,
+            'error': '',
+            'url': '',
+            'path': rel_path,
+            'createdAt': now,
+            'startedAt': 0,
+            'finishedAt': 0,
+            'lastBps': 0,
+            'maxBps': 0,
+            'samples': [],
+        }
+        # Persist internal helper fields (not exposed in snapshot but kept in memory)
+        save_task(task)
+        # Keep an in-memory map for chunk handlers to find paths quickly
+        UPLOAD_TASKS[task_id] = {
+            'partPath': part_path,
+            'finalPath': file_path,
+            'size': size,
+            'createdAt': now,
+            'batchId': batch_id,
+        }
+        self.send_json({'success': True, 'taskId': task_id, 'offset': offset})
+
+    def _api_upload_chunk(self, qs):
+        """Append a binary chunk to the .part file.
+        Query: taskId, offset, total
+        Body: raw bytes to append.
+        """
+        task_id = str(qs.get('taskId', [''])[0]).strip()
+        try:
+            offset = int(qs.get('offset', ['0'])[0])
+        except ValueError:
+            offset = 0
+        if not task_id:
+            return self.send_err(400, '缺少 taskId')
+        info = UPLOAD_TASKS.get(task_id)
+        if not info:
+            # Reconstruct from persisted state if possible
+            snap = load_persisted_tasks().get(task_id)
+            if not snap or snap.get('kind') != 'upload':
+                return self.send_err(404, '上传任务不存在（可能已重启服务）')
+            full = safe_join(ROOT_DIR, snap.get('path', ''))
+            if not full:
+                return self.send_err(404, '上传任务路径无效')
+            info = {
+                'partPath': full + '.part',
+                'finalPath': full,
+                'size': int(snap.get('size') or 0),
+                'createdAt': float(snap.get('createdAt') or time.time()),
+                'batchId': '',
+            }
+            UPLOAD_TASKS[task_id] = info
+        part_path = info['partPath']
+        # Verify offset matches current .part size (prevents race/corruption)
+        try:
+            current = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+        except OSError:
+            current = 0
+        if current != offset:
+            # Drain the request body so the connection can be reused (keep-alive)
+            try:
+                cl = int(self.headers.get('Content-Length', 0))
+                while cl > 0:
+                    buf = self.rfile.read(min(cl, 65536))
+                    if not buf:
+                        break
+                    cl -= len(buf)
+            except OSError:
+                pass
+            return self.send_json({
+                'success': False,
+                'error': f'偏移不一致（期望 {offset}，实际 {current}）',
+                'offset': current,
+            }, 409)
+        content_length = int(self.headers.get('Content-Length', 0))
+        try:
+            with open(part_path, 'ab') as f:
+                remaining = content_length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+            new_size = os.path.getsize(part_path)
+        except OSError as e:
+            return self.send_err(500, f'写入失败: {self._sanitize_error(e)}')
+        # Update persisted progress
+        snap = load_persisted_tasks().get(task_id)
+        if snap is None:
+            snap = {
+                'id': task_id, 'kind': 'upload', 'name': os.path.basename(info['finalPath']),
+                'status': 'downloading', 'size': info.get('size', 0), 'loaded': new_size,
+                'error': '', 'url': '', 'path': root_relative_path(info['finalPath']),
+                'createdAt': info.get('createdAt', time.time()), 'startedAt': 0,
+                'finishedAt': 0, 'lastBps': 0, 'maxBps': 0, 'samples': [],
+            }
+        snap['loaded'] = new_size
+        snap['status'] = 'downloading'
+        save_task(snap)
+        self.send_json({'success': True, 'offset': new_size, 'loaded': new_size})
+
+    def _api_upload_complete(self):
+        """Finalize a chunked upload: rename .part -> final path."""
+        data = self.read_json()
+        task_id = str(data.get('taskId', '')).strip()
+        if not task_id:
+            return self.send_err(400, '缺少 taskId')
+        info = UPLOAD_TASKS.get(task_id)
+        snap = load_persisted_tasks().get(task_id)
+        if not info:
+            if not snap or snap.get('kind') != 'upload':
+                return self.send_err(404, '上传任务不存在')
+            full = safe_join(ROOT_DIR, snap.get('path', ''))
+            if not full:
+                return self.send_err(404, '上传任务路径无效')
+            info = {'partPath': full + '.part', 'finalPath': full}
+        part_path = info['partPath']
+        final_path = info['finalPath']
+        if not os.path.exists(part_path):
+            return self.send_err(400, '未找到上传分片数据（.part 缺失）')
+        try:
+            os.replace(part_path, final_path)
+        except OSError as e:
+            return self.send_err(500, f'完成上传失败: {self._sanitize_error(e)}')
+        if snap:
+            snap['status'] = 'done'
+            snap['loaded'] = snap.get('size') or os.path.getsize(final_path)
+            snap['finishedAt'] = time.time()
+            snap['error'] = ''
+            save_task(snap)
+        UPLOAD_TASKS.pop(task_id, None)
+        self.send_ok('上传完成')
+
+    def _api_upload_cancel(self):
+        """Pause or cancel a chunked upload.
+        Body: { taskId, action } action in {'pause','cancel'}.
+        pause: keep .part; cancel: delete .part and task record.
+        """
+        data = self.read_json()
+        task_id = str(data.get('taskId', '')).strip()
+        action = str(data.get('action', 'pause')).strip().lower()
+        info = UPLOAD_TASKS.get(task_id)
+        snap = load_persisted_tasks().get(task_id)
+        part_path = info.get('partPath') if info else None
+        if action == 'cancel':
+            if part_path and os.path.exists(part_path):
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
+            UPLOAD_TASKS.pop(task_id, None)
+            delete_persisted_task(task_id)
+            self.send_ok('上传已取消并删除')
+            return
+        # pause
+        if snap:
+            snap['status'] = 'paused'
+            save_task(snap)
+        self.send_ok('上传已暂停')
+
+    def _api_tasks_delete(self):
+        """Delete one or more persisted task records (and their .part files)."""
+        data = self.read_json()
+        ids = data.get('ids') or []
+        if isinstance(ids, str):
+            ids = [ids]
+        if not ids:
+            # accept singular id too
+            single = str(data.get('id', '') or '').strip()
+            if single:
+                ids = [single]
+        if not ids:
+            return self.send_err(400, '缺少任务 id')
+        for task_id in ids:
+            # Stop live remote task if running
+            with REMOTE_TASKS_LOCK:
+                task = REMOTE_TASKS.get(task_id)
+                if task:
+                    task['cancel'] = True
+                    task['pauseRequested'] = False
+                    if task.get('status') == 'downloading':
+                        task['status'] = 'canceled'
+                        task['finishedAt'] = time.time()
+                    temp_path = task.get('tempPath') or ''
+                    REMOTE_TASKS.pop(task_id, None)
+                else:
+                    temp_path = ''
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+            # Remove upload .part if any
+            snap = load_persisted_tasks().get(task_id)
+            if snap and snap.get('kind') == 'upload':
+                full = safe_join(ROOT_DIR, snap.get('path', ''))
+                if full and os.path.exists(full + '.part'):
+                    try:
+                        os.remove(full + '.part')
+                    except OSError:
+                        pass
+            UPLOAD_TASKS.pop(task_id, None)
+            delete_persisted_task(task_id)
+        self.send_ok(f'已删除 {len(ids)} 个任务')
 
     def _api_mkdir(self):
         data = self.read_json()
@@ -1688,6 +2210,7 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         now = time.time()
         task = {
             'id': task_id,
+            'kind': 'remote',
             'url': url,
             'name': remote_url_filename(url),
             'status': 'queued',
@@ -1704,16 +2227,23 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             'lastT': 0,
             'lastBytes': 0,
             'cancel': False,
+            'pauseRequested': False,
         }
         with REMOTE_TASKS_LOCK:
             REMOTE_TASKS[task_id] = task
-        t = threading.Thread(target=remote_download_worker, args=(task_id,), daemon=True)
-        t.start()
+        save_task(task)
+        start_remote_worker(task_id)
         self.send_json({'success': True, 'task': remote_task_snapshot(task)})
 
     def _api_remote_download_cancel(self):
+        """Pause or cancel a remote task.
+        Body: { id, action } where action is 'pause' (default) or 'cancel'.
+        - pause: stop worker, KEEP .part file, status -> paused
+        - cancel: stop worker, DELETE .part file, status -> canceled
+        """
         data = self.read_json()
         task_id = str(data.get('id', '')).strip()
+        action = str(data.get('action', 'pause')).strip().lower()
         with REMOTE_TASKS_LOCK:
             task = REMOTE_TASKS.get(task_id)
             if not task:
@@ -1721,20 +2251,59 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             if task.get('status') in ('done', 'error', 'canceled'):
                 return self.send_json({'success': True, 'message': '任务已结束'})
             task['cancel'] = True
-        self.send_ok('任务已取消')
+            task['pauseRequested'] = (action != 'cancel')
+            if action == 'cancel':
+                task['status'] = 'canceled'
+                task['finishedAt'] = time.time()
+            else:
+                task['status'] = 'paused'
+        save_task(merge_remote_task_for_persist(REMOTE_TASKS.get(task_id)))
+        self.send_ok('任务已暂停' if action != 'cancel' else '任务已取消')
 
-    def _api_remote_download_delete(self):
+    def _api_remote_download_resume(self):
+        """Resume a paused/queued/error remote download with HTTP Range."""
         data = self.read_json()
         task_id = str(data.get('id', '')).strip()
         with REMOTE_TASKS_LOCK:
             task = REMOTE_TASKS.get(task_id)
             if not task:
                 return self.send_err(404, '任务不存在')
-            if task.get('status') == 'downloading':
-                task['cancel'] = True
-                task['status'] = 'canceled'
-                task['finishedAt'] = time.time()
-            REMOTE_TASKS.pop(task_id, None)
+            if task.get('status') in ('downloading',):
+                return self.send_json({'success': True, 'task': remote_task_snapshot(task), 'message': '任务正在下载'})
+            if task.get('status') == 'done':
+                return self.send_err(400, '任务已完成，无需继续')
+            # Reset cancel flags
+            task['cancel'] = False
+            task['pauseRequested'] = False
+            task['status'] = 'queued'
+            task['error'] = ''
+        save_task(merge_remote_task_for_persist(REMOTE_TASKS.get(task_id)))
+        start_remote_worker(task_id)
+        self.send_json({'success': True, 'task': remote_task_snapshot(REMOTE_TASKS.get(task_id))})
+
+    def _api_remote_download_delete(self):
+        data = self.read_json()
+        task_id = str(data.get('id', '')).strip()
+        temp_path = ''
+        with REMOTE_TASKS_LOCK:
+            task = REMOTE_TASKS.get(task_id)
+            if not task:
+                # Still try to remove from persistent store
+                pass
+            else:
+                if task.get('status') == 'downloading':
+                    task['cancel'] = True
+                    task['pauseRequested'] = False
+                    task['status'] = 'canceled'
+                    task['finishedAt'] = time.time()
+                temp_path = task.get('tempPath') or ''
+                REMOTE_TASKS.pop(task_id, None)
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        delete_persisted_task(task_id)
         self.send_ok('任务已删除')
 
     def _api_save_text(self):
@@ -2399,6 +2968,12 @@ def main():
 +---------------------------------------------------+
 '''
     _print_safe(banner)
+
+    # Resume unfinished remote download tasks from persistent state
+    try:
+        resume_persisted_remote_tasks()
+    except Exception as e:
+        _print_safe(f'[WARN] resume remote tasks failed: {e}')
 
     try:
         server.serve_forever()
