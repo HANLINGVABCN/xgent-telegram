@@ -565,6 +565,7 @@ class BotState:
     SET_AGENT_MAX_ITERATIONS = 'set_agent_max_iterations'
     SET_COMMAND_BLACKLIST = 'set_command_blacklist'
     SET_UPDATE_TOKEN = 'set_update_token'
+    SET_MEMORY = 'set_memory'
 
 # --- ☆ 消息类型定义（用于全局记录）☆ ---
 class MessageType:
@@ -5522,6 +5523,10 @@ SKILL_SUMMARY_BLOCK_TAG = '!'
 SINGLE_MEMORY_SESSION_ID = "global_memory"
 SINGLE_MEMORY_SESSION_NAME = "全局记忆"
 
+MEMORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'memory')
+MEMORY_FILE_PREFIX = 'memory_'
+MEMORY_FILE_SUFFIX = '.txt'
+
 def list_skill_files() -> List[str]:
     skill_files = []
     if not os.path.isdir(SKILL_DIR):
@@ -5624,6 +5629,81 @@ def get_agent_runtime_prompt(agent_mode: bool) -> str:
     if not agent_mode:
         prompt += PromptFileManager.get('agent_disabled_addon')
     return prompt
+
+
+# --- 记忆（memory）文件管理：一条记忆 = 一个文件，按需读取拼进 system prompt ---
+def list_memory_files() -> List[str]:
+    """列出 memory/ 下所有记忆文件名，按文件名（即时间戳）升序排序。"""
+    if not os.path.isdir(MEMORY_DIR):
+        return []
+    result = []
+    for filename in os.listdir(MEMORY_DIR):
+        if filename.startswith('.') or not filename.endswith(MEMORY_FILE_SUFFIX):
+            continue
+        full_path = os.path.join(MEMORY_DIR, filename)
+        if not os.path.isfile(full_path):
+            continue
+        result.append(filename)
+    return sorted(result, key=str.lower)
+
+
+def read_memory_file(filename: str) -> str:
+    """读取单条记忆内容，复用 skill 的 utf-8/gbk 回退解码。"""
+    safe_name = os.path.basename(filename)
+    full_path = os.path.join(MEMORY_DIR, safe_name)
+    return read_skill_text(full_path)
+
+
+def save_memory_file(content: str) -> str:
+    """保存一条记忆为新文件（文件名带时间戳+随机后缀，避免重名），返回文件名。"""
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    rand_suffix = uuid.uuid4().hex[:6]
+    filename = f"{MEMORY_FILE_PREFIX}{timestamp}_{rand_suffix}{MEMORY_FILE_SUFFIX}"
+    full_path = os.path.join(MEMORY_DIR, filename)
+    with open(full_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+    return filename
+
+
+def delete_memory_file(filename: str) -> bool:
+    """删除指定记忆文件，成功返回 True。"""
+    safe_name = os.path.basename(filename)
+    full_path = os.path.join(MEMORY_DIR, safe_name)
+    if not os.path.isfile(full_path):
+        return False
+    try:
+        os.remove(full_path)
+        return True
+    except OSError:
+        return False
+
+
+def clear_all_memory() -> int:
+    """清空所有记忆文件，返回删除条数。"""
+    files = list_memory_files()
+    count = 0
+    for filename in files:
+        if delete_memory_file(filename):
+            count += 1
+    return count
+
+
+def build_memory_prompt_section() -> str:
+    """拼接所有记忆到 system prompt。无记忆返回空串，不污染 prompt。"""
+    files = list_memory_files()
+    if not files:
+        return ''
+    parts = []
+    for filename in files:
+        text = read_memory_file(filename)
+        text = text.strip()
+        if text:
+            parts.append(text)
+    if not parts:
+        return ''
+    body = "\n---\n".join(parts)
+    return f"\n\n【用户记忆】\n{body}\n"
 
 
 class ArtifactManager:
@@ -6306,6 +6386,7 @@ def get_main_menu():
         [InlineKeyboardButton(f"🤖 Agent:{'开' if agent_on else '关'}", callback_data="toggle_agent_mode"),
          InlineKeyboardButton(f"🌊 流式:{'开' if stream_on else '关'}", callback_data="toggle_stream_mode")],
         [InlineKeyboardButton(f"🧩 拼接:{stitch_label}", callback_data="menu_text_stitch_mode")],
+        [InlineKeyboardButton("🧠 记忆", callback_data="menu_memory")],
         [InlineKeyboardButton("📝 提示词", callback_data="menu_prompts"),
          InlineKeyboardButton("⚙️ 更多", callback_data="menu_more_settings")]
     ])
@@ -6439,6 +6520,73 @@ def get_command_blacklist_menu():
         [InlineKeyboardButton("🧹 清空黑名单", callback_data="confirm_clear_command_blacklist")],
         [InlineKeyboardButton("🔙 返回", callback_data="menu_more_settings")]
     ])
+
+
+def get_memory_menu():
+    """记忆管理主菜单。"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ 添加记忆", callback_data="act_add_memory")],
+        [InlineKeyboardButton("📋 列出全部", callback_data="act_list_memory")],
+        [InlineKeyboardButton("🗑️ 删除单条", callback_data="act_delete_memory_menu:1")],
+        [InlineKeyboardButton("🧹 清空全部", callback_data="confirm_clear_user_memory")],
+        [InlineKeyboardButton("🔙 返回", callback_data="act_main_menu")]
+    ])
+
+
+def build_memory_menu_text(title: str = "记忆管理") -> str:
+    """记忆管理界面文案：显示条数 + 前 N 条预览。"""
+    files = list_memory_files()
+    preview_parts = []
+    for idx, filename in enumerate(files[:10], start=1):
+        content = read_memory_file(filename).strip()
+        # 单行预览，过长截断
+        one_line = ' '.join(content.split())
+        if len(one_line) > 50:
+            one_line = one_line[:50] + '…'
+        preview_parts.append(f"{idx}. {safe_text(one_line)}")
+    if not preview_parts:
+        preview = "（暂无记忆）"
+    else:
+        preview = '\n'.join(preview_parts)
+        if len(files) > 10:
+            preview += f"\n... 还有 {len(files) - 10} 条"
+    return (
+        f"🧠 <b>{safe_text(title)}</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"当前记忆: <b>{len(files)} 条</b>\n"
+        f"存储位置: <code>{safe_text(to_display_path(MEMORY_DIR))}</code>\n\n"
+        f"<pre>{preview}</pre>\n\n"
+        "每条记忆无长度限制，可分段发送（自动拼接为一条）后保存。\n"
+        "保存后立即拼入 system prompt，无需重启。"
+    )
+
+
+def get_memory_delete_keyboard(page: int) -> InlineKeyboardMarkup:
+    """单条删除分页键盘：每页 8 条，带翻页。"""
+    files = list_memory_files()
+    PER_PAGE = 8
+    total_pages = max(1, math.ceil(len(files) / PER_PAGE))
+    page = max(1, min(page, total_pages))
+    page_files = files[(page - 1) * PER_PAGE: page * PER_PAGE]
+    base_index = (page - 1) * PER_PAGE
+    rows = []
+    for offset, filename in enumerate(page_files):
+        idx = base_index + offset + 1
+        content = read_memory_file(filename).strip()
+        one_line = ' '.join(content.split())
+        if len(one_line) > 40:
+            one_line = one_line[:40] + '…'
+        # 文件名经 CallbackDataStore 处理，避免超长或特殊字符问题
+        cb = CallbackDataStore.store(f"act_delete_memory:{filename}")
+        rows.append([InlineKeyboardButton(f"🗑️ #{idx} {one_line}", callback_data=cb)])
+    rows.append([
+        InlineKeyboardButton("◀️", callback_data=f"act_delete_memory_menu:{max(1, page - 1)}"),
+        InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"),
+        InlineKeyboardButton("▶️", callback_data=f"act_delete_memory_menu:{min(total_pages, page + 1)}"),
+    ])
+    rows.append([InlineKeyboardButton("🔙 返回", callback_data="menu_memory")])
+    return InlineKeyboardMarkup(rows)
+
 
 def build_command_blacklist_text(title: str = "Agent 命令黑名单") -> str:
     patterns = AgentCommandBlacklist.get_patterns()
@@ -7985,7 +8133,152 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=get_command_blacklist_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
-        
+
+        # --- 记忆管理 ---
+        elif data == "menu_memory":
+            UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('memory_buffer', "")
+            await query.message.edit_text(
+                build_memory_menu_text(),
+                reply_markup=get_memory_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "act_add_memory":
+            UserDataManager.set('state', BotState.SET_MEMORY)
+            UserDataManager.set('memory_buffer', "")
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ 完成并保存", callback_data="act_confirm_memory")],
+                [InlineKeyboardButton("🔙 返回", callback_data="menu_memory")]
+            ])
+            await query.message.reply_text(
+                "🧠 <b>添加记忆</b>\n"
+                "━━━━━━━━━━━━━━\n"
+                "发送你希望 AI 牢记的内容（事实、偏好、背景等）。\n"
+                "单条无长度限制：可以一次发送完整内容，也可以分多条发送，"
+                "系统会自动拼接成一条后再保存。\n"
+                "也可以发送 txt / md / text 文件，内容会追加到当前拼接。\n"
+                "━━━━━━━━━━━━━━\n"
+                "<i>全部发送完后点“完成并保存”。发送 cancel 取消。</i>",
+                reply_markup=kb,
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "act_confirm_memory":
+            buffer = UserDataManager.get('memory_buffer', "")
+            buffer = buffer.strip()
+            if not buffer:
+                await query.answer("⚠️ 还没有输入任何内容", show_alert=True)
+                return
+            filename = save_memory_file(buffer)
+            UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('memory_buffer', "")
+            await GlobalRecorder.record_system_op(
+                "添加用户记忆",
+                {"filename": filename, "chars": len(buffer)}
+            )
+            await query.message.reply_text(
+                f"✅ 已保存 1 条记忆（{len(buffer)} 字），已立即拼入 system prompt。",
+                reply_markup=get_memory_menu()
+            )
+
+        elif data == "act_list_memory":
+            files = list_memory_files()
+            if not files:
+                await query.answer("暂无记忆", show_alert=True)
+                return
+            # 完整列出每条内容（每条之间用分隔线）
+            lines = []
+            for idx, filename in enumerate(files, start=1):
+                content = read_memory_file(filename).strip()
+                lines.append(f"#{idx} [{filename}]\n{safe_text(content)}")
+            full_text = "\n\n━━━━━━━━\n\n".join(lines)
+            # Telegram 单条消息 4096 字符上限，超长则分段发送
+            MAX_MSG = 3800
+            chunks = [full_text[i:i + MAX_MSG] for i in range(0, len(full_text), MAX_MSG)] if full_text else ["（空）"]
+            await query.message.reply_text(
+                f"📋 <b>全部记忆（共 {len(files)} 条）</b>",
+                parse_mode=constants.ParseMode.HTML
+            )
+            for chunk in chunks:
+                await query.message.reply_text(
+                    f"<pre>{chunk}</pre>",
+                    parse_mode=constants.ParseMode.HTML
+                )
+            await query.message.reply_text(
+                build_memory_menu_text(),
+                reply_markup=get_memory_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data.startswith("act_delete_memory_menu:"):
+            page_str = data.split(":", 1)[1]
+            page = int(page_str) if page_str.isdigit() else 1
+            files = list_memory_files()
+            if not files:
+                await query.answer("暂无记忆，无法删除", show_alert=True)
+                return
+            await query.message.edit_text(
+                "🗑️ <b>删除记忆</b>\n点击要删除的条目：",
+                reply_markup=get_memory_delete_keyboard(page),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data.startswith("act_delete_memory:"):
+            filename = data.split(":", 1)[1]
+            ok = delete_memory_file(filename)
+            if ok:
+                await GlobalRecorder.record_system_op(
+                    "删除用户记忆",
+                    {"filename": filename}
+                )
+                await query.answer(f"已删除: {filename}", show_alert=False)
+            else:
+                await query.answer("删除失败：文件不存在", show_alert=True)
+            # 回到删除菜单或记忆主页
+            files = list_memory_files()
+            if not files:
+                await query.message.edit_text(
+                    build_memory_menu_text("记忆管理（已无记忆）"),
+                    reply_markup=get_memory_menu(),
+                    parse_mode=constants.ParseMode.HTML
+                )
+            else:
+                await query.message.edit_text(
+                    "🗑️ <b>删除记忆</b>\n点击要删除的条目：",
+                    reply_markup=get_memory_delete_keyboard(1),
+                    parse_mode=constants.ParseMode.HTML
+                )
+
+        elif data == "confirm_clear_user_memory":
+            files = list_memory_files()
+            if not files:
+                await query.answer("暂无记忆", show_alert=True)
+                return
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ 确认清空", callback_data="do_clear_user_memory")],
+                [InlineKeyboardButton("🔙 返回", callback_data="menu_memory")]
+            ])
+            await query.message.edit_text(
+                f"⚠️ <b>确认清空全部 {len(files)} 条记忆？</b>\n\n"
+                "清空后不可恢复，且记忆会立即从 system prompt 移除。",
+                reply_markup=kb,
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "do_clear_user_memory":
+            count = clear_all_memory()
+            await GlobalRecorder.record_system_op(
+                "清空全部用户记忆",
+                {"cleared_count": count}
+            )
+            await query.message.edit_text(
+                build_memory_menu_text(f"记忆管理（已清空 {count} 条）"),
+                reply_markup=get_memory_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+
         # --- Agent模式切换 ---
         elif data == "toggle_agent_mode":
             current = UserDataManager.get('agent_mode', False)
@@ -8939,7 +9232,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     # 处理中锁（仅对非提示词编辑状态生效）
     await UserDataManager.init()
     state = UserDataManager.get('state')
-    if not is_prompt_edit_state(state) and state != BotState.SET_COMMAND_BLACKLIST:
+    if not is_prompt_edit_state(state) and state != BotState.SET_COMMAND_BLACKLIST and state != BotState.SET_MEMORY:
         global _is_processing
         if _is_processing:
             await update.message.reply_text(
@@ -8982,6 +9275,38 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         except Exception as e:
             logger.error(f"Blacklist file read error: {e}")
             await update.message.reply_text("黑名单文件读取失败。")
+        return
+
+    if state == BotState.SET_MEMORY:
+        await GlobalRecorder.record_user_message(
+            f"[记忆文件] {doc_name}",
+            MessageType.USER_FILE,
+            update.effective_chat.id
+        )
+        if not (doc_name.endswith('.txt') or doc_name.endswith('.md') or
+                (doc.mime_type and 'text' in doc.mime_type)):
+            await update.message.reply_text("🫠 记忆导入只接受 txt / md / text 文件。")
+            return
+        try:
+            content_bytes = await download_telegram_file(doc)
+            text_content = ArtifactManager.try_decode_text(bytes(content_bytes))
+            if text_content is None:
+                raise ValueError("unsupported memory file encoding")
+            current_buffer = UserDataManager.get('memory_buffer', "")
+            current_buffer = current_buffer + "\n" + text_content if current_buffer else text_content
+            UserDataManager.set('memory_buffer', current_buffer)
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ 完成并保存", callback_data="act_confirm_memory")],
+                [InlineKeyboardButton("🔙 返回", callback_data="menu_memory")]
+            ])
+            await update.message.reply_text(
+                f"📥 已读入 {safe_text(doc_name)}，当前累计 {len(current_buffer)} 字。\n"
+                "可继续发送文字或文件，会自动拼接为一条；全部发完后点完成并保存。",
+                reply_markup=kb
+            )
+        except Exception as e:
+            logger.error(f"Memory file read error: {e}")
+            await update.message.reply_text("记忆文件读取失败。")
         return
 
     if is_prompt_edit_state(state):
@@ -9112,6 +9437,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         UserDataManager.set('editing_prompt_key', "")
         UserDataManager.set('prompt_buffer', "")
         UserDataManager.set('command_blacklist_buffer', "")
+        UserDataManager.set('memory_buffer', "")
         await update.message.reply_text(
             "🚫 操作已取消。",
             reply_markup=get_main_menu()
@@ -9207,6 +9533,21 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(
             f"📥 收到！当前累计 {parsed_count} 条可用黑名单。\n"
             "可以继续发送；批量内容每条一行，或用独立一行三个横杠 --- 分隔。最后点完成。",
+            reply_markup=kb
+        )
+        return
+
+    if state == BotState.SET_MEMORY:
+        current_buffer = UserDataManager.get('memory_buffer', "")
+        current_buffer = current_buffer + "\n" + text if current_buffer else text
+        UserDataManager.set('memory_buffer', current_buffer)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ 完成并保存", callback_data="act_confirm_memory")],
+            [InlineKeyboardButton("🔙 返回", callback_data="menu_memory")]
+        ])
+        await update.message.reply_text(
+            f"📥 收到！当前累计 {len(current_buffer)} 字。\n"
+            "可继续发送下一段，会自动拼接为一条；全部发完后点完成并保存。",
             reply_markup=kb
         )
         return
@@ -9638,6 +9979,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     global_addon = get_runtime_prompt('global_prompt_addon')
     global_depth = max(1, int(UserDataManager.get('global_depth', 30)))
     system_prompt = base_prompt + global_addon
+    # 用户记忆（始终拼接，独立于 Agent 开关）
+    system_prompt += build_memory_prompt_section()
     history = await db.get_conversation_messages(global_depth)
     if content_override is not None:
         # 文件/图片本体只在本轮临时喂给模型；长期记忆和导出仍只保留路径索引。
@@ -10479,7 +10822,7 @@ async def cmd_export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         base_prompt = get_runtime_prompt('assistant_prompt')
         global_addon = get_runtime_prompt('global_prompt_addon')
         agent_mode = bool(UserDataManager.get('agent_mode', False))
-        actual_system_prompt = base_prompt + global_addon + get_agent_runtime_prompt(agent_mode)
+        actual_system_prompt = base_prompt + global_addon + build_memory_prompt_section() + get_agent_runtime_prompt(agent_mode)
 
         def _format_global_memory_context(messages: List[Dict[str, Any]]) -> str:
             return (

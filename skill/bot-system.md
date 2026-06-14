@@ -48,14 +48,16 @@ Telegram AI Bot 的提示词结构、拼接逻辑、回复流程和基础功能�
 
 1. `assistant_prompt`
 2. `global_prompt_addon`
-3. `agent_prompt_addon`
-4. 自动生成的当前运行目录绝对路径段
-5. 自动生成的 `skill/` 文件索引段
-6. 如果 Agent 模式关闭，再追加 `agent_disabled_addon`
+3. 用户记忆段（`memory/` 目录下每条记忆拼接，详见第 8 节）
+4. `agent_prompt_addon`
+5. 自动生成的当前运行目录绝对路径段
+6. 自动生成的 `skill/` 文件索引段
+7. 如果 Agent 模式关闭，再追加 `agent_disabled_addon`
 
 对应代码入口：
 
 - `get_runtime_prompt()`
+- `build_memory_prompt_section()`
 - `get_agent_runtime_prompt(agent_mode)`
 - `build_absolute_path_prompt_section()`
 - `build_skill_prompt_section()`
@@ -138,3 +140,20 @@ Agent 命令会受 `prompts/extras/agent_command_blacklist.txt` 管理。一次�
 - 覆盖并备份提示词和 skill：先把当前 `prompts/` 与 `skill/` 一起备份到 `bot_storage/update_backups/custom_时间戳/`，再覆盖为 GitHub 最新版本。
 
 运行数据、数据库、日志、存储目录、虚拟环境和 Git 目录不会被更新流程覆盖。
+
+## 8. 用户记忆（memory）
+
+用户记忆是一个独立于对话历史的常驻提示词层，用于让 AI 牢记用户的事实、偏好和背景。
+
+- 存储位置：项目根目录下的 `memory/`，每条记忆一个 `.txt` 文件，文件名形如 `memory_YYYYMMDD_HHMMSS_<6位随机>.txt`，按文件名（即时间戳）排序。
+- 加载机制：参照 skill 的"按需读取"模式，每轮对话组装 system prompt 时实时扫描目录、实时读文件，不预加载缓存，增删即时生效，无需重启。
+- 拼接：所有记忆会拼成一个段落（条目之间用 `---` 分隔），以 `【用户记忆】` 标记拼在 `global_prompt_addon` 之后、Agent 提示词之前；无论 Agent 开关都始终拼接。无记忆时返回空串，不污染 prompt。
+- 管理入口：主菜单的「🧠 记忆」按钮。支持逐条添加（单条无长度限制，可分多条发送自动拼接为一条）、列出全部、单条删除（分页）、清空全部，也支持发送 txt/md/text 文件导入为一条记忆。
+- 状态机：添加记忆时进入 `BotState.SET_MEMORY`，与提示词编辑、黑名单添加共用相同的"输入态→累计→确认落库"模式，发送 `cancel` 可随时取消。
+
+对应代码入口：
+
+- `MEMORY_DIR` 常量、`list_memory_files()`、`read_memory_file()`、`save_memory_file()`、`delete_memory_file()`、`clear_all_memory()`、`build_memory_prompt_section()`
+- 菜单与文案：`get_memory_menu()`、`build_memory_menu_text()`、`get_memory_delete_keyboard()`
+- 回调：`menu_memory`、`act_add_memory`、`act_confirm_memory`、`act_list_memory`、`act_delete_memory_menu:`、`act_delete_memory:`、`confirm_clear_user_memory`、`do_clear_user_memory`
+
