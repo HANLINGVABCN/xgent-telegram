@@ -141,7 +141,7 @@ def get_file_info(root, rel_path, full_path):
 
 
 def _empty_state():
-    return {'shares': {}, 'shareTrash': {}, 'tempFiles': {}, 'tasks': {}}
+    return {'shares': {}, 'shareTrash': {}, 'tempFiles': {}, 'tasks': {}, 'pinned': [], 'taskTrash': {}}
 
 
 def load_state():
@@ -155,6 +155,8 @@ def load_state():
         data.setdefault('shareTrash', {})
         data.setdefault('tempFiles', {})
         data.setdefault('tasks', {})
+        data.setdefault('pinned', [])
+        data.setdefault('taskTrash', {})
         return data
 
 
@@ -1279,6 +1281,8 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             '/api/share-detail': self._api_share_detail,
             '/api/remote-downloads': self._api_remote_downloads,
             '/api/tasks': self._api_tasks,
+            '/api/tasks-trash': self._api_tasks_trash,
+            '/api/pinned': self._api_pinned,
         }
         handler = routes.get(path)
         if handler:
@@ -1362,6 +1366,20 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         cleanup_expired_temp_files()
         _ensure_root_size_worker()
         u = shutil.disk_usage(ROOT_DIR)
+        # ?refresh=1 triggers a synchronous recompute so the caller (e.g. after
+        # delete/upload/move) sees up-to-date numbers immediately instead of the
+        # up-to-60s-old background cache value.
+        refresh = False
+        if qs:
+            refresh = (qs.get('refresh', [''])[0] in ('1', 'true', 'yes'))
+        if refresh:
+            logical = _calculate_root_logical_size()
+            allocated = _calculate_root_allocated_size()
+            with _root_size_cache['lock']:
+                _root_size_cache['logical'] = logical
+                _root_size_cache['allocated'] = allocated
+                _root_size_cache['size'] = allocated
+                _root_size_cache['updated'] = time.time()
         with _root_size_cache['lock']:
             root_size = int(_root_size_cache.get('logical') or _root_size_cache.get('size') or 0)
             root_allocated_size = int(_root_size_cache.get('allocated') or _root_size_cache.get('size') or 0)
@@ -1642,6 +1660,8 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             '/api/move': self._api_move,
             '/api/archive': self._api_archive,
             '/api/extract': self._api_extract,
+            '/api/tasks-restore': self._api_tasks_restore,
+            '/api/pinned': self._api_pinned,
         }
         handler = routes.get(path)
         if handler:
@@ -2002,7 +2022,14 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         self.send_ok('上传已暂停')
 
     def _api_tasks_delete(self):
-        """Delete one or more persisted task records (and their .part files)."""
+        """Delete one or more task records.
+
+        Body: { ids?: [...], id?: 'x', trash?: bool }
+        - trash=true (default): soft-delete — move snapshot from state['tasks']
+          into state['taskTrash'] so it no longer shows in the main list but is
+          recoverable. Stops live task + removes .part/.temp artifacts.
+        - trash=false: hard-delete — permanently remove from state['taskTrash'].
+        """
         data = self.read_json()
         ids = data.get('ids') or []
         if isinstance(ids, str):
@@ -2014,6 +2041,25 @@ class FileManagerHandler(BaseHTTPRequestHandler):
                 ids = [single]
         if not ids:
             return self.send_err(400, '缺少任务 id')
+        trash = data.get('trash', True)
+        if not trash:
+            # Hard-delete from trash only.
+            state = load_state()
+            trash_map = state.get('taskTrash', {})
+            changed = False
+            for task_id in ids:
+                if trash_map.pop(task_id, None) is not None:
+                    changed = True
+            if changed:
+                state['taskTrash'] = trash_map
+                save_state(state)
+            self.send_ok(f'已彻底删除 {len(ids)} 个任务')
+            return
+        # Soft-delete: stop live task, move snapshot into trash.
+        state = load_state()
+        tasks_map = state.get('tasks', {})
+        trash_map = state.setdefault('taskTrash', {})
+        moved = 0
         for task_id in ids:
             # Stop live remote task if running
             with REMOTE_TASKS_LOCK:
@@ -2034,7 +2080,7 @@ class FileManagerHandler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
             # Remove upload .part if any
-            snap = load_persisted_tasks().get(task_id)
+            snap = tasks_map.get(task_id)
             if snap and snap.get('kind') == 'upload':
                 full = safe_join(ROOT_DIR, snap.get('path', ''))
                 if full and os.path.exists(full + '.part'):
@@ -2043,8 +2089,52 @@ class FileManagerHandler(BaseHTTPRequestHandler):
                     except OSError:
                         pass
             UPLOAD_TASKS.pop(task_id, None)
-            delete_persisted_task(task_id)
+            # Move snapshot into trash (preserve it), then drop from active tasks.
+            if snap is None:
+                snap = {}
+            snap = dict(snap)
+            snap.setdefault('id', task_id)
+            snap.setdefault('kind', 'remote')
+            snap['deletedAt'] = time.time()
+            trash_map[task_id] = snap
+            if tasks_map.pop(task_id, None) is not None:
+                moved += 1
+        state['tasks'] = tasks_map
+        state['taskTrash'] = trash_map
+        save_state(state)
         self.send_ok(f'已删除 {len(ids)} 个任务')
+
+    def _api_tasks_restore(self):
+        """Restore a soft-deleted task back into the active list.
+        Body: { id } -> restores state['taskTrash'][id] into state['tasks'].
+        The task is never auto-resumed; remote tasks come back as 'paused'.
+        """
+        data = self.read_json()
+        task_id = str(data.get('id', '') or '').strip()
+        if not task_id:
+            return self.send_err(400, '缺少任务 id')
+        state = load_state()
+        trash_map = state.get('taskTrash', {})
+        snap = trash_map.get(task_id)
+        if snap is None:
+            return self.send_err(404, '回收站中无此任务')
+        snap = dict(snap)
+        snap.pop('deletedAt', None)
+        # Force non-terminal remote tasks to 'paused' so they don't auto-resume.
+        if snap.get('kind', 'remote') == 'remote' and snap.get('status') not in ('done', 'canceled', 'error'):
+            snap['status'] = 'paused'
+        state.setdefault('tasks', {})[task_id] = snap
+        trash_map.pop(task_id, None)
+        state['taskTrash'] = trash_map
+        save_state(state)
+        self.send_json({'success': True, 'task': snap})
+
+    def _api_tasks_trash(self, qs=None):
+        """Return soft-deleted task snapshots, newest first."""
+        trash_map = load_state().get('taskTrash', {})
+        items = [dict(s or {}, id=tid) for tid, s in trash_map.items()]
+        items.sort(key=lambda x: x.get('deletedAt') or x.get('createdAt') or 0, reverse=True)
+        self.send_json({'success': True, 'items': items})
 
     def _api_mkdir(self):
         data = self.read_json()
@@ -2379,6 +2469,44 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             self.send_ok('重命名成功')
         except OSError as e:
             self.send_err(500, f'重命名失败: {e}')
+
+    def _api_pinned(self, qs=None):
+        """GET /api/pinned -> {'pinned': [...]}
+        POST /api/pinned {path, action:'add'|'remove'} -> {'success':True,'pinned':[...]}
+        Only top-level folders directly under ROOT_DIR may be pinned.
+        """
+        if qs is None:
+            # POST branch (route dispatch calls handler() with no args)
+            data = self.read_json() or {}
+            path = (data.get('path') or '').strip()
+            action = (data.get('action') or 'add').strip()
+            if not path or action not in ('add', 'remove'):
+                return self.send_err(400, '缺少参数')
+            # normalize: must be a single-segment path under root
+            normalized = '/' + path.replace('\\', '/').strip('/')
+            if not normalized or '/' in normalized.strip('/'):
+                return self.send_err(400, '只能置顶根目录下的文件夹')
+            fp = safe_join(ROOT_DIR, normalized)
+            if not fp or not os.path.isdir(fp):
+                return self.send_err(404, '文件夹不存在')
+            state = load_state()
+            pinned = list(state.get('pinned') or [])
+            # prune stale pins (folder deleted/renamed) opportunistically
+            pinned = [p for p in pinned if os.path.isdir(safe_join(ROOT_DIR, p))]
+            if action == 'add':
+                if normalized not in pinned:
+                    pinned.append(normalized)
+            else:
+                pinned = [p for p in pinned if p != normalized]
+            state['pinned'] = pinned
+            save_state(state)
+            self.send_json({'success': True, 'pinned': pinned})
+            return
+        # GET branch
+        state = load_state()
+        pinned = list(state.get('pinned') or [])
+        pinned = [p for p in pinned if os.path.isdir(safe_join(ROOT_DIR, p))]
+        self.send_json({'pinned': pinned})
 
     def _api_copy(self):
         data = self.read_json()

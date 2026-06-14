@@ -430,6 +430,8 @@ body {
 }
 .file-size { font-size: 0.78rem; color: var(--text-muted); text-align: right; }
 .file-date { font-size: 0.78rem; color: var(--text-muted); }
+.pin-badge { font-size: 0.75rem; flex-shrink: 0; opacity: 0.85; }
+.file-item.pinned { background: var(--bg-elevated, rgba(255,255,255,0.04)); }
 
 /* File item - grid view */
 .file-list.grid-view {
@@ -1055,10 +1057,12 @@ body {
 }
 .transfer-filter {
     display: flex;
-    gap: 8px;
+    gap: 6px;
     flex-wrap: wrap;
-    padding: 8px 2px 4px;
+    margin-left: auto;
+    justify-content: flex-end;
 }
+#transferFilterRow { padding: 0; }
 .filter-chip {
     font-size: 0.78rem;
     padding: 4px 14px;
@@ -1080,6 +1084,14 @@ body {
     font-size: 0.74rem;
     margin-bottom: 8px;
 }
+.remote-inline-form {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+    flex: 1;
+    min-width: 220px;
+}
+.remote-inline-form .modal-input { min-width: 0; }
 .download-layout {
     display: grid;
     grid-template-columns: minmax(300px, 0.95fr) minmax(380px, 1.35fr);
@@ -1106,6 +1118,13 @@ body {
     gap: 10px;
     padding: 10px 12px;
     border-bottom: 1px solid rgba(255,255,255,0.07);
+    flex-wrap: wrap;
+}
+.download-list-head-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
 }
 .download-list-title {
     font-size: 0.86rem;
@@ -1370,6 +1389,7 @@ body {
     .transfer-options { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .transfer-option { padding-left: 8px; padding-right: 8px; }
     .remote-form { grid-template-columns: 1fr; }
+    .remote-inline-form { grid-template-columns: 1fr; }
     .download-layout { grid-template-columns: 1fr; }
     .download-total-grid { grid-template-columns: 1fr; }
     .link-item { grid-template-columns: 1fr; }
@@ -1725,7 +1745,7 @@ body {
             <div class="page-actions">
                 <button class="btn" onclick="showBrowserPage()">返回</button>
                 <button class="btn unit-toggle" id="downloadUnitToggle" onclick="toggleDownloadUnit()">MB/s</button>
-                <button class="btn btn-danger" onclick="clearFinishedDownloads()">清除完成</button>
+                <button class="btn btn-danger" id="clearFinishedBtn" onclick="clearFinishedDownloads()">清除完成</button>
             </div>
         </div>
         <div class="transfer-options">
@@ -1733,17 +1753,23 @@ body {
             <button class="btn transfer-option" id="transferTabUpload" onclick="setTransferTab('upload')">📤 上传</button>
             <button class="btn transfer-option" id="transferTabDownload" onclick="setTransferTab('download')">📥 下载</button>
         </div>
-        <div class="transfer-filter" id="transferFilterRow">
-            <button class="btn filter-chip active" id="transferFilterAll" onclick="setTransferFilter('all')">全部</button>
-            <button class="btn filter-chip" id="transferFilterActive" onclick="setTransferFilter('active')">进行中</button>
-            <button class="btn filter-chip" id="transferFilterDone" onclick="setTransferFilter('done')">已完成</button>
+
+        <!-- Remote-download action box (remote tab only) -->
+        <div class="upload-transfer-actions" id="remoteActionBox" style="display:none;">
+            <div class="upload-action-row">
+                <div style="min-width:0;">
+                    <div class="upload-action-title">远程下载</div>
+                    <div class="upload-action-sub">远程下载会由服务器后台执行，完成后自动保存到根目录下的 download 文件夹。</div>
+                </div>
+                <div class="remote-inline-form" id="remoteDownloadForm">
+                    <input type="url" class="modal-input" id="remoteDownloadUrl" placeholder="输入 http/https 链接">
+                    <button class="btn" onclick="startRemoteDownload()">开始远程下载</button>
+                </div>
+            </div>
         </div>
-        <div class="remote-form" id="remoteDownloadForm">
-            <input type="url" class="modal-input" id="remoteDownloadUrl" placeholder="输入 http/https 链接，文件会保存到 /download">
-            <button class="btn" onclick="startRemoteDownload()">开始远程下载</button>
-        </div>
-        <div class="remote-hint">远程下载会由服务器后台执行，完成后自动保存到根目录下的 download 文件夹。</div>
-        <div class="upload-transfer-actions" id="uploadTransferActions">
+
+        <!-- Upload action box (upload tab only) -->
+        <div class="upload-transfer-actions" id="uploadActionBox" style="display:none;">
             <div class="upload-action-row">
                 <div>
                     <div class="upload-action-title">添加上传任务</div>
@@ -1752,11 +1778,32 @@ body {
                 <button class="btn" onclick="openUploadModal()">📤 上传文件 / 文件夹</button>
             </div>
         </div>
+
+        <!-- Download action box (download tab only) -->
+        <div class="upload-transfer-actions" id="downloadActionBox" style="display:none;">
+            <div class="upload-action-row">
+                <div>
+                    <div class="upload-action-title">下载文件</div>
+                    <div class="upload-action-sub">从网盘选择文件下载到本地，任务在后台执行。</div>
+                </div>
+                <button class="btn" onclick="openDownloadFilePicker()">📥 选择文件下载</button>
+            </div>
+        </div>
+
         <div class="download-workspace download-layout">
             <div class="download-list-panel">
                 <div class="download-list-head">
-                    <div class="download-list-title">任务</div>
-                    <div class="download-list-count" id="downloadQueueCount">0 个文件</div>
+                    <div class="download-list-head-info">
+                        <div class="download-list-title">任务</div>
+                        <div class="download-list-count" id="downloadQueueCount">0 个文件</div>
+                    </div>
+                    <button class="btn btn-danger" id="clearTrashBtn" onclick="clearTrash()" style="display:none;">🗑 清空回收站</button>
+                    <div class="transfer-filter" id="transferFilterRow">
+                        <button class="btn filter-chip active" id="transferFilterAll" onclick="setTransferFilter('all')">全部</button>
+                        <button class="btn filter-chip" id="transferFilterActive" onclick="setTransferFilter('active')">进行中</button>
+                        <button class="btn filter-chip" id="transferFilterDone" onclick="setTransferFilter('done')">已完成</button>
+                        <button class="btn filter-chip" id="transferFilterTrash" onclick="setTransferFilter('trash')">♻️ 回收站</button>
+                    </div>
                 </div>
                 <div class="download-queue-list" id="downloadQueueList"></div>
             </div>
@@ -1839,6 +1886,7 @@ body {
 <!-- Context menu -->
 <div class="ctx-menu" id="ctxMenu">
     <button class="ctx-item" id="ctxOpen" onclick="ctxOpen()"><span class="ctx-icon">📂</span>打开</button>
+    <button class="ctx-item" id="ctxPin" onclick="ctxTogglePin()" style="display:none;"><span class="ctx-icon">📌</span>置顶</button>
     <button class="ctx-item" id="ctxDownload" onclick="ctxDownload()"><span class="ctx-icon">📥</span>下载</button>
     <button class="ctx-item" id="ctxEdit" onclick="ctxEdit()"><span class="ctx-icon">📝</span>编辑文本</button>
     <button class="ctx-item" id="ctxShare" onclick="ctxShare()"><span class="ctx-icon">🔗</span>生成下载链接</button>
@@ -2057,6 +2105,21 @@ body {
     </div>
 </div>
 
+<!-- Download file picker modal -->
+<div class="modal-overlay" id="downloadFilePickerModal">
+    <div class="modal">
+        <div class="modal-title">选择要下载的文件</div>
+        <div class="dir-picker-bar">
+            <div class="dir-picker-path" id="dlPickerPath">/</div>
+            <button class="btn" onclick="downloadPickerSelectAll()">下载当前目录全部文件</button>
+        </div>
+        <div class="dir-picker-list" id="dlPickerList"></div>
+        <div class="modal-actions">
+            <button class="btn" onclick="hideModal('downloadFilePickerModal')">关闭</button>
+        </div>
+    </div>
+</div>
+
 <!-- Transfer modal -->
 <div class="modal-overlay" id="transferModal">
     <div class="modal modal-wide">
@@ -2213,6 +2276,7 @@ let sortBy = 'name';
 let sortOrder = 'asc';
 let searchQ = '';
 let diskInfo = null;
+let pinnedFolders = [];   // top-level folder paths pinned at root (e.g. ['/电影', '/工作'])
 let authRequired = false;
 let appStarted = false;
 let createMode = 'folder';
@@ -2470,9 +2534,9 @@ async function loadFiles(path) {
     }
 }
 
-async function loadDiskInfo() {
+async function loadDiskInfo(refresh = false) {
     try {
-        diskInfo = await apiFetch('/api/disk');
+        diskInfo = await apiFetch('/api/disk' + (refresh ? '?refresh=1' : ''));
         renderDisk();
     } catch (e) {
         console.error('Disk info error:', e);
@@ -2537,16 +2601,19 @@ function renderFiles() {
     items.forEach((f, i) => {
         const sel = selected.has(f.path) ? ' selected' : '';
         const cut = clipboard && clipboard.action === 'cut' && clipboard.paths.includes(f.path) ? ' cut' : '';
+        const pinned = curPath === '/' && f.isDir && pinnedFolders.includes(f.path) ? ' pinned' : '';
         const icon = fileIcon(f);
         const size = f.isDir ? '' : fmtSize(f.size);
         const escapedPath = escAttr(f.path);
-        html += `<div class="file-item${sel}${cut}" data-path="${escapedPath}" data-idx="${i}"
+        const pinBadge = pinned ? '<span class="pin-badge" title="已置顶">📌</span>' : '';
+        html += `<div class="file-item${sel}${cut}${pinned}" data-path="${escapedPath}" data-idx="${i}"
             onclick="onFileClick(event,${i})" ondblclick="onFileDbl(${i})"
             oncontextmenu="onFileCtx(event,${i})"
             style="animation-delay:${Math.min(i * 15, 300)}ms">
             <div class="file-item-name">
                 <span class="file-icon">${icon}</span>
                 <span class="file-name" title="${escapedPath}">${esc(f.name)}</span>
+                ${pinBadge}
             </div>
             <span class="file-size">${size}</span>
             <span class="file-date">${f.modifiedStr || ''}</span>
@@ -2570,6 +2637,10 @@ function getVisibleFiles() {
         arr = arr.filter(f => f.name.toLowerCase().includes(q));
     }
     arr.sort((a, b) => {
+        // Pinned folders always float to the very top (root directory only).
+        const ap = curPath === '/' && a.isDir && pinnedFolders.includes(a.path);
+        const bp = curPath === '/' && b.isDir && pinnedFolders.includes(b.path);
+        if (ap !== bp) return ap ? -1 : 1;
         if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
         let c = 0;
         if (sortBy === 'name') c = a.name.localeCompare(b.name, 'zh');
@@ -2878,6 +2949,17 @@ function showCtx(x, y) {
     setDisabled('ctxDelete', !hasSel);
     setDisabled('ctxProps', !singleFile);
 
+    // Pin-to-top item: only for a single folder at the root directory.
+    const pinBtn = document.getElementById('ctxPin');
+    if (pinBtn) {
+        const canPin = singleFile && f && f.isDir && curPath === '/';
+        pinBtn.style.display = canPin ? '' : 'none';
+        if (canPin) {
+            const isPinned = pinnedFolders.includes(f.path);
+            pinBtn.innerHTML = `<span class="ctx-icon">${isPinned ? '📍' : '📌'}</span>${isPinned ? '取消置顶' : '置顶'}`;
+        }
+    }
+
     const isMobile = window.innerWidth <= 768;
     if (isMobile) {
         document.getElementById('ctxBackdrop').classList.add('show');
@@ -2900,6 +2982,37 @@ function hideCtx() {
 
 function setDisabled(id, disabled) {
     document.getElementById(id).classList.toggle('disabled', disabled);
+}
+
+async function loadPinnedFolders() {
+    try {
+        const data = await apiFetch('/api/pinned');
+        pinnedFolders = Array.isArray(data.pinned) ? data.pinned : [];
+    } catch (e) {
+        pinnedFolders = [];
+    }
+    if (typeof renderFiles === 'function') renderFiles();
+}
+
+async function ctxTogglePin() {
+    hideCtx();
+    if (selected.size !== 1) return;
+    const path = [...selected][0];
+    const f = files.find(fi => fi.path === path);
+    if (!f || !f.isDir || curPath !== '/') return;
+    const action = pinnedFolders.includes(path) ? 'remove' : 'add';
+    try {
+        const data = await apiFetch('/api/pinned', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path, action }),
+        });
+        if (data && data.success) {
+            pinnedFolders = Array.isArray(data.pinned) ? data.pinned : [];
+            toast(action === 'add' ? '已置顶' : '已取消置顶', 'success');
+            renderFiles();
+        }
+    } catch (e) { toast(e.message, 'error'); }
 }
 
 /* ============================================================
@@ -2954,6 +3067,7 @@ async function ctxPaste() {
         }
     } catch (e) { toast(e.message, 'error'); }
     await loadFiles(curPath);
+    loadDiskInfo(true);
 }
 
 function ctxRename() {
@@ -2980,6 +3094,7 @@ function ctxRename() {
         } catch (e) { toast(e.message, 'error'); }
         hideModal('renameModal');
         await loadFiles(curPath);
+        loadDiskInfo(true);
     };
 }
 
@@ -3003,7 +3118,7 @@ function ctxDelete() {
             else toast((data.errors || []).join('\n'), 'error');
         } catch (e) { toast(e.message, 'error'); }
         await loadFiles(curPath);
-        loadDiskInfo();
+        loadDiskInfo(true);
     });
 }
 
@@ -3281,7 +3396,7 @@ async function uploadFiles(fileList) {
     }
     toast('上传完成', 'success');
     await loadFiles(curPath);
-    loadDiskInfo();
+    loadDiskInfo(true);
 }
 
 function doUpload(file, uid) {
@@ -3841,6 +3956,17 @@ function showCtx(x, y) {
     setDisabled('ctxDelete', !hasSel);
     setDisabled('ctxProps', !singleFile);
 
+    // Pin-to-top item: only for a single folder at the root directory.
+    const pinBtn = document.getElementById('ctxPin');
+    if (pinBtn) {
+        const canPin = singleFile && f && f.isDir && curPath === '/';
+        pinBtn.style.display = canPin ? '' : 'none';
+        if (canPin) {
+            const isPinned = pinnedFolders.includes(f.path);
+            pinBtn.innerHTML = `<span class="ctx-icon">${isPinned ? '📍' : '📌'}</span>${isPinned ? '取消置顶' : '置顶'}`;
+        }
+    }
+
     const isMobile = window.innerWidth <= 768;
     if (isMobile) {
         document.getElementById('ctxBackdrop').classList.add('show');
@@ -3980,6 +4106,94 @@ function selectDirectoryPickerPath() {
     hideModal('directoryPickerModal');
 }
 
+/* ============================================================
+   Download file picker (网盘文件选择器 → 下载队列)
+   ============================================================ */
+let downloadPickerPath = '/';
+let downloadPickerLastFiles = [];   // last /api/list files (non-dir) for "download all"
+
+function openDownloadFilePicker() {
+    showModal('downloadFilePickerModal');
+    loadDownloadFilePicker(curPath || '/');
+}
+
+async function loadDownloadFilePicker(path) {
+    const list = document.getElementById('dlPickerList');
+    if (!list) return;
+    list.innerHTML = '<div class="loading-wrap"><div class="spinner"></div></div>';
+    try {
+        const data = await apiFetch('/api/list?path=' + encodeURIComponent(path || '/'));
+        downloadPickerPath = data.path || '/';
+        const pathEl = document.getElementById('dlPickerPath');
+        if (pathEl) pathEl.textContent = downloadPickerPath;
+        const items = data.items || [];
+        downloadPickerLastFiles = items.filter(f => !f.isDir);   // for "download all"
+        const rows = [];
+        if (downloadPickerPath !== '/') {
+            rows.push(`<button class="dir-picker-item" data-dir-path="${escAttr(parentDir(downloadPickerPath))}"><span>⬆️</span><span>上一级</span></button>`);
+        }
+        // Directories first (click to enter), then files (click to download).
+        const dirs = items.filter(f => f.isDir);
+        const files = items.filter(f => !f.isDir);
+        rows.push(...dirs.map(d => `<button class="dir-picker-item" data-dir-path="${escAttr(d.path)}"><span>📁</span><span>${esc(d.name)}</span></button>`));
+        rows.push(...files.map(f => `<button class="dir-picker-item" data-dl-file="${escAttr(f.path)}" title="点击下载"><span>📄</span><span>${esc(f.name)}</span></button>`));
+        list.innerHTML = rows.length ? rows.join('') : '<div class="empty-state"><div class="empty-text">没有文件</div></div>';
+        list.querySelectorAll('[data-dir-path]').forEach(btn => {
+            btn.onclick = () => loadDownloadFilePicker(btn.getAttribute('data-dir-path') || '/');
+        });
+        list.querySelectorAll('[data-dl-file]').forEach(btn => {
+            btn.onclick = () => {
+                const fp = btn.getAttribute('data-dl-file') || '';
+                const f = files.find(x => x.path === fp);
+                if (!f) return;
+                addDownloadTask(f);
+                processDownloadQueue();
+            };
+        });
+    } catch (e) {
+        list.innerHTML = '';
+        toast(e.message, 'error');
+    }
+}
+
+function downloadPickerSelectAll() {
+    // Batch-add every file in the currently-listed directory to the download queue.
+    if (!downloadPickerLastFiles.length) return toast('当前目录没有文件', 'info');
+    let added = 0;
+    downloadPickerLastFiles.forEach(f => { downloadTasks.push(makeDownloadTask(f)); added++; });
+    if (added) {
+        updateTransferBadge();
+        toast(`已加入 ${added} 个文件`, 'success');
+        processDownloadQueue();
+        hideModal('downloadFilePickerModal');
+    }
+}
+
+function makeDownloadTask(f) {
+    // Build a download task the same way addDownloadTask does, but without its per-file toast.
+    return {
+        id: 'dl:' + f.path + ':' + Date.now() + ':' + Math.random().toString(16).slice(2),
+        kind: 'download',
+        path: f.path,
+        name: f.name,
+        size: Number(f.size) || 0,
+        url: downloadUrlForPath(f.path),
+        status: 'queued',
+        loaded: 0,
+        chunks: [],
+        controller: null,
+        maxBps: 0,
+        lastBps: 0,
+        samples: [],
+        totalActiveMs: 0,
+        lastResumeAt: 0,
+        lastT: 0,
+        lastBytes: 0,
+        error: '',
+        contentType: 'application/octet-stream',
+    };
+}
+
 function setArchiveBusy(busy) {
     const btn = document.getElementById('archiveConfirmBtn');
     if (!btn) return;
@@ -4012,7 +4226,7 @@ async function doCompress() {
         } catch (e) {
             toast(e.message, 'error');
         }
-        loadDiskInfo();
+        loadDiskInfo(true);
     } catch (e) {
         toast(e.message, 'error');
     } finally {
@@ -4033,7 +4247,7 @@ async function doExtract() {
         extractSourcePath = '';
         toast(data.message || '解压完成', 'success');
         await loadFiles(data.dest || dest);
-        loadDiskInfo();
+        loadDiskInfo(true);
     } catch (e) {
         toast(e.message, 'error');
     }
@@ -5025,6 +5239,7 @@ function startApp() {
     if (appStarted) return;
     appStarted = true;
     loadDiskInfo();
+    loadPinnedFolders();
     loadFiles('/', { replaceHistory: true });
 }
 
@@ -5286,8 +5501,9 @@ var currentLinkTab = 'active';
 var shareCache = { items: [], trash: [] };
 var remotePollTimer = null;
 var currentTransferTab = 'remote';
-var currentTransferFilter = 'all';  // all | active | done
+var currentTransferFilter = 'all';  // all | active | done | trash
 var ignoredRemoteTaskIds = new Set();
+var trashedTasks = [];   // soft-deleted task snapshots (回收站)
 
 function transferTabText(tab = currentTransferTab) {
     const map = { remote: '远程下载', upload: '上传', download: '下载' };
@@ -5306,6 +5522,8 @@ function taskKind(task) {
 function taskMatchesFilter(task) {
     // active: queued + downloading + paused + error (进行中含失败和暂停)
     // done: done (已完成不含 canceled，因为 canceled 是用户主动取消)
+    // trash: handled by renderTrashList — main list never shows trash items.
+    if (currentTransferFilter === 'trash') return false;
     if (currentTransferFilter === 'all') return true;
     if (currentTransferFilter === 'active') {
         return ['queued', 'downloading', 'paused', 'error'].includes(task.status);
@@ -5317,15 +5535,23 @@ function taskMatchesFilter(task) {
 }
 
 function setTransferFilter(filter) {
-    currentTransferFilter = ['all', 'active', 'done'].includes(filter) ? filter : 'all';
+    currentTransferFilter = ['all', 'active', 'done', 'trash'].includes(filter) ? filter : 'all';
     [
         ['transferFilterAll', 'all'],
         ['transferFilterActive', 'active'],
         ['transferFilterDone', 'done'],
+        ['transferFilterTrash', 'trash'],
     ].forEach(([id, value]) => {
         const el = document.getElementById(id);
         if (el) el.classList.toggle('active', currentTransferFilter === value);
     });
+    if (currentTransferFilter === 'trash') {
+        // Trash view is a separate list; clear the detail panel selection.
+        selectedDownloadId = '';
+        loadTrashedTasks();
+        renderDownloadDetails(null);
+        return;
+    }
     if (!visibleTransferTasks().some(t => t.id === selectedDownloadId)) {
         selectedDownloadId = visibleTransferTasks()[0]?.id || '';
     }
@@ -5354,12 +5580,15 @@ function setTransferTab(tab) {
         el.classList.toggle('active', active);
         el.classList.toggle('btn-primary', active);
     });
-    const remoteForm = document.getElementById('remoteDownloadForm');
-    const remoteHint = document.querySelector('.remote-hint');
-    const uploadActions = document.getElementById('uploadTransferActions');
-    if (remoteForm) remoteForm.style.display = currentTransferTab === 'remote' ? 'grid' : 'none';
-    if (remoteHint) remoteHint.style.display = currentTransferTab === 'remote' ? 'block' : 'none';
-    if (uploadActions) uploadActions.style.display = currentTransferTab === 'upload' ? 'block' : 'none';
+    // Show/hide the per-tab action box (remote / upload / download).
+    // Note: .upload-transfer-actions defaults to display:none in CSS, so we must
+    // explicitly set 'block' to show (clearing inline style would re-hide it).
+    const remoteBox = document.getElementById('remoteActionBox');
+    const uploadBox = document.getElementById('uploadActionBox');
+    const downloadBox = document.getElementById('downloadActionBox');
+    if (remoteBox) remoteBox.style.display = currentTransferTab === 'remote' ? 'block' : 'none';
+    if (uploadBox) uploadBox.style.display = currentTransferTab === 'upload' ? 'block' : 'none';
+    if (downloadBox) downloadBox.style.display = currentTransferTab === 'download' ? 'block' : 'none';
     const title = document.querySelector('.download-list-title');
     if (title) title.textContent = `${transferTabText()}任务`;
     if (!visibleTransferTasks().some(t => t.id === selectedDownloadId)) {
@@ -5966,7 +6195,7 @@ async function startUploadTask(task) {
         if (curPath === (task.path.split('/').slice(0, -1).join('/') || '/')) {
             try { await loadFiles(curPath); } catch (e) {}
         }
-        loadDiskInfo();
+        loadDiskInfo(true);
         toast(`上传完成：${task.name}`, 'success');
     } catch (e) {
         finishDownloadActivity(task);
@@ -6040,6 +6269,10 @@ function selectedDownloadTask() {
 }
 
 function renderDownloadQueue() {
+    // Trash view is rendered by a dedicated renderer; hide the "clear finished"
+    // button and surface "clear trash" instead.
+    syncTrashActions();
+    if (currentTransferFilter === 'trash') return renderTrashList();
     const list = document.getElementById('downloadQueueList');
     const count = document.getElementById('downloadQueueCount');
     if (!list || !count) return;
@@ -6056,6 +6289,9 @@ function renderDownloadQueue() {
         const active = selectedDownloadId === task.id ? ' active' : '';
         const kind = transferKindText(task);
         const status = downloadTaskStatusText(task);
+        const copyBtn = task.url
+            ? `<button class="btn" data-download-copy-url="${escAttr(task.url)}" title="复制下载链接">🔗</button>`
+            : '';
         let action = '';
         if (task.status === 'downloading') {
             action = `<button class="btn" data-download-pause="${escAttr(task.id)}" title="暂停">⏸</button>
@@ -6076,7 +6312,7 @@ function renderDownloadQueue() {
                 <span class="download-task-drag" title="拖拽排序">☰</span>
                 <div class="download-task-name" title="${escAttr(task.path || task.url || '')}">${esc(task.name || '未命名任务')}</div>
                 <div class="download-task-actions">
-                    ${action}
+                    ${copyBtn}${action}
                 </div>
             </div>
             <div class="download-task-meta">
@@ -6111,6 +6347,21 @@ function renderDownloadQueue() {
     });
     list.querySelectorAll('[data-download-cancel]').forEach(btn => btn.onclick = () => cancelDownloadTask(btn.getAttribute('data-download-cancel')));
     list.querySelectorAll('[data-download-delete]').forEach(btn => btn.onclick = () => deleteDownloadTask(btn.getAttribute('data-download-delete')));
+    list.querySelectorAll('[data-download-copy-url]').forEach(btn => btn.onclick = async () => {
+        const url = btn.getAttribute('data-download-copy-url');
+        if (!url) return toast('无可用链接', 'warning');
+        try {
+            await navigator.clipboard.writeText(url);
+        } catch (e) {
+            const input = document.createElement('input');
+            input.value = url;
+            document.body.appendChild(input);
+            input.select();
+            try { document.execCommand('copy'); } catch (_) {}
+            input.remove();
+        }
+        toast('已复制下载链接', 'success');
+    });
     renderDownloadTotals();
     persistLocalTasks();
 }
@@ -6363,26 +6614,16 @@ async function deleteDownloadTask(id) {
     if (idx < 0) return;
     const task = downloadTasks[idx];
     if (task.status === 'downloading') await pauseDownloadTask(id);
-    // Remove server record + .part for any kind
+    // Soft-delete: stop live task + snapshot to trash (one call handles both).
     try {
         const serverId = task.serverTaskId || task.remoteId || task.id;
         await apiFetch('/api/tasks-delete', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: serverId }),
+            body: JSON.stringify({ id: serverId, trash: true }),
         });
     } catch (e) {}
-    // Also clear any live remote task
-    if (task.kind === 'remote') {
-        try {
-            await apiFetch('/api/remote-download-delete', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ id: task.remoteId || task.id }),
-            });
-        } catch (e) {}
-        ignoredRemoteTaskIds.add(task.remoteId || task.id);
-    }
+    if (task.kind === 'remote') ignoredRemoteTaskIds.add(task.remoteId || task.id);
     downloadTasks.splice(idx, 1);
     if (selectedDownloadId === id) selectedDownloadId = visibleTransferTasks()[0]?.id || '';
     renderDownloadQueue();
@@ -6401,7 +6642,7 @@ async function clearFinishedDownloads() {
             await apiFetch('/api/tasks-delete', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ids }),
+                body: JSON.stringify({ ids, trash: true }),
             });
         } catch (e) {}
     }
@@ -6409,6 +6650,111 @@ async function clearFinishedDownloads() {
     if (!visibleTransferTasks().some(t => t.id === selectedDownloadId)) selectedDownloadId = visibleTransferTasks()[0]?.id || '';
     renderDownloadQueue();
     renderDownloadDetails(selectedDownloadTask());
+}
+
+/* ============================================================
+   Task Trash (回收站)
+   ============================================================ */
+function syncTrashActions() {
+    // "清空回收站" only appears in the trash view (it lives in the task-list
+    // header next to the filter chips, separate from the top "清除完成" button).
+    const isTrash = currentTransferFilter === 'trash';
+    const ct = document.getElementById('clearTrashBtn');
+    if (ct) ct.style.display = isTrash ? '' : 'none';
+}
+
+async function loadTrashedTasks() {
+    try {
+        const data = await apiFetch('/api/tasks-trash');
+        trashedTasks = Array.isArray(data.items) ? data.items : [];
+    } catch (e) {
+        trashedTasks = [];
+    }
+    renderTrashList();
+}
+
+function renderTrashList() {
+    const list = document.getElementById('downloadQueueList');
+    const count = document.getElementById('downloadQueueCount');
+    if (!list || !count) return;
+    count.textContent = `${trashedTasks.length} 个记录`;
+    updateTransferBadge();
+    if (!trashedTasks.length) {
+        list.innerHTML = `<div class="empty-state"><div class="empty-icon">♻️</div><div class="empty-text">回收站为空</div></div>`;
+        renderDownloadTotals();
+        return;
+    }
+    list.innerHTML = trashedTasks.map(task => {
+        const kind = task.kind === 'upload' ? '上传' : (task.kind === 'remote' ? '远程下载' : '下载');
+        const pct = task.size ? Math.min(100, (task.loaded || 0) / task.size * 100) : 0;
+        return `<div class="download-task" data-trash-id="${escAttr(task.id)}">
+            <div class="download-task-top">
+                <span class="download-task-drag">♻️</span>
+                <div class="download-task-name" title="${escAttr(task.path || task.url || '')}">${esc(task.name || '未命名任务')}</div>
+                <div class="download-task-actions">
+                    <button class="btn" data-trash-restore="${escAttr(task.id)}" title="恢复">↩</button>
+                    <button class="btn btn-danger" data-trash-purge="${escAttr(task.id)}" title="彻底删除">🗑</button>
+                </div>
+            </div>
+            <div class="download-task-meta">
+                <span class="download-task-kind">${kind}</span>
+                <span>${task.size ? pct.toFixed(1) + '%' : '--'}</span>
+            </div>
+            <div class="download-task-meta">
+                <span>${fmtSize(task.loaded || 0)} / ${task.size ? fmtSize(task.size) : '未知'}</span>
+            </div>
+        </div>`;
+    }).join('');
+    list.querySelectorAll('[data-trash-restore]').forEach(btn => btn.onclick = () => restoreTrashedTask(btn.getAttribute('data-trash-restore')));
+    list.querySelectorAll('[data-trash-purge]').forEach(btn => btn.onclick = () => purgeTrashedTask(btn.getAttribute('data-trash-purge')));
+    renderDownloadTotals();
+}
+
+async function restoreTrashedTask(id) {
+    try {
+        const data = await apiFetch('/api/tasks-restore', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id }),
+        });
+        if (data && data.success) {
+            trashedTasks = trashedTasks.filter(t => t.id !== id);
+            toast('已恢复', 'success');
+            renderTrashList();
+            await loadAllTasks();   // refresh main list with the restored record
+        }
+    } catch (e) { toast(e.message, 'error'); }
+}
+
+async function purgeTrashedTask(id) {
+    try {
+        await apiFetch('/api/tasks-delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id, trash: false }),
+        });
+        trashedTasks = trashedTasks.filter(t => t.id !== id);
+        toast('已彻底删除', 'success');
+        renderTrashList();
+    } catch (e) { toast(e.message, 'error'); }
+}
+
+async function clearTrash() {
+    if (!trashedTasks.length) return toast('回收站为空', 'info');
+    showConfirm('🗑️ 清空回收站', `确定要彻底删除回收站里的 ${trashedTasks.length} 个记录吗？此操作不可恢复。`, async () => {
+        const ids = trashedTasks.map(t => t.id).filter(Boolean);
+        if (!ids.length) return;
+        try {
+            await apiFetch('/api/tasks-delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ids, trash: false }),
+            });
+            trashedTasks = [];
+            toast('回收站已清空', 'success');
+            renderTrashList();
+        } catch (e) { toast(e.message, 'error'); }
+    });
 }
 
 async function loadShares() {

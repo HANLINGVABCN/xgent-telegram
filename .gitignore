@@ -9,6 +9,10 @@ bot_memory.db-*
 *.sqlite
 *.sqlite3
 bot_storage/
+
+# 用户记忆（每条一个文件，含用户私密事实/偏好，绝不上传）
+memory/
+
 bot_output.log
 bot_server.log
 bot_full_trace.log
@@ -29,6 +33,11 @@ htmlcov/
 venv/
 .venv/
 env/
+
+# 本地临时测试脚本
+test_memory_offline.py
+test_*.py
+
 
 # Build and package artifacts
 build/
