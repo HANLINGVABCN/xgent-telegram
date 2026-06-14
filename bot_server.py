@@ -101,6 +101,36 @@ class BotConfig:
 
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# 本地 Bot API server 容器内的数据根路径（卷映射的另一端）
+_LOCAL_API_CONTAINER_DATA_DIR = "/var/lib/telegram-bot-api"
+# 宿主机上对应的本地 API 数据目录
+_LOCAL_API_HOST_DATA_DIR = os.path.join(PROJECT_ROOT, ".local-api-data")
+
+
+async def download_telegram_file(telegram_obj) -> bytes:
+    """统一下载 Telegram 文件（PhotoSize/Document/Audio/Voice/Video 等），返回字节。
+
+    本地 Bot API server（local_mode）模式下，PTB 拿到的 file_path 是容器内路径
+    （/var/lib/telegram-bot-api/...），宿主机上不存在。这里把容器路径翻译成
+    宿主机实际数据目录后直接读文件。
+
+    官方 api.telegram.org 模式下，走 PTB 原生的 HTTP 下载，行为完全不变。
+    """
+    file_obj = await telegram_obj.get_file()
+
+    if BotConfig.API_BASE_URL:
+        # 本地模式：file_path 是容器内绝对路径，翻译到宿主机
+        container_path = getattr(file_obj, 'file_path', '') or ''
+        if container_path.startswith(_LOCAL_API_CONTAINER_DATA_DIR):
+            host_path = _LOCAL_API_HOST_DATA_DIR + container_path[len(_LOCAL_API_CONTAINER_DATA_DIR):]
+            with open(host_path, 'rb') as f:
+                return f.read()
+        # 路径不符合预期，回退到 PTB 原生下载
+        return bytes(await file_obj.download_as_bytearray())
+
+    # 官方模式：PTB 原生 HTTP 下载
+    return bytes(await file_obj.download_as_bytearray())
 UPDATE_SKIP_NAMES = {
     ".env",
     ".git",
@@ -8924,8 +8954,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("🫠 黑名单批量导入只接受 txt / md / text 文件。")
             return
         try:
-            file_obj = await doc.get_file()
-            content_bytes = await file_obj.download_as_bytearray()
+            content_bytes = await download_telegram_file(doc)
             text_content = ArtifactManager.try_decode_text(bytes(content_bytes))
             if text_content is None:
                 raise ValueError("unsupported blacklist file encoding")
@@ -8961,8 +8990,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 
         status_msg = await update.message.reply_text("📝 正在读取用户提供的提示词文件...")
         try:
-            file_obj = await doc.get_file()
-            content_bytes = await file_obj.download_as_bytearray()
+            content_bytes = await download_telegram_file(doc)
             text_content = ArtifactManager.try_decode_text(bytes(content_bytes))
             if text_content is None:
                 raise ValueError("unsupported prompt file encoding")
@@ -8992,8 +9020,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         return
 
     try:
-        file_obj = await doc.get_file()
-        content_bytes = bytes(await file_obj.download_as_bytearray())
+        content_bytes = await download_telegram_file(doc)
         saved_file = ArtifactManager.save_binary_upload(doc_name, content_bytes)
         note = ArtifactManager.shorten_text(caption, 80) if caption else ""
         memory_text = ArtifactManager.build_index_message("文件", doc_name, saved_file['rel_path'], note)
@@ -10534,8 +10561,7 @@ async def handle_photo_message_indexed(update: Update, context: ContextTypes.DEF
 
     try:
         largest_photo = update.message.photo[-1]
-        file_obj = await largest_photo.get_file()
-        photo_bytes = await file_obj.download_as_bytearray()
+        photo_bytes = await download_telegram_file(largest_photo)
         image_b64 = base64.b64encode(bytes(photo_bytes)).decode('ascii')
 
         multimodal_content: List[Dict[str, str]] = []
@@ -10573,8 +10599,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     try:
         largest_photo = update.message.photo[-1]
-        file_obj = await largest_photo.get_file()
-        photo_bytes = bytes(await file_obj.download_as_bytearray())
+        photo_bytes = await download_telegram_file(largest_photo)
         saved_photo = ArtifactManager.save_binary_upload("telegram_photo.jpg", photo_bytes)
         image_b64 = base64.b64encode(photo_bytes).decode('ascii')
         memory_text = ArtifactManager.build_index_message(
@@ -10778,11 +10803,12 @@ if __name__ == '__main__':
         )
         if BotConfig.API_BASE_URL:
             # 走本地 Telegram Bot API server：base_url / base_file_url 同源，开 local_mode
+            # 注意：PTB v20 会自动在 base_url 后追加 token，这里只给前缀，不要带 token
             _app_builder = _app_builder.base_url(
-                f"{BotConfig.API_BASE_URL}/bot{BotConfig.TOKEN}"
+                f"{BotConfig.API_BASE_URL}/bot"
             )
             _app_builder = _app_builder.base_file_url(
-                f"{BotConfig.API_BASE_URL}/file{BotConfig.TOKEN}"
+                f"{BotConfig.API_BASE_URL}/file/bot"
             )
             _app_builder = _app_builder.local_mode(True)
         app = _app_builder.build()
