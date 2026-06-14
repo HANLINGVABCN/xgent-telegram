@@ -9731,7 +9731,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             fname = os.path.basename(resolved_sendfile_path)
 
                             if fsize > AgentExecutor.MAX_FILE_SIZE and BotConfig.API_BASE_URL:
-                                # 大文件 + 本地 API：复制到挂载目录，用 file:// 容器路径直穿
+                                # 大文件 + 本地 API：用硬链接(瞬间/零空间)把文件暴露到挂载目录，
+                                # 跨分区(EXDEV)等失败时降级为物理复制
                                 import shutil
                                 import uuid as _sf_uuid
                                 # 临时文件名加唯一后缀，避免并发/重名冲突
@@ -9739,7 +9740,15 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                 temp_host_path = os.path.join(_LOCAL_API_HOST_DATA_DIR, _sf_unique_name)
                                 try:
                                     os.makedirs(_LOCAL_API_HOST_DATA_DIR, exist_ok=True)
-                                    shutil.copy2(resolved_sendfile_path, temp_host_path)
+                                    try:
+                                        # 优先硬链接：零拷贝零空间，瞬间完成
+                                        if os.path.exists(temp_host_path):
+                                            os.remove(temp_host_path)
+                                        os.link(resolved_sendfile_path, temp_host_path)
+                                    except OSError as _sf_link_err:
+                                        # 跨分区(EXDEV)或权限不足等 → 降级物理复制
+                                        logger.info(f"sendfile 硬链接失败({type(_sf_link_err).__name__})，降级复制: {temp_host_path}")
+                                        shutil.copy2(resolved_sendfile_path, temp_host_path)
                                     # 容器内对应路径（卷映射：宿主机 .local-api-data ↔ 容器 /var/lib/telegram-bot-api）
                                     container_file_path = (
                                         f"file://{_LOCAL_API_CONTAINER_DATA_DIR}/{_sf_unique_name}"
