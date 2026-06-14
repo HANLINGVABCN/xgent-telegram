@@ -11180,21 +11180,28 @@ async def setup_bot_commands(app):
         except Exception as e:
             logger.warning(f"同步 Telegram 命令菜单失败: {e}")
 
-    if _startup_menu_sent:
-        return
+    # 跨进程时间窗口去重：即使 PM2 重启拉起新进程（flag 会重置），
+    # 只要距上次发送不到 5 分钟，就不再发——彻底防止"重启后短时间内收到多条 start"。
+    STARTUP_MENU_COOLDOWN = 300  # 5 分钟
 
-    # 加锁：防止 post_init 与 run_once(when=3) 兜底任务并发各发一次
+    # 加锁：防止 post_init 与并发任务同时进入
     async with _startup_menu_lock:
-        # 双重检查：拿到锁后可能已被另一个协程发过
+        # 进程内去重：拿到锁后可能已被另一个协程发过
         if _startup_menu_sent:
             return
         try:
             await UserDataManager.init()
             db = await BotMemoryDB.get_instance()
+            # 跨进程去重：检查上次发送时间戳
+            last_sent_ts = await db.get_config('last_startup_menu_sent_ts', 0)
+            elapsed = time.time() - float(last_sent_ts or 0)
+            if elapsed < STARTUP_MENU_COOLDOWN:
+                logger.info(f"⏭️ 启动菜单跳过：距上次发送仅 {int(elapsed)}s（冷却 {STARTUP_MENU_COOLDOWN}s 内）")
+                _startup_menu_sent = True
+                return
             notify_chat_id = await db.get_config('restart_notify_chat_id', BotConfig.AUTHORIZED_USER_ID)
             # 标记置位（不再回滚）：宁可启动菜单漏发，也绝不能重复发送。
             # 漏发时用户随时可手动 /start；重复发送才是真正困扰用户的问题。
-            # 这同时挡住：post_init/polling 重连再次进入、3秒兜底任务、PTB 内部重试。
             _startup_menu_sent = True
             await app.bot.send_message(
                 chat_id=notify_chat_id or BotConfig.AUTHORIZED_USER_ID,
@@ -11202,10 +11209,12 @@ async def setup_bot_commands(app):
                 reply_markup=get_main_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
+            # 记录发送时间戳到数据库（跨进程有效）
+            await db.set_config('last_startup_menu_sent_ts', time.time())
             await GlobalRecorder.record_system_op("启动后发送完整主菜单", {"chat_id": notify_chat_id})
             logger.info("✅ 启动主菜单已发送给用户")
         except Exception as e:
-            # 发送失败也不回滚 flag：避免兜底任务/polling 重连再次触发导致重复发送
+            # 发送失败也不回滚 flag：避免并发/重连再次触发导致重复发送
             logger.warning(f"启动主菜单发送失败（不再重试，用户可手动 /start）: {e}")
 
 async def send_startup_menu_job(context: ContextTypes.DEFAULT_TYPE):
