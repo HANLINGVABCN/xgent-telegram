@@ -63,6 +63,7 @@ _is_processing = False                                    # 处理中锁
 _conversation_processing_lock = asyncio.Lock()
 _startup_commands_synced = False
 _startup_menu_sent = False
+_startup_menu_lock = asyncio.Lock()                        # 启动菜单发送锁，防止并发双发
 
 
 def get_or_create_stop_event() -> asyncio.Event:
@@ -6385,8 +6386,8 @@ def get_main_menu():
          InlineKeyboardButton("🎯 模型", callback_data="menu_default_models")],
         [InlineKeyboardButton(f"🤖 Agent:{'开' if agent_on else '关'}", callback_data="toggle_agent_mode"),
          InlineKeyboardButton(f"🌊 流式:{'开' if stream_on else '关'}", callback_data="toggle_stream_mode")],
-        [InlineKeyboardButton(f"🧩 拼接:{stitch_label}", callback_data="menu_text_stitch_mode"),
-         InlineKeyboardButton("🧠 记忆", callback_data="menu_memory")],
+        [InlineKeyboardButton(f"🧩{stitch_label}", callback_data="menu_text_stitch_mode"),
+         InlineKeyboardButton("🧠记忆", callback_data="menu_memory")],
         [InlineKeyboardButton("📝 提示词", callback_data="menu_prompts"),
          InlineKeyboardButton("⚙️ 更多", callback_data="menu_more_settings")]
     ])
@@ -11182,21 +11183,30 @@ async def setup_bot_commands(app):
     if _startup_menu_sent:
         return
 
-    try:
-        await UserDataManager.init()
-        db = await BotMemoryDB.get_instance()
-        notify_chat_id = await db.get_config('restart_notify_chat_id', BotConfig.AUTHORIZED_USER_ID)
-        await app.bot.send_message(
-            chat_id=notify_chat_id or BotConfig.AUTHORIZED_USER_ID,
-            text=build_start_menu_text(),
-            reply_markup=get_main_menu(),
-            parse_mode=constants.ParseMode.HTML
-        )
-        _startup_menu_sent = True
-        await GlobalRecorder.record_system_op("启动后发送完整主菜单", {"chat_id": notify_chat_id})
-        logger.info("✅ 启动主菜单已发送给用户")
-    except Exception as e:
-        logger.warning(f"启动主菜单发送失败: {e}")
+    # 加锁：防止 post_init 与 run_once(when=3) 兜底任务并发各发一次
+    async with _startup_menu_lock:
+        # 双重检查：拿到锁后可能已被另一个协程发过
+        if _startup_menu_sent:
+            return
+        try:
+            await UserDataManager.init()
+            db = await BotMemoryDB.get_instance()
+            notify_chat_id = await db.get_config('restart_notify_chat_id', BotConfig.AUTHORIZED_USER_ID)
+            # 先标记后发送：即使 send_message 因网络抖动触发 PTB 内部重试，
+            # 兜底任务进来也会被 flag 挡住，避免重复发送
+            _startup_menu_sent = True
+            await app.bot.send_message(
+                chat_id=notify_chat_id or BotConfig.AUTHORIZED_USER_ID,
+                text=build_start_menu_text(),
+                reply_markup=get_main_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+            await GlobalRecorder.record_system_op("启动后发送完整主菜单", {"chat_id": notify_chat_id})
+            logger.info("✅ 启动主菜单已发送给用户")
+        except Exception as e:
+            # 发送失败：回滚 flag，让兜底任务（3秒后）有机会重试
+            _startup_menu_sent = False
+            logger.warning(f"启动主菜单发送失败: {e}")
 
 async def send_startup_menu_job(context: ContextTypes.DEFAULT_TYPE):
     """JobQueue 兜底：启动后主动发送完整 /start 主菜单。"""
