@@ -119,6 +119,15 @@ async def download_telegram_file(telegram_obj) -> bytes:
     """
     file_obj = await telegram_obj.get_file()
 
+    # 【DEBUG】临时排查日志：打印 file_obj 的所有可能路径字段，定位本地模式真实格式
+    _debug_fp = getattr(file_obj, 'file_path', None)
+    _debug_fid = getattr(file_obj, 'file_id', None)
+    _debug_fuid = getattr(file_obj, 'file_unique_id', None)
+    logger.info(f"【DEBUG download_telegram_file】API_BASE_URL={BotConfig.API_BASE_URL!r}")
+    logger.info(f"【DEBUG download_telegram_file】file_path={_debug_fp!r}")
+    logger.info(f"【DEBUG download_telegram_file】file_id={_debug_fid!r} file_unique_id={_debug_fuid!r}")
+    logger.info(f"【DEBUG download_telegram_file】file_obj 类型={type(file_obj).__name__}")
+
     if BotConfig.API_BASE_URL:
         # 本地模式：file_path 是容器内绝对路径，翻译到宿主机
         container_path = getattr(file_obj, 'file_path', '') or ''
@@ -127,6 +136,7 @@ async def download_telegram_file(telegram_obj) -> bytes:
             with open(host_path, 'rb') as f:
                 return f.read()
         # 路径不符合预期，回退到 PTB 原生下载
+        logger.warning(f"【DEBUG】file_path 不匹配容器前缀，回退原生下载。file_path={container_path!r}")
         return bytes(await file_obj.download_as_bytearray())
 
     # 官方模式：PTB 原生 HTTP 下载
