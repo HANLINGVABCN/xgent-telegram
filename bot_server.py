@@ -6385,8 +6385,8 @@ def get_main_menu():
          InlineKeyboardButton("🎯 模型", callback_data="menu_default_models")],
         [InlineKeyboardButton(f"🤖 Agent:{'开' if agent_on else '关'}", callback_data="toggle_agent_mode"),
          InlineKeyboardButton(f"🌊 流式:{'开' if stream_on else '关'}", callback_data="toggle_stream_mode")],
-        [InlineKeyboardButton(f"🧩 拼接:{stitch_label}", callback_data="menu_text_stitch_mode")],
-        [InlineKeyboardButton("🧠 记忆", callback_data="menu_memory")],
+        [InlineKeyboardButton(f"🧩 拼接:{stitch_label}", callback_data="menu_text_stitch_mode"),
+         InlineKeyboardButton("🧠 记忆", callback_data="menu_memory")],
         [InlineKeyboardButton("📝 提示词", callback_data="menu_prompts"),
          InlineKeyboardButton("⚙️ 更多", callback_data="menu_more_settings")]
     ])
