@@ -9753,16 +9753,47 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                     container_file_path = (
                                         f"file://{_LOCAL_API_CONTAINER_DATA_DIR}/{_sf_unique_name}"
                                     )
-                                    await context.bot.send_document(
-                                        chat_id=update.effective_chat.id,
-                                        document=container_file_path,
-                                        filename=fname,
-                                        caption=f"📄 {fname} ({fsize} bytes) [本地API直发]"
-                                    )
-                                    sendfile_notice = (
-                                        f"[sendfile结果] 已发送服务器文件给用户: "
-                                        f"{resolved_sendfile_path} ({fsize} bytes) [本地API直发]"
-                                    )
+                                    # 大文件上行耗时长：先发“正在上传”状态，避免客户端误以为卡死
+                                    # chat_action 每 ~5s 失效，开一个后台 task 周期重发直到发送完成
+                                    _sf_chat_id = update.effective_chat.id
+                                    _sf_keep_alive = {'on': True}
+
+                                    async def _sf_upload_indicator():
+                                        while _sf_keep_alive['on']:
+                                            try:
+                                                await context.bot.send_chat_action(
+                                                    chat_id=_sf_chat_id, action="upload_document"
+                                                )
+                                            except Exception:
+                                                pass
+                                            await asyncio.sleep(4)
+
+                                    _sf_indicator_task = asyncio.create_task(_sf_upload_indicator())
+                                    try:
+                                        # 大文件本地 API 直发：本地 API 容器要把它推到 Telegram 官方服务器，
+                                        # 耗时取决于上行带宽。默认 HTTP 读取超时(10~20s)会提前抛 Timed out，
+                                        # 即使后台仍在继续上传。这里显式给足 read/write timeout。
+                                        # 按文件大小动态估算：每 50MB 给 60s，最少 120s，最多 1800s(30min)
+                                        _sf_read_to = max(120, min(1800, int(fsize / (50 * 1024 * 1024) * 60)))
+                                        await context.bot.send_document(
+                                            chat_id=update.effective_chat.id,
+                                            document=container_file_path,
+                                            filename=fname,
+                                            caption=f"📄 {fname} ({fsize} bytes) [本地API直发]",
+                                            read_timeout=_sf_read_to,
+                                            write_timeout=_sf_read_to,
+                                            connect_timeout=30,
+                                            pool_timeout=30,
+                                        )
+                                        sendfile_notice = (
+                                            f"[sendfile结果] 已发送服务器文件给用户: "
+                                            f"{resolved_sendfile_path} ({fsize} bytes) [本地API直发]"
+                                        )
+                                    finally:
+                                        _sf_keep_alive['on'] = False
+                                        _sf_indicator_task.cancel()
+                                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                                            await _sf_indicator_task
                                 finally:
                                     # 发送完成（或失败）后清理挂载目录下的临时文件
                                     try:
@@ -9789,12 +9820,20 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
 
                             else:
                                 # 小文件：走原生内存发送
+                                try:
+                                    await context.bot.send_chat_action(
+                                        chat_id=update.effective_chat.id, action="upload_document"
+                                    )
+                                except Exception:
+                                    pass
                                 with open(resolved_sendfile_path, 'rb') as sendfile:
                                     await context.bot.send_document(
                                         chat_id=update.effective_chat.id,
                                         document=sendfile,
                                         filename=fname,
-                                        caption=f"📄 {fname} ({fsize} bytes)"
+                                        caption=f"📄 {fname} ({fsize} bytes)",
+                                        read_timeout=120,
+                                        write_timeout=120,
                                     )
                                 sendfile_notice = (
                                     f"[sendfile结果] 已发送服务器文件给用户: "
