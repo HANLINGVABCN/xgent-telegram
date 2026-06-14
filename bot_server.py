@@ -9728,18 +9728,58 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             )
                         else:
                             fsize = os.path.getsize(resolved_sendfile_path)
-                            if fsize > AgentExecutor.MAX_FILE_SIZE:
+                            fname = os.path.basename(resolved_sendfile_path)
+
+                            if fsize > AgentExecutor.MAX_FILE_SIZE and BotConfig.API_BASE_URL:
+                                # 大文件 + 本地 API：复制到挂载目录，用 file:// 容器路径直穿
+                                import shutil
+                                import uuid as _sf_uuid
+                                # 临时文件名加唯一后缀，避免并发/重名冲突
+                                _sf_unique_name = f"{fname}.sendfile_{_sf_uuid.uuid4().hex[:8]}"
+                                temp_host_path = os.path.join(_LOCAL_API_HOST_DATA_DIR, _sf_unique_name)
+                                try:
+                                    os.makedirs(_LOCAL_API_HOST_DATA_DIR, exist_ok=True)
+                                    shutil.copy2(resolved_sendfile_path, temp_host_path)
+                                    # 容器内对应路径（卷映射：宿主机 .local-api-data ↔ 容器 /var/lib/telegram-bot-api）
+                                    container_file_path = (
+                                        f"file://{_LOCAL_API_CONTAINER_DATA_DIR}/{_sf_unique_name}"
+                                    )
+                                    await context.bot.send_document(
+                                        chat_id=update.effective_chat.id,
+                                        document=container_file_path,
+                                        filename=fname,
+                                        caption=f"📄 {fname} ({fsize} bytes) [本地API直发]"
+                                    )
+                                    sendfile_notice = (
+                                        f"[sendfile结果] 已发送服务器文件给用户: "
+                                        f"{resolved_sendfile_path} ({fsize} bytes) [本地API直发]"
+                                    )
+                                finally:
+                                    # 发送完成（或失败）后清理挂载目录下的临时文件
+                                    try:
+                                        if os.path.exists(temp_host_path):
+                                            os.remove(temp_host_path)
+                                    except OSError as _sf_clean_err:
+                                        logger.warning(f"清理 sendfile 临时文件失败: {temp_host_path} ({_sf_clean_err})")
+
+                            elif fsize > AgentExecutor.MAX_FILE_SIZE:
+                                # 大文件 + 官方 API：无能为力，报错并提示配置本地 API
                                 sendfile_notice = (
-                                    f"[sendfile结果] 发送失败: 文件超过50MB限制: "
-                                    f"{resolved_sendfile_path} ({fsize} bytes)"
+                                    f"[sendfile结果] 发送失败: 文件超过50MB限制({fsize} bytes)，"
+                                    f"且未启用本地 API，无法发送。"
                                 )
                                 await safe_send_message(
                                     context,
                                     update.effective_chat.id,
-                                    f"❌ 文件超过50MB限制: {safe_text(resolved_sendfile_path)}"
+                                    (
+                                        f"❌ 文件超过50MB限制({fsize} bytes)，官方 API 无法发送。\n"
+                                        f"如需发送大文件，请通过 install.sh 菜单选项 8 启用本地 API 容器。\n"
+                                        f"路径: {safe_text(resolved_sendfile_path)}"
+                                    )
                                 )
+
                             else:
-                                fname = os.path.basename(resolved_sendfile_path)
+                                # 小文件：走原生内存发送
                                 with open(resolved_sendfile_path, 'rb') as sendfile:
                                     await context.bot.send_document(
                                         chat_id=update.effective_chat.id,
