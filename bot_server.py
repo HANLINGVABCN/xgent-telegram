@@ -11192,8 +11192,9 @@ async def setup_bot_commands(app):
             await UserDataManager.init()
             db = await BotMemoryDB.get_instance()
             notify_chat_id = await db.get_config('restart_notify_chat_id', BotConfig.AUTHORIZED_USER_ID)
-            # 先标记后发送：即使 send_message 因网络抖动触发 PTB 内部重试，
-            # 兜底任务进来也会被 flag 挡住，避免重复发送
+            # 标记置位（不再回滚）：宁可启动菜单漏发，也绝不能重复发送。
+            # 漏发时用户随时可手动 /start；重复发送才是真正困扰用户的问题。
+            # 这同时挡住：post_init/polling 重连再次进入、3秒兜底任务、PTB 内部重试。
             _startup_menu_sent = True
             await app.bot.send_message(
                 chat_id=notify_chat_id or BotConfig.AUTHORIZED_USER_ID,
@@ -11204,9 +11205,8 @@ async def setup_bot_commands(app):
             await GlobalRecorder.record_system_op("启动后发送完整主菜单", {"chat_id": notify_chat_id})
             logger.info("✅ 启动主菜单已发送给用户")
         except Exception as e:
-            # 发送失败：回滚 flag，让兜底任务（3秒后）有机会重试
-            _startup_menu_sent = False
-            logger.warning(f"启动主菜单发送失败: {e}")
+            # 发送失败也不回滚 flag：避免兜底任务/polling 重连再次触发导致重复发送
+            logger.warning(f"启动主菜单发送失败（不再重试，用户可手动 /start）: {e}")
 
 async def send_startup_menu_job(context: ContextTypes.DEFAULT_TYPE):
     """JobQueue 兜底：启动后主动发送完整 /start 主菜单。"""
@@ -11269,7 +11269,8 @@ if __name__ == '__main__':
         job_queue = app.job_queue
         assert job_queue is not None
         job_queue.run_repeating(check_and_send_idle_message, interval=3600, first=60)
-        job_queue.run_once(send_startup_menu_job, when=3, name="send_startup_menu")
+        # 注意：不再注册 send_startup_menu 兜底任务。
+        # post_init 已保证启动菜单发送且 flag 不回滚，兜底任务只会制造重复发送风险。
         
         # 注册命令。CommandHandler 必须放在兜底 MessageHandler 前面，否则命令会被普通消息处理器吃掉。
         app.add_handler(CommandHandler("start", cmd_start))
