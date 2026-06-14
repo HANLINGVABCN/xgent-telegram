@@ -26,6 +26,7 @@ LOCAL_API_CONTAINER="telegram-local-bot-api"
 LOCAL_API_PORT="8081"
 LOCAL_API_DATA_DIR="$SCRIPT_DIR/.local-api-data"
 LOCAL_API_IMAGE="aiogram/telegram-bot-api:latest"
+LOCAL_API_ALLOWED_IPS_FILE="$STATE_DIR/local-api-allowed-ips"
 
 print_banner() {
     echo -e "${CYAN}"
@@ -700,6 +701,77 @@ local_api_enabled_for_bot() {
     fi
 }
 
+# 读取允许访问本地 API 的 IP 白名单。
+# 文件不存在或为空时，返回默认 127.0.0.1（仅本机）。
+# 每行一个 IP，忽略空行和 # 注释。
+get_allowed_ips() {
+    if [ -f "$LOCAL_API_ALLOWED_IPS_FILE" ]; then
+        local ips
+        ips="$(grep -vE '^\s*(#|$)' "$LOCAL_API_ALLOWED_IPS_FILE" 2>/dev/null || true)"
+        if [ -n "$ips" ]; then
+            printf '%s\n' "$ips"
+            return
+        fi
+    fi
+    printf '127.0.0.1\n'
+}
+
+# 把白名单 IP 列表转成 docker run 的端口映射参数（每个 IP 一条 -p）。
+# 输出形如：-p 127.0.0.1:8081:8081 -p 1.2.3.4:8081:8081
+build_local_api_port_args() {
+    local ip args=""
+    while IFS= read -r ip; do
+        [ -z "$ip" ] && continue
+        # 简单格式校验：只允许 IPv4/IPv6/主机名常见字符
+        if [[ "$ip" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+            args="${args} -p ${ip}:${LOCAL_API_PORT}:8081"
+        fi
+    done < <(get_allowed_ips)
+    if [ -z "$args" ]; then
+        args="-p 127.0.0.1:${LOCAL_API_PORT}:8081"
+    fi
+    printf '%s' "${args# }"
+}
+
+# 简单 IPv4 校验（4 段 0-255）。IPv6 不做严格校验，交给 docker 判断。
+is_valid_ipv4() {
+    local ip="$1"
+    if [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        local i
+        for i in 1 2 3 4; do
+            local seg="${BASH_REMATCH[i]}"
+            if [ "$seg" -gt 255 ]; then
+                return 1
+            fi
+        done
+        return 0
+    fi
+    return 1
+}
+
+# 把一个 IP 追加到白名单（去重）
+add_allowed_ip() {
+    local ip="$1"
+    ensure_state_dir
+    touch "$LOCAL_API_ALLOWED_IPS_FILE"
+    if grep -Fxq -- "$ip" "$LOCAL_API_ALLOWED_IPS_FILE" 2>/dev/null; then
+        return 0
+    fi
+    printf '%s\n' "$ip" >> "$LOCAL_API_ALLOWED_IPS_FILE"
+}
+
+# 从白名单删除一个 IP
+remove_allowed_ip() {
+    local ip="$1"
+    if [ ! -f "$LOCAL_API_ALLOWED_IPS_FILE" ]; then
+        return 0
+    fi
+    local tmp_file
+    tmp_file="$(mktemp)"
+    grep -Fxv -- "$ip" "$LOCAL_API_ALLOWED_IPS_FILE" > "$tmp_file" 2>/dev/null || true
+    mv "$tmp_file" "$LOCAL_API_ALLOWED_IPS_FILE"
+}
+
 ensure_docker() {
     # 已安装且守护进程可用
     if command_exists docker && docker info >/dev/null 2>&1; then
@@ -1264,6 +1336,21 @@ start_local_api_container() {
     fi
 
     info "[本地 API] 正在启动容器..."
+    # 按白名单 IP 生成端口绑定参数（默认仅 127.0.0.1，可随时加白名单）
+    local -a port_args=()
+    local ip
+    while IFS= read -r ip; do
+        [ -z "$ip" ] && continue
+        port_args+=("-p" "${ip}:${LOCAL_API_PORT}:8081")
+    done < <(get_allowed_ips)
+    if [ "${#port_args[@]}" -eq 0 ]; then
+        port_args+=("-p" "127.0.0.1:${LOCAL_API_PORT}:8081")
+    fi
+
+    local allowed_summary
+    allowed_summary="$(get_allowed_ips | tr '\n' ' ' | sed 's/ *$//')"
+    info "[本地 API] 端口 ${LOCAL_API_PORT} 允许访问的 IP: ${allowed_summary:-127.0.0.1}"
+
     if ! docker run -d \
         --name "$LOCAL_API_CONTAINER" \
         --restart unless-stopped \
@@ -1271,7 +1358,7 @@ start_local_api_container() {
         -e TELEGRAM_API_ID="$api_id" \
         -e TELEGRAM_API_HASH="$api_hash" \
         -e TELEGRAM_LOCAL=true \
-        -p "${port}:8081" \
+        "${port_args[@]}" \
         "$LOCAL_API_IMAGE"; then
         error "[错误] 启动容器失败。"
         return 1
@@ -1371,6 +1458,78 @@ stop_local_api_container() {
     fi
 }
 
+# 管理本地 API 端口白名单 IP（查看/添加/删除）。
+# 默认 127.0.0.1；可随时增删，改完需重启容器（子选项 1）才生效。
+manage_allowed_ips() {
+    local choice ip current_ips
+
+    while true; do
+        echo ""
+        echo -e "${CYAN}--- 本地 API 白名单 IP ---${NC}"
+        echo "当前允许访问端口 ${LOCAL_API_PORT} 的 IP:"
+        current_ips="$(get_allowed_ips)"
+        if [ -z "$current_ips" ]; then
+            echo "  (空，将默认 127.0.0.1)"
+        else
+            while IFS= read -r ip; do
+                [ -n "$ip" ] && echo "  - $ip"
+            done <<< "$current_ips"
+        fi
+        echo ""
+        echo "请选择操作:"
+        echo "  1) 添加 IP 到白名单"
+        echo "  2) 从白名单删除 IP"
+        echo "  3) 返回本地 API 菜单"
+        echo ""
+        read -r -p "请输入选项 [1/2/3，默认 3]: " choice
+
+        case "$choice" in
+            1)
+                read -r -p "请输入要添加的 IPv4 地址（如 1.2.3.4 或 0.0.0.0 表示全部）: " ip
+                if [ -z "$ip" ]; then
+                    warn "未输入，已取消。"
+                    continue
+                fi
+                if [ "$ip" = "0.0.0.0" ]; then
+                    warn "⚠️  0.0.0.0 表示对所有 IP 开放（公网可访问），请确认你知道风险。"
+                    read -r -p "确认添加 0.0.0.0？输入 y 继续: " confirm
+                    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+                        warn "已取消。"
+                        continue
+                    fi
+                elif ! is_valid_ipv4 "$ip"; then
+                    error "[错误] 不是合法的 IPv4 地址: $ip"
+                    continue
+                fi
+                add_allowed_ip "$ip"
+                success "已添加: $ip"
+                warn "   改动需重启容器后生效：返回本地 API 菜单选择 1) 启动/重新安装启动。"
+                ;;
+            2)
+                read -r -p "请输入要删除的 IP: " ip
+                if [ -z "$ip" ]; then
+                    warn "未输入，已取消。"
+                    continue
+                fi
+                if ! grep -Fxq -- "$ip" <(get_allowed_ips); then
+                    warn "白名单中没有: $ip"
+                    continue
+                fi
+                remove_allowed_ip "$ip"
+                success "已删除: $ip"
+                warn "   改动需重启容器后生效：返回本地 API 菜单选择 1) 启动/重新安装启动。"
+                ;;
+            ""|3)
+                warn "已返回本地 API 菜单。"
+                break
+                ;;
+            *)
+                error "[错误] 无效选项。"
+                ;;
+        esac
+    done
+}
+
 manage_local_api() {
     local choice
     local container_status bot_enabled
@@ -1382,13 +1541,15 @@ manage_local_api() {
     echo -e "${CYAN}--- 本地 API 容器 (Docker) ---${NC}"
     echo "容器状态: $container_status"
     echo "bot 启用本地 API: $bot_enabled"
+    echo "允许访问端口 ${LOCAL_API_PORT} 的 IP: $(get_allowed_ips | tr '\n' ' ' | sed 's/ *$//')"
     echo ""
     echo "请选择操作:"
     echo "  1) 启动/重新安装启动本地 API 容器 (Docker)"
     echo "  2) 关闭本地 API 容器"
-    echo "  3) 返回主菜单"
+    echo "  3) 管理白名单 IP (默认仅 127.0.0.1)"
+    echo "  4) 返回主菜单"
     echo ""
-    read -r -p "请输入选项 [1/2/3，默认 3]: " choice
+    read -r -p "请输入选项 [1/2/3/4，默认 4]: " choice
 
     case "$choice" in
         1)
@@ -1397,7 +1558,10 @@ manage_local_api() {
         2)
             stop_local_api_container
             ;;
-        ""|3)
+        3)
+            manage_allowed_ips
+            ;;
+        ""|4)
             warn "已返回主菜单。"
             ;;
         *)
