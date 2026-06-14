@@ -2134,6 +2134,7 @@ body {
             <span class="prop-label">类型</span><span class="prop-value" id="propType"></span>
             <span class="prop-label">大小</span><span class="prop-value" id="propSize"></span>
             <span class="prop-label">修改时间</span><span class="prop-value" id="propModified"></span>
+            <span class="prop-label">VPS 真实路径</span><span class="prop-value" id="propRealPath" title=""></span>
         </div>
         <div class="modal-actions">
             <button class="btn" onclick="hideModal('propsModal')">关闭</button>
@@ -3017,6 +3018,9 @@ function ctxProps() {
     document.getElementById('propType').textContent = f.isDir ? '文件夹' : extLabel(f.name);
     document.getElementById('propSize').textContent = f.isDir ? '计算中...' : fmtSize(f.size);
     document.getElementById('propModified').textContent = f.modifiedStr;
+    const realEl = document.getElementById('propRealPath');
+    realEl.textContent = '获取中...';
+    realEl.title = '';
     showModal('propsModal');
     refreshProps(path);
 }
@@ -3029,8 +3033,13 @@ async function refreshProps(path) {
         document.getElementById('propType').textContent = info.isDir ? '文件夹' : extLabel(info.name || '');
         document.getElementById('propSize').textContent = fmtSize(Number(info.size) || 0);
         document.getElementById('propModified').textContent = info.modifiedStr || '--';
+        const realEl = document.getElementById('propRealPath');
+        const rp = info.realPath || '';
+        realEl.textContent = rp || '不可用';
+        realEl.title = rp || '';
     } catch (e) {
         document.getElementById('propSize').textContent = '计算失败';
+        document.getElementById('propRealPath').textContent = '获取失败';
         toast(e.message, 'error');
     }
 }

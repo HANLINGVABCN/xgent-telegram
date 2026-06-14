@@ -1389,9 +1389,12 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         if not full or not os.path.exists(full):
             return self.send_err(404, '项目不存在')
         info = get_file_info(ROOT_DIR, req_path, full)
-        if info and info.get('isDir'):
-            info['size'] = calculate_logical_size(full)
-            info['sizeStr'] = format_size(info['size'])
+        if info:
+            # Expose the absolute path on the server filesystem (VPS real path)
+            info['realPath'] = full
+            if info.get('isDir'):
+                info['size'] = calculate_logical_size(full)
+                info['sizeStr'] = format_size(info['size'])
         self.send_json(info)
 
     def _api_text_get(self, qs):
