@@ -1629,6 +1629,7 @@ gen_inbound_hysteria2() {
       "users": [{"password": "$PASSWORD"}],
       "tls": {
         "enabled": true,
+        "alpn": ["h3"],
         "certificate_path": "$TLS_CERT",
         "key_path": "$TLS_KEY"
       }
