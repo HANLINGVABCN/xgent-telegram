@@ -575,6 +575,15 @@ def _scan_mailu_accounts(db_path):
     return domains, accounts_dedup, None
 
 
+def get_public_ip():
+    """尝试获取本机的公网 IP，失败则回退到 127.0.0.1"""
+    try:
+        import urllib.request
+        return urllib.request.urlopen("https://api.ipify.org", timeout=3).read().decode("utf-8").strip()
+    except Exception:
+        return "127.0.0.1"
+
+
 def detect_defaults():
     """
     探测 Mailu 环境得到 init 默认值。
@@ -585,7 +594,7 @@ def detect_defaults():
     d = {
         "domain": "",
         "username": "",
-        "smtp_host": "127.0.0.1",
+        "smtp_host": get_public_ip(),
         "smtp_port": 587,
         "security": "starttls",
         "source": None,
