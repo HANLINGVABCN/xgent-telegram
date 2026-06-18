@@ -1,5 +1,5 @@
 ```!
-Mailu 邮件服务器部署与运维辅助：当用户要安装/启动 Mailu、检查 Mailu 环境、配置证书挂载、检查宿主机反向代理、排查 DNS/MX/SPF/DKIM/DMARC/PTR、创建或重置管理员、配置根域名或任意子域名 catch-all、查看邮件客户端参数、查看 Mailu 日志、备份/恢复、卸载辅助配置、管理证书监控服务时使用本技能。脚本位置固定为 skill/script/mailu-helper/mailu-helper.sh。常用命令：chmod +x skill/script/mailu-helper/mailu-helper.sh && sudo bash skill/script/mailu-helper/mailu-helper.sh；也可使用子命令 detect/check/dns/proxy/client/catchall/cert-service。脚本会写配置文件、修改 Mailu .env/compose、复制证书、写 Postfix overrides、创建 systemd 证书监控服务或重启 Docker Compose 服务，执行前必须确认当前机器就是目标 Mailu 服务器且用户允许改动这些配置。DNS 面板、PTR 反向解析和云厂商安全组通常不能由脚本自动完成，需要提醒用户到对应控制台手动处理。
+Mailu 辅助技能：支持 Mailu 部署、检查、证书、DNS、反代、catch-all 管理。执行命令：sudo bash skill/script/mailu-helper/mailu-helper.sh，支持交互菜单及子命令(detect/check/dns/proxy/client/catchall/cert-service)。执行前确认目标机器且允许改动配置。如有复杂异常，请先 read 本文档全文。
 ```
 
 # Mailu Helper 使用说明
