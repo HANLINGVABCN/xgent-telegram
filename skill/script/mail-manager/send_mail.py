@@ -13,6 +13,7 @@ import getpass
 import json
 import mimetypes
 import os
+import sqlite3
 import sys
 import smtplib
 from email.mime.text import MIMEText
@@ -30,6 +31,16 @@ MAILU_ENV_CANDIDATES = [
     "/mailu/.env",
     "/mailu/data/mailu.env",
 ]
+
+# Mailu SQLite 数据库候选路径（按优先级）
+MAILU_DB_CANDIDATES = [
+    "/mailu/data/main.db",
+    "/mailu/main.db",
+    "/mailu/data/mailu.db",
+]
+
+# 账号默认前缀（Mailu 默认 POSTMASTER=admin）
+DEFAULT_POSTMASTER = "admin"
 
 # 退出码约定
 EXIT_OK = 0
@@ -392,20 +403,19 @@ def cmd_check(args):
         results.append((False, f"解析安全模式失败: {e}"))
         security = None
 
-    # 5) SMTP 实连测试（用第一个域名的凭证）
+    # 5) SMTP 实连测试（逐个域名凭证，每个都测，全部打印）
     if do_connect and field_ok and cred_ok and security:
-        first_dom = next(iter(domains_cfg))
-        cred = domains_cfg[first_dom]
-        uname = cred.get("username")
-        upass = cred.get("password")
-        try:
-            srv = smtp_connect(smtp_host, smtp_port, security, uname, upass)
-            close_smtp(srv)
-            results.append((True, f"SMTP 实连测试: 登录成功 ({uname})"))
-        except smtplib.SMTPAuthenticationError as e:
-            results.append((False, f"SMTP 实连测试: 认证失败 ({uname}) — {e}"))
-        except Exception as e:
-            results.append((False, f"SMTP 实连测试: 连接失败 — {e}"))
+        for dom, cred in domains_cfg.items():
+            uname = cred.get("username")
+            upass = cred.get("password")
+            try:
+                srv = smtp_connect(smtp_host, smtp_port, security, uname, upass)
+                close_smtp(srv)
+                results.append((True, f"SMTP 实连测试 [{dom}]: 登录成功 ({uname})"))
+            except smtplib.SMTPAuthenticationError as e:
+                results.append((False, f"SMTP 实连测试 [{dom}]: 认证失败 ({uname}) — {e}"))
+            except Exception as e:
+                results.append((False, f"SMTP 实连测试 [{dom}]: 连接失败 ({uname}) — {e}"))
 
     _emit_check_results(results, do_connect)
     all_ok = all(ok for ok, _ in results)
@@ -487,10 +497,69 @@ def parse_env_file(path):
     return data
 
 
+def _find_mailu_db():
+    """按优先级查找 Mailu SQLite 数据库，返回路径或 None。"""
+    for p in MAILU_DB_CANDIDATES:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _scan_mailu_accounts(db_path):
+    """
+    扫描 Mailu SQLite 数据库，提取所有域名及每个域名下的账号。
+
+    返回 (domains:list[str], accounts:dict[email->None], error:str|None)。
+    accounts 键即完整邮箱；同时也会从 user 表补充独立账号。
+    """
+    domains = []
+    accounts = []
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        # 1) 域名表（Mailu 表名 domain，字段 name）
+        try:
+            cur.execute("SELECT name FROM domain ORDER BY name")
+            domains = [row["name"] for row in cur.fetchall() if row["name"]]
+        except sqlite3.Error:
+            pass
+        # 2) 用户表（Mailu 表名 user，字段 email / domain）
+        try:
+            cur.execute("SELECT email FROM user ORDER BY email")
+            accounts = [row["email"] for row in cur.fetchall() if row["email"]]
+        except sqlite3.Error:
+            pass
+        con.close()
+    except sqlite3.Error as e:
+        return [], [], str(e)
+
+    # 合并：账号里出现的域名也纳入；账号列表去重保序
+    seen = set(domains)
+    for em in accounts:
+        if "@" in em:
+            dom = em.split("@", 1)[1]
+            if dom not in seen:
+                seen.add(dom)
+                domains.append(dom)
+
+    # accounts 去重保序
+    seen_acc = set()
+    accounts_dedup = []
+    for em in accounts:
+        if em not in seen_acc:
+            seen_acc.add(em)
+            accounts_dedup.append(em)
+
+    return domains, accounts_dedup, None
+
+
 def detect_defaults():
     """
     探测 Mailu 环境得到 init 默认值。
-    返回 dict：{domain, username, smtp_host, smtp_port, security, source}
+    优先扫 SQLite 数据库（可发现全部域名/账号），回退到 .env（仅主域名）。
+    返回 dict：{domain, username, smtp_host, smtp_port, security, source,
+                domains(list), accounts(list)}
     """
     d = {
         "domain": "",
@@ -499,18 +568,42 @@ def detect_defaults():
         "smtp_port": 587,
         "security": "starttls",
         "source": None,
+        "domains": [],          # 全部已知域名（数据库或 .env 推导）
+        "accounts": [],         # 全部已知账号（完整邮箱）
+        "default_domain": "",   # 推荐的 default_domain
     }
+
+    # 1) 先试 SQLite 数据库（最权威，能拿到全部域名/账号）
+    db_path = _find_mailu_db()
+    if db_path:
+        doms, accs, db_err = _scan_mailu_accounts(db_path)
+        if not db_err and (doms or accs):
+            d["domains"] = doms
+            d["accounts"] = accs
+            d["source"] = db_path
+            d["default_domain"] = doms[0] if doms else ""
+            if accs:
+                d["domain"] = accs[0].split("@", 1)[1] if "@" in accs[0] else ""
+                d["username"] = accs[0]
+            elif doms:
+                d["domain"] = doms[0]
+                d["username"] = f"{DEFAULT_POSTMASTER}@{doms[0]}"
+            return d
+
+    # 2) 回退到 .env（只有主域名信息）
     env_path = _find_mailu_env()
     if not env_path:
         return d
     env = parse_env_file(env_path)
     domain = env.get("DOMAIN", "").strip()
-    postmaster = env.get("POSTMASTER", "admin").strip() or "admin"
-    hostnames = env.get("HOSTNAMES", "").strip()
+    postmaster = env.get("POSTMASTER", DEFAULT_POSTMASTER).strip() or DEFAULT_POSTMASTER
+    hostnames = [h.strip() for h in env.get("HOSTNAMES", "").split(",") if h.strip()]
     if domain:
         d["domain"] = domain
         d["username"] = f"{postmaster}@{domain}"
-    # SMTP 中继走本机最稳，HOSTNAMES 仅作信息记录（不直接当 smtp_host）
+        d["domains"] = [domain]
+        # HOSTNAMES 如 mail.example.com 不可直接当域名，但可作信息
+        d["default_domain"] = domain
     d["source"] = env_path
     return d
 
@@ -528,12 +621,12 @@ def _ask(prompt, default=""):
     return raw if raw else default
 
 
-def _ask_password(default=""):
-    """交互式问密码，不回显。非 TTY 时用 default。"""
+def _ask_password_for(label, default=""):
+    """带账号标签的密码询问，不回显。非 TTY 时用 default。"""
     if not sys.stdin.isatty():
         return default
     try:
-        pw = getpass.getpass("  登录密码 (输入不可见): ").strip()
+        pw = getpass.getpass(f"  {label} 的密码: ").strip()
     except (EOFError, KeyboardInterrupt):
         print()
         sys.exit(EXIT_ERROR)
@@ -541,46 +634,66 @@ def _ask_password(default=""):
 
 
 def cmd_init(args):
-    """交互式或批量生成 config.json。"""
+    """交互式或批量生成 config.json（多域名）。"""
     defaults = detect_defaults()
 
-    # 批量模式：命令行参数齐全则跳过交互
-    batch_ready = all([args.domain, args.username, args.password])
-
+    # ---------- 批量模式：--domains + --passwords 齐全则跳过交互 ----------
+    batch_ready = bool(args.domains and args.passwords)
     if batch_ready:
-        domain = args.domain
-        username = args.username
-        password = args.password
+        domain_list = split_addresses(args.domains)
+        passwords = split_addresses(args.passwords)
+        if len(passwords) == 1:
+            passwords = passwords * len(domain_list)  # 单密码广播
+        if len(passwords) != len(domain_list):
+            print(f"Error: --domains 有 {len(domain_list)} 个域名，--passwords 有 {len(passwords)} 个密码，数量不匹配。", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
+        username_prefix = args.username_prefix or DEFAULT_POSTMASTER
         smtp_host = args.smtp_host or "127.0.0.1"
         smtp_port = args.smtp_port or 587
         security = args.security or "starttls"
+        accounts = [f"{username_prefix}@{dom}" for dom in domain_list]
         if defaults["source"]:
             print(f"（检测到 Mailu 环境: {defaults['source']}，但使用了命令行批量参数）")
     else:
+        # ---------- 交互模式 ----------
         if defaults["source"]:
-            print(f"已检测到 Mailu 环境: {defaults['source']}")
-            print("默认值已自动填充，直接回车采用。\n")
+            kind = "数据库" if defaults["accounts"] or (defaults["domains"] and not defaults["source"].endswith(".env")) else ".env"
+            print(f"已检测到 Mailu {kind}: {defaults['source']}")
+            if defaults["domains"]:
+                print(f"发现域名 ({len(defaults['domains'])}): {', '.join(defaults['domains'])}")
+            if defaults["accounts"]:
+                print(f"发现账号 ({len(defaults['accounts'])}): {', '.join(defaults['accounts'])}")
+            print("密码在数据库里是 hash，需逐个输入明文。直接回车采用方括号内默认值。\n")
         else:
             print("未检测到 Mailu 环境，将逐项询问。直接回车采用方括号内默认值。\n")
 
-        smtp_host = _ask("[1/6] SMTP 服务器地址", args.smtp_host or defaults["smtp_host"])
-        smtp_port = _ask("[2/6] SMTP 端口 (587=STARTTLS / 465=SSL / 25=无加密)", str(args.smtp_port or defaults["smtp_port"]))
-        security = _ask("[3/6] 安全模式 (starttls/ssl/none)", args.security or defaults["security"])
-        domain = _ask("[4/6] 主域名", args.domain or defaults["domain"])
-        username = _ask("[5/6] 登录用户名 (完整邮箱)", args.username or defaults["username"])
-        password = _ask_password(args.password or "")
+        smtp_host = _ask("[1/5] SMTP 服务器地址", args.smtp_host or defaults["smtp_host"])
+        smtp_port = _ask("[2/5] SMTP 端口 (587=STARTTLS / 465=SSL / 25=无加密)", str(args.smtp_port or defaults["smtp_port"]))
+        security = _ask("[3/5] 安全模式 (starttls/ssl/none)", args.security or defaults["security"])
+
+        # 域名列表：默认用探测到的，可手动改
+        default_domains_str = ",".join(defaults["domains"]) if defaults["domains"] else ""
+        domains_input = _ask("[4/5] 所有域名 (逗号分隔)", args.domains or default_domains_str)
+        domain_list = split_addresses(domains_input)
+        if not domain_list:
+            print("Error: 至少需要一个域名。", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
+
+        username_prefix = _ask("      用户名前缀 (每域一个账号)", args.username_prefix or DEFAULT_POSTMASTER)
+        accounts = [f"{username_prefix}@{dom}" for dom in domain_list]
+
+        # 5) 逐个询问密码（不可回显）
+        print(f"\n[5/5] 逐个输入密码（{len(domain_list)} 个域名，输入不可见）:")
+        passwords = []
+        for dom, acc in zip(domain_list, accounts):
+            pw = _ask_password_for(acc)
+            if not pw:
+                print(f"Error: {acc} 的密码不能为空。", file=sys.stderr)
+                sys.exit(EXIT_ERROR)
+            passwords.append(pw)
         print()
 
-    # 校验关键字段
-    if not domain:
-        print("Error: 主域名不能为空。", file=sys.stderr)
-        sys.exit(EXIT_ERROR)
-    if not username or "@" not in username:
-        print("Error: 登录用户名必须是完整邮箱地址（如 admin@example.com）。", file=sys.stderr)
-        sys.exit(EXIT_ERROR)
-    if not password:
-        print("Error: 登录密码不能为空。", file=sys.stderr)
-        sys.exit(EXIT_ERROR)
+    # ---------- 校验 ----------
     try:
         smtp_port = int(smtp_port)
     except (TypeError, ValueError):
@@ -589,22 +702,30 @@ def cmd_init(args):
     if security not in ("starttls", "ssl", "none"):
         print(f"Error: 安全模式必须是 starttls/ssl/none，得到: {security}", file=sys.stderr)
         sys.exit(EXIT_ERROR)
+    for acc in accounts:
+        if "@" not in acc:
+            print(f"Error: 账号必须是完整邮箱地址: {acc}", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
+    if not all(passwords):
+        print("Error: 登录密码不能为空。", file=sys.stderr)
+        sys.exit(EXIT_ERROR)
+
+    # ---------- 组装多域名 config ----------
+    domains_cfg = {}
+    for dom, acc, pw in zip(domain_list, accounts, passwords):
+        domains_cfg[dom] = {"username": acc, "password": pw}
 
     config = {
         "smtp_host": smtp_host,
         "smtp_port": smtp_port,
         "smtp_security": security,
-        "default_domain": domain,
-        "domains": {
-            domain: {
-                "username": username,
-                "password": password,
-            }
-        },
+        "default_domain": domain_list[0],
+        "domains": domains_cfg,
     }
 
     _write_config(config, args.force)
     print(f"\n✓ 已生成配置: {CONFIG_PATH}")
+    print(f"  共 {len(domain_list)} 个域名: {', '.join(domain_list)}")
 
     # 写完自动做格式检查（不实连，避免部署时网络未通）
     print("\n--- 验证配置 ---")
@@ -690,10 +811,10 @@ def build_parser():
     p_check.add_argument("--no-connect", action="store_true", help="跳过 SMTP 实连测试，仅做格式检查")
 
     # init 子命令
-    p_init = sub.add_parser("init", help="交互式生成 config.json")
-    p_init.add_argument("--domain", help="主域名（如 example.com）")
-    p_init.add_argument("--username", help="登录用户名（完整邮箱）")
-    p_init.add_argument("--password", help="登录密码（交互模式下不传则不回显询问）")
+    p_init = sub.add_parser("init", help="交互式生成 config.json（支持多域名，自动扫描 Mailu 数据库）")
+    p_init.add_argument("--domains", help="所有域名，逗号/分号/空格分隔（批量模式必填）")
+    p_init.add_argument("--username-prefix", help="每域账号前缀（默认 admin，批量模式可用）")
+    p_init.add_argument("--passwords", help="各域密码，逗号/分号分隔；或单个密码广播到所有域（批量模式必填）")
     p_init.add_argument("--smtp-host", help="SMTP 服务器地址")
     p_init.add_argument("--smtp-port", help="SMTP 端口")
     p_init.add_argument("--security", choices=["starttls", "ssl", "none"], help="安全模式")
