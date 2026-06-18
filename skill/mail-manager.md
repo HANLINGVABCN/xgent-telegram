@@ -5,7 +5,7 @@ Mailu邮件服务器管理助手：
    该脚本会自动读取本地凭证，支持任意前缀 and 任意自定义子域名，且自动补全 Message-ID、Date 头，智能信封路由防进垃圾箱。
    可选增强参数：--html "<HTML正文>"、--cc/--bcc "<抄送/密送>"、--body-file "<正文文件>"、--attach "<附件路径>"（可重复）。
    【发信流程】AI 直接发信；若返回 exit code 2（配置缺失/损坏）或认证失败，则提示用户运行 `sudo .../send_mail.py init` 生成配置、填密码，再重试。
-   【配置维护命令】`send_mail.py check` 验证配置可用性；`send_mail.py init` 从 Mailu 自动探测并交互生成 /etc/mail-manager/config.json。
+   【配置维护命令】`send_mail.py check` 既是配置健康检查，也是**自动获取当前可用邮箱账号清单**的途径——它逐个域名实测 SMTP 登录，结果清单可直接用于发信决策；`send_mail.py init` 扫描 Mailu 数据库自动发现全部域名/账号，交互生成 /etc/mail-manager/config.json。
 2. 【本地读信】：免密检索和解析 Maildir。物理路径规范（账号必须是完整邮箱，如 admin@example.com）：
    - 收件箱: /mailu/mail/<账号>/[new|cur]
    - 其他(垃圾箱/已发送/已删除/草稿): /mailu/mail/<账号>/.[Junk|Sent|Trash|Drafts]/[new|cur]
@@ -20,31 +20,46 @@ Mailu邮件服务器管理助手：
 
 ## 首次部署：生成发信配置
 
-发信脚本依赖 `/etc/mail-manager/config.json`（含 SMTP 登录凭证）。首次部署或配置丢失时用 `init` 命令生成：
+发信脚本依赖 `/etc/mail-manager/config.json`（含 SMTP 登录凭证，支持多域名）。首次部署或配置丢失时用 `init` 命令生成：
 
 ```bash
 sudo /opt/telegram-ai-bot/skill/script/mail-manager/send_mail.py init
 ```
 
-`init` 会自动探测 Mailu 的 `mailu.env`（DOMAIN / POSTMASTER 等），自动填充域名和默认用户名，**只需交互填入登录密码**（密码不回显）。探测不到 Mailu 环境时降级为逐项询问。
+`init` 的账号发现顺序（两级回退）：
 
-### 验证配置是否可用
+1. **优先扫描 Mailu SQLite 数据库**（`/mailu/data/main.db` 等，只读打开）：直接读到**全部域名**和**全部账号**列表（Mailu `domain` / `user` 表），无需手动罗列。
+2. **数据库不可用时回退读 `mailu.env`**：Mailu 的环境变量配置文件（`/mailu/mailu.env`），里面通常只有 `DOMAIN=example.com`（单数主域名），只能推出一个 `admin@域名` 账号，无法枚举多域名。
+
+发现域名/账号后，密码**无法自动获取**——Mailu 数据库里存的是 hash（SHA512-Crypt/bcrypt），不能逆向出明文用于 SMTP 登录。所以 `init` 会列出发现到的账号，**逐个交互询问明文密码**（不回显）。
+
+### 验证配置 & 获取可用账号清单
 
 ```bash
 sudo /opt/telegram-ai-bot/skill/script/mail-manager/send_mail.py check
 ```
 
-`check` 逐项检查：文件存在 → JSON 合法 → 必填字段齐全 → 凭证非空 → **SMTP 实连登录测试**（默认开启）。全部 ✓ 则 exit 0；任一 ✗ 则打印失败项并给 init 引导。
+`check` 有双重用途：
 
-- `check --no-connect`：跳过 SMTP 实连测试，仅做格式检查（适合部署时网络未通或快速校验）。
+- **健康检查**：文件存在 → JSON 合法 → 必填字段齐全 → 凭证非空 → 安全模式合法，逐项打印 ✓/✗。
+- **账号发现**：**逐个域名实测 SMTP 登录**（默认开启，每个域名单独一行结果，带 `[域名]` 标注）。这相当于一份"当前实际可用账号清单"——AI 发信前可先跑 `check`，确认目标域名账号是 ✓ 再发，避免发到一半认证失败。
+
+全部 ✓ 则 exit 0；任一 ✗ 则打印失败项并给 init 引导。
+
+- `check --no-connect`：跳过 SMTP 实连测试，仅做格式检查（适合部署时网络未通或快速校验；此时不输出可用账号清单）。
 
 ### 非交互批量生成（脚本调用）
 
 ```bash
 sudo /opt/telegram-ai-bot/skill/script/mail-manager/send_mail.py init \
-  --domain example.com --username admin@example.com --password "密码" \
+  --domains "example.com,example.net,example.org,example.io" \
+  --username-prefix admin --passwords "pw1,pw2,pw3,pw4" \
   --smtp-host 127.0.0.1 --smtp-port 587 --security starttls --force
 ```
+
+- `--domains`：所有域名，逗号/分号/空格分隔。
+- `--username-prefix`：每个域的账号前缀（默认 `admin`，生成 `admin@example.com` 等）。
+- `--passwords`：各域密码，逗号/分号分隔，数量须与域名一致；**或只传一个密码广播到所有域**。
 
 ### AI 发信排查流程
 
@@ -55,7 +70,7 @@ sudo /opt/telegram-ai-bot/skill/script/mail-manager/send_mail.py init \
      "发信配置不存在，请在服务器运行： sudo .../send_mail.py init"
 3. 用户按提示填完密码后 → 重新发信
 4. 若仍认证失败 → 提示用户运行 sudo .../send_mail.py init --force 改密码，
-   或运行 sudo .../send_mail.py check 排查具体原因
+   或运行 sudo .../send_mail.py check 排查具体原因（逐域名定位哪个账号失效）
 ```
 
 ---
