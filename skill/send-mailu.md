@@ -1,18 +1,18 @@
 ```!
 Mailu邮件服务器管理助手：
 1. 【免密发信】：AI发信时，严禁索要密码！直接调用本地安全脚本发信：
-   `/opt/telegram-ai-bot/skill/script/mail-manager/send_mail.py --to "<收件人>" --from-addr "<发件人>" --subject "<主题>" --body "<正文>"`
+   `/opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py --to "<收件人>" --from-addr "<发件人>" --subject "<主题>" --body "<正文>"`
    该脚本会自动读取本地凭证，支持任意前缀 and 任意自定义子域名，且自动补全 Message-ID、Date 头，智能信封路由防进垃圾箱。
    可选增强参数：--html "<HTML正文>"、--cc/--bcc "<抄送/密送>"、--body-file "<正文文件>"、--attach "<附件路径>"（可重复）。
-   【发信流程】AI 直接发信；若返回 exit code 2（配置缺失/损坏）或认证失败，则提示用户运行 `sudo .../send_mail.py init` 生成配置、填密码，再重试。
-   【配置维护命令】`send_mail.py check` 既是配置健康检查，也是**自动获取当前可用邮箱账号清单**的途径——它逐个域名实测 SMTP 登录，结果清单可直接用于发信决策；`send_mail.py init` 扫描 Mailu 数据库自动发现全部域名/账号，交互生成 /etc/mail-manager/config.json。
+   【发信流程】AI 直接发信；若返回 exit code 2（配置缺失/损坏）或认证失败，则提示用户运行 `sudo .../send-mailu.py check` 检查并交互配置，再重试。
+   【配置维护命令】`send-mailu.py check` 既是配置健康检查，也是**自动获取当前可用邮箱账号清单**的途径——它逐个域名实测 SMTP 登录，结果清单可直接用于发信决策；检查失败时自动提示是否开始交互配置，生成 /etc/send-mailu/config.json。
 2. 【本地读信】：免密检索和解析 Maildir。物理路径规范（账号必须是完整邮箱，如 admin@example.com）：
    - 收件箱: /mailu/mail/<账号>/[new|cur]
    - 其他(垃圾箱/已发送/已删除/草稿): /mailu/mail/<账号>/.[Junk|Sent|Trash|Drafts]/[new|cur]
    直接读取本地 EML 文件，严禁修改或删除。
 ```
 
-# 邮件管理助手 (mail-manager)
+# 邮件发信助手 (send-mailu)
 
 本技能用于在不修改服务器配置、不向用户索要邮箱密码的前提下，提供极速、安全、合规的无痕发信测试与本地收件箱直接读取、检索功能。
 
@@ -20,38 +20,41 @@ Mailu邮件服务器管理助手：
 
 ## 首次部署：生成发信配置
 
-发信脚本依赖 `/etc/mail-manager/config.json`（含 SMTP 登录凭证，支持多域名）。首次部署或配置丢失时用 `init` 命令生成：
+发信脚本依赖 `/etc/send-mailu/config.json`（含 SMTP 登录凭证，支持多域名）。首次部署或配置丢失时用 `check` 命令检查并交互配置：
 
 ```bash
-sudo /opt/telegram-ai-bot/skill/script/mail-manager/send_mail.py init
+sudo /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
 ```
 
-`init` 的账号发现顺序（两级回退）：
+`check` 会先检查配置状态，**若检查失败，自动提示「是否开始配置？」**，用户确认后进入交互配置流程。
+
+配置时的账号发现顺序（两级回退）：
 
 1. **优先扫描 Mailu SQLite 数据库**（`/mailu/data/main.db` 等，只读打开）：直接读到**全部域名**和**全部账号**列表（Mailu `domain` / `user` 表），无需手动罗列。
 2. **数据库不可用时回退读 `mailu.env`**：Mailu 的环境变量配置文件（`/mailu/mailu.env`），里面通常只有 `DOMAIN=example.com`（单数主域名），只能推出一个 `admin@域名` 账号，无法枚举多域名。
 
-发现域名/账号后，密码**无法自动获取**——Mailu 数据库里存的是 hash（SHA512-Crypt/bcrypt），不能逆向出明文用于 SMTP 登录。所以 `init` 会列出发现到的账号，**逐个交互询问明文密码**（不回显）。
+发现域名/账号后，密码**无法自动获取**——Mailu 数据库里存的是 hash（SHA512-Crypt/bcrypt），不能逆向出明文用于 SMTP 登录。所以配置流程会列出发现到的账号，**逐个交互询问明文密码**（不回显）。
 
 ### 验证配置 & 获取可用账号清单
 
 ```bash
-sudo /opt/telegram-ai-bot/skill/script/mail-manager/send_mail.py check
+sudo /opt/telegram-ai-bot/skill/script/send_mail/send_mail.py check
 ```
 
-`check` 有双重用途：
+`check` 有三重用途：
 
 - **健康检查**：文件存在 → JSON 合法 → 必填字段齐全 → 凭证非空 → 安全模式合法，逐项打印 ✓/✗。
 - **账号发现**：**逐个域名实测 SMTP 登录**（默认开启，每个域名单独一行结果，带 `[域名]` 标注）。这相当于一份"当前实际可用账号清单"——AI 发信前可先跑 `check`，确认目标域名账号是 ✓ 再发，避免发到一半认证失败。
+- **自动引导配置**：检查失败时自动提示「是否开始配置？」，确认后进入交互配置流程。
 
-全部 ✓ 则 exit 0；任一 ✗ 则打印失败项并给 init 引导。
+全部 ✓ 则 exit 0；任一 ✗ 则打印失败项并提示配置。
 
 - `check --no-connect`：跳过 SMTP 实连测试，仅做格式检查（适合部署时网络未通或快速校验；此时不输出可用账号清单）。
 
-### 非交互批量生成（脚本调用）
+### 非交互批量配置（脚本调用）
 
 ```bash
-sudo /opt/telegram-ai-bot/skill/script/mail-manager/send_mail.py init \
+sudo /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check \
   --domains "example.com,example.net,example.org,example.io" \
   --username-prefix admin --passwords "pw1,pw2,pw3,pw4" \
   --smtp-host 127.0.0.1 --smtp-port 587 --security starttls --force
@@ -65,12 +68,11 @@ sudo /opt/telegram-ai-bot/skill/script/mail-manager/send_mail.py init \
 
 ```
 当用户要发信时，AI 直接运行发信命令：
-1. 运行 send_mail.py --to ... --body ...
+1. 运行 send-mailu.py --to ... --body ...
 2. 若返回 exit code 2（配置缺失/损坏）→ 提示用户：
-     "发信配置不存在，请在服务器运行： sudo .../send_mail.py init"
-3. 用户按提示填完密码后 → 重新发信
-4. 若仍认证失败 → 提示用户运行 sudo .../send_mail.py init --force 改密码，
-   或运行 sudo .../send_mail.py check 排查具体原因（逐域名定位哪个账号失效）
+     "发信配置不存在，请在服务器运行： sudo .../send-mailu.py check"
+3. 用户运行 check → 自动检查 → 失败时提示配置 → 填完密码 → 重新发信
+4. 若仍认证失败 → 提示用户运行 sudo .../send-mailu.py check --force 重新配置
 ```
 
 ---
@@ -81,7 +83,7 @@ AI 不需要在对话中索要用户的明文密码。直接在服务器上调�
 
 ### 执行命令（最小调用）
 
-/opt/telegram-ai-bot/skill/script/mail-manager/send_mail.py \
+/opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
   --to "<收件人>" \
   --from-addr "<发件人>" \
   --subject "<主题>" \
@@ -107,40 +109,40 @@ AI 不需要在对话中索要用户的明文密码。直接在服务器上调�
 
 **带附件（可重复传多个）：**
 
-/opt/telegram-ai-bot/skill/script/mail-manager/send_mail.py \
+/opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
   --to "user@example.com" --from-addr "admin@example.com" \
   --subject "月度报告" --body "附件请查收" \
   --attach "/tmp/report.pdf" --attach "/tmp/data.xlsx"
 
 **HTML 正文（自动带纯文本降级）：**
 
-/opt/telegram-ai-bot/skill/script/mail-manager/send_mail.py \
+/opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
   --to "user@example.com" --from-addr "admin@example.com" \
   --subject "通知" --body "纯文本降级内容" \
   --html "<h1>通知</h1><p>这是 <b>HTML</b> 正文。</p>"
 
 **抄送 + 密送：**
 
-/opt/telegram-ai-bot/skill/script/mail-manager/send_mail.py \
+/opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
   --to "user@example.com" --from-addr "admin@example.com" \
   --subject "会议纪要" --body "见正文" \
   --cc "a@example.com,b@example.com" --bcc "boss@example.com"
 
 **正文从文件读取（避免大段正文走命令行）：**
 
-/opt/telegram-ai-bot/skill/script/mail-manager/send_mail.py \
+/opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
   --to "user@example.com" --from-addr "admin@example.com" \
   --subject "日志" --body-file "/tmp/long-body.txt"
 
 ### SMTP 安全模式
 
-脚本读取 `/etc/mail-manager/config.json` 中的 `smtp_security` 字段决定连接方式：
+脚本读取 `/etc/send-mailu/config.json` 中的 `smtp_security` 字段决定连接方式：
 - `starttls`（默认）：先明文连接再升级 TLS，适配 587 端口
 - `ssl`：直接 SSL/TLS 连接，适配 465 端口
 - `none`：不加密，适配本地 25 无加密中继
 
 若未配置该字段，脚本按端口智能判定：**465 → ssl，其余 → starttls**。
-配置样例见 `skill/script/mail-manager/config.example.json`。
+配置样例见 `skill/script/send-mailu/config.example.json`。
 
 ---
 
