@@ -1,5 +1,5 @@
 ```!
-stdin 协议完整语法参考。普通文本直接写；明确控制前缀包括 `key:`、`line:`、`paste:`、`wait:`、`raw:`、`hex:`、`base64:`、`bytes:`、`keys:`、`repeat:`。高层语法覆盖常见人类终端操作，精确字节语法可兜底表达理论上任意 stdin 输入。
+stdin 协议完整语法参考。普通文本直接写；明确控制前缀包括 `key:`、`line:`、`paste:`、`wait:`、`raw:`、`hex:`、`base64:`、`bytes:`、`keys:`、`repeat:`。如遇复杂按键或终端问题，请先 read 本文档全文。
 ```
 
 # stdin 语法大全

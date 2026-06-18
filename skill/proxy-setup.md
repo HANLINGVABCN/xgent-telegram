@@ -1,5 +1,5 @@
 ```!
-当用户要在 Linux VPS 部署/重装/卸载代理节点、sing-box、Reality、Hysteria2、TUIC、Shadowsocks、Cloudflare WARP 或 Clash/Mihomo 配置时使用本技能。脚本一定随项目位于 skill/script/proxy-setup/proxy_setup.sh；本地执行：chmod +x skill/script/proxy-setup/proxy_setup.sh && sudo bash skill/script/proxy-setup/proxy_setup.sh。默认推荐路线：主菜单 1 全新安装 -> 机器类型 3 标准 VPS -> 协议 1 VLESS + Reality -> 出站 3 双节点 -> WARP 方式 1 WireGuard 直连。新增自由全协议模式（协议 7）：一次性部署最多7个节点（6种直连协议+1个WARP），逐个询问是否安装，需域名的协议可输入skip跳过，自动递增端口。WireGuard 模式无需 warp-cli；WARP 异常先用主菜单 6 状态检查看 endpoint/wireguard 握手与出站日志。脚本会尝试开放本机防火墙端口，但云厂商安全组必须让用户手动放行。卸载用主菜单 4 深度卸载；不会删除脚本自身或云安全组规则；通用依赖 ca-certificates/wget/tar/curl/openssl/jq/qrencode 强烈不建议删除，默认保留。
+代理节点部署技能：支持 sing-box、Reality、Hysteria2、WARP 等。执行命令：sudo bash skill/script/proxy-setup/proxy_setup.sh。支持自由全协议组合安装。脚本会自动开放本机防火墙，云安全组需用户手动放行。如遇 WARP 异常或高级需求，请先 read 本文档全文。
 ```
 
 # proxy_setup.sh 使用说明

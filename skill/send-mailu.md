@@ -1,15 +1,14 @@
 ```!
-Mailu邮件服务器管理助手：
-1. 【免密发信】：AI发信时，严禁索要密码！直接调用本地安全脚本发信：
-   `/opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py --to "<收件人>" --from-addr "<发件人>" --subject "<主题>" --body "<正文>"`
-   该脚本会自动读取本地凭证，支持任意前缀 and 任意自定义子域名，且自动补全 Message-ID、Date 头，智能信封路由防进垃圾箱。
-   可选增强参数：--html "<HTML正文>"、--cc/--bcc "<抄送/密送>"、--body-file "<正文文件>"、--attach "<附件路径>"（可重复）。
-   【发信流程】AI 直接发信；若返回 exit code 2（配置缺失/损坏）或认证失败，则提示用户运行 `sudo .../send-mailu.py check` 检查并交互配置，再重试。
-   【配置维护命令】`send-mailu.py check` 既是配置健康检查，也是**自动获取当前可用邮箱账号清单**的途径——它逐个域名实测 SMTP 登录，结果清单可直接用于发信决策；检查失败时自动提示是否开始交互配置，生成 /etc/send-mailu/config.json。
-2. 【本地读信】：免密检索和解析 Maildir。物理路径规范（账号必须是完整邮箱，如 admin@example.com）：
-   - 收件箱: /mailu/mail/<账号>/[new|cur]
-   - 其他(垃圾箱/已发送/已删除/草稿): /mailu/mail/<账号>/.[Junk|Sent|Trash|Drafts]/[new|cur]
-   直接读取本地 EML 文件，严禁修改或删除。
+Mailu 发信/读信技能：
+1. 【免密发信】：严禁索要密码！执行命令：`/opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py --to "<收件人>" --from-addr "<发件人>" --subject "<主题>" --body "<正文>"` (增强参数：--html, --cc, --bcc, --attach)。
+   发信脚本支持任意前缀和任意自定义子域名邮箱。
+   发信流程：AI 直接发信；若返回 exit code 2 或认证失败，提示用户运行 `sudo .../send-mailu.py check` 交互配置。
+   重要：`.../send-mailu.py check` 不仅是健康检查，还能自动获取【当前可用邮箱账号清单】供 AI 发信前决策。
+2. 【本地读信】：免密检索本地 EML 文件，严禁修改或删除。
+   物理路径（<账号>需完整邮箱，如 admin@example.com）：
+   - 收件箱: `/mailu/mail/<账号>/[new|cur]`
+   - 其他文件夹: `/mailu/mail/<账号>/.[Junk|Sent|Trash|Drafts]/[new|cur]`
+   如需高级检索 Python 代码，请 read 本文档全文。
 ```
 
 # 邮件发信助手 (send-mailu)

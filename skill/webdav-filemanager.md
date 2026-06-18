@@ -1,5 +1,5 @@
 ```!
-WebDAV 文件管理器：一键部署私有网页网盘和 WebDAV 服务，支持文件/文件夹上传、传输中心（远程下载、上传、下载）、临时下载链接、链接访问统计、链接回收站、文本编辑、右键压缩/解压和网页登录。上传、复制、移动、重命名都不覆盖同名文件或文件夹；当前目标目录已有同名项时必须重命名或取消。脚本目录：skill/script/webdav-filemanager/，核心文件：install.sh、server.py、index.html。安装命令：chmod +x skill/script/webdav-filemanager/install.sh && sudo bash skill/script/webdav-filemanager/install.sh install（root 用户可去掉 sudo）。更新命令：sudo bash skill/script/webdav-filemanager/install.sh update（保留端口、账号、密码、文件根目录、网盘文件、临时链接状态，只替换程序文件）。卸载命令：sudo bash skill/script/webdav-filemanager/install.sh uninstall（删除程序和服务，保留网盘文件）。菜单模式：sudo bash skill/script/webdav-filemanager/install.sh（选项 1=安装/重装，选项 2=更新程序，选项 3=卸载）。默认端口 8989，默认服务名 webdav-filemanager，部署后访问 http://服务器IP:端口/，WebDAV 地址 http://服务器IP:端口/dav/。日常程序升级请用 update 命令，不要用 install 重装（install 会覆盖用户在网页里修改过的账号密码）。
+WebDAV网盘技能：一键部署网页网盘及WebDAV服务。安装: sudo bash skill/script/webdav-filemanager/install.sh install。日常更新: sudo bash skill/script/webdav-filemanager/install.sh update (注意：日常更新严禁用install，否则会覆盖账号)。卸载: 传参数 uninstall。默认端口 8989。同名文件严格不覆盖。详细功能、常见故障排查请先 read 本文档全文。
 ```
 
 # 服务器网盘 + WebDAV + HTTP 测速文件管理器
