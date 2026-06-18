@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Mail Manager 发信工具。
+Send Mailu 发信工具。
 
 子命令：
-  (无) / send   发信（向后兼容老调用 send_mail.py --to ... --body ...）
-  check         检查 /etc/mail-manager/config.json 是否可用（格式 + SMTP 实连测试）
-  init          交互式生成 config.json（从 Mailu .env 探测默认值，仅需填密码）
+  send    发信（默认，可省略子命令直接 send-mailu.py --to ... --body ...）
+  check   检查配置是否可用（格式 + SMTP 实连测试），失败时提示是否开始配置
 """
 import argparse
 import base64
@@ -22,7 +21,7 @@ from email.mime.base import MIMEBase
 from email.utils import formatdate, make_msgid
 
 # 发信配置路径（支持环境变量覆盖，便于测试/迁移）
-CONFIG_PATH = os.environ.get("MAIL_MANAGER_CONFIG", "/etc/mail-manager/config.json")
+CONFIG_PATH = os.environ.get("SEND_MAILU_CONFIG", "/etc/send-mailu/config.json")
 CONFIG_DIR = os.path.dirname(CONFIG_PATH)
 
 # Mailu .env 探测路径（按优先级）
@@ -143,10 +142,8 @@ def load_config(path=CONFIG_PATH):
 
 
 def print_init_hint(stream=sys.stderr):
-    """打印 init 引导提示。AI/用户据此知道如何修复 config。"""
-    print("  → 请运行生成命令（自动探测 Mailu 配置，仅需填密码）：", file=stream)
-    print(f"    sudo {sys.argv[0]} init", file=stream)
-    print("  → 生成后可用 check 命令验证：", file=stream)
+    """打印配置引导提示。"""
+    print("  → 请运行检查命令（失败后可交互配置）：", file=stream)
     print(f"    sudo {sys.argv[0]} check", file=stream)
 
 
@@ -346,23 +343,19 @@ def cmd_send(args):
 
 
 # ============================================================
-# check 子命令（检查 config 可用性）
+# check 子命令（检查 config 可用性 + 失败时引导配置）
 # ============================================================
 
-def cmd_check(args):
-    """
-    检查 config.json：格式 + 字段 +（可选）SMTP 实连测试。
-    每项打印 ✓/✗，全部通过 exit 0，否则 exit 非0 并给 init 引导。
-    """
-    do_connect = not args.no_connect
-    results = []  # [(ok:bool, msg:str), ...]
+def _run_check(do_connect):
+    """执行所有检查项，打印结果，返回 all_ok:bool。"""
+    results = []
 
     # 1) 文件存在 + JSON 合法
     config, err = load_config()
     if err:
         results.append((False, f"读取配置: {err}"))
         _emit_check_results(results, do_connect)
-        sys.exit(EXIT_CONFIG_MISSING if "不存在" in err else EXIT_ERROR)
+        return False
     results.append((True, f"读取配置: {CONFIG_PATH}"))
 
     # 2) 必填字段
@@ -418,13 +411,42 @@ def cmd_check(args):
                 results.append((False, f"SMTP 实连测试 [{dom}]: 连接失败 ({uname}) — {e}"))
 
     _emit_check_results(results, do_connect)
-    all_ok = all(ok for ok, _ in results)
-    if not all_ok:
-        sys.exit(EXIT_ERROR)
+    return all(ok for ok, _ in results)
+
+
+def cmd_check(args):
+    """
+    检查 config.json：格式 + 字段 +（可选）SMTP 实连测试。
+    失败时提示用户是否开始交互配置。
+    """
+    do_connect = not args.no_connect
+    all_ok = _run_check(do_connect)
+
+    if all_ok:
+        return
+
+    # 检查失败：提示是否开始配置
+    if sys.stdin.isatty():
+        try:
+            answer = input("\n检查未通过，是否开始配置？(y/n): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(EXIT_ERROR)
+        if answer in ('y', 'yes'):
+            args.force = True  # 用户确认重新配置，允许覆盖
+            cmd_init(args)
+            # 配置完成后重新检查
+            print("\n--- 重新检查配置 ---")
+            recheck_ok = _run_check(do_connect)
+            if not recheck_ok:
+                sys.exit(EXIT_ERROR)
+            return
+
+    sys.exit(EXIT_ERROR)
 
 
 def _emit_check_results(results, do_connect):
-    """格式化打印 check 结果 + 失败时附 init 引导。"""
+    """格式化打印 check 结果。"""
     print(f"检查配置: {CONFIG_PATH}")
     for ok, msg in results:
         mark = "✓" if ok else "✗"
@@ -436,11 +458,10 @@ def _emit_check_results(results, do_connect):
         print("✗ config 不可用")
         if not do_connect:
             print("  （已跳过 SMTP 实连测试，加 --connect 或省略 --no-connect 可深度验证）", file=sys.stderr)
-        print_init_hint()
 
 
 # ============================================================
-# init 子命令（生成 config.json）
+# 配置生成逻辑（由 check 失败时触发）
 # ============================================================
 
 def _find_mailu_env():
@@ -727,14 +748,7 @@ def cmd_init(args):
     print(f"\n✓ 已生成配置: {CONFIG_PATH}")
     print(f"  共 {len(domain_list)} 个域名: {', '.join(domain_list)}")
 
-    # 写完自动做格式检查（不实连，避免部署时网络未通）
-    print("\n--- 验证配置 ---")
-    class _CheckArgs:
-        no_connect = True
-    try:
-        cmd_check(_CheckArgs())
-    except SystemExit:
-        pass
+
 
 
 def _write_config(config, force):
@@ -798,7 +812,7 @@ def _add_send_args(p):
 def build_parser():
     """构建 argparse。关键：子命令可选，无子命令时默认 send。"""
     parser = argparse.ArgumentParser(
-        description="Mail Manager 发信工具（发信 / 检查配置 / 生成配置）",
+        description="Send Mailu 发信工具（发信 / 检查配置）",
     )
     sub = parser.add_subparsers(dest="command")
 
@@ -806,26 +820,24 @@ def build_parser():
     p_send = sub.add_parser("send", help="发信（默认，可省略子命令）")
     _add_send_args(p_send)
 
-    # check 子命令
-    p_check = sub.add_parser("check", help="检查 config.json 是否可用")
+    # check 子命令（含配置生成功能，失败时可交互配置）
+    p_check = sub.add_parser("check", help="检查配置是否可用，失败时可交互配置")
     p_check.add_argument("--no-connect", action="store_true", help="跳过 SMTP 实连测试，仅做格式检查")
-
-    # init 子命令
-    p_init = sub.add_parser("init", help="交互式生成 config.json（支持多域名，自动扫描 Mailu 数据库）")
-    p_init.add_argument("--domains", help="所有域名，逗号/分号/空格分隔（批量模式必填）")
-    p_init.add_argument("--username-prefix", help="每域账号前缀（默认 admin，批量模式可用）")
-    p_init.add_argument("--passwords", help="各域密码，逗号/分号分隔；或单个密码广播到所有域（批量模式必填）")
-    p_init.add_argument("--smtp-host", help="SMTP 服务器地址")
-    p_init.add_argument("--smtp-port", help="SMTP 端口")
-    p_init.add_argument("--security", choices=["starttls", "ssl", "none"], help="安全模式")
-    p_init.add_argument("--force", action="store_true", help="覆盖已存在的配置")
+    # 以下参数用于批量配置模式（合并原 init 功能）
+    p_check.add_argument("--domains", help="所有域名，逗号/分号/空格分隔（批量配置模式）")
+    p_check.add_argument("--username-prefix", help="每域账号前缀（默认 admin，批量配置模式可用）")
+    p_check.add_argument("--passwords", help="各域密码，逗号/分号分隔；或单个密码广播到所有域（批量配置模式）")
+    p_check.add_argument("--smtp-host", help="SMTP 服务器地址")
+    p_check.add_argument("--smtp-port", help="SMTP 端口")
+    p_check.add_argument("--security", choices=["starttls", "ssl", "none"], help="安全模式")
+    p_check.add_argument("--force", action="store_true", help="覆盖已存在的配置")
 
     return parser
 
 
 def main():
     # 关键：无子命令时，把整个 argv 当作发信参数解析（向后兼容）
-    if len(sys.argv) >= 2 and sys.argv[1] in ("send", "check", "init", "-h", "--help"):
+    if len(sys.argv) >= 2 and sys.argv[1] in ("send", "check", "-h", "--help"):
         parser = build_parser()
         args = parser.parse_args()
         command = args.command or "send"
@@ -840,8 +852,6 @@ def main():
         cmd_send(args)
     elif command == "check":
         cmd_check(args)
-    elif command == "init":
-        cmd_init(args)
     else:
         parser.print_help()
         sys.exit(EXIT_ERROR)
