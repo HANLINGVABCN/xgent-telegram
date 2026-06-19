@@ -220,8 +220,9 @@ def archive_to_sent(imap_settings, raw_message):
     username = imap_settings["username"]
     password = imap_settings["password"]
 
-    # IMAP 的 INTERNALDATE 格式: 19-Jun-2026 12:34:56 +0000
-    internaldate = datetime.now(timezone.utc).strftime("%d-%b-%Y %H:%M:%S +0000")
+    # imaplib.append 的 date_time 只接受 datetime/struct_time，不接受字符串
+    # （内部 Time2Internaldate 会自动转成带引号的 "20-Jun-2026 12:34:56 +0000"）。
+    internaldate = datetime.now(timezone.utc)
 
     imap = None
     try:
@@ -233,10 +234,8 @@ def archive_to_sent(imap_settings, raw_message):
                 imap.starttls()
         imap.login(username, password)
 
-        # 用括号包裹文件夹名，兼容含空格/特殊字符的邮箱名
-        target = f'"{folder}"' if not folder.startswith('"') else folder
-        # APPEND 不存在会返回 NO，仅告警不致命
-        typ, data = imap.append(target, r'(\Seen)', internaldate, raw_message.encode("utf-8"))
+        # mailbox 不用手动加引号，imaplib 会自动转义；手加会变成 ""Sent"" 双重转义
+        typ, data = imap.append(folder, r'(\Seen)', internaldate, raw_message.encode("utf-8"))
         if typ != "OK":
             print(f"Warning: IMAP 归档到 {folder} 未成功 (server reply: {typ} {data})", file=sys.stderr)
     except Exception as e:
