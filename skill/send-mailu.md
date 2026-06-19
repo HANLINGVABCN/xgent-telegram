@@ -148,10 +148,20 @@ python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
 
 SMTP 只负责"把邮件投递出去"，本身不会在发件箱留下副本——所以脚本发的信默认在 Mailu 网页端"已发送"里看不到。config 里的 `sent_archive` 段开启后，脚本发信成功后会**用同一套登录凭证再连一次 IMAP**，把同一封邮件 `APPEND` 到指定文件夹，网页端即可见。
 
+### 自动探测可用 IMAP 端口
+
+`check`（含自动配置）在生成 config 时会**自动探测** IMAP 可用端口：依次试 `smtp_host:993(ssl)` → `smtp_host:143(starttls)` → `127.0.0.1:993` → `127.0.0.1:143`，第一个能连上的就写进 `sent_archive`。
+
+这能解决两类常见坑：
+- **VPS 防火墙拦 143 放行 993**（很多服务商默认防 IMAP 明文爆破）→ 自动选 993/ssl
+- **Docker 端口只绑公网 IP 不绑 127.0.0.1** → 自动回退到能连的那个 host
+
+如果四个候选全连不上，仍会生成 `enabled:true`（保留 folder），发信不受影响，归档留待手动填。
+
 ```json
 "sent_archive": {
   "enabled": true,
-  "host": "127.0.0.1",
+  "host": "1.2.3.4",
   "port": 993,
   "security": "ssl",
   "folder": "Sent"
@@ -161,19 +171,29 @@ SMTP 只负责"把邮件投递出去"，本身不会在发件箱留下副本—�
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `enabled` | 是 | `true` 开启归档。缺省/非 dict/`false` 都视为关闭（向后兼容旧 config） |
-| `host` | 否 | IMAP 主机。省略时自动沿用 `smtp_host` |
+| `host` | 否 | IMAP 主机。省略时自动沿用 `smtp_host`。`check` 配置时已自动探测填好 |
 | `port` | 否 | IMAP 端口。省略时按 `security` 推断：ssl→993，其余→143 |
 | `security` | 否 | `ssl`/`starttls`/`none`。省略时沿用 `smtp_security` |
 | `folder` | 否 | 归档目标文件夹名，默认 `Sent`。不同 Webmail 命名可能是 `Sent Messages` / `已发送`，以 `check` 探针列出的文件夹清单为准 |
 
 归档是**尽力而为**：未配置、连接失败、文件夹不存在等情况都只在 stderr 打印 `Warning: ...`，**不影响发信本身的成功结果**。归档用的账号/密码就是 SMTP 登录成功的那套凭证（即 `domains.匹配域名.username/password`），因此**只有"真实登录发信"的那个账号**的"已发送"里会出现副本，`--from-addr` 用到的别名账号不会单独归档。
 
-`check` 末尾会打印一段 IMAP 归档探针（不计入可用性判定），告诉你归档能否真正跑通、目标文件夹是否存在：
+`check` 末尾会打印一段 IMAP 归档探针（不计入可用性判定），告诉你归档能否真正跑通、目标文件夹是否存在。**失败时会自动探测可用端口并给出可直接照抄的 `sent_archive` 配置建议**：
 
 ```
   --- 已发送归档（IMAP）探针（不计入可用性判定）---
-  [✓] 已发送归档: IMAP 登录成功，文件夹「Sent」存在 (admin@example.com@127.0.0.1:993/ssl)
+  [✓] 已发送归档: IMAP 登录成功，文件夹「Sent」存在 (admin@example.com@1.2.3.4:993/ssl)
 ```
+
+失败示例（自动给出修复建议）：
+
+```
+  [✗] 已发送归档: IMAP 连接/登录失败 (admin@example.com@1.2.3.4:143/starttls) — [Errno 111] Connection refused
+      💡 探测到可用 IMAP: ssl @ 1.2.3.4:993
+         建议把 sent_archive 改为: host='1.2.3.4', port=993, security='ssl'
+```
+
+> 旧 config 升级：直接重跑 `sudo python3 .../send-mailu.py check`（检查失败时确认配置 → 自动重填含探测结果的 sent_archive），或手动按上面字段补 `host`/`port`/`security`。
 
 ---
 
