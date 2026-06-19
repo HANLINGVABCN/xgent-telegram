@@ -14,7 +14,9 @@ import mimetypes
 import os
 import sqlite3
 import sys
+import imaplib
 import smtplib
+from datetime import datetime, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -135,6 +137,116 @@ def close_smtp(server):
             server.close()
         except Exception:
             pass
+
+
+# IMAP 归档默认值（可被 config 的 sent_archive 覆盖）
+_DEFAULT_SENT_FOLDER = "Sent"
+_DEFAULT_IMAP_PORT = {
+    "ssl": 993,
+    "starttls": 143,
+    "none": 143,
+}
+
+
+def resolve_imap_settings(config, matched_domain, username, password, smtp_security):
+    """
+    解析发信后 IMAP 归档所需的连接参数。
+
+    config['sent_archive'] 为可选对象：
+      enabled (bool, 默认 False)
+      host / port / security / folder
+    未显式 enable 时不归档（向后兼容现有 config）。
+
+    host 默认沿用 SMTP host；port 默认按 security 推断（ssl→993，其余→143）；
+    security 默认沿用 SMTP 的 security；folder 默认 'Sent'。
+    缺关键凭证（password）时返回 None 表示不归档。
+    """
+    arch_cfg = config.get("sent_archive")
+    # sent_archive 不是 dict 时一律视为关闭
+    if not isinstance(arch_cfg, dict):
+        return None
+
+    enabled = bool(arch_cfg.get("enabled", False))
+    # 允许 false / 'false' / '0' 等字符串
+    enabled_str = str(arch_cfg.get("enabled", "")).strip().lower()
+    if enabled_str in ("0", "false", "no", "off"):
+        enabled = False
+    elif enabled_str in ("1", "true", "yes", "on"):
+        enabled = True
+    if not enabled:
+        return None
+
+    host = str(arch_cfg.get("host") or config.get("smtp_host") or "127.0.0.1").strip()
+    security = str(arch_cfg.get("security") or smtp_security or "starttls").strip().lower()
+    if security not in ("ssl", "starttls", "none"):
+        security = "starttls"
+    # 端口：显式 > security 默认
+    if arch_cfg.get("port"):
+        try:
+            port = int(arch_cfg.get("port"))
+        except (TypeError, ValueError):
+            port = _DEFAULT_IMAP_PORT.get(security, 143)
+    else:
+        port = _DEFAULT_IMAP_PORT.get(security, 143)
+    folder = str(arch_cfg.get("folder") or _DEFAULT_SENT_FOLDER).strip() or _DEFAULT_SENT_FOLDER
+
+    # 归档用的是"已登录成功"的 username/password（即 matched_domain 的凭证）
+    if not username or not password:
+        return None
+
+    return {
+        "host": host,
+        "port": port,
+        "security": security,
+        "folder": folder,
+        "username": username,
+        "password": password,
+    }
+
+
+def archive_to_sent(imap_settings, raw_message):
+    """
+    通过 IMAP APPEND 把整封邮件归档到「已发送」文件夹。
+
+    raw_message: 已构造好的邮件字符串（含头）。用 IMAP INTERNALDATE 标为"现在"。
+    任何失败都吞掉（仅记到 stderr 告警），不影响发信本身的成功判定。
+    """
+    if not imap_settings:
+        return
+    host = imap_settings["host"]
+    port = imap_settings["port"]
+    security = imap_settings["security"]
+    folder = imap_settings["folder"]
+    username = imap_settings["username"]
+    password = imap_settings["password"]
+
+    # IMAP 的 INTERNALDATE 格式: 19-Jun-2026 12:34:56 +0000
+    internaldate = datetime.now(timezone.utc).strftime("%d-%b-%Y %H:%M:%S +0000")
+
+    imap = None
+    try:
+        if security == "ssl":
+            imap = imaplib.IMAP4_SSL(host, port, timeout=10)
+        else:
+            imap = imaplib.IMAP4(host, port, timeout=10)
+            if security == "starttls":
+                imap.starttls()
+        imap.login(username, password)
+
+        # 用括号包裹文件夹名，兼容含空格/特殊字符的邮箱名
+        target = f'"{folder}"' if not folder.startswith('"') else folder
+        # APPEND 不存在会返回 NO，仅告警不致命
+        typ, data = imap.append(target, r'(\Seen)', internaldate, raw_message.encode("utf-8"))
+        if typ != "OK":
+            print(f"Warning: IMAP 归档到 {folder} 未成功 (server reply: {typ} {data})", file=sys.stderr)
+    except Exception as e:
+        print(f"Warning: IMAP 归档失败（不影响发信结果）: {e}", file=sys.stderr)
+    finally:
+        if imap is not None:
+            try:
+                imap.logout()
+            except Exception:
+                pass
 
 
 def load_config(path=CONFIG_PATH):
@@ -299,6 +411,7 @@ def cmd_send(args):
     authenticated = False
     matched_domain = None
     username = None
+    matched_password = None  # 记录登录成功的明文密码，供 IMAP 归档复用
 
     # 终极回溯与降级尝试算法
     for domain in candidates:
@@ -321,6 +434,7 @@ def cmd_send(args):
             authenticated = True
             matched_domain = domain
             username = cur_username
+            matched_password = cur_password
             break
         except (smtplib.SMTPAuthenticationError, smtplib.SMTPConnectError):
             # 如果是认证失败，自动尝试下一个候选域名（降级回溯）
@@ -348,16 +462,24 @@ def cmd_send(args):
 
     # 构造邮件（Message-ID 域名兜底用 matched_domain 或 default_dom）
     msg = build_message(args, plain_body, matched_domain or default_dom)
+    # 一次序列化，SMTP 投递与 IMAP 归档复用同一份内容（保证两者一致）
+    raw_message = msg.as_string()
 
     # 发送邮件（finally 确保连接关闭，修复历史 socket 泄漏）
     try:
-        server.sendmail(envelope_from, all_recipients, msg.as_string())
+        server.sendmail(envelope_from, all_recipients, raw_message)
         print("SUCCESS: Email sent successfully!")
     except Exception as e:
         print(f"FAILED: {e}", file=sys.stderr)
         sys.exit(EXIT_ERROR)
     finally:
         close_smtp(server)
+
+    # 发信成功后，把同一份邮件归档到「已发送」文件夹（IMAP APPEND）。
+    # 归档是尽力而为：未配置/未开启/归档失败都不影响发信结果。
+    imap_settings = resolve_imap_settings(config, matched_domain, username, matched_password, security)
+    if imap_settings:
+        archive_to_sent(imap_settings, raw_message)
 
 
 # ============================================================
@@ -429,6 +551,62 @@ def _run_check(do_connect):
                 results.append((False, f"SMTP 实连测试 [{dom}]: 连接失败 ({uname}) — {e}"))
 
     _emit_check_results(results, do_connect)
+
+    # 6) IMAP 归档探针（建议性，不计入可用性判定，仅提示是否能归档到「已发送」）
+    #    用 default_domain 的凭证做代表探测；其他域名假设配置一致。
+    if do_connect and field_ok and cred_ok and security:
+        imap_info = []
+        default_dom_probe = config.get("default_domain", "")
+        cred = domains_cfg.get(default_dom_probe, {})
+        uname = cred.get("username")
+        upass = cred.get("password")
+        imap_settings = resolve_imap_settings(config, default_dom_probe, uname, upass, security)
+        if not imap_settings:
+            imap_info.append((None, "已发送归档: 未配置或未开启 (sent_archive.enabled=false/缺省)，发信不会归档"))
+        else:
+            host = imap_settings["host"]
+            port = imap_settings["port"]
+            sec = imap_settings["security"]
+            folder = imap_settings["folder"]
+            imap = None
+            try:
+                if sec == "ssl":
+                    imap = imaplib.IMAP4_SSL(host, port, timeout=10)
+                else:
+                    imap = imaplib.IMAP4(host, port, timeout=10)
+                    if sec == "starttls":
+                        imap.starttls()
+                imap.login(uname, upass)
+                # LIST 全部文件夹，模糊匹配目标文件夹名（兼容 Sent / Sent Messages / 已发送 等命名）
+                typ, data = imap.list()
+                folders = []
+                if typ == "OK":
+                    for item in data:
+                        try:
+                            folders.append(item.decode("utf-8", "ignore"))
+                        except Exception:
+                            folders.append(str(item))
+                folder_match = any(folder.lower() in f.lower() for f in folders)
+                if folder_match:
+                    imap_info.append((True, f"已发送归档: IMAP 登录成功，文件夹「{folder}」存在 ({uname}@{host}:{port}/{sec})"))
+                else:
+                    sample = ", ".join(folders[:8]) if folders else "(空)"
+                    imap_info.append((False, f'已发送归档: IMAP 登录成功，但文件夹「{folder}」未找到。请改 sent_archive.folder。现有: {sample}'))
+            except Exception as e:
+                imap_info.append((False, f"已发送归档: IMAP 连接/登录失败 ({uname}@{host}:{port}/{sec}) — {e}"))
+            finally:
+                if imap is not None:
+                    try:
+                        imap.logout()
+                    except Exception:
+                        pass
+
+        # 单独打印（不进 results，不影响可用性判定）
+        print("  --- 已发送归档（IMAP）探针（不计入可用性判定）---")
+        for ok, msg in imap_info:
+            mark = "·" if ok is None else ("✓" if ok else "✗")
+            print(f"  [{mark}] {msg}")
+
     return all(ok for ok, _ in results)
 
 
@@ -769,11 +947,19 @@ def cmd_init(args):
         "smtp_security": security,
         "default_domain": domain_list[0],
         "domains": domains_cfg,
+        # 发信成功后，把同一封邮件 IMAP APPEND 到「已发送」文件夹。
+        # 默认开启；关闭把 enabled 改成 false 即可（向后兼容：未配置则不归档）。
+        "sent_archive": {
+            "enabled": True,
+            # host 省略时自动沿用 smtp_host；port/security 省略时按 security 推断
+            "folder": _DEFAULT_SENT_FOLDER,
+        },
     }
 
     _write_config(config, args.force)
     print(f"\n✓ 已生成配置: {CONFIG_PATH}")
     print(f"  共 {len(domain_list)} 个域名: {', '.join(domain_list)}")
+    print(f"  已发送归档: 开启（IMAP APPEND 到「{config['sent_archive']['folder']}」文件夹）")
 
 
 
