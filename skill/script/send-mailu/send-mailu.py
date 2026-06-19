@@ -18,7 +18,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
-from email.utils import formatdate, make_msgid
+from email.utils import formatdate, make_msgid, parseaddr
 
 # 发信配置路径（支持环境变量覆盖，便于测试/迁移）
 CONFIG_PATH = os.environ.get("SEND_MAILU_CONFIG", "/etc/send-mailu/config.json")
@@ -51,12 +51,27 @@ EXIT_CONFIG_MISSING = 2 # config 缺失/损坏，需运行 init
 # 公共工具函数（send / check / init 复用）
 # ============================================================
 
+def extract_email(from_addr):
+    """
+    从 --from-addr 提取纯邮箱地址。
+    支持纯邮箱（'a@b.com'）和带显示名格式（'"名称 <a@b.com>"' / '名称 <a@b.com>'），
+    统一返回尖括号内或解析后的邮箱本体，便于域名匹配与信封路由。
+    失败时原样返回，交由后续校验处理。
+    """
+    if not from_addr:
+        return from_addr
+    _, addr = parseaddr(from_addr)
+    return addr if addr else from_addr
+
+
 def get_domain_candidates(from_addr, config):
     """
     根据发件人地址，生成所有可能的登录域名候选列表（从具体到宽泛）。
+    兼容带显示名的格式：先用 extract_email 提取纯邮箱再拆域名。
     """
     candidates = []
     default_dom = config.get("default_domain", "example.com")  # 彻底使用通用占位符作为代码默认值
+    from_addr = extract_email(from_addr)
 
     if "@" not in from_addr:
         return [default_dom]
@@ -324,8 +339,11 @@ def cmd_send(args):
         sys.exit(EXIT_ERROR)
 
     # 智能信封路由判定：
-    envelope_from = args.from_addr
-    if args.from_addr.lower().endswith("@" + matched_domain) and args.from_addr.lower() != username.lower():
+    # 智能信封路由判定：基于纯邮箱判断后缀，避免带显示名时末尾为 `>` 导致 endswith 失效。
+    # 信封发件人（envelope_from）用纯邮箱走 SMTP 防拒绝；Header From 仍保留原始 args.from_addr（含显示名）。
+    pure_from = extract_email(args.from_addr)
+    envelope_from = pure_from
+    if pure_from.lower().endswith("@" + matched_domain) and pure_from.lower() != username.lower():
         envelope_from = username
 
     # 构造邮件（Message-ID 域名兜底用 matched_domain 或 default_dom）
