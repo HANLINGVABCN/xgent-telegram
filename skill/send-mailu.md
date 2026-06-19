@@ -1,9 +1,10 @@
 ```!
 Mailu 发信/读信技能：
-1. 【免密发信】：严禁索要密码！执行命令：`/opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py --to "<收件人>" --from-addr "<发件人>" --subject "<主题>" --body "<正文>"` (增强参数：--body-file, --html, --cc, --bcc, --attach)。
+1. 【免密发信】：严禁索要密码！执行命令：`python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py --to "<收件人>" --from-addr "<发件人>" --subject "<主题>" --body "<正文>"` (增强参数：--body-file, --html, --cc, --bcc, --attach)。
    发信脚本支持任意前缀和任意自定义子域名邮箱。
-   发信流程：AI 直接发信；若返回 exit code 2（配置缺失/损坏）或认证全部失败（exit 1），提示用户运行 `sudo .../send-mailu.py check`。
+   发信流程：AI 直接发信；若返回 exit code 2（配置缺失/损坏）或认证全部失败（exit 1），提示用户运行 `sudo python3 .../send-mailu.py check`。
    check 是配置入口：逐项检查 config.json（含逐域名 SMTP 实连 ✓/✗）；全部通过则输出实测可用账号清单（exit 0），任一失败且在交互终端时自动提示「是否开始配置？」，确认后进入配置流程——此时扫 Mailu SQLite 发现全部域名/账号并逐个问密码，配置完自动复查。
+   归档（可选）：config 的 sent_archive.enabled=true 时，每封信发信成功后自动 IMAP APPEND 一份到「已发送」文件夹（复用同一账号登录 IMAP），失败仅告警不影响发信。check 末尾会打印 IMAP 归档探针结果（不计入可用性判定）。
 2. 【本地读信】：免密检索本地 EML 文件，严禁修改或删除。
    物理路径（<账号>需完整邮箱，如 admin@example.com）：
    - 收件箱: `/mailu/mail/<账号>/[new|cur]`
@@ -22,7 +23,7 @@ Mailu 发信/读信技能：
 发信脚本依赖 `/etc/send-mailu/config.json`（含 SMTP 登录凭证，支持多域名）。首次部署或配置丢失时用 `check` 命令检查并交互配置：
 
 ```bash
-sudo /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
+sudo python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
 ```
 
 `check` 会先检查配置状态，**若检查失败，自动提示「是否开始配置？」**，用户确认后进入交互配置流程。
@@ -37,7 +38,7 @@ sudo /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
 ### 验证配置 & 获取可用账号清单
 
 ```bash
-sudo /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
+sudo python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
 ```
 
 `check` 有三重用途：
@@ -53,7 +54,7 @@ sudo /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
 ### 非交互批量配置（脚本调用）
 
 ```bash
-sudo /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check \
+sudo python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check \
   --domains "example.com,example.net,example.org,example.io" \
   --username-prefix admin --passwords "pw1,pw2,pw3,pw4" \
   --smtp-host 127.0.0.1 --smtp-port 587 --security starttls --force
@@ -67,11 +68,11 @@ sudo /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check \
 
 ```
 当用户要发信时，AI 直接运行发信命令：
-1. 运行 send-mailu.py --to ... --body ...
+1. 运行 python3 send-mailu.py --to ... --body ...
 2. 若返回 exit code 2（配置缺失/损坏）→ 提示用户：
-     "发信配置不存在，请在服务器运行： sudo .../send-mailu.py check"
+     "发信配置不存在，请在服务器运行： sudo python3 .../send-mailu.py check"
 3. 用户运行 check → 自动检查 → 失败时提示配置 → 填完密码 → 重新发信
-4. 若仍认证失败 → 提示用户运行 sudo .../send-mailu.py check --force 重新配置
+4. 若仍认证失败 → 提示用户运行 sudo python3 .../send-mailu.py check --force 重新配置
 ```
 
 ---
@@ -82,7 +83,7 @@ AI 不需要在对话中索要用户的明文密码。直接在服务器上调�
 
 ### 执行命令（最小调用）
 
-/opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
+python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
   --to "<收件人>" \
   --from-addr "<发件人>" \
   --subject "<主题>" \
@@ -108,28 +109,28 @@ AI 不需要在对话中索要用户的明文密码。直接在服务器上调�
 
 **带附件（可重复传多个）：**
 
-/opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
+python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
   --to "user@example.com" --from-addr "admin@example.com" \
   --subject "月度报告" --body "附件请查收" \
   --attach "/tmp/report.pdf" --attach "/tmp/data.xlsx"
 
 **HTML 正文（自动带纯文本降级）：**
 
-/opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
+python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
   --to "user@example.com" --from-addr "admin@example.com" \
   --subject "通知" --body "纯文本降级内容" \
   --html "<h1>通知</h1><p>这是 <b>HTML</b> 正文。</p>"
 
 **抄送 + 密送：**
 
-/opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
+python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
   --to "user@example.com" --from-addr "admin@example.com" \
   --subject "会议纪要" --body "见正文" \
   --cc "a@example.com,b@example.com" --bcc "boss@example.com"
 
 **正文从文件读取（避免大段正文走命令行）：**
 
-/opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
+python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
   --to "user@example.com" --from-addr "admin@example.com" \
   --subject "日志" --body-file "/tmp/long-body.txt"
 
@@ -142,6 +143,37 @@ AI 不需要在对话中索要用户的明文密码。直接在服务器上调�
 
 若未配置该字段，脚本按端口智能判定：**465 → ssl，其余 → starttls**。
 配置样例见 `skill/script/send-mailu/config.example.json`。
+
+### 已发送归档（IMAP APPEND）
+
+SMTP 只负责"把邮件投递出去"，本身不会在发件箱留下副本——所以脚本发的信默认在 Mailu 网页端"已发送"里看不到。config 里的 `sent_archive` 段开启后，脚本发信成功后会**用同一套登录凭证再连一次 IMAP**，把同一封邮件 `APPEND` 到指定文件夹，网页端即可见。
+
+```json
+"sent_archive": {
+  "enabled": true,
+  "host": "127.0.0.1",
+  "port": 993,
+  "security": "ssl",
+  "folder": "Sent"
+}
+```
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `enabled` | 是 | `true` 开启归档。缺省/非 dict/`false` 都视为关闭（向后兼容旧 config） |
+| `host` | 否 | IMAP 主机。省略时自动沿用 `smtp_host` |
+| `port` | 否 | IMAP 端口。省略时按 `security` 推断：ssl→993，其余→143 |
+| `security` | 否 | `ssl`/`starttls`/`none`。省略时沿用 `smtp_security` |
+| `folder` | 否 | 归档目标文件夹名，默认 `Sent`。不同 Webmail 命名可能是 `Sent Messages` / `已发送`，以 `check` 探针列出的文件夹清单为准 |
+
+归档是**尽力而为**：未配置、连接失败、文件夹不存在等情况都只在 stderr 打印 `Warning: ...`，**不影响发信本身的成功结果**。归档用的账号/密码就是 SMTP 登录成功的那套凭证（即 `domains.匹配域名.username/password`），因此**只有"真实登录发信"的那个账号**的"已发送"里会出现副本，`--from-addr` 用到的别名账号不会单独归档。
+
+`check` 末尾会打印一段 IMAP 归档探针（不计入可用性判定），告诉你归档能否真正跑通、目标文件夹是否存在：
+
+```
+  --- 已发送归档（IMAP）探针（不计入可用性判定）---
+  [✓] 已发送归档: IMAP 登录成功，文件夹「Sent」存在 (admin@example.com@127.0.0.1:993/ssl)
+```
 
 ---
 
