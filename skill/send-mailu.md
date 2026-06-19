@@ -1,9 +1,9 @@
 ```!
 Mailu 发信/读信技能：
-1. 【免密发信】：严禁索要密码！执行命令：`/opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py --to "<收件人>" --from-addr "<发件人>" --subject "<主题>" --body "<正文>"` (增强参数：--html, --cc, --bcc, --attach)。
+1. 【免密发信】：严禁索要密码！执行命令：`/opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py --to "<收件人>" --from-addr "<发件人>" --subject "<主题>" --body "<正文>"` (增强参数：--body-file, --html, --cc, --bcc, --attach)。
    发信脚本支持任意前缀和任意自定义子域名邮箱。
-   发信流程：AI 直接发信；若返回 exit code 2 或认证失败，提示用户运行 `sudo .../send-mailu.py check` 交互配置。
-   重要：`.../send-mailu.py check` 不仅是健康检查，还能自动获取【当前可用邮箱账号清单】供 AI 发信前决策。
+   发信流程：AI 直接发信；若返回 exit code 2（配置缺失/损坏）或认证全部失败（exit 1），提示用户运行 `sudo .../send-mailu.py check`。
+   check 是配置入口：逐项检查 config.json（含逐域名 SMTP 实连 ✓/✗）；全部通过则输出实测可用账号清单（exit 0），任一失败且在交互终端时自动提示「是否开始配置？」，确认后进入配置流程——此时扫 Mailu SQLite 发现全部域名/账号并逐个问密码，配置完自动复查。
 2. 【本地读信】：免密检索本地 EML 文件，严禁修改或删除。
    物理路径（<账号>需完整邮箱，如 admin@example.com）：
    - 收件箱: `/mailu/mail/<账号>/[new|cur]`
@@ -37,7 +37,7 @@ sudo /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
 ### 验证配置 & 获取可用账号清单
 
 ```bash
-sudo /opt/telegram-ai-bot/skill/script/send_mail/send_mail.py check
+sudo /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
 ```
 
 `check` 有三重用途：
