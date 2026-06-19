@@ -555,62 +555,7 @@ def _run_check(do_connect):
     # 6) IMAP 归档探针（建议性，不计入可用性判定，仅提示是否能归档到「已发送」）
     #    用 default_domain 的凭证做代表探测；其他域名假设配置一致。
     if do_connect and field_ok and cred_ok and security:
-        imap_info = []
-        default_dom_probe = config.get("default_domain", "")
-        cred = domains_cfg.get(default_dom_probe, {})
-        uname = cred.get("username")
-        upass = cred.get("password")
-        imap_settings = resolve_imap_settings(config, default_dom_probe, uname, upass, security)
-        if not imap_settings:
-            imap_info.append((None, "已发送归档: 未配置或未开启 (sent_archive.enabled=false/缺省)，发信不会归档"))
-        else:
-            host = imap_settings["host"]
-            port = imap_settings["port"]
-            sec = imap_settings["security"]
-            folder = imap_settings["folder"]
-            imap = None
-            try:
-                if sec == "ssl":
-                    imap = imaplib.IMAP4_SSL(host, port, timeout=10)
-                else:
-                    imap = imaplib.IMAP4(host, port, timeout=10)
-                    if sec == "starttls":
-                        imap.starttls()
-                imap.login(uname, upass)
-                # LIST 全部文件夹，模糊匹配目标文件夹名（兼容 Sent / Sent Messages / 已发送 等命名）
-                typ, data = imap.list()
-                folders = []
-                if typ == "OK":
-                    for item in data:
-                        try:
-                            folders.append(item.decode("utf-8", "ignore"))
-                        except Exception:
-                            folders.append(str(item))
-                folder_match = any(folder.lower() in f.lower() for f in folders)
-                if folder_match:
-                    imap_info.append((True, f"已发送归档: IMAP 登录成功，文件夹「{folder}」存在 ({uname}@{host}:{port}/{sec})"))
-                else:
-                    sample = ", ".join(folders[:8]) if folders else "(空)"
-                    imap_info.append((False, f'已发送归档: IMAP 登录成功，但文件夹「{folder}」未找到。请改 sent_archive.folder。现有: {sample}'))
-            except Exception as e:
-                msg = f"已发送归档: IMAP 连接/登录失败 ({uname}@{host}:{port}/{sec}) — {e}"
-                # 失败时自动探测可用端口，给出可操作的修复建议
-                detected = detect_imap_settings(config.get("smtp_host", "127.0.0.1"))
-                if detected and (detected["port"] != port or detected["security"] != sec or detected["host"] != host):
-                    msg += (
-                        f"\n      💡 探测到可用 IMAP: {detected['security']} @ {detected['host']}:{detected['port']}"
-                        f"\n         建议把 sent_archive 改为: host={detected['host']!r}, port={detected['port']}, security={detected['security']!r}"
-                    )
-                elif not detected:
-                    msg += "\n      （993/143 均连不上：可能是防火墙拦截，或需把 sent_archive.host 改成容器 IP）"
-                imap_info.append((False, msg))
-            finally:
-                if imap is not None:
-                    try:
-                        imap.logout()
-                    except Exception:
-                        pass
-
+        imap_info = _probe_imap_and_autofix(config, domains_cfg, security)
         # 单独打印（不进 results，不影响可用性判定）
         print("  --- 已发送归档（IMAP）探针（不计入可用性判定）---")
         for ok, msg in imap_info:
@@ -618,6 +563,107 @@ def _run_check(do_connect):
             print(f"  [{mark}] {msg}")
 
     return all(ok for ok, _ in results)
+
+
+def _probe_imap_once(imap_settings, uname, upass):
+    """
+    用给定 IMAP 设置登录一次，检查目标文件夹是否存在。
+    返回 (status, message)：status ∈ {True, False, None}，None 表示文件夹名匹配失败（可恢复）。
+    """
+    host = imap_settings["host"]
+    port = imap_settings["port"]
+    sec = imap_settings["security"]
+    folder = imap_settings["folder"]
+    imap = None
+    try:
+        if sec == "ssl":
+            imap = imaplib.IMAP4_SSL(host, port, timeout=10)
+        else:
+            imap = imaplib.IMAP4(host, port, timeout=10)
+            if sec == "starttls":
+                imap.starttls()
+        imap.login(uname, upass)
+        # LIST 全部文件夹，模糊匹配目标文件夹名（兼容 Sent / Sent Messages / 已发送 等命名）
+        typ, data = imap.list()
+        folders = []
+        if typ == "OK":
+            for item in data:
+                try:
+                    folders.append(item.decode("utf-8", "ignore"))
+                except Exception:
+                    folders.append(str(item))
+        folder_match = any(folder.lower() in f.lower() for f in folders)
+        if folder_match:
+            return (True, f"已发送归档: IMAP 登录成功，文件夹「{folder}」存在 ({uname}@{host}:{port}/{sec})")
+        sample = ", ".join(folders[:8]) if folders else "(空)"
+        return (False, f'已发送归档: IMAP 登录成功，但文件夹「{folder}」未找到。请改 sent_archive.folder。现有: {sample}')
+    except Exception as e:
+        return (False, f"已发送归档: IMAP 连接/登录失败 ({uname}@{host}:{port}/{sec}) — {e}")
+    finally:
+        if imap is not None:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+
+
+def _probe_imap_and_autofix(config, domains_cfg, security):
+    """
+    探测 IMAP 归档；首次失败时若探测到可用端口，自动 patch config 并重验一次。
+
+    返回 imap_info 列表供调用方打印。整段不计入 check 可用性判定。
+    """
+    default_dom_probe = config.get("default_domain", "")
+    cred = domains_cfg.get(default_dom_probe, {})
+    uname = cred.get("username")
+    upass = cred.get("password")
+
+    imap_settings = resolve_imap_settings(config, default_dom_probe, uname, upass, security)
+    if not imap_settings:
+        return [(None, "已发送归档: 未配置或未开启 (sent_archive.enabled=false/缺省)，发信不会归档")]
+
+    # 第一次探测
+    ok, msg = _probe_imap_once(imap_settings, uname, upass)
+    if ok:
+        return [(ok, msg)]
+
+    # 失败了：探测可用端口
+    detected = detect_imap_settings(config.get("smtp_host", "127.0.0.1"))
+    if not detected:
+        # 探测不到可用端口，只报原始错误
+        return [(False, msg + "\n      （993/143 均连不上：可能是防火墙拦截，或需把 sent_archive.host 改成容器 IP）")]
+
+    # 当前配置已经和探测结果一致却还失败 → 不重复 patch，只报错（避免死循环）
+    cur = imap_settings
+    if detected["host"] == cur["host"] and detected["port"] == cur["port"] and detected["security"] == cur["security"]:
+        return [(False, msg + "\n      （探测到的端口与当前配置相同，仍失败：可能是凭证问题或文件夹名不对）")]
+
+    # 自动 patch config（只改 sent_archive，其余不动，保留 0600 权限）
+    patched = patch_sent_archive({
+        "host": detected["host"],
+        "port": detected["port"],
+        "security": detected["security"],
+    })
+    note = (
+        f"\n      🔧 探测到可用 IMAP: {detected['security']} @ {detected['host']}:{detected['port']}"
+    )
+    if not patched:
+        # 没权限改 config（非 root 等），退化成建议
+        note += (
+            f"\n         自动修改 config 失败（权限不足？请用 sudo 重跑）"
+            f"\n         请手动改 sent_archive: host={detected['host']!r}, port={detected['port']}, security={detected['security']!r}"
+        )
+        return [(False, msg + note)]
+    note += "\n      已自动修改 config 的 sent_archive，重验中..."
+
+    # 用新设置重探
+    new_settings = dict(imap_settings)
+    new_settings.update({"host": detected["host"], "port": detected["port"], "security": detected["security"]})
+    ok2, msg2 = _probe_imap_once(new_settings, uname, upass)
+    if ok2:
+        return [(False, msg + note), (True, msg2 + "（自动修正成功）")]
+    return [(False, msg + note), (False, msg2)]
+
 
 
 def cmd_check(args):
@@ -1006,6 +1052,48 @@ def cmd_init(args):
         print(f"    发信不受影响；归档需手动填 sent_archive.host/port/security。")
 
 
+
+
+def patch_sent_archive(updates):
+    """
+    原子地只更新 config 的 sent_archive 字段，其余字段原样保留，权限维持 0600。
+
+    用于 check 探针发现 sent_archive 配错（如端口被防火墙拦）但探测到可用端口时，
+    自动把 host/port/security 改对，免去手动编辑 JSON。
+
+    updates: dict，会合并进现有 sent_archive（同名键覆盖）。
+    成功返回 True；失败（文件不存在/读写失败）返回 False。
+    """
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    arch = config.get("sent_archive")
+    if not isinstance(arch, dict):
+        arch = {}
+    arch.update(updates)
+    config["sent_archive"] = arch
+
+    payload = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+    tmp = CONFIG_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(payload)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, CONFIG_PATH)
+        return True
+    except OSError:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return False
 
 
 def _write_config(config, force):
