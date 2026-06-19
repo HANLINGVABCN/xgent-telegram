@@ -593,7 +593,17 @@ def _run_check(do_connect):
                     sample = ", ".join(folders[:8]) if folders else "(空)"
                     imap_info.append((False, f'已发送归档: IMAP 登录成功，但文件夹「{folder}」未找到。请改 sent_archive.folder。现有: {sample}'))
             except Exception as e:
-                imap_info.append((False, f"已发送归档: IMAP 连接/登录失败 ({uname}@{host}:{port}/{sec}) — {e}"))
+                msg = f"已发送归档: IMAP 连接/登录失败 ({uname}@{host}:{port}/{sec}) — {e}"
+                # 失败时自动探测可用端口，给出可操作的修复建议
+                detected = detect_imap_settings(config.get("smtp_host", "127.0.0.1"))
+                if detected and (detected["port"] != port or detected["security"] != sec or detected["host"] != host):
+                    msg += (
+                        f"\n      💡 探测到可用 IMAP: {detected['security']} @ {detected['host']}:{detected['port']}"
+                        f"\n         建议把 sent_archive 改为: host={detected['host']!r}, port={detected['port']}, security={detected['security']!r}"
+                    )
+                elif not detected:
+                    msg += "\n      （993/143 均连不上：可能是防火墙拦截，或需把 sent_archive.host 改成容器 IP）"
+                imap_info.append((False, msg))
             finally:
                 if imap is not None:
                     try:
@@ -834,6 +844,33 @@ def detect_defaults():
     return d
 
 
+def detect_imap_settings(smtp_host):
+    """
+    探测 IMAP 归档可用连接参数。
+
+    Mailu 常见两种 IMAP 端口：993（IMAPS，隐式 SSL）和 143（IMAP，明文/STARTTLS）。
+    不少 VPS 防火墙会拦 143 防爆破，但放行 993；端口也可能绑在公网 IP 而非 127.0.0.1。
+    这里用纯 socket 试连，优先 993，回退 143，返回第一个能连上的那套配置。
+
+    返回 dict: {host, port, security, folder}，探测失败返回 None（不写 sent_archive）。
+    """
+    import socket
+
+    candidates = [
+        (smtp_host, 993, "ssl"),
+        (smtp_host, 143, "starttls"),
+        ("127.0.0.1", 993, "ssl"),
+        ("127.0.0.1", 143, "starttls"),
+    ]
+    for host, port, security in candidates:
+        try:
+            with socket.create_connection((host, port), timeout=3):
+                return {"host": host, "port": port, "security": security, "folder": _DEFAULT_SENT_FOLDER}
+        except OSError:
+            continue
+    return None
+
+
 def _ask(prompt, default=""):
     """交互式提问，支持默认值（直接回车采用）。非 TTY 时返回 default。"""
     if not sys.stdin.isatty():
@@ -941,6 +978,9 @@ def cmd_init(args):
     for dom, acc, pw in zip(domain_list, accounts, passwords):
         domains_cfg[dom] = {"username": acc, "password": pw}
 
+    # 探测 IMAP 归档可用端口（很多 VPS 拦 143 但放行 993，公网回环 vs 127.0.0.1 也可能不同）
+    imap_detected = detect_imap_settings(smtp_host)
+
     config = {
         "smtp_host": smtp_host,
         "smtp_port": smtp_port,
@@ -951,15 +991,19 @@ def cmd_init(args):
         # 默认开启；关闭把 enabled 改成 false 即可（向后兼容：未配置则不归档）。
         "sent_archive": {
             "enabled": True,
-            # host 省略时自动沿用 smtp_host；port/security 省略时按 security 推断
-            "folder": _DEFAULT_SENT_FOLDER,
+            **(imap_detected or {"folder": _DEFAULT_SENT_FOLDER}),
         },
     }
 
     _write_config(config, args.force)
     print(f"\n✓ 已生成配置: {CONFIG_PATH}")
     print(f"  共 {len(domain_list)} 个域名: {', '.join(domain_list)}")
-    print(f"  已发送归档: 开启（IMAP APPEND 到「{config['sent_archive']['folder']}」文件夹）")
+    if imap_detected:
+        print(f"  已发送归档: 开启（IMAP {imap_detected['security']} @ {imap_detected['host']}:{imap_detected['port']}，归档到「{imap_detected['folder']}」）")
+        print(f"    （已自动探测到可用 IMAP 端口；若探针仍报错，可手动改 sent_archive.port/security）")
+    else:
+        print(f"  已发送归档: 开启，但未探测到可用 IMAP 端口（993/143 均连不上）。")
+        print(f"    发信不受影响；归档需手动填 sent_archive.host/port/security。")
 
 
 
