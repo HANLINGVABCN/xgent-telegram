@@ -1,0 +1,682 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SERVICE_NAME="webdav-filemanager"
+APP_DIR="/opt/webdav-filemanager"
+CONFIG_FILE="${APP_DIR}/config.env"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+DEFAULT_PORT="8989"
+
+red() { printf '\033[31m%s\033[0m\n' "$*"; }
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+blue() { printf '\033[34m%s\033[0m\n' "$*"; }
+
+need_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    yellow "需要 root 权限，正在尝试使用 sudo 重新执行..."
+    exec sudo bash "$0" "$@"
+  fi
+}
+
+ask() {
+  local prompt="$1"
+  local default_value="$2"
+  local value=""
+  if [[ -n "$default_value" ]]; then
+    read -r -p "${prompt} [${default_value}]: " value
+    printf '%s' "${value:-$default_value}"
+  else
+    read -r -p "${prompt}: " value
+    printf '%s' "$value"
+  fi
+}
+
+ask_password() {
+  local prompt="$1"
+  local value=""
+  read -r -s -p "${prompt}: " value
+  printf '\n' >&2
+  printf '%s' "$value"
+}
+
+confirm() {
+  local prompt="$1"
+  local answer=""
+  read -r -p "${prompt} [y/N]: " answer
+  case "$answer" in
+    y|Y|yes|YES|Yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_port() {
+  local port="$1"
+  if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    red "端口号必须是 1-65535 的数字。"
+    exit 1
+  fi
+}
+
+validate_username() {
+  local username="$1"
+  if [[ -z "$username" || "$username" == *:* ]]; then
+    red "登录账号不能为空，且不能包含冒号。"
+    exit 1
+  fi
+  if [[ "$username" =~ [[:cntrl:]] ]]; then
+    red "登录账号不能包含控制字符。"
+    exit 1
+  fi
+}
+
+shell_quote() {
+  printf '%q' "$1"
+}
+
+print_header() {
+  blue "========================================"
+  blue " WebDAV 文件管理器 一键部署"
+  blue "========================================"
+  printf '\n'
+}
+
+# ----------------------------------------------------------
+# Detect which process manager is currently managing the app.
+# Returns a space-separated list, for example: "systemd pm2".
+# ----------------------------------------------------------
+systemd_unit_exists() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  [[ -e "$SERVICE_FILE" || -L "$SERVICE_FILE" ]] && return 0
+  systemctl list-unit-files --no-legend "${SERVICE_NAME}.service" 2>/dev/null |
+    awk '{print $1}' |
+    grep -Fxq "${SERVICE_NAME}.service"
+}
+
+detect_manager() {
+  local found=()
+
+  if systemd_unit_exists; then
+    found+=("systemd")
+  fi
+
+  if command -v pm2 >/dev/null 2>&1; then
+    if pm2 describe "$SERVICE_NAME" >/dev/null 2>&1; then
+      found+=("pm2")
+    fi
+  fi
+
+  printf '%s' "${found[*]:-}"
+}
+
+copy_program_files() {
+  local src_dir="$1"
+
+  cp "${src_dir}/server.py" "$APP_DIR/server.py.new"
+  cp "${src_dir}/index.html" "$APP_DIR/index.html.new"
+  chmod 755 "$APP_DIR/server.py.new"
+  chmod 644 "$APP_DIR/index.html.new"
+  mv -f "$APP_DIR/server.py.new" "$APP_DIR/server.py"
+  mv -f "$APP_DIR/index.html.new" "$APP_DIR/index.html"
+}
+
+write_runtime_files() {
+  local port="$1"
+  local root_dir="$2"
+  local auth="$3"
+  local host="${4:-0.0.0.0}"
+  local python_bin
+  python_bin="$(command -v python3)"
+
+  cat > "$CONFIG_FILE" <<CONFIG_EOF
+WEBDAV_HOST=$(shell_quote "$host")
+WEBDAV_PORT=$(shell_quote "$port")
+WEBDAV_ROOT=$(shell_quote "$root_dir")
+WEBDAV_AUTH=$(shell_quote "$auth")
+CONFIG_EOF
+  chmod 600 "$CONFIG_FILE"
+
+  cat > "$APP_DIR/start.sh" <<START_EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="\${SCRIPT_DIR}/config.env"
+
+WEBDAV_HOST=$(shell_quote "$host")
+WEBDAV_PORT=$(shell_quote "$port")
+WEBDAV_ROOT=$(shell_quote "$root_dir")
+WEBDAV_AUTH=$(shell_quote "$auth")
+
+if [[ -f "\$CONFIG_FILE" ]]; then
+  while IFS='=' read -r _cfg_key _cfg_value || [[ -n "\$_cfg_key" ]]; do
+    case "\$_cfg_key" in
+      WEBDAV_HOST) WEBDAV_HOST="\$_cfg_value" ;;
+      WEBDAV_PORT) WEBDAV_PORT="\$_cfg_value" ;;
+      WEBDAV_ROOT) WEBDAV_ROOT="\$_cfg_value" ;;
+      WEBDAV_AUTH) WEBDAV_AUTH="\$_cfg_value" ;;
+    esac
+  done < "\$CONFIG_FILE"
+fi
+
+exec $(shell_quote "$python_bin") $(shell_quote "$APP_DIR/server.py") -H "\$WEBDAV_HOST" -p "\$WEBDAV_PORT" -r "\$WEBDAV_ROOT" -a "\$WEBDAV_AUTH"
+START_EOF
+  chmod 700 "$APP_DIR/start.sh"
+}
+
+RUNTIME_HOST=""
+RUNTIME_PORT=""
+RUNTIME_ROOT=""
+RUNTIME_AUTH=""
+
+read_config_env() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    return 0
+  fi
+
+  local WEBDAV_HOST=""
+  local WEBDAV_PORT=""
+  local WEBDAV_ROOT=""
+  local WEBDAV_AUTH=""
+
+  # 安全逐行解析，避免 source 被篡改的配置文件导致任意代码执行
+  local _key _value
+  while IFS='=' read -r _key _value || [[ -n "$_key" ]]; do
+    case "$_key" in
+      WEBDAV_HOST) WEBDAV_HOST="$_value" ;;
+      WEBDAV_PORT) WEBDAV_PORT="$_value" ;;
+      WEBDAV_ROOT) WEBDAV_ROOT="$_value" ;;
+      WEBDAV_AUTH) WEBDAV_AUTH="$_value" ;;
+    esac
+  done < "$CONFIG_FILE"
+
+  RUNTIME_HOST="${WEBDAV_HOST:-$RUNTIME_HOST}"
+  RUNTIME_PORT="${WEBDAV_PORT:-$RUNTIME_PORT}"
+  RUNTIME_ROOT="${WEBDAV_ROOT:-$RUNTIME_ROOT}"
+  RUNTIME_AUTH="${WEBDAV_AUTH:-$RUNTIME_AUTH}"
+}
+
+read_start_sh_config() {
+  local start_file="$APP_DIR/start.sh"
+  local python_bin
+  python_bin="$(command -v python3 || true)"
+  if [[ -z "$python_bin" || ! -f "$start_file" ]]; then
+    return 0
+  fi
+
+  local parsed
+  parsed="$("$python_bin" - "$start_file" <<'PY' 2>/dev/null || true
+import shlex
+import sys
+
+line = ''
+with open(sys.argv[1], 'r', encoding='utf-8', errors='ignore') as f:
+    for raw in f:
+        stripped = raw.strip()
+        if stripped.startswith('exec '):
+            line = stripped[5:]
+
+try:
+    args = shlex.split(line)
+except ValueError:
+    args = []
+
+def pick(*names):
+    for idx, arg in enumerate(args[:-1]):
+        if arg in names:
+            return args[idx + 1]
+    return ''
+
+print(pick('-H', '--host'))
+print(pick('-p', '--port'))
+print(pick('-r', '--root'))
+print(pick('-a', '--auth'))
+PY
+)"
+
+  local values=()
+  mapfile -t values <<< "$parsed"
+  if [[ -z "$RUNTIME_HOST" && -n "${values[0]:-}" && "${values[0]}" != '$'* ]]; then
+    RUNTIME_HOST="${values[0]}"
+  fi
+  if [[ -z "$RUNTIME_PORT" && -n "${values[1]:-}" && "${values[1]}" != '$'* ]]; then
+    RUNTIME_PORT="${values[1]}"
+  fi
+  if [[ -z "$RUNTIME_ROOT" && -n "${values[2]:-}" && "${values[2]}" != '$'* ]]; then
+    RUNTIME_ROOT="${values[2]}"
+  fi
+  if [[ -z "$RUNTIME_AUTH" && -n "${values[3]:-}" && "${values[3]}" != '$'* ]]; then
+    RUNTIME_AUTH="${values[3]}"
+  fi
+}
+
+read_auth_file_config() {
+  local auth_file="$APP_DIR/filemanager_auth.json"
+  local python_bin
+  python_bin="$(command -v python3 || true)"
+  if [[ -z "$python_bin" || ! -f "$auth_file" ]]; then
+    return 0
+  fi
+
+  local auth
+  auth="$("$python_bin" - "$auth_file" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        print(str(json.load(f).get('auth') or ''))
+except Exception:
+    print('')
+PY
+)"
+
+  if [[ -n "$auth" ]]; then
+    RUNTIME_AUTH="$auth"
+  fi
+}
+
+load_runtime_config() {
+  RUNTIME_HOST=""
+  RUNTIME_PORT=""
+  RUNTIME_ROOT=""
+  RUNTIME_AUTH=""
+
+  read_config_env
+  read_start_sh_config
+  read_auth_file_config
+
+  RUNTIME_HOST="${RUNTIME_HOST:-0.0.0.0}"
+}
+
+restart_app() {
+  local restarted=0
+
+  if systemd_unit_exists; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if systemctl restart "$SERVICE_NAME" >/dev/null 2>&1; then
+      restarted=1
+      green "已重启 systemd 服务：$SERVICE_NAME"
+    else
+      yellow "systemd 服务重启失败，请运行：systemctl status $SERVICE_NAME --no-pager"
+    fi
+  fi
+
+  if command -v pm2 >/dev/null 2>&1 && pm2 describe "$SERVICE_NAME" >/dev/null 2>&1; then
+    if pm2 restart "$SERVICE_NAME" --update-env >/dev/null 2>&1; then
+      pm2 save --force >/dev/null 2>&1 || true
+      restarted=1
+      green "已重启 pm2 进程：$SERVICE_NAME"
+    else
+      yellow "pm2 进程重启失败，请运行：pm2 show $SERVICE_NAME"
+    fi
+  fi
+
+  if (( restarted == 0 )); then
+    yellow "未检测到 systemd/pm2 托管进程；程序文件已更新，请按你的启动方式手动重启。"
+  fi
+}
+
+# ----------------------------------------------------------
+# Install
+# ----------------------------------------------------------
+install_app() {
+  local src_dir
+  src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  if [[ ! -f "${src_dir}/server.py" || ! -f "${src_dir}/index.html" ]]; then
+    red "未找到 server.py 或 index.html。请把 install.sh、server.py、index.html 放在同一目录后再运行。"
+    exit 1
+  fi
+
+  command -v python3 >/dev/null 2>&1 || { red "未找到 python3，请先安装 Python 3。"; exit 1; }
+
+  # Choose process manager
+  local manager=""
+  printf '请选择进程管理方式：\n'
+  printf '  1) pm2（推荐，Node.js 进程管理器，也可管理 Python 进程）\n'
+  printf '  2) systemd（Linux 默认进程管理器）\n\n'
+  local mgr_choice=""
+  read -r -p "请输入选项 [1]: " mgr_choice
+  mgr_choice="${mgr_choice:-1}"
+
+  case "$mgr_choice" in
+    1)
+      manager="pm2"
+      command -v pm2 >/dev/null 2>&1 || { red "未找到 pm2，请先安装：npm install -g pm2"; exit 1; }
+      ;;
+    2)
+      manager="systemd"
+      command -v systemctl >/dev/null 2>&1 || { red "未找到 systemctl，本选项适用于 systemd 系统。请选择 pm2 或安装 systemd。"; exit 1; }
+      ;;
+    *)
+      red "无效选项。"
+      exit 1
+      ;;
+  esac
+
+  local port username password root_dir
+  port="$(ask "请输入端口号" "$DEFAULT_PORT")"
+  validate_port "$port"
+
+  username="$(ask "请输入登录账号" "admin")"
+  validate_username "$username"
+
+  password="$(ask_password "请输入登录密码")"
+  if [[ -z "$password" ]]; then
+    red "登录密码不能为空。"
+    exit 1
+  fi
+
+  root_dir="$(ask "请输入文件根目录" "/data/files")"
+  if [[ -z "$root_dir" ]]; then
+    red "文件根目录不能为空。"
+    exit 1
+  fi
+
+  mkdir -p "$APP_DIR"
+  mkdir -p "$root_dir"
+
+  copy_program_files "$src_dir"
+  # Security: restrict APP_DIR so other users cannot read runtime credentials.
+  chmod 700 "$APP_DIR"
+  rm -f -- "$APP_DIR/filemanager_auth.json" "$APP_DIR/filemanager_auth.json.tmp"
+  write_runtime_files "$port" "$root_dir" "${username}:${password}" "0.0.0.0"
+
+  # Register with chosen process manager
+  if [[ "$manager" == "systemd" ]]; then
+    _install_systemd
+  else
+    _install_pm2
+  fi
+
+  # Print success info
+  local ip="服务器IP"
+  if command -v hostname >/dev/null 2>&1; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    [[ -z "$ip" ]] && ip="服务器IP"
+  fi
+
+  printf '\n'
+  green "部署完成！（进程管理：${manager}）"
+  printf 'Web 页面：  http://%s:%s/\n' "$ip" "$port"
+  printf 'WebDAV：    http://%s:%s/dav/\n' "$ip" "$port"
+  printf '登录账号：  %s\n' "$username"
+  printf '文件目录：  %s\n' "$root_dir"
+  printf '\n'
+
+  if [[ "$manager" == "systemd" ]]; then
+    printf '查看状态：  systemctl status %s\n' "$SERVICE_NAME"
+    printf '重启服务：  systemctl restart %s\n' "$SERVICE_NAME"
+  else
+    printf '查看状态：  pm2 show %s\n' "$SERVICE_NAME"
+    printf '重启服务：  pm2 restart %s\n' "$SERVICE_NAME"
+    printf '查看日志：  pm2 logs %s\n' "$SERVICE_NAME"
+  fi
+  printf '卸载程序：  sudo ./install.sh uninstall\n'
+}
+
+# ----------------------------------------------------------
+# Update
+# ----------------------------------------------------------
+update_app() {
+  local src_dir
+  src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  if [[ ! -f "${src_dir}/server.py" || ! -f "${src_dir}/index.html" ]]; then
+    red "未找到 server.py 或 index.html。请把 install.sh、server.py、index.html 放在同一目录后再运行。"
+    exit 1
+  fi
+
+  command -v python3 >/dev/null 2>&1 || { red "未找到 python3，请先安装 Python 3。"; exit 1; }
+
+  if [[ ! -d "$APP_DIR" ]]; then
+    red "未检测到安装目录：$APP_DIR"
+    printf '请先运行：sudo ./install.sh install\n'
+    exit 1
+  fi
+
+  load_runtime_config
+
+  yellow "即将更新 WebDAV 文件管理器程序文件。"
+  printf '会替换：%s/server.py、%s/index.html\n' "$APP_DIR" "$APP_DIR"
+  printf '会保留：登录密码持久化文件、临时链接状态、网盘文件根目录\n'
+  if [[ -n "$RUNTIME_PORT" ]]; then
+    printf '当前端口：%s\n' "$RUNTIME_PORT"
+  fi
+  if [[ -n "$RUNTIME_ROOT" ]]; then
+    printf '文件根目录：%s\n' "$RUNTIME_ROOT"
+  fi
+  printf '\n'
+
+  copy_program_files "$src_dir"
+  chmod 700 "$APP_DIR"
+
+  if [[ -n "$RUNTIME_PORT" && -n "$RUNTIME_ROOT" ]]; then
+    validate_port "$RUNTIME_PORT"
+    write_runtime_files "$RUNTIME_PORT" "$RUNTIME_ROOT" "$RUNTIME_AUTH" "$RUNTIME_HOST"
+    green "已刷新运行配置：$CONFIG_FILE"
+  else
+    yellow "未能完整读取旧运行配置，已保留原 start.sh，不改端口、目录和账号配置。"
+  fi
+
+  restart_app
+
+  printf '\n'
+  green "更新完成。"
+  printf '网盘文件根目录未被修改或删除。\n'
+}
+
+_install_systemd() {
+  cat > "$SERVICE_FILE" <<SERVICE_EOF
+[Unit]
+Description=WebDAV File Manager
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${APP_DIR}
+ExecStart=${APP_DIR}/start.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_EOF
+
+  systemctl daemon-reload
+  systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    systemctl restart "$SERVICE_NAME"
+  else
+    systemctl enable --now "$SERVICE_NAME"
+  fi
+}
+
+_install_pm2() {
+  # Stop existing pm2 process if any
+  pm2 delete "$SERVICE_NAME" >/dev/null 2>&1 || true
+
+  pm2 start "$APP_DIR/start.sh" \
+    --name "$SERVICE_NAME" \
+    --interpreter bash \
+    --cwd "$APP_DIR"
+
+  pm2 save --force
+  # Setup pm2 startup (auto-start on boot)
+  # Security: avoid eval on pm2 output; run pm2 startup directly
+  pm2 startup 2>/dev/null | grep -E '^sudo ' | head -n1 | bash >/dev/null 2>&1 || true
+}
+
+# ----------------------------------------------------------
+# Uninstall
+# ----------------------------------------------------------
+remove_systemd_service_file() {
+  local file="$1"
+  if [[ ! -e "$file" && ! -L "$file" ]]; then
+    return 0
+  fi
+
+  if [[ -L "$file" ]] ||
+     grep -qF "$APP_DIR/start.sh" "$file" 2>/dev/null ||
+     grep -qF "WebDAV File Manager" "$file" 2>/dev/null; then
+    rm -f -- "$file"
+  else
+    yellow "跳过未知 systemd 文件：$file"
+  fi
+}
+
+cleanup_systemd_service() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+    systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+  fi
+
+  remove_systemd_service_file "$SERVICE_FILE"
+  remove_systemd_service_file "/lib/systemd/system/${SERVICE_NAME}.service"
+  remove_systemd_service_file "/usr/lib/systemd/system/${SERVICE_NAME}.service"
+
+  if [[ -d /etc/systemd/system ]]; then
+    find /etc/systemd/system -type l -name "${SERVICE_NAME}.service" -exec rm -f {} \; 2>/dev/null || true
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
+  fi
+}
+
+cleanup_pm2_service() {
+  if command -v pm2 >/dev/null 2>&1; then
+    pm2 delete "$SERVICE_NAME" >/dev/null 2>&1 || true
+    pm2 save --force >/dev/null 2>&1 || true
+  fi
+
+  local pm2_homes=("${HOME:-}" "/root")
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    pm2_homes+=("/home/${SUDO_USER}")
+  fi
+
+  local home_dir
+  for home_dir in "${pm2_homes[@]}"; do
+    if [[ -n "$home_dir" && -d "$home_dir/.pm2" ]]; then
+      rm -f -- "$home_dir/.pm2/logs/${SERVICE_NAME}-out.log" \
+               "$home_dir/.pm2/logs/${SERVICE_NAME}-error.log" \
+               "$home_dir/.pm2/pids/${SERVICE_NAME}-"*.pid 2>/dev/null || true
+    fi
+  done
+}
+
+stop_leftover_processes() {
+  if ! command -v pgrep >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local pids=""
+  pids="$(pgrep -f "${APP_DIR}/start.sh|${APP_DIR}/server.py" 2>/dev/null || true)"
+  if [[ -z "$pids" ]]; then
+    return 0
+  fi
+
+  kill $pids >/dev/null 2>&1 || true
+  sleep 1
+
+  local pid
+  for pid in $pids; do
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      kill -9 "$pid" >/dev/null 2>&1 || true
+    fi
+  done
+}
+
+remove_app_dir() {
+  if [[ "$APP_DIR" != /opt/* || "$APP_DIR" == "/opt" || "$APP_DIR" == "/" ]]; then
+    red "APP_DIR 路径异常，拒绝删除：$APP_DIR"
+    exit 1
+  fi
+  rm -rf -- "$APP_DIR"
+}
+
+uninstall_app() {
+  local old_root=""
+  load_runtime_config
+  old_root="$RUNTIME_ROOT"
+
+  local current_mgr
+  current_mgr="$(detect_manager)"
+
+  yellow "即将卸载 WebDAV 文件管理器。"
+  if [[ -n "$current_mgr" ]]; then
+    printf '检测到的进程管理方式：%s\n' "$current_mgr"
+  else
+    printf '未检测到正在注册的进程管理方式，仍会执行全面清理。\n'
+  fi
+  printf '会删除：\n'
+  printf '  - systemd 服务 %s 及残留链接\n' "$SERVICE_NAME"
+  printf '  - pm2 进程 %s 及该进程日志/PID\n' "$SERVICE_NAME"
+  printf '  - 残留运行进程（%s/start.sh 或 server.py）\n' "$APP_DIR"
+  printf '  - 程序目录 %s（包含程序配置、登录密码持久化文件、临时链接状态）\n' "$APP_DIR"
+  printf '不会删除：你存入的网盘文件根目录'
+  if [[ -n "$old_root" ]]; then
+    printf '（当前配置可能是 %s）' "$old_root"
+  fi
+  printf '\n\n'
+
+  if ! confirm "确认卸载吗？"; then
+    yellow "已取消卸载。"
+    return 0
+  fi
+
+  cleanup_systemd_service
+  cleanup_pm2_service
+  stop_leftover_processes
+  remove_app_dir
+
+  printf '\n'
+  green "卸载完成。"
+  printf '已全面删除程序、服务配置、pm2 进程记录和残留运行进程。\n'
+  if [[ -n "$old_root" ]]; then
+    printf '已保留文件根目录：%s\n' "$old_root"
+  else
+    printf '已保留你的文件根目录；脚本未删除任何存储目录。\n'
+  fi
+}
+
+# ----------------------------------------------------------
+# Menu
+# ----------------------------------------------------------
+show_menu() {
+  print_header
+  printf '请选择操作：\n'
+  printf '  1) 安装 / 重新安装\n'
+  printf '  2) 更新程序：保留端口、账号、目录和网盘文件\n'
+  printf '  3) 卸载：全面删除程序和服务，不删除存入的文件\n'
+  printf '  4) 退出\n\n'
+
+  local choice=""
+  read -r -p "请输入选项 [1-4]: " choice
+  case "${choice:-}" in
+    1) install_app ;;
+    2) update_app ;;
+    3) uninstall_app ;;
+    4) yellow "已退出。" ;;
+    *) red "无效选项。"; exit 1 ;;
+  esac
+}
+
+# ----------------------------------------------------------
+# Main
+# ----------------------------------------------------------
+main() {
+  need_root "$@"
+
+  case "${1:-}" in
+    install|--install) print_header; install_app ;;
+    update|--update|upgrade|--upgrade) print_header; update_app ;;
+    uninstall|--uninstall|remove|--remove) print_header; uninstall_app ;;
+    "") show_menu ;;
+    *) red "未知参数：$1"; printf '用法：sudo ./install.sh [install|update|uninstall]\n'; exit 1 ;;
+  esac
+}
+
+main "$@"

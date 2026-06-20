@@ -1,0 +1,117 @@
+# Local secrets and deployment config
+.env
+.env.*
+!.env.example
+config.ini
+secrets.json
+credentials.yaml
+
+# Runtime data
+bot_memory.db
+bot_memory.db-*
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+bot_storage/
+
+# 用户记忆（每条一个文件，含用户私密事实/偏好，绝不上传）
+memory/
+
+# Logs
+bot_output.log
+bot_server.log
+bot_full_trace.log
+*.log
+*.pid
+logs/
+*.log.*
+
+# Python
+__pycache__/
+tests/
+*.py[cod]
+*$py.class
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+*.cover
+.hypothesis/
+venv/
+.venv/
+env/
+ENV/
+*.so
+*.egg
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+
+# 本地临时测试脚本
+test_memory_offline.py
+test_*.py
+
+# Build and package artifacts
+build/
+dist/
+*.egg-info/
+node_modules/
+wheels/
+*.whl
+
+# Editor and OS local files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*.tmp
+*.bak
+*.orig
+*~
+*.code-workspace
+
+# Private keys, certificates, and local archives
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# PyCharm
+*.iml
+
+# Documentation builds
+docs/_build/
+site/
+
+# macOS
+.AppleDouble
+.LSOverride
+
+# Windows
+$RECYCLE_BIN/
+ehthumbs.db
+ehthumbs_vista.db
