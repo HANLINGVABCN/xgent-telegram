@@ -115,3 +115,8 @@ site/
 $RECYCLE_BIN/
 ehthumbs.db
 ehthumbs_vista.db
+
+# Custom additions
+.install-state/
+.local-api-data/
+*bak*
