@@ -2290,6 +2290,7 @@ let lastShareUrl = '';
 let downloadTasks = [];
 let selectedDownloadId = '';
 const LOCAL_TASKS_KEY = 'fm_local_tasks_v1';
+const IGNORED_TASKS_KEY = 'fm_ignored_tasks_v1';
 
 function persistLocalTasks() {
     // Persist lightweight metadata for download/upload tasks so the record
@@ -2314,10 +2315,26 @@ function persistLocalTasks() {
             needsFile: !!t.needsFile,
         }));
         localStorage.setItem(LOCAL_TASKS_KEY, JSON.stringify(snap));
+        // 同时保存已忽略的远程任务 ID，防止刷新后被删除的任务重新出现
+        try {
+            localStorage.setItem(IGNORED_TASKS_KEY, JSON.stringify([...ignoredRemoteTaskIds]));
+        } catch (e2) {}
     } catch (e) {}
 }
 
 function loadLocalTasks() {
+    try {
+        // 恢复已忽略的远程任务 ID 集合（防止刷新后被删除的任务重新出现）
+        try {
+            const ignoredRaw = localStorage.getItem(IGNORED_TASKS_KEY);
+            if (ignoredRaw) {
+                const ignoredArr = JSON.parse(ignoredRaw);
+                if (Array.isArray(ignoredArr)) {
+                    ignoredArr.forEach(id => { if (id) ignoredRemoteTaskIds.add(id); });
+                }
+            }
+        } catch (e2) {}
+    } catch (e) {}
     try {
         const raw = localStorage.getItem(LOCAL_TASKS_KEY);
         if (!raw) return;
@@ -2328,6 +2345,8 @@ function loadLocalTasks() {
         // by loadAllTasks() afterward.
         snap.forEach(s => {
             if (downloadTasks.find(t => t.id === s.id)) return;  // already present
+            // 跳过已被忽略（已删除）的远程任务
+            if ((s.kind === 'remote') && ignoredRemoteTaskIds.has(s.remoteId || s.id)) return;
             const status = (s.kind === 'remote') ? s.status
                 : (s.status === 'downloading' ? 'paused' : s.status);
             downloadTasks.push({
@@ -5706,6 +5725,24 @@ async function pollAllTasks() {
                 mergePersistedTask(raw);
             }
         });
+        // 清理：服务端已不存在的远程任务（已被删除），且不在本地进行中，应从本地列表移除
+        const toRemove = [];
+        downloadTasks.forEach((t, i) => {
+            if (t.kind === 'remote' && !serverIds.has(t.remoteId || t.id) && !t.controller) {
+                // 只移除非活跃的远程任务（没有 controller 的）
+                if (!['queued', 'downloading'].includes(t.status)) {
+                    toRemove.push(i);
+                }
+            }
+        });
+        // 从后往前删除，避免索引偏移
+        for (let i = toRemove.length - 1; i >= 0; i--) {
+            const removed = downloadTasks.splice(toRemove[i], 1)[0];
+            if (removed && (removed.remoteId || removed.id)) {
+                ignoredRemoteTaskIds.add(removed.remoteId || removed.id);
+            }
+        }
+        if (toRemove.length) persistLocalTasks();
         renderDownloadQueue();
         renderDownloadDetails(selectedDownloadTask());
         stopRemotePollingIfIdle();
@@ -5719,12 +5756,27 @@ async function loadAllTasks() {
     // Initial fetch of all persisted tasks (called once on page load / opening transfer center)
     try {
         const data = await apiFetch('/api/tasks');
+        const serverIds = new Set();
         (data.items || []).forEach(raw => {
             if (!raw || !raw.id) return;
+            serverIds.add(raw.id);
             const kind = raw.kind || 'remote';
             if (kind === 'remote') mergeRemoteTask(raw);
             else mergePersistedTask(raw);
         });
+        // 清理：服务端已不存在的远程任务（已被软删除），从本地列表移除
+        const before = downloadTasks.length;
+        downloadTasks = downloadTasks.filter(t => {
+            if (t.kind !== 'remote') return true;
+            const rid = t.remoteId || t.id;
+            if (ignoredRemoteTaskIds.has(rid)) return false;
+            if (!serverIds.has(rid) && !t.controller && !['queued', 'downloading'].includes(t.status)) {
+                ignoredRemoteTaskIds.add(rid);
+                return false;
+            }
+            return true;
+        });
+        if (downloadTasks.length !== before) persistLocalTasks();
         renderDownloadQueue();
         renderDownloadDetails(selectedDownloadTask());
         // If any remote task is active, keep polling
@@ -5805,7 +5857,9 @@ function mergeRemoteTask(raw) {
     if (!raw || !raw.id) return;
     if (ignoredRemoteTaskIds.has(raw.id)) return;
     let task = downloadTasks.find(t => t.id === raw.id);
-    if (task && task.localPaused) return;
+    // 如果本地标记了 localPaused 且服务端状态还是 downloading/queued，
+    // 说明暂停请求还没生效，跳过此次合并防止状态被覆盖
+    if (task && task.localPaused && ['downloading', 'queued'].includes(raw.status)) return;
     if (!task) {
         task = {
             id: raw.id,
@@ -5840,7 +5894,10 @@ function mergeRemoteTask(raw) {
     task.maxBps = Number(raw.maxBps) || task.maxBps || 0;
     task.samples = raw.samples || task.samples || [];
     task.error = raw.error || '';
-    task.localPaused = false;
+    // 服务端已确认 paused 状态（或已变成其他非 downloading 状态），清除 localPaused 标记
+    if (raw.status === 'paused' || (task.localPaused && !['downloading', 'queued'].includes(raw.status))) {
+        task.localPaused = false;
+    }
     if (!selectedDownloadId) selectedDownloadId = task.id;
     updateTransferBadge();
 }
@@ -6451,6 +6508,7 @@ async function pauseDownloadTask(id) {
                 body: JSON.stringify({ id: task.remoteId || task.id, action: 'pause' }),
             });
             task.status = 'paused';
+            task.localPaused = true;  // 防止 poll 把状态覆盖回 downloading
             task.lastBps = 0;
         } catch (e) {
             task.error = e.message;
@@ -6537,7 +6595,9 @@ async function cancelDownloadTask(id) {
     }
     finishDownloadActivity(task);
     downloadTasks.splice(idx, 1);
+    if (task.kind === 'remote') ignoredRemoteTaskIds.add(task.remoteId || task.id);
     if (selectedDownloadId === id) selectedDownloadId = visibleTransferTasks()[0]?.id || '';
+    persistLocalTasks();
     renderDownloadQueue();
     renderDownloadDetails(selectedDownloadTask());
     processDownloadQueue();
@@ -6626,6 +6686,7 @@ async function deleteDownloadTask(id) {
     if (task.kind === 'remote') ignoredRemoteTaskIds.add(task.remoteId || task.id);
     downloadTasks.splice(idx, 1);
     if (selectedDownloadId === id) selectedDownloadId = visibleTransferTasks()[0]?.id || '';
+    persistLocalTasks();
     renderDownloadQueue();
     renderDownloadDetails(selectedDownloadTask());
     processDownloadQueue();
@@ -6648,6 +6709,7 @@ async function clearFinishedDownloads() {
     }
     downloadTasks = downloadTasks.filter(t => !(taskKind(t) === currentTransferTab && (t.status === 'done' || t.status === 'canceled')));
     if (!visibleTransferTasks().some(t => t.id === selectedDownloadId)) selectedDownloadId = visibleTransferTasks()[0]?.id || '';
+    persistLocalTasks();
     renderDownloadQueue();
     renderDownloadDetails(selectedDownloadTask());
 }

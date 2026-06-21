@@ -48,7 +48,7 @@ SESSION_MAX_AGE = 7 * 24 * 60 * 60
 MAX_SESSIONS = 1000
 SESSIONS = {}
 SESSIONS_LOCK = threading.Lock()
-STATE_LOCK = threading.Lock()
+STATE_LOCK = threading.RLock()
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'filemanager_state.json')
 AUTH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'filemanager_auth.json')
 MAX_TTL_SECONDS = 10 * 365 * 24 * 60 * 60
@@ -2076,51 +2076,69 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         trash = data.get('trash', True)
         if not trash:
             # Hard-delete from trash only.
-            state = load_state()
-            trash_map = state.get('taskTrash', {})
-            changed = False
-            for task_id in ids:
-                if trash_map.pop(task_id, None) is not None:
-                    changed = True
-            if changed:
-                state['taskTrash'] = trash_map
-                save_state(state)
+            with STATE_LOCK:
+                state = load_state()
+                trash_map = state.get('taskTrash', {})
+                changed = False
+                for task_id in ids:
+                    if trash_map.pop(task_id, None) is not None:
+                        changed = True
+                if changed:
+                    state['taskTrash'] = trash_map
+                    save_state(state)
             self.send_ok(f'已彻底删除 {len(ids)} 个任务')
             return
         # Soft-delete: stop live task, move snapshot into trash.
-        # 先从持久化中移到回收站并保存，再停止 worker，防止 worker 的 save_task 复活任务。
-        state = load_state()
-        tasks_map = state.get('tasks', {})
-        trash_map = state.setdefault('taskTrash', {})
-        moved = 0
-        live_tasks = {}  # 记住 live task 以备后用
-        for task_id in ids:
-            # 先拍快照：优先从持久化取，没有则从 REMOTE_TASKS 拍
-            snap = tasks_map.get(task_id)
-            with REMOTE_TASKS_LOCK:
+        # 先在 REMOTE_TASKS_LOCK 内拍取所有 live task 快照（避免 STATE_LOCK → REMOTE_TASKS_LOCK 死锁）
+        live_tasks = {}
+        live_snaps = {}
+        with REMOTE_TASKS_LOCK:
+            for task_id in ids:
                 live_task = REMOTE_TASKS.get(task_id)
                 if live_task:
                     live_tasks[task_id] = live_task
-            if snap is None and live_task:
-                snap = task_snapshot(live_task)
-            if snap is None:
-                snap = {}
-            snap = dict(snap)
-            snap.setdefault('id', task_id)
-            snap.setdefault('kind', 'remote')
-            snap.setdefault('name', live_task.get('name', '') if live_task else '')
-            snap.setdefault('status', live_task.get('status', '') if live_task else '')
-            snap.setdefault('size', live_task.get('size', 0) if live_task else 0)
-            snap.setdefault('url', live_task.get('url', '') if live_task else '')
-            snap['deletedAt'] = time.time()
-            trash_map[task_id] = snap
-            if tasks_map.pop(task_id, None) is not None:
-                moved += 1
-        # 先保存回收站，这样 worker 的 save_task 检查回收站时能看到
-        state['tasks'] = tasks_map
-        state['taskTrash'] = trash_map
-        save_state(state)
-        # 然后再停止 live task
+                    live_snaps[task_id] = task_snapshot(live_task)
+        # 然后在 STATE_LOCK 内完成 load-modify-save，防止 worker 的 save_task 在中间复活任务
+        with STATE_LOCK:
+            state = load_state()
+            tasks_map = state.get('tasks', {})
+            trash_map = state.setdefault('taskTrash', {})
+            moved = 0
+            for task_id in ids:
+                # 先拍快照：优先从持久化取，没有则用之前拍的 live snap
+                snap = tasks_map.get(task_id)
+                if snap is None and task_id in live_snaps:
+                    snap = live_snaps[task_id]
+                if snap is None:
+                    snap = {}
+                snap = dict(snap)
+                # 合并持久化和 live 中的信息，确保回收站条目有足够数据
+                snap.setdefault('id', task_id)
+                snap.setdefault('kind', 'remote')
+                # 优先使用 live_task 的值（更实时），其次使用已有的 snap 值
+                live_task = live_tasks.get(task_id)
+                if live_task:
+                    for key in ('name', 'status', 'size', 'url', 'path', 'error', 'loaded',
+                                'createdAt', 'startedAt', 'finishedAt', 'lastBps', 'maxBps'):
+                        if not snap.get(key) and live_task.get(key):
+                            snap[key] = live_task[key]
+                # 确保基本字段有默认值，避免回收站显示空白条目
+                snap.setdefault('name', '')
+                snap.setdefault('status', '')
+                snap.setdefault('size', 0)
+                snap.setdefault('url', '')
+                snap.setdefault('path', '')
+                snap.setdefault('error', '')
+                snap.setdefault('loaded', 0)
+                snap.setdefault('createdAt', 0)
+                snap['deletedAt'] = time.time()
+                trash_map[task_id] = snap
+                if tasks_map.pop(task_id, None) is not None:
+                    moved += 1
+            state['tasks'] = tasks_map
+            state['taskTrash'] = trash_map
+            save_state(state)
+        # 然后再停止 live task（在 STATE_LOCK 外，避免嵌套锁导致死锁）
         for task_id in ids:
             live_task = live_tasks.get(task_id)
             with REMOTE_TASKS_LOCK:
@@ -2437,13 +2455,18 @@ class FileManagerHandler(BaseHTTPRequestHandler):
                 task['finishedAt'] = time.time()
             else:
                 task['status'] = 'paused'
-        save_task(merge_remote_task_for_persist(REMOTE_TASKS.get(task_id)))
+        # 使用 lock 内保存的 task 引用来持久化，而不是重新从 REMOTE_TASKS 获取
+        # （worker 可能在此期间将任务从 REMOTE_TASKS 中移除）
+        save_task(merge_remote_task_for_persist(task))
         self.send_ok('任务已暂停' if action != 'cancel' else '任务已取消')
 
     def _api_remote_download_resume(self):
         """Resume a paused/queued/error remote download with HTTP Range."""
         data = self.read_json()
         task_id = str(data.get('id', '')).strip()
+        # 检查任务是否已被软删除（在回收站中）
+        if task_id in load_state().get('taskTrash', {}):
+            return self.send_err(410, '任务已被删除，请先从回收站恢复')
         with REMOTE_TASKS_LOCK:
             task = REMOTE_TASKS.get(task_id)
             if not task:
@@ -2493,9 +2516,10 @@ class FileManagerHandler(BaseHTTPRequestHandler):
                 task['pauseRequested'] = False
                 task['status'] = 'queued'
                 task['error'] = ''
-        save_task(merge_remote_task_for_persist(REMOTE_TASKS.get(task_id)))
+        # 使用 lock 内保存的 task 引用，而不是重新从 REMOTE_TASKS 获取
+        save_task(merge_remote_task_for_persist(task))
         start_remote_worker(task_id)
-        self.send_json({'success': True, 'task': remote_task_snapshot(REMOTE_TASKS.get(task_id))})
+        self.send_json({'success': True, 'task': remote_task_snapshot(task)})
 
     def _api_remote_download_delete(self):
         data = self.read_json()
@@ -2520,6 +2544,11 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             except OSError:
                 pass
         delete_persisted_task(task_id)
+        # 也从 taskTrash 中移除（如果存在）
+        with STATE_LOCK:
+            state = load_state()
+            if state.get('taskTrash', {}).pop(task_id, None) is not None:
+                save_state(state)
         self.send_ok('任务已删除')
 
     def _api_save_text(self):
