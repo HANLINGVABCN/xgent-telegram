@@ -120,6 +120,7 @@ def smtp_connect(host, port, security, username, password):
     按指定安全模式建立 SMTP 连接并登录。返回已登录的 server，失败抛异常。
     """
     ctx = ssl.create_default_context()
+    ctx.check_hostname = False  # 允许 IP 地址连接（证书 CN 通常不含 IP）
     if security == "ssl":
         server = smtplib.SMTP_SSL(host, port, timeout=10, context=ctx)
     else:
@@ -232,11 +233,15 @@ def archive_to_sent(imap_settings, raw_message):
     imap = None
     try:
         if security == "ssl":
-            imap = imaplib.IMAP4_SSL(host, port, timeout=10, ssl_context=ssl.create_default_context())
+            imap_ctx = ssl.create_default_context()
+            imap_ctx.check_hostname = False  # 允许 IP 地址连接
+            imap = imaplib.IMAP4_SSL(host, port, timeout=10, ssl_context=imap_ctx)
         else:
             imap = imaplib.IMAP4(host, port, timeout=10)
             if security == "starttls":
-                imap.starttls(ssl.create_default_context())
+                imap_ctx = ssl.create_default_context()
+                imap_ctx.check_hostname = False
+                imap.starttls(imap_ctx)
         imap.login(username, password)
 
         # mailbox 不用手动加引号，imaplib 会自动转义；手加会变成 ""Sent"" 双重转义
