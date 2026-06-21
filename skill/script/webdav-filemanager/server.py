@@ -192,11 +192,19 @@ def task_snapshot(task):
 
 
 def save_task(task):
-    """Persist a single task snapshot into state['tasks'][id] (atomic)."""
+    """Persist a single task snapshot into state['tasks'][id] (atomic).
+
+    If the task has already been soft-deleted (present in state['taskTrash']),
+    skip writing to prevent a concurrent worker from resurrecting a deleted task.
+    """
     if not task or not task.get('id'):
         return
+    task_id = task['id'] if isinstance(task, dict) and 'id' in task else task.get('id')
     snap = task_snapshot(task)
     state = load_state()
+    # 防止 worker 线程在删除后复活任务
+    if task_id in state.get('taskTrash', {}):
+        return
     state.setdefault('tasks', {})[snap['id']] = snap
     save_state(state)
 
@@ -2061,41 +2069,19 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             self.send_ok(f'已彻底删除 {len(ids)} 个任务')
             return
         # Soft-delete: stop live task, move snapshot into trash.
+        # 先从持久化中移到回收站并保存，再停止 worker，防止 worker 的 save_task 复活任务。
         state = load_state()
         tasks_map = state.get('tasks', {})
         trash_map = state.setdefault('taskTrash', {})
         moved = 0
+        live_tasks = {}  # 记住 live task 以备后用
         for task_id in ids:
-            # Stop live remote task if running
+            # 先拍快照：优先从持久化取，没有则从 REMOTE_TASKS 拍
+            snap = tasks_map.get(task_id)
             with REMOTE_TASKS_LOCK:
                 live_task = REMOTE_TASKS.get(task_id)
                 if live_task:
-                    live_task['cancel'] = True
-                    live_task['pauseRequested'] = False
-                    if live_task.get('status') == 'downloading':
-                        live_task['status'] = 'canceled'
-                        live_task['finishedAt'] = time.time()
-                    temp_path = live_task.get('tempPath') or ''
-                    REMOTE_TASKS.pop(task_id, None)
-                else:
-                    temp_path = ''
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
-            # Remove upload .part if any
-            snap = tasks_map.get(task_id)
-            if snap and snap.get('kind') == 'upload':
-                full = safe_join(ROOT_DIR, snap.get('path', ''))
-                if full and os.path.exists(full + '.part'):
-                    try:
-                        os.remove(full + '.part')
-                    except OSError:
-                        pass
-            UPLOAD_TASKS.pop(task_id, None)
-            # Move snapshot into trash (preserve it), then drop from active tasks.
-            # 如果持久化中没有快照，尝试从 live_task 拍快照（防止回收站出现空条目）
+                    live_tasks[task_id] = live_task
             if snap is None and live_task:
                 snap = task_snapshot(live_task)
             if snap is None:
@@ -2111,9 +2097,39 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             trash_map[task_id] = snap
             if tasks_map.pop(task_id, None) is not None:
                 moved += 1
+        # 先保存回收站，这样 worker 的 save_task 检查回收站时能看到
         state['tasks'] = tasks_map
         state['taskTrash'] = trash_map
         save_state(state)
+        # 然后再停止 live task
+        for task_id in ids:
+            live_task = live_tasks.get(task_id)
+            with REMOTE_TASKS_LOCK:
+                if live_task and REMOTE_TASKS.get(task_id) is live_task:
+                    live_task['cancel'] = True
+                    live_task['pauseRequested'] = False
+                    if live_task.get('status') == 'downloading':
+                        live_task['status'] = 'canceled'
+                        live_task['finishedAt'] = time.time()
+                    temp_path = live_task.get('tempPath') or ''
+                    REMOTE_TASKS.pop(task_id, None)
+                else:
+                    temp_path = ''
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+            # Remove upload .part if any
+            snap = trash_map.get(task_id, {})
+            if snap.get('kind') == 'upload':
+                full = safe_join(ROOT_DIR, snap.get('path', ''))
+                if full and os.path.exists(full + '.part'):
+                    try:
+                        os.remove(full + '.part')
+                    except OSError:
+                        pass
+            UPLOAD_TASKS.pop(task_id, None)
         self.send_ok(f'已删除 {len(ids)} 个任务')
 
     def _api_tasks_restore(self):
