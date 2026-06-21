@@ -2068,14 +2068,14 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         for task_id in ids:
             # Stop live remote task if running
             with REMOTE_TASKS_LOCK:
-                task = REMOTE_TASKS.get(task_id)
-                if task:
-                    task['cancel'] = True
-                    task['pauseRequested'] = False
-                    if task.get('status') == 'downloading':
-                        task['status'] = 'canceled'
-                        task['finishedAt'] = time.time()
-                    temp_path = task.get('tempPath') or ''
+                live_task = REMOTE_TASKS.get(task_id)
+                if live_task:
+                    live_task['cancel'] = True
+                    live_task['pauseRequested'] = False
+                    if live_task.get('status') == 'downloading':
+                        live_task['status'] = 'canceled'
+                        live_task['finishedAt'] = time.time()
+                    temp_path = live_task.get('tempPath') or ''
                     REMOTE_TASKS.pop(task_id, None)
                 else:
                     temp_path = ''
@@ -2095,11 +2095,18 @@ class FileManagerHandler(BaseHTTPRequestHandler):
                         pass
             UPLOAD_TASKS.pop(task_id, None)
             # Move snapshot into trash (preserve it), then drop from active tasks.
+            # 如果持久化中没有快照，尝试从 live_task 拍快照（防止回收站出现空条目）
+            if snap is None and live_task:
+                snap = task_snapshot(live_task)
             if snap is None:
                 snap = {}
             snap = dict(snap)
             snap.setdefault('id', task_id)
             snap.setdefault('kind', 'remote')
+            snap.setdefault('name', live_task.get('name', '') if live_task else '')
+            snap.setdefault('status', live_task.get('status', '') if live_task else '')
+            snap.setdefault('size', live_task.get('size', 0) if live_task else 0)
+            snap.setdefault('url', live_task.get('url', '') if live_task else '')
             snap['deletedAt'] = time.time()
             trash_map[task_id] = snap
             if tasks_map.pop(task_id, None) is not None:
@@ -2345,7 +2352,34 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         with REMOTE_TASKS_LOCK:
             task = REMOTE_TASKS.get(task_id)
             if not task:
-                return self.send_err(404, '任务不存在')
+                # 任务可能在 worker 退出后不在 REMOTE_TASKS 中，但持久化中有记录
+                snap = load_persisted_tasks().get(task_id)
+                if not snap:
+                    return self.send_err(404, '任务不存在')
+                if snap.get('status') in ('done', 'error', 'canceled'):
+                    return self.send_json({'success': True, 'message': '任务已结束'})
+                # 直接更新持久化状态
+                if action == 'cancel':
+                    snap = dict(snap)
+                    snap['status'] = 'canceled'
+                    snap['finishedAt'] = time.time()
+                    save_task(snap)
+                    # 删除 .part 文件
+                    path_rel = snap.get('path') or ''
+                    if path_rel and path_rel != '/' + DOWNLOAD_DIR_NAME:
+                        full = safe_join(ROOT_DIR, path_rel)
+                        if full and os.path.exists(full + '.part'):
+                            try:
+                                os.remove(full + '.part')
+                            except OSError:
+                                pass
+                    self.send_ok('任务已取消')
+                else:
+                    snap = dict(snap)
+                    snap['status'] = 'paused'
+                    save_task(snap)
+                    self.send_ok('任务已暂停')
+                return
             if task.get('status') in ('done', 'error', 'canceled'):
                 return self.send_json({'success': True, 'message': '任务已结束'})
             task['cancel'] = True
@@ -2365,16 +2399,52 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         with REMOTE_TASKS_LOCK:
             task = REMOTE_TASKS.get(task_id)
             if not task:
-                return self.send_err(404, '任务不存在')
-            if task.get('status') in ('downloading',):
-                return self.send_json({'success': True, 'task': remote_task_snapshot(task), 'message': '任务正在下载'})
-            if task.get('status') == 'done':
-                return self.send_err(400, '任务已完成，无需继续')
-            # Reset cancel flags
-            task['cancel'] = False
-            task['pauseRequested'] = False
-            task['status'] = 'queued'
-            task['error'] = ''
+                # 任务可能在 worker 退出后从 REMOTE_TASKS 中移除了，尝试从持久化恢复
+                snap = load_persisted_tasks().get(task_id)
+                if not snap:
+                    return self.send_err(404, '任务不存在')
+                if snap.get('status') == 'done':
+                    return self.send_err(400, '任务已完成，无需继续')
+                # 从快照重建内存任务
+                task = {
+                    'id': snap.get('id') or task_id,
+                    'url': snap.get('url') or '',
+                    'name': snap.get('name') or 'remote-download',
+                    'status': 'queued',
+                    'size': int(snap.get('size') or 0),
+                    'loaded': int(snap.get('loaded') or 0),
+                    'createdAt': float(snap.get('createdAt') or time.time()),
+                    'startedAt': float(snap.get('startedAt') or 0),
+                    'finishedAt': 0,
+                    'path': snap.get('path') or '/' + DOWNLOAD_DIR_NAME,
+                    'error': '',
+                    'lastBps': 0,
+                    'maxBps': float(snap.get('maxBps') or 0),
+                    'samples': [],
+                    'lastT': 0,
+                    'lastBytes': 0,
+                    'cancel': False,
+                    'pauseRequested': False,
+                    'kind': 'remote',
+                }
+                path_rel = snap.get('path') or ''
+                if path_rel and path_rel != '/' + DOWNLOAD_DIR_NAME:
+                    base = safe_join(ROOT_DIR, path_rel)
+                    if base:
+                        task['tempPath'] = base + '.part'
+                if not task['url']:
+                    return self.send_err(400, '缺少 URL，无法恢复')
+                REMOTE_TASKS[task_id] = task
+            else:
+                if task.get('status') in ('downloading',):
+                    return self.send_json({'success': True, 'task': remote_task_snapshot(task), 'message': '任务正在下载'})
+                if task.get('status') == 'done':
+                    return self.send_err(400, '任务已完成，无需继续')
+                # Reset cancel flags
+                task['cancel'] = False
+                task['pauseRequested'] = False
+                task['status'] = 'queued'
+                task['error'] = ''
         save_task(merge_remote_task_for_persist(REMOTE_TASKS.get(task_id)))
         start_remote_worker(task_id)
         self.send_json({'success': True, 'task': remote_task_snapshot(REMOTE_TASKS.get(task_id))})
