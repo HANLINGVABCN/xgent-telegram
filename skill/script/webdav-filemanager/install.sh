@@ -74,6 +74,19 @@ shell_quote() {
   printf '%q' "$1"
 }
 
+# 将值用双引号包裹写入配置文件，读取时 eval 安全还原。
+# 相比 shell_quote (printf %q)，这种方式不会被 IFS='=' read 原样保留转义符。
+quote_value() {
+  local s="$1"
+  s="${s//\\\\/\\\\\\\\}"    # \\ -> \\\\
+  s="${s//\"/\\\"}"      # \" -> \\\"  
+  s="${s//\$/\\\$}"      # $ -> \\$
+  s="${s//\`/\\\`}"      # ` -> \\`
+  s="${s//$'\n'/\\n}"   # 换行 -> \\n
+  s="${s//$'\r'/\\r}"   # 回车 -> \\r
+  printf '"%s"' "$s"
+}
+
 print_header() {
   blue "========================================"
   blue " WebDAV 文件管理器 一键部署"
@@ -129,10 +142,10 @@ write_runtime_files() {
   python_bin="$(command -v python3)"
 
   cat > "$CONFIG_FILE" <<CONFIG_EOF
-WEBDAV_HOST=$(shell_quote "$host")
-WEBDAV_PORT=$(shell_quote "$port")
-WEBDAV_ROOT=$(shell_quote "$root_dir")
-WEBDAV_AUTH=$(shell_quote "$auth")
+WEBDAV_HOST=$(quote_value "$host")
+WEBDAV_PORT=$(quote_value "$port")
+WEBDAV_ROOT=$(quote_value "$root_dir")
+WEBDAV_AUTH=$(quote_value "$auth")
 CONFIG_EOF
   chmod 600 "$CONFIG_FILE"
 
@@ -151,10 +164,19 @@ WEBDAV_AUTH=$(shell_quote "$auth")
 if [[ -f "\$CONFIG_FILE" ]]; then
   while IFS='=' read -r _cfg_key _cfg_value || [[ -n "\$_cfg_key" ]]; do
     case "\$_cfg_key" in
-      WEBDAV_HOST) WEBDAV_HOST="\$_cfg_value" ;;
-      WEBDAV_PORT) WEBDAV_PORT="\$_cfg_value" ;;
-      WEBDAV_ROOT) WEBDAV_ROOT="\$_cfg_value" ;;
-      WEBDAV_AUTH) WEBDAV_AUTH="\$_cfg_value" ;;
+      WEBDAV_HOST|WEBDAV_PORT|WEBDAV_ROOT|WEBDAV_AUTH)
+        if [[ "\$_cfg_value" == \"*\" ]]; then
+          eval "_cfg_resolved=\$_cfg_value"
+        else
+          _cfg_resolved="\$_cfg_value"
+        fi
+        ;;
+    esac
+    case "\$_cfg_key" in
+      WEBDAV_HOST) WEBDAV_HOST="\$_cfg_resolved" ;;
+      WEBDAV_PORT) WEBDAV_PORT="\$_cfg_resolved" ;;
+      WEBDAV_ROOT) WEBDAV_ROOT="\$_cfg_resolved" ;;
+      WEBDAV_AUTH) WEBDAV_AUTH="\$_cfg_resolved" ;;
     esac
   done < "\$CONFIG_FILE"
 fi
@@ -180,13 +202,24 @@ read_config_env() {
   local WEBDAV_AUTH=""
 
   # 安全逐行解析，避免 source 被篡改的配置文件导致任意代码执行
+  # 值用双引号包裹（quote_value），读取时 eval 安全还原特殊字符
   local _key _value
   while IFS='=' read -r _key _value || [[ -n "$_key" ]]; do
     case "$_key" in
-      WEBDAV_HOST) WEBDAV_HOST="$_value" ;;
-      WEBDAV_PORT) WEBDAV_PORT="$_value" ;;
-      WEBDAV_ROOT) WEBDAV_ROOT="$_value" ;;
-      WEBDAV_AUTH) WEBDAV_AUTH="$_value" ;;
+      WEBDAV_HOST|WEBDAV_PORT|WEBDAV_ROOT|WEBDAV_AUTH)
+        # 用 eval 展开双引号值（安全：写入格式由 quote_value 控制）
+        if [[ "$_value" == \"*\" ]]; then
+          eval "_resolved=$_value"
+        else
+          _resolved="$_value"
+        fi
+        ;;
+    esac
+    case "$_key" in
+      WEBDAV_HOST) WEBDAV_HOST="$_resolved" ;;
+      WEBDAV_PORT) WEBDAV_PORT="$_resolved" ;;
+      WEBDAV_ROOT) WEBDAV_ROOT="$_resolved" ;;
+      WEBDAV_AUTH) WEBDAV_AUTH="$_resolved" ;;
     esac
   done < "$CONFIG_FILE"
 
