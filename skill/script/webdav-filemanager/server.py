@@ -194,19 +194,30 @@ def task_snapshot(task):
 def save_task(task):
     """Persist a single task snapshot into state['tasks'][id] (atomic).
 
-    If the task has already been soft-deleted (present in state['taskTrash']),
-    skip writing to prevent a concurrent worker from resurrecting a deleted task.
+    Uses STATE_LOCK across the entire read-check-write cycle to prevent
+    race conditions with concurrent delete operations. If the task has
+    already been soft-deleted (present in state['taskTrash']), skip writing.
     """
     if not task or not task.get('id'):
         return
-    task_id = task['id'] if isinstance(task, dict) and 'id' in task else task.get('id')
     snap = task_snapshot(task)
-    state = load_state()
-    # 防止 worker 线程在删除后复活任务
-    if task_id in state.get('taskTrash', {}):
-        return
-    state.setdefault('tasks', {})[snap['id']] = snap
-    save_state(state)
+    task_id = snap['id']
+    with STATE_LOCK:
+        try:
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+        except Exception:
+            state = {}
+        state.setdefault('tasks', {})
+        state.setdefault('taskTrash', {})
+        # 如果任务已在回收站，不再写回（防止 worker 线程复活已删除的任务）
+        if task_id in state.get('taskTrash', {}):
+            return
+        state['tasks'][task_id] = snap
+        tmp = STATE_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, STATE_FILE)
 
 
 def delete_persisted_task(task_id):
@@ -1536,12 +1547,18 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         """Unified task list: merge live remote tasks + persisted upload/download records.
 
         Live remote tasks take precedence over stale persisted snapshots.
+        Tasks present in taskTrash are always excluded (prevents resurrected tasks
+        from appearing after a soft-delete).
         Returns {success, items} sorted by createdAt desc.
         """
-        persisted = load_persisted_tasks()
+        state = load_state()
+        persisted = state.get('tasks', {}) or {}
+        trash_ids = set(state.get('taskTrash', {}).keys())
         items_by_id = {}
         # Start from persisted snapshots (covers upload/download history + remote)
         for task_id, snap in persisted.items():
+            if task_id in trash_ids:
+                continue
             snap = dict(snap or {})
             snap.setdefault('id', task_id)
             snap.setdefault('kind', 'remote')
@@ -1549,6 +1566,8 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         # Live remote tasks override their persisted counterparts (fresher progress)
         with REMOTE_TASKS_LOCK:
             for task_id, task in REMOTE_TASKS.items():
+                if task_id in trash_ids:
+                    continue
                 items_by_id[task_id] = remote_task_snapshot(task)
         items = list(items_by_id.values())
         items.sort(key=lambda x: x.get('createdAt') or 0, reverse=True)
@@ -2158,9 +2177,22 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         self.send_json({'success': True, 'task': snap})
 
     def _api_tasks_trash(self, qs=None):
-        """Return soft-deleted task snapshots, newest first."""
+        """Return soft-deleted task snapshots, newest first.
+        Filters out entries with no meaningful content to avoid showing
+        blank ♻️ rows in the trash UI.
+        """
         trash_map = load_state().get('taskTrash', {})
-        items = [dict(s or {}, id=tid) for tid, s in trash_map.items()]
+        items = []
+        for tid, s in trash_map.items():
+            snap = dict(s or {})
+            snap.setdefault('id', tid)
+            # 跳过完全没有内容的空条目（只有 id 和 deletedAt，没有任何实际信息）
+            has_content = snap.get('name') or snap.get('url') or snap.get('path') or snap.get('status')
+            if not has_content:
+                continue
+            snap.setdefault('kind', 'remote')
+            snap.setdefault('name', '未命名任务')
+            items.append(snap)
         items.sort(key=lambda x: x.get('deletedAt') or x.get('createdAt') or 0, reverse=True)
         self.send_json({'success': True, 'items': items})
 
