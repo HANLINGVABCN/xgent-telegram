@@ -2056,118 +2056,208 @@ class FileManagerHandler(BaseHTTPRequestHandler):
     def _api_tasks_delete(self):
         """Delete one or more task records.
 
-        Body: { ids?: [...], id?: 'x', trash?: bool }
+        Body: {
+            ids?: ['x', ...] | 'x',          # ids to delete
+            id?:  'x',                        # singular alias of ids
+            items?: [{ id, kind, path, ...snap_fields }, ...],  # rich delete
+            trash?: bool                      # default true
+        }
         - trash=true (default): soft-delete — move snapshot from state['tasks']
           into state['taskTrash'] so it no longer shows in the main list but is
           recoverable. Stops live task + removes .part/.temp artifacts.
         - trash=false: hard-delete — permanently remove from state['taskTrash'].
+
+        Matching strategy per requested item (so soft-delete actually lands even
+        when the client's local id differs from the server-persisted id, e.g.
+        upload tasks where the client id is 'up:timestamp:rand' but the server
+        id is 'up:token' from /api/upload-init, or download tasks the server
+        never persists at all):
+            1. exact id  ->  state['tasks'] / REMOTE_TASKS / state['taskTrash']
+            2. (kind, path) fallback  ->  state['tasks'] (upload/download history)
+            3. no server record  ->  persist the client-supplied snapshot
+               straight into taskTrash (so the trash UI still shows an entry)
         """
         data = self.read_json()
+        trash = data.get('trash', True)
+
+        # Build a normalized request list. Each entry is a dict with at least
+        # {id}, optionally {kind, path} and extra snapshot fields.
+        req_items = []
+        raw_items = data.get('items')
+        if isinstance(raw_items, list):
+            for it in raw_items:
+                if not isinstance(it, dict):
+                    continue
+                rid = str(it.get('id') or it.get('serverTaskId') or it.get('remoteId') or '').strip()
+                if rid:
+                    it = dict(it)
+                    it['id'] = rid
+                    req_items.append(it)
         ids = data.get('ids') or []
         if isinstance(ids, str):
             ids = [ids]
-        if not ids:
-            # accept singular id too
-            single = str(data.get('id', '') or '').strip()
-            if single:
-                ids = [single]
-        if not ids:
+        for tid in ids or []:
+            tid = str(tid or '').strip()
+            if tid:
+                req_items.append({'id': tid})
+        single = str(data.get('id', '') or '').strip()
+        if single and not any(it.get('id') == single for it in req_items):
+            req_items.append({'id': single})
+        if not req_items:
             return self.send_err(400, '缺少任务 id')
-        trash = data.get('trash', True)
+
+        # Deduplicate by id (keep the richest entry — the one carrying kind/path)
+        seen = {}
+        for it in req_items:
+            rid = it.get('id')
+            prev = seen.get(rid)
+            if prev is None or (not prev.get('path') and it.get('path')):
+                seen[rid] = it
+        req_items = list(seen.values())
+
         if not trash:
             # Hard-delete from trash only.
             with STATE_LOCK:
                 state = load_state()
                 trash_map = state.get('taskTrash', {})
-                changed = False
-                for task_id in ids:
-                    if trash_map.pop(task_id, None) is not None:
-                        changed = True
+                changed = 0
+                for it in req_items:
+                    rid = it['id']
+                    # exact id
+                    if trash_map.pop(rid, None) is not None:
+                        changed += 1
+                        continue
+                    # (kind, path) fallback inside trash
+                    kind = it.get('kind')
+                    path = it.get('path')
+                    if kind and path:
+                        for tid, s in list(trash_map.items()):
+                            if s.get('kind') == kind and s.get('path') == path:
+                                trash_map.pop(tid, None)
+                                changed += 1
+                                break
                 if changed:
                     state['taskTrash'] = trash_map
                     save_state(state)
-            self.send_ok(f'已彻底删除 {len(ids)} 个任务')
+            self.send_ok(f'已彻底删除 {changed} 个任务')
             return
+
         # Soft-delete: stop live task, move snapshot into trash.
         # 先在 REMOTE_TASKS_LOCK 内拍取所有 live task 快照（避免 STATE_LOCK → REMOTE_TASKS_LOCK 死锁）
         live_tasks = {}
         live_snaps = {}
         with REMOTE_TASKS_LOCK:
-            for task_id in ids:
-                live_task = REMOTE_TASKS.get(task_id)
+            for it in req_items:
+                rid = it['id']
+                live_task = REMOTE_TASKS.get(rid)
                 if live_task:
-                    live_tasks[task_id] = live_task
-                    live_snaps[task_id] = task_snapshot(live_task)
+                    live_tasks[rid] = live_task
+                    live_snaps[rid] = task_snapshot(live_task)
         # 然后在 STATE_LOCK 内完成 load-modify-save，防止 worker 的 save_task 在中间复活任务
+        temp_paths = []  # (task_id, kind, path) for post-lock .part/.temp cleanup
         with STATE_LOCK:
             state = load_state()
             tasks_map = state.get('tasks', {})
             trash_map = state.setdefault('taskTrash', {})
             moved = 0
-            for task_id in ids:
-                # 先拍快照：优先从持久化取，没有则用之前拍的 live snap
-                snap = tasks_map.get(task_id)
-                if snap is None and task_id in live_snaps:
-                    snap = live_snaps[task_id]
+            for it in req_items:
+                rid = it['id']
+                # 1. exact id match in persisted tasks
+                snap = tasks_map.get(rid)
+                matched_id = rid if snap is not None else None
+                # 2. (kind, path) fallback across persisted tasks
+                if snap is None:
+                    kind = it.get('kind')
+                    path = it.get('path')
+                    if kind and path:
+                        for tid, s in tasks_map.items():
+                            sk = s.get('kind') or 'remote'
+                            sp = s.get('path') or ''
+                            if sk == kind and sp and sp == path:
+                                snap = s
+                                matched_id = tid
+                                break
+                # 3. live snap (remote) fallback
+                if snap is None and rid in live_snaps:
+                    snap = live_snaps[rid]
+                    matched_id = rid
+                # 4. nothing on the server — adopt the client snapshot verbatim
+                #    (download tasks the server never persisted; upload tasks
+                #    whose server id we can't resolve) so the trash has an entry.
                 if snap is None:
                     snap = {}
+                    for k in TASK_SNAPSHOT_FIELDS:
+                        if k in it and it[k] not in (None, ''):
+                            snap[k] = it[k]
+                    matched_id = rid
                 snap = dict(snap)
-                # 合并持久化和 live 中的信息，确保回收站条目有足够数据
-                snap.setdefault('id', task_id)
-                snap.setdefault('kind', 'remote')
-                # 优先使用 live_task 的值（更实时），其次使用已有的 snap 值
-                live_task = live_tasks.get(task_id)
+                # 合并 live 中的实时信息，确保回收站条目有足够数据
+                snap.setdefault('id', matched_id or rid)
+                snap.setdefault('kind', it.get('kind') or 'remote')
+                live_task = live_tasks.get(rid)
                 if live_task:
                     for key in ('name', 'status', 'size', 'url', 'path', 'error', 'loaded',
                                 'createdAt', 'startedAt', 'finishedAt', 'lastBps', 'maxBps'):
                         if not snap.get(key) and live_task.get(key):
                             snap[key] = live_task[key]
+                # 用客户端传来的字段补齐（download/未持久化 upload 任务的主要信息来源）
+                for key in ('name', 'kind', 'path', 'url', 'size', 'loaded', 'status', 'error',
+                            'createdAt', 'lastBps', 'maxBps'):
+                    if not snap.get(key) and it.get(key) not in (None, '', 0):
+                        snap[key] = it[key]
                 # 确保基本字段有默认值，避免回收站显示空白条目
-                snap.setdefault('name', '')
-                snap.setdefault('status', '')
-                snap.setdefault('size', 0)
-                snap.setdefault('url', '')
-                snap.setdefault('path', '')
-                snap.setdefault('error', '')
-                snap.setdefault('loaded', 0)
-                snap.setdefault('createdAt', 0)
+                snap.setdefault('name', it.get('name') or '')
+                snap.setdefault('status', it.get('status') or '')
+                snap.setdefault('size', int(it.get('size') or 0) or 0)
+                snap.setdefault('url', it.get('url') or '')
+                snap.setdefault('path', it.get('path') or '')
+                snap.setdefault('error', it.get('error') or '')
+                snap.setdefault('loaded', int(it.get('loaded') or 0) or 0)
+                snap.setdefault('createdAt', it.get('createdAt') or 0)
                 snap['deletedAt'] = time.time()
-                trash_map[task_id] = snap
-                if tasks_map.pop(task_id, None) is not None:
+                final_id = matched_id or rid
+                trash_map[final_id] = snap
+                if matched_id and tasks_map.pop(matched_id, None) is not None:
                     moved += 1
+                temp_paths.append((final_id, snap.get('kind'), snap.get('path', '')))
             state['tasks'] = tasks_map
             state['taskTrash'] = trash_map
             save_state(state)
         # 然后再停止 live task（在 STATE_LOCK 外，避免嵌套锁导致死锁）
-        for task_id in ids:
-            live_task = live_tasks.get(task_id)
-            with REMOTE_TASKS_LOCK:
-                if live_task and REMOTE_TASKS.get(task_id) is live_task:
-                    live_task['cancel'] = True
-                    live_task['pauseRequested'] = False
-                    if live_task.get('status') == 'downloading':
-                        live_task['status'] = 'canceled'
-                        live_task['finishedAt'] = time.time()
-                    temp_path = live_task.get('tempPath') or ''
-                    REMOTE_TASKS.pop(task_id, None)
-                else:
-                    temp_path = ''
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
+        for final_id, kind, path in temp_paths:
+            rid_candidates = {final_id}
+            # also try the original request id (may differ from matched server id)
+            for it in req_items:
+                if it.get('kind') == kind and it.get('path') == path and it.get('path'):
+                    rid_candidates.add(it['id'])
+            for rid in rid_candidates:
+                live_task = live_tasks.get(rid)
+                with REMOTE_TASKS_LOCK:
+                    if live_task and REMOTE_TASKS.get(rid) is live_task:
+                        live_task['cancel'] = True
+                        live_task['pauseRequested'] = False
+                        if live_task.get('status') == 'downloading':
+                            live_task['status'] = 'canceled'
+                            live_task['finishedAt'] = time.time()
+                        temp_path = live_task.get('tempPath') or ''
+                        REMOTE_TASKS.pop(rid, None)
+                    else:
+                        temp_path = ''
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+                UPLOAD_TASKS.pop(rid, None)
             # Remove upload .part if any
-            snap = trash_map.get(task_id, {})
-            if snap.get('kind') == 'upload':
-                full = safe_join(ROOT_DIR, snap.get('path', ''))
+            if kind == 'upload' and path:
+                full = safe_join(ROOT_DIR, path)
                 if full and os.path.exists(full + '.part'):
                     try:
                         os.remove(full + '.part')
                     except OSError:
                         pass
-            UPLOAD_TASKS.pop(task_id, None)
-        self.send_ok(f'已删除 {len(ids)} 个任务')
+        self.send_ok(f'已删除 {len(req_items)} 个任务')
 
     def _api_tasks_restore(self):
         """Restore a soft-deleted task back into the active list.
@@ -3177,11 +3267,27 @@ def _calc_root_size():
 
 
 def _ensure_root_size_worker():
-    """Start the background root size worker if not already running."""
+    """Start the background root size worker if not already running.
+
+    Computes the real size synchronously once before returning, so the first
+    /api/disk request (and thus the first page load) sees the correct value
+    instead of the stale 0 the cache is initialized with.
+    """
     with _root_size_cache['lock']:
         if _root_size_cache['started']:
             return
         _root_size_cache['started'] = True
+        # Synchronous first computation: avoids showing 0 / a wrong number on
+        # the very first page load (the worker loop sleeps up to 60s otherwise).
+        try:
+            logical = _calculate_root_logical_size()
+            allocated = _calculate_root_allocated_size()
+            _root_size_cache['logical'] = logical
+            _root_size_cache['allocated'] = allocated
+            _root_size_cache['size'] = allocated
+            _root_size_cache['updated'] = time.time()
+        except OSError:
+            pass
     t = threading.Thread(target=_calc_root_size, daemon=True)
     t.start()
 

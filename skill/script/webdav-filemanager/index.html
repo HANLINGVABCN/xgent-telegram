@@ -2553,9 +2553,15 @@ async function loadFiles(path) {
     }
 }
 
+// Tracks whether the very first /api/disk fetch has happened. The first call
+// forces a synchronous recompute on the server so the page shows the real root
+// size immediately, instead of the stale 0 the background cache starts with.
+let _diskInfoLoaded = false;
 async function loadDiskInfo(refresh = false) {
+    const force = refresh || !_diskInfoLoaded;
     try {
-        diskInfo = await apiFetch('/api/disk' + (refresh ? '?refresh=1' : ''));
+        diskInfo = await apiFetch('/api/disk' + (force ? '?refresh=1' : ''));
+        _diskInfoLoaded = true;
         renderDisk();
     } catch (e) {
         console.error('Disk info error:', e);
@@ -6675,12 +6681,33 @@ async function deleteDownloadTask(id) {
     const task = downloadTasks[idx];
     if (task.status === 'downloading') await pauseDownloadTask(id);
     // Soft-delete: stop live task + snapshot to trash (one call handles both).
+    // Send the full snapshot (id + serverTaskId + remoteId + kind + path +
+    // name/size/loaded/...) so the server can match by (kind, path) when the
+    // client id differs from the persisted server id (upload/download tasks),
+    // and so download tasks — which the server never persists — still produce
+    // a trash entry instead of vanishing and reappearing after refresh.
+    const kind = task.kind || 'download';
+    const serverId = task.serverTaskId || task.remoteId || task.id;
+    const snap = {
+        id: serverId,
+        localId: task.id,
+        kind,
+        name: task.name || '',
+        path: task.path || '',
+        url: task.url || '',
+        size: Number(task.size) || 0,
+        loaded: Number(task.loaded) || 0,
+        status: task.status || '',
+        error: task.error || '',
+        createdAt: task.createdAt || 0,
+        lastBps: Number(task.lastBps) || 0,
+        maxBps: Number(task.maxBps) || 0,
+    };
     try {
-        const serverId = task.serverTaskId || task.remoteId || task.id;
         await apiFetch('/api/tasks-delete', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: serverId, trash: true }),
+            body: JSON.stringify({ items: [snap], trash: true }),
         });
     } catch (e) {}
     if (task.kind === 'remote') ignoredRemoteTaskIds.add(task.remoteId || task.id);
@@ -6693,17 +6720,32 @@ async function deleteDownloadTask(id) {
 }
 
 async function clearFinishedDownloads() {
-    // Collect finished task ids in the current view to delete server-side
+    // Collect finished tasks in the current view to delete server-side. Send
+    // full snapshots (not just ids) so the server can match by (kind, path)
+    // when the client id differs from the persisted server id, and so tasks
+    // the server never persisted (download kind) still land in the trash.
     const finishedTasks = downloadTasks.filter(t => taskKind(t) === currentTransferTab && (t.status === 'done' || t.status === 'canceled'));
-    const ids = finishedTasks
-        .map(t => t.serverTaskId || t.remoteId || t.id)
-        .filter(Boolean);
-    if (ids.length) {
+    const items = finishedTasks.map(t => ({
+        id: t.serverTaskId || t.remoteId || t.id,
+        localId: t.id,
+        kind: t.kind || 'download',
+        name: t.name || '',
+        path: t.path || '',
+        url: t.url || '',
+        size: Number(t.size) || 0,
+        loaded: Number(t.loaded) || 0,
+        status: t.status || '',
+        error: t.error || '',
+        createdAt: t.createdAt || 0,
+        lastBps: Number(t.lastBps) || 0,
+        maxBps: Number(t.maxBps) || 0,
+    })).filter(it => it.id);
+    if (items.length) {
         try {
             await apiFetch('/api/tasks-delete', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ids, trash: true }),
+                body: JSON.stringify({ items, trash: true }),
             });
         } catch (e) {}
     }
