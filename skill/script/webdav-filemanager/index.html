@@ -5265,7 +5265,39 @@ function startApp() {
     appStarted = true;
     loadDiskInfo();
     loadPinnedFolders();
-    loadFiles('/', { replaceHistory: true });
+    // Restore the view the user was on before the refresh, instead of always
+    // forcing the file browser home page. Prefer history.state (preserved
+    // across a same-document reload); fall back to parsing the URL hash.
+    const saved = (history.state && history.state.fm) ? history.state : null;
+    const initialView = saved ? (saved.view || 'browser') : parseHashView();
+    const initialPath = saved ? (saved.path || '/') : parseHashPath();
+    if (initialView && initialView !== 'browser' && initialView !== 'login') {
+        showView(initialView, { replaceHistory: true });
+        // Non-browser views (download/editor/links) don't depend on a path; just
+        // load the home listing in the background so switching back to browser is instant.
+        loadFiles('/', { replaceHistory: true });
+    } else {
+        loadFiles(initialPath || '/', { replaceHistory: true });
+    }
+}
+
+// Parse the view name (browser|download|editor|links) from the URL hash.
+// Hash formats: '#/path' (browser), '#/download', '#/editor', '#/linkspath'.
+function parseHashView() {
+    const h = (window.location.hash || '').replace(/^#\/?/, '');
+    for (const v of ['download', 'editor', 'links']) {
+        if (h === v || h.startsWith(v + '/') || h.startsWith(v)) return v;
+    }
+    return 'browser';
+}
+
+// Parse the file path from the URL hash (browser view only).
+function parseHashPath() {
+    const h = (window.location.hash || '').replace(/^#\/?/, '');
+    for (const v of ['download', 'editor', 'links']) {
+        if (h === v || h.startsWith(v + '/') || h.startsWith(v)) return '/';
+    }
+    return '/' + h;
 }
 
 async function initAuth() {
@@ -5507,8 +5539,14 @@ function applyHistoryState(state) {
 
 document.addEventListener('DOMContentLoaded', () => {
     navReady = true;
-    history.replaceState(appState(), '', window.location.pathname + window.location.search + '#/');
-    history.pushState(appState(), '', window.location.pathname + window.location.search + '#/');
+    // Preserve the current URL (including its hash) so a page refresh keeps the
+    // user on the same view instead of jumping back to the file-browser home.
+    // Only seed a state object if there isn't a usable one already, so popstate
+    // handlers and startApp() can read back the pre-refresh view.
+    if (!(history.state && history.state.fm)) {
+        const initial = { fm: true, view: parseHashView(), path: parseHashPath() };
+        history.replaceState(initial, '', window.location.pathname + window.location.search + window.location.hash);
+    }
     window.addEventListener('popstate', (e) => {
         if (e.state && e.state.fm) {
             applyHistoryState(e.state);
@@ -6547,10 +6585,35 @@ async function pauseDownloadTask(id) {
     processDownloadQueue();
 }
 
+// Build a soft-delete snapshot for a task, so the trash UI gets a real entry
+// (with name/path/size/...) instead of a blank row that the server filters out.
+function buildTaskSnapshot(task) {
+    if (!task) return null;
+    const kind = task.kind || 'download';
+    const serverId = task.serverTaskId || task.remoteId || task.id;
+    return {
+        id: serverId,
+        localId: task.id,
+        kind,
+        name: task.name || '',
+        path: task.path || '',
+        url: task.url || '',
+        size: Number(task.size) || 0,
+        loaded: Number(task.loaded) || 0,
+        status: task.status || 'canceled',
+        error: task.error || '',
+        createdAt: task.createdAt || 0,
+        lastBps: Number(task.lastBps) || 0,
+        maxBps: Number(task.maxBps) || 0,
+    };
+}
+
 async function cancelDownloadTask(id) {
     const idx = downloadTasks.findIndex(t => t.id === id);
     if (idx < 0) return;
     const task = downloadTasks[idx];
+    // Mark the task canceled before any server call so the snapshot reflects it.
+    task.status = 'canceled';
     if (task.kind === 'remote') {
         try {
             // action=cancel drops the .part file
@@ -6563,6 +6626,14 @@ async function cancelDownloadTask(id) {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ id: task.remoteId || task.id }),
+            });
+        } catch (e) {}
+        // Soft-delete into trash with a real snapshot, so the trash shows the entry.
+        try {
+            await apiFetch('/api/tasks-delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ items: [buildTaskSnapshot(task)], trash: true }),
             });
         } catch (e) {}
     } else if (task.kind === 'upload') {
@@ -6579,23 +6650,40 @@ async function cancelDownloadTask(id) {
                     body: JSON.stringify({ taskId: task.serverTaskId, action: 'cancel' }),
                 });
             } catch (e) {}
-        } else {
+            // Soft-delete the persisted server record into trash (with snapshot).
             try {
                 await apiFetch('/api/tasks-delete', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ id: task.id }),
+                    body: JSON.stringify({ items: [buildTaskSnapshot(task)], trash: true }),
+                });
+            } catch (e) {}
+        } else {
+            // Never persisted server-side: send the snapshot directly to trash.
+            try {
+                await apiFetch('/api/tasks-delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ items: [buildTaskSnapshot(task)], trash: true }),
                 });
             } catch (e) {}
         }
     } else if (task.status === 'downloading' && task.controller) {
-        task.status = 'canceled';
         task.controller.abort();
         try {
             await apiFetch('/api/tasks-delete', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ id: task.id }),
+                body: JSON.stringify({ items: [buildTaskSnapshot(task)], trash: true }),
+            });
+        } catch (e) {}
+    } else {
+        // Paused/queued/errored download: still soft-delete so it shows in trash.
+        try {
+            await apiFetch('/api/tasks-delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ items: [buildTaskSnapshot(task)], trash: true }),
             });
         } catch (e) {}
     }
@@ -6607,6 +6695,8 @@ async function cancelDownloadTask(id) {
     renderDownloadQueue();
     renderDownloadDetails(selectedDownloadTask());
     processDownloadQueue();
+    // Refresh the trash list so the just-canceled task appears immediately.
+    loadTrashedTasks();
 }
 
 async function resumeDownloadTask(id) {
@@ -6681,33 +6771,15 @@ async function deleteDownloadTask(id) {
     const task = downloadTasks[idx];
     if (task.status === 'downloading') await pauseDownloadTask(id);
     // Soft-delete: stop live task + snapshot to trash (one call handles both).
-    // Send the full snapshot (id + serverTaskId + remoteId + kind + path +
-    // name/size/loaded/...) so the server can match by (kind, path) when the
-    // client id differs from the persisted server id (upload/download tasks),
-    // and so download tasks — which the server never persists — still produce
-    // a trash entry instead of vanishing and reappearing after refresh.
-    const kind = task.kind || 'download';
-    const serverId = task.serverTaskId || task.remoteId || task.id;
-    const snap = {
-        id: serverId,
-        localId: task.id,
-        kind,
-        name: task.name || '',
-        path: task.path || '',
-        url: task.url || '',
-        size: Number(task.size) || 0,
-        loaded: Number(task.loaded) || 0,
-        status: task.status || '',
-        error: task.error || '',
-        createdAt: task.createdAt || 0,
-        lastBps: Number(task.lastBps) || 0,
-        maxBps: Number(task.maxBps) || 0,
-    };
+    // buildTaskSnapshot() carries id + kind + path + name/size/loaded/... so the
+    // server can match by (kind, path) when the client id differs from the
+    // persisted server id, and so download tasks (never persisted server-side)
+    // still produce a trash entry instead of vanishing & reappearing on refresh.
     try {
         await apiFetch('/api/tasks-delete', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ items: [snap], trash: true }),
+            body: JSON.stringify({ items: [buildTaskSnapshot(task)], trash: true }),
         });
     } catch (e) {}
     if (task.kind === 'remote') ignoredRemoteTaskIds.add(task.remoteId || task.id);
@@ -6717,6 +6789,8 @@ async function deleteDownloadTask(id) {
     renderDownloadQueue();
     renderDownloadDetails(selectedDownloadTask());
     processDownloadQueue();
+    // Refresh the trash list so the just-deleted task appears immediately.
+    loadTrashedTasks();
 }
 
 async function clearFinishedDownloads() {
@@ -6725,21 +6799,7 @@ async function clearFinishedDownloads() {
     // when the client id differs from the persisted server id, and so tasks
     // the server never persisted (download kind) still land in the trash.
     const finishedTasks = downloadTasks.filter(t => taskKind(t) === currentTransferTab && (t.status === 'done' || t.status === 'canceled'));
-    const items = finishedTasks.map(t => ({
-        id: t.serverTaskId || t.remoteId || t.id,
-        localId: t.id,
-        kind: t.kind || 'download',
-        name: t.name || '',
-        path: t.path || '',
-        url: t.url || '',
-        size: Number(t.size) || 0,
-        loaded: Number(t.loaded) || 0,
-        status: t.status || '',
-        error: t.error || '',
-        createdAt: t.createdAt || 0,
-        lastBps: Number(t.lastBps) || 0,
-        maxBps: Number(t.maxBps) || 0,
-    })).filter(it => it.id);
+    const items = finishedTasks.map(buildTaskSnapshot).filter(it => it && it.id);
     if (items.length) {
         try {
             await apiFetch('/api/tasks-delete', {
@@ -6754,6 +6814,7 @@ async function clearFinishedDownloads() {
     persistLocalTasks();
     renderDownloadQueue();
     renderDownloadDetails(selectedDownloadTask());
+    loadTrashedTasks();
 }
 
 /* ============================================================
@@ -6825,7 +6886,21 @@ async function restoreTrashedTask(id) {
             trashedTasks = trashedTasks.filter(t => t.id !== id);
             toast('已恢复', 'success');
             renderTrashList();
-            await loadAllTasks();   // refresh main list with the restored record
+            // refresh main list with the restored record
+            await loadAllTasks();
+            // The restored task may belong to a different tab/filter than the one
+            // currently shown, so make sure it's visible: switch to its kind tab,
+            // reset the filter to 'all', and select the restored record.
+            const restored = data.task || {};
+            const kind = restored.kind || 'remote';
+            const tab = (kind === 'upload') ? 'upload' : (kind === 'remote' ? 'remote' : 'download');
+            if (currentTransferTab !== tab) setTransferTab(tab);
+            if (currentTransferFilter !== 'all') setTransferFilter('all');
+            const tid = restored.id || id;
+            const match = downloadTasks.find(t => t.id === tid || t.remoteId === tid || t.serverTaskId === tid);
+            if (match) selectedDownloadId = match.id;
+            renderDownloadQueue();
+            renderDownloadDetails(selectedDownloadTask());
         }
     } catch (e) { toast(e.message, 'error'); }
 }
