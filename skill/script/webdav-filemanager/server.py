@@ -54,6 +54,9 @@ AUTH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'filemanage
 MAX_TTL_SECONDS = 10 * 365 * 24 * 60 * 60
 MAX_SPARSE_FILE_SIZE = 100 * 1024 * 1024 * 1024
 MAX_TEXT_EDIT_SIZE = 10 * 1024 * 1024
+# 同一 IP 连续请求间隔若超过此值，视为一次新的下载会话。
+# 用于把多线程/Range 分块下载收敛成"1 次下载"，而非每个分片算 1 次。
+SHARE_SESSION_GAP = 30 * 60
 WEBDAV_DIR_NAME = 'webdav'
 DOWNLOAD_DIR_NAME = 'download'
 REMOTE_TASK_SAMPLE_LIMIT = 240
@@ -1321,11 +1324,11 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         real_ip = self.headers.get('X-Real-IP', '').strip()
         return real_ip or self.client_address[0]
 
-    def _record_share_access(self, state, token, meta, full):
+    def _record_share_access(self, state, token, meta, full, length):
         now = time.time()
         ip = self._client_ip()
         ua = self.headers.get('User-Agent', '')[:240]
-        size = os.path.getsize(full) if full and os.path.isfile(full) else 0
+        file_size = os.path.getsize(full) if full and os.path.isfile(full) else 0
         stats = meta.setdefault('accessStats', {})
         item = stats.setdefault(ip, {
             'ip': ip,
@@ -1333,14 +1336,27 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             'bytes': 0,
             'firstAt': now,
             'lastAt': 0,
+            'lastCountedAt': 0,
+            'sessionBytes': 0,
             'userAgent': '',
         })
-        item['count'] = int(item.get('count') or 0) + 1
-        item['bytes'] = int(item.get('bytes') or 0) + size
+        # 会话判定：同一 IP 距上次请求超过阈值，或换了一个新文件，算一次新下载。
+        gap = now - float(item.get('lastCountedAt') or 0)
+        new_session = gap > SHARE_SESSION_GAP or item.get('fileSize') != file_size
+        item['count'] = int(item.get('count') or 0) + (1 if new_session else 0)
+        item['bytes'] = int(item.get('bytes') or 0) + int(length or 0)
         item['lastAt'] = now
+        item['lastCountedAt'] = now
+        item['fileSize'] = file_size
         item['userAgent'] = ua
-        meta['downloadCount'] = int(meta.get('downloadCount') or 0) + 1
-        meta['downloadBytes'] = int(meta.get('downloadBytes') or 0) + size
+        if new_session:
+            item['sessionBytes'] = int(length or 0)
+        else:
+            item['sessionBytes'] = int(item.get('sessionBytes') or 0) + int(length or 0)
+        # 整体次数同样按会话计；流量按实际传输字节累加。
+        if new_session:
+            meta['downloadCount'] = int(meta.get('downloadCount') or 0) + 1
+        meta['downloadBytes'] = int(meta.get('downloadBytes') or 0) + int(length or 0)
         meta['lastAccessAt'] = now
         save_state(state)
 
@@ -1364,8 +1380,14 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         full = safe_join(ROOT_DIR, meta.get('path', ''))
         if not full or not os.path.isfile(full):
             return self.send_err(404, '文件不存在')
+        # 先解析 Range 得到本次实际要传输的字节数，用于精确统计流量；416 不计入。
+        length = 0
         if not head_only:
-            self._record_share_access(state, token, meta, full)
+            resolved = self._resolve_range(os.path.getsize(full))
+            if resolved is not None:
+                start, end, _ = resolved
+                length = max(0, end - start + 1)
+                self._record_share_access(state, token, meta, full, length)
         self._stream_file(full, head_only=head_only)
 
     def _api_list(self, qs):
@@ -1604,12 +1626,15 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             return self.send_err(404, '文件不存在')
         self._stream_file(full)
 
-    def _stream_file(self, full, head_only=False):
-        file_size = os.path.getsize(full)
-        filename = os.path.basename(full)
-        start = 0
-        end = file_size - 1
-        status = 200
+    def _resolve_range(self, file_size):
+        """Parse the Range header for a single byte range.
+
+        Returns (start, end, status):
+          - (0, file_size-1, 200) when there is no usable Range header;
+          - (start, end, 206) for a valid Range request.
+        Returns None when the range is unsatisfiable (caller should send 416).
+        """
+        start, end, status = 0, file_size - 1, 200
         range_header = self.headers.get('Range', '')
         if range_header.startswith('bytes='):
             spec = range_header[6:].split(',', 1)[0].strip()
@@ -1624,14 +1649,23 @@ class FileManagerHandler(BaseHTTPRequestHandler):
                         if right:
                             end = min(file_size - 1, int(right))
                     if start > end or start >= file_size:
-                        self.send_response(416)
-                        self.send_header('Content-Range', f'bytes */{file_size}')
-                        self.send_header('Content-Length', '0')
-                        self.end_headers()
-                        return
+                        return None
                     status = 206
                 except ValueError:
                     start, end, status = 0, file_size - 1, 200
+        return start, end, status
+
+    def _stream_file(self, full, head_only=False):
+        file_size = os.path.getsize(full)
+        filename = os.path.basename(full)
+        resolved = self._resolve_range(file_size)
+        if resolved is None:
+            self.send_response(416)
+            self.send_header('Content-Range', f'bytes */{file_size}')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        start, end, status = resolved
         length = max(0, end - start + 1)
         st = os.stat(full)
         self.send_response(status)
