@@ -6412,7 +6412,7 @@ function renderDownloadQueue() {
         const active = selectedDownloadId === task.id ? ' active' : '';
         const kind = transferKindText(task);
         const status = downloadTaskStatusText(task);
-        const copyBtn = task.url
+        const copyBtn = (task.kind === 'remote' && task.url)
             ? `<button class="btn" data-download-copy-url="${escAttr(task.url)}" title="复制下载链接">🔗</button>`
             : '';
         let action = '';
@@ -6708,6 +6708,17 @@ async function deleteDownloadTask(id) {
     const task = downloadTasks.find(t => t.id === id);
     if (!task) return;
     if (task.status === 'downloading') await pauseDownloadTask(id);
+    // 远程下载未完成时，通知服务器删除 .part 文件；已完成的保留。
+    if (task.kind === 'remote' && task.status !== 'done') {
+        try {
+            await apiFetch('/api/remote-download-cancel', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: task.remoteId || task.id, action: 'cancel' }),
+            });
+        } catch (e) {}
+        task.status = 'canceled';
+    }
     trashTask(task);
 }
 
@@ -6748,6 +6759,9 @@ function restoreTask(task) {
     if (!task || !task.trashed) return;
     task.trashed = false;
     delete task.deletedAt;
+    // 已取消的任务恢复后，状态重置为 paused，这样渲染时显示 ▶（继续）按钮
+    // 而非 ✕（已取消）按钮。
+    if (task.status === 'canceled') task.status = 'paused';
     // 选中它，并切到它所属的 tab + 重置过滤，保证恢复后立即可见。
     const kind = task.kind || 'download';
     const tab = kind === 'upload' ? 'upload' : (kind === 'remote' ? 'remote' : 'download');
@@ -6843,6 +6857,7 @@ function renderTrashList() {
                 <span class="download-task-drag">♻️</span>
                 <div class="download-task-name" title="${escAttr(task.path || task.url || '')}">${esc(task.name || '未命名任务')}</div>
                 <div class="download-task-actions">
+                    ${(task.kind === 'remote' && task.url) ? `<button class="btn" data-trash-copy-url="${escAttr(task.url)}" title="复制下载链接">🔗</button>` : ''}
                     <button class="btn" data-trash-restore="${escAttr(task.id)}" title="恢复">↩</button>
                     <button class="btn btn-danger" data-trash-purge="${escAttr(task.id)}" title="彻底删除">🗑</button>
                 </div>
@@ -6858,6 +6873,21 @@ function renderTrashList() {
     }).join('');
     list.querySelectorAll('[data-trash-restore]').forEach(btn => btn.onclick = () => restoreTrashedTask(btn.getAttribute('data-trash-restore')));
     list.querySelectorAll('[data-trash-purge]').forEach(btn => btn.onclick = () => purgeTrashedTask(btn.getAttribute('data-trash-purge')));
+    list.querySelectorAll('[data-trash-copy-url]').forEach(btn => btn.onclick = async () => {
+        const url = btn.getAttribute('data-trash-copy-url');
+        if (!url) return toast('无可用链接', 'warning');
+        try {
+            await navigator.clipboard.writeText(url);
+        } catch (e) {
+            const input = document.createElement('input');
+            input.value = url;
+            document.body.appendChild(input);
+            input.select();
+            try { document.execCommand('copy'); } catch (_) {}
+            input.remove();
+        }
+        toast('已复制下载链接', 'success');
+    });
     renderDownloadTotals();
 }
 
