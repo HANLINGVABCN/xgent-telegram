@@ -13,6 +13,9 @@ bot_memory.db-*
 *.sqlite3
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
+*db*
 bot_storage/
 
 # 用户记忆（每条一个文件，含用户私密事实/偏好，绝不上传）
@@ -56,6 +59,9 @@ pip-delete-this-directory.txt
 # 本地临时测试脚本
 test_memory_offline.py
 test_*.py
+test_*
+*test*
+test/
 
 # Build and package artifacts
 build/
@@ -77,6 +83,9 @@ desktop.ini
 *.swo
 *.tmp
 *.bak
+*.bak.*
+*.editbak.*
+*.bak*
 *.orig
 *~
 *.code-workspace
@@ -95,6 +104,8 @@ id_ed25519*
 *.tgz
 *.7z
 *.rar
+.install-state/
+.local-api-data/
 
 # Jupyter Notebook
 .ipynb_checkpoints
