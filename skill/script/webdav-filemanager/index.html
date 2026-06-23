@@ -2313,6 +2313,9 @@ function persistLocalTasks() {
             samples: (t.samples || []).slice(-60),
             createdAt: t.createdAt || (Date.now() / 1000),
             needsFile: !!t.needsFile,
+            // 保留回收站标记，刷新后回收站仍能看到被删的任务。
+            trashed: !!t.trashed,
+            deletedAt: t.deletedAt || 0,
         }));
         localStorage.setItem(LOCAL_TASKS_KEY, JSON.stringify(snap));
         // 同时保存已忽略的远程任务 ID，防止刷新后被删除的任务重新出现
@@ -2373,6 +2376,9 @@ function loadLocalTasks() {
                 file: null,
                 needsFile: (s.kind === 'upload' && ['paused', 'error', 'queued'].includes(status)) || !!s.needsFile,
                 createdAt: s.createdAt,
+                // 恢复回收站标记，刷新后回收站仍能看到被删的任务。
+                trashed: !!s.trashed,
+                deletedAt: s.deletedAt || 0,
             });
         });
     } catch (e) {}
@@ -5256,27 +5262,33 @@ function setAppVisible(visible) {
     if (visible) showView(currentView || 'browser', { skipHistory: true });
 }
 
-function startApp() {
+async function startApp() {
     hideLogin();
-    setAppVisible(true);
     const settingsBtn = document.getElementById('settingsBtn');
     if (settingsBtn) settingsBtn.style.display = authRequired ? 'inline-flex' : 'none';
     if (appStarted) return;
     appStarted = true;
-    loadDiskInfo();
+    // Load disk info first and AWAIT it so the header shows correct values immediately
+    await loadDiskInfo();
     loadPinnedFolders();
-    // Restore the view the user was on before the refresh, instead of always
-    // forcing the file browser home page. Prefer history.state (preserved
-    // across a same-document reload); fall back to parsing the URL hash.
+    // Restore the view the user was on before the refresh, BEFORE calling
+    // setAppVisible(true), because setAppVisible() -> showView(currentView) and
+    // currentView defaults to 'browser' — so if we don't set currentView first,
+    // the app renders the home page on every refresh.
+    // Prefer history.state (preserved across a same-document reload); fall back
+    // to parsing the URL hash.
     const saved = (history.state && history.state.fm) ? history.state : null;
     const initialView = saved ? (saved.view || 'browser') : parseHashView();
     const initialPath = saved ? (saved.path || '/') : parseHashPath();
+    currentView = initialView || 'browser';
     if (initialView && initialView !== 'browser' && initialView !== 'login') {
+        // Non-browser view: switch to it (without loading files), but preload
+        // the home listing in the background so going back to browser is instant.
+        setAppVisible(true);
         showView(initialView, { replaceHistory: true });
-        // Non-browser views (download/editor/links) don't depend on a path; just
-        // load the home listing in the background so switching back to browser is instant.
         loadFiles('/', { replaceHistory: true });
     } else {
+        setAppVisible(true);
         loadFiles(initialPath || '/', { replaceHistory: true });
     }
 }
@@ -5583,10 +5595,11 @@ function taskKind(task) {
 }
 
 function taskMatchesFilter(task) {
-    // active: queued + downloading + paused + error (进行中含失败和暂停)
-    // done: done (已完成不含 canceled，因为 canceled 是用户主动取消)
-    // trash: handled by renderTrashList — main list never shows trash items.
-    if (currentTransferFilter === 'trash') return false;
+    // 单一来源：task.trashed 决定任务在主列表还是回收站。
+    //   trashed=true  -> 只在回收站（trash filter）显示
+    //   trashed=false -> 在主列表（all/active/done）显示，按 status 二次过滤
+    if (currentTransferFilter === 'trash') return !!task.trashed;
+    if (task.trashed) return false;
     if (currentTransferFilter === 'all') return true;
     if (currentTransferFilter === 'active') {
         return ['queued', 'downloading', 'paused', 'error'].includes(task.status);
@@ -5609,9 +5622,9 @@ function setTransferFilter(filter) {
         if (el) el.classList.toggle('active', currentTransferFilter === value);
     });
     if (currentTransferFilter === 'trash') {
-        // Trash view is a separate list; clear the detail panel selection.
+        // 回收站直接复用主数组里 trashed 的任务，无需额外请求。
         selectedDownloadId = '';
-        loadTrashedTasks();
+        renderDownloadQueue();
         renderDownloadDetails(null);
         return;
     }
@@ -5662,7 +5675,8 @@ function setTransferTab(tab) {
 }
 
 function transferTaskCount() {
-    return downloadTasks.filter(t => !['done', 'canceled'].includes(t.status)).length;
+    // 角标只算非完成、非取消、且不在回收站里的任务。
+    return downloadTasks.filter(t => !t.trashed && !['done', 'canceled'].includes(t.status)).length;
 }
 
 function updateTransferBadge() {
@@ -5769,9 +5783,11 @@ async function pollAllTasks() {
                 mergePersistedTask(raw);
             }
         });
-        // 清理：服务端已不存在的远程任务（已被删除），且不在本地进行中，应从本地列表移除
+        // 清理：服务端已不存在的远程任务（已被删除），且不在本地进行中，应从本地列表移除。
+        // 注意：trashed=true 的任务（在回收站里）要保留，不能清理掉。
         const toRemove = [];
         downloadTasks.forEach((t, i) => {
+            if (t.trashed) return;  // 回收站里的任务不清理
             if (t.kind === 'remote' && !serverIds.has(t.remoteId || t.id) && !t.controller) {
                 // 只移除非活跃的远程任务（没有 controller 的）
                 if (!['queued', 'downloading'].includes(t.status)) {
@@ -5808,9 +5824,11 @@ async function loadAllTasks() {
             if (kind === 'remote') mergeRemoteTask(raw);
             else mergePersistedTask(raw);
         });
-        // 清理：服务端已不存在的远程任务（已被软删除），从本地列表移除
+        // 清理：服务端已不存在的远程任务（已被软删除），从本地列表移除。
+        // 注意：trashed=true 的任务（在回收站里）要保留，不能清理掉。
         const before = downloadTasks.length;
         downloadTasks = downloadTasks.filter(t => {
+            if (t.trashed) return true;  // 回收站里的任务保留
             if (t.kind !== 'remote') return true;
             const rid = t.remoteId || t.id;
             if (ignoredRemoteTaskIds.has(rid)) return false;
@@ -5843,6 +5861,8 @@ function mergePersistedTask(raw) {
     let task = downloadTasks.find(t => t.id === raw.id)
         || downloadTasks.find(t => (t.kind || 'download') === (raw.kind || 'download')
             && t.path === raw.path && t.path);
+    // 已在回收站的任务（trashed）不合并服务端数据，避免覆盖删除状态。
+    if (task && task.trashed) return;
     if (task && task.controller) {
         // Live in-progress task: only refresh progress fields, don't clobber status
         task.loaded = Number(raw.loaded) || task.loaded;
@@ -5901,6 +5921,8 @@ function mergeRemoteTask(raw) {
     if (!raw || !raw.id) return;
     if (ignoredRemoteTaskIds.has(raw.id)) return;
     let task = downloadTasks.find(t => t.id === raw.id);
+    // 已在回收站的任务（trashed）不合并服务端数据，避免覆盖删除状态。
+    if (task && task.trashed) return;
     // 如果本地标记了 localPaused 且服务端状态还是 downloading/queued，
     // 说明暂停请求还没生效，跳过此次合并防止状态被覆盖
     if (task && task.localPaused && ['downloading', 'queued'].includes(raw.status)) return;
@@ -6585,63 +6607,21 @@ async function pauseDownloadTask(id) {
     processDownloadQueue();
 }
 
-// Build a soft-delete snapshot for a task, so the trash UI gets a real entry
-// (with name/path/size/...) instead of a blank row that the server filters out.
-function buildTaskSnapshot(task) {
-    if (!task) return null;
-    const kind = task.kind || 'download';
-    const serverId = task.serverTaskId || task.remoteId || task.id;
-    return {
-        id: serverId,
-        localId: task.id,
-        kind,
-        name: task.name || '',
-        path: task.path || '',
-        url: task.url || '',
-        size: Number(task.size) || 0,
-        loaded: Number(task.loaded) || 0,
-        status: task.status || 'canceled',
-        error: task.error || '',
-        createdAt: task.createdAt || 0,
-        lastBps: Number(task.lastBps) || 0,
-        maxBps: Number(task.maxBps) || 0,
-    };
-}
-
 async function cancelDownloadTask(id) {
-    const idx = downloadTasks.findIndex(t => t.id === id);
-    if (idx < 0) return;
-    const task = downloadTasks[idx];
-    // Mark the task canceled before any server call so the snapshot reflects it.
+    const task = downloadTasks.find(t => t.id === id);
+    if (!task) return;
+    // 取消 = 停掉实际传输 + 打 trashed 标记，任务留在数组里进回收站。
     task.status = 'canceled';
     if (task.kind === 'remote') {
         try {
-            // action=cancel drops the .part file
             await apiFetch('/api/remote-download-cancel', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ id: task.remoteId || task.id, action: 'cancel' }),
             });
-            await apiFetch('/api/remote-download-delete', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ id: task.remoteId || task.id }),
-            });
-        } catch (e) {}
-        // Soft-delete into trash with a real snapshot, so the trash shows the entry.
-        try {
-            await apiFetch('/api/tasks-delete', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ items: [buildTaskSnapshot(task)], trash: true }),
-            });
         } catch (e) {}
     } else if (task.kind === 'upload') {
-        // Stop local chunk + drop server .part and record
-        if (task.status === 'downloading' && task.controller) {
-            task._cancelRequested = true;
-            task.controller.abort();
-        }
+        if (task.controller) { task._cancelRequested = true; task.controller.abort(); }
         if (task.serverTaskId) {
             try {
                 await apiFetch('/api/upload-cancel', {
@@ -6650,53 +6630,12 @@ async function cancelDownloadTask(id) {
                     body: JSON.stringify({ taskId: task.serverTaskId, action: 'cancel' }),
                 });
             } catch (e) {}
-            // Soft-delete the persisted server record into trash (with snapshot).
-            try {
-                await apiFetch('/api/tasks-delete', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ items: [buildTaskSnapshot(task)], trash: true }),
-                });
-            } catch (e) {}
-        } else {
-            // Never persisted server-side: send the snapshot directly to trash.
-            try {
-                await apiFetch('/api/tasks-delete', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ items: [buildTaskSnapshot(task)], trash: true }),
-                });
-            } catch (e) {}
         }
-    } else if (task.status === 'downloading' && task.controller) {
+    } else if (task.controller) {
         task.controller.abort();
-        try {
-            await apiFetch('/api/tasks-delete', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ items: [buildTaskSnapshot(task)], trash: true }),
-            });
-        } catch (e) {}
-    } else {
-        // Paused/queued/errored download: still soft-delete so it shows in trash.
-        try {
-            await apiFetch('/api/tasks-delete', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ items: [buildTaskSnapshot(task)], trash: true }),
-            });
-        } catch (e) {}
     }
     finishDownloadActivity(task);
-    downloadTasks.splice(idx, 1);
-    if (task.kind === 'remote') ignoredRemoteTaskIds.add(task.remoteId || task.id);
-    if (selectedDownloadId === id) selectedDownloadId = visibleTransferTasks()[0]?.id || '';
-    persistLocalTasks();
-    renderDownloadQueue();
-    renderDownloadDetails(selectedDownloadTask());
-    processDownloadQueue();
-    // Refresh the trash list so the just-canceled task appears immediately.
-    loadTrashedTasks();
+    trashTask(task);
 }
 
 async function resumeDownloadTask(id) {
@@ -6766,60 +6705,73 @@ function pickFileForResume(task) {
 }
 
 async function deleteDownloadTask(id) {
-    const idx = downloadTasks.findIndex(t => t.id === id);
-    if (idx < 0) return;
-    const task = downloadTasks[idx];
+    const task = downloadTasks.find(t => t.id === id);
+    if (!task) return;
     if (task.status === 'downloading') await pauseDownloadTask(id);
-    // Soft-delete: stop live task + snapshot to trash (one call handles both).
-    // buildTaskSnapshot() carries id + kind + path + name/size/loaded/... so the
-    // server can match by (kind, path) when the client id differs from the
-    // persisted server id, and so download tasks (never persisted server-side)
-    // still produce a trash entry instead of vanishing & reappearing on refresh.
-    try {
-        await apiFetch('/api/tasks-delete', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ items: [buildTaskSnapshot(task)], trash: true }),
-        });
-    } catch (e) {}
-    if (task.kind === 'remote') ignoredRemoteTaskIds.add(task.remoteId || task.id);
-    downloadTasks.splice(idx, 1);
-    if (selectedDownloadId === id) selectedDownloadId = visibleTransferTasks()[0]?.id || '';
-    persistLocalTasks();
-    renderDownloadQueue();
-    renderDownloadDetails(selectedDownloadTask());
-    processDownloadQueue();
-    // Refresh the trash list so the just-deleted task appears immediately.
-    loadTrashedTasks();
+    trashTask(task);
 }
 
 async function clearFinishedDownloads() {
-    // Collect finished tasks in the current view to delete server-side. Send
-    // full snapshots (not just ids) so the server can match by (kind, path)
-    // when the client id differs from the persisted server id, and so tasks
-    // the server never persisted (download kind) still land in the trash.
-    const finishedTasks = downloadTasks.filter(t => taskKind(t) === currentTransferTab && (t.status === 'done' || t.status === 'canceled'));
-    const items = finishedTasks.map(buildTaskSnapshot).filter(it => it && it.id);
-    if (items.length) {
-        try {
-            await apiFetch('/api/tasks-delete', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ items, trash: true }),
-            });
-        } catch (e) {}
-    }
-    downloadTasks = downloadTasks.filter(t => !(taskKind(t) === currentTransferTab && (t.status === 'done' || t.status === 'canceled')));
-    if (!visibleTransferTasks().some(t => t.id === selectedDownloadId)) selectedDownloadId = visibleTransferTasks()[0]?.id || '';
+    // 清除完成 = 把当前 tab 里已完成/取消的任务打 trashed 标记，它们自动进回收站。
+    downloadTasks.forEach(t => {
+        if (taskKind(t) === currentTransferTab && !t.trashed && (t.status === 'done' || t.status === 'canceled')) {
+            trashTask(t, { reRender: false });
+        }
+    });
     persistLocalTasks();
     renderDownloadQueue();
     renderDownloadDetails(selectedDownloadTask());
-    loadTrashedTasks();
 }
 
 /* ============================================================
    Task Trash (回收站)
    ============================================================ */
+// 统一状态切换：所有删除/取消/恢复/清空都走这三个函数，纯前端改 trashed 属性，
+// 任务始终留在 downloadTasks 里——主列表按 trashed=false 过滤，回收站按 trashed=true
+// 过滤。这样删除/恢复立即生效，不需要重新加载或等后端。
+function trashTask(task, opts) {
+    if (!task || task.trashed) return;
+    task.trashed = true;
+    task.deletedAt = task.deletedAt || Date.now();
+    // 移到队尾，回收站里最新删的在最上面（renderTrashList 会再排序）。
+    const idx = downloadTasks.indexOf(task);
+    if (idx >= 0) { downloadTasks.splice(idx, 1); downloadTasks.push(task); }
+    if (selectedDownloadId === task.id) selectedDownloadId = visibleTransferTasks()[0]?.id || '';
+    if (opts && opts.reRender === false) return;
+    persistLocalTasks();
+    renderDownloadQueue();
+    renderDownloadDetails(selectedDownloadTask());
+    syncTrashActions();
+}
+
+function restoreTask(task) {
+    if (!task || !task.trashed) return;
+    task.trashed = false;
+    delete task.deletedAt;
+    // 选中它，并切到它所属的 tab + 重置过滤，保证恢复后立即可见。
+    const kind = task.kind || 'download';
+    const tab = kind === 'upload' ? 'upload' : (kind === 'remote' ? 'remote' : 'download');
+    if (currentTransferTab !== tab) setTransferTab(tab);
+    if (currentTransferFilter === 'trash') setTransferFilter('all');
+    selectedDownloadId = task.id;
+    persistLocalTasks();
+    renderDownloadQueue();
+    renderDownloadDetails(task);
+    syncTrashActions();
+}
+
+function purgeTask(task) {
+    if (!task) return;
+    // 彻底删除 = 从数组里真正移除。
+    const idx = downloadTasks.indexOf(task);
+    if (idx >= 0) downloadTasks.splice(idx, 1);
+    if (selectedDownloadId === task.id) selectedDownloadId = '';
+    persistLocalTasks();
+    renderDownloadQueue();
+    renderDownloadDetails(selectedDownloadTask());
+    syncTrashActions();
+}
+
 function syncTrashActions() {
     // "清空回收站" only appears in the trash view (it lives in the task-list
     // header next to the filter chips, separate from the top "清除完成" button).
@@ -6828,17 +6780,51 @@ function syncTrashActions() {
     if (ct) ct.style.display = isTrash ? '' : 'none';
 }
 
+// 回收站现在直接复用主数组里 trashed=true 的任务，不再单独从后端拉。
+// 保留这个函数仅为兼容旧调用点（启动时同步一次后端，捡漏刷新前已删的任务）。
 async function loadTrashedTasks() {
     try {
         const data = await apiFetch('/api/tasks-trash');
-        trashedTasks = Array.isArray(data.items) ? data.items : [];
-    } catch (e) {
-        trashedTasks = [];
-    }
+        const serverTrash = Array.isArray(data.items) ? data.items : [];
+        // 用后端记录给本地 trashed 任务补齐（启动时本地数组可能还没这些条目）。
+        serverTrash.forEach(snap => {
+            if (!snap || !snap.id) return;
+            const localId = snap.localId || snap.id;
+            let t = downloadTasks.find(x => x.id === localId)
+                  || downloadTasks.find(x => (x.serverTaskId || x.remoteId) === snap.id);
+            if (t) {
+                // 已在数组里：只打标记，不覆盖实时数据。
+                t.trashed = true;
+                if (!t.deletedAt) t.deletedAt = snap.deletedAt || Date.now();
+            } else {
+                // 刷新前删的、本地数组没有的：补一条 display-only 记录。
+                downloadTasks.push({
+                    id: localId,
+                    kind: snap.kind || 'download',
+                    remoteId: snap.id,
+                    serverTaskId: snap.kind === 'upload' ? snap.id : '',
+                    name: snap.name || '未命名任务',
+                    path: snap.path || '',
+                    url: snap.url || '',
+                    status: snap.status || '',
+                    size: Number(snap.size) || 0,
+                    loaded: Number(snap.loaded) || 0,
+                    error: snap.error || '',
+                    trashed: true,
+                    deletedAt: snap.deletedAt || Date.now(),
+                    displayOnly: true,
+                });
+            }
+        });
+    } catch (e) { /* ignore */ }
     renderTrashList();
 }
 
 function renderTrashList() {
+    // 回收站 = 主数组里 trashed=true 的任务（当前 tab）。和主列表共用一套数据，
+    // 所以删除/恢复都是纯前端状态切换，立即生效，无需重新加载。
+    trashedTasks = downloadTasks.filter(t => taskKind(t) === currentTransferTab && t.trashed);
+    trashedTasks.sort((a, b) => (b.deletedAt || 0) - (a.deletedAt || 0));
     const list = document.getElementById('downloadQueueList');
     const count = document.getElementById('downloadQueueCount');
     if (!list || !count) return;
@@ -6876,63 +6862,27 @@ function renderTrashList() {
 }
 
 async function restoreTrashedTask(id) {
-    try {
-        const data = await apiFetch('/api/tasks-restore', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id }),
-        });
-        if (data && data.success) {
-            trashedTasks = trashedTasks.filter(t => t.id !== id);
-            toast('已恢复', 'success');
-            renderTrashList();
-            // refresh main list with the restored record
-            await loadAllTasks();
-            // The restored task may belong to a different tab/filter than the one
-            // currently shown, so make sure it's visible: switch to its kind tab,
-            // reset the filter to 'all', and select the restored record.
-            const restored = data.task || {};
-            const kind = restored.kind || 'remote';
-            const tab = (kind === 'upload') ? 'upload' : (kind === 'remote' ? 'remote' : 'download');
-            if (currentTransferTab !== tab) setTransferTab(tab);
-            if (currentTransferFilter !== 'all') setTransferFilter('all');
-            const tid = restored.id || id;
-            const match = downloadTasks.find(t => t.id === tid || t.remoteId === tid || t.serverTaskId === tid);
-            if (match) selectedDownloadId = match.id;
-            renderDownloadQueue();
-            renderDownloadDetails(selectedDownloadTask());
-        }
-    } catch (e) { toast(e.message, 'error'); }
+    // 恢复 = 把 trashed 改回 false，任务自动回到主列表。纯前端，立即生效。
+    const task = downloadTasks.find(t => t.id === id);
+    if (!task || !task.trashed) return;
+    restoreTask(task);
+    toast('已恢复', 'success');
 }
 
 async function purgeTrashedTask(id) {
-    try {
-        await apiFetch('/api/tasks-delete', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id, trash: false }),
-        });
-        trashedTasks = trashedTasks.filter(t => t.id !== id);
-        toast('已彻底删除', 'success');
-        renderTrashList();
-    } catch (e) { toast(e.message, 'error'); }
+    // 彻底删除 = 从数组里真正移除。
+    const task = downloadTasks.find(t => t.id === id);
+    if (!task) return;
+    purgeTask(task);
+    toast('已彻底删除', 'success');
 }
 
 async function clearTrash() {
-    if (!trashedTasks.length) return toast('回收站为空', 'info');
-    showConfirm('🗑️ 清空回收站', `确定要彻底删除回收站里的 ${trashedTasks.length} 个记录吗？此操作不可恢复。`, async () => {
-        const ids = trashedTasks.map(t => t.id).filter(Boolean);
-        if (!ids.length) return;
-        try {
-            await apiFetch('/api/tasks-delete', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ids, trash: false }),
-            });
-            trashedTasks = [];
-            toast('回收站已清空', 'success');
-            renderTrashList();
-        } catch (e) { toast(e.message, 'error'); }
+    const items = downloadTasks.filter(t => t.trashed);
+    if (!items.length) return toast('回收站为空', 'info');
+    showConfirm('🗑️ 清空回收站', `确定要彻底删除回收站里的 ${items.length} 个记录吗？此操作不可恢复。`, async () => {
+        items.forEach(purgeTask);
+        toast('回收站已清空', 'success');
     });
 }
 
