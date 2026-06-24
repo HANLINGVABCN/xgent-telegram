@@ -2552,9 +2552,20 @@ class AgentExecutor:
         return os.path.abspath(os.path.join(cls.WORK_DIR, cleaned))
 
     @classmethod
+    def resolve_write_path(cls, requested_path: str) -> str:
+        """写文件用的路径解析：相对路径一律落到项目根的 workspace/ 下（自动创建），
+        绝对路径原样。读路径不走这里，仍用 resolve_file_path，保持能读到项目已有文件。"""
+        cleaned = requested_path.strip()
+        if not cleaned:
+            raise ValueError("文件路径为空")
+        if os.path.isabs(cleaned):
+            return os.path.abspath(cleaned)
+        return os.path.abspath(os.path.join(cls.WORK_DIR, 'workspace', cleaned))
+
+    @classmethod
     async def write_file(cls, requested_path: str, content: str) -> Dict[str, Any]:
         """将文件真实写入服务器。"""
-        target_path = cls.resolve_file_path(requested_path)
+        target_path = cls.resolve_write_path(requested_path)
         existed = os.path.exists(target_path)
         byte_size = len(content.encode('utf-8'))
 
@@ -10918,7 +10929,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         if not clean_b64:
                             raise ValueError("base64 内容为空")
                         raw_bytes = base64.b64decode(clean_b64, validate=False)
-                        b64_target_path = AgentExecutor.resolve_file_path(filename)
+                        b64_target_path = AgentExecutor.resolve_write_path(filename)
                         b64_existed = os.path.exists(b64_target_path)
 
                         def _write_b64_bytes(path=b64_target_path, data=raw_bytes):
