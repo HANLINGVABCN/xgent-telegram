@@ -6870,7 +6870,8 @@ class CallbackDataStore:
 # --- ☆ UI 构建 ☆ ---
 def build_magic_keyboard(items: List[str], page: int, callback_prefix: str, back_callback: str,
                          search_callback: Optional[str] = None, filter_text: Optional[str] = None,
-                         extra_buttons: Optional[List[InlineKeyboardButton]] = None):
+                         extra_buttons: Optional[List[InlineKeyboardButton]] = None,
+                         marker_fn: Optional[callable] = None):
     PER_PAGE = 8
     display_list = [m for m in items if filter_text and filter_text.lower() in m.lower()] if filter_text else items
     total_pages = math.ceil(len(display_list) / PER_PAGE) or 1
@@ -6882,6 +6883,10 @@ def build_magic_keyboard(items: List[str], page: int, callback_prefix: str, back
     row = []
     for m in current_items:
         display_name = pretty_model_name(m)
+        if marker_fn:
+            marker = marker_fn(m)
+            if marker:
+                display_name = f"{display_name} {marker}"
         is_long = len(display_name) > 16
         # 使用短哈希避免超长
         cb_data = CallbackDataStore.store(f"{callback_prefix}{m}")
@@ -7260,6 +7265,32 @@ def get_default_model_provider_menu(target: str):
     return InlineKeyboardMarkup(keyboard)
 
 
+def make_manage_marker_fn(prov_name: str):
+    """管理模式标记：模型是当前对话或媒体默认时返回 ✅"""
+    def marker_fn(model_name: str) -> Optional[str]:
+        chat_model = UserDataManager.get('default_model')
+        chat_prov = UserDataManager.get('active_provider_key')
+        media_model = UserDataManager.get('default_media_model')
+        media_prov = UserDataManager.get('default_media_provider_key')
+        if (chat_prov == prov_name and chat_model == model_name) or \
+           (media_prov == prov_name and media_model == model_name):
+            return "✅"
+        return None
+    return marker_fn
+
+
+def make_select_marker_fn(target: str, prov_name: str):
+    """选择模式标记：模型是当前 target 的默认时返回 ✅"""
+    meta = get_model_target_meta(target)
+    def marker_fn(model_name: str) -> Optional[str]:
+        current_model = UserDataManager.get(meta['model_state_key'])
+        current_prov = UserDataManager.get(meta['provider_state_key'])
+        if current_prov == prov_name and current_model == model_name:
+            return "✅"
+        return None
+    return marker_fn
+
+
 def build_saved_models_keyboard(provider_name: str, target: Optional[str] = None, page: int = 1):
     providers = UserDataManager.get('providers', {})
     models = providers.get(provider_name, {}).get('models', [])
@@ -7277,7 +7308,8 @@ def build_saved_models_keyboard(provider_name: str, target: Optional[str] = None
         extra_buttons=[
             InlineKeyboardButton("➕ 手写", callback_data=f"act_manual_mod_{provider_name}"),
             InlineKeyboardButton("⚡ 联网获取", callback_data=f"fetch_market_{provider_name}"),
-        ]
+        ],
+        marker_fn=make_manage_marker_fn(provider_name)
     )
 
 
@@ -7326,7 +7358,8 @@ def build_model_selection_keyboard(provider_name: str, target: str, page: int = 
         models,
         page,
         "pick_default_",
-        f"target_{target}_models"
+        f"target_{target}_models",
+        marker_fn=make_select_marker_fn(target, provider_name)
     )
 
 # --- ☆ 核心：授权用户校验与未授权用户通报系统 ☆ ---
@@ -9604,11 +9637,14 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 {"provider": prov_name, "target": target}
             )
 
-            await query.answer(f"✅ 已设为{get_model_target_label(target)}")
-            detail_text, detail_kb = build_model_detail_menu(prov_name, model_name)
+            target_label = get_model_target_label(target)
+            await query.answer(f"✅ 已设为{target_label}")
+            kb = build_saved_models_keyboard(prov_name)
             await query.message.edit_text(
-                detail_text,
-                reply_markup=detail_kb,
+                f"✅ <b>{safe_text(model_name)}</b> 已设为{target_label}！\n\n"
+                f"🧰 <b>{safe_text(prov_name)}</b> 已保存的模型\n\n"
+                "这里可以继续新增、联网获取，或点击模型进行设置。",
+                reply_markup=kb,
                 parse_mode=constants.ParseMode.HTML
             )
 
@@ -9648,10 +9684,14 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 db = await BotMemoryDB.get_instance()
                 await db.update_provider_models(pname, providers[pname]['models'])
                 await GlobalRecorder.record_system_op(f"删除模型: {mname}", {"provider": pname})
+            await query.answer(f"🗑️ 已删除 {mname}")
             kb = build_saved_models_keyboard(pname)
             await query.message.edit_text(
-                f"🗑️ 已将 {safe_text(mname)} 从模型列表中删除。",
-                reply_markup=kb
+                f"🗑️ <b>{safe_text(mname)}</b> 已从模型列表中删除！\n\n"
+                f"🧰 <b>{safe_text(pname)}</b> 已保存的模型\n\n"
+                "这里可以继续新增、联网获取，或点击模型进行设置。",
+                reply_markup=kb,
+                parse_mode=constants.ParseMode.HTML
             )
         
         elif data.startswith("fetch_market_"):
@@ -9739,14 +9779,20 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 menu_mode = UserDataManager.get('temp_model_menu_mode') or 'manage'
                 back_callback = f"view_prov_{pname}" if menu_mode == 'manage' else f"target_{UserDataManager.get('temp_model_target') or 'chat'}_models"
                 extra_buttons = None
+                marker = None
                 if menu_mode == 'manage':
                     extra_buttons = [
                         InlineKeyboardButton("➕ 手写", callback_data=f"act_manual_mod_{pname}"),
                         InlineKeyboardButton("⚡ 联网获取", callback_data=f"fetch_market_{pname}")
                     ]
+                    marker = make_manage_marker_fn(pname)
+                else:
+                    target = UserDataManager.get('temp_model_target') or 'chat'
+                    marker = make_select_marker_fn(target, pname)
                 kb = build_magic_keyboard(
                     items, page, prefix, back_callback,
-                    extra_buttons=extra_buttons
+                    extra_buttons=extra_buttons,
+                    marker_fn=marker
                 )
             else:
                 items = UserDataManager.get('fetched_cache', [])
