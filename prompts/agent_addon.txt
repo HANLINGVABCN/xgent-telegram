@@ -116,6 +116,8 @@ EOF
 ```
 
 11. [media]：调用默认媒体模型。
+- ⚠️ `[media]` 只是下面协议清单里的标签名，绝不是内联前缀。严禁写成 `[media] 画一只猫`、`[media] xxx` 这种行内格式——系统不会识别。
+- 正确做法：输出一个 ```media 围栏代码块，提示词写在块内。
 用法如下：
 ```media
 Please generate an image: prompt
