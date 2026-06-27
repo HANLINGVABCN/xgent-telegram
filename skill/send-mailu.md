@@ -1,5 +1,15 @@
 ```!
-Mailu 发信/读信技能：免密发信（`python3 .../send-mailu.py --to/--from-addr/--subject/--body`，增强参数 --body-file/--html/--cc/--bcc/--attach），配置入口 `.../send-mailu.py check`；本地读信路径 `/mailu/mail/<账号>/[new|cur]`。详见本文全文。
+Mailu 发信/读信技能：
+1. 【免密发信】：严禁索要密码！执行命令：`python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py --to "<收件人>" --from-addr "<发件人>" --subject "<主题>" --body "<正文>"` (增强参数：--body-file, --html, --cc, --bcc, --attach)。
+   发信脚本支持任意前缀和任意自定义子域名邮箱。
+   发信流程：AI 直接发信；若返回 exit code 2（配置缺失/损坏）或认证全部失败（exit 1），提示用户运行 `sudo python3 .../send-mailu.py check`。
+   check 是配置入口：逐项检查 config.json（含逐域名 SMTP 实连 ✓/✗）；全部通过则输出实测可用账号清单（exit 0），任一失败且在交互终端时自动提示「是否开始配置？」，确认后进入配置流程——此时扫 Mailu SQLite 发现全部域名/账号并逐个问密码，配置完自动复查。
+   归档（可选）：config 的 sent_archive.enabled=true 时，每封信发信成功后自动 IMAP APPEND 一份到「已发送」文件夹（复用同一账号登录 IMAP），失败仅告警不影响发信。check 末尾会打印 IMAP 归档探针结果（不计入可用性判定）。
+2. 【本地读信】：免密检索本地 EML 文件，严禁修改或删除。
+   物理路径（<账号>需完整邮箱，如 admin@example.com）：
+   - 收件箱: `/mailu/mail/<账号>/[new|cur]`
+   - 其他文件夹: `/mailu/mail/<账号>/.[Junk|Sent|Trash|Drafts]/[new|cur]`
+   如需高级检索 Python 代码，请 read 本文档全文。
 ```
 
 # 邮件发信助手 (send-mailu)
