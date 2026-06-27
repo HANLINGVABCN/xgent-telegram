@@ -3094,7 +3094,9 @@ class AgentExecutor:
     @classmethod
     async def read_path_for_model(cls, requested_path: str, api_format: str = 'openai') -> Dict[str, Any]:
         """按路径读取文件，并把原文件本体直接构造成回灌消息。"""
-        target_path = cls.resolve_file_path(requested_path)
+        # 安全分离可能的行号区间后缀，防止把区间误当文件名
+        path_part, _ = cls._split_read_range(requested_path)
+        target_path = cls.resolve_file_path(path_part)
         if not os.path.exists(target_path):
             raise FileNotFoundError(f"文件不存在: {target_path}")
 
@@ -7488,6 +7490,129 @@ async def keep_typing_while_waiting(context: ContextTypes.DEFAULT_TYPE, chat_id:
         except asyncio.TimeoutError:
             continue
 
+def _inline_markdown_to_html(text: str) -> str:
+    """将行内 Markdown 转换为 Telegram HTML（非代码文本部分）。"""
+    if not text:
+        return ""
+
+    # 先提取行内代码（保护其内容不被后续处理影响）
+    inline_codes: List[str] = []
+
+    def _save_inline(m: re.Match) -> str:
+        idx = len(inline_codes)
+        inline_codes.append(f'<code>{html.escape(m.group(1))}</code>')
+        return f'\x01IC{idx}\x01'
+
+    text = re.sub(r'`([^`]+)`', _save_inline, text)
+
+    # HTML 转义剩余文本（行内代码已被提取为占位符，不受影响）
+    text = html.escape(text, quote=False)
+
+    # 逐行处理块级元素：标题、引用、列表
+    lines = text.split('\n')
+    processed: List[str] = []
+    blockquote_buffer: List[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        # 引用块（> 在 HTML 转义后变为 &gt;）
+        if stripped.startswith('&gt; '):
+            blockquote_buffer.append(stripped[5:])
+            continue
+        else:
+            if blockquote_buffer:
+                processed.append(f'<blockquote>{"<br>".join(blockquote_buffer)}</blockquote>')
+                blockquote_buffer = []
+
+        # 标题：# ## ### 等 → 粗体
+        m = re.match(r'^(#{1,6})\s+(.+)$', stripped)
+        if m:
+            processed.append(f'<b>{m.group(2)}</b>')
+            continue
+
+        # 无序列表：- 或 * 开头 → 替换为 •
+        if re.match(r'^[\-\*]\s+', stripped):
+            processed.append(re.sub(r'^[\-\*]\s+', '\u2022 ', stripped))
+            continue
+
+        # 有序列表：保持原样
+        if re.match(r'^\d+\.\s+', stripped):
+            processed.append(stripped)
+            continue
+
+        processed.append(line)
+
+    if blockquote_buffer:
+        processed.append(f'<blockquote>{"<br>".join(blockquote_buffer)}</blockquote>')
+
+    text = '\n'.join(processed)
+
+    # 粗体：**text** 或 __text__
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
+
+    # 删除线：~~text~~
+    text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
+
+    # 链接：[text](url)
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
+
+    # 斜体：*text*（在粗体之后处理，避免 ** 冲突）
+    # 用 [^\W_] 代替 \w（排除下划线），防止颜文字 (*_*) 中的 * 被误匹配
+    text = re.sub(r'(?<!\*)\*(?=[^\W_])(.+?)(?<=[^\W_])\*(?!\*)', r'<i>\1</i>', text)
+
+    # 斜体（下划线）：_text_（避免匹配 snake_case 和颜文字 (>_<) 中的 _）
+    # 用 [^\W_] 代替 \w（排除下划线），防止颜文字中的 _ 被误匹配
+    text = re.sub(r'(?<![^\W_])_(?=[^\W_])(.+?)(?<=[^\W_])_(?![^\W_])', r'<i>\1</i>', text)
+
+    # 还原行内代码占位符
+    for i, code_html in enumerate(inline_codes):
+        text = text.replace(f'\x01IC{i}\x01', code_html)
+
+    return text
+
+
+def markdown_to_telegram_html(text: str) -> str:
+    """将 Markdown 转换为 Telegram 兼容的 HTML。
+
+    支持：代码块、行内代码、粗体、斜体、删除线、链接、标题、引用、列表。
+    自动处理不完整的 Markdown（用于流式输出中尚未闭合的标记）。
+    """
+    if not text:
+        return ""
+
+    # 流式输出中可能有未闭合的代码块，临时补全
+    fence_count = len(re.findall(r'```', text))
+    if fence_count % 2 == 1:
+        text = text + '\n```'
+
+    # 用正则分割代码块和非代码文本
+    segments = re.split(r'(```\w*\n?.*?```)', text, flags=re.DOTALL)
+
+    result: List[str] = []
+    for seg in segments:
+        if not seg:
+            continue
+        if seg.startswith('```'):
+            # 代码块
+            m = re.match(r'```(\w*)\n?(.*?)```', seg, re.DOTALL)
+            if m:
+                lang = m.group(1) or ''
+                code = m.group(2)
+                escaped = html.escape(code)
+                if lang and lang.lower() not in ('text', 'plain'):
+                    result.append(f'<pre><code class="language-{lang}">{escaped}</code></pre>')
+                else:
+                    result.append(f'<pre>{escaped}</pre>')
+            else:
+                result.append(html.escape(seg))
+        else:
+            result.append(_inline_markdown_to_html(seg))
+
+    return ''.join(result)
+
+
 def split_text_for_telegram(text: str, limit: int = 4000) -> List[str]:
     """Split long plain-text replies into Telegram-safe chunks."""
     if len(text) <= limit:
@@ -7570,14 +7695,15 @@ async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
 
 async def finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: Any,
                                  response: str, limit: int = 4000):
-    chunks = split_text_for_telegram(response, limit)
+    html_response = markdown_to_telegram_html(response)
+    chunks = split_text_for_telegram(html_response, limit)
     logger.info(
         f"Sending final Telegram response: chat_id={chat_id}, "
-        f"text_len={len(response)}, chunks={len(chunks)}"
+        f"text_len={len(response)}, html_len={len(html_response)}, chunks={len(chunks)}"
     )
-    await safe_edit_text(msg, chunks[0], reply_markup=None)
+    await safe_edit_text(msg, chunks[0], reply_markup=None, parse_mode=constants.ParseMode.HTML)
     for extra_chunk in chunks[1:]:
-        await safe_send_message(context, chat_id, extra_chunk)
+        await safe_send_message(context, chat_id, extra_chunk, parse_mode=constants.ParseMode.HTML)
 
 def _retry_after_seconds(exc: RetryAfter) -> float:
     retry_after = getattr(exc, 'retry_after', 1.0)
@@ -7588,23 +7714,44 @@ def _retry_after_seconds(exc: RetryAfter) -> float:
     except (TypeError, ValueError):
         return 1.0
 
-async def safe_edit_text(msg: Any, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> bool:
-    """Edit a Telegram message while tolerating no-op edits and flood-wait pacing."""
+async def safe_edit_text(msg: Any, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None,
+                         parse_mode: Optional[str] = None) -> bool:
+    """Edit a Telegram message while tolerating no-op edits, flood-wait pacing, and HTML parse failures."""
     try:
-        await msg.edit_text(text, reply_markup=reply_markup)
+        await msg.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
         return True
     except RetryAfter as e:
         await asyncio.sleep(_retry_after_seconds(e) + 0.1)
         try:
-            await msg.edit_text(text, reply_markup=reply_markup)
+            await msg.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
             return True
         except BadRequest as retry_bad_request:
-            if "message is not modified" in str(retry_bad_request).lower():
+            msg_lower = str(retry_bad_request).lower()
+            if "message is not modified" in msg_lower:
                 return True
+            if parse_mode and "can't parse entities" in msg_lower:
+                logger.warning(f"HTML 解析失败，回退到纯文本: {retry_bad_request}")
+                try:
+                    await msg.edit_text(plain_text_from_html(text), reply_markup=reply_markup)
+                    return True
+                except BadRequest as fallback_err:
+                    if "message is not modified" in str(fallback_err).lower():
+                        return True
+                    raise
             raise
     except BadRequest as e:
-        if "message is not modified" in str(e).lower():
+        msg_lower = str(e).lower()
+        if "message is not modified" in msg_lower:
             return True
+        if parse_mode and "can't parse entities" in msg_lower:
+            logger.warning(f"HTML 解析失败，回退到纯文本: {e}")
+            try:
+                await msg.edit_text(plain_text_from_html(text), reply_markup=reply_markup)
+                return True
+            except BadRequest as fallback_err:
+                if "message is not modified" in str(fallback_err).lower():
+                    return True
+                raise
         raise
 
 def _drain_task_result(task: asyncio.Task):
@@ -7686,12 +7833,14 @@ class TelegramStreamRenderer:
         partial = ''.join(self.response_parts).strip()
         visible_text = self.current_text.strip() or partial
         if visible_text:
-            stopped_text = visible_text + "\n\n⏹️ 已停止，保留以上已生成内容。"
+            html_visible = markdown_to_telegram_html(visible_text)
+            stopped_text = html_visible + "\n\n\u23f9\ufe0f 已停止，保留以上已生成内容。"
         else:
-            stopped_text = "⏹️ 已停止，还没有生成可保留的内容。"
+            stopped_text = "\u23f9\ufe0f 已停止，还没有生成可保留的内容。"
         if self.live_edit_enabled:
             try:
-                await safe_edit_text(self.current_msg, stopped_text, reply_markup=None)
+                await safe_edit_text(self.current_msg, stopped_text, reply_markup=None,
+                                     parse_mode=constants.ParseMode.HTML)
             except Exception as e:
                 logger.debug(f"停止时保留流式内容失败: {e}")
         return partial
@@ -7699,7 +7848,9 @@ class TelegramStreamRenderer:
     async def remove_controls(self):
         if self.live_edit_enabled and self.current_text.strip():
             try:
-                await safe_edit_text(self.current_msg, self.current_text, reply_markup=None)
+                html_text = markdown_to_telegram_html(self.current_text)
+                await safe_edit_text(self.current_msg, html_text, reply_markup=None,
+                                     parse_mode=constants.ParseMode.HTML)
             except Exception as e:
                 logger.debug(f"移除流式停止按钮失败: {e}")
 
@@ -7732,17 +7883,22 @@ class TelegramStreamRenderer:
         if len(self.current_text) + len(text) > self.limit:
             if self.live_edit_enabled and self.current_text.strip():
                 try:
-                    await safe_edit_text(self.current_msg, self.current_text, reply_markup=None)
+                    html_text = markdown_to_telegram_html(self.current_text)
+                    await safe_edit_text(self.current_msg, html_text, reply_markup=None,
+                                         parse_mode=constants.ParseMode.HTML)
                 except Exception as e:
                     self.live_edit_enabled = False
                     logger.warning(f"流式消息刷新失败，改为结束后一次性发送: {e}")
             self.current_text = text
             if self.live_edit_enabled:
                 try:
+                    new_text = text if text.strip() else "…"
+                    html_text = markdown_to_telegram_html(new_text)
                     self.current_msg = await self.context.bot.send_message(
                         chat_id=self.chat_id,
-                        text=text if text.strip() else "…",
-                        reply_markup=self.reply_markup
+                        text=html_text,
+                        reply_markup=self.reply_markup,
+                        parse_mode=constants.ParseMode.HTML
                     )
                 except Exception as e:
                     self.live_edit_enabled = False
@@ -7756,7 +7912,9 @@ class TelegramStreamRenderer:
             return
 
         try:
-            await safe_edit_text(self.current_msg, self.current_text, reply_markup=self.reply_markup)
+            html_text = markdown_to_telegram_html(self.current_text)
+            await safe_edit_text(self.current_msg, html_text, reply_markup=self.reply_markup,
+                                 parse_mode=constants.ParseMode.HTML)
         except Exception as e:
             self.live_edit_enabled = False
             logger.warning(f"流式消息刷新失败，改为结束后一次性发送: {e}")
@@ -10840,7 +10998,12 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     else:
                         read_path = block['body']
                         try:
-                            read_result = await AgentExecutor.read_path_for_model(read_path, provider_api_format)
+                            # 检查 body 是否带行号区间后缀，有则走 read_file_ranged
+                            _, range_part = AgentExecutor._split_read_range(read_path)
+                            if range_part:
+                                read_result = await AgentExecutor.read_file_ranged(read_path)
+                            else:
+                                read_result = await AgentExecutor.read_path_for_model(read_path, provider_api_format)
                         except Exception as e:
                             logger.error(f"Agent读取路径失败: {read_path} ({e})")
                             read_result = {
