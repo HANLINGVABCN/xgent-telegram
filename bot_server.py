@@ -7490,12 +7490,127 @@ async def keep_typing_while_waiting(context: ContextTypes.DEFAULT_TYPE, chat_id:
         except asyncio.TimeoutError:
             continue
 
+def _parse_markdown_table_row(line: str) -> Optional[List[str]]:
+    """把一行 `| a | b |` 解析成单元格列表；不是表格行返回 None。"""
+    stripped = line.strip()
+    if '|' not in stripped:
+        return None
+    # 必须以 | 开头或结尾（表格行的典型特征）；也允许单列内含 | 但首尾有 | 的情况
+    if not stripped.startswith('|'):
+        return None
+    inner = stripped
+    if inner.startswith('|'):
+        inner = inner[1:]
+    if inner.endswith('|'):
+        inner = inner[:-1]
+    cells = [c.strip() for c in inner.split('|')]
+    # 至少两列才算表格行（单列 |x| 视作普通文本，避免误伤）
+    if len(cells) < 2:
+        return None
+    return cells
+
+
+def _is_table_separator_row(cells: Optional[List[str]]) -> bool:
+    """判断是否是表格分隔行：单元格全是 --- / :--: / --: 之类。"""
+    if not cells:
+        return False
+    sep_re = re.compile(r'^:?-{1,}:?$')
+    return all(sep_re.match(c) and '-' in c for c in cells)
+
+
+def _build_table_pre_block(rows_cells: List[List[str]]) -> str:
+    """把多行单元格渲染成等宽对齐的 <pre> 块。rows_cells 含表头+分隔占位+数据行。"""
+    # 跳过分隔行本身（它是表格语法的分隔，不展示）
+    display_rows = [r for r in rows_cells if not _is_table_separator_row(r)]
+    if not display_rows:
+        return ''
+    # 表格放进 <pre> 等宽块后，单元格内的行内代码反引号是多余的，去掉只保留内容
+    display_rows = [[re.sub(r'`([^`]*)`', r'\1', c) for c in row] for row in display_rows]
+    num_cols = max(len(r) for r in display_rows)
+    # 补齐每行列数
+    for r in display_rows:
+        while len(r) < num_cols:
+            r.append('')
+
+    # 计算每列最大显示宽度（按字符数，中文按 2 计宽以便对齐）
+    def _cell_width(s: str) -> int:
+        width = 0
+        for ch in s:
+            width += 2 if ord(ch) > 0x2E80 else 1  # CJK 及全角符号按 2
+        return width
+
+    col_widths = [0] * num_cols
+    for r in display_rows:
+        for i, cell in enumerate(r):
+            col_widths[i] = max(col_widths[i], _cell_width(cell))
+
+    # 拼接对齐后的文本（左对齐，右侧补空格），列间用 "  " 分隔
+    lines: List[str] = []
+    for row_idx, r in enumerate(display_rows):
+        parts = []
+        for i, cell in enumerate(r):
+            pad = col_widths[i] - _cell_width(cell)
+            parts.append(cell + ' ' * max(0, pad))
+        lines.append('  '.join(parts).rstrip())
+        # 在表头下方插入分隔线（ASCII 表格观感）
+        if row_idx == 0:
+            sep_parts = []
+            for i in range(num_cols):
+                sep_parts.append('-' * col_widths[i])
+            lines.append('  '.join(sep_parts))
+
+    return f"<pre>{html.escape(chr(10).join(lines))}</pre>"
+
+
+def _extract_markdown_tables(text: str) -> Tuple[str, List[str]]:
+    """提取文本中的完整 Markdown 表格，替换为占位符。
+
+    只提取「完整」表格（含表头+分隔行+至少一数据行）。
+    流式输出中尚未出现分隔行的半成品不会被识别，避免乱码。
+    返回 (替换后的文本, 表格HTML列表)。
+    """
+    tables: List[str] = []
+    if '|' not in text:
+        return text, tables
+
+    lines = text.split('\n')
+    out_lines: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        row_cells = _parse_markdown_table_row(lines[i])
+        # 判断是否是一个表格的起点：本行是表格行，且下一行是分隔行
+        if row_cells and i + 1 < n and _is_table_separator_row(_parse_markdown_table_row(lines[i + 1])):
+            # 收集连续的表格行（含表头、分隔、数据）
+            block: List[List[str]] = [row_cells]
+            j = i + 1
+            while j < n:
+                next_cells = _parse_markdown_table_row(lines[j])
+                if next_cells is None:
+                    break
+                block.append(next_cells)
+                j += 1
+            pre_html = _build_table_pre_block(block)
+            idx = len(tables)
+            tables.append(pre_html)
+            out_lines.append(f'\x02TBL{idx}\x02')
+            i = j
+            continue
+        out_lines.append(lines[i])
+        i += 1
+
+    return '\n'.join(out_lines), tables
+
+
 def _inline_markdown_to_html(text: str) -> str:
     """将行内 Markdown 转换为 Telegram HTML（非代码文本部分）。"""
     if not text:
         return ""
 
-    # 先提取行内代码（保护其内容不被后续处理影响）
+    # 先提取 Markdown 表格为 <pre> 占位符（表格内容整体等宽对齐，不再参与行内转换）
+    text, table_blocks = _extract_markdown_tables(text)
+
+    # 再提取行内代码（保护其内容不被后续处理影响）
     inline_codes: List[str] = []
 
     def _save_inline(m: re.Match) -> str:
@@ -7505,7 +7620,7 @@ def _inline_markdown_to_html(text: str) -> str:
 
     text = re.sub(r'`([^`]+)`', _save_inline, text)
 
-    # HTML 转义剩余文本（行内代码已被提取为占位符，不受影响）
+    # HTML 转义剩余文本（行内代码、表格已被提取为占位符，不受影响）
     text = html.escape(text, quote=False)
 
     # 逐行处理块级元素：标题、引用、列表
@@ -7569,6 +7684,11 @@ def _inline_markdown_to_html(text: str) -> str:
     # 还原行内代码占位符
     for i, code_html in enumerate(inline_codes):
         text = text.replace(f'\x01IC{i}\x01', code_html)
+
+    # 还原表格 <pre> 占位符（表格 HTML 已构建好，直接放回；不在表格内做行内转换）
+    for i, pre_html in enumerate(table_blocks):
+        # 转义后的文本里占位符字符 \x02 不受 html.escape 影响，仍可匹配
+        text = text.replace(f'\x02TBL{i}\x02', pre_html)
 
     return text
 
@@ -8370,40 +8490,86 @@ async def cmd_restart_system(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await GlobalRecorder.record_user_message(update.message.text, MessageType.COMMAND, update.effective_chat.id)
         
     message = update.message or update.callback_query.message
-    await message.reply_text("🔄 服务正在重启。")
+    sent = await message.reply_text("🔄 服务正在重启。")
+    # 给 Telegram 一点时间把提示消息发出去，避免 sys.exit 截断未完成的发送
+    if sent is not None:
+        await asyncio.sleep(0.3)
     
     # 记录并关闭数据库
     await GlobalRecorder.record_system_op("重启机器人")
-    await restart_current_process(update.effective_chat.id)
+    await restart_current_process(update.effective_chat.id, context.bot)
 
-async def restart_current_process(chat_id: int):
-    """彻底重启进程，确保重新加载所有配置"""
+async def restart_current_process(chat_id: int, bot: Any = None):
+    """彻底重启进程，确保重新加载所有配置和代码。
+
+    支持三种守护模式：
+    - PM2 / nohup：调用 install.sh restart（detached，含完整 stop+start），由它拉起新进程。
+    - systemd：依赖 unit 的 Restart= 自动拉起。
+    - 兜底（无任何守护）：先给用户发提示，再退出，避免静默掉线。
+    退出前写入重启标记（PID + 时间戳），新进程启动时据此判断“代码是否真的换了”。
+    """
     db = await BotMemoryDB.get_instance()
     await db.set_config('restart_notify_chat_id', chat_id)
+    # 写入重启校验标记：新进程启动时对比 PID，判断是否真的换了新进程/新代码
+    await db.set_config('restart_expected_ts', time.time())
+    await db.set_config('restart_expected_pid', os.getpid())
     await db.close()
 
-    # 检测是否在 PM2 下运行
+    install_sh = os.path.join(PROJECT_ROOT, 'install.sh')
+    has_install_sh = os.path.exists(install_sh)
     is_pm2 = any(k in os.environ for k in ('PM2_HOME', 'pm_id', 'PM2_USAGE'))
+    is_nohup = os.path.exists(os.path.join(PROJECT_ROOT, 'bot.pid'))
+    # systemd 会在被托管进程的环境里注入 INVOCATION_ID（及 JOURNAL_STREAM）
+    is_systemd = 'INVOCATION_ID' in os.environ or 'JOURNAL_STREAM' in os.environ
 
+    restart_via_install = False
     if is_pm2:
-        # PM2 模式：调用 install.sh 脱离重启
-        install_sh = os.path.join(PROJECT_ROOT, 'install.sh')
-        if os.path.exists(install_sh):
-            logger.info("检测到 PM2 环境，调用 install.sh restart 彻底重启")
-            try:
-                subprocess.Popen(
-                    ['bash', install_sh, 'restart'],
-                    cwd=PROJECT_ROOT,
-                    start_new_session=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
+        logger.info("检测到 PM2 环境，调用 install.sh restart 彻底重启")
+        restart_via_install = True
+    elif is_nohup and has_install_sh:
+        logger.info("检测到 nohup（bot.pid）环境，调用 install.sh restart 彻底重启")
+        restart_via_install = True
+    elif is_systemd:
+        # systemd 会按 unit 的 Restart= 策略自动拉起新进程
+        logger.info("检测到 systemd 托管环境，进程退出后由 systemd 自动拉起")
+
+    if restart_via_install:
+        try:
+            subprocess.Popen(
+                ['bash', install_sh, 'restart'],
+                cwd=PROJECT_ROOT,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            await asyncio.sleep(1)
+        except Exception as e:
+            logger.warning(f"调用 install.sh restart 失败: {e}，回退到直接退出")
+            # 失败时若 PM2 仍在，PM2 还会自动拉起；否则需要兜底提示
+            if not is_pm2 and bot is not None:
+                with contextlib.suppress(Exception):
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="⚠️ 自动重启脚本调用失败，进程即将退出。"
+                             "如果没有自动恢复，请手动运行 install.sh 重启。"
+                    )
+                await asyncio.sleep(0.3)
+    elif not is_systemd:
+        # 兜底：既不是 PM2/nohup 也不是 systemd，退出后没有守护进程拉起，
+        # 先提示用户手动重启，避免静默掉线后不知所措。
+        logger.warning("未检测到 PM2/nohup/systemd 守护，进程退出后可能无法自动恢复")
+        if bot is not None:
+            with contextlib.suppress(Exception):
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ 检测到当前没有 PM2/nohup/systemd 守护进程。\n"
+                         "进程即将退出，可能无法自动重启。\n"
+                         "如果 Bot 没有恢复，请手动到服务器运行 install.sh 启动。"
                 )
-                await asyncio.sleep(1)
-            except Exception as e:
-                logger.warning(f"调用 install.sh restart 失败: {e}，回退到直接退出")
+            await asyncio.sleep(0.3)
 
     # 彻底退出进程，让外层管理器（PM2/systemd/nohup）重新启动
-    # 这样确保重新加载 .env 和所有配置文件
+    # 这样确保重新加载 .env 和所有配置文件，以及最新代码
     logger.info("进程即将退出以完成重启")
     sys.exit(0)
 
@@ -8547,7 +8713,9 @@ async def perform_update_system(update: Update, context: ContextTypes.DEFAULT_TY
         f"{success_title}"
         f"{skipped_line}{reload_line}{backup_line}"
     )
-    await restart_current_process(update.effective_chat.id)
+    # 给 Telegram 一点时间把“更新成功”消息发出去，避免 sys.exit 截断
+    await asyncio.sleep(0.4)
+    await restart_current_process(update.effective_chat.id, context.bot)
 
 async def cmd_providers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
@@ -12053,6 +12221,55 @@ async def setup_bot_commands(app):
         try:
             await UserDataManager.init()
             db = await BotMemoryDB.get_instance()
+
+            # === 重启/更新校验：判断本次启动是否真的换了新进程 ===
+            # restart_current_process 退出前会写入 restart_expected_pid（旧进程 PID）+ 时间戳。
+            # 新进程启动时对比当前 PID：不同=重启成功（新代码已加载），相同=没换进程（重启未生效）。
+            notify_chat_id = await db.get_config('restart_notify_chat_id', BotConfig.AUTHORIZED_USER_ID) or BotConfig.AUTHORIZED_USER_ID
+            expected_pid = await db.get_config('restart_expected_pid', None)
+            expected_ts = await db.get_config('restart_expected_ts', 0)
+            restart_notice_sent = False
+            try:
+                expected_ts_f = float(expected_ts or 0)
+            except (TypeError, ValueError):
+                expected_ts_f = 0.0
+            # 标记存活窗口：5 分钟内的标记才认为是“刚刚请求的重启”，更早的视为陈旧残留
+            if expected_pid is not None and (time.time() - expected_ts_f) < 300:
+                current_pid = os.getpid()
+                try:
+                    expected_pid_int = int(expected_pid)
+                except (TypeError, ValueError):
+                    expected_pid_int = -1
+                if current_pid != expected_pid_int:
+                    # PID 变了 → 新进程被拉起，代码确实重新从磁盘加载
+                    logger.info(f"✅ 重启校验通过：新进程 PID={current_pid}（旧 PID={expected_pid_int}），新代码已加载")
+                    with contextlib.suppress(Exception):
+                        await app.bot.send_message(
+                            chat_id=notify_chat_id,
+                            text=(
+                                f"✅ 已成功重启，新代码已加载。\n"
+                                f"新进程 PID: <code>{current_pid}</code>（原 {expected_pid_int}）"
+                            ),
+                            parse_mode=constants.ParseMode.HTML
+                        )
+                        restart_notice_sent = True
+                else:
+                    # PID 没变 → sys.exit 没生效或重启脚本没拉起，仍是旧进程/旧代码
+                    logger.warning(f"⚠️ 重启校验失败：当前 PID={current_pid} 与重启前相同，进程未真正重启，可能是旧代码")
+                    with contextlib.suppress(Exception):
+                        await app.bot.send_message(
+                            chat_id=notify_chat_id,
+                            text=(
+                                "⚠️ 重启可能未生效：当前仍是重启前的同一个进程（PID 未变）。\n"
+                                "代码可能没有更新，请到服务器手动运行 install.sh restart 确认。"
+                            ),
+                            parse_mode=constants.ParseMode.HTML
+                        )
+                        restart_notice_sent = True
+                # 消费标记，避免下次普通启动重复发校验通知
+                await db.set_config('restart_expected_pid', None)
+                await db.set_config('restart_expected_ts', None)
+
             # 跨进程去重：检查上次发送时间戳
             last_sent_ts = await db.get_config('last_startup_menu_sent_ts', 0)
             elapsed = time.time() - float(last_sent_ts or 0)
@@ -12060,7 +12277,6 @@ async def setup_bot_commands(app):
                 logger.info(f"⏭️ 启动菜单跳过：距上次发送仅 {int(elapsed)}s（冷却 {STARTUP_MENU_COOLDOWN}s 内）")
                 _startup_menu_sent = True
                 return
-            notify_chat_id = await db.get_config('restart_notify_chat_id', BotConfig.AUTHORIZED_USER_ID)
             # 标记置位（不再回滚）：宁可启动菜单漏发，也绝不能重复发送。
             # 漏发时用户随时可手动 /start；重复发送才是真正困扰用户的问题。
             _startup_menu_sent = True
@@ -12072,7 +12288,7 @@ async def setup_bot_commands(app):
             )
             # 记录发送时间戳到数据库（跨进程有效）
             await db.set_config('last_startup_menu_sent_ts', time.time())
-            await GlobalRecorder.record_system_op("启动后发送完整主菜单", {"chat_id": notify_chat_id})
+            await GlobalRecorder.record_system_op("启动后发送完整主菜单", {"chat_id": notify_chat_id, "restart_notice_sent": restart_notice_sent})
             logger.info("✅ 启动主菜单已发送给用户")
         except Exception as e:
             # 发送失败也不回滚 flag：避免并发/重连再次触发导致重复发送
