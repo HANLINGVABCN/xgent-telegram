@@ -2552,9 +2552,20 @@ class AgentExecutor:
         return os.path.abspath(os.path.join(cls.WORK_DIR, cleaned))
 
     @classmethod
+    def resolve_write_path(cls, requested_path: str) -> str:
+        """写文件用的路径解析：相对路径一律落到项目根的 workspace/ 下（自动创建），
+        绝对路径原样。读路径不走这里，仍用 resolve_file_path，保持能读到项目已有文件。"""
+        cleaned = requested_path.strip()
+        if not cleaned:
+            raise ValueError("文件路径为空")
+        if os.path.isabs(cleaned):
+            return os.path.abspath(cleaned)
+        return os.path.abspath(os.path.join(cls.WORK_DIR, 'workspace', cleaned))
+
+    @classmethod
     async def write_file(cls, requested_path: str, content: str) -> Dict[str, Any]:
         """将文件真实写入服务器。"""
-        target_path = cls.resolve_file_path(requested_path)
+        target_path = cls.resolve_write_path(requested_path)
         existed = os.path.exists(target_path)
         byte_size = len(content.encode('utf-8'))
 
@@ -3083,7 +3094,9 @@ class AgentExecutor:
     @classmethod
     async def read_path_for_model(cls, requested_path: str, api_format: str = 'openai') -> Dict[str, Any]:
         """按路径读取文件，并把原文件本体直接构造成回灌消息。"""
-        target_path = cls.resolve_file_path(requested_path)
+        # 安全分离可能的行号区间后缀，防止把区间误当文件名
+        path_part, _ = cls._split_read_range(requested_path)
+        target_path = cls.resolve_file_path(path_part)
         if not os.path.exists(target_path):
             raise FileNotFoundError(f"文件不存在: {target_path}")
 
@@ -6859,7 +6872,8 @@ class CallbackDataStore:
 # --- ☆ UI 构建 ☆ ---
 def build_magic_keyboard(items: List[str], page: int, callback_prefix: str, back_callback: str,
                          search_callback: Optional[str] = None, filter_text: Optional[str] = None,
-                         extra_buttons: Optional[List[InlineKeyboardButton]] = None):
+                         extra_buttons: Optional[List[InlineKeyboardButton]] = None,
+                         marker_fn: Optional[callable] = None):
     PER_PAGE = 8
     display_list = [m for m in items if filter_text and filter_text.lower() in m.lower()] if filter_text else items
     total_pages = math.ceil(len(display_list) / PER_PAGE) or 1
@@ -6871,6 +6885,10 @@ def build_magic_keyboard(items: List[str], page: int, callback_prefix: str, back
     row = []
     for m in current_items:
         display_name = pretty_model_name(m)
+        if marker_fn:
+            marker = marker_fn(m)
+            if marker:
+                display_name = f"{display_name} {marker}"
         is_long = len(display_name) > 16
         # 使用短哈希避免超长
         cb_data = CallbackDataStore.store(f"{callback_prefix}{m}")
@@ -7221,8 +7239,7 @@ def get_providers_menu():
 
 def get_provider_detail_menu(prov_name):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 对话模型", callback_data=f"prov_models_chat_{prov_name}"),
-         InlineKeyboardButton("🖼️ 媒体模型", callback_data=f"prov_models_media_{prov_name}")],
+        [InlineKeyboardButton("📦 模型", callback_data=f"prov_models_{prov_name}")],
         [InlineKeyboardButton("🔑 Key", callback_data=f"edit_pkey_{prov_name}"),
          InlineKeyboardButton("🔗 URL", callback_data=f"edit_purl_{prov_name}")],
         [InlineKeyboardButton("🗑️ 删除", callback_data=f"del_prov_{prov_name}")],
@@ -7250,7 +7267,33 @@ def get_default_model_provider_menu(target: str):
     return InlineKeyboardMarkup(keyboard)
 
 
-def build_saved_models_keyboard(provider_name: str, target: str, page: int = 1):
+def make_manage_marker_fn(prov_name: str):
+    """管理模式标记：模型是当前对话或媒体默认时返回 ✅"""
+    def marker_fn(model_name: str) -> Optional[str]:
+        chat_model = UserDataManager.get('default_model')
+        chat_prov = UserDataManager.get('active_provider_key')
+        media_model = UserDataManager.get('default_media_model')
+        media_prov = UserDataManager.get('default_media_provider_key')
+        if (chat_prov == prov_name and chat_model == model_name) or \
+           (media_prov == prov_name and media_model == model_name):
+            return "✅"
+        return None
+    return marker_fn
+
+
+def make_select_marker_fn(target: str, prov_name: str):
+    """选择模式标记：模型是当前 target 的默认时返回 ✅"""
+    meta = get_model_target_meta(target)
+    def marker_fn(model_name: str) -> Optional[str]:
+        current_model = UserDataManager.get(meta['model_state_key'])
+        current_prov = UserDataManager.get(meta['provider_state_key'])
+        if current_prov == prov_name and current_model == model_name:
+            return "✅"
+        return None
+    return marker_fn
+
+
+def build_saved_models_keyboard(provider_name: str, target: Optional[str] = None, page: int = 1):
     providers = UserDataManager.get('providers', {})
     models = providers.get(provider_name, {}).get('models', [])
     UserDataManager.set('temp_viewing_prov', provider_name)
@@ -7267,8 +7310,41 @@ def build_saved_models_keyboard(provider_name: str, target: str, page: int = 1):
         extra_buttons=[
             InlineKeyboardButton("➕ 手写", callback_data=f"act_manual_mod_{provider_name}"),
             InlineKeyboardButton("⚡ 联网获取", callback_data=f"fetch_market_{provider_name}"),
-        ]
+        ],
+        marker_fn=make_manage_marker_fn(provider_name)
     )
+
+
+def build_model_detail_menu(prov_name: str, model_name: str):
+    """构建模型详情菜单：设为对话模型、设为媒体模型、删除模型"""
+    set_chat_cb = CallbackDataStore.store(f"set_mdl|chat|{prov_name}|{model_name}")
+    set_media_cb = CallbackDataStore.store(f"set_mdl|media|{prov_name}|{model_name}")
+    del_cb = CallbackDataStore.store(f"do_del|{prov_name}|{model_name}")
+
+    chat_model = UserDataManager.get('default_model')
+    chat_prov = UserDataManager.get('active_provider_key')
+    media_model = UserDataManager.get('default_media_model')
+    media_prov = UserDataManager.get('default_media_provider_key')
+
+    status_parts = []
+    if chat_prov == prov_name and chat_model == model_name:
+        status_parts.append("💬 当前对话模型")
+    if media_prov == prov_name and media_model == model_name:
+        status_parts.append("🖼️ 当前媒体模型")
+    status = "、".join(status_parts) if status_parts else "未设为默认"
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬 设为对话模型", callback_data=set_chat_cb)],
+        [InlineKeyboardButton("🖼️ 设为媒体模型", callback_data=set_media_cb)],
+        [InlineKeyboardButton("🗑️ 删除模型", callback_data=del_cb)],
+        [InlineKeyboardButton("🔙 返回", callback_data=f"mng_saved_{prov_name}")]
+    ])
+    text = (
+        f"⚙️ <b>{safe_text(model_name)}</b>\n"
+        f"提供商: {safe_text(prov_name)}\n"
+        f"状态: {status}"
+    )
+    return text, kb
 
 
 def build_model_selection_keyboard(provider_name: str, target: str, page: int = 1):
@@ -7284,7 +7360,8 @@ def build_model_selection_keyboard(provider_name: str, target: str, page: int = 
         models,
         page,
         "pick_default_",
-        f"target_{target}_models"
+        f"target_{target}_models",
+        marker_fn=make_select_marker_fn(target, provider_name)
     )
 
 # --- ☆ 核心：授权用户校验与未授权用户通报系统 ☆ ---
@@ -7413,6 +7490,129 @@ async def keep_typing_while_waiting(context: ContextTypes.DEFAULT_TYPE, chat_id:
         except asyncio.TimeoutError:
             continue
 
+def _inline_markdown_to_html(text: str) -> str:
+    """将行内 Markdown 转换为 Telegram HTML（非代码文本部分）。"""
+    if not text:
+        return ""
+
+    # 先提取行内代码（保护其内容不被后续处理影响）
+    inline_codes: List[str] = []
+
+    def _save_inline(m: re.Match) -> str:
+        idx = len(inline_codes)
+        inline_codes.append(f'<code>{html.escape(m.group(1))}</code>')
+        return f'\x01IC{idx}\x01'
+
+    text = re.sub(r'`([^`]+)`', _save_inline, text)
+
+    # HTML 转义剩余文本（行内代码已被提取为占位符，不受影响）
+    text = html.escape(text, quote=False)
+
+    # 逐行处理块级元素：标题、引用、列表
+    lines = text.split('\n')
+    processed: List[str] = []
+    blockquote_buffer: List[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        # 引用块（> 在 HTML 转义后变为 &gt;）
+        if stripped.startswith('&gt; '):
+            blockquote_buffer.append(stripped[5:])
+            continue
+        else:
+            if blockquote_buffer:
+                processed.append(f'<blockquote>{"<br>".join(blockquote_buffer)}</blockquote>')
+                blockquote_buffer = []
+
+        # 标题：# ## ### 等 → 粗体
+        m = re.match(r'^(#{1,6})\s+(.+)$', stripped)
+        if m:
+            processed.append(f'<b>{m.group(2)}</b>')
+            continue
+
+        # 无序列表：- 或 * 开头 → 替换为 •
+        if re.match(r'^[\-\*]\s+', stripped):
+            processed.append(re.sub(r'^[\-\*]\s+', '\u2022 ', stripped))
+            continue
+
+        # 有序列表：保持原样
+        if re.match(r'^\d+\.\s+', stripped):
+            processed.append(stripped)
+            continue
+
+        processed.append(line)
+
+    if blockquote_buffer:
+        processed.append(f'<blockquote>{"<br>".join(blockquote_buffer)}</blockquote>')
+
+    text = '\n'.join(processed)
+
+    # 粗体：**text** 或 __text__
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
+
+    # 删除线：~~text~~
+    text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
+
+    # 链接：[text](url)
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
+
+    # 斜体：*text*（在粗体之后处理，避免 ** 冲突）
+    # 用 [^\W_] 代替 \w（排除下划线），防止颜文字 (*_*) 中的 * 被误匹配
+    text = re.sub(r'(?<!\*)\*(?=[^\W_])(.+?)(?<=[^\W_])\*(?!\*)', r'<i>\1</i>', text)
+
+    # 斜体（下划线）：_text_（避免匹配 snake_case 和颜文字 (>_<) 中的 _）
+    # 用 [^\W_] 代替 \w（排除下划线），防止颜文字中的 _ 被误匹配
+    text = re.sub(r'(?<![^\W_])_(?=[^\W_])(.+?)(?<=[^\W_])_(?![^\W_])', r'<i>\1</i>', text)
+
+    # 还原行内代码占位符
+    for i, code_html in enumerate(inline_codes):
+        text = text.replace(f'\x01IC{i}\x01', code_html)
+
+    return text
+
+
+def markdown_to_telegram_html(text: str) -> str:
+    """将 Markdown 转换为 Telegram 兼容的 HTML。
+
+    支持：代码块、行内代码、粗体、斜体、删除线、链接、标题、引用、列表。
+    自动处理不完整的 Markdown（用于流式输出中尚未闭合的标记）。
+    """
+    if not text:
+        return ""
+
+    # 流式输出中可能有未闭合的代码块，临时补全
+    fence_count = len(re.findall(r'```', text))
+    if fence_count % 2 == 1:
+        text = text + '\n```'
+
+    # 用正则分割代码块和非代码文本
+    segments = re.split(r'(```\w*\n?.*?```)', text, flags=re.DOTALL)
+
+    result: List[str] = []
+    for seg in segments:
+        if not seg:
+            continue
+        if seg.startswith('```'):
+            # 代码块
+            m = re.match(r'```(\w*)\n?(.*?)```', seg, re.DOTALL)
+            if m:
+                lang = m.group(1) or ''
+                code = m.group(2)
+                escaped = html.escape(code)
+                if lang and lang.lower() not in ('text', 'plain'):
+                    result.append(f'<pre><code class="language-{lang}">{escaped}</code></pre>')
+                else:
+                    result.append(f'<pre>{escaped}</pre>')
+            else:
+                result.append(html.escape(seg))
+        else:
+            result.append(_inline_markdown_to_html(seg))
+
+    return ''.join(result)
+
+
 def split_text_for_telegram(text: str, limit: int = 4000) -> List[str]:
     """Split long plain-text replies into Telegram-safe chunks."""
     if len(text) <= limit:
@@ -7495,14 +7695,15 @@ async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
 
 async def finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: Any,
                                  response: str, limit: int = 4000):
-    chunks = split_text_for_telegram(response, limit)
+    html_response = markdown_to_telegram_html(response)
+    chunks = split_text_for_telegram(html_response, limit)
     logger.info(
         f"Sending final Telegram response: chat_id={chat_id}, "
-        f"text_len={len(response)}, chunks={len(chunks)}"
+        f"text_len={len(response)}, html_len={len(html_response)}, chunks={len(chunks)}"
     )
-    await safe_edit_text(msg, chunks[0], reply_markup=None)
+    await safe_edit_text(msg, chunks[0], reply_markup=None, parse_mode=constants.ParseMode.HTML)
     for extra_chunk in chunks[1:]:
-        await safe_send_message(context, chat_id, extra_chunk)
+        await safe_send_message(context, chat_id, extra_chunk, parse_mode=constants.ParseMode.HTML)
 
 def _retry_after_seconds(exc: RetryAfter) -> float:
     retry_after = getattr(exc, 'retry_after', 1.0)
@@ -7513,23 +7714,44 @@ def _retry_after_seconds(exc: RetryAfter) -> float:
     except (TypeError, ValueError):
         return 1.0
 
-async def safe_edit_text(msg: Any, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> bool:
-    """Edit a Telegram message while tolerating no-op edits and flood-wait pacing."""
+async def safe_edit_text(msg: Any, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None,
+                         parse_mode: Optional[str] = None) -> bool:
+    """Edit a Telegram message while tolerating no-op edits, flood-wait pacing, and HTML parse failures."""
     try:
-        await msg.edit_text(text, reply_markup=reply_markup)
+        await msg.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
         return True
     except RetryAfter as e:
         await asyncio.sleep(_retry_after_seconds(e) + 0.1)
         try:
-            await msg.edit_text(text, reply_markup=reply_markup)
+            await msg.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
             return True
         except BadRequest as retry_bad_request:
-            if "message is not modified" in str(retry_bad_request).lower():
+            msg_lower = str(retry_bad_request).lower()
+            if "message is not modified" in msg_lower:
                 return True
+            if parse_mode and "can't parse entities" in msg_lower:
+                logger.warning(f"HTML 解析失败，回退到纯文本: {retry_bad_request}")
+                try:
+                    await msg.edit_text(plain_text_from_html(text), reply_markup=reply_markup)
+                    return True
+                except BadRequest as fallback_err:
+                    if "message is not modified" in str(fallback_err).lower():
+                        return True
+                    raise
             raise
     except BadRequest as e:
-        if "message is not modified" in str(e).lower():
+        msg_lower = str(e).lower()
+        if "message is not modified" in msg_lower:
             return True
+        if parse_mode and "can't parse entities" in msg_lower:
+            logger.warning(f"HTML 解析失败，回退到纯文本: {e}")
+            try:
+                await msg.edit_text(plain_text_from_html(text), reply_markup=reply_markup)
+                return True
+            except BadRequest as fallback_err:
+                if "message is not modified" in str(fallback_err).lower():
+                    return True
+                raise
         raise
 
 def _drain_task_result(task: asyncio.Task):
@@ -7611,12 +7833,14 @@ class TelegramStreamRenderer:
         partial = ''.join(self.response_parts).strip()
         visible_text = self.current_text.strip() or partial
         if visible_text:
-            stopped_text = visible_text + "\n\n⏹️ 已停止，保留以上已生成内容。"
+            html_visible = markdown_to_telegram_html(visible_text)
+            stopped_text = html_visible + "\n\n\u23f9\ufe0f 已停止，保留以上已生成内容。"
         else:
-            stopped_text = "⏹️ 已停止，还没有生成可保留的内容。"
+            stopped_text = "\u23f9\ufe0f 已停止，还没有生成可保留的内容。"
         if self.live_edit_enabled:
             try:
-                await safe_edit_text(self.current_msg, stopped_text, reply_markup=None)
+                await safe_edit_text(self.current_msg, stopped_text, reply_markup=None,
+                                     parse_mode=constants.ParseMode.HTML)
             except Exception as e:
                 logger.debug(f"停止时保留流式内容失败: {e}")
         return partial
@@ -7624,7 +7848,9 @@ class TelegramStreamRenderer:
     async def remove_controls(self):
         if self.live_edit_enabled and self.current_text.strip():
             try:
-                await safe_edit_text(self.current_msg, self.current_text, reply_markup=None)
+                html_text = markdown_to_telegram_html(self.current_text)
+                await safe_edit_text(self.current_msg, html_text, reply_markup=None,
+                                     parse_mode=constants.ParseMode.HTML)
             except Exception as e:
                 logger.debug(f"移除流式停止按钮失败: {e}")
 
@@ -7657,17 +7883,22 @@ class TelegramStreamRenderer:
         if len(self.current_text) + len(text) > self.limit:
             if self.live_edit_enabled and self.current_text.strip():
                 try:
-                    await safe_edit_text(self.current_msg, self.current_text, reply_markup=None)
+                    html_text = markdown_to_telegram_html(self.current_text)
+                    await safe_edit_text(self.current_msg, html_text, reply_markup=None,
+                                         parse_mode=constants.ParseMode.HTML)
                 except Exception as e:
                     self.live_edit_enabled = False
                     logger.warning(f"流式消息刷新失败，改为结束后一次性发送: {e}")
             self.current_text = text
             if self.live_edit_enabled:
                 try:
+                    new_text = text if text.strip() else "…"
+                    html_text = markdown_to_telegram_html(new_text)
                     self.current_msg = await self.context.bot.send_message(
                         chat_id=self.chat_id,
-                        text=text if text.strip() else "…",
-                        reply_markup=self.reply_markup
+                        text=html_text,
+                        reply_markup=self.reply_markup,
+                        parse_mode=constants.ParseMode.HTML
                     )
                 except Exception as e:
                     self.live_edit_enabled = False
@@ -7681,7 +7912,9 @@ class TelegramStreamRenderer:
             return
 
         try:
-            await safe_edit_text(self.current_msg, self.current_text, reply_markup=self.reply_markup)
+            html_text = markdown_to_telegram_html(self.current_text)
+            await safe_edit_text(self.current_msg, html_text, reply_markup=self.reply_markup,
+                                 parse_mode=constants.ParseMode.HTML)
         except Exception as e:
             self.live_edit_enabled = False
             logger.warning(f"流式消息刷新失败，改为结束后一次性发送: {e}")
@@ -9308,15 +9541,15 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
         elif data.startswith("prov_models_"):
-            _, _, target, name = data.split("_", 3)
+            name = data[len("prov_models_"):]
             providers = UserDataManager.get('providers', {})
             if name not in providers:
                 await query.answer("⚠️ 找不到这个提供商", show_alert=True)
                 return
-            kb = build_saved_models_keyboard(name, target)
+            kb = build_saved_models_keyboard(name)
             await query.message.edit_text(
-                f"🧰 <b>{safe_text(name)}</b> 的{safe_text(get_model_target_label(target))}管理\n\n"
-                "这里可以手写新增、联网获取，或删除已保存模型。",
+                f"🧰 <b>{safe_text(name)}</b> 的模型管理\n\n"
+                "这里可以手写新增、联网获取，或点击模型进行设置。",
                 reply_markup=kb,
                 parse_mode=constants.ParseMode.HTML
             )
@@ -9487,11 +9720,10 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             providers = UserDataManager.get('providers', {})
             if name not in providers:
                 return
-            target = UserDataManager.get('temp_model_target') or 'chat'
-            kb = build_saved_models_keyboard(name, target)
+            kb = build_saved_models_keyboard(name)
             await query.message.edit_text(
-                f"🧰 <b>{safe_text(name)}</b> 已保存的{safe_text(get_model_target_label(target))}\n\n"
-                "这里可以继续新增、联网获取，或删除模型。",
+                f"🧰 <b>{safe_text(name)}</b> 已保存的模型\n\n"
+                "这里可以继续新增、联网获取，或点击模型进行设置。",
                 reply_markup=kb,
                 parse_mode=constants.ParseMode.HTML
             )
@@ -9499,9 +9731,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif data.startswith("act_manual_mod_"):
             UserDataManager.set('editing_provider', data.split("_", 3)[3])
             UserDataManager.set('state', BotState.ADD_MODEL_MANUAL)
-            target = UserDataManager.get('temp_model_target') or 'chat'
             await query.message.reply_text(
-                f"✍️ <b>手动添加{safe_text(get_model_target_label(target))}</b>\n\n"
+                "✍️ <b>手动添加模型</b>\n\n"
                 "请输入模型代号，单个或批量都可以。\n"
                 "批量输入时，用英文逗号 <code>,</code> 断开。\n\n"
                 "例：\n"
@@ -9513,22 +9744,15 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif data.startswith("act_saved_"):
             content = data[len("act_saved_"):]
             prov_name = UserDataManager.get('temp_viewing_prov')
-            target = UserDataManager.get('temp_model_target') or 'chat'
             if prov_name and content.startswith(prov_name + "_"):
                 model_name = content[len(prov_name)+1:]
             else:
                 model_name = content
-            
-            del_cb = CallbackDataStore.store(f"do_del|{prov_name}|{model_name}")
-            
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🗑️ 删除", callback_data=del_cb)],
-                [InlineKeyboardButton("🔙 返回", callback_data=f"mng_saved_{prov_name}")]
-            ])
+
+            detail_text, detail_kb = build_model_detail_menu(prov_name, model_name)
             await query.message.edit_text(
-                f"⚙️ <b>{safe_text(model_name)}</b>\n目标: {safe_text(get_model_target_label(target))}\n"
-                "这里是提供商下的模型管理，只能删除，不负责设置默认。",
-                reply_markup=kb,
+                detail_text,
+                reply_markup=detail_kb,
                 parse_mode=constants.ParseMode.HTML
             )
 
@@ -9557,6 +9781,31 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode=constants.ParseMode.HTML
             )
         
+        elif data.startswith("set_mdl|"):
+            _, target, prov_name, model_name = data.split("|", 3)
+            await save_model_target_selection(target, prov_name, model_name)
+
+            cid = UserDataManager.get('current_chat_id')
+            if target == 'chat' and cid:
+                db = await BotMemoryDB.get_instance()
+                await db.update_session(cid, model=model_name)
+
+            await GlobalRecorder.record_system_op(
+                f"设置{get_model_target_label(target)}: {model_name}",
+                {"provider": prov_name, "target": target}
+            )
+
+            target_label = get_model_target_label(target)
+            await query.answer(f"✅ 已设为{target_label}")
+            kb = build_saved_models_keyboard(prov_name)
+            await query.message.edit_text(
+                f"✅ <b>{safe_text(model_name)}</b> 已设为{target_label}！\n\n"
+                f"🧰 <b>{safe_text(prov_name)}</b> 已保存的模型\n\n"
+                "这里可以继续新增、联网获取，或点击模型进行设置。",
+                reply_markup=kb,
+                parse_mode=constants.ParseMode.HTML
+            )
+
         elif data.startswith("do_use|") or data.startswith("do_use_"):
             if data.startswith("do_use|"):
                 _, target, prov_name, model_name = data.split("|", 3)
@@ -9587,17 +9836,20 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             else:
                 parts = data.split("_", 3)
                 pname, mname = parts[2], parts[3]
-            target = UserDataManager.get('temp_model_target') or 'chat'
             providers = UserDataManager.get('providers', {})
             if pname in providers and mname in providers[pname].get('models', []):
                 providers[pname]['models'].remove(mname)
                 db = await BotMemoryDB.get_instance()
                 await db.update_provider_models(pname, providers[pname]['models'])
                 await GlobalRecorder.record_system_op(f"删除模型: {mname}", {"provider": pname})
-            kb = build_saved_models_keyboard(pname, target)
+            await query.answer(f"🗑️ 已删除 {mname}")
+            kb = build_saved_models_keyboard(pname)
             await query.message.edit_text(
-                f"🗑️ 已将 {safe_text(mname)} 从 {safe_text(get_model_target_label(target))} 备选中删除。",
-                reply_markup=kb
+                f"🗑️ <b>{safe_text(mname)}</b> 已从模型列表中删除！\n\n"
+                f"🧰 <b>{safe_text(pname)}</b> 已保存的模型\n\n"
+                "这里可以继续新增、联网获取，或点击模型进行设置。",
+                reply_markup=kb,
+                parse_mode=constants.ParseMode.HTML
             )
         
         elif data.startswith("fetch_market_"):
@@ -9622,7 +9874,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             UserDataManager.set('temp_back_callback', back_callback)
             kb = build_magic_keyboard(models, 1, "pick_fetch_", back_callback, "act_search_fetched")
             await query.message.reply_text(
-                f"🌐 已为 {get_model_target_label(target)} 找到了 {len(models)} 个模型:",
+                f"🌐 找到了 {len(models)} 个模型:",
                 reply_markup=kb
             )
         
@@ -9644,15 +9896,10 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 else:
                     await query.answer("⚠️ 该模型已存在", show_alert=False)
                 if menu_mode == 'manage':
-                    del_cb = CallbackDataStore.store(f"do_del|{pname}|{mname}")
-                    kb = InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🗑️ 删除", callback_data=del_cb)],
-                        [InlineKeyboardButton("🔙 返回", callback_data=f"mng_saved_{pname}")]
-                    ])
+                    detail_text, detail_kb = build_model_detail_menu(pname, mname)
                     await query.message.edit_text(
-                        f"⚙️ <b>{safe_text(mname)}</b>\n目标: {safe_text(get_model_target_label(target))}\n"
-                        "模型已经加到这个提供商下面了。",
-                        reply_markup=kb,
+                        f"✅ 模型已保存。\n\n{detail_text}",
+                        reply_markup=detail_kb,
                         parse_mode=constants.ParseMode.HTML
                     )
                 else:
@@ -9673,9 +9920,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         elif data == "act_search_fetched":
             UserDataManager.set('state', BotState.SEARCH_FETCHED)
-            target = UserDataManager.get('temp_model_target') or 'chat'
             await query.message.reply_text(
-                f"🔍 请输入在 {get_model_target_label(target)} 中搜索的内容 (或 'cancel'):"
+                "🔍 请输入搜索的内容 (或 'cancel'):"
             )
         
         elif data.startswith("page_"):
@@ -9691,14 +9937,20 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 menu_mode = UserDataManager.get('temp_model_menu_mode') or 'manage'
                 back_callback = f"view_prov_{pname}" if menu_mode == 'manage' else f"target_{UserDataManager.get('temp_model_target') or 'chat'}_models"
                 extra_buttons = None
+                marker = None
                 if menu_mode == 'manage':
                     extra_buttons = [
                         InlineKeyboardButton("➕ 手写", callback_data=f"act_manual_mod_{pname}"),
                         InlineKeyboardButton("⚡ 联网获取", callback_data=f"fetch_market_{pname}")
                     ]
+                    marker = make_manage_marker_fn(pname)
+                else:
+                    target = UserDataManager.get('temp_model_target') or 'chat'
+                    marker = make_select_marker_fn(target, pname)
                 kb = build_magic_keyboard(
                     items, page, prefix, back_callback,
-                    extra_buttons=extra_buttons
+                    extra_buttons=extra_buttons,
+                    marker_fn=marker
                 )
             else:
                 items = UserDataManager.get('fetched_cache', [])
@@ -10277,7 +10529,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if state == BotState.ADD_MODEL_MANUAL:
         p = UserDataManager.get('editing_provider')
         providers = UserDataManager.get('providers', {})
-        target = UserDataManager.get('temp_model_target') or 'chat'
         if p and p in providers:
             model_names = parse_manual_model_names(text)
             if not model_names:
@@ -10306,22 +10557,21 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     f"手动添加模型: {', '.join(added_models)}",
                     {
                         "provider": p,
-                        "target": target,
                         "count": len(added_models),
                         "skipped_existing": skipped_models
                     }
                 )
             UserDataManager.set('state', BotState.IDLE)
-            kb = build_saved_models_keyboard(p, target)
+            kb = build_saved_models_keyboard(p)
             if added_models:
                 added_preview = "、".join(safe_text(name) for name in added_models[:8])
                 if len(added_models) > 8:
                     added_preview += f" 等 {len(added_models)} 个"
-                reply_text = f"✅ {get_model_target_label(target)} 已记住 {len(added_models)} 个模型: {added_preview}"
+                reply_text = f"✅ 已记住 {len(added_models)} 个模型: {added_preview}"
                 if skipped_models:
                     reply_text += f"\nℹ️ 已跳过 {len(skipped_models)} 个重复模型。"
             else:
-                reply_text = f"ℹ️ 这些{get_model_target_label(target)}以前都保存过了。"
+                reply_text = "ℹ️ 这些模型以前都保存过了。"
             await update.message.reply_text(
                 reply_text,
                 reply_markup=kb,
@@ -10334,14 +10584,13 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         UserDataManager.set('temp_page', 1)
         UserDataManager.set('state', BotState.IDLE)
         pname = UserDataManager.get('temp_viewing_prov')
-        target = UserDataManager.get('temp_model_target') or 'chat'
         models = UserDataManager.get('fetched_cache', [])
         kb = build_magic_keyboard(
-            models, 1, "pick_fetch_", UserDataManager.get('temp_back_callback') or f"target_{target}_models",
+            models, 1, "pick_fetch_", UserDataManager.get('temp_back_callback') or f"mng_saved_{pname}",
             "act_search_fetched", text
         )
         await update.message.reply_text(
-            f"🔍 在 {get_model_target_label(target)} 里搜索 '{safe_text(text)}' 的结果:",
+            f"🔍 搜索 '{safe_text(text)}' 的结果:",
             reply_markup=kb
         )
         return
@@ -10749,7 +10998,12 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     else:
                         read_path = block['body']
                         try:
-                            read_result = await AgentExecutor.read_path_for_model(read_path, provider_api_format)
+                            # 检查 body 是否带行号区间后缀，有则走 read_file_ranged
+                            _, range_part = AgentExecutor._split_read_range(read_path)
+                            if range_part:
+                                read_result = await AgentExecutor.read_file_ranged(read_path)
+                            else:
+                                read_result = await AgentExecutor.read_path_for_model(read_path, provider_api_format)
                         except Exception as e:
                             logger.error(f"Agent读取路径失败: {read_path} ({e})")
                             read_result = {
@@ -10918,7 +11172,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         if not clean_b64:
                             raise ValueError("base64 内容为空")
                         raw_bytes = base64.b64decode(clean_b64, validate=False)
-                        b64_target_path = AgentExecutor.resolve_file_path(filename)
+                        b64_target_path = AgentExecutor.resolve_write_path(filename)
                         b64_existed = os.path.exists(b64_target_path)
 
                         def _write_b64_bytes(path=b64_target_path, data=raw_bytes):
