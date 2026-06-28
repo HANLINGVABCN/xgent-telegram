@@ -7620,7 +7620,20 @@ def _inline_markdown_to_html(text: str) -> str:
 
     text = re.sub(r'`([^`]+)`', _save_inline, text)
 
-    # HTML 转义剩余文本（行内代码、表格已被提取为占位符，不受影响）
+    # 提取链接 [text](url)，在 html.escape 之前保护 URL 不被双重转义
+    # 正则支持 URL 中的一层嵌套括号（如 Wikipedia 链接）
+    link_blocks: List[str] = []
+
+    def _save_link(m: re.Match) -> str:
+        idx = len(link_blocks)
+        link_text = html.escape(m.group(1), quote=False)
+        link_url = m.group(2)  # URL 不做 html.escape，避免 & 被转成 &amp;
+        link_blocks.append(f'<a href="{link_url}">{link_text}</a>')
+        return f'\x01LK{idx}\x01'
+
+    text = re.sub(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _save_link, text)
+
+    # HTML 转义剩余文本（行内代码、表格、链接已被提取为占位符，不受影响）
     text = html.escape(text, quote=False)
 
     # 逐行处理块级元素：标题、引用、列表
@@ -7663,15 +7676,15 @@ def _inline_markdown_to_html(text: str) -> str:
 
     text = '\n'.join(processed)
 
-    # 粗体：**text** 或 __text__
-    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
-    text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
+    # 粗斜体：***text***（必须在粗体和斜体之前处理）
+    text = re.sub(r'\*\*\*(.+?)\*\*\*', r'<b><i>\1</i></b>', text, flags=re.DOTALL)
+
+    # 粗体：**text** 或 __text__（支持跨行，但不跨空行）
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text, flags=re.DOTALL)
+    text = re.sub(r'__(.+?)__', r'<b>\1</b>', text, flags=re.DOTALL)
 
     # 删除线：~~text~~
     text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
-
-    # 链接：[text](url)
-    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
 
     # 斜体：*text*（在粗体之后处理，避免 ** 冲突）
     # 用 [^\W_] 代替 \w（排除下划线），防止颜文字 (*_*) 中的 * 被误匹配
@@ -7684,6 +7697,10 @@ def _inline_markdown_to_html(text: str) -> str:
     # 还原行内代码占位符
     for i, code_html in enumerate(inline_codes):
         text = text.replace(f'\x01IC{i}\x01', code_html)
+
+    # 还原链接占位符
+    for i, link_html in enumerate(link_blocks):
+        text = text.replace(f'\x01LK{i}\x01', link_html)
 
     # 还原表格 <pre> 占位符（表格 HTML 已构建好，直接放回；不在表格内做行内转换）
     for i, pre_html in enumerate(table_blocks):
@@ -7767,6 +7784,47 @@ def plain_text_from_html(text: str) -> str:
     cleaned = re.sub(r'<[^>]+>', '', cleaned)
     return html.unescape(cleaned)
 
+def _sanitize_telegram_html(text: str) -> str:
+    """尝试修复无效的 Telegram HTML，而非直接降级到纯文本。
+
+    Telegram 只支持有限的 HTML 标签（b, i, u, s, a, code, pre, blockquote）。
+    此函数移除所有不支持的标签，修复常见的解析错误，尽可能保留有效格式。
+    """
+    # Telegram 支持的标签
+    ALLOWED_TAGS = {'b', 'i', 'u', 's', 'a', 'code', 'pre', 'blockquote', 'tg-spoiler', 'tg-emoji'}
+
+    def _replace_tag(m: re.Match) -> str:
+        full = m.group(0)
+        tag_match = re.match(r'</?([a-zA-Z][a-zA-Z0-9-]*)(?:\s|>|/)', full)
+        if not tag_match:
+            return html.escape(full)
+        tag_name = tag_match.group(1).lower()
+        if tag_name in ALLOWED_TAGS:
+            return full  # 保留合法标签
+        return html.escape(full)  # 转义非法标签
+
+    result = re.sub(r'<[^>]+>', _replace_tag, text)
+
+    # 修复未闭合的标签：统计开闭标签，补全缺失的闭合标签
+    open_tags: List[str] = []
+    for m in re.finditer(r'<(/?)([a-zA-Z][a-zA-Z0-9-]*)(?:\s[^>]*)?>',  result):
+        is_close = m.group(1) == '/'
+        tag = m.group(2).lower()
+        if tag not in ALLOWED_TAGS:
+            continue
+        if tag in ('pre', 'code'):  # pre/code 自闭合错误是最常见的 parse entities 原因
+            pass
+        if is_close:
+            if open_tags and open_tags[-1] == tag:
+                open_tags.pop()
+        else:
+            open_tags.append(tag)
+    # 按 LIFO 顺序补全未闭合标签
+    for tag in reversed(open_tags):
+        result += f'</{tag}>'
+
+    return result
+
 async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: Any,
                             limit: int = 3900, **kwargs: Any) -> List[Any]:
     """Send text without letting Telegram's per-message limit break the handler."""
@@ -7788,7 +7846,28 @@ async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
             sent.append(await context.bot.send_message(chat_id=chat_id, text=chunk, **send_kwargs))
         except BadRequest as e:
             message = str(e).lower()
-            if parse_mode and ("message is too long" in message or "can't parse entities" in message):
+            if parse_mode and "can't parse entities" in message:
+                # 先尝试清理 HTML 保留格式，而非直接降级到纯文本
+                logger.warning(f"HTML 解析失败，尝试清理后重发: {e}")
+                sanitized = _sanitize_telegram_html(chunk)
+                try:
+                    sent.append(await context.bot.send_message(
+                        chat_id=chat_id, text=sanitized, **send_kwargs
+                    ))
+                    continue
+                except BadRequest:
+                    pass  # 清理后仍失败，降级到纯文本
+                fallback_kwargs = dict(send_kwargs)
+                fallback_kwargs.pop('parse_mode', None)
+                fallback_text = plain_text_from_html(chunk)
+                for fallback_chunk in split_text_for_telegram(fallback_text, limit):
+                    sent.append(await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=fallback_chunk,
+                        **fallback_kwargs
+                    ))
+                continue
+            if parse_mode and "message is too long" in message:
                 fallback_kwargs = dict(send_kwargs)
                 fallback_kwargs.pop('parse_mode', None)
                 fallback_text = plain_text_from_html(chunk)
@@ -7850,7 +7929,13 @@ async def safe_edit_text(msg: Any, text: str, reply_markup: Optional[InlineKeybo
             if "message is not modified" in msg_lower:
                 return True
             if parse_mode and "can't parse entities" in msg_lower:
-                logger.warning(f"HTML 解析失败，回退到纯文本: {retry_bad_request}")
+                logger.warning(f"HTML 解析失败，尝试清理后重发: {retry_bad_request}")
+                # 先尝试清理 HTML 保留格式
+                try:
+                    await msg.edit_text(_sanitize_telegram_html(text), reply_markup=reply_markup, parse_mode=parse_mode)
+                    return True
+                except BadRequest:
+                    pass  # 清理后仍失败，降级到纯文本
                 try:
                     await msg.edit_text(plain_text_from_html(text), reply_markup=reply_markup)
                     return True
@@ -7864,7 +7949,13 @@ async def safe_edit_text(msg: Any, text: str, reply_markup: Optional[InlineKeybo
         if "message is not modified" in msg_lower:
             return True
         if parse_mode and "can't parse entities" in msg_lower:
-            logger.warning(f"HTML 解析失败，回退到纯文本: {e}")
+            logger.warning(f"HTML 解析失败，尝试清理后重发: {e}")
+            # 先尝试清理 HTML 保留格式
+            try:
+                await msg.edit_text(_sanitize_telegram_html(text), reply_markup=reply_markup, parse_mode=parse_mode)
+                return True
+            except BadRequest:
+                pass  # 清理后仍失败，降级到纯文本
             try:
                 await msg.edit_text(plain_text_from_html(text), reply_markup=reply_markup)
                 return True
