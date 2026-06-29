@@ -7710,6 +7710,78 @@ def _inline_markdown_to_html(text: str) -> str:
     return text
 
 
+def _try_parse_text_table_in_codeblock(code: str) -> Optional[str]:
+    """尝试将代码块中的空格对齐纯文本表格转换为 <pre> 对齐表格。
+
+    AI 有时会把表格数据包在 ``` 代码块中，用空格对齐列、用 ---- 做分隔行，
+    而非使用标准 Markdown | 语法。此函数检测这种模式并转换为等宽 <pre> 块。
+    返回转换后的 HTML，或 None 表示不是文本表格。
+    """
+    lines = code.strip().split('\n')
+    if len(lines) < 3:  # 至少需要：表头、分隔行、一行数据
+        return None
+
+    # 检测分隔行（第二行应该主要由 - 和空格组成）
+    sep_line = lines[1].strip()
+    # 分隔行的模式：连续的 --- 段用空格隔开，或者 |---|---| 格式
+    dashes = sep_line.replace(' ', '')
+    if not dashes or len(dashes) < 3:
+        return None
+    dash_ratio = sum(1 for c in dashes if c == '-') / len(dashes)
+    if dash_ratio < 0.8:  # 至少 80% 的非空白字符是 -
+        return None
+
+    # 用分隔行的 ---- 段来确定列的位置
+    # 找出每个 ---- 段的起止位置
+    col_spans: List[Tuple[int, int]] = []
+    in_dash = False
+    start = 0
+    for ci, ch in enumerate(lines[1]):
+        if ch == '-':
+            if not in_dash:
+                start = ci
+                in_dash = True
+        else:
+            if in_dash:
+                col_spans.append((start, ci))
+                in_dash = False
+    if in_dash:
+        col_spans.append((start, len(lines[1])))
+
+    if len(col_spans) < 2:  # 至少需要 2 列才算表格
+        return None
+
+    # 用列位置来分割每行
+    def split_by_spans(line: str) -> List[str]:
+        cells = []
+        for si, (cs, ce) in enumerate(col_spans):
+            # 最后一列延伸到行尾
+            end = ce if si < len(col_spans) - 1 else max(ce, len(line))
+            cell = line[cs:end].strip() if cs < len(line) else ''
+            cells.append(cell)
+        return cells
+
+    # 提取所有行（跳过分隔行）
+    table_rows: List[List[str]] = []
+    header = split_by_spans(lines[0])
+    table_rows.append(header)
+    for li in range(2, len(lines)):  # 跳过分隔行(index 1)
+        line = lines[li]
+        if not line.strip():
+            continue
+        # 跳过额外的分隔行
+        stripped_nospace = line.strip().replace(' ', '')
+        if stripped_nospace and all(c == '-' for c in stripped_nospace):
+            continue
+        table_rows.append(split_by_spans(line))
+
+    if len(table_rows) < 2:  # 至少需要表头 + 1行数据
+        return None
+
+    # 用 _build_table_pre_block 的逻辑来构建对齐的 <pre> 表格
+    return _build_table_pre_block(table_rows)
+
+
 def markdown_to_telegram_html(text: str) -> str:
     """将 Markdown 转换为 Telegram 兼容的 HTML。
 
@@ -7737,6 +7809,12 @@ def markdown_to_telegram_html(text: str) -> str:
             if m:
                 lang = m.group(1) or ''
                 code = m.group(2)
+                # 无语言标注（或 text/plain）的代码块：检查是否是伪装的文本表格
+                if not lang or lang.lower() in ('text', 'plain'):
+                    table_html = _try_parse_text_table_in_codeblock(code)
+                    if table_html:
+                        result.append(table_html)
+                        continue
                 escaped = html.escape(code)
                 if lang and lang.lower() not in ('text', 'plain'):
                     result.append(f'<pre><code class="language-{lang}">{escaped}</code></pre>')
