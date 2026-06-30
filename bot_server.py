@@ -10521,7 +10521,13 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 
     doc = update.message.document
     doc_name = doc.file_name or f"document_{uuid.uuid4().hex[:8]}.bin"
-    caption = (update.message.caption or "").strip()
+    # 使用 caption 保留格式
+    caption = ""
+    if update.message.caption:
+        try:
+            caption = (update.message.caption_markdown or update.message.caption or "").strip()
+        except Exception:
+            caption = (update.message.caption or "").strip()
     # 转发的富文本消息：caption 可能为空，文字在 rich_message.blocks 里
     if not caption:
         caption = _extract_rich_message_text(update.message).strip()
@@ -10761,7 +10767,26 @@ def _extract_rich_message_text(msg):
             elif isinstance(part, dict):
                 t = part.get('text')
                 if t and isinstance(t, str):
-                    parts.append(t)
+                    fmt = part.get('type', '')
+                    if fmt == 'bold':
+                        parts.append(f'**{t}**')
+                    elif fmt == 'italic':
+                        parts.append(f'*{t}*')
+                    elif fmt == 'code':
+                        parts.append(f'`{t}`')
+                    elif fmt == 'pre':
+                        parts.append('```' + chr(10) + t + chr(10) + '```')
+                    elif fmt == 'strikethrough':
+                        parts.append(f'~~{t}~~')
+                    elif fmt == 'underline':
+                        parts.append(f'__{t}__')
+                    elif fmt == 'spoiler':
+                        parts.append(f'||{t}||')
+                    elif fmt == 'link':
+                        url = part.get('url', '')
+                        parts.append(f'[{t}]({url})' if url else t)
+                    else:
+                        parts.append(t)
         if parts:
             para = ''.join(parts)
             paragraphs.append(para)
@@ -10783,7 +10808,15 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await UserDataManager.init()
     state = UserDataManager.get('state')
-    text = (update.message.text or update.message.caption or "").strip()
+    # 使用 text_markdown 保留格式（粗体/斜体/代码块等）
+    text = ""
+    if update.message.text:
+        try:
+            text = (update.message.text_markdown or update.message.text or "").strip()
+        except Exception:
+            text = (update.message.text or "").strip()
+    else:
+        text = (update.message.caption or "").strip()
 
     # 转发消息 text 可能为 None（python-telegram-bot 解析问题），
     # 用 forwardMessage API 重新拉取完整消息内容
