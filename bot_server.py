@@ -10700,13 +10700,99 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text(f"文件 {safe_text(doc_name)} 已收到，但保存或转交模型失败。")
 
 
-def _extract_rich_message_text(msg):
-    """Extract plain text from rich_message (Telegram rich text format).
+def _rich_part_to_markdown(part):
+    """Convert a rich text part to markdown. Handles string, dict (formatted), and list."""
+    if isinstance(part, str):
+        return part
+    if isinstance(part, dict):
+        t = part.get('text')
+        if t is None:
+            return ''
+        if isinstance(t, (dict, list)):
+            inner = _rich_part_to_markdown(t)
+        else:
+            inner = str(t)
+        fmt = part.get('type', '')
+        if fmt == 'bold':
+            return '**' + inner + '**'
+        elif fmt == 'italic':
+            return '*' + inner + '*'
+        elif fmt == 'code':
+            return '`' + inner + '`'
+        elif fmt == 'pre':
+            return '```' + chr(10) + inner + chr(10) + '```'
+        elif fmt == 'strikethrough':
+            return '~~' + inner + '~~'
+        elif fmt == 'underline':
+            return '__' + inner + '__'
+        elif fmt == 'spoiler':
+            return '||' + inner + '||'
+        elif fmt == 'link':
+            url = part.get('url', '')
+            return '[' + inner + '](' + url + ')' if url else inner
+        else:
+            return inner
+    if isinstance(part, list):
+        return ''.join(_rich_part_to_markdown(p) for p in part)
+    return ''
 
-    Supports two formats:
-    1. markdown: {"markdown": "full text"}
-    2. blocks: {"blocks": [{"type": "paragraph", "text": [...]}]}
-    """
+
+def _rich_block_to_text(block):
+    """Convert a rich_message block to text. Handles paragraphs, blockquotes, tables, lists."""
+    if not isinstance(block, dict):
+        return ''
+    btype = block.get('type', '')
+    text = block.get('text')
+    if text is not None:
+        return _rich_part_to_markdown(text)
+    if 'blocks' in block:
+        nested = [_rich_block_to_text(b) for b in block['blocks'] if isinstance(b, dict)]
+        result = chr(10).join(nested)
+        if btype == 'blockquote':
+            result = chr(10).join('> ' + line for line in result.split(chr(10)) if line)
+        return result
+    if 'cells' in block:
+        cells = block['cells']
+        if not isinstance(cells, list):
+            return ''
+        rows = []
+        for row in cells:
+            if not isinstance(row, list):
+                continue
+            cell_texts = []
+            for cell in row:
+                if isinstance(cell, dict):
+                    ct = cell.get('text', '')
+                    cell_texts.append(_rich_part_to_markdown(ct))
+                else:
+                    cell_texts.append(str(cell))
+            rows.append(cell_texts)
+        if not rows:
+            return ''
+        lines = []
+        for i, row in enumerate(rows):
+            lines.append('| ' + ' | '.join(row) + ' |')
+            if i == 0:
+                lines.append('| ' + ' | '.join(['---'] * len(row)) + ' |')
+        return chr(10).join(lines)
+    if 'items' in block:
+        items = block['items']
+        if not isinstance(items, list):
+            return ''
+        lines = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            label = item.get('label', '-')
+            item_blocks = item.get('blocks', [])
+            item_text = chr(10).join(_rich_block_to_text(b) for b in item_blocks if isinstance(b, dict))
+            lines.append(label + ' ' + item_text)
+        return chr(10).join(lines)
+    return ''
+
+
+def _extract_rich_message_text(msg):
+    """Extract text from rich_message (Telegram rich text format), preserving formatting as markdown."""
     extra = getattr(msg, 'api_kwargs', None) or {}
     rich = extra.get('rich_message')
     rich_source = "api_kwargs"
@@ -10719,79 +10805,31 @@ def _extract_rich_message_text(msg):
             rich = None
     if not rich or not isinstance(rich, dict):
         return ""
-
-    # Log full content for debugging
     try:
         rich_json = json.dumps(rich, ensure_ascii=False, default=str)
         logger.warning(f"_extract_rich_message_text: source={rich_source}, keys={list(rich.keys())}, full={rich_json[:3000]}")
     except Exception:
         logger.warning(f"_extract_rich_message_text: source={rich_source}, keys={list(rich.keys()) if isinstance(rich, dict) else type(rich)}")
-
-    # Format 1: markdown (used by send_rich_message)
     md = rich.get('markdown')
     if md and isinstance(md, str) and md.strip():
         logger.warning(f"_extract_rich_message_text: extracted via markdown, len={len(md)}: {md[:200]}")
         return md
-
-    # Format 2: blocks (structured format)
     blocks = rich.get('blocks')
     if not blocks or not isinstance(blocks, list):
-        logger.warning(f"_extract_rich_message_text: no blocks, trying other keys: {list(rich.keys())}")
-        # Try to find text in any other key
-        for k, v in rich.items():
-            if isinstance(v, str) and len(v) > 5:
-                logger.warning(f"_extract_rich_message_text: found text in key='{k}', len={len(v)}: {v[:200]}")
-                return v
         return ""
     logger.warning(f"_extract_rich_message_text: found {len(blocks)} blocks")
     paragraphs = []
     for i, block in enumerate(blocks):
         if not isinstance(block, dict):
             continue
-        text_parts = block.get('text')
-        if not text_parts:
-            logger.warning(f"_extract_rich_message_text: block[{i}] no text, keys={list(block.keys())}")
-            continue
-        if isinstance(text_parts, str):
-            # text is a plain string (paragraph without formatting)
-            paragraphs.append(text_parts)
-            logger.warning(f"_extract_rich_message_text: block[{i}] (string) len={len(text_parts)}: {text_parts[:100]}")
-            continue
-        if not isinstance(text_parts, list):
-            logger.warning(f"_extract_rich_message_text: block[{i}] text type={type(text_parts).__name__}, keys={list(block.keys())}")
-            continue
-        parts = []
-        for part in text_parts:
-            if isinstance(part, str):
-                parts.append(part)
-            elif isinstance(part, dict):
-                t = part.get('text')
-                if t and isinstance(t, str):
-                    fmt = part.get('type', '')
-                    if fmt == 'bold':
-                        parts.append(f'**{t}**')
-                    elif fmt == 'italic':
-                        parts.append(f'*{t}*')
-                    elif fmt == 'code':
-                        parts.append(f'`{t}`')
-                    elif fmt == 'pre':
-                        parts.append('```' + chr(10) + t + chr(10) + '```')
-                    elif fmt == 'strikethrough':
-                        parts.append(f'~~{t}~~')
-                    elif fmt == 'underline':
-                        parts.append(f'__{t}__')
-                    elif fmt == 'spoiler':
-                        parts.append(f'||{t}||')
-                    elif fmt == 'link':
-                        url = part.get('url', '')
-                        parts.append(f'[{t}]({url})' if url else t)
-                    else:
-                        parts.append(t)
-        if parts:
-            para = ''.join(parts)
-            paragraphs.append(para)
-            logger.warning(f"_extract_rich_message_text: block[{i}] len={len(para)}: {para[:100]}")
-    result = '\n'.join(paragraphs)
+        btype = block.get('type', '')
+        t = _rich_block_to_text(block)
+        if t:
+            logger.warning(f"_extract_rich_message_text: block[{i}] ({btype}) len={len(t)}")
+            paragraphs.append(t)
+        else:
+            logger.warning(f"_extract_rich_message_text: block[{i}] ({btype}) empty, keys={list(block.keys())}")
+    result = chr(10).join(paragraphs)
     logger.warning(f"_extract_rich_message_text: total len={len(result)}, paragraphs={len(paragraphs)}")
     return result
 
