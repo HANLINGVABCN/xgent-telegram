@@ -12564,7 +12564,7 @@ async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYP
         extracted_text = (msg_dict.get('text') or msg_dict.get('caption') or "").strip()
 
     if not extracted_text:
-        # 深度搜索：遍历 api_kwargs 的所有键值
+        # 深度搜索：遍历 api_kwargs 的所有键值，找最长的字符串（最可能是消息正文）
         extra = getattr(msg, 'api_kwargs', None) or {}
         _SKIP_KEYS = {'date', 'message_id', 'chat_id', 'from_user_id', 'update_id',
                        'id', 'file_id', 'file_unique_id', 'mime_type', 'file_size',
@@ -12579,39 +12579,49 @@ async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYP
                        'new_chat_photo', 'left_chat_member',
                        'photo', 'reply_to_message', 'pinned_message',
                        'via_bot', 'author'}
+        # 记录所有候选字符串
+        for k, v in extra.items():
+            if isinstance(v, str) and len(v) > 3:
+                logger.warning(f"handle_other_message candidate api_kwargs['{k}'] len={len(v)}: {v[:100]}")
+        # 找最长的字符串
+        best_text = ""
+        best_key = ""
         for k, v in extra.items():
             if k in _SKIP_KEYS:
                 continue
-            if isinstance(v, str) and len(v) > 10:
-                extracted_text = v
-                logger.warning(f"handle_other_message: extracted from api_kwargs['{k}']")
-                break
+            if isinstance(v, str) and len(v) > 10 and len(v) > len(best_text):
+                best_text = v
+                best_key = k
+        if best_text:
+            extracted_text = best_text
+            logger.warning(f"handle_other_message: extracted from api_kwargs['{best_key}'], len={len(best_text)}")
 
     if not extracted_text:
-        # 递归深度搜索 to_dict() 的所有值
-        def _deep_search(obj, depth=0):
+        # 递归深度搜索 to_dict() 的所有值，找最长的字符串
+        def _deep_search_longest(obj, depth=0) -> Optional[str]:
             if depth > 5:
                 return None
+            best = None
             if isinstance(obj, str) and len(obj) > 10:
-                return obj
+                best = obj
             if isinstance(obj, dict):
                 for k, v in obj.items():
                     if k in _SKIP_KEYS:
                         continue
-                    result = _deep_search(v, depth + 1)
-                    if result:
-                        return result
+                    result = _deep_search_longest(v, depth + 1)
+                    if result and (best is None or len(result) > len(best)):
+                        best = result
             if isinstance(obj, list):
                 for item in obj:
-                    result = _deep_search(item, depth + 1)
-                    if result:
-                        return result
-            return None
+                    result = _deep_search_longest(item, depth + 1)
+                    if result and (best is None or len(result) > len(best)):
+                        best = result
+            return best
 
-        found = _deep_search(msg_dict)
+        found = _deep_search_longest(msg_dict)
         if found:
             extracted_text = found
-            logger.warning(f"handle_other_message: extracted via deep search: {found[:200]}")
+            logger.warning(f"handle_other_message: extracted via deep search, len={len(found)}: {found[:200]}")
 
     if not extracted_text:
         # 检查嵌套消息
