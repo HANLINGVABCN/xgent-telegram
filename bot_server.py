@@ -7542,433 +7542,25 @@ class TelegramRichAPI:
 
     @classmethod
     async def send_rich_message_draft(cls, chat_id: int, text: str,
-                                       draft_message_id: Optional[int] = None) -> Dict:
-        """发送/更新流式 Rich Message Draft。返回含 draft_message_id 的响应。"""
+                                       draft_id: int) -> Dict:
+        """发送/更新流式 Rich Message Draft。
+
+        Bot API 10.1: sendRichMessageDraft 在私聊中创建一个 30 秒临时的 Draft 预览。
+        相同 draft_id 的后续调用会以动画过渡更新内容。
+        完成后必须调用 send_rich_message 发送最终消息以持久化。
+        API 返回 True（非 Message 对象），draft_id 由调用方生成。
+        """
         payload: Dict[str, Any] = {
             "chat_id": chat_id,
+            "draft_id": draft_id,
             "rich_message": {"markdown": text or " "},
         }
-        if draft_message_id is not None:
-            payload["draft_message_id"] = draft_message_id
         client = cls._get_client()
         resp = await client.post(cls._api_url("sendRichMessageDraft"), json=payload)
         result = resp.json()
         if not result.get("ok"):
             raise TelegramError(f"sendRichMessageDraft failed: {result.get('description', result)}")
         return result
-
-
-def _parse_inline_rich_text(text: str) -> List[Dict]:
-    """将行内 Markdown 格式转换为 RichText 对象列表。
-
-    支持：**粗体**、*斜体*、~~删除线~~、`行内代码`、[链接](url)。
-    返回 RichText 对象列表，纯文本为 {"type": "plain", "text": "..."}。
-    """
-    if not text:
-        return []
-
-    # 占位符系统：先提取特殊格式，最后还原
-    placeholders: List[Dict] = []
-
-    def _save(rich_obj: Dict) -> str:
-        idx = len(placeholders)
-        placeholders.append(rich_obj)
-        return f"\x03PH{idx}\x03"
-
-    # 1. 行内代码 `code`（最先提取，保护内容）
-    def _replace_code(m: re.Match) -> str:
-        return _save({"type": "code", "text": m.group(1)})
-    text = re.sub(r'`([^`]+)`', _replace_code, text)
-
-    # 2. 链接 [text](url)（在其他格式之前提取，避免冲突）
-    def _replace_link(m: re.Match) -> str:
-        link_text = m.group(1)
-        link_url = m.group(2)
-        # 递归解析链接文本中的行内格式
-        inner_texts = _parse_inline_rich_text(link_text)
-        return _save({"type": "url", "url": link_url, "text": inner_texts})
-    text = re.sub(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _replace_link, text)
-
-    # 3. 粗斜体 ***text***
-    def _replace_bold_italic(m: re.Match) -> str:
-        inner = _parse_inline_rich_text(m.group(1))
-        return _save({"type": "bold", "text": [{"type": "italic", "text": inner}]})
-    text = re.sub(r'\*\*\*(.+?)\*\*\*', _replace_bold_italic, text, flags=re.DOTALL)
-
-    # 4. 粗体 **text** 或 __text__
-    def _replace_bold(m: re.Match) -> str:
-        inner = _parse_inline_rich_text(m.group(1))
-        return _save({"type": "bold", "text": inner})
-    text = re.sub(r'\*\*(.+?)\*\*', _replace_bold, text, flags=re.DOTALL)
-    text = re.sub(r'__(.+?)__', _replace_bold, text, flags=re.DOTALL)
-
-    # 5. 删除线 ~~text~~
-    def _replace_strike(m: re.Match) -> str:
-        inner = _parse_inline_rich_text(m.group(1))
-        return _save({"type": "strikethrough", "text": inner})
-    text = re.sub(r'~~(.+?)~~', _replace_strike, text)
-
-    # 6. 斜体 *text*（在粗体之后处理，避免 ** 冲突）
-    def _replace_italic(m: re.Match) -> str:
-        inner = _parse_inline_rich_text(m.group(1))
-        return _save({"type": "italic", "text": inner})
-    text = re.sub(r'(?<!\*)\*(?=[^\W_])(.+?)(?<=[^\W_])\*(?!\*)', _replace_italic, text)
-
-    # 还原占位符，构建最终 RichText 列表
-    result: List[Dict] = []
-    remaining = text
-    while remaining:
-        ph_match = re.search(r'\x03PH(\d+)\x03', remaining)
-        if not ph_match:
-            if remaining:
-                result.append({"type": "plain", "text": remaining})
-            break
-        before = remaining[:ph_match.start()]
-        if before:
-            result.append({"type": "plain", "text": before})
-        idx = int(ph_match.group(1))
-        result.append(placeholders[idx])
-        remaining = remaining[ph_match.end():]
-
-    return result if result else [{"type": "plain", "text": ""}]
-
-
-def _parse_table_rows_to_rich(lines: List[str], start: int) -> Tuple[Optional[Dict], int]:
-    """尝试从 lines[start] 开始解析 Markdown 表格。
-
-    返回 (RichBlockTable dict, 消耗的行数结束索引) 或 (None, start)。
-    """
-    if start >= len(lines):
-        return None, start
-
-    header_cells = _parse_markdown_table_row_rich(lines[start])
-    if header_cells is None:
-        return None, start
-    if start + 1 >= len(lines):
-        return None, start
-
-    sep_cells = _parse_markdown_table_row_rich(lines[start + 1])
-    if not _is_table_separator_row_rich(sep_cells):
-        return None, start
-
-    # 收集所有数据行
-    rows_data: List[List[str]] = [header_cells]
-    j = start + 2
-    while j < len(lines):
-        row_cells = _parse_markdown_table_row_rich(lines[j])
-        if row_cells is None:
-            break
-        if _is_table_separator_row_rich(row_cells):
-            j += 1
-            continue
-        rows_data.append(row_cells)
-        j += 1
-
-    if len(rows_data) < 2:
-        return None, start
-
-    # 构建 RichBlockTable
-    num_cols = max(len(r) for r in rows_data)
-    table_rows: List[Dict] = []
-    for ri, row in enumerate(rows_data):
-        cells: List[Dict] = []
-        for ci in range(num_cols):
-            cell_text = row[ci] if ci < len(row) else ""
-            cells.append({
-                "text": _parse_inline_rich_text(cell_text),
-                "is_header": ri == 0,
-            })
-        table_rows.append({"cells": cells})
-
-    table_block: Dict = {
-        "type": "table",
-        "is_bordered": True,
-        "is_striped": True,
-        "rows": table_rows,
-    }
-    return table_block, j
-
-
-def _parse_markdown_table_row_rich(line: str) -> Optional[List[str]]:
-    """把一行 `| a | b |` 解析成单元格列表；不是表格行返回 None。"""
-    stripped = line.strip()
-    if '|' not in stripped:
-        return None
-    inner = stripped
-    if inner.startswith('|'):
-        inner = inner[1:]
-    if inner.endswith('|'):
-        inner = inner[:-1]
-    cells = [c.strip() for c in inner.split('|')]
-    if len(cells) < 2:
-        return None
-    return cells
-
-
-def _is_table_separator_row_rich(cells: Optional[List[str]]) -> bool:
-    """判断是否是表格分隔行。"""
-    if not cells:
-        return False
-    sep_re = re.compile(r'^:?-{1,}:?$')
-    return all(sep_re.match(c) and '-' in c for c in cells)
-
-
-def _parse_list_items_to_rich(lines: List[str], start: int) -> Tuple[Optional[Dict], int]:
-    """从 lines[start] 开始解析连续的列表项。
-
-    支持无序列表（- 或 *）和有序列表（1.），支持缩进嵌套。
-    返回 (RichBlockList dict, 消耗的行数结束索引) 或 (None, start)。
-    """
-    if start >= len(lines):
-        return None, start
-
-    # 检测列表类型
-    first = lines[start]
-    stripped = first.lstrip()
-    is_ordered = bool(re.match(r'^\d+\.\s+', stripped))
-    is_unordered = bool(re.match(r'^[\-\*]\s+', stripped))
-    if not is_ordered and not is_unordered:
-        return None, start
-
-    items: List[Dict] = []
-    j = start
-    base_indent = len(first) - len(first.lstrip())
-
-    while j < len(lines):
-        line = lines[j]
-        if not line.strip():
-            # 空行可能是列表项之间的分隔，看下一行
-            if j + 1 < len(lines):
-                next_stripped = lines[j + 1].lstrip()
-                next_indent = len(lines[j + 1]) - len(next_stripped)
-                if next_indent >= base_indent and (
-                    re.match(r'^[\-\*]\s+', next_stripped) or
-                    re.match(r'^\d+\.\s+', next_stripped)
-                ):
-                    j += 1
-                    continue
-            break
-
-        current_indent = len(line) - len(line.lstrip())
-        stripped = line.lstrip()
-
-        # 嵌套列表：缩进更深的列表项
-        if current_indent > base_indent:
-            # 收集所有缩进更深的行作为子列表
-            sub_lines: List[str] = []
-            while j < len(lines) and lines[j].strip():
-                ci = len(lines[j]) - len(lines[j].lstrip())
-                if ci <= base_indent:
-                    break
-                # 去掉相对基础缩进的额外空格
-                sub_lines.append(lines[j][base_indent + 2:] if len(lines[j]) > base_indent + 2 else lines[j].lstrip())
-                j += 1
-            sub_list, _ = _parse_list_items_to_rich(sub_lines, 0)
-            if sub_list and items:
-                # 将子列表附加到最后一个列表项
-                last_item = items[-1]
-                if "sub_blocks" not in last_item:
-                    last_item["sub_blocks"] = []
-                last_item["sub_blocks"].append(sub_list)
-            continue
-
-        # 匹配列表项
-        m_unordered = re.match(r'^[\-\*]\s+(.*)$', stripped)
-        m_ordered = re.match(r'^\d+\.\s+(.*)$', stripped)
-
-        if m_unordered:
-            content = m_unordered.group(1)
-            items.append({
-                "type": "list_item",
-                "text": _parse_inline_rich_text(content),
-            })
-            j += 1
-        elif m_ordered:
-            content = m_ordered.group(1)
-            items.append({
-                "type": "list_item",
-                "text": _parse_inline_rich_text(content),
-            })
-            j += 1
-        else:
-            break
-
-    if not items:
-        return None, start
-
-    list_block: Dict = {
-        "type": "list",
-        "is_ordered": is_ordered,
-        "items": items,
-    }
-    return list_block, j
-
-
-def _parse_blockquote_to_rich(lines: List[str], start: int) -> Tuple[Optional[Dict], int]:
-    """从 lines[start] 开始解析连续的引用块。"""
-    if start >= len(lines):
-        return None, start
-
-    stripped = lines[start].strip()
-    if not stripped.startswith('> ') and stripped != '>':
-        return None, start
-
-    quote_lines: List[str] = []
-    j = start
-    while j < len(lines):
-        s = lines[j].strip()
-        if s.startswith('> '):
-            quote_lines.append(s[2:])
-            j += 1
-        elif s == '>':
-            quote_lines.append('')
-            j += 1
-        else:
-            break
-
-    if not quote_lines:
-        return None, start
-
-    # 递归解析引用块内部的内容
-    inner_blocks = markdown_to_rich_blocks('\n'.join(quote_lines))
-    quote_block: Dict = {
-        "type": "block_quotation",
-        "blocks": inner_blocks,
-    }
-    return quote_block, j
-
-
-def markdown_to_rich_blocks(text: str) -> List[Dict]:
-    """将 Markdown 文本转换为 RichBlock JSON 列表（用于 Telegram Bot API 10.1 Rich Messages）。
-
-    支持：
-    - 代码块 → RichBlockPreformatted
-    - 标题 → RichBlockSectionHeading
-    - 分割线 → RichBlockDivider
-    - 引用块 → RichBlockBlockQuotation
-    - 表格 → RichBlockTable
-    - 列表 → RichBlockList
-    - 段落 → RichBlockParagraph（含行内格式：粗体/斜体/删除线/代码/链接）
-    """
-    if not text:
-        return []
-
-    # 流式输出中可能有未闭合的代码块，临时补全
-    fence_count = len(re.findall(r'```', text))
-    if fence_count % 2 == 1:
-        text = text + '\n```'
-
-    blocks: List[Dict] = []
-
-    # 先按代码块分割
-    segments = re.split(r'(```\w*\n?.*?```)', text, flags=re.DOTALL)
-
-    for seg in segments:
-        if not seg:
-            continue
-        if seg.startswith('```'):
-            m = re.match(r'```(\w*)\n?(.*?)```', seg, re.DOTALL)
-            if m:
-                lang = m.group(1) or ''
-                code = m.group(2)
-                block: Dict = {
-                    "type": "preformatted",
-                    "text": code,
-                }
-                if lang and lang.lower() not in ('text', 'plain'):
-                    block["language"] = lang
-                blocks.append(block)
-            continue
-
-        # 非代码段：逐行解析块级元素
-        lines = seg.split('\n')
-        i = 0
-        paragraph_buffer: List[str] = []
-
-        def flush_paragraph():
-            nonlocal paragraph_buffer
-            if paragraph_buffer:
-                para_text = '\n'.join(paragraph_buffer).strip()
-                if para_text:
-                    blocks.append({
-                        "type": "paragraph",
-                        "text": _parse_inline_rich_text(para_text),
-                    })
-                paragraph_buffer = []
-
-        while i < len(lines):
-            line = lines[i]
-            stripped = line.strip()
-
-            # 空行：刷新段落
-            if not stripped:
-                flush_paragraph()
-                i += 1
-                continue
-
-            # 分割线：--- 或 *** 或 ___（至少3个字符，独占一行）
-            if re.match(r'^[-*_]{3,}\s*$', stripped):
-                flush_paragraph()
-                blocks.append({"type": "divider"})
-                i += 1
-                continue
-
-            # 标题：# 到 ######
-            m_heading = re.match(r'^(#{1,6})\s+(.+)$', stripped)
-            if m_heading:
-                flush_paragraph()
-                level = len(m_heading.group(1))
-                blocks.append({
-                    "type": "section_heading",
-                    "text": _parse_inline_rich_text(m_heading.group(2)),
-                    "level": level,
-                })
-                i += 1
-                continue
-
-            # 引用块
-            if stripped.startswith('> ') or stripped == '>':
-                flush_paragraph()
-                quote_block, new_i = _parse_blockquote_to_rich(lines, i)
-                if quote_block:
-                    blocks.append(quote_block)
-                    i = new_i
-                    continue
-                # 如果解析失败，当普通文本
-                paragraph_buffer.append(line)
-                i += 1
-                continue
-
-            # 表格
-            if '|' in stripped:
-                table_block, new_i = _parse_table_rows_to_rich(lines, i)
-                if table_block:
-                    flush_paragraph()
-                    blocks.append(table_block)
-                    i = new_i
-                    continue
-
-            # 列表
-            if re.match(r'^[\-\*]\s+', stripped) or re.match(r'^\d+\.\s+', stripped):
-                flush_paragraph()
-                list_block, new_i = _parse_list_items_to_rich(lines, i)
-                if list_block:
-                    blocks.append(list_block)
-                    i = new_i
-                    continue
-                # 如果列表解析失败，当普通文本
-                paragraph_buffer.append(line)
-                i += 1
-                continue
-
-            # 普通文本行：加入段落缓冲
-            paragraph_buffer.append(line)
-            i += 1
-
-        flush_paragraph()
-
-    return blocks
-
 
 async def rich_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str,
                             reply_markup: Optional[InlineKeyboardMarkup] = None,
@@ -8616,7 +8208,8 @@ class TelegramStreamRenderer:
         self._task: Optional[asyncio.Task] = None
         self.live_edit_enabled = True
         # Rich Message Draft 模式
-        self._draft_message_id: Optional[int] = None
+        # draft_id 由 bot 自行生成（API 要求非零整数），相同 draft_id 的调用会动画过渡更新
+        self._draft_id: int = int(time.time() * 1000) % 0x7FFFFFFF + 1
         self._rich_draft_enabled = True  # 尝试使用 Rich Draft，失败则降级
 
     def start(self):
@@ -8760,14 +8353,16 @@ class TelegramStreamRenderer:
         # 优先使用 Rich Message Draft 推送
         if self._rich_draft_enabled:
             try:
-                result = await TelegramRichAPI.send_rich_message_draft(
+                # 文本较短时在开头添加 <tg-thinking> 思考块（API 10.1 Draft 专属）
+                # 给用户"AI 正在思考"的视觉反馈，文本足够长后自动移除
+                draft_text = self.current_text
+                if len(draft_text.strip()) < 80:
+                    draft_text = "<tg-thinking>正在思考…</tg-thinking>\n\n" + draft_text
+                await TelegramRichAPI.send_rich_message_draft(
                     chat_id=self.chat_id,
-                    text=self.current_text,
-                    draft_message_id=self._draft_message_id,
+                    text=draft_text,
+                    draft_id=self._draft_id,
                 )
-                # 保存 draft_message_id 用于后续更新
-                if result.get('result', {}).get('message_id'):
-                    self._draft_message_id = result['result']['message_id']
                 return
             except Exception as e:
                 logger.info(f"Rich Draft 推送失败，降级为 HTML edit: {e}")
@@ -13058,6 +12653,12 @@ async def on_shutdown(app):
         logger.info("✅ 数据库连接已关闭")
     except Exception as e:
         logger.error(f"关闭数据库失败: {e}")
+    try:
+        if TelegramRichAPI._client and not TelegramRichAPI._client.is_closed:
+            await TelegramRichAPI._client.aclose()
+            logger.info("✅ Rich API httpx 客户端已关闭")
+    except Exception as e:
+        logger.error(f"关闭 Rich API httpx 客户端失败: {e}")
 
 # --- ☆ 主程序入口 ☆ ---
 if __name__ == '__main__':
