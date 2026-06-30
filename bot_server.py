@@ -10674,6 +10674,10 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
                 )
             })
 
+        forward_prefix = build_forward_origin_prefix(update.message)
+        if forward_prefix:
+            memory_text = f"{forward_prefix}\n{memory_text}"
+
         await process_conversation(
             update,
             context,
@@ -11110,6 +11114,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     # --- 正常对话处理 ---
+    forward_prefix = build_forward_origin_prefix(update.message)
+    if forward_prefix:
+        text = f"{forward_prefix}\n{text}"
     await handle_normal_text_conversation(update, context, text)
 
 
@@ -12435,6 +12442,10 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
             "data": image_b64
         })
 
+        forward_prefix = build_forward_origin_prefix(update.message)
+        if forward_prefix:
+            memory_text = f"{forward_prefix}\n{memory_text}"
+
         await process_conversation(
             update,
             context,
@@ -12465,9 +12476,62 @@ async def handle_sticker_message(update: Update, context: ContextTypes.DEFAULT_T
     prov_name, prov_data = get_current_provider()
     model = UserDataManager.get('default_model')
     if prov_data and model and emoji:
-        await process_conversation(update, context, f"[用户发送了一个贴纸: {emoji}]")
+        sticker_conv_text = f"[用户发送了一个贴纸: {emoji}]"
+        forward_prefix = build_forward_origin_prefix(update.message)
+        if forward_prefix:
+            sticker_conv_text = f"{forward_prefix}\n{sticker_conv_text}"
+        await process_conversation(update, context, sticker_conv_text)
     else:
         await update.message.reply_text(f"已收到贴纸 {emoji} ")
+
+
+def build_forward_origin_prefix(msg) -> str:
+    """从消息中提取转发来源信息，返回前缀字符串。非转发消息返回空字符串。"""
+    origin = getattr(msg, 'forward_origin', None)
+
+    # 旧版 API 兼容：forward_from / forward_from_chat
+    if not origin:
+        ff = getattr(msg, 'forward_from', None)
+        ffc = getattr(msg, 'forward_from_chat', None)
+        if ff:
+            name = ff.full_name or ff.first_name or ff.username or "未知用户"
+            return f"[转发消息，来源：{name}]"
+        if ffc:
+            name = ffc.title or ffc.username or "未知聊天"
+            return f"[转发消息，来源：{name}]"
+        if getattr(msg, 'forward_date', None):
+            return "[转发消息，来源：未知]"
+        return ""
+
+    origin_type = getattr(origin, 'type', '')
+
+    if origin_type == 'user':
+        sender = getattr(origin, 'sender_user', None)
+        name = (sender.full_name or sender.first_name or sender.username or "未知用户") if sender else "未知用户"
+        return f"[转发消息，来源：{name}]"
+
+    if origin_type == 'hidden_user':
+        name = getattr(origin, 'sender_user_name', None) or "隐藏用户"
+        return f"[转发消息，来源：{name}]"
+
+    if origin_type == 'chat':
+        sender = getattr(origin, 'sender_chat', None)
+        name = (sender.title or sender.username or "未知聊天") if sender else "未知聊天"
+        sig = getattr(origin, 'author_signature', None)
+        if sig:
+            name += f"（作者：{sig}）"
+        return f"[转发消息，来源：{name}]"
+
+    if origin_type == 'channel':
+        chat = getattr(origin, 'chat', None)
+        name = (chat.title or chat.username or "未知频道") if chat else "未知频道"
+        sig = getattr(origin, 'author_signature', None)
+        if sig:
+            name += f"（作者：{sig}）"
+        return f"[转发消息，来源：{name}]"
+
+    return "[转发消息]"
+
 
 async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
@@ -12506,15 +12570,13 @@ async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYP
             extracted_text = (getattr(rm, 'text', None) or getattr(rm, 'caption', None) or "").strip()
 
     if extracted_text:
-        await GlobalRecorder.record_user_message(
-            extracted_text,
-            MessageType.USER_TEXT,
-            update.effective_chat.id
-        )
+        forward_prefix = build_forward_origin_prefix(msg)
+        if forward_prefix:
+            extracted_text = f"{forward_prefix}\n{extracted_text}"
         if _conversation_processing_lock.locked():
             await msg.reply_text("⏳ 系统仍在处理上一个请求... 请稍后再发送新请求。")
             return
-        await process_conversation(update, context, extracted_text)
+        await handle_normal_text_conversation(update, context, extracted_text)
         return
 
     # 确实没有文字内容，简洁提示
