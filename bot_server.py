@@ -10522,6 +10522,11 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     doc = update.message.document
     doc_name = doc.file_name or f"document_{uuid.uuid4().hex[:8]}.bin"
     caption = (update.message.caption or "").strip()
+    # 转发的富文本消息：caption 可能为空，文字在 rich_message.blocks 里
+    if not caption:
+        caption = _extract_rich_message_text(update.message).strip()
+        if caption:
+            logger.warning(f"handle_document_message: extracted caption via rich_message, len={len(caption)}: {caption[:200]}")
 
     if state == BotState.SET_COMMAND_BLACKLIST:
         await GlobalRecorder.record_user_message(
@@ -10824,6 +10829,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not text:
         await handle_other_message(update, context)
         return
+
+    # 转发消息添加来源信息
+    forward_prefix = build_forward_origin_prefix(update.message)
+    if forward_prefix:
+        text = f"{forward_prefix}\n{text}"
 
     # 普通聊天按拼接模式决定：直接发送，或累计到“完成”按钮后再写入记忆。
     if state != BotState.IDLE:
@@ -12527,6 +12537,11 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     await UserDataManager.init()
 
     caption = (update.message.caption or "").strip()
+    # 转发的富文本消息：caption 可能为空，文字在 rich_message.blocks 里
+    if not caption:
+        caption = _extract_rich_message_text(update.message).strip()
+        if caption:
+            logger.warning(f"handle_photo_message: extracted caption via rich_message, len={len(caption)}: {caption[:200]}")
     prov_name, prov_data = get_current_provider()
     model = UserDataManager.get('default_model')
     if not prov_data or not model:
@@ -12567,6 +12582,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         forward_prefix = build_forward_origin_prefix(update.message)
         if forward_prefix:
             memory_text = f"{forward_prefix}\n{memory_text}"
+            multimodal_content.insert(0, {"type": "text", "text": forward_prefix})
 
         await process_conversation(
             update,
