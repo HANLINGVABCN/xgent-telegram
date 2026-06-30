@@ -38,6 +38,7 @@ import urllib.parse
 import urllib.request
 import aiosqlite
 import json
+import httpx
 import hashlib
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict, Any, Deque, cast
@@ -7490,7 +7491,534 @@ async def keep_typing_while_waiting(context: ContextTypes.DEFAULT_TYPE, chat_id:
         except asyncio.TimeoutError:
             continue
 
+# --- ☆ Rich Messages (Bot API 10.1) ☆ ---
+# Telegram Bot API 10.1 (2026-06-11) 原生支持表格、标题、引用块、分割线、嵌套列表等富文本。
+# 使用 sendRichMessage / sendRichMessageDraft 直接发送结构化 JSON，
+# 彻底解决旧 HTML 模式下表格被包在 <pre> 里、链接嵌套失效、引用块不渲染、--- 显示原文等问题。
+
+# Rich Message 字符上限（API 10.1 提升至 32768）
+RICH_MESSAGE_CHAR_LIMIT = 32000
+
+class TelegramRichAPI:
+    """直接调用 Telegram Bot API 的 Rich Message 端点（绕过 python-telegram-bot 库版本限制）。"""
+
+    _client: Optional[httpx.AsyncClient] = None
+
+    @classmethod
+    def _get_client(cls) -> httpx.AsyncClient:
+        if cls._client is None or cls._client.is_closed:
+            cls._client = httpx.AsyncClient(timeout=30.0)
+        return cls._client
+
+    @classmethod
+    def _api_url(cls, method: str) -> str:
+        base = BotConfig.API_BASE_URL or "https://api.telegram.org"
+        return f"{base}/bot{BotConfig.TOKEN}/{method}"
+
+    @classmethod
+    async def send_rich_message(cls, chat_id: int, block_tree: List[Dict],
+                                 reply_markup: Optional[Dict] = None,
+                                 reply_to_message_id: Optional[int] = None) -> Dict:
+        """发送完整的 Rich Message。返回 Telegram API 响应 JSON。"""
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "rich_message": {"block_tree": block_tree},
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = reply_to_message_id
+        client = cls._get_client()
+        resp = await client.post(cls._api_url("sendRichMessage"), json=payload)
+        result = resp.json()
+        if not result.get("ok"):
+            raise TelegramError(f"sendRichMessage failed: {result.get('description', result)}")
+        return result
+
+    @classmethod
+    async def send_rich_message_draft(cls, chat_id: int, block_tree: List[Dict],
+                                       draft_message_id: Optional[int] = None) -> Dict:
+        """发送/更新流式 Rich Message Draft。返回含 draft_message_id 的响应。"""
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "rich_message": {"block_tree": block_tree},
+        }
+        if draft_message_id is not None:
+            payload["draft_message_id"] = draft_message_id
+        client = cls._get_client()
+        resp = await client.post(cls._api_url("sendRichMessageDraft"), json=payload)
+        result = resp.json()
+        if not result.get("ok"):
+            raise TelegramError(f"sendRichMessageDraft failed: {result.get('description', result)}")
+        return result
+
+
+def _parse_inline_rich_text(text: str) -> List[Dict]:
+    """将行内 Markdown 格式转换为 RichText 对象列表。
+
+    支持：**粗体**、*斜体*、~~删除线~~、`行内代码`、[链接](url)。
+    返回 RichText 对象列表，纯文本为 {"type": "plain", "text": "..."}。
+    """
+    if not text:
+        return []
+
+    # 占位符系统：先提取特殊格式，最后还原
+    placeholders: List[Dict] = []
+
+    def _save(rich_obj: Dict) -> str:
+        idx = len(placeholders)
+        placeholders.append(rich_obj)
+        return f"\x03PH{idx}\x03"
+
+    # 1. 行内代码 `code`（最先提取，保护内容）
+    def _replace_code(m: re.Match) -> str:
+        return _save({"type": "code", "text": m.group(1)})
+    text = re.sub(r'`([^`]+)`', _replace_code, text)
+
+    # 2. 链接 [text](url)（在其他格式之前提取，避免冲突）
+    def _replace_link(m: re.Match) -> str:
+        link_text = m.group(1)
+        link_url = m.group(2)
+        # 递归解析链接文本中的行内格式
+        inner_texts = _parse_inline_rich_text(link_text)
+        return _save({"type": "url", "url": link_url, "text": inner_texts})
+    text = re.sub(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _replace_link, text)
+
+    # 3. 粗斜体 ***text***
+    def _replace_bold_italic(m: re.Match) -> str:
+        inner = _parse_inline_rich_text(m.group(1))
+        return _save({"type": "bold", "text": [{"type": "italic", "text": inner}]})
+    text = re.sub(r'\*\*\*(.+?)\*\*\*', _replace_bold_italic, text, flags=re.DOTALL)
+
+    # 4. 粗体 **text** 或 __text__
+    def _replace_bold(m: re.Match) -> str:
+        inner = _parse_inline_rich_text(m.group(1))
+        return _save({"type": "bold", "text": inner})
+    text = re.sub(r'\*\*(.+?)\*\*', _replace_bold, text, flags=re.DOTALL)
+    text = re.sub(r'__(.+?)__', _replace_bold, text, flags=re.DOTALL)
+
+    # 5. 删除线 ~~text~~
+    def _replace_strike(m: re.Match) -> str:
+        inner = _parse_inline_rich_text(m.group(1))
+        return _save({"type": "strikethrough", "text": inner})
+    text = re.sub(r'~~(.+?)~~', _replace_strike, text)
+
+    # 6. 斜体 *text*（在粗体之后处理，避免 ** 冲突）
+    def _replace_italic(m: re.Match) -> str:
+        inner = _parse_inline_rich_text(m.group(1))
+        return _save({"type": "italic", "text": inner})
+    text = re.sub(r'(?<!\*)\*(?=[^\W_])(.+?)(?<=[^\W_])\*(?!\*)', _replace_italic, text)
+
+    # 还原占位符，构建最终 RichText 列表
+    result: List[Dict] = []
+    remaining = text
+    while remaining:
+        ph_match = re.search(r'\x03PH(\d+)\x03', remaining)
+        if not ph_match:
+            if remaining:
+                result.append({"type": "plain", "text": remaining})
+            break
+        before = remaining[:ph_match.start()]
+        if before:
+            result.append({"type": "plain", "text": before})
+        idx = int(ph_match.group(1))
+        result.append(placeholders[idx])
+        remaining = remaining[ph_match.end():]
+
+    return result if result else [{"type": "plain", "text": ""}]
+
+
+def _parse_table_rows_to_rich(lines: List[str], start: int) -> Tuple[Optional[Dict], int]:
+    """尝试从 lines[start] 开始解析 Markdown 表格。
+
+    返回 (RichBlockTable dict, 消耗的行数结束索引) 或 (None, start)。
+    """
+    if start >= len(lines):
+        return None, start
+
+    header_cells = _parse_markdown_table_row_rich(lines[start])
+    if header_cells is None:
+        return None, start
+    if start + 1 >= len(lines):
+        return None, start
+
+    sep_cells = _parse_markdown_table_row_rich(lines[start + 1])
+    if not _is_table_separator_row_rich(sep_cells):
+        return None, start
+
+    # 收集所有数据行
+    rows_data: List[List[str]] = [header_cells]
+    j = start + 2
+    while j < len(lines):
+        row_cells = _parse_markdown_table_row_rich(lines[j])
+        if row_cells is None:
+            break
+        if _is_table_separator_row_rich(row_cells):
+            j += 1
+            continue
+        rows_data.append(row_cells)
+        j += 1
+
+    if len(rows_data) < 2:
+        return None, start
+
+    # 构建 RichBlockTable
+    num_cols = max(len(r) for r in rows_data)
+    table_rows: List[Dict] = []
+    for ri, row in enumerate(rows_data):
+        cells: List[Dict] = []
+        for ci in range(num_cols):
+            cell_text = row[ci] if ci < len(row) else ""
+            cells.append({
+                "text": _parse_inline_rich_text(cell_text),
+                "is_header": ri == 0,
+            })
+        table_rows.append({"cells": cells})
+
+    table_block: Dict = {
+        "type": "table",
+        "is_bordered": True,
+        "is_striped": True,
+        "rows": table_rows,
+    }
+    return table_block, j
+
+
+def _parse_markdown_table_row_rich(line: str) -> Optional[List[str]]:
+    """把一行 `| a | b |` 解析成单元格列表；不是表格行返回 None。"""
+    stripped = line.strip()
+    if '|' not in stripped:
+        return None
+    inner = stripped
+    if inner.startswith('|'):
+        inner = inner[1:]
+    if inner.endswith('|'):
+        inner = inner[:-1]
+    cells = [c.strip() for c in inner.split('|')]
+    if len(cells) < 2:
+        return None
+    return cells
+
+
+def _is_table_separator_row_rich(cells: Optional[List[str]]) -> bool:
+    """判断是否是表格分隔行。"""
+    if not cells:
+        return False
+    sep_re = re.compile(r'^:?-{1,}:?$')
+    return all(sep_re.match(c) and '-' in c for c in cells)
+
+
+def _parse_list_items_to_rich(lines: List[str], start: int) -> Tuple[Optional[Dict], int]:
+    """从 lines[start] 开始解析连续的列表项。
+
+    支持无序列表（- 或 *）和有序列表（1.），支持缩进嵌套。
+    返回 (RichBlockList dict, 消耗的行数结束索引) 或 (None, start)。
+    """
+    if start >= len(lines):
+        return None, start
+
+    # 检测列表类型
+    first = lines[start]
+    stripped = first.lstrip()
+    is_ordered = bool(re.match(r'^\d+\.\s+', stripped))
+    is_unordered = bool(re.match(r'^[\-\*]\s+', stripped))
+    if not is_ordered and not is_unordered:
+        return None, start
+
+    items: List[Dict] = []
+    j = start
+    base_indent = len(first) - len(first.lstrip())
+
+    while j < len(lines):
+        line = lines[j]
+        if not line.strip():
+            # 空行可能是列表项之间的分隔，看下一行
+            if j + 1 < len(lines):
+                next_stripped = lines[j + 1].lstrip()
+                next_indent = len(lines[j + 1]) - len(next_stripped)
+                if next_indent >= base_indent and (
+                    re.match(r'^[\-\*]\s+', next_stripped) or
+                    re.match(r'^\d+\.\s+', next_stripped)
+                ):
+                    j += 1
+                    continue
+            break
+
+        current_indent = len(line) - len(line.lstrip())
+        stripped = line.lstrip()
+
+        # 嵌套列表：缩进更深的列表项
+        if current_indent > base_indent:
+            # 收集所有缩进更深的行作为子列表
+            sub_lines: List[str] = []
+            while j < len(lines) and lines[j].strip():
+                ci = len(lines[j]) - len(lines[j].lstrip())
+                if ci <= base_indent:
+                    break
+                # 去掉相对基础缩进的额外空格
+                sub_lines.append(lines[j][base_indent + 2:] if len(lines[j]) > base_indent + 2 else lines[j].lstrip())
+                j += 1
+            sub_list, _ = _parse_list_items_to_rich(sub_lines, 0)
+            if sub_list and items:
+                # 将子列表附加到最后一个列表项
+                last_item = items[-1]
+                if "sub_blocks" not in last_item:
+                    last_item["sub_blocks"] = []
+                last_item["sub_blocks"].append(sub_list)
+            continue
+
+        # 匹配列表项
+        m_unordered = re.match(r'^[\-\*]\s+(.*)$', stripped)
+        m_ordered = re.match(r'^\d+\.\s+(.*)$', stripped)
+
+        if m_unordered:
+            content = m_unordered.group(1)
+            items.append({
+                "type": "list_item",
+                "text": _parse_inline_rich_text(content),
+            })
+            j += 1
+        elif m_ordered:
+            content = m_ordered.group(1)
+            items.append({
+                "type": "list_item",
+                "text": _parse_inline_rich_text(content),
+            })
+            j += 1
+        else:
+            break
+
+    if not items:
+        return None, start
+
+    list_block: Dict = {
+        "type": "list",
+        "is_ordered": is_ordered,
+        "items": items,
+    }
+    return list_block, j
+
+
+def _parse_blockquote_to_rich(lines: List[str], start: int) -> Tuple[Optional[Dict], int]:
+    """从 lines[start] 开始解析连续的引用块。"""
+    if start >= len(lines):
+        return None, start
+
+    stripped = lines[start].strip()
+    if not stripped.startswith('> ') and stripped != '>':
+        return None, start
+
+    quote_lines: List[str] = []
+    j = start
+    while j < len(lines):
+        s = lines[j].strip()
+        if s.startswith('> '):
+            quote_lines.append(s[2:])
+            j += 1
+        elif s == '>':
+            quote_lines.append('')
+            j += 1
+        else:
+            break
+
+    if not quote_lines:
+        return None, start
+
+    # 递归解析引用块内部的内容
+    inner_blocks = markdown_to_rich_blocks('\n'.join(quote_lines))
+    quote_block: Dict = {
+        "type": "block_quotation",
+        "blocks": inner_blocks,
+    }
+    return quote_block, j
+
+
+def markdown_to_rich_blocks(text: str) -> List[Dict]:
+    """将 Markdown 文本转换为 RichBlock JSON 列表（用于 Telegram Bot API 10.1 Rich Messages）。
+
+    支持：
+    - 代码块 → RichBlockPreformatted
+    - 标题 → RichBlockSectionHeading
+    - 分割线 → RichBlockDivider
+    - 引用块 → RichBlockBlockQuotation
+    - 表格 → RichBlockTable
+    - 列表 → RichBlockList
+    - 段落 → RichBlockParagraph（含行内格式：粗体/斜体/删除线/代码/链接）
+    """
+    if not text:
+        return []
+
+    # 流式输出中可能有未闭合的代码块，临时补全
+    fence_count = len(re.findall(r'```', text))
+    if fence_count % 2 == 1:
+        text = text + '\n```'
+
+    blocks: List[Dict] = []
+
+    # 先按代码块分割
+    segments = re.split(r'(```\w*\n?.*?```)', text, flags=re.DOTALL)
+
+    for seg in segments:
+        if not seg:
+            continue
+        if seg.startswith('```'):
+            m = re.match(r'```(\w*)\n?(.*?)```', seg, re.DOTALL)
+            if m:
+                lang = m.group(1) or ''
+                code = m.group(2)
+                block: Dict = {
+                    "type": "preformatted",
+                    "text": code,
+                }
+                if lang and lang.lower() not in ('text', 'plain'):
+                    block["language"] = lang
+                blocks.append(block)
+            continue
+
+        # 非代码段：逐行解析块级元素
+        lines = seg.split('\n')
+        i = 0
+        paragraph_buffer: List[str] = []
+
+        def flush_paragraph():
+            nonlocal paragraph_buffer
+            if paragraph_buffer:
+                para_text = '\n'.join(paragraph_buffer).strip()
+                if para_text:
+                    blocks.append({
+                        "type": "paragraph",
+                        "text": _parse_inline_rich_text(para_text),
+                    })
+                paragraph_buffer = []
+
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+
+            # 空行：刷新段落
+            if not stripped:
+                flush_paragraph()
+                i += 1
+                continue
+
+            # 分割线：--- 或 *** 或 ___（至少3个字符，独占一行）
+            if re.match(r'^[-*_]{3,}\s*$', stripped):
+                flush_paragraph()
+                blocks.append({"type": "divider"})
+                i += 1
+                continue
+
+            # 标题：# 到 ######
+            m_heading = re.match(r'^(#{1,6})\s+(.+)$', stripped)
+            if m_heading:
+                flush_paragraph()
+                level = len(m_heading.group(1))
+                blocks.append({
+                    "type": "section_heading",
+                    "text": _parse_inline_rich_text(m_heading.group(2)),
+                    "level": level,
+                })
+                i += 1
+                continue
+
+            # 引用块
+            if stripped.startswith('> ') or stripped == '>':
+                flush_paragraph()
+                quote_block, new_i = _parse_blockquote_to_rich(lines, i)
+                if quote_block:
+                    blocks.append(quote_block)
+                    i = new_i
+                    continue
+                # 如果解析失败，当普通文本
+                paragraph_buffer.append(line)
+                i += 1
+                continue
+
+            # 表格
+            if '|' in stripped:
+                table_block, new_i = _parse_table_rows_to_rich(lines, i)
+                if table_block:
+                    flush_paragraph()
+                    blocks.append(table_block)
+                    i = new_i
+                    continue
+
+            # 列表
+            if re.match(r'^[\-\*]\s+', stripped) or re.match(r'^\d+\.\s+', stripped):
+                flush_paragraph()
+                list_block, new_i = _parse_list_items_to_rich(lines, i)
+                if list_block:
+                    blocks.append(list_block)
+                    i = new_i
+                    continue
+                # 如果列表解析失败，当普通文本
+                paragraph_buffer.append(line)
+                i += 1
+                continue
+
+            # 普通文本行：加入段落缓冲
+            paragraph_buffer.append(line)
+            i += 1
+
+        flush_paragraph()
+
+    return blocks
+
+
+async def rich_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str,
+                            reply_markup: Optional[InlineKeyboardMarkup] = None,
+                            **kwargs: Any) -> List[Any]:
+    """优先使用 Rich Message 发送，失败时 fallback 到旧 HTML 模式。"""
+    try:
+        block_tree = markdown_to_rich_blocks(text)
+        if not block_tree:
+            block_tree = [{"type": "paragraph", "text": [{"type": "plain", "text": text or " "}]}]
+
+        # 将 InlineKeyboardMarkup 转为可 JSON 序列化的 dict
+        markup_dict = None
+        if reply_markup:
+            markup_dict = reply_markup.to_dict() if hasattr(reply_markup, 'to_dict') else None
+
+        result = await TelegramRichAPI.send_rich_message(
+            chat_id=chat_id,
+            block_tree=block_tree,
+            reply_markup=markup_dict,
+        )
+        # 返回 Message 对象需要适配——此处返回原始结果供上层使用
+        return [result]
+    except Exception as e:
+        logger.warning(f"Rich Message 发送失败，降级为 HTML 模式: {e}")
+        html_text = markdown_to_telegram_html(text)
+        return await safe_send_message(context, chat_id, html_text,
+                                        parse_mode=constants.ParseMode.HTML,
+                                        reply_markup=reply_markup, **kwargs)
+
+
+async def rich_finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
+                                       msg: Any, response: str, limit: int = RICH_MESSAGE_CHAR_LIMIT):
+    """使用 Rich Message 发送最终回复。失败时 fallback 到旧 HTML 编辑模式。"""
+    try:
+        block_tree = markdown_to_rich_blocks(response)
+        if not block_tree:
+            block_tree = [{"type": "paragraph", "text": [{"type": "plain", "text": response or " "}]}]
+
+        await TelegramRichAPI.send_rich_message(
+            chat_id=chat_id,
+            block_tree=block_tree,
+        )
+        # 删除原来的占位消息
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        logger.info(f"Rich Message 发送成功: chat_id={chat_id}, blocks={len(block_tree)}")
+    except Exception as e:
+        logger.warning(f"Rich Message 最终发送失败，降级为 HTML 编辑模式: {e}")
+        await finalize_text_response(context, chat_id, msg, response, min(limit, 4000))
+
+
 def _parse_markdown_table_row(line: str) -> Optional[List[str]]:
+
     """把一行 `| a | b |` 解析成单元格列表；不是表格行返回 None。"""
     stripped = line.strip()
     if '|' not in stripped:
@@ -8066,13 +8594,17 @@ async def cancel_task_quietly(task: Optional[asyncio.Task], timeout: float = 1.0
         task.add_done_callback(_drain_task_result)
 
 class TelegramStreamRenderer:
-    """Render upstream streaming chunks to Telegram without fighting edit rate limits."""
+    """Render upstream streaming chunks to Telegram using Rich Message drafts (Bot API 10.1).
+
+    优先使用 sendRichMessageDraft 推送流式内容（不受 edit_message 频率限制），
+    失败时自动降级为旧的 edit_message_text HTML 模式。
+    """
 
     FLUSH_INTERVAL_SECONDS = 0.35
     MIN_CHARS_PER_FLUSH = 12
 
     def __init__(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: Any,
-                 reply_markup: InlineKeyboardMarkup, limit: int = 4000,
+                 reply_markup: InlineKeyboardMarkup, limit: int = RICH_MESSAGE_CHAR_LIMIT,
                  stop_event: Optional[asyncio.Event] = None):
         self.context = context
         self.chat_id = chat_id
@@ -8086,6 +8618,9 @@ class TelegramStreamRenderer:
         self.pending_text = ""
         self._task: Optional[asyncio.Task] = None
         self.live_edit_enabled = True
+        # Rich Message Draft 模式
+        self._draft_message_id: Optional[int] = None
+        self._rich_draft_enabled = True  # 尝试使用 Rich Draft，失败则降级
 
     def start(self):
         self._task = asyncio.create_task(self._render_loop())
@@ -8122,6 +8657,18 @@ class TelegramStreamRenderer:
         partial = ''.join(self.response_parts).strip()
         visible_text = self.current_text.strip() or partial
         if visible_text:
+            # 用 Rich Message 固化已生成内容
+            try:
+                block_tree = markdown_to_rich_blocks(visible_text + "\n\n⏹️ 已停止，保留以上已生成内容。")
+                await TelegramRichAPI.send_rich_message(chat_id=self.chat_id, block_tree=block_tree)
+                try:
+                    await self.current_msg.delete()
+                except Exception:
+                    pass
+                return partial
+            except Exception:
+                pass
+            # 降级为 HTML 编辑
             html_visible = markdown_to_telegram_html(visible_text)
             stopped_text = html_visible + "\n\n\u23f9\ufe0f 已停止，保留以上已生成内容。"
         else:
@@ -8135,7 +8682,23 @@ class TelegramStreamRenderer:
         return partial
 
     async def remove_controls(self):
-        if self.live_edit_enabled and self.current_text.strip():
+        """流式完成后：用 Rich Message 发送最终内容，删除旧占位消息。"""
+        if not self.current_text.strip():
+            return
+        if self.live_edit_enabled:
+            # 优先尝试 Rich Message 固化
+            try:
+                block_tree = markdown_to_rich_blocks(self.current_text)
+                if block_tree:
+                    await TelegramRichAPI.send_rich_message(chat_id=self.chat_id, block_tree=block_tree)
+                    try:
+                        await self.current_msg.delete()
+                    except Exception:
+                        pass
+                    return
+            except Exception as e:
+                logger.debug(f"Rich Message 固化失败，降级为 HTML: {e}")
+            # 降级为 HTML 编辑
             try:
                 html_text = markdown_to_telegram_html(self.current_text)
                 await safe_edit_text(self.current_msg, html_text, reply_markup=None,
@@ -8200,6 +8763,25 @@ class TelegramStreamRenderer:
         if not self.live_edit_enabled:
             return
 
+        # 优先使用 Rich Message Draft 推送
+        if self._rich_draft_enabled:
+            try:
+                block_tree = markdown_to_rich_blocks(self.current_text)
+                if block_tree:
+                    result = await TelegramRichAPI.send_rich_message_draft(
+                        chat_id=self.chat_id,
+                        block_tree=block_tree,
+                        draft_message_id=self._draft_message_id,
+                    )
+                    # 保存 draft_message_id 用于后续更新
+                    if result.get('result', {}).get('message_id'):
+                        self._draft_message_id = result['result']['message_id']
+                    return
+            except Exception as e:
+                logger.info(f"Rich Draft 推送失败，降级为 HTML edit: {e}")
+                self._rich_draft_enabled = False
+
+        # 降级为旧的 edit_message_text HTML 模式
         try:
             html_text = markdown_to_telegram_html(self.current_text)
             await safe_edit_text(self.current_msg, html_text, reply_markup=self.reply_markup,
@@ -8215,7 +8797,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
     """流式回复：上游边生成，Telegram 边按字符刷新显示。"""
     global _stop_generation_event
     chat_id = update.effective_chat.id
-    TELEGRAM_MSG_LIMIT = 4000
+    TELEGRAM_MSG_LIMIT = RICH_MESSAGE_CHAR_LIMIT
 
     msg = None
     renderer = None
@@ -8376,7 +8958,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
                     logger.warning(f"发送模型原生媒体失败: {e}")
             if renderer and not renderer.live_edit_enabled and msg:
                 try:
-                    await finalize_text_response(context, chat_id, msg, full_response, TELEGRAM_MSG_LIMIT)
+                    await rich_finalize_text_response(context, chat_id, msg, full_response, TELEGRAM_MSG_LIMIT)
                 except Exception as e:
                     logger.warning(f"流式降级后的最终消息发送失败: {e}")
             await send_token_usage_message(
@@ -8412,7 +8994,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             await renderer.cancel()
         try:
             if msg:
-                await finalize_text_response(context, chat_id, renderer.current_msg if renderer else msg, error_text, TELEGRAM_MSG_LIMIT)
+                await rich_finalize_text_response(context, chat_id, renderer.current_msg if renderer else msg, error_text, TELEGRAM_MSG_LIMIT)
             else:
                 await context.bot.send_message(chat_id=chat_id, text=error_text)
         except Exception as edit_err:
@@ -8436,7 +9018,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
     """非流式回复：等待完整回复后一次性发送"""
     global _stop_generation_event
     chat_id = update.effective_chat.id
-    TELEGRAM_MSG_LIMIT = 4000
+    TELEGRAM_MSG_LIMIT = RICH_MESSAGE_CHAR_LIMIT
 
     msg = None
     typing_stop = None
@@ -8516,7 +9098,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
                 "elapsed_seconds": time.monotonic() - generation_started_at,
             })
             try:
-                await finalize_text_response(context, chat_id, msg, error, TELEGRAM_MSG_LIMIT)
+                await rich_finalize_text_response(context, chat_id, msg, error, TELEGRAM_MSG_LIMIT)
             except Exception:
                 pass
             return error
@@ -8553,7 +9135,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
                 except Exception as e:
                     logger.warning(f"发送模型原生媒体失败: {e}")
             try:
-                await finalize_text_response(context, chat_id, msg, response, TELEGRAM_MSG_LIMIT)
+                await rich_finalize_text_response(context, chat_id, msg, response, TELEGRAM_MSG_LIMIT)
             except Exception as e:
                 logger.warning(f"非流式最终消息更新失败: {e}")
             await send_token_usage_message(
@@ -8585,7 +9167,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
         })
         try:
             if msg:
-                await finalize_text_response(context, chat_id, msg, error_text, TELEGRAM_MSG_LIMIT)
+                await rich_finalize_text_response(context, chat_id, msg, error_text, TELEGRAM_MSG_LIMIT)
             else:
                 await context.bot.send_message(chat_id=chat_id, text=error_text)
         except Exception:

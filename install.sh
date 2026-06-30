@@ -1168,7 +1168,7 @@ start_with_pm2() {
         --cwd "$SCRIPT_DIR" \
         --interpreter none \
         --stop-exit-codes 78 \
-        --max-memory-restart 500M \
+        --max-memory-restart 1G \
         --exp-backoff-restart-delay=100 \
         -- -c "$code"
 
