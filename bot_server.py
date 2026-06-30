@@ -12633,6 +12633,33 @@ async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     extracted_text = nested_text
                     break
 
+    if not extracted_text:
+        # 最后手段：用 forwardMessage API 重新获取消息内容
+        # Bot API 的 update 可能没有 text 字段，但 forwardMessage 返回的 Message 可能有
+        try:
+            fwd_msg = await context.bot.forward_message(
+                chat_id=update.effective_chat.id,
+                from_chat_id=update.effective_chat.id,
+                message_id=msg.message_id,
+                disable_notification=True
+            )
+            fwd_text = (getattr(fwd_msg, 'text', None) or getattr(fwd_msg, 'caption', None) or "").strip()
+            # 立即删除转发的副本
+            try:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=fwd_msg.message_id
+                )
+            except Exception:
+                pass
+            if fwd_text:
+                extracted_text = fwd_text
+                logger.warning(f"handle_other_message: extracted via forwardMessage, len={len(fwd_text)}: {fwd_text[:200]}")
+            else:
+                logger.warning("handle_other_message: forwardMessage returned but no text/caption found")
+        except Exception as e:
+            logger.warning(f"handle_other_message: forwardMessage fallback failed: {e}")
+
     if extracted_text:
         forward_prefix = build_forward_origin_prefix(msg)
         if forward_prefix:
