@@ -10701,7 +10701,46 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await UserDataManager.init()
     state = UserDataManager.get('state')
-    text = update.message.text.strip()
+    text = (update.message.text or update.message.caption or "").strip()
+
+    # 转发消息 text 可能为 None（python-telegram-bot 解析问题），
+    # 用 forwardMessage API 重新拉取完整消息内容
+    if not text:
+        try:
+            msg_dict_debug = update.message.to_dict() if hasattr(update.message, 'to_dict') else {}
+            logger.warning(f"handle_text_message: text is None, raw dict keys: {list(msg_dict_debug.keys())}")
+            extra = getattr(update.message, 'api_kwargs', None) or {}
+            if extra:
+                logger.warning(f"handle_text_message: api_kwargs keys: {list(extra.keys())}")
+        except Exception:
+            pass
+        try:
+            fwd_msg = await context.bot.forward_message(
+                chat_id=update.effective_chat.id,
+                from_chat_id=update.effective_chat.id,
+                message_id=update.message.message_id,
+                disable_notification=True
+            )
+            text = (getattr(fwd_msg, 'text', None) or getattr(fwd_msg, 'caption', None) or "").strip()
+            # 立即删除转发的副本
+            try:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=fwd_msg.message_id
+                )
+            except Exception:
+                pass
+            if text:
+                logger.warning(f"handle_text_message: extracted via forwardMessage, len={len(text)}: {text[:200]}")
+            else:
+                logger.warning("handle_text_message: forwardMessage returned but no text/caption found")
+        except Exception as e:
+            logger.warning(f"handle_text_message: forwardMessage fallback failed: {e}")
+
+    # 仍然没有文字：不是文字消息（如转发的语音/视频/位置等），交给 handle_other_message
+    if not text:
+        await handle_other_message(update, context)
+        return
 
     # 普通聊天按拼接模式决定：直接发送，或累计到“完成”按钮后再写入记忆。
     if state != BotState.IDLE:
@@ -12553,8 +12592,41 @@ async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         msg_dict = {}
 
-    # 尝试从所有可能含文字的字段中提取
-    extracted_text = (msg.text or msg.caption or "").strip()
+    # 转发消息优先用 forwardMessage API 获取完整内容
+    # （api_kwargs 可能有短字符串导致提前命中，forwardMessage 必须最先尝试）
+    is_forwarded = (
+        getattr(msg, 'forward_origin', None) is not None
+        or getattr(msg, 'forward_from', None) is not None
+        or getattr(msg, 'forward_from_chat', None) is not None
+    )
+    extracted_text = ""
+
+    if is_forwarded:
+        try:
+            fwd_msg = await context.bot.forward_message(
+                chat_id=update.effective_chat.id,
+                from_chat_id=update.effective_chat.id,
+                message_id=msg.message_id,
+                disable_notification=True
+            )
+            extracted_text = (getattr(fwd_msg, 'text', None) or getattr(fwd_msg, 'caption', None) or "").strip()
+            try:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=fwd_msg.message_id
+                )
+            except Exception:
+                pass
+            if extracted_text:
+                logger.warning(f"handle_other_message: extracted via forwardMessage (first), len={len(extracted_text)}: {extracted_text[:200]}")
+            else:
+                logger.warning("handle_other_message: forwardMessage returned but no text/caption found")
+        except Exception as e:
+            logger.warning(f"handle_other_message: forwardMessage failed: {e}")
+
+    # 标准提取（forwardMessage 失败或非转发消息的 fallback）
+    if not extracted_text:
+        extracted_text = (msg.text or msg.caption or "").strip()
 
     if not extracted_text:
         extra = getattr(msg, 'api_kwargs', None) or {}
@@ -12947,12 +13019,12 @@ if __name__ == '__main__':
         # 贴纸处理器
         app.add_handler(MessageHandler(filters.Sticker.ALL, handle_sticker_message))
         
-        # 文本处理器
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-        
-        # 其他类型消息
+        # 文本处理器（含转发消息——转发消息和普通消息完全一样处理）
+        app.add_handler(MessageHandler((filters.TEXT | filters.FORWARDED) & ~filters.COMMAND, handle_text_message))
+
+        # 其他类型消息（排除转发、文本、文件/图片/贴纸）
         app.add_handler(MessageHandler(
-            filters.ALL & ~filters.COMMAND & ~filters.TEXT & ~filters.Document.ALL & ~filters.PHOTO & ~filters.Sticker.ALL,
+            filters.ALL & ~filters.COMMAND & ~filters.TEXT & ~filters.FORWARDED & ~filters.Document.ALL & ~filters.PHOTO & ~filters.Sticker.ALL,
             handle_other_message
         ))
         
