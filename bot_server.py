@@ -38,6 +38,7 @@ import urllib.parse
 import urllib.request
 import aiosqlite
 import json
+import httpx
 import hashlib
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict, Any, Deque, cast
@@ -7490,12 +7491,243 @@ async def keep_typing_while_waiting(context: ContextTypes.DEFAULT_TYPE, chat_id:
         except asyncio.TimeoutError:
             continue
 
+# --- ☆ Rich Messages (Bot API 10.1) ☆ ---
+# Telegram Bot API 10.1 (2026-06-11) 原生支持表格、标题、引用块、分割线、嵌套列表等富文本。
+# 使用 sendRichMessage / sendRichMessageDraft 直接发送结构化 JSON，
+# 彻底解决旧 HTML 模式下表格被包在 <pre> 里、链接嵌套失效、引用块不渲染、--- 显示原文等问题。
+
+# Rich Message 字符上限（API 10.1 提升至 32768）
+RICH_MESSAGE_CHAR_LIMIT = 32000
+
+class TelegramRichAPI:
+    """直接调用 Telegram Bot API 的 Rich Message 端点（绕过 python-telegram-bot 库版本限制）。"""
+
+    _client: Optional[httpx.AsyncClient] = None
+
+    @classmethod
+    def _get_client(cls) -> httpx.AsyncClient:
+        if cls._client is None or cls._client.is_closed:
+            cls._client = httpx.AsyncClient(timeout=30.0)
+        return cls._client
+
+    @classmethod
+    def _api_url(cls, method: str) -> str:
+        base = BotConfig.API_BASE_URL or "https://api.telegram.org"
+        return f"{base}/bot{BotConfig.TOKEN}/{method}"
+
+    @classmethod
+    async def send_rich_message(cls, chat_id: int, text: str,
+                                 reply_markup: Optional[Dict] = None,
+                                 reply_to_message_id: Optional[int] = None) -> Dict:
+        """发送完整的 Rich Message。返回 Telegram API 响应 JSON。
+
+        Bot API 10.1 的 rich_message 参数接受 {"markdown": "..."} 格式，
+        由 Telegram 服务端自行解析 Markdown 为原生 RichBlock（表格/标题/列表等），
+        无需客户端自行构建 block_tree。
+        """
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "rich_message": {"markdown": text or " "},
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = reply_to_message_id
+        client = cls._get_client()
+        resp = await client.post(cls._api_url("sendRichMessage"), json=payload)
+        result = resp.json()
+        if not result.get("ok"):
+            raise TelegramError(f"sendRichMessage failed: {result.get('description', result)}")
+        return result
+
+    @classmethod
+    async def send_rich_message_draft(cls, chat_id: int, text: str,
+                                       draft_id: int) -> Dict:
+        """发送/更新流式 Rich Message Draft。
+
+        Bot API 10.1: sendRichMessageDraft 在私聊中创建一个 30 秒临时的 Draft 预览。
+        相同 draft_id 的后续调用会以动画过渡更新内容。
+        完成后必须调用 send_rich_message 发送最终消息以持久化。
+        API 返回 True（非 Message 对象），draft_id 由调用方生成。
+        """
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "draft_id": draft_id,
+            "rich_message": {"markdown": text or " "},
+        }
+        client = cls._get_client()
+        resp = await client.post(cls._api_url("sendRichMessageDraft"), json=payload)
+        result = resp.json()
+        if not result.get("ok"):
+            raise TelegramError(f"sendRichMessageDraft failed: {result.get('description', result)}")
+        return result
+
+async def rich_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str,
+                            reply_markup: Optional[InlineKeyboardMarkup] = None,
+                            **kwargs: Any) -> List[Any]:
+    """优先使用 Rich Message 发送，失败时 fallback 到旧 HTML 模式。"""
+    try:
+        # 将 InlineKeyboardMarkup 转为可 JSON 序列化的 dict
+        markup_dict = None
+        if reply_markup:
+            markup_dict = reply_markup.to_dict() if hasattr(reply_markup, 'to_dict') else None
+
+        result = await TelegramRichAPI.send_rich_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=markup_dict,
+        )
+        # 返回 Message 对象需要适配——此处返回原始结果供上层使用
+        return [result]
+    except Exception as e:
+        logger.warning(f"Rich Message 发送失败，降级为 HTML 模式: {e}")
+        html_text = markdown_to_telegram_html(text)
+        return await safe_send_message(context, chat_id, html_text,
+                                        parse_mode=constants.ParseMode.HTML,
+                                        reply_markup=reply_markup, **kwargs)
+
+
+async def rich_finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
+                                       msg: Any, response: str, limit: int = RICH_MESSAGE_CHAR_LIMIT):
+    """使用 Rich Message 发送最终回复。失败时 fallback 到旧 HTML 编辑模式。"""
+    try:
+        await TelegramRichAPI.send_rich_message(
+            chat_id=chat_id,
+            text=response,
+        )
+        # 删除原来的占位消息
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        logger.info(f"Rich Message 发送成功: chat_id={chat_id}")
+    except Exception as e:
+        logger.warning(f"Rich Message 最终发送失败，降级为 HTML 编辑模式: {e}")
+        await finalize_text_response(context, chat_id, msg, response, min(limit, 4000))
+
+
+def _parse_markdown_table_row(line: str) -> Optional[List[str]]:
+
+    """把一行 `| a | b |` 解析成单元格列表；不是表格行返回 None。"""
+    stripped = line.strip()
+    if '|' not in stripped:
+        return None
+    # 必须以 | 开头或结尾（表格行的典型特征）；也允许单列内含 | 但首尾有 | 的情况
+    if not stripped.startswith('|'):
+        return None
+    inner = stripped
+    if inner.startswith('|'):
+        inner = inner[1:]
+    if inner.endswith('|'):
+        inner = inner[:-1]
+    cells = [c.strip() for c in inner.split('|')]
+    # 至少两列才算表格行（单列 |x| 视作普通文本，避免误伤）
+    if len(cells) < 2:
+        return None
+    return cells
+
+
+def _is_table_separator_row(cells: Optional[List[str]]) -> bool:
+    """判断是否是表格分隔行：单元格全是 --- / :--: / --: 之类。"""
+    if not cells:
+        return False
+    sep_re = re.compile(r'^:?-{1,}:?$')
+    return all(sep_re.match(c) and '-' in c for c in cells)
+
+
+def _build_table_pre_block(rows_cells: List[List[str]]) -> str:
+    """把多行单元格渲染成等宽对齐的 <pre> 块。rows_cells 含表头+分隔占位+数据行。"""
+    # 跳过分隔行本身（它是表格语法的分隔，不展示）
+    display_rows = [r for r in rows_cells if not _is_table_separator_row(r)]
+    if not display_rows:
+        return ''
+    # 表格放进 <pre> 等宽块后，单元格内的行内代码反引号是多余的，去掉只保留内容
+    display_rows = [[re.sub(r'`([^`]*)`', r'\1', c) for c in row] for row in display_rows]
+    num_cols = max(len(r) for r in display_rows)
+    # 补齐每行列数
+    for r in display_rows:
+        while len(r) < num_cols:
+            r.append('')
+
+    # 计算每列最大显示宽度（按字符数，中文按 2 计宽以便对齐）
+    def _cell_width(s: str) -> int:
+        width = 0
+        for ch in s:
+            width += 2 if ord(ch) > 0x2E80 else 1  # CJK 及全角符号按 2
+        return width
+
+    col_widths = [0] * num_cols
+    for r in display_rows:
+        for i, cell in enumerate(r):
+            col_widths[i] = max(col_widths[i], _cell_width(cell))
+
+    # 拼接对齐后的文本（左对齐，右侧补空格），列间用 "  " 分隔
+    lines: List[str] = []
+    for row_idx, r in enumerate(display_rows):
+        parts = []
+        for i, cell in enumerate(r):
+            pad = col_widths[i] - _cell_width(cell)
+            parts.append(cell + ' ' * max(0, pad))
+        lines.append('  '.join(parts).rstrip())
+        # 在表头下方插入分隔线（ASCII 表格观感）
+        if row_idx == 0:
+            sep_parts = []
+            for i in range(num_cols):
+                sep_parts.append('-' * col_widths[i])
+            lines.append('  '.join(sep_parts))
+
+    return f"<pre>{html.escape(chr(10).join(lines))}</pre>"
+
+
+def _extract_markdown_tables(text: str) -> Tuple[str, List[str]]:
+    """提取文本中的完整 Markdown 表格，替换为占位符。
+
+    只提取「完整」表格（含表头+分隔行+至少一数据行）。
+    流式输出中尚未出现分隔行的半成品不会被识别，避免乱码。
+    返回 (替换后的文本, 表格HTML列表)。
+    """
+    tables: List[str] = []
+    if '|' not in text:
+        return text, tables
+
+    lines = text.split('\n')
+    out_lines: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        row_cells = _parse_markdown_table_row(lines[i])
+        # 判断是否是一个表格的起点：本行是表格行，且下一行是分隔行
+        if row_cells and i + 1 < n and _is_table_separator_row(_parse_markdown_table_row(lines[i + 1])):
+            # 收集连续的表格行（含表头、分隔、数据）
+            block: List[List[str]] = [row_cells]
+            j = i + 1
+            while j < n:
+                next_cells = _parse_markdown_table_row(lines[j])
+                if next_cells is None:
+                    break
+                block.append(next_cells)
+                j += 1
+            pre_html = _build_table_pre_block(block)
+            idx = len(tables)
+            tables.append(pre_html)
+            out_lines.append(f'\x02TBL{idx}\x02')
+            i = j
+            continue
+        out_lines.append(lines[i])
+        i += 1
+
+    return '\n'.join(out_lines), tables
+
+
 def _inline_markdown_to_html(text: str) -> str:
     """将行内 Markdown 转换为 Telegram HTML（非代码文本部分）。"""
     if not text:
         return ""
 
-    # 先提取行内代码（保护其内容不被后续处理影响）
+    # 先提取 Markdown 表格为 <pre> 占位符（表格内容整体等宽对齐，不再参与行内转换）
+    text, table_blocks = _extract_markdown_tables(text)
+
+    # 再提取行内代码（保护其内容不被后续处理影响）
     inline_codes: List[str] = []
 
     def _save_inline(m: re.Match) -> str:
@@ -7505,7 +7737,20 @@ def _inline_markdown_to_html(text: str) -> str:
 
     text = re.sub(r'`([^`]+)`', _save_inline, text)
 
-    # HTML 转义剩余文本（行内代码已被提取为占位符，不受影响）
+    # 提取链接 [text](url)，在 html.escape 之前保护 URL 不被双重转义
+    # 正则支持 URL 中的一层嵌套括号（如 Wikipedia 链接）
+    link_blocks: List[str] = []
+
+    def _save_link(m: re.Match) -> str:
+        idx = len(link_blocks)
+        link_text = html.escape(m.group(1), quote=False)
+        link_url = m.group(2)  # URL 不做 html.escape，避免 & 被转成 &amp;
+        link_blocks.append(f'<a href="{link_url}">{link_text}</a>')
+        return f'\x01LK{idx}\x01'
+
+    text = re.sub(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _save_link, text)
+
+    # HTML 转义剩余文本（行内代码、表格、链接已被提取为占位符，不受影响）
     text = html.escape(text, quote=False)
 
     # 逐行处理块级元素：标题、引用、列表
@@ -7548,15 +7793,15 @@ def _inline_markdown_to_html(text: str) -> str:
 
     text = '\n'.join(processed)
 
-    # 粗体：**text** 或 __text__
-    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
-    text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
+    # 粗斜体：***text***（必须在粗体和斜体之前处理）
+    text = re.sub(r'\*\*\*(.+?)\*\*\*', r'<b><i>\1</i></b>', text, flags=re.DOTALL)
+
+    # 粗体：**text** 或 __text__（支持跨行，但不跨空行）
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text, flags=re.DOTALL)
+    text = re.sub(r'__(.+?)__', r'<b>\1</b>', text, flags=re.DOTALL)
 
     # 删除线：~~text~~
     text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
-
-    # 链接：[text](url)
-    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
 
     # 斜体：*text*（在粗体之后处理，避免 ** 冲突）
     # 用 [^\W_] 代替 \w（排除下划线），防止颜文字 (*_*) 中的 * 被误匹配
@@ -7570,7 +7815,88 @@ def _inline_markdown_to_html(text: str) -> str:
     for i, code_html in enumerate(inline_codes):
         text = text.replace(f'\x01IC{i}\x01', code_html)
 
+    # 还原链接占位符
+    for i, link_html in enumerate(link_blocks):
+        text = text.replace(f'\x01LK{i}\x01', link_html)
+
+    # 还原表格 <pre> 占位符（表格 HTML 已构建好，直接放回；不在表格内做行内转换）
+    for i, pre_html in enumerate(table_blocks):
+        # 转义后的文本里占位符字符 \x02 不受 html.escape 影响，仍可匹配
+        text = text.replace(f'\x02TBL{i}\x02', pre_html)
+
     return text
+
+
+def _try_parse_text_table_in_codeblock(code: str) -> Optional[str]:
+    """尝试将代码块中的空格对齐纯文本表格转换为 <pre> 对齐表格。
+
+    AI 有时会把表格数据包在 ``` 代码块中，用空格对齐列、用 ---- 做分隔行，
+    而非使用标准 Markdown | 语法。此函数检测这种模式并转换为等宽 <pre> 块。
+    返回转换后的 HTML，或 None 表示不是文本表格。
+    """
+    lines = code.strip().split('\n')
+    if len(lines) < 3:  # 至少需要：表头、分隔行、一行数据
+        return None
+
+    # 检测分隔行（第二行应该主要由 - 和空格组成）
+    sep_line = lines[1].strip()
+    # 分隔行的模式：连续的 --- 段用空格隔开，或者 |---|---| 格式
+    dashes = sep_line.replace(' ', '')
+    if not dashes or len(dashes) < 3:
+        return None
+    dash_ratio = sum(1 for c in dashes if c == '-') / len(dashes)
+    if dash_ratio < 0.8:  # 至少 80% 的非空白字符是 -
+        return None
+
+    # 用分隔行的 ---- 段来确定列的位置
+    # 找出每个 ---- 段的起止位置
+    col_spans: List[Tuple[int, int]] = []
+    in_dash = False
+    start = 0
+    for ci, ch in enumerate(lines[1]):
+        if ch == '-':
+            if not in_dash:
+                start = ci
+                in_dash = True
+        else:
+            if in_dash:
+                col_spans.append((start, ci))
+                in_dash = False
+    if in_dash:
+        col_spans.append((start, len(lines[1])))
+
+    if len(col_spans) < 2:  # 至少需要 2 列才算表格
+        return None
+
+    # 用列位置来分割每行
+    def split_by_spans(line: str) -> List[str]:
+        cells = []
+        for si, (cs, ce) in enumerate(col_spans):
+            # 最后一列延伸到行尾
+            end = ce if si < len(col_spans) - 1 else max(ce, len(line))
+            cell = line[cs:end].strip() if cs < len(line) else ''
+            cells.append(cell)
+        return cells
+
+    # 提取所有行（跳过分隔行）
+    table_rows: List[List[str]] = []
+    header = split_by_spans(lines[0])
+    table_rows.append(header)
+    for li in range(2, len(lines)):  # 跳过分隔行(index 1)
+        line = lines[li]
+        if not line.strip():
+            continue
+        # 跳过额外的分隔行
+        stripped_nospace = line.strip().replace(' ', '')
+        if stripped_nospace and all(c == '-' for c in stripped_nospace):
+            continue
+        table_rows.append(split_by_spans(line))
+
+    if len(table_rows) < 2:  # 至少需要表头 + 1行数据
+        return None
+
+    # 用 _build_table_pre_block 的逻辑来构建对齐的 <pre> 表格
+    return _build_table_pre_block(table_rows)
 
 
 def markdown_to_telegram_html(text: str) -> str:
@@ -7600,6 +7926,12 @@ def markdown_to_telegram_html(text: str) -> str:
             if m:
                 lang = m.group(1) or ''
                 code = m.group(2)
+                # 无语言标注（或 text/plain）的代码块：检查是否是伪装的文本表格
+                if not lang or lang.lower() in ('text', 'plain'):
+                    table_html = _try_parse_text_table_in_codeblock(code)
+                    if table_html:
+                        result.append(table_html)
+                        continue
                 escaped = html.escape(code)
                 if lang and lang.lower() not in ('text', 'plain'):
                     result.append(f'<pre><code class="language-{lang}">{escaped}</code></pre>')
@@ -7647,6 +7979,47 @@ def plain_text_from_html(text: str) -> str:
     cleaned = re.sub(r'<[^>]+>', '', cleaned)
     return html.unescape(cleaned)
 
+def _sanitize_telegram_html(text: str) -> str:
+    """尝试修复无效的 Telegram HTML，而非直接降级到纯文本。
+
+    Telegram 只支持有限的 HTML 标签（b, i, u, s, a, code, pre, blockquote）。
+    此函数移除所有不支持的标签，修复常见的解析错误，尽可能保留有效格式。
+    """
+    # Telegram 支持的标签
+    ALLOWED_TAGS = {'b', 'i', 'u', 's', 'a', 'code', 'pre', 'blockquote', 'tg-spoiler', 'tg-emoji'}
+
+    def _replace_tag(m: re.Match) -> str:
+        full = m.group(0)
+        tag_match = re.match(r'</?([a-zA-Z][a-zA-Z0-9-]*)(?:\s|>|/)', full)
+        if not tag_match:
+            return html.escape(full)
+        tag_name = tag_match.group(1).lower()
+        if tag_name in ALLOWED_TAGS:
+            return full  # 保留合法标签
+        return html.escape(full)  # 转义非法标签
+
+    result = re.sub(r'<[^>]+>', _replace_tag, text)
+
+    # 修复未闭合的标签：统计开闭标签，补全缺失的闭合标签
+    open_tags: List[str] = []
+    for m in re.finditer(r'<(/?)([a-zA-Z][a-zA-Z0-9-]*)(?:\s[^>]*)?>',  result):
+        is_close = m.group(1) == '/'
+        tag = m.group(2).lower()
+        if tag not in ALLOWED_TAGS:
+            continue
+        if tag in ('pre', 'code'):  # pre/code 自闭合错误是最常见的 parse entities 原因
+            pass
+        if is_close:
+            if open_tags and open_tags[-1] == tag:
+                open_tags.pop()
+        else:
+            open_tags.append(tag)
+    # 按 LIFO 顺序补全未闭合标签
+    for tag in reversed(open_tags):
+        result += f'</{tag}>'
+
+    return result
+
 async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: Any,
                             limit: int = 3900, **kwargs: Any) -> List[Any]:
     """Send text without letting Telegram's per-message limit break the handler."""
@@ -7668,7 +8041,28 @@ async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
             sent.append(await context.bot.send_message(chat_id=chat_id, text=chunk, **send_kwargs))
         except BadRequest as e:
             message = str(e).lower()
-            if parse_mode and ("message is too long" in message or "can't parse entities" in message):
+            if parse_mode and "can't parse entities" in message:
+                # 先尝试清理 HTML 保留格式，而非直接降级到纯文本
+                logger.warning(f"HTML 解析失败，尝试清理后重发: {e}")
+                sanitized = _sanitize_telegram_html(chunk)
+                try:
+                    sent.append(await context.bot.send_message(
+                        chat_id=chat_id, text=sanitized, **send_kwargs
+                    ))
+                    continue
+                except BadRequest:
+                    pass  # 清理后仍失败，降级到纯文本
+                fallback_kwargs = dict(send_kwargs)
+                fallback_kwargs.pop('parse_mode', None)
+                fallback_text = plain_text_from_html(chunk)
+                for fallback_chunk in split_text_for_telegram(fallback_text, limit):
+                    sent.append(await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=fallback_chunk,
+                        **fallback_kwargs
+                    ))
+                continue
+            if parse_mode and "message is too long" in message:
                 fallback_kwargs = dict(send_kwargs)
                 fallback_kwargs.pop('parse_mode', None)
                 fallback_text = plain_text_from_html(chunk)
@@ -7730,7 +8124,13 @@ async def safe_edit_text(msg: Any, text: str, reply_markup: Optional[InlineKeybo
             if "message is not modified" in msg_lower:
                 return True
             if parse_mode and "can't parse entities" in msg_lower:
-                logger.warning(f"HTML 解析失败，回退到纯文本: {retry_bad_request}")
+                logger.warning(f"HTML 解析失败，尝试清理后重发: {retry_bad_request}")
+                # 先尝试清理 HTML 保留格式
+                try:
+                    await msg.edit_text(_sanitize_telegram_html(text), reply_markup=reply_markup, parse_mode=parse_mode)
+                    return True
+                except BadRequest:
+                    pass  # 清理后仍失败，降级到纯文本
                 try:
                     await msg.edit_text(plain_text_from_html(text), reply_markup=reply_markup)
                     return True
@@ -7744,7 +8144,13 @@ async def safe_edit_text(msg: Any, text: str, reply_markup: Optional[InlineKeybo
         if "message is not modified" in msg_lower:
             return True
         if parse_mode and "can't parse entities" in msg_lower:
-            logger.warning(f"HTML 解析失败，回退到纯文本: {e}")
+            logger.warning(f"HTML 解析失败，尝试清理后重发: {e}")
+            # 先尝试清理 HTML 保留格式
+            try:
+                await msg.edit_text(_sanitize_telegram_html(text), reply_markup=reply_markup, parse_mode=parse_mode)
+                return True
+            except BadRequest:
+                pass  # 清理后仍失败，降级到纯文本
             try:
                 await msg.edit_text(plain_text_from_html(text), reply_markup=reply_markup)
                 return True
@@ -7777,13 +8183,17 @@ async def cancel_task_quietly(task: Optional[asyncio.Task], timeout: float = 1.0
         task.add_done_callback(_drain_task_result)
 
 class TelegramStreamRenderer:
-    """Render upstream streaming chunks to Telegram without fighting edit rate limits."""
+    """Render upstream streaming chunks to Telegram using Rich Message drafts (Bot API 10.1).
+
+    优先使用 sendRichMessageDraft 推送流式内容（不受 edit_message 频率限制），
+    失败时自动降级为旧的 edit_message_text HTML 模式。
+    """
 
     FLUSH_INTERVAL_SECONDS = 0.35
     MIN_CHARS_PER_FLUSH = 12
 
     def __init__(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: Any,
-                 reply_markup: InlineKeyboardMarkup, limit: int = 4000,
+                 reply_markup: InlineKeyboardMarkup, limit: int = RICH_MESSAGE_CHAR_LIMIT,
                  stop_event: Optional[asyncio.Event] = None):
         self.context = context
         self.chat_id = chat_id
@@ -7797,6 +8207,10 @@ class TelegramStreamRenderer:
         self.pending_text = ""
         self._task: Optional[asyncio.Task] = None
         self.live_edit_enabled = True
+        # Rich Message Draft 模式
+        # draft_id 由 bot 自行生成（API 要求非零整数），相同 draft_id 的调用会动画过渡更新
+        self._draft_id: int = int(time.time() * 1000) % 0x7FFFFFFF + 1
+        self._rich_draft_enabled = True  # 尝试使用 Rich Draft，失败则降级
 
     def start(self):
         self._task = asyncio.create_task(self._render_loop())
@@ -7833,6 +8247,17 @@ class TelegramStreamRenderer:
         partial = ''.join(self.response_parts).strip()
         visible_text = self.current_text.strip() or partial
         if visible_text:
+            # 用 Rich Message 固化已生成内容
+            try:
+                await TelegramRichAPI.send_rich_message(chat_id=self.chat_id, text=visible_text + "\n\n⏹️ 已停止，保留以上已生成内容。")
+                try:
+                    await self.current_msg.delete()
+                except Exception:
+                    pass
+                return partial
+            except Exception:
+                pass
+            # 降级为 HTML 编辑
             html_visible = markdown_to_telegram_html(visible_text)
             stopped_text = html_visible + "\n\n\u23f9\ufe0f 已停止，保留以上已生成内容。"
         else:
@@ -7846,7 +8271,21 @@ class TelegramStreamRenderer:
         return partial
 
     async def remove_controls(self):
-        if self.live_edit_enabled and self.current_text.strip():
+        """流式完成后：用 Rich Message 发送最终内容，删除旧占位消息。"""
+        if not self.current_text.strip():
+            return
+        if self.live_edit_enabled:
+            # 优先尝试 Rich Message 固化
+            try:
+                await TelegramRichAPI.send_rich_message(chat_id=self.chat_id, text=self.current_text)
+                try:
+                    await self.current_msg.delete()
+                except Exception:
+                    pass
+                return
+            except Exception as e:
+                logger.debug(f"Rich Message 固化失败，降级为 HTML: {e}")
+            # 降级为 HTML 编辑
             try:
                 html_text = markdown_to_telegram_html(self.current_text)
                 await safe_edit_text(self.current_msg, html_text, reply_markup=None,
@@ -7911,6 +8350,25 @@ class TelegramStreamRenderer:
         if not self.live_edit_enabled:
             return
 
+        # 优先使用 Rich Message Draft 推送
+        if self._rich_draft_enabled:
+            try:
+                # 文本较短时在开头添加 <tg-thinking> 思考块（API 10.1 Draft 专属）
+                # 给用户"AI 正在思考"的视觉反馈，文本足够长后自动移除
+                draft_text = self.current_text
+                if len(draft_text.strip()) < 80:
+                    draft_text = "<tg-thinking>正在思考…</tg-thinking>\n\n" + draft_text
+                await TelegramRichAPI.send_rich_message_draft(
+                    chat_id=self.chat_id,
+                    text=draft_text,
+                    draft_id=self._draft_id,
+                )
+                return
+            except Exception as e:
+                logger.info(f"Rich Draft 推送失败，降级为 HTML edit: {e}")
+                self._rich_draft_enabled = False
+
+        # 降级为旧的 edit_message_text HTML 模式
         try:
             html_text = markdown_to_telegram_html(self.current_text)
             await safe_edit_text(self.current_msg, html_text, reply_markup=self.reply_markup,
@@ -7926,7 +8384,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
     """流式回复：上游边生成，Telegram 边按字符刷新显示。"""
     global _stop_generation_event
     chat_id = update.effective_chat.id
-    TELEGRAM_MSG_LIMIT = 4000
+    TELEGRAM_MSG_LIMIT = RICH_MESSAGE_CHAR_LIMIT
 
     msg = None
     renderer = None
@@ -8087,7 +8545,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
                     logger.warning(f"发送模型原生媒体失败: {e}")
             if renderer and not renderer.live_edit_enabled and msg:
                 try:
-                    await finalize_text_response(context, chat_id, msg, full_response, TELEGRAM_MSG_LIMIT)
+                    await rich_finalize_text_response(context, chat_id, msg, full_response, TELEGRAM_MSG_LIMIT)
                 except Exception as e:
                     logger.warning(f"流式降级后的最终消息发送失败: {e}")
             await send_token_usage_message(
@@ -8123,7 +8581,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             await renderer.cancel()
         try:
             if msg:
-                await finalize_text_response(context, chat_id, renderer.current_msg if renderer else msg, error_text, TELEGRAM_MSG_LIMIT)
+                await rich_finalize_text_response(context, chat_id, renderer.current_msg if renderer else msg, error_text, TELEGRAM_MSG_LIMIT)
             else:
                 await context.bot.send_message(chat_id=chat_id, text=error_text)
         except Exception as edit_err:
@@ -8147,7 +8605,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
     """非流式回复：等待完整回复后一次性发送"""
     global _stop_generation_event
     chat_id = update.effective_chat.id
-    TELEGRAM_MSG_LIMIT = 4000
+    TELEGRAM_MSG_LIMIT = RICH_MESSAGE_CHAR_LIMIT
 
     msg = None
     typing_stop = None
@@ -8227,7 +8685,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
                 "elapsed_seconds": time.monotonic() - generation_started_at,
             })
             try:
-                await finalize_text_response(context, chat_id, msg, error, TELEGRAM_MSG_LIMIT)
+                await rich_finalize_text_response(context, chat_id, msg, error, TELEGRAM_MSG_LIMIT)
             except Exception:
                 pass
             return error
@@ -8264,7 +8722,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
                 except Exception as e:
                     logger.warning(f"发送模型原生媒体失败: {e}")
             try:
-                await finalize_text_response(context, chat_id, msg, response, TELEGRAM_MSG_LIMIT)
+                await rich_finalize_text_response(context, chat_id, msg, response, TELEGRAM_MSG_LIMIT)
             except Exception as e:
                 logger.warning(f"非流式最终消息更新失败: {e}")
             await send_token_usage_message(
@@ -8296,7 +8754,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
         })
         try:
             if msg:
-                await finalize_text_response(context, chat_id, msg, error_text, TELEGRAM_MSG_LIMIT)
+                await rich_finalize_text_response(context, chat_id, msg, error_text, TELEGRAM_MSG_LIMIT)
             else:
                 await context.bot.send_message(chat_id=chat_id, text=error_text)
         except Exception:
@@ -8370,40 +8828,86 @@ async def cmd_restart_system(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await GlobalRecorder.record_user_message(update.message.text, MessageType.COMMAND, update.effective_chat.id)
         
     message = update.message or update.callback_query.message
-    await message.reply_text("🔄 服务正在重启。")
+    sent = await message.reply_text("🔄 服务正在重启。")
+    # 给 Telegram 一点时间把提示消息发出去，避免 sys.exit 截断未完成的发送
+    if sent is not None:
+        await asyncio.sleep(0.3)
     
     # 记录并关闭数据库
     await GlobalRecorder.record_system_op("重启机器人")
-    await restart_current_process(update.effective_chat.id)
+    await restart_current_process(update.effective_chat.id, context.bot)
 
-async def restart_current_process(chat_id: int):
-    """彻底重启进程，确保重新加载所有配置"""
+async def restart_current_process(chat_id: int, bot: Any = None):
+    """彻底重启进程，确保重新加载所有配置和代码。
+
+    支持三种守护模式：
+    - PM2 / nohup：调用 install.sh restart（detached，含完整 stop+start），由它拉起新进程。
+    - systemd：依赖 unit 的 Restart= 自动拉起。
+    - 兜底（无任何守护）：先给用户发提示，再退出，避免静默掉线。
+    退出前写入重启标记（PID + 时间戳），新进程启动时据此判断“代码是否真的换了”。
+    """
     db = await BotMemoryDB.get_instance()
     await db.set_config('restart_notify_chat_id', chat_id)
+    # 写入重启校验标记：新进程启动时对比 PID，判断是否真的换了新进程/新代码
+    await db.set_config('restart_expected_ts', time.time())
+    await db.set_config('restart_expected_pid', os.getpid())
     await db.close()
 
-    # 检测是否在 PM2 下运行
+    install_sh = os.path.join(PROJECT_ROOT, 'install.sh')
+    has_install_sh = os.path.exists(install_sh)
     is_pm2 = any(k in os.environ for k in ('PM2_HOME', 'pm_id', 'PM2_USAGE'))
+    is_nohup = os.path.exists(os.path.join(PROJECT_ROOT, 'bot.pid'))
+    # systemd 会在被托管进程的环境里注入 INVOCATION_ID（及 JOURNAL_STREAM）
+    is_systemd = 'INVOCATION_ID' in os.environ or 'JOURNAL_STREAM' in os.environ
 
+    restart_via_install = False
     if is_pm2:
-        # PM2 模式：调用 install.sh 脱离重启
-        install_sh = os.path.join(PROJECT_ROOT, 'install.sh')
-        if os.path.exists(install_sh):
-            logger.info("检测到 PM2 环境，调用 install.sh restart 彻底重启")
-            try:
-                subprocess.Popen(
-                    ['bash', install_sh, 'restart'],
-                    cwd=PROJECT_ROOT,
-                    start_new_session=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
+        logger.info("检测到 PM2 环境，调用 install.sh restart 彻底重启")
+        restart_via_install = True
+    elif is_nohup and has_install_sh:
+        logger.info("检测到 nohup（bot.pid）环境，调用 install.sh restart 彻底重启")
+        restart_via_install = True
+    elif is_systemd:
+        # systemd 会按 unit 的 Restart= 策略自动拉起新进程
+        logger.info("检测到 systemd 托管环境，进程退出后由 systemd 自动拉起")
+
+    if restart_via_install:
+        try:
+            subprocess.Popen(
+                ['bash', install_sh, 'restart'],
+                cwd=PROJECT_ROOT,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            await asyncio.sleep(1)
+        except Exception as e:
+            logger.warning(f"调用 install.sh restart 失败: {e}，回退到直接退出")
+            # 失败时若 PM2 仍在，PM2 还会自动拉起；否则需要兜底提示
+            if not is_pm2 and bot is not None:
+                with contextlib.suppress(Exception):
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="⚠️ 自动重启脚本调用失败，进程即将退出。"
+                             "如果没有自动恢复，请手动运行 install.sh 重启。"
+                    )
+                await asyncio.sleep(0.3)
+    elif not is_systemd:
+        # 兜底：既不是 PM2/nohup 也不是 systemd，退出后没有守护进程拉起，
+        # 先提示用户手动重启，避免静默掉线后不知所措。
+        logger.warning("未检测到 PM2/nohup/systemd 守护，进程退出后可能无法自动恢复")
+        if bot is not None:
+            with contextlib.suppress(Exception):
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ 检测到当前没有 PM2/nohup/systemd 守护进程。\n"
+                         "进程即将退出，可能无法自动重启。\n"
+                         "如果 Bot 没有恢复，请手动到服务器运行 install.sh 启动。"
                 )
-                await asyncio.sleep(1)
-            except Exception as e:
-                logger.warning(f"调用 install.sh restart 失败: {e}，回退到直接退出")
+            await asyncio.sleep(0.3)
 
     # 彻底退出进程，让外层管理器（PM2/systemd/nohup）重新启动
-    # 这样确保重新加载 .env 和所有配置文件
+    # 这样确保重新加载 .env 和所有配置文件，以及最新代码
     logger.info("进程即将退出以完成重启")
     sys.exit(0)
 
@@ -8547,7 +9051,9 @@ async def perform_update_system(update: Update, context: ContextTypes.DEFAULT_TY
         f"{success_title}"
         f"{skipped_line}{reload_line}{backup_line}"
     )
-    await restart_current_process(update.effective_chat.id)
+    # 给 Telegram 一点时间把“更新成功”消息发出去，避免 sys.exit 截断
+    await asyncio.sleep(0.4)
+    await restart_current_process(update.effective_chat.id, context.bot)
 
 async def cmd_providers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
@@ -10015,7 +10521,18 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 
     doc = update.message.document
     doc_name = doc.file_name or f"document_{uuid.uuid4().hex[:8]}.bin"
-    caption = (update.message.caption or "").strip()
+    # 使用 caption 保留格式
+    caption = ""
+    if update.message.caption:
+        try:
+            caption = (update.message.caption_markdown or update.message.caption or "").strip()
+        except Exception:
+            caption = (update.message.caption or "").strip()
+    # 转发的富文本消息：caption 可能为空，文字在 rich_message.blocks 里
+    if not caption:
+        caption = _extract_rich_message_text(update.message).strip()
+        if caption:
+            logger.warning(f"handle_document_message: extracted caption via rich_message, len={len(caption)}: {caption[:200]}")
 
     if state == BotState.SET_COMMAND_BLACKLIST:
         await GlobalRecorder.record_user_message(
@@ -10168,6 +10685,10 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
                 )
             })
 
+        forward_prefix = build_forward_origin_prefix(update.message)
+        if forward_prefix:
+            memory_text = f"{forward_prefix}\n{memory_text}"
+
         await process_conversation(
             update,
             context,
@@ -10177,6 +10698,168 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         logger.error(f"File save/process error: {e}")
         await update.message.reply_text(f"文件 {safe_text(doc_name)} 已收到，但保存或转交模型失败。")
+
+
+def _rich_part_to_markdown(part):
+    """Convert a rich text part to markdown. Handles string, dict (formatted), and list."""
+    if isinstance(part, str):
+        return part
+    if isinstance(part, dict):
+        t = part.get('text')
+        if t is None:
+            return ''
+        if isinstance(t, (dict, list)):
+            inner = _rich_part_to_markdown(t)
+        else:
+            inner = str(t)
+        fmt = part.get('type', '')
+        if fmt == 'bold':
+            return '**' + inner + '**'
+        elif fmt == 'italic':
+            return '*' + inner + '*'
+        elif fmt == 'code':
+            return '`' + inner + '`'
+        elif fmt == 'pre':
+            return '```' + chr(10) + inner + chr(10) + '```'
+        elif fmt == 'strikethrough':
+            return '~~' + inner + '~~'
+        elif fmt == 'underline':
+            return '__' + inner + '__'
+        elif fmt == 'spoiler':
+            return '||' + inner + '||'
+        elif fmt in ('link', 'text_link'):
+            url = part.get('url', '')
+            return '[' + inner + '](' + url + ')' if url else inner
+        else:
+            return inner
+    if isinstance(part, list):
+        return ''.join(_rich_part_to_markdown(p) for p in part)
+    return ''
+
+
+def _rich_block_to_text(block):
+    """Convert a rich_message block to text. Handles paragraphs, blockquotes, tables, lists."""
+    if not isinstance(block, dict):
+        return ''
+    btype = block.get('type', '')
+    text = block.get('text')
+    if text is not None:
+        return _rich_part_to_markdown(text)
+    if 'blocks' in block:
+        nested = [_rich_block_to_text(b) for b in block['blocks'] if isinstance(b, dict)]
+        result = chr(10).join(nested)
+        if btype == 'blockquote':
+            result = chr(10).join('> ' + line for line in result.split(chr(10)) if line)
+        return result
+    if 'cells' in block:
+        cells = block['cells']
+        if not isinstance(cells, list):
+            return ''
+        rows = []
+        for row in cells:
+            if not isinstance(row, list):
+                continue
+            cell_texts = []
+            for cell in row:
+                if isinstance(cell, dict):
+                    ct = cell.get('text', '')
+                    cell_texts.append(_rich_part_to_markdown(ct))
+                else:
+                    cell_texts.append(str(cell))
+            rows.append(cell_texts)
+        if not rows:
+            return ''
+        lines = []
+        for i, row in enumerate(rows):
+            lines.append('| ' + ' | '.join(row) + ' |')
+            if i == 0:
+                lines.append('| ' + ' | '.join(['---'] * len(row)) + ' |')
+        return chr(10).join(lines)
+    if 'items' in block:
+        items = block['items']
+        if not isinstance(items, list):
+            return ''
+        lines = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            label = item.get('label', '-')
+            item_blocks = item.get('blocks', [])
+            item_text = chr(10).join(_rich_block_to_text(b) for b in item_blocks if isinstance(b, dict))
+            lines.append(label + ' ' + item_text)
+        return chr(10).join(lines)
+    # Fallback for unknown block types: recursively search all fields for text
+    logger.warning(f"_rich_block_to_text: unknown block type={btype}, keys={list(block.keys())}")
+    parts = []
+    for key, value in block.items():
+        if key == 'type':
+            continue
+        if isinstance(value, str) and value.strip():
+            parts.append(value)
+        elif isinstance(value, dict):
+            t = _rich_part_to_markdown(value)
+            if not t:
+                t = _rich_block_to_text(value)
+            if t:
+                parts.append(t)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    t = _rich_part_to_markdown(item)
+                    if not t:
+                        t = _rich_block_to_text(item)
+                    if t:
+                        parts.append(t)
+    if parts:
+        result = chr(10).join(parts)
+        logger.warning(f"_rich_block_to_text: fallback extracted len={len(result)} from type={btype}")
+        return result
+    return ''
+
+
+def _extract_rich_message_text(msg):
+    """Extract text from rich_message (Telegram rich text format), preserving formatting as markdown."""
+    extra = getattr(msg, 'api_kwargs', None) or {}
+    rich = extra.get('rich_message')
+    rich_source = "api_kwargs"
+    if not rich or not isinstance(rich, dict):
+        try:
+            msg_dict = msg.to_dict() if hasattr(msg, 'to_dict') else {}
+            rich = msg_dict.get('rich_message')
+            rich_source = "to_dict"
+        except Exception:
+            rich = None
+    if not rich or not isinstance(rich, dict):
+        return ""
+    try:
+        rich_json = json.dumps(rich, ensure_ascii=False, default=str)
+        logger.warning(f"_extract_rich_message_text: source={rich_source}, keys={list(rich.keys())}, full={rich_json[:3000]}")
+    except Exception:
+        logger.warning(f"_extract_rich_message_text: source={rich_source}, keys={list(rich.keys()) if isinstance(rich, dict) else type(rich)}")
+    md = rich.get('markdown')
+    if md and isinstance(md, str) and md.strip():
+        logger.warning(f"_extract_rich_message_text: extracted via markdown, len={len(md)}: {md[:200]}")
+        return md
+    blocks = rich.get('blocks')
+    if not blocks or not isinstance(blocks, list):
+        return ""
+    logger.warning(f"_extract_rich_message_text: found {len(blocks)} blocks")
+    paragraphs = []
+    for i, block in enumerate(blocks):
+        if not isinstance(block, dict):
+            continue
+        btype = block.get('type', '')
+        t = _rich_block_to_text(block)
+        if t:
+            logger.warning(f"_extract_rich_message_text: block[{i}] ({btype}) len={len(t)}")
+            paragraphs.append(t)
+        else:
+            logger.warning(f"_extract_rich_message_text: block[{i}] ({btype}) empty, keys={list(block.keys())}")
+    result = chr(10).join(paragraphs)
+    logger.warning(f"_extract_rich_message_text: total len={len(result)}, paragraphs={len(paragraphs)}")
+    return result
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
@@ -10191,7 +10874,65 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await UserDataManager.init()
     state = UserDataManager.get('state')
-    text = update.message.text.strip()
+    # 使用 text_markdown 保留格式（粗体/斜体/代码块等）
+    text = ""
+    if update.message.text:
+        try:
+            text = (update.message.text_markdown or update.message.text or "").strip()
+        except Exception:
+            text = (update.message.text or "").strip()
+    else:
+        text = (update.message.caption or "").strip()
+
+    # 转发消息 text 可能为 None（python-telegram-bot 解析问题），
+    # 用 forwardMessage API 重新拉取完整消息内容
+    if not text:
+        try:
+            msg_dict_debug = update.message.to_dict() if hasattr(update.message, 'to_dict') else {}
+            logger.warning(f"handle_text_message: text is None, raw dict keys: {list(msg_dict_debug.keys())}")
+            extra = getattr(update.message, 'api_kwargs', None) or {}
+            if extra:
+                logger.warning(f"handle_text_message: api_kwargs keys: {list(extra.keys())}")
+        except Exception:
+            pass
+        try:
+            fwd_msg = await context.bot.forward_message(
+                chat_id=update.effective_chat.id,
+                from_chat_id=update.effective_chat.id,
+                message_id=update.message.message_id,
+                disable_notification=True
+            )
+            text = (getattr(fwd_msg, 'text', None) or getattr(fwd_msg, 'caption', None) or "").strip()
+            # 立即删除转发的副本
+            try:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=fwd_msg.message_id
+                )
+            except Exception:
+                pass
+            if text:
+                logger.warning(f"handle_text_message: extracted via forwardMessage, len={len(text)}: {text[:200]}")
+            else:
+                logger.warning("handle_text_message: forwardMessage returned but no text/caption found")
+        except Exception as e:
+            logger.warning(f"handle_text_message: forwardMessage fallback failed: {e}")
+
+    # 富文本消息：text 在 rich_message.blocks 结构里，不在 text 字段
+    if not text:
+        text = _extract_rich_message_text(update.message).strip()
+        if text:
+            logger.warning(f"handle_text_message: extracted via rich_message.blocks, len={len(text)}: {text[:200]}")
+
+    # 仍然没有文字：不是文字消息（如转发的语音/视频/位置等），交给 handle_other_message
+    if not text:
+        await handle_other_message(update, context)
+        return
+
+    # 转发消息添加来源信息
+    forward_prefix = build_forward_origin_prefix(update.message)
+    if forward_prefix:
+        text = f"{forward_prefix}\n{text}"
 
     # 普通聊天按拼接模式决定：直接发送，或累计到“完成”按钮后再写入记忆。
     if state != BotState.IDLE:
@@ -10604,6 +11345,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     # --- 正常对话处理 ---
+    forward_prefix = build_forward_origin_prefix(update.message)
+    if forward_prefix:
+        text = f"{forward_prefix}\n{text}"
     await handle_normal_text_conversation(update, context, text)
 
 
@@ -11892,6 +12636,11 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     await UserDataManager.init()
 
     caption = (update.message.caption or "").strip()
+    # 转发的富文本消息：caption 可能为空，文字在 rich_message.blocks 里
+    if not caption:
+        caption = _extract_rich_message_text(update.message).strip()
+        if caption:
+            logger.warning(f"handle_photo_message: extracted caption via rich_message, len={len(caption)}: {caption[:200]}")
     prov_name, prov_data = get_current_provider()
     model = UserDataManager.get('default_model')
     if not prov_data or not model:
@@ -11929,6 +12678,11 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
             "data": image_b64
         })
 
+        forward_prefix = build_forward_origin_prefix(update.message)
+        if forward_prefix:
+            memory_text = f"{forward_prefix}\n{memory_text}"
+            multimodal_content.insert(0, {"type": "text", "text": forward_prefix})
+
         await process_conversation(
             update,
             context,
@@ -11959,24 +12713,257 @@ async def handle_sticker_message(update: Update, context: ContextTypes.DEFAULT_T
     prov_name, prov_data = get_current_provider()
     model = UserDataManager.get('default_model')
     if prov_data and model and emoji:
-        await process_conversation(update, context, f"[用户发送了一个贴纸: {emoji}]")
+        sticker_conv_text = f"[用户发送了一个贴纸: {emoji}]"
+        forward_prefix = build_forward_origin_prefix(update.message)
+        if forward_prefix:
+            sticker_conv_text = f"{forward_prefix}\n{sticker_conv_text}"
+        await process_conversation(update, context, sticker_conv_text)
     else:
         await update.message.reply_text(f"已收到贴纸 {emoji} ")
+
+
+def build_forward_origin_prefix(msg) -> str:
+    """从消息中提取转发来源信息，返回前缀字符串。非转发消息返回空字符串。"""
+    origin = getattr(msg, 'forward_origin', None)
+
+    # 旧版 API 兼容：forward_from / forward_from_chat
+    if not origin:
+        ff = getattr(msg, 'forward_from', None)
+        ffc = getattr(msg, 'forward_from_chat', None)
+        if ff:
+            name = ff.full_name or ff.first_name or ff.username or "未知用户"
+            return f"[转发消息，来源：{name}]"
+        if ffc:
+            name = ffc.title or ffc.username or "未知聊天"
+            return f"[转发消息，来源：{name}]"
+        if getattr(msg, 'forward_date', None):
+            return "[转发消息，来源：未知]"
+        return ""
+
+    origin_type = getattr(origin, 'type', '')
+
+    if origin_type == 'user':
+        sender = getattr(origin, 'sender_user', None)
+        name = (sender.full_name or sender.first_name or sender.username or "未知用户") if sender else "未知用户"
+        return f"[转发消息，来源：{name}]"
+
+    if origin_type == 'hidden_user':
+        name = getattr(origin, 'sender_user_name', None) or "隐藏用户"
+        return f"[转发消息，来源：{name}]"
+
+    if origin_type == 'chat':
+        sender = getattr(origin, 'sender_chat', None)
+        name = (sender.title or sender.username or "未知聊天") if sender else "未知聊天"
+        sig = getattr(origin, 'author_signature', None)
+        if sig:
+            name += f"（作者：{sig}）"
+        return f"[转发消息，来源：{name}]"
+
+    if origin_type == 'channel':
+        chat = getattr(origin, 'chat', None)
+        name = (chat.title or chat.username or "未知频道") if chat else "未知频道"
+        sig = getattr(origin, 'author_signature', None)
+        if sig:
+            name += f"（作者：{sig}）"
+        return f"[转发消息，来源：{name}]"
+
+    return "[转发消息]"
+
 
 async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
         return
-    
+
     await UserDataManager.init()
-    await GlobalRecorder.record_user_message(
-        "[其他类型消息]",
-        MessageType.USER_TEXT,
-        update.effective_chat.id
+    msg = update.message
+
+    # 完整原始字典和 api_kwargs 写入日志
+    try:
+        msg_dict = msg.to_dict() if hasattr(msg, 'to_dict') else {}
+        logger.warning(f"handle_other_message raw dict: {msg_dict}")
+        extra = getattr(msg, 'api_kwargs', None) or {}
+        if extra:
+            logger.warning(f"handle_other_message api_kwargs keys: {list(extra.keys())}")
+            for k, v in extra.items():
+                if isinstance(v, str) and len(v) > 3:
+                    logger.warning(f"handle_other_message api_kwargs['{k}'] = {v[:200]}")
+    except Exception:
+        msg_dict = {}
+
+    # 转发消息优先用 forwardMessage API 获取完整内容
+    # （api_kwargs 可能有短字符串导致提前命中，forwardMessage 必须最先尝试）
+    is_forwarded = (
+        getattr(msg, 'forward_origin', None) is not None
+        or getattr(msg, 'forward_from', None) is not None
+        or getattr(msg, 'forward_from_chat', None) is not None
     )
-    # 发送默认回复
-    await update.message.reply_text(
-        "已收到该类型消息。目前建议发送文字或文件。"
-    )
+    extracted_text = ""
+
+    if is_forwarded:
+        try:
+            fwd_msg = await context.bot.forward_message(
+                chat_id=update.effective_chat.id,
+                from_chat_id=update.effective_chat.id,
+                message_id=msg.message_id,
+                disable_notification=True
+            )
+            extracted_text = (getattr(fwd_msg, 'text', None) or getattr(fwd_msg, 'caption', None) or "").strip()
+            try:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=fwd_msg.message_id
+                )
+            except Exception:
+                pass
+            if extracted_text:
+                logger.warning(f"handle_other_message: extracted via forwardMessage (first), len={len(extracted_text)}: {extracted_text[:200]}")
+            else:
+                logger.warning("handle_other_message: forwardMessage returned but no text/caption found")
+        except Exception as e:
+            logger.warning(f"handle_other_message: forwardMessage failed: {e}")
+
+    # 标准提取（forwardMessage 失败或非转发消息的 fallback）
+    if not extracted_text:
+        extracted_text = (msg.text or msg.caption or "").strip()
+
+    if not extracted_text:
+        extra = getattr(msg, 'api_kwargs', None) or {}
+        extracted_text = (extra.get('text') or extra.get('caption') or "").strip()
+
+    if not extracted_text:
+        extracted_text = (msg_dict.get('text') or msg_dict.get('caption') or "").strip()
+
+    # 富文本消息：text 在 rich_message.blocks 结构里
+    if not extracted_text:
+        extracted_text = _extract_rich_message_text(msg).strip()
+        if extracted_text:
+            logger.warning(f"handle_other_message: extracted via rich_message.blocks, len={len(extracted_text)}: {extracted_text[:200]}")
+
+    if not extracted_text:
+        # 深度搜索：遍历 api_kwargs 的所有键值，找最长的字符串（最可能是消息正文）
+        extra = getattr(msg, 'api_kwargs', None) or {}
+        _SKIP_KEYS = {'date', 'message_id', 'chat_id', 'from_user_id', 'update_id',
+                       'id', 'file_id', 'file_unique_id', 'mime_type', 'file_size',
+                       'width', 'height', 'duration', 'is_bot', 'language_code',
+                       'username', 'phone_number', 'color', 'type',
+                       'is_topic_message', 'is_automatic_forward',
+                       'has_protected_content', 'message_thread_id',
+                       'chat', 'from', 'from_user', 'forward_origin',
+                       'forward_from', 'forward_from_chat', 'forward_date',
+                       'sender_chat', 'sender_user', 'entities',
+                       'caption_entities', 'new_chat_members',
+                       'new_chat_photo', 'left_chat_member',
+                       'photo', 'reply_to_message', 'pinned_message',
+                       'via_bot', 'author'}
+        # 记录所有候选字符串
+        for k, v in extra.items():
+            if isinstance(v, str) and len(v) > 3:
+                logger.warning(f"handle_other_message candidate api_kwargs['{k}'] len={len(v)}: {v[:100]}")
+        # 找最长的字符串
+        best_text = ""
+        best_key = ""
+        for k, v in extra.items():
+            if k in _SKIP_KEYS:
+                continue
+            if isinstance(v, str) and len(v) > 10 and len(v) > len(best_text):
+                best_text = v
+                best_key = k
+        if best_text:
+            extracted_text = best_text
+            logger.warning(f"handle_other_message: extracted from api_kwargs['{best_key}'], len={len(best_text)}")
+
+    if not extracted_text:
+        # 递归深度搜索 to_dict() 的所有值，找最长的字符串
+        def _deep_search_longest(obj, depth=0) -> Optional[str]:
+            if depth > 5:
+                return None
+            best = None
+            if isinstance(obj, str) and len(obj) > 10:
+                best = obj
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k in _SKIP_KEYS:
+                        continue
+                    result = _deep_search_longest(v, depth + 1)
+                    if result and (best is None or len(result) > len(best)):
+                        best = result
+            if isinstance(obj, list):
+                for item in obj:
+                    result = _deep_search_longest(item, depth + 1)
+                    if result and (best is None or len(result) > len(best)):
+                        best = result
+            return best
+
+        found = _deep_search_longest(msg_dict)
+        if found:
+            extracted_text = found
+            logger.warning(f"handle_other_message: extracted via deep search, len={len(found)}: {found[:200]}")
+
+    if not extracted_text:
+        # 检查嵌套消息
+        for nested_key in ('pinned_message', 'reply_to_message'):
+            nested = getattr(msg, nested_key, None)
+            if nested:
+                nested_text = (getattr(nested, 'text', None) or getattr(nested, 'caption', None) or "").strip()
+                if nested_text:
+                    extracted_text = nested_text
+                    break
+
+    if not extracted_text:
+        # 最后手段：用 forwardMessage API 重新获取消息内容
+        # Bot API 的 update 可能没有 text 字段，但 forwardMessage 返回的 Message 可能有
+        try:
+            fwd_msg = await context.bot.forward_message(
+                chat_id=update.effective_chat.id,
+                from_chat_id=update.effective_chat.id,
+                message_id=msg.message_id,
+                disable_notification=True
+            )
+            fwd_text = (getattr(fwd_msg, 'text', None) or getattr(fwd_msg, 'caption', None) or "").strip()
+            # 立即删除转发的副本
+            try:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=fwd_msg.message_id
+                )
+            except Exception:
+                pass
+            if fwd_text:
+                extracted_text = fwd_text
+                logger.warning(f"handle_other_message: extracted via forwardMessage, len={len(fwd_text)}: {fwd_text[:200]}")
+            else:
+                logger.warning("handle_other_message: forwardMessage returned but no text/caption found")
+        except Exception as e:
+            logger.warning(f"handle_other_message: forwardMessage fallback failed: {e}")
+
+    if extracted_text:
+        forward_prefix = build_forward_origin_prefix(msg)
+        if forward_prefix:
+            extracted_text = f"{forward_prefix}\n{extracted_text}"
+        if _conversation_processing_lock.locked():
+            await msg.reply_text("⏳ 系统仍在处理上一个请求... 请稍后再发送新请求。")
+            return
+        await handle_normal_text_conversation(update, context, extracted_text)
+        return
+
+    # 无法提取文字内容
+    forward_prefix = build_forward_origin_prefix(msg)
+    if forward_prefix:
+        # 转发消息但无法提取文字：仍然送入对话流程，让 AI 自然回复
+        conv_text = f"{forward_prefix}（此消息未包含可读取的文字内容）"
+        if _conversation_processing_lock.locked():
+            await msg.reply_text("⏳ 系统仍在处理上一个请求... 请稍后再发送新请求。")
+            return
+        await GlobalRecorder.record_user_message(conv_text, MessageType.USER_TEXT, update.effective_chat.id)
+        await process_conversation(update, context, conv_text)
+    else:
+        # 非转发消息，确实没有文字内容
+        await GlobalRecorder.record_user_message(
+            "[其他类型消息]",
+            MessageType.USER_TEXT,
+            update.effective_chat.id
+        )
+        await msg.reply_text("已收到该类型消息。目前建议发送文字或文件。")
 
 # --- ☆ 错误处理 ☆ ---
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -12053,6 +13040,55 @@ async def setup_bot_commands(app):
         try:
             await UserDataManager.init()
             db = await BotMemoryDB.get_instance()
+
+            # === 重启/更新校验：判断本次启动是否真的换了新进程 ===
+            # restart_current_process 退出前会写入 restart_expected_pid（旧进程 PID）+ 时间戳。
+            # 新进程启动时对比当前 PID：不同=重启成功（新代码已加载），相同=没换进程（重启未生效）。
+            notify_chat_id = await db.get_config('restart_notify_chat_id', BotConfig.AUTHORIZED_USER_ID) or BotConfig.AUTHORIZED_USER_ID
+            expected_pid = await db.get_config('restart_expected_pid', None)
+            expected_ts = await db.get_config('restart_expected_ts', 0)
+            restart_notice_sent = False
+            try:
+                expected_ts_f = float(expected_ts or 0)
+            except (TypeError, ValueError):
+                expected_ts_f = 0.0
+            # 标记存活窗口：5 分钟内的标记才认为是“刚刚请求的重启”，更早的视为陈旧残留
+            if expected_pid is not None and (time.time() - expected_ts_f) < 300:
+                current_pid = os.getpid()
+                try:
+                    expected_pid_int = int(expected_pid)
+                except (TypeError, ValueError):
+                    expected_pid_int = -1
+                if current_pid != expected_pid_int:
+                    # PID 变了 → 新进程被拉起，代码确实重新从磁盘加载
+                    logger.info(f"✅ 重启校验通过：新进程 PID={current_pid}（旧 PID={expected_pid_int}），新代码已加载")
+                    with contextlib.suppress(Exception):
+                        await app.bot.send_message(
+                            chat_id=notify_chat_id,
+                            text=(
+                                f"✅ 已成功重启，新代码已加载。\n"
+                                f"新进程 PID: <code>{current_pid}</code>（原 {expected_pid_int}）"
+                            ),
+                            parse_mode=constants.ParseMode.HTML
+                        )
+                        restart_notice_sent = True
+                else:
+                    # PID 没变 → sys.exit 没生效或重启脚本没拉起，仍是旧进程/旧代码
+                    logger.warning(f"⚠️ 重启校验失败：当前 PID={current_pid} 与重启前相同，进程未真正重启，可能是旧代码")
+                    with contextlib.suppress(Exception):
+                        await app.bot.send_message(
+                            chat_id=notify_chat_id,
+                            text=(
+                                "⚠️ 重启可能未生效：当前仍是重启前的同一个进程（PID 未变）。\n"
+                                "代码可能没有更新，请到服务器手动运行 install.sh restart 确认。"
+                            ),
+                            parse_mode=constants.ParseMode.HTML
+                        )
+                        restart_notice_sent = True
+                # 消费标记，避免下次普通启动重复发校验通知
+                await db.set_config('restart_expected_pid', None)
+                await db.set_config('restart_expected_ts', None)
+
             # 跨进程去重：检查上次发送时间戳
             last_sent_ts = await db.get_config('last_startup_menu_sent_ts', 0)
             elapsed = time.time() - float(last_sent_ts or 0)
@@ -12060,7 +13096,6 @@ async def setup_bot_commands(app):
                 logger.info(f"⏭️ 启动菜单跳过：距上次发送仅 {int(elapsed)}s（冷却 {STARTUP_MENU_COOLDOWN}s 内）")
                 _startup_menu_sent = True
                 return
-            notify_chat_id = await db.get_config('restart_notify_chat_id', BotConfig.AUTHORIZED_USER_ID)
             # 标记置位（不再回滚）：宁可启动菜单漏发，也绝不能重复发送。
             # 漏发时用户随时可手动 /start；重复发送才是真正困扰用户的问题。
             _startup_menu_sent = True
@@ -12072,7 +13107,7 @@ async def setup_bot_commands(app):
             )
             # 记录发送时间戳到数据库（跨进程有效）
             await db.set_config('last_startup_menu_sent_ts', time.time())
-            await GlobalRecorder.record_system_op("启动后发送完整主菜单", {"chat_id": notify_chat_id})
+            await GlobalRecorder.record_system_op("启动后发送完整主菜单", {"chat_id": notify_chat_id, "restart_notice_sent": restart_notice_sent})
             logger.info("✅ 启动主菜单已发送给用户")
         except Exception as e:
             # 发送失败也不回滚 flag：避免并发/重连再次触发导致重复发送
@@ -12099,6 +13134,12 @@ async def on_shutdown(app):
         logger.info("✅ 数据库连接已关闭")
     except Exception as e:
         logger.error(f"关闭数据库失败: {e}")
+    try:
+        if TelegramRichAPI._client and not TelegramRichAPI._client.is_closed:
+            await TelegramRichAPI._client.aclose()
+            logger.info("✅ Rich API httpx 客户端已关闭")
+    except Exception as e:
+        logger.error(f"关闭 Rich API httpx 客户端失败: {e}")
 
 # --- ☆ 主程序入口 ☆ ---
 if __name__ == '__main__':
@@ -12182,12 +13223,12 @@ if __name__ == '__main__':
         # 贴纸处理器
         app.add_handler(MessageHandler(filters.Sticker.ALL, handle_sticker_message))
         
-        # 文本处理器
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-        
-        # 其他类型消息
+        # 文本处理器（含转发消息——转发消息和普通消息完全一样处理）
+        app.add_handler(MessageHandler((filters.TEXT | filters.FORWARDED) & ~filters.COMMAND, handle_text_message))
+
+        # 其他类型消息（排除转发、文本、文件/图片/贴纸）
         app.add_handler(MessageHandler(
-            filters.ALL & ~filters.COMMAND & ~filters.TEXT & ~filters.Document.ALL & ~filters.PHOTO & ~filters.Sticker.ALL,
+            filters.ALL & ~filters.COMMAND & ~filters.TEXT & ~filters.FORWARDED & ~filters.Document.ALL & ~filters.PHOTO & ~filters.Sticker.ALL,
             handle_other_message
         ))
         
