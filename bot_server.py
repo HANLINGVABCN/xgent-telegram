@@ -10727,7 +10727,7 @@ def _rich_part_to_markdown(part):
             return '__' + inner + '__'
         elif fmt == 'spoiler':
             return '||' + inner + '||'
-        elif fmt == 'link':
+        elif fmt in ('link', 'text_link'):
             url = part.get('url', '')
             return '[' + inner + '](' + url + ')' if url else inner
         else:
@@ -10788,6 +10788,34 @@ def _rich_block_to_text(block):
             item_text = chr(10).join(_rich_block_to_text(b) for b in item_blocks if isinstance(b, dict))
             lines.append(label + ' ' + item_text)
         return chr(10).join(lines)
+    # Fallback for unknown block types: recursively search all fields for text
+    logger.warning(f"_rich_block_to_text: unknown block type={btype}, keys={list(block.keys())}")
+    parts = []
+    for key, value in block.items():
+        if key == 'type':
+            continue
+        if isinstance(value, str) and value.strip():
+            parts.append(value)
+        elif isinstance(value, dict):
+            t = _rich_part_to_markdown(value)
+            if not t:
+                t = _rich_block_to_text(value)
+            if t:
+                parts.append(t)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    t = _rich_part_to_markdown(item)
+                    if not t:
+                        t = _rich_block_to_text(item)
+                    if t:
+                        parts.append(t)
+    if parts:
+        result = chr(10).join(parts)
+        logger.warning(f"_rich_block_to_text: fallback extracted len={len(result)} from type={btype}")
+        return result
     return ''
 
 
