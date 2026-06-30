@@ -10690,34 +10690,64 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 
 
 def _extract_rich_message_text(msg):
-    """Extract plain text from rich_message.blocks (Telegram rich text format).
+    """Extract plain text from rich_message (Telegram rich text format).
 
-    Rich text messages store content in a structured blocks format:
-    {"blocks": [{"type": "paragraph", "text": ["plain", {"type": "bold", "text": "bold"}, "more"]}]}
-    This function concatenates all text parts and joins paragraphs with newlines.
+    Supports two formats:
+    1. markdown: {"markdown": "full text"}
+    2. blocks: {"blocks": [{"type": "paragraph", "text": [...]}]}
     """
-    # Check api_kwargs for rich_message
     extra = getattr(msg, 'api_kwargs', None) or {}
     rich = extra.get('rich_message')
+    rich_source = "api_kwargs"
     if not rich or not isinstance(rich, dict):
-        # Also check msg_dict (to_dict result)
         try:
             msg_dict = msg.to_dict() if hasattr(msg, 'to_dict') else {}
             rich = msg_dict.get('rich_message')
+            rich_source = "to_dict"
         except Exception:
-            msg_dict = {}
             rich = None
     if not rich or not isinstance(rich, dict):
         return ""
+
+    # Log full content for debugging
+    try:
+        rich_json = json.dumps(rich, ensure_ascii=False, default=str)
+        logger.warning(f"_extract_rich_message_text: source={rich_source}, keys={list(rich.keys())}, full={rich_json[:3000]}")
+    except Exception:
+        logger.warning(f"_extract_rich_message_text: source={rich_source}, keys={list(rich.keys()) if isinstance(rich, dict) else type(rich)}")
+
+    # Format 1: markdown (used by send_rich_message)
+    md = rich.get('markdown')
+    if md and isinstance(md, str) and md.strip():
+        logger.warning(f"_extract_rich_message_text: extracted via markdown, len={len(md)}: {md[:200]}")
+        return md
+
+    # Format 2: blocks (structured format)
     blocks = rich.get('blocks')
     if not blocks or not isinstance(blocks, list):
+        logger.warning(f"_extract_rich_message_text: no blocks, trying other keys: {list(rich.keys())}")
+        # Try to find text in any other key
+        for k, v in rich.items():
+            if isinstance(v, str) and len(v) > 5:
+                logger.warning(f"_extract_rich_message_text: found text in key='{k}', len={len(v)}: {v[:200]}")
+                return v
         return ""
+    logger.warning(f"_extract_rich_message_text: found {len(blocks)} blocks")
     paragraphs = []
-    for block in blocks:
+    for i, block in enumerate(blocks):
         if not isinstance(block, dict):
             continue
         text_parts = block.get('text')
-        if not text_parts or not isinstance(text_parts, list):
+        if not text_parts:
+            logger.warning(f"_extract_rich_message_text: block[{i}] no text, keys={list(block.keys())}")
+            continue
+        if isinstance(text_parts, str):
+            # text is a plain string (paragraph without formatting)
+            paragraphs.append(text_parts)
+            logger.warning(f"_extract_rich_message_text: block[{i}] (string) len={len(text_parts)}: {text_parts[:100]}")
+            continue
+        if not isinstance(text_parts, list):
+            logger.warning(f"_extract_rich_message_text: block[{i}] text type={type(text_parts).__name__}, keys={list(block.keys())}")
             continue
         parts = []
         for part in text_parts:
@@ -10728,9 +10758,12 @@ def _extract_rich_message_text(msg):
                 if t and isinstance(t, str):
                     parts.append(t)
         if parts:
-            paragraphs.append(''.join(parts))
-    return '\n'.join(paragraphs)
-
+            para = ''.join(parts)
+            paragraphs.append(para)
+            logger.warning(f"_extract_rich_message_text: block[{i}] len={len(para)}: {para[:100]}")
+    result = '\n'.join(paragraphs)
+    logger.warning(f"_extract_rich_message_text: total len={len(result)}, paragraphs={len(paragraphs)}")
+    return result
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
