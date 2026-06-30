@@ -12472,16 +12472,70 @@ async def handle_sticker_message(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
         return
-    
+
     await UserDataManager.init()
+    msg = update.message
+
+    # 诊断日志：输出消息的所有可用属性，帮助排查为什么消息没有匹配 filters.TEXT
+    try:
+        msg_dict = msg.to_dict() if hasattr(msg, 'to_dict') else {}
+        non_none_keys = sorted(k for k, v in msg_dict.items() if v is not None)
+    except Exception:
+        non_none_keys = []
+    logger.warning(
+        f"handle_other_message: message did not match any specific filter. "
+        f"Present keys: {non_none_keys}, "
+        f"forward_origin={getattr(msg, 'forward_origin', None)!r}, "
+        f"text={getattr(msg, 'text', None)!r}, "
+        f"caption={getattr(msg, 'caption', None)!r}, "
+        f"chat_id={update.effective_chat.id if update.effective_chat else None}"
+    )
+
+    # 兜底：尝试从 text 或 caption 中提取文字内容
+    # 某些转发消息（如来自受保护频道、特殊来源）可能 text 为 None 但 caption 有值，或反之
+    extracted_text = (msg.text or msg.caption or "").strip()
+
+    if extracted_text:
+        # 有文字内容，走正常对话流程
+        await GlobalRecorder.record_user_message(
+            extracted_text,
+            MessageType.USER_TEXT,
+            update.effective_chat.id
+        )
+        # 检查处理中锁，避免和 handle_text_message 行为不一致
+        if _conversation_processing_lock.locked():
+            await msg.reply_text(
+                "⏳ 系统仍在处理上一个请求... 请稍后再发送新请求。"
+            )
+            return
+        await process_conversation(update, context, extracted_text)
+        return
+
+    # 没有可提取的文字内容，记录并发送更详细的提示
     await GlobalRecorder.record_user_message(
         "[其他类型消息]",
         MessageType.USER_TEXT,
         update.effective_chat.id
     )
-    # 发送默认回复
-    await update.message.reply_text(
-        "已收到该类型消息。目前建议发送文字或文件。"
+
+    # 构建更详细的类型描述
+    msg_type_parts: List[str] = []
+    for attr_name in ('animation', 'audio', 'video', 'video_note', 'voice',
+                       'contact', 'dice', 'game', 'poll', 'location', 'venue',
+                       'story', 'web_app_data', 'pinned_message', 'new_chat_members',
+                       'left_chat_member', 'new_chat_title', 'new_chat_photo',
+                       'successful_payment', 'invoice', 'connected_website'):
+        if getattr(msg, attr_name, None) is not None:
+            msg_type_parts.append(attr_name)
+
+    type_desc = ", ".join(msg_type_parts) if msg_type_parts else "未知类型"
+    is_forwarded = "是" if getattr(msg, 'forward_origin', None) else "否"
+
+    await msg.reply_text(
+        f"已收到该类型消息。\n"
+        f"消息类型: {type_desc}\n"
+        f"是否转发: {is_forwarded}\n"
+        f"目前建议直接发送文字、图片或文件。"
     )
 
 # --- ☆ 错误处理 ☆ ---
