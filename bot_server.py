@@ -2542,26 +2542,23 @@ class AgentExecutor:
 
     @classmethod
     def resolve_file_path(cls, requested_path: str) -> str:
-        """将文件路径解析为服务器上的实际路径。"""
+        """将文件路径解析为服务器上的实际路径。仅接受绝对路径。"""
         cleaned = requested_path.strip()
         if not cleaned:
             raise ValueError("文件路径为空")
-
-        if os.path.isabs(cleaned):
-            return os.path.abspath(cleaned)
-
-        return os.path.abspath(os.path.join(cls.WORK_DIR, cleaned))
+        if not os.path.isabs(cleaned):
+            raise ValueError(f"路径必须是绝对路径（以 / 开头），收到: {cleaned}。请使用项目根目录等绝对路径。")
+        return os.path.abspath(cleaned)
 
     @classmethod
     def resolve_write_path(cls, requested_path: str) -> str:
-        """写文件用的路径解析：相对路径一律落到项目根的 workspace/ 下（自动创建），
-        绝对路径原样。读路径不走这里，仍用 resolve_file_path，保持能读到项目已有文件。"""
+        """写文件用的路径解析。仅接受绝对路径。"""
         cleaned = requested_path.strip()
         if not cleaned:
             raise ValueError("文件路径为空")
-        if os.path.isabs(cleaned):
-            return os.path.abspath(cleaned)
-        return os.path.abspath(os.path.join(cls.WORK_DIR, 'workspace', cleaned))
+        if not os.path.isabs(cleaned):
+            raise ValueError(f"路径必须是绝对路径（以 / 开头），收到: {cleaned}。请使用项目根目录等绝对路径。")
+        return os.path.abspath(cleaned)
 
     @classmethod
     async def write_file(cls, requested_path: str, content: str) -> Dict[str, Any]:
@@ -2892,7 +2889,7 @@ class AgentExecutor:
                 'message': {'role': 'user', 'content': body_text},
             }
 
-        # 渲染：相对路径 + 行号 + 命中行 + 上下文（带行号，便于后续 read/edit 对齐）
+        # 渲染：路径 + 行号 + 命中行 + 上下文（带行号，便于后续 read/edit 对齐）
         parts = [header]
         # 按文件分组，路径只打印一次
         last_path = None
@@ -6180,6 +6177,7 @@ def build_absolute_path_prompt_section() -> str:
         f"- 项目根目录: {project_root}\n"
         f"- skill 目录: {skill_dir}\n"
         f"- 上传目录: {upload_dir}\n"
+        "所有协议的路径参数（read、edit、file、grep 的 path:、sendfile 等）必须使用上述绝对路径，禁止使用相对路径。需要新建文件时，在项目根目录下选择合适的子路径。\n"
         "---\n"
     )
 
