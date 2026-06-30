@@ -7516,13 +7516,18 @@ class TelegramRichAPI:
         return f"{base}/bot{BotConfig.TOKEN}/{method}"
 
     @classmethod
-    async def send_rich_message(cls, chat_id: int, block_tree: List[Dict],
+    async def send_rich_message(cls, chat_id: int, text: str,
                                  reply_markup: Optional[Dict] = None,
                                  reply_to_message_id: Optional[int] = None) -> Dict:
-        """发送完整的 Rich Message。返回 Telegram API 响应 JSON。"""
+        """发送完整的 Rich Message。返回 Telegram API 响应 JSON。
+
+        Bot API 10.1 的 rich_message 参数接受 {"markdown": "..."} 格式，
+        由 Telegram 服务端自行解析 Markdown 为原生 RichBlock（表格/标题/列表等），
+        无需客户端自行构建 block_tree。
+        """
         payload: Dict[str, Any] = {
             "chat_id": chat_id,
-            "rich_message": {"block_tree": block_tree},
+            "rich_message": {"markdown": text or " "},
         }
         if reply_markup:
             payload["reply_markup"] = reply_markup
@@ -7536,12 +7541,12 @@ class TelegramRichAPI:
         return result
 
     @classmethod
-    async def send_rich_message_draft(cls, chat_id: int, block_tree: List[Dict],
+    async def send_rich_message_draft(cls, chat_id: int, text: str,
                                        draft_message_id: Optional[int] = None) -> Dict:
         """发送/更新流式 Rich Message Draft。返回含 draft_message_id 的响应。"""
         payload: Dict[str, Any] = {
             "chat_id": chat_id,
-            "rich_message": {"block_tree": block_tree},
+            "rich_message": {"markdown": text or " "},
         }
         if draft_message_id is not None:
             payload["draft_message_id"] = draft_message_id
@@ -7970,10 +7975,6 @@ async def rich_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
                             **kwargs: Any) -> List[Any]:
     """优先使用 Rich Message 发送，失败时 fallback 到旧 HTML 模式。"""
     try:
-        block_tree = markdown_to_rich_blocks(text)
-        if not block_tree:
-            block_tree = [{"type": "paragraph", "text": [{"type": "plain", "text": text or " "}]}]
-
         # 将 InlineKeyboardMarkup 转为可 JSON 序列化的 dict
         markup_dict = None
         if reply_markup:
@@ -7981,7 +7982,7 @@ async def rich_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
 
         result = await TelegramRichAPI.send_rich_message(
             chat_id=chat_id,
-            block_tree=block_tree,
+            text=text,
             reply_markup=markup_dict,
         )
         # 返回 Message 对象需要适配——此处返回原始结果供上层使用
@@ -7998,20 +7999,16 @@ async def rich_finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_i
                                        msg: Any, response: str, limit: int = RICH_MESSAGE_CHAR_LIMIT):
     """使用 Rich Message 发送最终回复。失败时 fallback 到旧 HTML 编辑模式。"""
     try:
-        block_tree = markdown_to_rich_blocks(response)
-        if not block_tree:
-            block_tree = [{"type": "paragraph", "text": [{"type": "plain", "text": response or " "}]}]
-
         await TelegramRichAPI.send_rich_message(
             chat_id=chat_id,
-            block_tree=block_tree,
+            text=response,
         )
         # 删除原来的占位消息
         try:
             await msg.delete()
         except Exception:
             pass
-        logger.info(f"Rich Message 发送成功: chat_id={chat_id}, blocks={len(block_tree)}")
+        logger.info(f"Rich Message 发送成功: chat_id={chat_id}")
     except Exception as e:
         logger.warning(f"Rich Message 最终发送失败，降级为 HTML 编辑模式: {e}")
         await finalize_text_response(context, chat_id, msg, response, min(limit, 4000))
@@ -8659,8 +8656,7 @@ class TelegramStreamRenderer:
         if visible_text:
             # 用 Rich Message 固化已生成内容
             try:
-                block_tree = markdown_to_rich_blocks(visible_text + "\n\n⏹️ 已停止，保留以上已生成内容。")
-                await TelegramRichAPI.send_rich_message(chat_id=self.chat_id, block_tree=block_tree)
+                await TelegramRichAPI.send_rich_message(chat_id=self.chat_id, text=visible_text + "\n\n⏹️ 已停止，保留以上已生成内容。")
                 try:
                     await self.current_msg.delete()
                 except Exception:
@@ -8688,14 +8684,12 @@ class TelegramStreamRenderer:
         if self.live_edit_enabled:
             # 优先尝试 Rich Message 固化
             try:
-                block_tree = markdown_to_rich_blocks(self.current_text)
-                if block_tree:
-                    await TelegramRichAPI.send_rich_message(chat_id=self.chat_id, block_tree=block_tree)
-                    try:
-                        await self.current_msg.delete()
-                    except Exception:
-                        pass
-                    return
+                await TelegramRichAPI.send_rich_message(chat_id=self.chat_id, text=self.current_text)
+                try:
+                    await self.current_msg.delete()
+                except Exception:
+                    pass
+                return
             except Exception as e:
                 logger.debug(f"Rich Message 固化失败，降级为 HTML: {e}")
             # 降级为 HTML 编辑
@@ -8766,17 +8760,15 @@ class TelegramStreamRenderer:
         # 优先使用 Rich Message Draft 推送
         if self._rich_draft_enabled:
             try:
-                block_tree = markdown_to_rich_blocks(self.current_text)
-                if block_tree:
-                    result = await TelegramRichAPI.send_rich_message_draft(
-                        chat_id=self.chat_id,
-                        block_tree=block_tree,
-                        draft_message_id=self._draft_message_id,
-                    )
-                    # 保存 draft_message_id 用于后续更新
-                    if result.get('result', {}).get('message_id'):
-                        self._draft_message_id = result['result']['message_id']
-                    return
+                result = await TelegramRichAPI.send_rich_message_draft(
+                    chat_id=self.chat_id,
+                    text=self.current_text,
+                    draft_message_id=self._draft_message_id,
+                )
+                # 保存 draft_message_id 用于后续更新
+                if result.get('result', {}).get('message_id'):
+                    self._draft_message_id = result['result']['message_id']
+                return
             except Exception as e:
                 logger.info(f"Rich Draft 推送失败，降级为 HTML edit: {e}")
                 self._rich_draft_enabled = False
