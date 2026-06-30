@@ -10688,6 +10688,50 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         logger.error(f"File save/process error: {e}")
         await update.message.reply_text(f"文件 {safe_text(doc_name)} 已收到，但保存或转交模型失败。")
 
+
+def _extract_rich_message_text(msg):
+    """Extract plain text from rich_message.blocks (Telegram rich text format).
+
+    Rich text messages store content in a structured blocks format:
+    {"blocks": [{"type": "paragraph", "text": ["plain", {"type": "bold", "text": "bold"}, "more"]}]}
+    This function concatenates all text parts and joins paragraphs with newlines.
+    """
+    # Check api_kwargs for rich_message
+    extra = getattr(msg, 'api_kwargs', None) or {}
+    rich = extra.get('rich_message')
+    if not rich or not isinstance(rich, dict):
+        # Also check msg_dict (to_dict result)
+        try:
+            msg_dict = msg.to_dict() if hasattr(msg, 'to_dict') else {}
+            rich = msg_dict.get('rich_message')
+        except Exception:
+            msg_dict = {}
+            rich = None
+    if not rich or not isinstance(rich, dict):
+        return ""
+    blocks = rich.get('blocks')
+    if not blocks or not isinstance(blocks, list):
+        return ""
+    paragraphs = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        text_parts = block.get('text')
+        if not text_parts or not isinstance(text_parts, list):
+            continue
+        parts = []
+        for part in text_parts:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                t = part.get('text')
+                if t and isinstance(t, str):
+                    parts.append(t)
+        if parts:
+            paragraphs.append(''.join(parts))
+    return '\n'.join(paragraphs)
+
+
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
         return
@@ -10736,6 +10780,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 logger.warning("handle_text_message: forwardMessage returned but no text/caption found")
         except Exception as e:
             logger.warning(f"handle_text_message: forwardMessage fallback failed: {e}")
+
+    # 富文本消息：text 在 rich_message.blocks 结构里，不在 text 字段
+    if not text:
+        text = _extract_rich_message_text(update.message).strip()
+        if text:
+            logger.warning(f"handle_text_message: extracted via rich_message.blocks, len={len(text)}: {text[:200]}")
 
     # 仍然没有文字：不是文字消息（如转发的语音/视频/位置等），交给 handle_other_message
     if not text:
@@ -12634,6 +12684,12 @@ async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if not extracted_text:
         extracted_text = (msg_dict.get('text') or msg_dict.get('caption') or "").strip()
+
+    # 富文本消息：text 在 rich_message.blocks 结构里
+    if not extracted_text:
+        extracted_text = _extract_rich_message_text(msg).strip()
+        if extracted_text:
+            logger.warning(f"handle_other_message: extracted via rich_message.blocks, len={len(extracted_text)}: {extracted_text[:200]}")
 
     if not extracted_text:
         # 深度搜索：遍历 api_kwargs 的所有键值，找最长的字符串（最可能是消息正文）
