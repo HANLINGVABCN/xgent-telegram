@@ -12540,34 +12540,88 @@ async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYP
     await UserDataManager.init()
     msg = update.message
 
-    # 完整原始字典写入日志（仅日志，不发给用户）
+    # 完整原始字典和 api_kwargs 写入日志
     try:
         msg_dict = msg.to_dict() if hasattr(msg, 'to_dict') else {}
         logger.warning(f"handle_other_message raw dict: {msg_dict}")
+        extra = getattr(msg, 'api_kwargs', None) or {}
+        if extra:
+            logger.warning(f"handle_other_message api_kwargs keys: {list(extra.keys())}")
+            for k, v in extra.items():
+                if isinstance(v, str) and len(v) > 3:
+                    logger.warning(f"handle_other_message api_kwargs['{k}'] = {v[:200]}")
     except Exception:
         msg_dict = {}
 
-    # 兜底：从所有可能含文字的字段中提取
+    # 尝试从所有可能含文字的字段中提取
     extracted_text = (msg.text or msg.caption or "").strip()
 
     if not extracted_text:
-        # python-telegram-bot 有时会把未解析的原始字段放在 api_kwargs 里
         extra = getattr(msg, 'api_kwargs', None) or {}
         extracted_text = (extra.get('text') or extra.get('caption') or "").strip()
 
     if not extracted_text:
-        # 也检查 to_dict() 输出中是否有 text/caption
         extracted_text = (msg_dict.get('text') or msg_dict.get('caption') or "").strip()
 
     if not extracted_text:
-        pm = getattr(msg, 'pinned_message', None)
-        if pm:
-            extracted_text = (getattr(pm, 'text', None) or getattr(pm, 'caption', None) or "").strip()
+        # 深度搜索：遍历 api_kwargs 的所有键值
+        extra = getattr(msg, 'api_kwargs', None) or {}
+        _SKIP_KEYS = {'date', 'message_id', 'chat_id', 'from_user_id', 'update_id',
+                       'id', 'file_id', 'file_unique_id', 'mime_type', 'file_size',
+                       'width', 'height', 'duration', 'is_bot', 'language_code',
+                       'username', 'phone_number', 'color', 'type',
+                       'is_topic_message', 'is_automatic_forward',
+                       'has_protected_content', 'message_thread_id',
+                       'chat', 'from', 'from_user', 'forward_origin',
+                       'forward_from', 'forward_from_chat', 'forward_date',
+                       'sender_chat', 'sender_user', 'entities',
+                       'caption_entities', 'new_chat_members',
+                       'new_chat_photo', 'left_chat_member',
+                       'photo', 'reply_to_message', 'pinned_message',
+                       'via_bot', 'author'}
+        for k, v in extra.items():
+            if k in _SKIP_KEYS:
+                continue
+            if isinstance(v, str) and len(v) > 10:
+                extracted_text = v
+                logger.warning(f"handle_other_message: extracted from api_kwargs['{k}']")
+                break
 
     if not extracted_text:
-        rm = getattr(msg, 'reply_to_message', None)
-        if rm:
-            extracted_text = (getattr(rm, 'text', None) or getattr(rm, 'caption', None) or "").strip()
+        # 递归深度搜索 to_dict() 的所有值
+        def _deep_search(obj, depth=0):
+            if depth > 5:
+                return None
+            if isinstance(obj, str) and len(obj) > 10:
+                return obj
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k in _SKIP_KEYS:
+                        continue
+                    result = _deep_search(v, depth + 1)
+                    if result:
+                        return result
+            if isinstance(obj, list):
+                for item in obj:
+                    result = _deep_search(item, depth + 1)
+                    if result:
+                        return result
+            return None
+
+        found = _deep_search(msg_dict)
+        if found:
+            extracted_text = found
+            logger.warning(f"handle_other_message: extracted via deep search: {found[:200]}")
+
+    if not extracted_text:
+        # 检查嵌套消息
+        for nested_key in ('pinned_message', 'reply_to_message'):
+            nested = getattr(msg, nested_key, None)
+            if nested:
+                nested_text = (getattr(nested, 'text', None) or getattr(nested, 'caption', None) or "").strip()
+                if nested_text:
+                    extracted_text = nested_text
+                    break
 
     if extracted_text:
         forward_prefix = build_forward_origin_prefix(msg)
@@ -12579,13 +12633,24 @@ async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await handle_normal_text_conversation(update, context, extracted_text)
         return
 
-    # 确实没有文字内容，简洁提示
-    await GlobalRecorder.record_user_message(
-        "[其他类型消息]",
-        MessageType.USER_TEXT,
-        update.effective_chat.id
-    )
-    await msg.reply_text("已收到该类型消息。目前建议发送文字或文件。")
+    # 无法提取文字内容
+    forward_prefix = build_forward_origin_prefix(msg)
+    if forward_prefix:
+        # 转发消息但无法提取文字：仍然送入对话流程，让 AI 自然回复
+        conv_text = f"{forward_prefix}（此消息未包含可读取的文字内容）"
+        if _conversation_processing_lock.locked():
+            await msg.reply_text("⏳ 系统仍在处理上一个请求... 请稍后再发送新请求。")
+            return
+        await GlobalRecorder.record_user_message(conv_text, MessageType.USER_TEXT, update.effective_chat.id)
+        await process_conversation(update, context, conv_text)
+    else:
+        # 非转发消息，确实没有文字内容
+        await GlobalRecorder.record_user_message(
+            "[其他类型消息]",
+            MessageType.USER_TEXT,
+            update.effective_chat.id
+        )
+        await msg.reply_text("已收到该类型消息。目前建议发送文字或文件。")
 
 # --- ☆ 错误处理 ☆ ---
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
