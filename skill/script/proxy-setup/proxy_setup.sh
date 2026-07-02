@@ -77,7 +77,7 @@ DOMAIN=""
 UUID=""
 PASSWORD=""
 OBFS_PASSWORD=""
-SNI="www.microsoft.com"
+SNI="www.bing.com"
 PRIVATE_KEY=""
 PUBLIC_KEY=""
 SHORT_ID=""
@@ -1424,7 +1424,7 @@ collect_info() {
     fi
 
     # Reality SNI
-    [ "$PROTOCOL" = "reality" ] && { ui_read "Reality 伪装 SNI [www.microsoft.com]: " tmp; SNI="${tmp:-www.microsoft.com}"; }
+    [ "$PROTOCOL" = "reality" ] && { ui_read "Reality 伪装 SNI [www.bing.com]: " tmp; SNI="${tmp:-www.bing.com}"; }
 
     # 双节点端口
     if [ "$OUTBOUND_MODE" = "dual" ]; then
@@ -1895,7 +1895,7 @@ generate_free_multi_config() {
                 current_private_key="$PRIVATE_KEY"
                 current_public_key="$PUBLIC_KEY"
                 current_short_id="$SHORT_ID"
-                SNI="www.microsoft.com"
+                SNI="www.bing.com"
                 ;;
             hysteria2)
                 gen_self_signed_cert
@@ -2413,7 +2413,7 @@ EOF
         # 设置协议特定变量
         local proto_clean="${proto%-warp}"
         case "$proto_clean" in
-            reality) SNI="www.microsoft.com" ;;
+            reality) SNI="www.bing.com" ;;
             vless-ws|vmess-ws) ;; # DOMAIN已恢复
             *) ;;
         esac
@@ -2426,7 +2426,7 @@ EOF
             tuic) proto_display="TUIC" ;;
             vless-ws) proto_display="VLESS-WS" ;;
             vmess-ws) proto_display="VMess-WS" ;;
-            reality-warp) proto_display="Reality-WARP"; SNI="www.microsoft.com" ;;
+            reality-warp) proto_display="Reality-WARP"; SNI="www.bing.com" ;;
         esac
 
         local node_name="${NODE_NAME}-${proto_display}"
@@ -2485,7 +2485,7 @@ generate_free_multi_clash_config() {
             tuic) proto_display="TUIC" ;;
             vless-ws) proto_display="VLESS-WS" ;;
             vmess-ws) proto_display="VMess-WS" ;;
-            reality-warp) proto_display="Reality-WARP"; SNI="www.microsoft.com" ;;
+            reality-warp) proto_display="Reality-WARP"; SNI="www.bing.com" ;;
         esac
 
         local node_name="${NODE_NAME}-${proto_display}"
@@ -2495,7 +2495,7 @@ generate_free_multi_clash_config() {
         # 生成proxy配置
         case "$proto" in
             reality|reality-warp)
-                SNI="www.microsoft.com"
+                SNI="www.bing.com"
                 [ $i -gt 0 ] && proxies_yaml+=$'\n'
                 proxies_yaml+="  - name: ${node_name}
     type: vless
