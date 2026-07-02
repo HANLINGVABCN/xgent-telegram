@@ -1606,10 +1606,6 @@ gen_inbound_reality() {
           "private_key": "$PRIVATE_KEY",
           "short_id": ["$SHORT_ID"]
         }
-      },
-      "multiplex": {
-        "enabled": true,
-        "padding": true
       }
     }
 EOREAL
@@ -1622,8 +1618,6 @@ gen_inbound_hysteria2() {
       "tag": "$t",
       "listen": "0.0.0.0",
       "listen_port": $p,
-      "up_mbps": 1000,
-      "down_mbps": 1000,
       "ignore_client_bandwidth": true,
       "obfs": {
         "type": "salamander",
@@ -2867,7 +2861,13 @@ do_full_install() {
     generate_config
     /usr/local/bin/sing-box check -c "$CONFIG_FILE" || { red "配置校验失败"; cat "$CONFIG_FILE"; exit 1; }
     setup_service
-    open_firewall "${INTERNAL_PORT:-$SERVER_PORT}"
+    if [ "$PROTOCOL" = "free-multi" ] && [ ${#MULTI_PORTS[@]} -gt 0 ]; then
+        for port in "${MULTI_PORTS[@]}"; do
+            open_firewall "$port"
+        done
+    else
+        open_firewall "${INTERNAL_PORT:-$SERVER_PORT}"
+    fi
     [ "$OUTBOUND_MODE" = "dual" ] && open_firewall "$WARP_PORT"
     output_all
 }
