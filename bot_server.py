@@ -4608,7 +4608,10 @@ class ModelClient:
                 else:
                     model_id = str(m)
                 if model_id and 'embedding' not in str(model_id).lower() and 'audio' not in str(model_id).lower():
-                    model_ids.append(str(model_id).split('/')[-1])
+                    model_id_str = str(model_id)
+                    if model_id_str.startswith("models/"):
+                        model_id_str = model_id_str[len("models/"):]
+                    model_ids.append(model_id_str)
             return sorted(model_ids)
         except Exception as e:
             logger.error(f"OpenAI compatible fetch error: {format_provider_exception(e)}")
