@@ -1454,20 +1454,42 @@ class UserDataManager:
         """重新加载providers"""
         cls._data['providers'] = await cls._require_db().get_providers()
 
+# --- ☆ API Key 轮询（多 Key 支持）☆ ---
+# 每个 provider 维护一个轮询计数器，按逗号分隔的多个 key 依次轮询调用。
+_api_key_counters: Dict[str, int] = {}
+
+def get_next_api_key(prov_name: str, api_key_field: str) -> str:
+    """从可能包含多个逗号分隔 key 的字段中取出下一个 key（轮询）。
+
+    支持填写多个 API Key，用英文逗号隔开，忽略所有空格。
+    单个 Key 时直接返回；多个 Key 时按轮询方式依次取出。
+    """
+    keys = [k for k in api_key_field.replace(' ', '').split(',') if k]
+    if not keys:
+        return api_key_field
+    if len(keys) == 1:
+        return keys[0]
+    idx = _api_key_counters.get(prov_name, 0) % len(keys)
+    _api_key_counters[prov_name] = (idx + 1) % len(keys)
+    return keys[idx]
+
 # --- ☆ OpenAI 客户端管理 ☆ ---
 class PortalManager:
     _portals = {}
-    
+
     @classmethod
     def get_portal(cls, provider_name: str, api_key: str, base_url: str) -> AsyncOpenAI:
         read_timeout = normalize_stream_timeout(UserDataManager.get('stream_timeout', 0))
         read_timeout_value = None if read_timeout <= 0 else read_timeout
         config_hash = f"{base_url}|{api_key}|read_timeout={read_timeout_value}"
-        if provider_name in cls._portals:
-            cached = cls._portals[provider_name]
-            if cached['hash'] == config_hash: 
+        # 以 provider|api_key 作为缓存键，使多 Key 轮询时每个 Key 都有独立缓存，
+        # 避免每次轮询都重建客户端。
+        cache_key = f"{provider_name}|{api_key}"
+        if cache_key in cls._portals:
+            cached = cls._portals[cache_key]
+            if cached['hash'] == config_hash:
                 return cached['client']
-        
+
         import httpx
         client_timeout = httpx.Timeout(connect=20.0, read=read_timeout_value, write=60.0, pool=60.0)
         http_client = httpx.AsyncClient(
@@ -1483,20 +1505,24 @@ class PortalManager:
             default_headers=PROVIDER_HTTP_HEADERS,
             http_client=http_client,
         )
-        cls._portals[provider_name] = {'client': new_client, 'hash': config_hash}
+        cls._portals[cache_key] = {'client': new_client, 'hash': config_hash}
         return new_client
-    
+
     @classmethod
     def remove_portal(cls, provider_name: str):
-        """移除Provider的客户端，释放资源"""
-        entry = cls._portals.pop(provider_name, None)
-        if entry:
-            client = entry.get('client')
-            if client and hasattr(client, '_client') and hasattr(client._client, 'aclose'):
-                try:
-                    asyncio.get_event_loop().create_task(client._client.aclose())
-                except RuntimeError:
-                    pass
+        """移除Provider的所有客户端（含多 Key 轮询缓存），释放资源"""
+        prefix = f"{provider_name}|"
+        keys_to_remove = [k for k in cls._portals if k.startswith(prefix) or k == provider_name]
+        for key in keys_to_remove:
+            entry = cls._portals.pop(key, None)
+            if entry:
+                client = entry.get('client')
+                if client and hasattr(client, '_client') and hasattr(client._client, 'aclose'):
+                    try:
+                        asyncio.get_event_loop().create_task(client._client.aclose())
+                    except RuntimeError:
+                        pass
+        _api_key_counters.pop(provider_name, None)
 
 def build_read_file_context_text(notice: str, mime_type: str, filename: str) -> str:
     return (
@@ -6404,7 +6430,7 @@ async def generate_media_with_provider(provider_name: str, provider_data: Dict[s
         response, error = await asyncio.wait_for(
             ModelClient.think_and_reply(
                 provider_name,
-                str(provider_data.get('api_key', '')),
+                get_next_api_key(provider_name, str(provider_data.get('api_key', ''))),
                 str(provider_data.get('base_url', '')),
                 model_name,
                 "",
@@ -8417,7 +8443,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
         )
 
         stream_iter = ModelClient.think_and_reply_stream(
-            prov_name, prov_data['api_key'], prov_data['base_url'],
+            prov_name, get_next_api_key(prov_name, prov_data['api_key']), prov_data['base_url'],
             model, system_prompt, history,
             api_format=prov_data.get('api_format', 'openai'),
             usage_sink=usage_sink,
@@ -8629,7 +8655,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
         )
 
         response_task = asyncio.create_task(ModelClient.think_and_reply(
-            prov_name, prov_data['api_key'], prov_data['base_url'],
+            prov_name, get_next_api_key(prov_name, prov_data['api_key']), prov_data['base_url'],
             model, system_prompt, history,
             api_format=prov_data.get('api_format', 'openai'),
             usage_sink=usage_sink,
@@ -10215,7 +10241,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif data.startswith("edit_pkey_"):
             UserDataManager.set('editing_provider', data.split("_", 2)[2])
             UserDataManager.set('state', BotState.EDIT_PROV_KEY)
-            await query.message.reply_text("🔑 请发送新的 Key  (或 'cancel'):")
+            await query.message.reply_text("🔑 请发送新的 Key  (或 'cancel')\n💡 支持多个 Key，用英文逗号隔开即可轮询调用，空格会被忽略。")
         
         elif data.startswith("edit_purl_"):
             UserDataManager.set('editing_provider', data.split("_", 2)[2])
@@ -11196,7 +11222,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"接口模式: <b>{safe_text(get_provider_mode_label(api_format, text))}</b>\n"
             f"Base URL: <code>{safe_text(text)}</code>\n"
             f"请求形式: <code>{safe_text(get_provider_request_hint(api_format, text))}</code>\n\n"
-            f"{safe_text(get_provider_key_hint(api_format, text))}",
+            f"{safe_text(get_provider_key_hint(api_format, text))}\n\n"
+            f"💡 支持填写多个 Key，用英文逗号 <code>,</code> 隔开即可轮询调用，空格会被自动忽略。",
             parse_mode=constants.ParseMode.HTML
         )
         return
@@ -11205,6 +11232,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         name = UserDataManager.get('temp_prov_name')
         url = UserDataManager.get('temp_prov_url')
         api_format = UserDataManager.get('temp_prov_format', 'openai')
+        # 支持多个 Key（英文逗号分隔），忽略所有空格
+        text = text.replace(' ', '')
         providers = UserDataManager.get('providers', {})
         providers[name] = {'base_url': url, 'api_key': text, 'models': [], 'api_format': api_format}
         db = await BotMemoryDB.get_instance()
@@ -11226,6 +11255,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     if state == BotState.EDIT_PROV_KEY:
         p = UserDataManager.get('editing_provider')
+        # 支持多个 Key（英文逗号分隔），忽略所有空格
+        text = text.replace(' ', '')
         providers = UserDataManager.get('providers', {})
         if p and p in providers:
             providers[p]['api_key'] = text
@@ -11239,6 +11270,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 api_format=prov.get('api_format', 'openai')
             )
             await GlobalRecorder.record_system_op(f"更新Provider API Key: {p}")
+            # 清理旧 Key 的客户端缓存并重置轮询计数器
+            PortalManager.remove_portal(p)
         UserDataManager.set('state', BotState.IDLE)
         await update.message.reply_text(
             "✅ 新的 Key 已更新。",
@@ -12524,7 +12557,7 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
         
         # 生成提醒消息
         response, error = await ModelClient.think_and_reply(
-            prov_name, prov_data['api_key'], prov_data['base_url'],
+            prov_name, get_next_api_key(prov_name, prov_data['api_key']), prov_data['base_url'],
             model, idle_prompt, global_history,
             api_format=prov_data.get('api_format', 'openai')
         )

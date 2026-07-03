@@ -16,8 +16,8 @@ skill/script/proxy-setup/proxy_setup.sh
 
 - 安装并配置 `sing-box`。
 - 支持 NAT 小鸡、低配 VPS、标准 VPS 三种机器类型。
-- 支持 VLESS + Reality、Shadowsocks 2022、Hysteria2、TUIC v5、VLESS + WS + TLS、VMess + WS + TLS。
-- **新增自由全协议模式**：一次性部署多个协议（最多7个节点：6种直连 + 1个WARP），每个协议单独询问是否安装。
+- 支持 VLESS + Reality、Shadowsocks 2022、Hysteria2、TUIC v5、VLESS + WS + TLS、VMess + WS + TLS、SOCKS5。
+- **新增自由全协议模式**：一次性部署多个协议（最多8个节点：7种直连 + 1个WARP），每个协议单独询问是否安装。
 - 支持直连出站、WARP 出站、双节点模式。
 - WARP 出站支持两种方式：
   - **WireGuard 直连（推荐）**：sing-box 原生 WireGuard 出站，无需安装 warp-cli，自动通过 WARP API 注册并获取密钥。
@@ -88,20 +88,21 @@ ss -lntup | grep sing-box
 4) TUIC v5
 5) VLESS + WS + TLS
 6) VMess + WS + TLS
-7) 自由全协议模式  ← 新增：一次性部署多个协议
+7) SOCKS5
+8) 自由全协议模式  ← 新增：一次性部署多个协议
 ```
 
-**如果选择 1-6 单个协议**，继续出站模式选择：
+**如果选择 1-7 单个协议**，继续出站模式选择：
 
 ```text
 1) 直连出站        ← 不需要 WARP
 3) 双节点模式      ← 推荐，同时生成直连和 WARP 节点
 ```
 
-**如果选择 7 自由全协议模式**，会跳过出站模式选择，直接进入协议选择流程：
+**如果选择 8 自由全协议模式**，会跳过出站模式选择，直接进入协议选择流程：
 
 - 逐个询问每个协议是否安装（y/n，默认 y）
-- 6种直连协议：Reality、SS2022、Hysteria2、TUIC、VLESS-WS、VMess-WS
+- 7种直连协议：Reality、SS2022、Hysteria2、TUIC、VLESS-WS、VMess-WS、SOCKS5
 - 1个WARP节点（使用VLESS+Reality协议，出站走WARP）
 - 需要域名的协议（VLESS-WS、VMess-WS）可以输入域名或输入 `skip` 跳过
 - 自动递增端口号（起始端口、起始+1、起始+2...）
@@ -125,7 +126,7 @@ ss -lntup | grep sing-box
 
 **多协议自由组合（新增）：**
 ```text
-主菜单 1 -> 机器类型 3 -> 协议 7 -> 逐个选择要安装的协议 -> WARP 方式 1 (WireGuard)
+主菜单 1 -> 机器类型 3 -> 协议 8 -> 逐个选择要安装的协议 -> WARP 方式 1 (WireGuard)
 ```
 
 ### 传统 SOCKS5 流程（备选）
@@ -136,17 +137,17 @@ ss -lntup | grep sing-box
 主菜单 5 -> WARP 菜单 1 (免费注册) -> 返回主菜单 -> 主菜单 1 -> ... -> WARP 方式 2 (SOCKS5)
 ```
 
-## 自由全协议模式（第7个选项）
+## 自由全协议模式（第8个选项）
 
-自由全协议模式允许一次性部署多个协议节点，最多7个：
+自由全协议模式允许一次性部署多个协议节点，最多8个：
 
-- **6种直连协议**：Reality、SS2022、Hysteria2、TUIC、VLESS-WS、VMess-WS
+- **7种直连协议**：Reality、SS2022、Hysteria2、TUIC、VLESS-WS、VMess-WS、SOCKS5
 - **1个WARP节点**：使用VLESS+Reality协议，出站走WARP
 
 ### 使用流程
 
 1. 选择机器类型（标准VPS或低配VPS）
-2. 选择协议：`7) 自由全协议模式`
+2. 选择协议：`8) 自由全协议模式`
 3. 输入节点名称和起始端口（默认443）
 4. 逐个询问每个协议是否安装：
    - VLESS + Reality：`y/n` [默认y]
@@ -155,6 +156,7 @@ ss -lntup | grep sing-box
    - TUIC v5：`y/n` [默认y]
    - VLESS + WS + TLS：`y/n` [默认y]，需要域名或输入 `skip` 跳过
    - VMess + WS + TLS：`y/n` [默认y]，需要域名或输入 `skip` 跳过
+   - SOCKS5：`y/n` [默认y]
    - WARP节点（VLESS+Reality）：`y/n` [默认y]，选择WireGuard或SOCKS5模式
 
 ### 特点
@@ -180,7 +182,7 @@ ss -lntup | grep sing-box
 
 ### 注意事项
 
-- NAT小鸡不支持此模式
+- NAT 小鸡支持 Reality、SS2022、SOCKS5 三种协议；自由全协议模式需标准/低配 VPS
 - 需要域名的协议如果跳过，该协议不会安装
 - 建议至少安装3-4个协议
 - 所有协议共用同一个sing-box配置文件
