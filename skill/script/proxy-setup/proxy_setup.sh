@@ -77,12 +77,13 @@ DOMAIN=""
 UUID=""
 PASSWORD=""
 OBFS_PASSWORD=""
-SNI="www.microsoft.com"
+SNI="www.bing.com"
 PRIVATE_KEY=""
 PUBLIC_KEY=""
 SHORT_ID=""
 TLS_CERT=""
 TLS_KEY=""
+SOCKS5_USER="user"
 WARP_SOCKS_PORT=40000
 DIRECT_PORT=""
 WARP_PORT=""
@@ -1296,8 +1297,11 @@ select_protocol() {
    - 走 CDN，中转稳定，需要域名
 6) VMess + WS + TLS
    - 兼容老客户端，需要域名
-7) 自由全协议模式
-   - 6种直连协议 + 1个WARP节点 = 7个节点
+7) SOCKS5
+   - 最通用的代理协议，支持用户名/密码认证
+   - 兼容几乎所有客户端和工具
+8) 自由全协议模式
+   - 7种直连协议 + 1个WARP节点 = 8个节点
    - 每个协议单独询问是否安装，需要域名的协议可跳过
 
 0) 返回上一步
@@ -1309,9 +1313,11 @@ EOF
    - 抗封锁最强，不需要域名，优先推荐
 2) Shadowsocks 2022
    - 配置最简单，兼容性好
+3) SOCKS5
+   - 最通用的代理协议，支持用户名/密码认证
 
 提示:
-   - NAT 小鸡当前只支持 1) 和 2)
+   - NAT 小鸡支持 1)、2) 和 3)
 
 0) 返回上一步
    - 回到机器类型选择
@@ -1326,7 +1332,8 @@ EOF
             4) [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ] && { PROTOCOL="tuic"; return 0; } || red "当前模式不可用" ;;
             5) [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ] && { PROTOCOL="vless-ws"; return 0; } || red "当前模式不可用" ;;
             6) [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ] && { PROTOCOL="vmess-ws"; return 0; } || red "当前模式不可用" ;;
-            7) [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ] && { PROTOCOL="free-multi"; return 0; } || red "当前模式不可用" ;;
+            7) PROTOCOL="socks5"; return 0 ;;
+            8) [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ] && { PROTOCOL="free-multi"; return 0; } || red "当前模式不可用" ;;
             0) return 1 ;;
             *) red "无效选择" ;;
         esac
@@ -1396,13 +1403,17 @@ collect_info() {
 
     if [ "$MACHINE_MODE" = "nat" ]; then
         yellow "NAT小鸡没有独立公网IP，填面板映射页面显示的公网IP"
+        local nat_default_port=443
+        [ "$PROTOCOL" = "ss2022" ] && nat_default_port=8388
+        [ "$PROTOCOL" = "socks5" ] && nat_default_port=1080
         ui_read "面板映射公网IP [$SERVER_IP]: " tmp; SERVER_IP="${tmp:-$SERVER_IP}"
-        ui_read "内部监听端口 [443]: " tmp; INTERNAL_PORT="${tmp:-443}"
-        ui_read "外部映射端口 [443]: " tmp; SERVER_PORT="${tmp:-443}"
+        ui_read "内部监听端口 [$nat_default_port]: " tmp; INTERNAL_PORT="${tmp:-$nat_default_port}"
+        ui_read "外部映射端口 [$nat_default_port]: " tmp; SERVER_PORT="${tmp:-$nat_default_port}"
     else
         ui_read "服务器公网IP [$SERVER_IP]: " tmp; SERVER_IP="${tmp:-$SERVER_IP}"
         case "$PROTOCOL" in
             ss2022) ui_read "监听端口 [8388]: " tmp; SERVER_PORT="${tmp:-8388}" ;;
+            socks5) ui_read "监听端口 [1080]: " tmp; SERVER_PORT="${tmp:-1080}" ;;
             free-multi) ui_read "起始端口 [443]: " tmp; SERVER_PORT="${tmp:-443}" ;;
             *)      ui_read "监听端口 [443]: " tmp;  SERVER_PORT="${tmp:-443}" ;;
         esac
@@ -1424,7 +1435,7 @@ collect_info() {
     fi
 
     # Reality SNI
-    [ "$PROTOCOL" = "reality" ] && { ui_read "Reality 伪装 SNI [www.microsoft.com]: " tmp; SNI="${tmp:-www.microsoft.com}"; }
+    [ "$PROTOCOL" = "reality" ] && { ui_read "Reality 伪装 SNI [www.bing.com]: " tmp; SNI="${tmp:-www.bing.com}"; }
 
     # 双节点端口
     if [ "$OUTBOUND_MODE" = "dual" ]; then
@@ -1477,7 +1488,7 @@ collect_free_multi_protocols() {
     local current_port=$SERVER_PORT
 
     cat <<'EOF' | ui_box "自由全协议模式" "$Y"
-将逐个询问6种直连协议 + 1个WARP节点
+将逐个询问7种直连协议 + 1个WARP节点
 每个协议可选择安装(y)或跳过(n)，默认y
 需要域名的协议可以输入域名或输入skip跳过
 EOF
@@ -1548,7 +1559,16 @@ EOF
         fi
     fi
 
-    # 7. WARP (使用VLESS+Reality协议)
+    # 7. SOCKS5
+    ui_read "安装 SOCKS5? (y/n) [y]: " tmp
+    if [ "${tmp:-y}" = "y" ]; then
+        MULTI_PROTOCOLS+=("socks5")
+        MULTI_PORTS+=("$current_port")
+        MULTI_DOMAINS+=("")
+        current_port=$((current_port + 1))
+    fi
+
+    # 8. WARP (使用VLESS+Reality协议)
     ui_read "安装 WARP节点 (VLESS+Reality)? (y/n) [y]: " tmp
     if [ "${tmp:-y}" = "y" ]; then
         MULTI_PROTOCOLS+=("reality-warp")
@@ -1606,10 +1626,6 @@ gen_inbound_reality() {
           "private_key": "$PRIVATE_KEY",
           "short_id": ["$SHORT_ID"]
         }
-      },
-      "multiplex": {
-        "enabled": true,
-        "padding": true
       }
     }
 EOREAL
@@ -1622,8 +1638,6 @@ gen_inbound_hysteria2() {
       "tag": "$t",
       "listen": "0.0.0.0",
       "listen_port": $p,
-      "up_mbps": 1000,
-      "down_mbps": 1000,
       "ignore_client_bandwidth": true,
       "obfs": {
         "type": "salamander",
@@ -1664,6 +1678,7 @@ EOTUIC
 gen_inbound_ss2022()    { local p=$1 t=$2; local k=$(echo "$PASSWORD"|sed 's/^2022-blake3-aes-256-gcm://'); echo '    { "type":"shadowsocks","tag":"'$t'","listen":"0.0.0.0","listen_port":'$p',"method":"2022-blake3-aes-256-gcm","password":"'$k'"}'; }
 gen_inbound_vless_ws()  { local p=$1 t=$2; local wp=$(cat "$WORK_DIR/ws_path.txt" 2>/dev/null); echo '    { "type":"vless","tag":"'$t'","listen":"0.0.0.0","listen_port":'$p',"users":[{"uuid":"'$UUID'"}],"transport":{"type":"ws","path":"'$wp'"},"tls":{"enabled":true,"server_name":"'$DOMAIN'","acme":{"domain":["'$DOMAIN'"],"email":"admin@'$DOMAIN'"}}}'; }
 gen_inbound_vmess_ws()  { local p=$1 t=$2; local wp=$(cat "$WORK_DIR/ws_path.txt" 2>/dev/null); echo '    { "type":"vmess","tag":"'$t'","listen":"0.0.0.0","listen_port":'$p',"users":[{"uuid":"'$UUID'","alterId":0}],"transport":{"type":"ws","path":"'$wp'"},"tls":{"enabled":true,"server_name":"'$DOMAIN'","acme":{"domain":["'$DOMAIN'"],"email":"admin@'$DOMAIN'"}}}'; }
+gen_inbound_socks5()    { local p=$1 t=$2; echo '    { "type":"socks","tag":"'$t'","listen":"0.0.0.0","listen_port":'$p',"users":[{"username":"'$SOCKS5_USER'","password":"'$PASSWORD'"}]}'; }
 
 gen_inbound() {
     local p=$1 t=$2
@@ -1674,6 +1689,7 @@ gen_inbound() {
         ss2022)    gen_inbound_ss2022 "$p" "$t" ;;
         vless-ws)  gen_inbound_vless_ws "$p" "$t" ;;
         vmess-ws)  gen_inbound_vmess_ws "$p" "$t" ;;
+        socks5)    gen_inbound_socks5 "$p" "$t" ;;
     esac
 }
 
@@ -1755,6 +1771,8 @@ generate_config() {
     if [ "$PROTOCOL" = "ss2022" ]; then
         PASSWORD="2022-blake3-aes-256-gcm:$(openssl rand -base64 32)"
     fi
+    # SOCKS5: gen_password 已在 do_full_install 中调用，这里只需确保用户名
+    [ "$PROTOCOL" = "socks5" ] && SOCKS5_USER="user"
     trace_resume
     [ "$PROTOCOL" = "vless-ws" ] && echo "/ws-$(openssl rand -hex 4)" > "$WORK_DIR/ws_path.txt"
     [ "$PROTOCOL" = "vmess-ws" ] && echo "/vmws-$(openssl rand -hex 4)" > "$WORK_DIR/ws_path.txt"
@@ -1901,7 +1919,7 @@ generate_free_multi_config() {
                 current_private_key="$PRIVATE_KEY"
                 current_public_key="$PUBLIC_KEY"
                 current_short_id="$SHORT_ID"
-                SNI="www.microsoft.com"
+                SNI="www.bing.com"
                 ;;
             hysteria2)
                 gen_self_signed_cert
@@ -1920,6 +1938,9 @@ generate_free_multi_config() {
                 ;;
             ss2022)
                 current_password="2022-blake3-aes-256-gcm:$(openssl rand -base64 32)"
+                ;;
+            socks5)
+                current_password="$(openssl rand -base64 16)"
                 ;;
             vless-ws)
                 current_domain="$domain"
@@ -1953,6 +1974,7 @@ generate_free_multi_config() {
         OBFS_PASSWORD="$current_obfs_password"
         TLS_CERT="$current_tls_cert"
         TLS_KEY="$current_tls_key"
+        SOCKS5_USER="user"
 
         # 生成inbound（去除reality-warp的-warp后缀）
         local proto_for_gen="${proto%-warp}"
@@ -2043,6 +2065,7 @@ generate_share_link() {
         ss2022)   local E=$(echo -n "$PASSWORD"|base64 -w0 2>/dev/null||echo -n "$PASSWORD"|base64); LINK="ss://${E}@${addr}:${port}#${name}" ;;
         vless-ws) LINK="vless://${UUID}@${srv}:${port}?encryption=none&security=tls&sni=${DOMAIN}&type=ws&host=${DOMAIN}&path=${ws_path}#${name}" ;;
         vmess-ws) local J="{\"v\":\"2\",\"ps\":\"${name}\",\"add\":\"${srv}\",\"port\":\"${port}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"host\":\"${DOMAIN}\",\"path\":\"${ws_path}\",\"tls\":\"tls\",\"sni\":\"${DOMAIN}\"}"; LINK="vmess://$(echo -n "$J"|base64 -w0 2>/dev/null||echo -n "$J"|base64)" ;;
+        socks5)   LINK="socks5://${SOCKS5_USER}:${PASSWORD}@${addr}:${port}#${name}" ;;
     esac
 
     echo "$LINK"
@@ -2073,6 +2096,7 @@ output_node() {
         ss2022)   local E=$(echo -n "$PASSWORD"|base64 -w0 2>/dev/null||echo -n "$PASSWORD"|base64); LINK="ss://${E}@${addr}:${port}#${name}" ;;
         vless-ws) LINK="vless://${UUID}@${srv}:${port}?encryption=none&security=tls&sni=${DOMAIN}&type=ws&host=${DOMAIN}&path=${ws_path}#${name}" ;;
         vmess-ws) local J="{\"v\":\"2\",\"ps\":\"${name}\",\"add\":\"${srv}\",\"port\":\"${port}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"host\":\"${DOMAIN}\",\"path\":\"${ws_path}\",\"tls\":\"tls\",\"sni\":\"${DOMAIN}\"}"; LINK="vmess://$(echo -n "$J"|base64 -w0 2>/dev/null||echo -n "$J"|base64)" ;;
+        socks5)   LINK="socks5://${SOCKS5_USER}:${PASSWORD}@${addr}:${port}#${name}" ;;
     esac
 
     # Clash Meta
@@ -2084,6 +2108,7 @@ output_node() {
         ss2022)   local SP=$(echo "$PASSWORD"|sed 's/^2022-blake3-aes-256-gcm://'); CY="  - name: ${name}\n    type: ss\n    server: ${srv}\n    port: ${port}\n    cipher: 2022-blake3-aes-256-gcm\n    password: ${SP}" ;;
         vless-ws) CY="  - name: ${name}\n    type: vless\n    server: ${srv}\n    port: ${port}\n    uuid: ${UUID}\n    network: ws\n    tls: true\n    servername: ${DOMAIN}\n    ws-opts:\n      path: ${ws_path}\n      headers:\n        Host: ${DOMAIN}" ;;
         vmess-ws) CY="  - name: ${name}\n    type: vmess\n    server: ${srv}\n    port: ${port}\n    uuid: ${UUID}\n    alterId: 0\n    cipher: auto\n    network: ws\n    tls: true\n    servername: ${DOMAIN}\n    ws-opts:\n      path: ${ws_path}\n      headers:\n        Host: ${DOMAIN}" ;;
+        socks5)   CY="  - name: ${name}\n    type: socks5\n    server: ${srv}\n    port: ${port}\n    username: ${SOCKS5_USER}\n    password: ${PASSWORD}\n    udp: true" ;;
     esac
 
     # 打印
@@ -2269,6 +2294,13 @@ EOF
       path: ${ws_path}
       headers:
         Host: ${DOMAIN}" ;;
+            socks5) echo "  - name: ${n}
+    type: socks5
+    server: ${s}
+    port: ${p}
+    username: ${SOCKS5_USER}
+    password: ${PASSWORD}
+    udp: true" ;;
         esac
     }
 
@@ -2419,10 +2451,11 @@ EOF
         # 设置协议特定变量
         local proto_clean="${proto%-warp}"
         case "$proto_clean" in
-            reality) SNI="www.microsoft.com" ;;
+            reality) SNI="www.bing.com" ;;
             vless-ws|vmess-ws) ;; # DOMAIN已恢复
             *) ;;
         esac
+        SOCKS5_USER="user"
 
         local proto_display="${proto}"
         case "$proto" in
@@ -2432,7 +2465,8 @@ EOF
             tuic) proto_display="TUIC" ;;
             vless-ws) proto_display="VLESS-WS" ;;
             vmess-ws) proto_display="VMess-WS" ;;
-            reality-warp) proto_display="Reality-WARP"; SNI="www.microsoft.com" ;;
+            socks5) proto_display="SOCKS5" ;;
+            reality-warp) proto_display="Reality-WARP"; SNI="www.bing.com" ;;
         esac
 
         local node_name="${NODE_NAME}-${proto_display}"
@@ -2491,17 +2525,19 @@ generate_free_multi_clash_config() {
             tuic) proto_display="TUIC" ;;
             vless-ws) proto_display="VLESS-WS" ;;
             vmess-ws) proto_display="VMess-WS" ;;
-            reality-warp) proto_display="Reality-WARP"; SNI="www.microsoft.com" ;;
+            socks5) proto_display="SOCKS5" ;;
+            reality-warp) proto_display="Reality-WARP"; SNI="www.bing.com" ;;
         esac
 
         local node_name="${NODE_NAME}-${proto_display}"
         local srv="$SERVER_IP"
         [[ "$proto" =~ ws$ ]] && srv="$DOMAIN"
+        SOCKS5_USER="user"
 
         # 生成proxy配置
         case "$proto" in
             reality|reality-warp)
-                SNI="www.microsoft.com"
+                SNI="www.bing.com"
                 [ $i -gt 0 ] && proxies_yaml+=$'\n'
                 proxies_yaml+="  - name: ${node_name}
     type: vless
@@ -2586,6 +2622,16 @@ generate_free_multi_clash_config() {
       path: ${ws_path}
       headers:
         Host: ${DOMAIN}"
+                ;;
+            socks5)
+                [ $i -gt 0 ] && proxies_yaml+=$'\n'
+                proxies_yaml+="  - name: ${node_name}
+    type: socks5
+    server: ${srv}
+    port: ${port}
+    username: ${SOCKS5_USER}
+    password: ${PASSWORD}
+    udp: true"
                 ;;
         esac
 
@@ -2867,7 +2913,13 @@ do_full_install() {
     generate_config
     /usr/local/bin/sing-box check -c "$CONFIG_FILE" || { red "配置校验失败"; cat "$CONFIG_FILE"; exit 1; }
     setup_service
-    open_firewall "${INTERNAL_PORT:-$SERVER_PORT}"
+    if [ "$PROTOCOL" = "free-multi" ] && [ ${#MULTI_PORTS[@]} -gt 0 ]; then
+        for port in "${MULTI_PORTS[@]}"; do
+            open_firewall "$port"
+        done
+    else
+        open_firewall "${INTERNAL_PORT:-$SERVER_PORT}"
+    fi
     [ "$OUTBOUND_MODE" = "dual" ] && open_firewall "$WARP_PORT"
     output_all
 }

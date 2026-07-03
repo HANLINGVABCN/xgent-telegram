@@ -69,13 +69,20 @@ get_ip_mode() {
     fi
 
     case "$mode" in
-        ipv4|ipv6)
+        ipv4|ipv6|sock5)
             printf '%s\n' "$mode"
             ;;
         *)
             printf 'default\n'
             ;;
     esac
+}
+
+# 读取 SOCKS5 代理地址（仅当 IP 模式为 sock5 时有效）
+get_socks5_proxy() {
+    if [ -f ".env" ]; then
+        grep -E "^TELEGRAM_AI_BOT_SOCKS5_PROXY=" .env 2>/dev/null | tail -n 1 | cut -d= -f2- || true
+    fi
 }
 
 ip_mode_label() {
@@ -86,30 +93,53 @@ ip_mode_label() {
         ipv6)
             printf '仅 IPv6'
             ;;
+        sock5)
+            printf 'SOCKS5 代理'
+            ;;
         *)
             printf '服务器默认'
             ;;
     esac
 }
 
+# 设置 IP 出站模式。ipv4 / ipv6 / sock5 / default 四选一，互斥。
+# sock5 模式需额外传入代理地址（socks5://[user:pass@]host:port）。
+# 切换到任一模式时，会先清除其它模式的环境变量，确保互斥。
 set_ip_mode() {
     local mode="$1"
+    local socks5_url="${2:-}"
     local tmp_file
 
     case "$mode" in
         ipv4|ipv6)
             tmp_file="$(mktemp)"
             if [ -f ".env" ]; then
-                grep -v "^TELEGRAM_AI_BOT_IP_MODE=" .env > "$tmp_file" || true
+                grep -vE "^(TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env > "$tmp_file" || true
             fi
             printf 'TELEGRAM_AI_BOT_IP_MODE=%s\n' "$mode" >> "$tmp_file"
             mv "$tmp_file" .env
+            chmod 600 .env 2>/dev/null || true
+            ;;
+        sock5)
+            if [ -z "$socks5_url" ]; then
+                error "[错误] SOCKS5 模式需要提供代理地址"
+                exit 1
+            fi
+            tmp_file="$(mktemp)"
+            if [ -f ".env" ]; then
+                grep -vE "^(TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env > "$tmp_file" || true
+            fi
+            printf 'TELEGRAM_AI_BOT_IP_MODE=%s\n' "$mode" >> "$tmp_file"
+            printf 'TELEGRAM_AI_BOT_SOCKS5_PROXY=%s\n' "$socks5_url" >> "$tmp_file"
+            mv "$tmp_file" .env
+            chmod 600 .env 2>/dev/null || true
             ;;
         default)
             if [ -f ".env" ]; then
                 tmp_file="$(mktemp)"
-                grep -v "^TELEGRAM_AI_BOT_IP_MODE=" .env > "$tmp_file" || true
+                grep -vE "^(TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env > "$tmp_file" || true
                 mv "$tmp_file" .env
+                chmod 600 .env 2>/dev/null || true
             fi
             ;;
         *)
@@ -128,16 +158,30 @@ pythonpath_with_project() {
 }
 
 run_bot_python() {
-    local mode pythonpath app_entry
+    local mode pythonpath app_entry socks5_url
     mode="$(get_ip_mode)"
     pythonpath="$(pythonpath_with_project)"
     app_entry="${TELEGRAM_AI_BOT_APP_ENTRY:-$APP_ENTRY}"
 
-    if [ "$mode" = "default" ]; then
-        env -u TELEGRAM_AI_BOT_IP_MODE TELEGRAM_AI_BOT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
-    else
-        env TELEGRAM_AI_BOT_IP_MODE="$mode" TELEGRAM_AI_BOT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
-    fi
+    case "$mode" in
+        default)
+            env -u TELEGRAM_AI_BOT_IP_MODE -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
+                TELEGRAM_AI_BOT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
+            ;;
+        sock5)
+            socks5_url="$(get_socks5_proxy)"
+            if [ -z "$socks5_url" ]; then
+                error "[错误] SOCKS5 模式已启用但未配置代理地址，请在 IP 出站模式中重新设置。"
+                exit 1
+            fi
+            env TELEGRAM_AI_BOT_IP_MODE="$mode" TELEGRAM_AI_BOT_SOCKS5_PROXY="$socks5_url" \
+                TELEGRAM_AI_BOT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
+            ;;
+        *)
+            env TELEGRAM_AI_BOT_IP_MODE="$mode" -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
+                TELEGRAM_AI_BOT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
+            ;;
+    esac
 }
 
 ip_family_restrictor_python() {
@@ -149,6 +193,18 @@ import socket
 _ip_mode = (os.environ.get("TELEGRAM_AI_BOT_IP_MODE") or "").strip().lower()
 _allowed_family = None
 _blocked_family = None
+
+# SOCKS5 代理模式：把代理地址写入标准代理环境变量，让 httpx / OpenAI SDK 自动走代理。
+# 必须在任何 httpx 客户端创建之前完成，因此放在本预加载段执行。
+if _ip_mode in {"sock5", "socks5"}:
+    _socks5_url = (os.environ.get("TELEGRAM_AI_BOT_SOCKS5_PROXY") or "").strip()
+    if _socks5_url:
+        # httpx 读取 HTTPS_PROXY / HTTP_PROXY / ALL_PROXY
+        for _proxy_key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                           "https_proxy", "http_proxy", "all_proxy"):
+            os.environ[_proxy_key] = _socks5_url
+        # 同时让 urllib / requests 系列也走代理
+        os.environ["NO_PROXY"] = os.environ.get("NO_PROXY", "127.0.0.1,localhost")
 
 if _ip_mode in {"ipv4", "4", "only_ipv4", "ipv4_only"}:
     _allowed_family = socket.AF_INET
@@ -223,14 +279,15 @@ configure_ip_mode() {
     local current_label="$(ip_mode_label)"
 
     echo ""
-    echo "当前 IP 限制: $current_label"
-    echo "请选择 IP 出站模式:"
+    echo "当前 IP 出站模式: $current_label"
+    echo "请选择 IP 出站模式 (以下四项互斥，只能同时生效一个):"
     echo "  1) 仅 IPv4 - 禁用 IPv6，Telegram 和 AI 服务等运行期请求只解析/连接 IPv4"
     echo "  2) 仅 IPv6 - 禁用 IPv4，Telegram 和 AI 服务等运行期请求只解析/连接 IPv6"
-    echo "  3) 撤回修改 - 取消限制，恢复服务器默认网络栈"
-    echo "  4) 返回主菜单"
+    echo "  3) SOCKS5 代理 - 所有出站流量走指定的 SOCKS5 代理"
+    echo "  4) 撤回修改 - 取消限制，恢复服务器默认网络栈"
+    echo "  5) 返回主菜单"
     echo ""
-    read -r -p "请输入选项 [1/2/3/4，默认 4]: " choice
+    read -r -p "请输入选项 [1/2/3/4/5，默认 5]: " choice
 
     case "$choice" in
         1)
@@ -242,10 +299,31 @@ configure_ip_mode() {
             success "已设置为仅 IPv6。请重启 Bot 后生效。"
             ;;
         3)
+            local proxy_url=""
+            echo ""
+            echo "SOCKS5 代理地址格式:"
+            echo "  无认证:  socks5://127.0.0.1:1080"
+            echo "  带认证:  socks5://user:pass@127.0.0.1:1080"
+            echo ""
+            read -r -p "请输入 SOCKS5 代理地址: " proxy_url
+            if [ -z "$proxy_url" ]; then
+                warn "未输入代理地址，已取消。"
+                return 1
+            fi
+            if ! echo "$proxy_url" | grep -qE '^socks5://'; then
+                error "[错误] 代理地址必须以 socks5:// 开头"
+                return 1
+            fi
+            set_ip_mode sock5 "$proxy_url"
+            success "已设置为 SOCKS5 代理: $proxy_url"
+            warn "   请确保代理可用，并已安装 httpx[socks] 依赖（requirements.txt 已包含）。"
+            warn "   请重启 Bot 后生效。"
+            ;;
+        4)
             set_ip_mode default
             success "已撤回 IP 限制，恢复服务器默认状态。请重启 Bot 后生效。"
             ;;
-        ""|4)
+        ""|5)
             warn "已返回主菜单。"
             ;;
         *)
@@ -551,12 +629,24 @@ remove_recorded_apt_packages() {
 }
 
 remove_ip_mode_state() {
+    local cleaned=0
     if [ -f "$IP_MODE_FILE" ]; then
         info "[卸载] 正在清理 IP 出站模式设置"
         rm -f "$IP_MODE_FILE"
-        rmdir "$STATE_DIR" 2>/dev/null || true
-        success "IP 出站模式设置已清理"
+        cleaned=1
     fi
+    # 清理 .env 中的 IP 模式和 SOCKS5 代理设置
+    if [ -f ".env" ] && grep -qE "^(TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env 2>/dev/null; then
+        info "[卸载] 正在清理 .env 中的 IP 出站模式 / SOCKS5 代理设置"
+        local tmp_file
+        tmp_file="$(mktemp)"
+        grep -vE "^(TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env > "$tmp_file" || true
+        mv "$tmp_file" .env
+        chmod 600 .env 2>/dev/null || true
+        cleaned=1
+    fi
+    rmdir "$STATE_DIR" 2>/dev/null || true
+    [ "$cleaned" -eq 1 ] && success "IP 出站模式设置已清理"
 }
 
 uninstall_app() {
@@ -1105,7 +1195,7 @@ start_foreground() {
 }
 
 start_background() {
-    local mode pythonpath code
+    local mode pythonpath code socks5_url
 
     info "[运行] 正在后台启动 Telegram AI Bot..."
 
@@ -1128,11 +1218,28 @@ start_background() {
     mode="$(get_ip_mode)"
     pythonpath="$(pythonpath_with_project)"
     code="$(bot_python_code)"
-    if [ "$mode" = "default" ]; then
-        env -u TELEGRAM_AI_BOT_IP_MODE TELEGRAM_AI_BOT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" nohup "$VENV_PYTHON" -c "$code" > bot_output.log 2>&1 &
-    else
-        env TELEGRAM_AI_BOT_IP_MODE="$mode" TELEGRAM_AI_BOT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" nohup "$VENV_PYTHON" -c "$code" > bot_output.log 2>&1 &
-    fi
+    case "$mode" in
+        default)
+            env -u TELEGRAM_AI_BOT_IP_MODE -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
+                TELEGRAM_AI_BOT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" \
+                nohup "$VENV_PYTHON" -c "$code" > bot_output.log 2>&1 &
+            ;;
+        sock5)
+            socks5_url="$(get_socks5_proxy)"
+            if [ -z "$socks5_url" ]; then
+                error "[错误] SOCKS5 模式已启用但未配置代理地址。"
+                exit 1
+            fi
+            env TELEGRAM_AI_BOT_IP_MODE="$mode" TELEGRAM_AI_BOT_SOCKS5_PROXY="$socks5_url" \
+                TELEGRAM_AI_BOT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" \
+                nohup "$VENV_PYTHON" -c "$code" > bot_output.log 2>&1 &
+            ;;
+        *)
+            env TELEGRAM_AI_BOT_IP_MODE="$mode" -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
+                TELEGRAM_AI_BOT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" \
+                nohup "$VENV_PYTHON" -c "$code" > bot_output.log 2>&1 &
+            ;;
+    esac
     local pid=$!
     echo "$pid" > bot.pid
     sleep 2
@@ -1187,10 +1294,11 @@ start_with_pm2() {
 }
 
 restart_pm2_detached() {
-    local helper log_file mode
+    local helper log_file mode socks5_url
     helper="$(mktemp /tmp/${PM2_APP_NAME}-restart.XXXXXX.sh)"
     log_file="/tmp/${PM2_APP_NAME}-restart.log"
     mode="$(get_ip_mode)"
+    [ "$mode" = "sock5" ] && socks5_url="$(get_socks5_proxy)" || socks5_url=""
 
     cat > "$helper" <<EOF
 #!/usr/bin/env bash
@@ -1206,9 +1314,13 @@ set -u
     sleep 1
   fi
 
-  # 设置 IP 模式环境变量
+  # 设置 IP 模式环境变量（ipv4 / ipv6 / sock5 互斥）
+  unset TELEGRAM_AI_BOT_SOCKS5_PROXY || true
   if [ "$mode" = "default" ]; then
     unset TELEGRAM_AI_BOT_IP_MODE || true
+  elif [ "$mode" = "sock5" ]; then
+    export TELEGRAM_AI_BOT_IP_MODE="$mode"
+    export TELEGRAM_AI_BOT_SOCKS5_PROXY="$socks5_url"
   else
     export TELEGRAM_AI_BOT_IP_MODE="$mode"
   fi
