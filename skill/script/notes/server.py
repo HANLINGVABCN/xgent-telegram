@@ -21,43 +21,167 @@ INDEX_HTML = r"""<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>便签</title>
   <style>
-    :root { color-scheme: light; --bg:#f6f7f9; --panel:#fff; --text:#1f2937; --muted:#6b7280; --line:#d8dee8; --brand:#2563eb; --danger:#dc2626; }
+    :root {
+      color-scheme: light;
+      --bg: #f4f5f8;
+      --bg-grad: radial-gradient(1200px 600px at 80% -10%, #eef2ff 0%, transparent 60%), radial-gradient(900px 500px at -10% 110%, #ecfeff 0%, transparent 55%);
+      --panel: #ffffff;
+      --text: #1f2937;
+      --muted: #6b7280;
+      --faint: #9aa3b2;
+      --line: #e5e7eb;
+      --line-strong: #d1d5db;
+      --brand: #4f46e5;
+      --brand-soft: #eef2ff;
+      --brand-ink: #4338ca;
+      --danger: #dc2626;
+      --danger-soft: #fef2f2;
+      --ok: #059669;
+      --shadow: 0 1px 2px rgba(15,23,42,.04), 0 8px 24px rgba(15,23,42,.06);
+      --shadow-lg: 0 10px 40px rgba(15,23,42,.12);
+      --radius: 14px;
+    }
     * { box-sizing: border-box; }
-    body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
-    button, input, textarea { font: inherit; }
-    .login { min-height:100vh; display:grid; place-items:center; padding:24px; }
-    .login form { width:min(360px,100%); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:22px; box-shadow:0 10px 30px rgba(15,23,42,.08); }
-    h1 { margin:0 0 18px; font-size:22px; }
-    label { display:block; margin:12px 0 6px; color:var(--muted); }
-    input, textarea { width:100%; border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--text); outline:none; }
-    input { height:38px; padding:0 10px; }
-    textarea { min-height:360px; resize:vertical; padding:12px; }
-    input:focus, textarea:focus { border-color:var(--brand); box-shadow:0 0 0 3px rgba(37,99,235,.12); }
-    button { border:1px solid var(--line); background:#fff; color:var(--text); border-radius:6px; height:36px; padding:0 12px; cursor:pointer; }
-    button.primary { background:var(--brand); color:#fff; border-color:var(--brand); }
-    button.danger { color:var(--danger); }
-    .app { min-height:100vh; display:grid; grid-template-columns:320px 1fr; }
-    aside { background:var(--panel); border-right:1px solid var(--line); min-height:100vh; display:flex; flex-direction:column; }
-    .top { padding:14px; border-bottom:1px solid var(--line); display:grid; gap:10px; }
-    .row { display:flex; gap:8px; align-items:center; }
-    .row input { flex:1; }
-    .notes { overflow:auto; padding:8px; }
-    .note { width:100%; height:auto; text-align:left; display:block; border:1px solid transparent; padding:10px; margin-bottom:6px; background:transparent; }
-    .note:hover, .note.active { background:#eef4ff; border-color:#c7d7fe; }
-    .note-title { font-weight:650; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .note-preview { color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
-    main { padding:18px; min-width:0; }
-    .editor { max-width:980px; margin:0 auto; display:grid; gap:12px; }
-    .toolbar { display:flex; justify-content:space-between; gap:10px; align-items:center; }
-    .actions { display:flex; gap:8px; }
-    .status { color:var(--muted); font-size:12px; min-height:18px; }
-    .empty { height:70vh; display:grid; place-items:center; color:var(--muted); }
-    @media (max-width: 760px) {
-      .app { grid-template-columns:1fr; }
-      aside { min-height:auto; border-right:0; border-bottom:1px solid var(--line); }
-      .notes { max-height:38vh; }
-      main { padding:12px; }
-      textarea { min-height:300px; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      background-image: var(--bg-grad);
+      background-attachment: fixed;
+      color: var(--text);
+      font: 15px/1.6 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    button, input, textarea { font: inherit; color: inherit; }
+    a { color: inherit; text-decoration: none; }
+
+    /* ===== 通用控件 ===== */
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      height: 38px; padding: 0 14px; border-radius: 10px;
+      border: 1px solid var(--line-strong); background: #fff; color: var(--text);
+      cursor: pointer; transition: all .15s ease; white-space: nowrap;
+    }
+    .btn:hover { border-color: var(--brand); color: var(--brand-ink); }
+    .btn.primary { background: var(--brand); border-color: var(--brand); color: #fff; box-shadow: 0 6px 16px rgba(79,70,229,.28); }
+    .btn.primary:hover { background: var(--brand-ink); color: #fff; }
+    .btn.danger { color: var(--danger); border-color: #fecaca; background: var(--danger-soft); }
+    .btn.danger:hover { background: var(--danger); color: #fff; border-color: var(--danger); }
+    .btn.ghost { background: transparent; border-color: transparent; }
+    .btn.ghost:hover { background: var(--brand-soft); color: var(--brand-ink); }
+    .btn.icon { width: 38px; padding: 0; }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+
+    .field {
+      width: 100%; height: 42px; padding: 0 14px;
+      border: 1px solid var(--line-strong); border-radius: 10px;
+      background: #fff; outline: none; transition: all .15s ease;
+    }
+    .field:focus { border-color: var(--brand); box-shadow: 0 0 0 4px rgba(79,70,229,.14); }
+
+    /* ===== 登录页 ===== */
+    .login-wrap { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+    .login-card {
+      width: min(380px, 100%); background: var(--panel);
+      border: 1px solid var(--line); border-radius: 18px; padding: 30px 28px;
+      box-shadow: var(--shadow-lg);
+    }
+    .login-card h1 { margin: 0 0 4px; font-size: 22px; letter-spacing: .5px; }
+    .login-card .sub { margin: 0 0 22px; color: var(--muted); font-size: 13px; }
+    .login-card label { display: block; margin: 14px 0 6px; color: var(--muted); font-size: 13px; }
+    .login-card .field { height: 44px; }
+    .login-card .btn.primary { width: 100%; height: 44px; margin-top: 22px; }
+    .login-card .status { margin: 12px 0 0; min-height: 18px; color: var(--danger); font-size: 13px; }
+
+    /* ===== 顶栏 ===== */
+    .topbar {
+      position: sticky; top: 0; z-index: 20;
+      background: rgba(255,255,255,.82); backdrop-filter: saturate(180%) blur(12px);
+      border-bottom: 1px solid var(--line);
+    }
+    .topbar-inner {
+      max-width: 880px; margin: 0 auto; padding: 12px 18px;
+      display: flex; align-items: center; gap: 12px;
+    }
+    .brand { font-size: 18px; font-weight: 750; letter-spacing: .5px; display: inline-flex; align-items: center; gap: 8px; }
+    .brand .dot { width: 10px; height: 10px; border-radius: 50%; background: linear-gradient(135deg, var(--brand), #06b6d4); }
+    .spacer { flex: 1; }
+
+    /* ===== 容器 ===== */
+    .container { max-width: 880px; margin: 0 auto; padding: 22px 18px 80px; }
+
+    /* ===== 列表页 ===== */
+    .search-row { display: flex; gap: 10px; align-items: center; margin-bottom: 18px; }
+    .search-box { position: relative; flex: 1; }
+    .search-box .field { padding-left: 40px; height: 44px; }
+    .search-box .ico { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--faint); pointer-events: none; }
+    .search-box .clear { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); }
+    .meta-line { color: var(--muted); font-size: 13px; margin: 4px 4px 14px; min-height: 18px; }
+    .meta-line b { color: var(--text); }
+
+    .list { display: grid; gap: 12px; }
+    .card {
+      display: block; width: 100%; text-align: left;
+      background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+      padding: 16px 18px; cursor: pointer; transition: all .18s ease; box-shadow: var(--shadow);
+    }
+    .card:hover { transform: translateY(-2px); border-color: #c7d2fe; box-shadow: var(--shadow-lg); }
+    .card .c-title {
+      font-size: 17px; font-weight: 700; line-height: 1.4;
+      color: var(--text); margin: 0 0 6px;
+      overflow: hidden; text-overflow: ellipsis; display: -webkit-box;
+      -webkit-line-clamp: 1; -webkit-box-orient: vertical;
+    }
+    .card .c-preview {
+      color: var(--muted); font-size: 13px; line-height: 1.5; margin: 0;
+      overflow: hidden; text-overflow: ellipsis; display: -webkit-box;
+      -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    }
+    .card .c-foot { margin-top: 10px; color: var(--faint); font-size: 12px; display: flex; gap: 10px; align-items: center; }
+    .empty-state {
+      margin-top: 8vh; text-align: center; color: var(--muted);
+    }
+    .empty-state .big { font-size: 46px; opacity: .5; margin-bottom: 10px; }
+    .empty-state .t { font-size: 16px; margin-bottom: 4px; color: var(--text); font-weight: 600; }
+
+    mark { background: #fde68a; color: inherit; border-radius: 3px; padding: 0 2px; }
+
+    /* ===== 详情页 ===== */
+    .detail-head { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+    .detail-card {
+      background: var(--panel); border: 1px solid var(--line); border-radius: 18px;
+      padding: 28px 30px; box-shadow: var(--shadow);
+    }
+    .d-title {
+      font-size: 26px; font-weight: 800; line-height: 1.3; letter-spacing: .3px;
+      color: var(--text); margin: 0 0 18px; word-break: break-word; white-space: pre-wrap;
+    }
+    .d-title.muted { color: var(--faint); font-weight: 600; }
+    .d-body {
+      white-space: pre-wrap; word-break: break-word; color: #374151;
+      font-size: 15px; line-height: 1.8; margin: 0;
+    }
+    .d-body.muted { color: var(--faint); }
+    .editor-area {
+      width: 100%; min-height: 56vh; resize: vertical;
+      border: 1px solid var(--line-strong); border-radius: 12px; padding: 16px 18px;
+      background: #fff; outline: none; line-height: 1.8; transition: all .15s ease;
+    }
+    .editor-area:focus { border-color: var(--brand); box-shadow: 0 0 0 4px rgba(79,70,229,.14); }
+    .editor-hint { color: var(--faint); font-size: 12px; margin: 8px 2px 16px; }
+    .detail-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 18px; flex-wrap: wrap; }
+    .detail-foot .time { color: var(--faint); font-size: 12px; }
+    .detail-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+    .back-btn { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+    .back-btn:hover { color: var(--brand-ink); }
+
+    @media (max-width: 600px) {
+      .container { padding: 16px 14px 70px; }
+      .topbar-inner { padding: 10px 14px; }
+      .detail-card { padding: 20px 18px; }
+      .d-title { font-size: 22px; }
+      .search-row .btn span.label { display: none; }
     }
   </style>
 </head>
@@ -65,10 +189,9 @@ INDEX_HTML = r"""<!doctype html>
   <div id="root"></div>
   <script>
     const root = document.getElementById('root');
-    let notes = [];
-    let current = null;
-    let query = '';
+    const state = { notes: [], current: null, mode: 'view', query: '', loading: true };
 
+    /* ---------- API ---------- */
     async function api(path, options = {}) {
       const res = await fetch(path, {
         credentials: 'same-origin',
@@ -82,111 +205,290 @@ INDEX_HTML = r"""<!doctype html>
       return data;
     }
 
+    /* ---------- 工具 ---------- */
+    function escapeHtml(s) {
+      return String(s ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    }
+    function escapeAttr(s) { return escapeHtml(s).replace(/`/g, '&#96;'); }
+    function formatTime(ts) { return ts ? new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false }) : ''; }
+    function firstLine(content) {
+      const c = String(content ?? '');
+      const idx = c.indexOf('\n');
+      return idx === -1 ? c : c.slice(0, idx);
+    }
+    function restLines(content) {
+      const c = String(content ?? '');
+      const idx = c.indexOf('\n');
+      return idx === -1 ? '' : c.slice(idx + 1);
+    }
+    function searchTerms(q) {
+      return String(q || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+    }
+    function noteMatches(note, terms) {
+      if (!terms.length) return true;
+      const text = String(note.content || '').toLowerCase();
+      return terms.every(t => text.includes(t));
+    }
+    function highlight(text, terms) {
+      const esc = escapeHtml(text);
+      if (!terms.length) return esc;
+      const pattern = terms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+      const re = new RegExp('(' + pattern + ')', 'gi');
+      return esc.replace(re, '<mark>$1</mark>');
+    }
+
+    /* ---------- 路由 ---------- */
+    function parseHash() {
+      const h = location.hash.replace(/^#/, '');
+      if (h === '/new') return { name: 'new' };
+      const m = h.match(/^\/n\/(.+)$/);
+      if (m) return { name: 'note', id: decodeURIComponent(m[1]) };
+      return { name: 'list' };
+    }
+    function go(hash) { location.hash = hash; }
+
+    /* ---------- 登录页 ---------- */
     function renderLogin(message = '') {
-      root.innerHTML = `<div class="login"><form id="loginForm">
-        <h1>便签登录</h1>
-        <label>账号</label><input name="username" autocomplete="username" required>
-        <label>密码</label><input name="password" type="password" autocomplete="current-password" required>
-        <p class="status">${escapeHtml(message)}</p>
-        <button class="primary" type="submit">登录</button>
-      </form></div>`;
+      root.innerHTML = `<div class="login-wrap"><div class="login-card">
+        <h1>便签</h1>
+        <p class="sub">私有网页便签 · 登录</p>
+        <form id="loginForm">
+          <label>账号</label>
+          <input class="field" name="username" autocomplete="username" required>
+          <label>密码</label>
+          <input class="field" name="password" type="password" autocomplete="current-password" required>
+          <p class="status">${escapeHtml(message)}</p>
+          <button class="btn primary" type="submit">登录</button>
+        </form>
+      </div></div>`;
       document.getElementById('loginForm').onsubmit = async (e) => {
         e.preventDefault();
         const fd = new FormData(e.target);
         try {
-          await api('/api/login', { method:'POST', body: JSON.stringify({ username: fd.get('username'), password: fd.get('password') }) });
+          await api('/api/login', { method: 'POST', body: JSON.stringify({ username: fd.get('username'), password: fd.get('password') }) });
           await loadNotes();
+          render();
         } catch (err) {
           renderLogin(err.message);
         }
       };
     }
 
-    function renderApp() {
-      root.innerHTML = `<div class="app">
-        <aside>
-          <div class="top">
-            <div class="row"><input id="search" placeholder="搜索便签" value="${escapeAttr(query)}"><button id="newBtn" class="primary">新建</button></div>
-            <div class="row"><button id="logoutBtn">退出登录</button></div>
+    /* ---------- 顶栏 ---------- */
+    function topbar(rightHtml) {
+      return `<div class="topbar"><div class="topbar-inner">
+        <span class="brand"><span class="dot"></span>便签</span>
+        <span class="spacer"></span>
+        ${rightHtml || ''}
+      </div></div>`;
+    }
+
+    /* ---------- 列表页 ---------- */
+    function renderList() {
+      const right = `<button class="btn ghost" id="logoutBtn">退出登录</button>
+        <button class="btn primary" id="newBtn">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+          <span class="label">新建</span>
+        </button>`;
+      root.innerHTML = topbar(right) + `<div class="container">
+        <div class="search-row">
+          <div class="search-box">
+            <span class="ico"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></span>
+            <input class="field" id="search" placeholder="搜索标题或正文（多个关键词用空格分隔）" value="${escapeAttr(state.query)}" autocomplete="off">
+            <button class="btn ghost icon clear" id="clearBtn" title="清除" style="${state.query ? '' : 'display:none'}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
           </div>
-          <div class="notes" id="notes"></div>
-        </aside>
-        <main id="main"></main>
+        </div>
+        <div class="meta-line" id="metaLine"></div>
+        <div id="listArea"></div>
       </div>`;
-      document.getElementById('newBtn').onclick = createNote;
-      document.getElementById('logoutBtn').onclick = async () => { await api('/api/logout', { method:'POST' }); renderLogin(); };
-      document.getElementById('search').oninput = async (e) => { query = e.target.value; await loadNotes(false); };
-      renderNotes();
-      renderEditor();
+
+      document.getElementById('newBtn').onclick = () => go('/new');
+      document.getElementById('logoutBtn').onclick = async () => { await api('/api/logout', { method: 'POST' }); renderLogin(); };
+      const searchInput = document.getElementById('search');
+      const clearBtn = document.getElementById('clearBtn');
+      searchInput.oninput = () => {
+        state.query = searchInput.value;
+        clearBtn.style.display = state.query ? '' : 'none';
+        updateListArea();
+      };
+      clearBtn.onclick = () => {
+        state.query = '';
+        searchInput.value = '';
+        clearBtn.style.display = 'none';
+        updateListArea();
+        searchInput.focus();
+      };
+      updateListArea();
     }
 
-    function renderNotes() {
-      const list = document.getElementById('notes');
-      list.innerHTML = notes.map(n => `<button class="note ${current && current.id === n.id ? 'active' : ''}" data-id="${n.id}">
-        <div class="note-title">${escapeHtml(n.title || '无标题')}</div>
-        <div class="note-preview">${escapeHtml((n.content || '').replace(/\s+/g, ' ').slice(0, 80))}</div>
-      </button>`).join('') || '<div class="empty">没有便签</div>';
-      list.querySelectorAll('.note').forEach(btn => btn.onclick = () => openNote(btn.dataset.id));
-    }
-
-    function renderEditor() {
-      const main = document.getElementById('main');
-      if (!current) {
-        main.innerHTML = '<div class="empty">选择或新建一条便签</div>';
+    function updateListArea() {
+      const terms = searchTerms(state.query);
+      const filtered = state.notes.filter(n => noteMatches(n, terms));
+      const metaLine = document.getElementById('metaLine');
+      if (metaLine) {
+        metaLine.innerHTML = state.query
+          ? `找到 <b>${filtered.length}</b> 条结果（共 ${state.notes.length} 条）`
+          : `共 <b>${state.notes.length}</b> 条便签`;
+      }
+      const listArea = document.getElementById('listArea');
+      if (!listArea) return;
+      if (!filtered.length) {
+        const empty = state.query
+          ? { big: '🔍', t: '没有匹配的便签', s: '换个关键词试试' }
+          : { big: '📝', t: '还没有便签', s: '点击右上角“新建”开始记录' };
+        listArea.innerHTML = `<div class="empty-state"><div class="big">${empty.big}</div><div class="t">${empty.t}</div><div>${empty.s}</div></div>`;
         return;
       }
-      main.innerHTML = `<div class="editor">
-        <div class="toolbar">
-          <div class="status" id="status">${formatTime(current.updated_at)}</div>
-          <div class="actions"><button id="deleteBtn" class="danger">删除</button><button id="saveBtn" class="primary">保存</button></div>
+      listArea.innerHTML = `<div class="list">` + filtered.map(n => {
+        const title = firstLine(n.content);
+        const titleHtml = title ? highlight(title, terms) : '<span style="color:var(--faint)">无标题</span>';
+        const preview = restLines(n.content).replace(/\s+/g, ' ').trim();
+        return `<button class="card" data-id="${escapeAttr(n.id)}">
+          <div class="c-title">${titleHtml}</div>
+          ${preview ? `<div class="c-preview">${highlight(preview.slice(0, 160), terms)}</div>` : ''}
+          <div class="c-foot"><span>${formatTime(n.updated_at)}</span></div>
+        </button>`;
+      }).join('') + `</div>`;
+      listArea.querySelectorAll('.card').forEach(btn => btn.onclick = () => go('/n/' + encodeURIComponent(btn.dataset.id)));
+    }
+
+    /* ---------- 详情/编辑页 ---------- */
+    function renderDetail(isNew) {
+      const note = isNew ? null : state.current;
+      const editing = isNew || state.mode === 'edit';
+      const right = `<button class="btn ghost" id="logoutBtn">退出</button>`;
+      const back = `<button class="btn ghost back-btn" id="backBtn">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M15 18l-6-6 6-6"/></svg>返回
+      </button>`;
+
+      let body;
+      if (editing) {
+        const content = isNew ? '' : (note ? note.content : '');
+        body = `<div class="detail-card">
+          <div class="editor-hint">提示：正文第一行将作为标题，以大字显示。</div>
+          <textarea class="editor-area" id="content" placeholder="第一行写标题…&#10;下面写正文内容…" autofocus>${escapeHtml(content)}</textarea>
+        </div>`;
+      } else if (note) {
+        const title = firstLine(note.content);
+        const rest = restLines(note.content);
+        body = `<div class="detail-card">
+          <h2 class="d-title ${title ? '' : 'muted'}">${escapeHtml(title || '无标题')}</h2>
+          <div class="d-body ${rest ? '' : 'muted'}">${rest ? escapeHtml(rest) : '（无正文内容）'}</div>
+        </div>`;
+      } else {
+        body = `<div class="empty-state"><div class="t">便签不存在</div></div>`;
+      }
+
+      const actions = editing
+        ? `<div class="detail-actions">
+            <button class="btn" id="cancelBtn">${isNew ? '取消' : '取消'}</button>
+            <button class="btn primary" id="saveBtn">保存</button>
+          </div>`
+        : `<div class="detail-actions">
+            <button class="btn danger" id="deleteBtn">删除</button>
+            <button class="btn primary" id="editBtn">编辑</button>
+          </div>`;
+
+      const time = note && !isNew ? `更新于 ${formatTime(note.updated_at)}` : '';
+
+      root.innerHTML = topbar(right) + `<div class="container">
+        <div class="detail-head">${back}</div>
+        ${body}
+        <div class="detail-foot">
+          <span class="time">${time}</span>
+          ${actions}
         </div>
-        <input id="title" placeholder="标题" value="${escapeAttr(current.title || '')}">
-        <textarea id="content" placeholder="写点什么">${escapeHtml(current.content || '')}</textarea>
       </div>`;
-      document.getElementById('saveBtn').onclick = saveCurrent;
-      document.getElementById('deleteBtn').onclick = deleteCurrent;
+
+      document.getElementById('backBtn').onclick = () => go('/');
+      document.getElementById('logoutBtn').onclick = async () => { await api('/api/logout', { method: 'POST' }); renderLogin(); };
+
+      if (editing) {
+        const ta = document.getElementById('content');
+        document.getElementById('saveBtn').onclick = saveDetail;
+        document.getElementById('cancelBtn').onclick = () => { if (isNew) { go('/'); } else { state.mode = 'view'; renderDetail(false); } };
+        // Ctrl+S 保存
+        ta.onkeydown = (e) => {
+          if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); saveDetail(); }
+        };
+      } else {
+        document.getElementById('editBtn').onclick = () => { state.mode = 'edit'; renderDetail(false); };
+        document.getElementById('deleteBtn').onclick = deleteDetail;
+      }
     }
 
-    async function loadNotes(keepCurrent = true) {
-      const data = await api('/api/notes?q=' + encodeURIComponent(query));
-      notes = data.notes || [];
-      if (!keepCurrent || !current || !notes.some(n => n.id === current.id)) current = notes[0] || null;
-      renderApp();
+    async function saveDetail() {
+      const ta = document.getElementById('content');
+      if (!ta) return;
+      const content = ta.value;
+      try {
+        if (state.current && state.current.id) {
+          const updated = await api('/api/notes/' + encodeURIComponent(state.current.id), { method: 'PUT', body: JSON.stringify({ content }) });
+          const idx = state.notes.findIndex(n => n.id === updated.id);
+          if (idx >= 0) state.notes[idx] = updated;
+          state.current = updated;
+          state.mode = 'view';
+          renderDetail(false);
+        } else {
+          const created = await api('/api/notes', { method: 'POST', body: JSON.stringify({ content }) });
+          state.notes.unshift(created);
+          go('/n/' + encodeURIComponent(created.id));
+        }
+      } catch (err) {
+        alert(err.message);
+      }
     }
 
-    async function openNote(id) {
-      current = await api('/api/notes/' + encodeURIComponent(id));
-      renderApp();
+    async function deleteDetail() {
+      if (!state.current || !confirm('删除这条便签？此操作不可撤销。')) return;
+      try {
+        await api('/api/notes/' + encodeURIComponent(state.current.id), { method: 'DELETE' });
+        state.notes = state.notes.filter(n => n.id !== state.current.id);
+        state.current = null;
+        go('/');
+      } catch (err) {
+        alert(err.message);
+      }
     }
 
-    async function createNote() {
-      current = await api('/api/notes', { method:'POST', body: JSON.stringify({ title:'新便签', content:'' }) });
-      query = '';
-      await loadNotes(true);
-      current = await api('/api/notes/' + encodeURIComponent(current.id));
-      renderApp();
-      document.getElementById('title').focus();
+    /* ---------- 主渲染 ---------- */
+    function render() {
+      const route = parseHash();
+      if (route.name === 'new') {
+        state.current = null;
+        state.mode = 'edit';
+        renderDetail(true);
+        return;
+      }
+      if (route.name === 'note') {
+        const note = state.notes.find(n => n.id === route.id);
+        if (!note) { go('/'); return; }
+        state.current = note;
+        if (state.mode !== 'edit') state.mode = 'view';
+        renderDetail(false);
+        return;
+      }
+      // list
+      state.mode = 'view';
+      renderList();
     }
 
-    async function saveCurrent() {
-      const title = document.getElementById('title').value;
-      const content = document.getElementById('content').value;
-      current = await api('/api/notes/' + encodeURIComponent(current.id), { method:'PUT', body: JSON.stringify({ title, content }) });
-      document.getElementById('status').textContent = '已保存 ' + formatTime(current.updated_at);
-      await loadNotes(true);
+    async function loadNotes() {
+      const data = await api('/api/notes');
+      state.notes = (data.notes || []).slice().sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
+      state.loading = false;
     }
 
-    async function deleteCurrent() {
-      if (!current || !confirm('删除这条便签？')) return;
-      await api('/api/notes/' + encodeURIComponent(current.id), { method:'DELETE' });
-      current = null;
-      await loadNotes(false);
-    }
+    window.addEventListener('hashchange', render);
 
-    function escapeHtml(s) { return String(s ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); }
-    function escapeAttr(s) { return escapeHtml(s).replace(/`/g, '&#96;'); }
-    function formatTime(ts) { return ts ? new Date(ts * 1000).toLocaleString() : ''; }
-    loadNotes().catch(() => renderLogin());
+    (async function init() {
+      try {
+        await loadNotes();
+        render();
+      } catch (e) {
+        renderLogin();
+      }
+    })();
   </script>
 </body>
 </html>"""
@@ -205,9 +507,18 @@ class NotesStore:
         try:
             with self.notes_file.open("r", encoding="utf-8") as f:
                 data = json.load(f)
-            return data if isinstance(data, list) else []
+            if not isinstance(data, list):
+                return []
         except Exception:
             return []
+        for n in data:
+            if not isinstance(n, dict):
+                continue
+            # 兼容旧数据：旧版有独立 title 字段，新版只用 content
+            if "content" not in n:
+                n["content"] = n.get("title", "")
+            n.pop("title", None)
+        return data
 
     def save_notes(self, notes):
         tmp = self.notes_file.with_suffix(".json.tmp")
@@ -339,14 +650,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[-1]:
             note_id = parts[-1]
             for note in notes:
-                if note["id"] == note_id:
+                if note.get("id") == note_id:
                     self.send_json(note)
                     return
             self.send_json({"error": "not found"}, status=404)
             return
         q = urllib.parse.parse_qs(parsed.query).get("q", [""])[0].strip().lower()
         if q:
-            notes = [n for n in notes if q in (n.get("title", "") + "\n" + n.get("content", "")).lower()]
+            terms = [t for t in q.split() if t]
+            if terms:
+                def match(n):
+                    text = str(n.get("content", "")).lower()
+                    return all(t in text for t in terms)
+                notes = [n for n in notes if match(n)]
         notes.sort(key=lambda n: n.get("updated_at", 0), reverse=True)
         self.send_json({"notes": notes})
 
@@ -355,7 +671,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         now = time.time()
         note = {
             "id": secrets.token_hex(8),
-            "title": str(data.get("title") or "新便签"),
             "content": str(data.get("content") or ""),
             "created_at": now,
             "updated_at": now,
@@ -370,10 +685,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         data = self.parse_json()
         notes = self.server.store.load_notes()
         for note in notes:
-            if note["id"] == note_id:
-                note["title"] = str(data.get("title") or "").strip() or "无标题"
+            if note.get("id") == note_id:
                 note["content"] = str(data.get("content") or "")
                 note["updated_at"] = time.time()
+                note.pop("title", None)
                 self.server.store.save_notes(notes)
                 self.send_json(note)
                 return
@@ -382,7 +697,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def handle_delete_note(self):
         note_id = self.note_id_from_path()
         notes = self.server.store.load_notes()
-        new_notes = [n for n in notes if n["id"] != note_id]
+        new_notes = [n for n in notes if n.get("id") != note_id]
         if len(new_notes) == len(notes):
             self.send_json({"error": "not found"}, status=404)
             return
