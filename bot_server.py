@@ -6351,7 +6351,7 @@ def build_memory_prompt_section() -> str:
 
 
 def build_conversation_system_prompt(agent_mode: bool) -> str:
-    """正常聊天与思念模式共用的 system prompt。"""
+    """正常聊天与空闲提醒共用的 system prompt。"""
     return (
         get_runtime_prompt('assistant_prompt')
         + get_runtime_prompt('global_prompt_addon')
@@ -7139,7 +7139,7 @@ def get_timeout_settings_menu():
         [InlineKeyboardButton(f"💬 AI回复超时：{_fmt_timeout(ai_timeout)}", callback_data="cmd_set_ai_timeout")],
         [InlineKeyboardButton(f"⌨️ 命令等待：{_fmt_command_timeout(command_timeout)}", callback_data="cmd_set_command_timeout")],
         [InlineKeyboardButton(f"🔁 Agent轮数：{_fmt_agent_max_iterations(agent_max_iterations)}", callback_data="cmd_set_agent_max_iterations")],
-        [InlineKeyboardButton(f"💭 思念触发：{_fmt_idle_message_interval(idle_interval)}", callback_data="cmd_set_idle_message_interval")],
+        [InlineKeyboardButton(f"💭 空闲提醒：{_fmt_idle_message_interval(idle_interval)}", callback_data="cmd_set_idle_message_interval")],
         [InlineKeyboardButton("🔙 返回", callback_data="menu_more_settings")]
     ])
 
@@ -7154,10 +7154,10 @@ def build_timeout_settings_text() -> str:
         f"💬 AI回复超时：<b>{_fmt_timeout(ai_timeout)}</b>\n"
         f"⌨️ 命令等待窗口：<b>{_fmt_command_timeout(command_timeout)}</b>\n"
         f"🔁 Agent最大轮数：<b>{_fmt_agent_max_iterations(agent_max_iterations)}</b>\n"
-        f"💭 思念触发间隔：<b>{_fmt_idle_message_interval(idle_interval)}</b>\n\n"
+        f"💭 空闲提醒间隔：<b>{_fmt_idle_message_interval(idle_interval)}</b>\n\n"
         "AI回复超时控制等待模型响应的时间；命令等待窗口控制 run 的最长等待，也是 shell 状态判断的硬上限；"
         "Agent最大轮数控制本轮对话中 AI 自动执行工具并继续思考的最多次数；"
-        "思念触发间隔控制用户多久没发消息后自动生成一条思念回复。"
+        "空闲提醒间隔控制用户多久没发消息后自动生成一条提醒回复。"
     )
 
 def get_ai_timeout_menu():
@@ -9823,10 +9823,10 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif data == "cmd_set_idle_message_interval":
             current_interval = UserDataManager.get('idle_message_interval', DEFAULT_IDLE_MESSAGE_INTERVAL)
             await query.message.edit_text(
-                f"💭 <b>思念触发间隔</b>\n\n"
+                f"💭 <b>空闲提醒间隔</b>\n\n"
                 f"当前: <b>{_fmt_idle_message_interval(current_interval)}</b>\n"
-                f"到达这个时间没有收到你的消息后，系统会按正常聊天上下文额外追加思念提示词生成回复。\n"
-                f"设为 ∞关闭 表示不自动触发思念模式。",
+                f"到达这个时间没有收到你的消息后，系统会按正常聊天上下文额外追加空闲提醒提示词生成回复。\n"
+                f"设为 ∞关闭 表示不自动触发空闲提醒。",
                 reply_markup=get_idle_message_interval_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
@@ -9834,7 +9834,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif data == "set_idle_message_interval_custom":
             UserDataManager.set('state', BotState.SET_IDLE_MESSAGE_INTERVAL)
             await query.message.reply_text(
-                "💭 请输入自定义思念触发间隔。\n"
+                "💭 请输入自定义空闲提醒间隔。\n"
                 "例如: 90m、2h、3天、7200s；发送 0、∞ 或 关闭 可停用。发送 cancel 取消。"
             )
 
@@ -9842,9 +9842,9 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             interval = normalize_idle_message_interval(data.rsplit("_", 1)[1])
             UserDataManager.set('idle_message_interval', interval)
             await UserDataManager.save_config('idle_message_interval', interval)
-            await GlobalRecorder.record_system_op(f"设置思念触发间隔: {_fmt_idle_message_interval(interval)}")
+            await GlobalRecorder.record_system_op(f"设置空闲提醒间隔: {_fmt_idle_message_interval(interval)}")
             await query.message.edit_text(
-                f"✅ 思念触发间隔已设为 <b>{_fmt_idle_message_interval(interval)}</b>。",
+                f"✅ 空闲提醒间隔已设为 <b>{_fmt_idle_message_interval(interval)}</b>。",
                 reply_markup=get_timeout_settings_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
@@ -11288,9 +11288,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         UserDataManager.set('idle_message_interval', interval)
         UserDataManager.set('state', BotState.IDLE)
         await UserDataManager.save_config('idle_message_interval', interval)
-        await GlobalRecorder.record_system_op(f"设置思念触发间隔: {_fmt_idle_message_interval(interval)}")
+        await GlobalRecorder.record_system_op(f"设置空闲提醒间隔: {_fmt_idle_message_interval(interval)}")
         await update.message.reply_text(
-            f"✅ 思念触发间隔已设为 {_fmt_idle_message_interval(interval)}。",
+            f"✅ 空闲提醒间隔已设为 {_fmt_idle_message_interval(interval)}。",
             reply_markup=get_timeout_settings_menu()
         )
         return
@@ -12663,7 +12663,7 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
         if not last_time:
             return
         
-        # 检查是否超过配置的思念触发间隔
+        # 检查是否超过配置的空闲提醒间隔
         hours_passed = (time.time() - last_time) / 3600
         if time.time() - last_time < idle_interval:
             return
