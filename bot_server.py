@@ -173,6 +173,8 @@ MAX_AGENT_COMMAND_TIMEOUT = 3600
 DEFAULT_AGENT_MAX_ITERATIONS = 10
 MIN_AGENT_MAX_ITERATIONS = 1
 MAX_AGENT_MAX_ITERATIONS = 50
+DEFAULT_IDLE_MESSAGE_INTERVAL = 24 * 3600
+MIN_IDLE_MESSAGE_INTERVAL = 60
 PROVIDER_HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -266,6 +268,23 @@ def normalize_agent_max_iterations(value: Any, default: int = DEFAULT_AGENT_MAX_
     return iterations
 
 
+def normalize_idle_message_interval(value: Any, default: int = DEFAULT_IDLE_MESSAGE_INTERVAL) -> int:
+    if isinstance(value, str) and value.strip().lower() in {
+        "0", "∞", "inf", "infinite", "none", "no", "off", "disabled", "unlimited",
+        "无限", "关闭", "关", "不触发", "停用",
+    }:
+        return 0
+    try:
+        seconds = int(float(value))
+    except (TypeError, ValueError):
+        seconds = int(default)
+    if seconds <= 0:
+        return 0
+    if seconds < MIN_IDLE_MESSAGE_INTERVAL:
+        return MIN_IDLE_MESSAGE_INTERVAL
+    return seconds
+
+
 def parse_agent_max_iterations(text: str) -> int:
     cleaned = str(text or "").strip().lower()
     cleaned = re.sub(r"(轮|次|rounds?|iterations?|iters?)$", "", cleaned).strip()
@@ -278,6 +297,39 @@ def parse_agent_max_iterations(text: str) -> int:
     if iterations > MAX_AGENT_MAX_ITERATIONS:
         raise ValueError(f"iterations must be at most {MAX_AGENT_MAX_ITERATIONS}")
     return iterations
+
+
+def parse_idle_message_interval(text: str) -> int:
+    cleaned = str(text or "").strip().lower()
+    if cleaned in {
+        "0", "∞", "inf", "infinite", "none", "no", "off", "disabled", "unlimited",
+        "无限", "关闭", "关", "不触发", "停用",
+    }:
+        return 0
+
+    multiplier = 1
+    unit_patterns = [
+        (r"(hours?|hrs?|h|小时|时)$", 3600),
+        (r"(days?|d|天|日)$", 86400),
+        (r"(minutes?|mins?|m|分钟|分)$", 60),
+        (r"(seconds?|secs?|sec|s|秒)$", 1),
+    ]
+    for pattern, unit_multiplier in unit_patterns:
+        if re.search(pattern, cleaned):
+            multiplier = unit_multiplier
+            cleaned = re.sub(pattern, "", cleaned).strip()
+            break
+
+    try:
+        seconds = int(float(cleaned) * multiplier)
+    except (TypeError, ValueError):
+        raise ValueError("idle interval must be a number")
+
+    if seconds <= 0:
+        return 0
+    if seconds < MIN_IDLE_MESSAGE_INTERVAL:
+        raise ValueError(f"idle interval must be at least {MIN_IDLE_MESSAGE_INTERVAL} seconds")
+    return seconds
 
 
 def parse_timeout_seconds(text: str, minimum: int = 1, maximum: Optional[int] = None,
@@ -570,6 +622,7 @@ class BotState:
     SET_AI_TIMEOUT = 'set_ai_timeout'
     SET_COMMAND_TIMEOUT = 'set_command_timeout'
     SET_AGENT_MAX_ITERATIONS = 'set_agent_max_iterations'
+    SET_IDLE_MESSAGE_INTERVAL = 'set_idle_message_interval'
     SET_COMMAND_BLACKLIST = 'set_command_blacklist'
     SET_UPDATE_TOKEN = 'set_update_token'
     SET_MEMORY = 'set_memory'
@@ -1418,6 +1471,9 @@ class UserDataManager:
             ),
             'agent_max_iterations': normalize_agent_max_iterations(
                 await cls._require_db().get_config('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
+            ),
+            'idle_message_interval': normalize_idle_message_interval(
+                await cls._require_db().get_config('idle_message_interval', DEFAULT_IDLE_MESSAGE_INTERVAL)
             ),
             # 临时数据（不需要持久化）
             'temp_viewing_prov': None,
@@ -6294,6 +6350,16 @@ def build_memory_prompt_section() -> str:
     return f"\n\n【用户记忆】\n{body}\n"
 
 
+def build_conversation_system_prompt(agent_mode: bool) -> str:
+    """正常聊天与思念模式共用的 system prompt。"""
+    return (
+        get_runtime_prompt('assistant_prompt')
+        + get_runtime_prompt('global_prompt_addon')
+        + build_memory_prompt_section()
+        + get_agent_runtime_prompt(agent_mode)
+    )
+
+
 class ArtifactManager:
     ROOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bot_storage')
     UPLOAD_DIR = os.path.join(ROOT_DIR, 'uploads')
@@ -6968,6 +7034,21 @@ def _fmt_agent_max_iterations(val):
     val = normalize_agent_max_iterations(val)
     return f"{val}轮"
 
+def _fmt_idle_message_interval(val):
+    seconds = normalize_idle_message_interval(val)
+    if seconds <= 0:
+        return "∞关闭"
+    if seconds % 86400 == 0:
+        days = seconds // 86400
+        return f"{days}天"
+    if seconds % 3600 == 0:
+        hours = seconds // 3600
+        return f"{hours}小时"
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"{minutes}分钟"
+    return f"{seconds}s"
+
 def get_main_menu():
     agent_on = UserDataManager.get('agent_mode', False)
     stream_on = normalize_bool(UserDataManager.get('stream_mode', True), True)
@@ -7053,10 +7134,12 @@ def get_timeout_settings_menu():
     ai_timeout = UserDataManager.get('stream_timeout', 0)
     command_timeout = UserDataManager.get('agent_command_timeout', DEFAULT_AGENT_COMMAND_TIMEOUT)
     agent_max_iterations = UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
+    idle_interval = UserDataManager.get('idle_message_interval', DEFAULT_IDLE_MESSAGE_INTERVAL)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"💬 AI回复超时：{_fmt_timeout(ai_timeout)}", callback_data="cmd_set_ai_timeout")],
         [InlineKeyboardButton(f"⌨️ 命令等待：{_fmt_command_timeout(command_timeout)}", callback_data="cmd_set_command_timeout")],
         [InlineKeyboardButton(f"🔁 Agent轮数：{_fmt_agent_max_iterations(agent_max_iterations)}", callback_data="cmd_set_agent_max_iterations")],
+        [InlineKeyboardButton(f"💭 思念触发：{_fmt_idle_message_interval(idle_interval)}", callback_data="cmd_set_idle_message_interval")],
         [InlineKeyboardButton("🔙 返回", callback_data="menu_more_settings")]
     ])
 
@@ -7064,14 +7147,17 @@ def build_timeout_settings_text() -> str:
     ai_timeout = UserDataManager.get('stream_timeout', 0)
     command_timeout = UserDataManager.get('agent_command_timeout', DEFAULT_AGENT_COMMAND_TIMEOUT)
     agent_max_iterations = UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
+    idle_interval = UserDataManager.get('idle_message_interval', DEFAULT_IDLE_MESSAGE_INTERVAL)
     return (
         "⏱️ <b>超时设置</b>\n"
         "━━━━━━━━━━━━━━\n"
         f"💬 AI回复超时：<b>{_fmt_timeout(ai_timeout)}</b>\n"
         f"⌨️ 命令等待窗口：<b>{_fmt_command_timeout(command_timeout)}</b>\n"
-        f"🔁 Agent最大轮数：<b>{_fmt_agent_max_iterations(agent_max_iterations)}</b>\n\n"
+        f"🔁 Agent最大轮数：<b>{_fmt_agent_max_iterations(agent_max_iterations)}</b>\n"
+        f"💭 思念触发间隔：<b>{_fmt_idle_message_interval(idle_interval)}</b>\n\n"
         "AI回复超时控制等待模型响应的时间；命令等待窗口控制 run 的最长等待，也是 shell 状态判断的硬上限；"
-        "Agent最大轮数控制本轮对话中 AI 自动执行工具并继续思考的最多次数。"
+        "Agent最大轮数控制本轮对话中 AI 自动执行工具并继续思考的最多次数；"
+        "思念触发间隔控制用户多久没发消息后自动生成一条思念回复。"
     )
 
 def get_ai_timeout_menu():
@@ -7102,6 +7188,15 @@ def get_agent_max_iterations_menu():
         [InlineKeyboardButton("20轮", callback_data="set_agent_max_iterations_20"),
          InlineKeyboardButton("30轮", callback_data="set_agent_max_iterations_30")],
         [InlineKeyboardButton("✍️ 自定义", callback_data="set_agent_max_iterations_custom")],
+        [InlineKeyboardButton("🔙 返回", callback_data="menu_timeout_settings")]
+    ])
+
+def get_idle_message_interval_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("1小时", callback_data="set_idle_message_interval_3600"),
+         InlineKeyboardButton("24小时", callback_data="set_idle_message_interval_86400")],
+        [InlineKeyboardButton("∞关闭", callback_data="set_idle_message_interval_0"),
+         InlineKeyboardButton("✍️ 自定义", callback_data="set_idle_message_interval_custom")],
         [InlineKeyboardButton("🔙 返回", callback_data="menu_timeout_settings")]
     ])
 
@@ -9724,6 +9819,35 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=get_timeout_settings_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
+
+        elif data == "cmd_set_idle_message_interval":
+            current_interval = UserDataManager.get('idle_message_interval', DEFAULT_IDLE_MESSAGE_INTERVAL)
+            await query.message.edit_text(
+                f"💭 <b>思念触发间隔</b>\n\n"
+                f"当前: <b>{_fmt_idle_message_interval(current_interval)}</b>\n"
+                f"到达这个时间没有收到你的消息后，系统会按正常聊天上下文额外追加思念提示词生成回复。\n"
+                f"设为 ∞关闭 表示不自动触发思念模式。",
+                reply_markup=get_idle_message_interval_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "set_idle_message_interval_custom":
+            UserDataManager.set('state', BotState.SET_IDLE_MESSAGE_INTERVAL)
+            await query.message.reply_text(
+                "💭 请输入自定义思念触发间隔。\n"
+                "例如: 90m、2h、3天、7200s；发送 0、∞ 或 关闭 可停用。发送 cancel 取消。"
+            )
+
+        elif data.startswith("set_idle_message_interval_"):
+            interval = normalize_idle_message_interval(data.rsplit("_", 1)[1])
+            UserDataManager.set('idle_message_interval', interval)
+            await UserDataManager.save_config('idle_message_interval', interval)
+            await GlobalRecorder.record_system_op(f"设置思念触发间隔: {_fmt_idle_message_interval(interval)}")
+            await query.message.edit_text(
+                f"✅ 思念触发间隔已设为 <b>{_fmt_idle_message_interval(interval)}</b>。",
+                reply_markup=get_timeout_settings_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
         
         # --- 记忆深度设置 ---
         elif data == "cmd_set_global_depth":
@@ -11152,6 +11276,24 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=get_timeout_settings_menu()
         )
         return
+
+    if state == BotState.SET_IDLE_MESSAGE_INTERVAL:
+        try:
+            interval = parse_idle_message_interval(text)
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ 请输入有效的时间，例如 90m、2h、3天、7200s；发送 0、∞ 或 关闭 可停用。"
+            )
+            return
+        UserDataManager.set('idle_message_interval', interval)
+        UserDataManager.set('state', BotState.IDLE)
+        await UserDataManager.save_config('idle_message_interval', interval)
+        await GlobalRecorder.record_system_op(f"设置思念触发间隔: {_fmt_idle_message_interval(interval)}")
+        await update.message.reply_text(
+            f"✅ 思念触发间隔已设为 {_fmt_idle_message_interval(interval)}。",
+            reply_markup=get_timeout_settings_menu()
+        )
+        return
     
     if state == BotState.SET_GLOBAL_DEPTH:
         if text.isdigit() and 1 <= int(text) <= 500:
@@ -11524,12 +11666,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
 
     await db.add_chat_message(cid, 'user', text)
 
-    base_prompt = get_runtime_prompt('assistant_prompt')
-    global_addon = get_runtime_prompt('global_prompt_addon')
     global_depth = max(1, int(UserDataManager.get('global_depth', 30)))
-    system_prompt = base_prompt + global_addon
-    # 用户记忆（始终拼接，独立于 Agent 开关）
-    system_prompt += build_memory_prompt_section()
+    system_prompt = build_conversation_system_prompt(agent_mode)
     history = await db.get_conversation_messages(global_depth)
     if content_override is not None:
         # 文件/图片本体只在本轮临时喂给模型；长期记忆和导出仍只保留路径索引。
@@ -11539,8 +11677,6 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 break
         else:
             history.append({'role': 'user', 'content': content_override})
-    # Agent 提示词始终保留，只切换执行权限状态
-    system_prompt += get_agent_runtime_prompt(agent_mode)
     
     # 根据流式/非流式开关选择回复方式
     if stream_mode:
@@ -12516,19 +12652,25 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
 
         db = await BotMemoryDB.get_instance()
         
+        idle_interval = normalize_idle_message_interval(
+            UserDataManager.get('idle_message_interval', DEFAULT_IDLE_MESSAGE_INTERVAL)
+        )
+        if idle_interval <= 0:
+            return
+
         # 获取用户最后发消息的时间
         last_time = await db.get_last_user_message_time()
         if not last_time:
             return
         
-        # 检查是否超过24小时
+        # 检查是否超过配置的思念触发间隔
         hours_passed = (time.time() - last_time) / 3600
-        if hours_passed < 24:
+        if time.time() - last_time < idle_interval:
             return
         
-        # 检查今天是否已经发过
+        # 同一个间隔内最多发一次
         last_idle_notice_time = await db.get_config('last_idle_notice_time', 0)
-        if time.time() - last_idle_notice_time < 86400:
+        if time.time() - last_idle_notice_time < idle_interval:
             return
         
         # 获取Provider
@@ -12542,16 +12684,12 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
         assert prov_name is not None
         
         # 获取全局对话记忆
-        global_depth = UserDataManager.get('global_depth', 30)
+        global_depth = max(1, int(UserDataManager.get('global_depth', 30)))
         global_history = await db.get_conversation_messages(global_depth)
 
-        # 提醒消息只生成自然语言，不执行工具，因此固定按 Agent 关闭态拼完整提示词链
-        base_prompt = get_runtime_prompt('assistant_prompt')
-        global_addon = get_runtime_prompt('global_prompt_addon')
-        agent_runtime_prompt = get_agent_runtime_prompt(False)
-
+        agent_mode = UserDataManager.get('agent_mode', False)
         idle_prompt = (
-            base_prompt + global_addon + agent_runtime_prompt +
+            build_conversation_system_prompt(agent_mode) +
             format_prompt_template('idle_message_prompt', hours_passed=int(hours_passed))
         )
         
