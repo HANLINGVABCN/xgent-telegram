@@ -168,6 +168,15 @@ INDEX_HTML = r"""<!doctype html>
       background: #fff; outline: none; line-height: 1.8; transition: all .15s ease;
     }
     .editor-area:focus { border-color: var(--brand); box-shadow: 0 0 0 4px rgba(79,70,229,.14); }
+    .title-input {
+      width: 100%; display: block; border: none; border-bottom: 1px dashed var(--line);
+      background: transparent; outline: none; padding: 4px 0 16px; margin: 0 0 4px;
+      font-size: 26px; font-weight: 800; line-height: 1.3; letter-spacing: .3px; color: var(--text);
+      transition: border-color .15s ease;
+    }
+    .title-input::placeholder { color: #c7ccd6; font-weight: 800; }
+    .title-input:focus { border-bottom-color: var(--brand); }
+    .detail-card .editor-area { margin-top: 14px; }
     .editor-hint { color: var(--faint); font-size: 12px; margin: 8px 2px 16px; }
     .detail-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 18px; flex-wrap: wrap; }
     .detail-foot .time { color: var(--faint); font-size: 12px; }
@@ -353,43 +362,32 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     /* ---------- 详情/编辑页 ---------- */
+    function splitContent(content) {
+      const c = String(content ?? '');
+      const idx = c.indexOf('\n');
+      return idx === -1 ? { title: c, body: '' } : { title: c.slice(0, idx), body: c.slice(idx + 1) };
+    }
+
     function renderDetail(isNew) {
       const note = isNew ? null : state.current;
-      const editing = isNew || state.mode === 'edit';
+      const parts = splitContent(note ? note.content : '');
       const right = `<button class="btn ghost" id="logoutBtn">退出</button>`;
       const back = `<button class="btn ghost back-btn" id="backBtn">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M15 18l-6-6 6-6"/></svg>返回
       </button>`;
 
-      let body;
-      if (editing) {
-        const content = isNew ? '' : (note ? note.content : '');
-        body = `<div class="detail-card">
-          <div class="editor-hint">提示：正文第一行将作为标题，以大字显示。</div>
-          <textarea class="editor-area" id="content" placeholder="第一行写标题…&#10;下面写正文内容…" autofocus>${escapeHtml(content)}</textarea>
-        </div>`;
-      } else if (note) {
-        const title = firstLine(note.content);
-        const rest = restLines(note.content);
-        body = `<div class="detail-card">
-          <h2 class="d-title ${title ? '' : 'muted'}">${escapeHtml(title || '无标题')}</h2>
-          <div class="d-body ${rest ? '' : 'muted'}">${rest ? escapeHtml(rest) : '（无正文内容）'}</div>
-        </div>`;
-      } else {
-        body = `<div class="empty-state"><div class="t">便签不存在</div></div>`;
-      }
+      const body = `<div class="detail-card">
+        <input class="title-input" id="title" placeholder="标题" autocomplete="off" value="${escapeAttr(parts.title)}">
+        <textarea class="editor-area" id="content" placeholder="写点正文…" autofocus>${escapeHtml(parts.body)}</textarea>
+      </div>`;
 
-      const actions = editing
-        ? `<div class="detail-actions">
-            <button class="btn" id="cancelBtn">${isNew ? '取消' : '取消'}</button>
-            <button class="btn primary" id="saveBtn">保存</button>
-          </div>`
-        : `<div class="detail-actions">
-            <button class="btn danger" id="deleteBtn">删除</button>
-            <button class="btn primary" id="editBtn">编辑</button>
-          </div>`;
+      const actions = `<div class="detail-actions">
+        ${!isNew ? `<button class="btn danger" id="deleteBtn">删除</button>` : ''}
+        <button class="btn" id="cancelBtn">取消</button>
+        <button class="btn primary" id="saveBtn">保存</button>
+      </div>`;
 
-      const time = note && !isNew ? `更新于 ${formatTime(note.updated_at)}` : '';
+      const time = note && !isNew ? `更新于 ${formatTime(note.updated_at)}` : '新便签';
 
       root.innerHTML = topbar(right) + `<div class="container">
         <div class="detail-head">${back}</div>
@@ -402,36 +400,34 @@ INDEX_HTML = r"""<!doctype html>
 
       document.getElementById('backBtn').onclick = () => go('/');
       document.getElementById('logoutBtn').onclick = async () => { await api('/api/logout', { method: 'POST' }); renderLogin(); };
-
-      if (editing) {
-        const ta = document.getElementById('content');
-        document.getElementById('saveBtn').onclick = saveDetail;
-        document.getElementById('cancelBtn').onclick = () => { if (isNew) { go('/'); } else { state.mode = 'view'; renderDetail(false); } };
-        // Ctrl+S 保存
-        ta.onkeydown = (e) => {
-          if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); saveDetail(); }
-        };
-      } else {
-        document.getElementById('editBtn').onclick = () => { state.mode = 'edit'; renderDetail(false); };
-        document.getElementById('deleteBtn').onclick = deleteDetail;
-      }
+      document.getElementById('saveBtn').onclick = saveDetail;
+      document.getElementById('cancelBtn').onclick = () => go('/');
+      if (!isNew) document.getElementById('deleteBtn').onclick = deleteDetail;
+      const ta = document.getElementById('content');
+      ta.onkeydown = (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); saveDetail(); }
+      };
+      // 新建时自动聚焦标题
+      if (isNew) document.getElementById('title').focus();
     }
 
     async function saveDetail() {
-      const ta = document.getElementById('content');
-      if (!ta) return;
-      const content = ta.value;
+      const titleEl = document.getElementById('title');
+      const bodyEl = document.getElementById('content');
+      if (!titleEl || !bodyEl) return;
+      // 数据上没有标题：标题行 + 换行 + 正文，统一存入 content
+      const content = titleEl.value + '\n' + bodyEl.value;
       try {
         if (state.current && state.current.id) {
           const updated = await api('/api/notes/' + encodeURIComponent(state.current.id), { method: 'PUT', body: JSON.stringify({ content }) });
           const idx = state.notes.findIndex(n => n.id === updated.id);
           if (idx >= 0) state.notes[idx] = updated;
           state.current = updated;
-          state.mode = 'view';
           renderDetail(false);
         } else {
           const created = await api('/api/notes', { method: 'POST', body: JSON.stringify({ content }) });
           state.notes.unshift(created);
+          state.current = created;
           go('/n/' + encodeURIComponent(created.id));
         }
       } catch (err) {
@@ -456,7 +452,6 @@ INDEX_HTML = r"""<!doctype html>
       const route = parseHash();
       if (route.name === 'new') {
         state.current = null;
-        state.mode = 'edit';
         renderDetail(true);
         return;
       }
@@ -464,12 +459,10 @@ INDEX_HTML = r"""<!doctype html>
         const note = state.notes.find(n => n.id === route.id);
         if (!note) { go('/'); return; }
         state.current = note;
-        if (state.mode !== 'edit') state.mode = 'view';
         renderDetail(false);
         return;
       }
       // list
-      state.mode = 'view';
       renderList();
     }
 
