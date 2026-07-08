@@ -180,7 +180,13 @@ INDEX_HTML = r"""<!doctype html>
     .editor-hint { color: var(--faint); font-size: 12px; margin: 8px 2px 16px; }
     .detail-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 18px; flex-wrap: wrap; }
     .detail-foot .time { color: var(--faint); font-size: 12px; }
-    .detail-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .detail-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .detail-foot .status { font-size: 12px; color: var(--faint); min-width: 70px; }
+    .detail-foot .status.saving { color: var(--brand); }
+    .detail-foot .status.saved { color: var(--ok); }
+    .detail-foot .status.unsaved { color: var(--muted); }
+    .detail-foot .status.error { color: var(--danger); }
+    .detail-foot .sep { width: 1px; height: 22px; background: var(--line); margin: 0 4px; }
 
     .back-btn { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
     .back-btn:hover { color: var(--brand-ink); }
@@ -198,7 +204,8 @@ INDEX_HTML = r"""<!doctype html>
   <div id="root"></div>
   <script>
     const root = document.getElementById('root');
-    const state = { notes: [], current: null, mode: 'view', query: '', loading: true };
+    const state = { notes: [], current: null, query: '', loading: true };
+    const editState = { history: [], index: 0, saveTimer: null, saving: false, pending: false, hasId: false };
 
     /* ---------- API ---------- */
     async function api(path, options = {}) {
@@ -368,9 +375,107 @@ INDEX_HTML = r"""<!doctype html>
       return idx === -1 ? { title: c, body: '' } : { title: c.slice(0, idx), body: c.slice(idx + 1) };
     }
 
+    function currentSnapshot() {
+      return { title: document.getElementById('title').value, body: document.getElementById('content').value };
+    }
+    function applySnapshot(snap) {
+      document.getElementById('title').value = snap.title;
+      document.getElementById('content').value = snap.body;
+    }
+    function recordSnapshot() {
+      const snap = currentSnapshot();
+      const top = editState.history[editState.index];
+      if (top && top.title === snap.title && top.body === snap.body) return;
+      editState.history = editState.history.slice(0, editState.index + 1);
+      editState.history.push(snap);
+      editState.index = editState.history.length - 1;
+      updateUndoRedo();
+    }
+    function updateUndoRedo() {
+      const u = document.getElementById('undoBtn'), r = document.getElementById('redoBtn');
+      if (u) u.disabled = editState.index <= 0;
+      if (r) r.disabled = editState.index >= editState.history.length - 1;
+    }
+    function setStatus(text, cls) {
+      const el = document.getElementById('status');
+      if (!el) return;
+      el.textContent = text;
+      el.className = 'status' + (cls ? ' ' + cls : '');
+    }
+
+    function onEdit() {
+      setStatus('编辑中…', 'unsaved');
+      clearTimeout(editState.saveTimer);
+      editState.saveTimer = setTimeout(() => {
+        recordSnapshot();
+        autoSave();
+      }, 800);
+    }
+    function onKey(e) {
+      const k = e.key.toLowerCase();
+      if ((e.ctrlKey || e.metaKey) && k === 's') { e.preventDefault(); flushSave(); }
+      else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && k === 'z') { e.preventDefault(); undo(); }
+      else if ((e.ctrlKey || e.metaKey) && (k === 'y' || (e.shiftKey && k === 'z'))) { e.preventDefault(); redo(); }
+    }
+    function undo() {
+      if (editState.index <= 0) return;
+      editState.index--;
+      applySnapshot(editState.history[editState.index]);
+      updateUndoRedo();
+      flushSave();
+    }
+    function redo() {
+      if (editState.index >= editState.history.length - 1) return;
+      editState.index++;
+      applySnapshot(editState.history[editState.index]);
+      updateUndoRedo();
+      flushSave();
+    }
+    function flushSave() {
+      clearTimeout(editState.saveTimer);
+      autoSave();
+    }
+    async function autoSave() {
+      if (editState.saving) { editState.pending = true; return; }
+      const snap = currentSnapshot();
+      const content = snap.title + '\n' + snap.body;
+      // 新便签且内容为空时不创建
+      if (!editState.hasId && !snap.title && !snap.body) return;
+      editState.saving = true;
+      setStatus('保存中…', 'saving');
+      try {
+        let saved;
+        if (editState.hasId) {
+          saved = await api('/api/notes/' + encodeURIComponent(state.current.id), { method: 'PUT', body: JSON.stringify({ content }) });
+          const idx = state.notes.findIndex(n => n.id === saved.id);
+          if (idx >= 0) state.notes[idx] = saved;
+          state.current = saved;
+        } else {
+          saved = await api('/api/notes', { method: 'POST', body: JSON.stringify({ content }) });
+          state.notes.unshift(saved);
+          state.current = saved;
+          editState.hasId = true;
+          // 不触发 hashchange，避免重渲染丢焦点
+          history.replaceState({}, '', '#/n/' + encodeURIComponent(saved.id));
+        }
+        setStatus('已保存 ' + formatTime(saved.updated_at), 'saved');
+      } catch (e) {
+        setStatus('保存失败', 'error');
+      }
+      editState.saving = false;
+      if (editState.pending) { editState.pending = false; autoSave(); }
+    }
+
     function renderDetail(isNew) {
       const note = isNew ? null : state.current;
       const parts = splitContent(note ? note.content : '');
+      // 初始化编辑历史
+      editState.history = [{ title: parts.title, body: parts.body }];
+      editState.index = 0;
+      editState.hasId = !!(note && note.id);
+      editState.saving = false; editState.pending = false;
+      clearTimeout(editState.saveTimer);
+
       const right = `<button class="btn ghost" id="logoutBtn">退出</button>`;
       const back = `<button class="btn ghost back-btn" id="backBtn">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M15 18l-6-6 6-6"/></svg>返回
@@ -382,68 +487,46 @@ INDEX_HTML = r"""<!doctype html>
       </div>`;
 
       const actions = `<div class="detail-actions">
-        ${!isNew ? `<button class="btn danger" id="deleteBtn">删除</button>` : ''}
-        <button class="btn" id="cancelBtn">取消</button>
-        <button class="btn primary" id="saveBtn">保存</button>
+        <button class="btn icon" id="undoBtn" title="撤回 (Ctrl+Z)" disabled><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-15-6.7L3 13"/></svg></button>
+        <button class="btn icon" id="redoBtn" title="恢复 (Ctrl+Y)" disabled><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 7v6h-6"/><path d="M3 17a9 9 0 0 1 15-6.7L21 13"/></svg></button>
+        <span class="sep"></span>
+        <button class="btn danger" id="deleteBtn">删除</button>
+        <button class="btn primary" id="doneBtn">完成</button>
       </div>`;
-
-      const time = note && !isNew ? `更新于 ${formatTime(note.updated_at)}` : '新便签';
 
       root.innerHTML = topbar(right) + `<div class="container">
         <div class="detail-head">${back}</div>
         ${body}
         <div class="detail-foot">
-          <span class="time">${time}</span>
+          <span class="status" id="status">${editState.hasId ? '已保存 ' + formatTime(note.updated_at) : '新便签'}</span>
           ${actions}
         </div>
       </div>`;
 
-      document.getElementById('backBtn').onclick = () => go('/');
-      document.getElementById('logoutBtn').onclick = async () => { await api('/api/logout', { method: 'POST' }); renderLogin(); };
-      document.getElementById('saveBtn').onclick = saveDetail;
-      document.getElementById('cancelBtn').onclick = () => go('/');
-      if (!isNew) document.getElementById('deleteBtn').onclick = deleteDetail;
-      const ta = document.getElementById('content');
-      ta.onkeydown = (e) => {
-        if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); saveDetail(); }
-      };
-      // 新建时自动聚焦标题
-      if (isNew) document.getElementById('title').focus();
-    }
-
-    async function saveDetail() {
       const titleEl = document.getElementById('title');
       const bodyEl = document.getElementById('content');
-      if (!titleEl || !bodyEl) return;
-      // 数据上没有标题：标题行 + 换行 + 正文，统一存入 content
-      const content = titleEl.value + '\n' + bodyEl.value;
-      try {
-        if (state.current && state.current.id) {
-          const updated = await api('/api/notes/' + encodeURIComponent(state.current.id), { method: 'PUT', body: JSON.stringify({ content }) });
-          const idx = state.notes.findIndex(n => n.id === updated.id);
-          if (idx >= 0) state.notes[idx] = updated;
-          state.current = updated;
-          renderDetail(false);
-        } else {
-          const created = await api('/api/notes', { method: 'POST', body: JSON.stringify({ content }) });
-          state.notes.unshift(created);
-          state.current = created;
-          go('/n/' + encodeURIComponent(created.id));
-        }
-      } catch (err) {
-        alert(err.message);
-      }
+      titleEl.oninput = onEdit; bodyEl.oninput = onEdit;
+      titleEl.onkeydown = onKey; bodyEl.onkeydown = onKey;
+      document.getElementById('backBtn').onclick = () => { flushSave(); go('/'); };
+      document.getElementById('logoutBtn').onclick = async () => { await api('/api/logout', { method: 'POST' }); renderLogin(); };
+      document.getElementById('undoBtn').onclick = undo;
+      document.getElementById('redoBtn').onclick = redo;
+      document.getElementById('deleteBtn').onclick = deleteDetail;
+      document.getElementById('doneBtn').onclick = () => { flushSave(); go('/'); };
+      if (isNew) titleEl.focus();
+      updateUndoRedo();
     }
 
     async function deleteDetail() {
-      if (!state.current || !confirm('删除这条便签？此操作不可撤销。')) return;
+      if (!editState.hasId) { go('/'); return; }
+      if (!confirm('删除这条便签？此操作不可撤销。')) return;
       try {
         await api('/api/notes/' + encodeURIComponent(state.current.id), { method: 'DELETE' });
         state.notes = state.notes.filter(n => n.id !== state.current.id);
         state.current = null;
         go('/');
-      } catch (err) {
-        alert(err.message);
+      } catch (e) {
+        alert(e.message);
       }
     }
 
