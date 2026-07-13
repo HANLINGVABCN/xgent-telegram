@@ -46,7 +46,7 @@ from collections import OrderedDict, deque
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from telegram import BotCommand, Update, constants, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import BotCommand, BotCommandScopeAllPrivateChats, Update, constants, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.error import BadRequest, InvalidToken, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
@@ -13190,11 +13190,12 @@ async def setup_bot_commands(app):
                 BotCommand("show_chat_info", "查看状态与记忆统计"),
                 BotCommand("show_all", "导出全部记忆"),
             ]
-            await app.bot.delete_my_commands()
-            await app.bot.set_my_commands(commands)
+            private_scope = BotCommandScopeAllPrivateChats()
+            await app.bot.delete_my_commands(scope=private_scope)
+            await app.bot.set_my_commands(commands, scope=private_scope)
             with contextlib.suppress(Exception):
-                await app.bot.delete_my_commands(language_code="zh")
-                await app.bot.set_my_commands(commands, language_code="zh")
+                await app.bot.delete_my_commands(scope=private_scope, language_code="zh")
+                await app.bot.set_my_commands(commands, scope=private_scope, language_code="zh")
             _startup_commands_synced = True
             logger.info("✅ Telegram 命令菜单已同步")
         except Exception as e:
