@@ -6918,8 +6918,6 @@ def format_chat_name(cid: str, chat_data: dict) -> str:
     return time.strftime("%m-%d %H:%M", time.localtime(ts)) if ts > 0 else cid
 
 def pretty_model_name(name: str) -> str:
-    if len(name) > 25:
-        return "..." + name[-22:]
     return name
 
 def parse_manual_model_names(text: str) -> List[str]:
