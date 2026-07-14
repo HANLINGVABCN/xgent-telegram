@@ -6917,6 +6917,13 @@ def format_chat_name(cid: str, chat_data: dict) -> str:
     ts = chat_data.get('last_active', 0)
     return time.strftime("%m-%d %H:%M", time.localtime(ts)) if ts > 0 else cid
 
+def display_width(s: str) -> int:
+    """估算字符串在 Telegram 按钮中的显示宽度：CJK/全角/emoji 计 2，其余计 1。"""
+    width = 0
+    for ch in s:
+        width += 2 if ord(ch) > 0x2E80 else 1
+    return width
+
 def pretty_model_name(name: str) -> str:
     if len(name) > 25:
         return "..." + name[-22:]
@@ -6976,29 +6983,34 @@ def build_magic_keyboard(items: List[str], page: int, callback_prefix: str, back
     current_items = display_list[(page - 1) * PER_PAGE : page * PER_PAGE]
     keyboard = []
     
-    row = []
+    PAIR_BUDGET = 14   # 单个按钮宽于此值则不与他人同列（半行装不下）
+    ROW_BUDGET   = 28   # 两个按钮同列时的合计宽度上限（含 1 间距）
+
+    pending = None  # (btn, width)
     for m in current_items:
         display_name = pretty_model_name(m)
         if marker_fn:
             marker = marker_fn(m)
             if marker:
                 display_name = f"{display_name} {marker}"
-        is_long = len(display_name) > 16
         # 使用短哈希避免超长
         cb_data = CallbackDataStore.store(f"{callback_prefix}{m}")
         btn = InlineKeyboardButton(display_name, callback_data=cb_data)
-        if is_long:
-            if row:
-                keyboard.append(row)
-                row = []
-            keyboard.append([btn])
+        w = display_width(display_name)
+
+        if pending is None:
+            pending = (btn, w)
+            continue
+        p_btn, p_w = pending
+        # 仅当两个按钮都足够短、且合计宽度在预算内时才同列
+        if p_w <= PAIR_BUDGET and w <= PAIR_BUDGET and p_w + w + 1 <= ROW_BUDGET:
+            keyboard.append([p_btn, btn])
+            pending = None
         else:
-            row.append(btn)
-            if len(row) == 2:
-                keyboard.append(row)
-                row = []
-    if row:
-        keyboard.append(row)
+            keyboard.append([p_btn])
+            pending = (btn, w)
+    if pending:
+        keyboard.append([pending[0]])
     
     nav_row = []
     if total_pages > 1:
