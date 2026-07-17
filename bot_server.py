@@ -4760,6 +4760,39 @@ class SelfTriggerManager:
     _stopping = False
     _started = False
 
+    @staticmethod
+    def _compact_task_summary(value: Any, max_chars: int = 600) -> str:
+        text = str(value or '').strip()
+        if not text:
+            return ''
+        text = re.sub(r'```.*?```', ' ', text, flags=re.S)
+        text = re.sub(r'\s+', ' ', text).strip()
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars - 1].rstrip() + '…'
+
+    @classmethod
+    def _build_task_summary(cls, task: Dict[str, Any]) -> str:
+        for source in (task.get('origin_assistant_text'), task.get('origin_user_text')):
+            source_text = str(source or '')
+            match = re.search(
+                r'(?im)^\s*(?:任务概述|任务说明)\s*[:：]\s*(.+?)\s*$',
+                source_text,
+            )
+            if match:
+                summary = cls._compact_task_summary(match.group(1))
+                if summary:
+                    return summary
+
+        original_request = cls._compact_task_summary(task.get('origin_user_text'))
+        if original_request:
+            return original_request
+
+        command = cls._compact_task_summary(task.get('command'))
+        if command:
+            return f'执行后台命令：{command}'
+        return '未记录任务说明'
+
     @classmethod
     async def _new_task_id(cls) -> str:
         db = await BotMemoryDB.get_instance()
@@ -5389,13 +5422,25 @@ class SelfTriggerManager:
         }.get(run.get('trigger_reason'), str(run.get('trigger_reason') or '后台任务已产生结果'))
         output_text = clip_middle_text(str(run.get('output') or '(无输出)'), 24000, '后台输出')
         original_request = clip_middle_text(str(task.get('origin_user_text') or '(未记录)'), 4000, '原始请求')
+        task_summary = cls._build_task_summary(task)
         condition_text = task.get('condition_expr') or '(无；命令退出即完成)'
         matched_text = ', '.join(matched_conditions) if matched_conditions else '(无)'
+        warning_statuses = {'failed', 'condition_unmatched', 'interrupted'}
+        notice_emoji = '⚠️' if run.get('status') in warning_statuses or run.get('error') else '🔔'
+        visible_notice = (
+            f"{notice_emoji} 后台任务已产生结果\n"
+            f"任务概述：{task_summary}\n"
+            f"结果状态：{reason_text}\n"
+            f"任务 ID：{task['id']}\n"
+            f"AI 正在根据完整执行结果继续处理。"
+        )
         internal_result = (
             f"[后台任务结果]\n"
             f"这是系统在未来时间自动注入的真实执行结果，不是用户刚发送的新请求。"
-            f"请结合原始请求自然地回复用户；不要复述内部协议。需要发送文件时可继续使用 sendfile。\n\n"
+            f"Telegram 中已经显示过任务完成系统提醒。请根据任务概述和执行结果自然地继续处理，"
+            f"不要重复系统提醒、不要复述内部协议。需要发送文件时可继续使用 sendfile。\n\n"
             f"任务 ID: {task['id']}\n"
+            f"任务概述: {task_summary}\n"
             f"原始用户请求: {original_request}\n"
             f"后台命令: {task['command']}\n"
             f"结果原因: {reason_text}\n"
@@ -5414,6 +5459,23 @@ class SelfTriggerManager:
         process_task: Optional[asyncio.Task] = None
         wait_notice_task: Optional[asyncio.Task] = None
         try:
+            try:
+                await bot.send_message(
+                    chat_id=int(task['chat_id']),
+                    text=visible_notice,
+                )
+            except Exception as exc:
+                logger.warning(f"发送 trigger 可见提醒失败 {run_id}: {exc}")
+            await GlobalRecorder.record_system_op(
+                visible_notice,
+                {
+                    'trigger_task_id': task['id'],
+                    'trigger_run_id': run_id,
+                    'task_summary': task_summary,
+                    'result_reason': reason_text,
+                },
+                int(task['chat_id']),
+            )
             await GlobalRecorder.record_user_message(
                 internal_result,
                 MessageType.USER_TEXT,
