@@ -40,9 +40,14 @@ import aiosqlite
 import json
 import httpx
 import hashlib
-from datetime import datetime
+import codecs
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Optional, Tuple, List, Dict, Any, Deque, cast
 from collections import OrderedDict, deque
+
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -1099,6 +1104,53 @@ class BotMemoryDB:
                 timestamp REAL NOT NULL
             )
         ''')
+
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS trigger_tasks (
+                id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                conversation_id TEXT NOT NULL,
+                command TEXT NOT NULL,
+                schedule_type TEXT NOT NULL,
+                schedule_expr TEXT,
+                timezone TEXT NOT NULL,
+                next_run_at REAL,
+                condition_expr TEXT,
+                repeat INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                origin_user_text TEXT,
+                origin_assistant_text TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                last_started_at REAL,
+                last_finished_at REAL,
+                fire_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                recovery_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            )
+        ''')
+
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS trigger_runs (
+                run_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                scheduled_at REAL NOT NULL,
+                started_at REAL,
+                finished_at REAL,
+                status TEXT NOT NULL,
+                trigger_reason TEXT,
+                matched_conditions TEXT,
+                exit_code INTEGER,
+                output TEXT,
+                output_path TEXT,
+                error TEXT,
+                delivered_at REAL,
+                created_at REAL NOT NULL,
+                UNIQUE(task_id, scheduled_at),
+                FOREIGN KEY (task_id) REFERENCES trigger_tasks(id)
+            )
+        ''')
         
         # 索引优化
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_global_timestamp ON global_messages(timestamp)')
@@ -1107,6 +1159,10 @@ class BotMemoryDB:
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id)')
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_chat_messages_time ON chat_messages(timestamp)')
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_unauthorized_access_timestamp ON unauthorized_access_logs(timestamp)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_trigger_tasks_status ON trigger_tasks(status)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_trigger_tasks_next_run ON trigger_tasks(next_run_at)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_trigger_runs_delivery ON trigger_runs(status, delivered_at)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_trigger_runs_task ON trigger_runs(task_id, created_at)')
         
         self._initialized = True
         logger.info("📚 系统记忆数据库初始化完成")
@@ -1415,7 +1471,163 @@ class BotMemoryDB:
         ''', (limit,))
         rows = await cursor.fetchall()
         return [dict(row) for row in reversed(rows)]
-    
+
+    # --- 持久化后台触发任务 ---
+    async def create_trigger_task(self, task: Dict[str, Any]):
+        conn = await self._get_conn()
+        await conn.execute('''
+            INSERT INTO trigger_tasks (
+                id, chat_id, conversation_id, command, schedule_type, schedule_expr,
+                timezone, next_run_at, condition_expr, repeat, status,
+                origin_user_text, origin_assistant_text, created_at, updated_at,
+                last_started_at, last_finished_at, fire_count, failure_count,
+                recovery_count, last_error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            task['id'], task['chat_id'], task['conversation_id'], task['command'],
+            task['schedule_type'], task.get('schedule_expr'), task['timezone'],
+            task.get('next_run_at'), task.get('condition_expr'), int(bool(task.get('repeat'))),
+            task['status'], task.get('origin_user_text'), task.get('origin_assistant_text'),
+            task['created_at'], task['updated_at'], task.get('last_started_at'),
+            task.get('last_finished_at'), int(task.get('fire_count', 0)),
+            int(task.get('failure_count', 0)), int(task.get('recovery_count', 0)),
+            task.get('last_error'),
+        ))
+
+    async def get_trigger_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        conn = await self._get_conn()
+        cursor = await conn.execute('SELECT * FROM trigger_tasks WHERE id = ?', (task_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def list_trigger_tasks(self, active_only: bool = True) -> List[Dict[str, Any]]:
+        conn = await self._get_conn()
+        if active_only:
+            cursor = await conn.execute('''
+                SELECT * FROM trigger_tasks
+                WHERE status NOT IN ('completed', 'cancelled', 'failed')
+                ORDER BY created_at ASC
+            ''')
+        else:
+            cursor = await conn.execute('SELECT * FROM trigger_tasks ORDER BY created_at ASC')
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def update_trigger_task(self, task_id: str, **fields: Any):
+        allowed = {
+            'schedule_expr', 'next_run_at', 'status', 'updated_at', 'last_started_at',
+            'last_finished_at', 'fire_count', 'failure_count', 'recovery_count', 'last_error',
+        }
+        updates = {key: value for key, value in fields.items() if key in allowed}
+        if not updates:
+            return
+        updates.setdefault('updated_at', time.time())
+        assignments = ', '.join(f'{key} = ?' for key in updates)
+        conn = await self._get_conn()
+        await conn.execute(
+            f'UPDATE trigger_tasks SET {assignments} WHERE id = ?',
+            (*updates.values(), task_id),
+        )
+
+    async def cancel_trigger_tasks(self, task_id: Optional[str] = None) -> int:
+        conn = await self._get_conn()
+        now = time.time()
+        if task_id is None:
+            cursor = await conn.execute('''
+                UPDATE trigger_tasks
+                SET status = 'cancelled', next_run_at = NULL, updated_at = ?
+                WHERE status NOT IN ('completed', 'cancelled', 'failed')
+            ''', (now,))
+        else:
+            cursor = await conn.execute('''
+                UPDATE trigger_tasks
+                SET status = 'cancelled', next_run_at = NULL, updated_at = ?
+                WHERE id = ? AND status NOT IN ('completed', 'cancelled', 'failed')
+            ''', (now, task_id))
+        return max(0, int(cursor.rowcount or 0))
+
+    async def create_trigger_run(self, task_id: str, scheduled_at: float,
+                                 trigger_reason: str) -> Tuple[Dict[str, Any], bool]:
+        conn = await self._get_conn()
+        run_id = f"trun_{uuid.uuid4().hex[:10]}"
+        now = time.time()
+        cursor = await conn.execute('''
+            INSERT OR IGNORE INTO trigger_runs (
+                run_id, task_id, scheduled_at, started_at, status,
+                trigger_reason, created_at
+            ) VALUES (?, ?, ?, ?, 'running', ?, ?)
+        ''', (run_id, task_id, scheduled_at, now, trigger_reason, now))
+        created = bool(cursor.rowcount)
+        row_cursor = await conn.execute(
+            'SELECT * FROM trigger_runs WHERE task_id = ? AND scheduled_at = ?',
+            (task_id, scheduled_at),
+        )
+        row = await row_cursor.fetchone()
+        if row is None:
+            raise RuntimeError(f'无法创建 trigger run: {task_id}')
+        return dict(row), created
+
+    async def finish_trigger_run(self, run_id: str, **fields: Any):
+        allowed = {
+            'finished_at', 'status', 'trigger_reason', 'matched_conditions',
+            'exit_code', 'output', 'output_path', 'error', 'delivered_at',
+        }
+        updates = {key: value for key, value in fields.items() if key in allowed}
+        if not updates:
+            return
+        assignments = ', '.join(f'{key} = ?' for key in updates)
+        conn = await self._get_conn()
+        await conn.execute(
+            f'UPDATE trigger_runs SET {assignments} WHERE run_id = ?',
+            (*updates.values(), run_id),
+        )
+
+    async def get_trigger_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        conn = await self._get_conn()
+        cursor = await conn.execute('SELECT * FROM trigger_runs WHERE run_id = ?', (run_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def list_undelivered_trigger_runs(self) -> List[Dict[str, Any]]:
+        conn = await self._get_conn()
+        cursor = await conn.execute('''
+            SELECT r.*, t.chat_id, t.conversation_id, t.command, t.schedule_type,
+                   t.schedule_expr, t.timezone, t.condition_expr, t.repeat,
+                   t.origin_user_text, t.origin_assistant_text
+            FROM trigger_runs r
+            JOIN trigger_tasks t ON t.id = r.task_id
+            WHERE r.finished_at IS NOT NULL AND r.delivered_at IS NULL
+              AND r.status IN ('completed', 'condition_matched', 'condition_unmatched', 'failed', 'interrupted')
+              AND t.status != 'cancelled'
+            ORDER BY r.finished_at ASC
+        ''')
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def interrupt_running_trigger_runs(self) -> int:
+        conn = await self._get_conn()
+        now = time.time()
+        cursor = await conn.execute('''
+            UPDATE trigger_runs
+            SET status = 'interrupted', finished_at = ?,
+                delivered_at = ?,
+                error = COALESCE(error, 'Bot 进程退出，操作系统子进程不可恢复')
+            WHERE status = 'running' AND finished_at IS NULL
+        ''', (now, now))
+        await conn.execute('''
+            UPDATE trigger_tasks
+            SET status = 'recovering', recovery_count = recovery_count + 1,
+                updated_at = ?, last_error = 'Bot 重启后重新执行任务'
+            WHERE status = 'running'
+              AND EXISTS (
+                  SELECT 1 FROM trigger_runs r
+                  WHERE r.task_id = trigger_tasks.id
+                    AND r.status = 'interrupted'
+                    AND r.delivered_at = ?
+              )
+        ''', (now, now))
+        return max(0, int(cursor.rowcount or 0))
+
     async def close(self):
         """关闭连接"""
         if self._connection:
@@ -2451,7 +2663,7 @@ class AgentExecutor:
         n = len(lines)
 
         std_tag_re = re.compile(
-            r'^```(?P<tag>run|shell|stdin:[^\n]+|shellread:[^\n]+|shellkill:[^\n]+|trigger:[^\n]+|'
+            r'^```(?P<tag>run|shell|stdin:[^\n]+|shellread:[^\n]+|shellkill:[^\n]+|trigger(?::[^\n]+)?|'
             r'sendfile|read:[^\n]+|read|edit|grep|media|file:[^\n]+)\s*$'
         )
 
@@ -2552,11 +2764,11 @@ class AgentExecutor:
                     'start_line': block_start,
                     'end_line': end_i,
                 })
-            elif tag.startswith('trigger:'):
+            elif tag == 'trigger' or tag.startswith('trigger:'):
                 blocks.append({
                     'type': 'trigger',
-                    'path': tag[8:].strip(),
-                    'body': raw_body.strip(),
+                    'path': tag[8:].strip() if tag.startswith('trigger:') else '',
+                    'body': raw_body,
                     'start_line': block_start,
                     'end_line': end_i,
                 })
@@ -3570,7 +3782,15 @@ async def terminate_async_process(process: Any):
 
             os.killpg(os.getpgid(process.pid), signal.SIGTERM)
         else:
-            process.terminate()
+            try:
+                killer = await asyncio.create_subprocess_exec(
+                    'taskkill', '/PID', str(process.pid), '/T', '/F',
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await killer.communicate()
+            except Exception:
+                process.terminate()
         try:
             await asyncio.wait_for(process.wait(), timeout=3)
         except asyncio.TimeoutError:
@@ -4360,9 +4580,6 @@ class AgentShellSessionManager:
     async def kill(cls, session_id: str) -> Dict[str, Any]:
         try:
             session = cls._get(session_id)
-            trigger_manager = globals().get('SelfTriggerManager')
-            if trigger_manager is not None:
-                await trigger_manager.cancel_for_session(session_id)
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, session.terminate)
             output = session.read_delta()
@@ -4374,9 +4591,6 @@ class AgentShellSessionManager:
 
     @classmethod
     def kill_all(cls):
-        trigger_manager = globals().get('SelfTriggerManager')
-        if trigger_manager is not None:
-            trigger_manager.cancel_all_now()
         with cls._lock:
             sessions = list(cls._sessions.values())
             cls._sessions.clear()
@@ -4384,25 +4598,129 @@ class AgentShellSessionManager:
             session.terminate()
 
 
-class SelfTriggerTask:
-    def __init__(self, task_id: str, session_id: str, watch: str, command: str,
-                 timeout: Optional[int], repeat: bool, context_text: str,
-                 bot: Any, chat_id: int):
-        self.task_id = task_id
-        self.session_id = session_id
-        self.watch = watch
-        self.command = command
-        self.timeout = timeout
-        self.repeat = repeat
-        self.context_text = context_text
-        self.bot = bot
-        self.chat_id = chat_id
-        self.created_at = time.time()
-        self.created_monotonic = time.monotonic()
-        self.output_offset = 0
-        self.scan_carry = ""
-        self.trigger_count = 0
-        self.monitor_task: Optional[asyncio.Task] = None
+class TriggerConditionExpression:
+    """解析并增量计算由字符串字面量、AND/OR 和括号组成的条件表达式。"""
+
+    def __init__(self, expression: str):
+        self.expression = (expression or '').strip()
+        if not self.expression:
+            raise ValueError('when 条件不能为空')
+        self.tokens = self._tokenize(self.expression)
+        self.index = 0
+        self.ast = self._parse_or()
+        if self.index != len(self.tokens):
+            raise ValueError(f"when 条件存在多余内容: {self.tokens[self.index][1]}")
+        self.literals = list(dict.fromkeys(self._collect_literals(self.ast)))
+        self.matched: set = set()
+        self.carry = ''
+        self.max_literal_length = max(len(item) for item in self.literals)
+
+    @staticmethod
+    def _tokenize(expression: str) -> List[Tuple[str, str]]:
+        tokens: List[Tuple[str, str]] = []
+        index = 0
+        while index < len(expression):
+            char = expression[index]
+            if char.isspace():
+                index += 1
+                continue
+            if char in '()':
+                tokens.append((char, char))
+                index += 1
+                continue
+            if char in {'"', "'"}:
+                quote = char
+                index += 1
+                value: List[str] = []
+                while index < len(expression):
+                    char = expression[index]
+                    if char == '\\' and index + 1 < len(expression):
+                        value.append(expression[index + 1])
+                        index += 2
+                        continue
+                    if char == quote:
+                        break
+                    value.append(char)
+                    index += 1
+                if index >= len(expression) or expression[index] != quote:
+                    raise ValueError('when 条件中的字符串没有闭合')
+                literal = ''.join(value)
+                if not literal:
+                    raise ValueError('when 条件不允许空字符串')
+                tokens.append(('LITERAL', literal))
+                index += 1
+                continue
+            end = index
+            while end < len(expression) and not expression[end].isspace() and expression[end] not in '()':
+                end += 1
+            word = expression[index:end]
+            upper_word = word.upper()
+            if upper_word in {'AND', 'OR'}:
+                tokens.append((upper_word, upper_word))
+            else:
+                tokens.append(('LITERAL', word))
+            index = end
+        if not tokens:
+            raise ValueError('when 条件不能为空')
+        return tokens
+
+    def _accept(self, token_type: str) -> Optional[Tuple[str, str]]:
+        if self.index < len(self.tokens) and self.tokens[self.index][0] == token_type:
+            token = self.tokens[self.index]
+            self.index += 1
+            return token
+        return None
+
+    def _parse_or(self):
+        node = self._parse_and()
+        while self._accept('OR'):
+            node = ('OR', node, self._parse_and())
+        return node
+
+    def _parse_and(self):
+        node = self._parse_primary()
+        while self._accept('AND'):
+            node = ('AND', node, self._parse_primary())
+        return node
+
+    def _parse_primary(self):
+        literal = self._accept('LITERAL')
+        if literal:
+            return ('LITERAL', literal[1])
+        if self._accept('('):
+            node = self._parse_or()
+            if not self._accept(')'):
+                raise ValueError('when 条件缺少右括号')
+            return node
+        found = self.tokens[self.index][1] if self.index < len(self.tokens) else '表达式末尾'
+        raise ValueError(f'when 条件语法错误，意外内容: {found}')
+
+    @classmethod
+    def _collect_literals(cls, node) -> List[str]:
+        if node[0] == 'LITERAL':
+            return [node[1]]
+        return cls._collect_literals(node[1]) + cls._collect_literals(node[2])
+
+    def feed(self, output: str) -> bool:
+        combined = self.carry + (output or '')
+        for literal in self.literals:
+            if literal not in self.matched and literal in combined:
+                self.matched.add(literal)
+        carry_length = max(0, self.max_literal_length - 1)
+        self.carry = combined[-carry_length:] if carry_length else ''
+        return self.is_satisfied()
+
+    def is_satisfied(self) -> bool:
+        def evaluate(node) -> bool:
+            if node[0] == 'LITERAL':
+                return node[1] in self.matched
+            if node[0] == 'AND':
+                return evaluate(node[1]) and evaluate(node[2])
+            return evaluate(node[1]) or evaluate(node[2])
+        return evaluate(self.ast)
+
+    def matched_literals(self) -> List[str]:
+        return [literal for literal in self.literals if literal in self.matched]
 
 
 class _SelfTriggerMessage:
@@ -4427,73 +4745,140 @@ class _SelfTriggerContext:
 
 
 class SelfTriggerManager:
-    """监控 shell 输出，并在命中暗号后通过正常 Agent 循环唤醒 AI。"""
+    """持久化执行后台命令，并把完成结果作为内部系统结果唤醒 AI。"""
 
-    POLL_SECONDS = 3.0
     WAIT_NOTICE_SECONDS = 60.0
-    _tasks: Dict[str, SelfTriggerTask] = {}
+    REPEAT_RESTART_DELAY_SECONDS = 1.0
+    DEFAULT_TIMEZONE = os.getenv('TRIGGER_TIMEZONE', 'Asia/Shanghai')
+    MAX_CAPTURE_CHARS = 200000
+    _application: Optional[Application] = None
+    _runtime_tasks: Dict[str, asyncio.Task] = {}
+    _processes: Dict[str, Any] = {}
+    _task_locks: Dict[str, asyncio.Lock] = {}
     _lock = asyncio.Lock()
     _execution_tasks: set = set()
+    _stopping = False
+    _started = False
 
     @classmethod
-    def _new_task_id(cls) -> str:
+    async def _new_task_id(cls) -> str:
+        db = await BotMemoryDB.get_instance()
         while True:
             task_id = f"trg_{uuid.uuid4().hex[:6]}"
-            if task_id not in cls._tasks:
+            if await db.get_trigger_task(task_id) is None:
                 return task_id
 
     @classmethod
     def _parse_definition(cls, body: str) -> Dict[str, Any]:
-        allowed = {'watch', 'command', 'timeout', 'repeat', 'context'}
-        values: Dict[str, str] = {}
-        current_key: Optional[str] = None
-        for raw_line in (body or '').splitlines():
-            match = re.match(r'^([A-Za-z_]+)\s*:\s*(.*)$', raw_line)
-            if match:
-                key = match.group(1).lower()
-                if key not in allowed:
-                    raise ValueError(f"不支持的字段: {key}")
-                current_key = key
-                values[key] = match.group(2)
-                continue
-            if current_key is not None:
-                values[current_key] = values[current_key] + "\n" + raw_line
-            elif raw_line.strip():
-                raise ValueError(f"无法解析的内容: {raw_line[:80]}")
+        allowed = {'after', 'at', 'cron', 'tz', 'when', 'repeat'}
+        lines = (body or '').splitlines()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        directives: Dict[str, str] = {}
+        command_start = 0
+        for index, raw_line in enumerate(lines):
+            match = re.match(r'^\s*#@([A-Za-z_]+)(?:\s+(.*?))?\s*$', raw_line)
+            if not match:
+                command_start = index
+                break
+            key = match.group(1).lower()
+            value = (match.group(2) or '').strip()
+            if key not in allowed:
+                raise ValueError(f"不支持的 trigger 指令: #@{key}")
+            if key in directives:
+                raise ValueError(f"trigger 指令不能重复: #@{key}")
+            if not value:
+                raise ValueError(f"trigger 指令缺少参数: #@{key}")
+            directives[key] = value
+            command_start = index + 1
 
-        watch = values.get('watch', '').strip()
-        command = values.get('command', '').strip()
-        if not watch:
-            raise ValueError("缺少必填字段 watch")
+        command = '\n'.join(lines[command_start:]).strip()
         if not command:
-            raise ValueError("缺少必填字段 command")
+            raise ValueError('trigger 命令不能为空')
         if any(line.strip() == '```' for line in command.splitlines()):
-            raise ValueError("command 不能包含独立的三反引号围栏")
+            raise ValueError('trigger 命令不能包含独立的三反引号围栏')
 
-        timeout: Optional[int] = None
-        timeout_text = values.get('timeout', '').strip()
-        if timeout_text:
+        timezone_name = directives.get('tz', cls.DEFAULT_TIMEZONE)
+        try:
+            timezone_value = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f'未知时区: {timezone_name}') from exc
+
+        schedule_directives = [key for key in ('after', 'at', 'cron') if key in directives]
+        if len(schedule_directives) > 1:
+            raise ValueError('#@after、#@at、#@cron 只能使用一个')
+
+        now = datetime.now(timezone_value)
+        schedule_type = 'immediate'
+        schedule_expr: Optional[str] = None
+        next_run_at = now.timestamp()
+        if 'after' in directives:
+            duration_match = re.fullmatch(r'(\d+(?:\.\d+)?)\s*([smhdw])', directives['after'], re.I)
+            if not duration_match:
+                raise ValueError('#@after 格式应为 30s、15m、2h、1d 或 1w')
+            duration_value = float(duration_match.group(1))
+            unit = duration_match.group(2).lower()
+            seconds = duration_value * {'s': 1, 'm': 60, 'h': 3600, 'd': 86400, 'w': 604800}[unit]
+            if seconds <= 0:
+                raise ValueError('#@after 必须大于 0')
+            schedule_type = 'once'
+            schedule_expr = directives['after']
+            next_run_at = (now + timedelta(seconds=seconds)).timestamp()
+        elif 'at' in directives:
             try:
-                timeout = int(timeout_text)
+                run_at = datetime.fromisoformat(directives['at'])
             except ValueError as exc:
-                raise ValueError("timeout 必须是整数秒数") from exc
-            if timeout <= 0:
-                raise ValueError("timeout 必须大于 0")
+                raise ValueError('#@at 格式应为 YYYY-MM-DD HH:MM[:SS]') from exc
+            if run_at.tzinfo is None:
+                run_at = run_at.replace(tzinfo=timezone_value)
+            else:
+                run_at = run_at.astimezone(timezone_value)
+            schedule_type = 'once'
+            schedule_expr = directives['at']
+            next_run_at = run_at.timestamp()
+        elif 'cron' in directives:
+            try:
+                cron_trigger = CronTrigger.from_crontab(directives['cron'], timezone=timezone_value)
+                next_fire = cron_trigger.get_next_fire_time(None, now)
+            except Exception as exc:
+                raise ValueError(f"无效的 cron 表达式: {directives['cron']}") from exc
+            if next_fire is None:
+                raise ValueError('cron 表达式没有可执行的未来时间')
+            schedule_type = 'cron'
+            schedule_expr = directives['cron']
+            next_run_at = next_fire.timestamp()
 
-        repeat_text = values.get('repeat', 'false').strip().lower()
+        condition_expr = directives.get('when')
+        if condition_expr:
+            TriggerConditionExpression(condition_expr)
+
+        repeat_text = directives.get('repeat', 'false').lower()
         if repeat_text not in {'true', 'false'}:
-            raise ValueError("repeat 只能是 true 或 false")
+            raise ValueError('#@repeat 只能是 true 或 false')
+        repeat = repeat_text == 'true'
+        if repeat and not condition_expr:
+            raise ValueError('#@repeat true 只能与 #@when 一起使用')
+        if repeat and schedule_type == 'cron':
+            raise ValueError('#@repeat true 不能与 #@cron 同时使用')
+
+        blocked, pattern = AgentCommandBlacklist.check(command)
+        if blocked:
+            raise ValueError(f'命令被安全系统拦截，匹配黑名单: {pattern}')
 
         return {
-            'watch': watch,
             'command': command,
-            'timeout': timeout,
-            'repeat': repeat_text == 'true',
-            'context': values.get('context', '').strip(),
+            'schedule_type': schedule_type,
+            'schedule_expr': schedule_expr,
+            'timezone': timezone_name,
+            'next_run_at': next_run_at,
+            'condition_expr': condition_expr,
+            'repeat': repeat,
         }
 
     @classmethod
-    async def handle_protocol(cls, target: str, body: str, bot: Any, chat_id: int) -> str:
+    async def handle_protocol(cls, target: str, body: str, bot: Any, chat_id: int,
+                              conversation_id: str, origin_user_text: str,
+                              origin_assistant_text: str) -> str:
         normalized_target = (target or '').strip()
         if normalized_target == 'show':
             return await cls.format_active_tasks()
@@ -4505,121 +4890,132 @@ class SelfTriggerManager:
             return await cls.cancel(task_id)
         if normalized_target == 'kill':
             raise ValueError("请使用 trigger:kill:<任务ID> 或 trigger:kill:all")
-        return await cls.register(normalized_target, body, bot, chat_id)
+        if normalized_target:
+            raise ValueError('创建任务请使用裸 ```trigger 协议块')
+        return await cls.register(
+            body, bot, chat_id, conversation_id,
+            origin_user_text, origin_assistant_text,
+        )
 
     @classmethod
-    async def register(cls, session_id: str, body: str, bot: Any, chat_id: int) -> str:
-        if not session_id:
-            raise ValueError("缺少 shell 会话 ID")
-        session = AgentShellSessionManager._get(session_id)
+    async def register(cls, body: str, bot: Any, chat_id: int, conversation_id: str,
+                       origin_user_text: str, origin_assistant_text: str) -> str:
         definition = cls._parse_definition(body)
-        task_id = cls._new_task_id()
-        task = SelfTriggerTask(
-            task_id=task_id,
-            session_id=session_id,
-            watch=definition['watch'],
-            command=definition['command'],
-            timeout=definition['timeout'],
-            repeat=definition['repeat'],
-            context_text=definition['context'],
-            bot=bot,
-            chat_id=chat_id,
-        )
-        task.output_offset = session.output_start_offset
-        async with cls._lock:
-            cls._tasks[task_id] = task
-        task.monitor_task = asyncio.create_task(cls._monitor_loop(task))
-        return (
-            f"[trigger结果] 已创建触发任务 {task_id}，正在监控进程 {session_id}，"
-            f"暗号: {task.watch}"
-        )
+        task_id = await cls._new_task_id()
+        now = time.time()
+        task = {
+            'id': task_id,
+            'chat_id': chat_id,
+            'conversation_id': conversation_id,
+            **definition,
+            'status': 'scheduled' if definition['schedule_type'] in {'once', 'cron'} else 'pending',
+            'origin_user_text': origin_user_text,
+            'origin_assistant_text': origin_assistant_text,
+            'created_at': now,
+            'updated_at': now,
+        }
+        db = await BotMemoryDB.get_instance()
+        await db.create_trigger_task(task)
+        if cls._application is None:
+            cls._application = getattr(bot, '_application', None)
+        await cls._activate_task(task, recovery=False)
+
+        schedule_text = cls._format_schedule(task)
+        condition_text = f"，条件: {definition['condition_expr']}" if definition.get('condition_expr') else ''
+        repeat_text = '，命中后自动重新启动' if definition.get('repeat') else ''
+        return f"[trigger结果] 已创建持久化任务 {task_id}，{schedule_text}{condition_text}{repeat_text}"
 
     @classmethod
     async def cancel(cls, task_id: str) -> str:
-        async with cls._lock:
-            task = cls._tasks.pop(task_id, None)
-        if task is None:
+        db = await BotMemoryDB.get_instance()
+        task = await db.get_trigger_task(task_id)
+        if task is None or task['status'] in {'completed', 'cancelled', 'failed'}:
             return f"[trigger:kill 结果] 未找到触发任务: {task_id}"
-        if task.monitor_task and task.monitor_task is not asyncio.current_task():
-            task.monitor_task.cancel()
-        return (
-            f"[trigger:kill 结果] 已取消触发任务: {task.task_id} "
-            f"(监控会话: {task.session_id}, 暗号: {task.watch})"
-        )
-
-    @classmethod
-    async def cancel_for_session(cls, session_id: str) -> int:
-        async with cls._lock:
-            matched = [task for task in cls._tasks.values() if task.session_id == session_id]
-            for task in matched:
-                cls._tasks.pop(task.task_id, None)
-        for task in matched:
-            if task.monitor_task and task.monitor_task is not asyncio.current_task():
-                task.monitor_task.cancel()
-        if matched:
-            logger.info(f"shellkill 已取消会话 {session_id} 的 {len(matched)} 个触发任务")
-        return len(matched)
+        await db.cancel_trigger_tasks(task_id)
+        cls._remove_scheduler_job(task_id)
+        runtime_task = cls._runtime_tasks.get(task_id)
+        if runtime_task and not runtime_task.done():
+            runtime_task.cancel()
+        process = cls._processes.get(task_id)
+        if process is not None:
+            await terminate_async_process(process)
+        return f"[trigger:kill 结果] 已取消触发任务: {task_id}"
 
     @classmethod
     async def cancel_all(cls) -> int:
-        async with cls._lock:
-            tasks = list(cls._tasks.values())
-            cls._tasks.clear()
-        monitor_tasks = []
+        db = await BotMemoryDB.get_instance()
+        tasks = await db.list_trigger_tasks(active_only=True)
+        count = await db.cancel_trigger_tasks()
         for task in tasks:
-            if task.monitor_task and task.monitor_task is not asyncio.current_task():
-                task.monitor_task.cancel()
-                monitor_tasks.append(task.monitor_task)
-        if monitor_tasks:
-            await asyncio.gather(*monitor_tasks, return_exceptions=True)
-        return len(tasks)
+            cls._remove_scheduler_job(task['id'])
+            runtime_task = cls._runtime_tasks.get(task['id'])
+            if runtime_task and not runtime_task.done():
+                runtime_task.cancel()
+            process = cls._processes.get(task['id'])
+            if process is not None:
+                await terminate_async_process(process)
+        return count
 
     @classmethod
     async def shutdown(cls):
-        await cls.cancel_all()
-        execution_tasks = [task for task in cls._execution_tasks if not task.done()]
-        for execution_task in execution_tasks:
-            execution_task.cancel()
-        if execution_tasks:
-            await asyncio.gather(*execution_tasks, return_exceptions=True)
-
-    @classmethod
-    def cancel_all_now(cls):
-        tasks = list(cls._tasks.values())
-        cls._tasks.clear()
-        for task in tasks:
-            if task.monitor_task and not task.monitor_task.done():
-                task.monitor_task.cancel()
-        for execution_task in list(cls._execution_tasks):
-            if not execution_task.done():
-                execution_task.cancel()
+        cls._stopping = True
+        runtime_tasks = [task for task in cls._runtime_tasks.values() if not task.done()]
+        for runtime_task in runtime_tasks:
+            runtime_task.cancel()
+        for process in list(cls._processes.values()):
+            await terminate_async_process(process)
+        if runtime_tasks:
+            await asyncio.gather(*runtime_tasks, return_exceptions=True)
+        delivery_tasks = [task for task in cls._execution_tasks if not task.done()]
+        for delivery_task in delivery_tasks:
+            delivery_task.cancel()
+        if delivery_tasks:
+            await asyncio.gather(*delivery_tasks, return_exceptions=True)
+        cls._runtime_tasks.clear()
+        cls._processes.clear()
 
     @classmethod
     async def format_active_tasks(cls) -> str:
-        async with cls._lock:
-            tasks = list(cls._tasks.values())
+        db = await BotMemoryDB.get_instance()
+        tasks = await db.list_trigger_tasks(active_only=True)
         if not tasks:
             return "[trigger:show 结果] 当前没有活跃触发任务。"
         lines = [f"[trigger:show 结果] 当前活跃触发任务: {len(tasks)} 个"]
         now = time.time()
         for index, task in enumerate(tasks, start=1):
-            try:
-                running = AgentShellSessionManager._get(task.session_id).is_running()
-                session_status = '运行中' if running else '已退出'
-            except KeyError:
-                session_status = '不存在'
-            elapsed = cls._format_elapsed(now - task.created_at)
-            repeat_text = '是' if task.repeat else '否'
-            if task.repeat:
-                repeat_text += f" (已触发 {task.trigger_count} 次)"
-            context_text = task.context_text or '(无)'
+            elapsed = cls._format_elapsed(now - float(task['created_at']))
+            repeat_text = '是' if task['repeat'] else '否'
+            condition_text = task.get('condition_expr') or '(进程退出时触发)'
             lines.append(
-                f"\n#{index} ID: {task.task_id}\n"
-                f"监控会话: {task.session_id} ({session_status})\n"
-                f"暗号: {task.watch}\n命令: {task.command}\n"
-                f"已等待: {elapsed}\n重复: {repeat_text}\n上下文: {context_text}"
+                f"\n#{index} ID: {task['id']}\n"
+                f"状态: {task['status']}\n计划: {cls._format_schedule(task)}\n"
+                f"条件: {condition_text}\n命令: {task['command']}\n"
+                f"已存在: {elapsed}\n重复监控: {repeat_text}\n"
+                f"已触发: {task['fire_count']} 次，恢复: {task['recovery_count']} 次"
             )
         return "\n".join(lines)
+
+    @classmethod
+    def _format_schedule(cls, task: Dict[str, Any]) -> str:
+        schedule_type = task['schedule_type']
+        if schedule_type == 'immediate':
+            return '立即执行'
+        if schedule_type == 'cron':
+            return f"cron {task['schedule_expr']} ({task['timezone']})"
+        next_run_at = task.get('next_run_at')
+        if next_run_at is None:
+            return '单次任务'
+        timezone_value = ZoneInfo(task['timezone'])
+        local_time = datetime.fromtimestamp(float(next_run_at), timezone_value)
+        return f"单次 {local_time.isoformat(sep=' ', timespec='seconds')}"
+
+    @classmethod
+    def _remove_scheduler_job(cls, task_id: str):
+        if cls._application is None or cls._application.job_queue is None:
+            return
+        job_id = f'self-trigger:{task_id}'
+        with contextlib.suppress(Exception):
+            cls._application.job_queue.scheduler.remove_job(job_id)
 
     @staticmethod
     def _format_elapsed(seconds: float) -> str:
@@ -4631,140 +5027,436 @@ class SelfTriggerManager:
         return f"{seconds // 3600}小时{(seconds % 3600) // 60}分钟"
 
     @classmethod
-    async def _remove_completed_task(cls, task: SelfTriggerTask):
-        async with cls._lock:
-            if cls._tasks.get(task.task_id) is task:
-                cls._tasks.pop(task.task_id, None)
+    async def startup(cls, application: Application):
+        if cls._started and cls._application is application and not cls._stopping:
+            return
+        cls._application = application
+        cls._stopping = False
+        cls._started = True
+        db = await BotMemoryDB.get_instance()
+        interrupted_count = await db.interrupt_running_trigger_runs()
+        if interrupted_count:
+            logger.warning(f'检测到 {interrupted_count} 个因进程重启中断的 trigger run，将恢复任务')
+
+        undelivered_runs = await db.list_undelivered_trigger_runs()
+        for run in undelivered_runs:
+            await cls._reconcile_finished_run_task(run)
+            cls._schedule_delivery(run['run_id'])
+
+        tasks = await db.list_trigger_tasks(active_only=True)
+        for task in tasks:
+            try:
+                await cls._activate_task(task, recovery=task['status'] == 'recovering')
+            except Exception as exc:
+                logger.error(f"恢复 trigger 任务 {task['id']} 失败: {exc}", exc_info=True)
+                await db.update_trigger_task(
+                    task['id'], status='failed', last_error=str(exc)[:1000],
+                    failure_count=int(task['failure_count']) + 1,
+                )
+        logger.info(f'✅ trigger 持久化任务恢复完成，活跃任务 {len(tasks)} 个')
 
     @classmethod
-    def _consume_matches(cls, task: SelfTriggerTask, delta: str) -> int:
-        combined = task.scan_carry + (delta or '')
-        count = combined.count(task.watch)
-        carry_length = max(0, len(task.watch) - 1)
-        task.scan_carry = combined[-carry_length:] if carry_length else ''
-        return count
+    async def _reconcile_finished_run_task(cls, run: Dict[str, Any]):
+        db = await BotMemoryDB.get_instance()
+        task = await db.get_trigger_task(run['task_id'])
+        if task is None or task['status'] != 'running':
+            return
+        counters = {
+            'fire_count': int(task['fire_count']) + 1,
+            'failure_count': int(task['failure_count']) + int(run['status'] in {'failed', 'condition_unmatched'}),
+            'last_error': run.get('error'),
+        }
+        if task['schedule_type'] == 'cron':
+            await db.update_trigger_task(
+                task['id'], status='scheduled', next_run_at=cls._next_cron_timestamp(task),
+                last_finished_at=run['finished_at'], **counters,
+            )
+        elif task['repeat'] and run['status'] == 'condition_matched':
+            await db.update_trigger_task(
+                task['id'], status='pending', next_run_at=time.time(),
+                last_finished_at=run['finished_at'], **counters,
+            )
+        else:
+            await db.update_trigger_task(
+                task['id'], status='completed', next_run_at=None,
+                last_finished_at=run['finished_at'], **counters,
+            )
 
     @classmethod
-    async def _monitor_loop(cls, task: SelfTriggerTask):
-        try:
+    async def _activate_task(cls, task: Dict[str, Any], recovery: bool):
+        if cls._stopping or task['status'] in {'completed', 'cancelled', 'failed'}:
+            return
+        schedule_type = task['schedule_type']
+        now = time.time()
+        next_run_at = float(task.get('next_run_at') or now)
+
+        if schedule_type == 'cron':
+            if next_run_at <= now:
+                cls._launch_runtime(task['id'], next_run_at, 'cron_misfire')
+            cls._add_cron_job(task)
+            return
+
+        if schedule_type == 'once' and next_run_at > now:
+            cls._add_date_job(task['id'], next_run_at, 'scheduled')
+            return
+
+        reason = 'recovery' if recovery else ('overdue' if schedule_type == 'once' else 'immediate')
+        scheduled_at = now if recovery or schedule_type == 'immediate' else next_run_at
+        cls._launch_runtime(task['id'], scheduled_at, reason)
+
+    @classmethod
+    def _add_date_job(cls, task_id: str, scheduled_at: float, reason: str):
+        if cls._application is None or cls._application.job_queue is None:
+            raise RuntimeError('trigger 调度器尚未初始化')
+        cls._application.job_queue.scheduler.add_job(
+            cls._scheduled_job,
+            trigger=DateTrigger(run_date=datetime.fromtimestamp(scheduled_at).astimezone()),
+            args=[task_id, scheduled_at, reason],
+            id=f'self-trigger:{task_id}',
+            replace_existing=True,
+            misfire_grace_time=None,
+        )
+
+    @classmethod
+    def _add_cron_job(cls, task: Dict[str, Any]):
+        if cls._application is None or cls._application.job_queue is None:
+            raise RuntimeError('trigger 调度器尚未初始化')
+        cron_trigger = CronTrigger.from_crontab(
+            task['schedule_expr'],
+            timezone=ZoneInfo(task['timezone']),
+        )
+        cls._application.job_queue.scheduler.add_job(
+            cls._cron_job,
+            trigger=cron_trigger,
+            args=[task['id']],
+            id=f"self-trigger:{task['id']}",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=None,
+        )
+
+    @classmethod
+    async def _scheduled_job(cls, task_id: str, scheduled_at: float, reason: str):
+        cls._launch_runtime(task_id, scheduled_at, reason)
+
+    @classmethod
+    async def _cron_job(cls, task_id: str):
+        scheduled_at = float(int(time.time() // 60) * 60)
+        cls._launch_runtime(task_id, scheduled_at, 'cron')
+
+    @classmethod
+    def _launch_runtime(cls, task_id: str, scheduled_at: float, reason: str):
+        if cls._stopping:
+            return
+        existing = cls._runtime_tasks.get(task_id)
+        if existing and not existing.done():
+            logger.warning(f'trigger 任务 {task_id} 上一次仍在运行，跳过本次 {reason}')
+            return
+        runtime_task = asyncio.create_task(cls._execute_task(task_id, scheduled_at, reason))
+        cls._runtime_tasks[task_id] = runtime_task
+
+        def cleanup(done_task: asyncio.Task):
+            if cls._runtime_tasks.get(task_id) is done_task:
+                cls._runtime_tasks.pop(task_id, None)
+
+        runtime_task.add_done_callback(cleanup)
+
+    @classmethod
+    async def _execute_task(cls, task_id: str, scheduled_at: float, reason: str):
+        task_lock = cls._task_locks.setdefault(task_id, asyncio.Lock())
+        async with task_lock:
+            db = await BotMemoryDB.get_instance()
+            task = await db.get_trigger_task(task_id)
+            if task is None or task['status'] in {'completed', 'cancelled', 'failed'}:
+                return
+
+            run, created = await db.create_trigger_run(task_id, scheduled_at, reason)
+            if not created:
+                return
+            run_id = run['run_id']
+            await db.update_trigger_task(
+                task_id, status='running', last_started_at=time.time(), last_error=None,
+            )
+
+            try:
+                result = await cls._run_trigger_command(task, run_id)
+            except asyncio.CancelledError:
+                process = cls._processes.get(task_id)
+                if process is not None:
+                    await terminate_async_process(process)
+                await db.finish_trigger_run(
+                    run_id, status='interrupted', finished_at=time.time(),
+                    delivered_at=time.time(),
+                    error='Bot 正在关闭，后台进程已终止' if cls._stopping else '任务已取消',
+                )
+                latest = await db.get_trigger_task(task_id)
+                if latest and latest['status'] != 'cancelled':
+                    await db.update_trigger_task(task_id, status='recovering')
+                raise
+            except Exception as exc:
+                logger.error(f'trigger 任务 {task_id} 执行失败: {exc}', exc_info=True)
+                result = {
+                    'status': 'failed', 'trigger_reason': 'execution_error',
+                    'matched_conditions': [], 'exit_code': -1, 'output': '',
+                    'output_path': None, 'error': str(exc)[:2000],
+                }
+            finally:
+                cls._processes.pop(task_id, None)
+
+            finished_at = time.time()
+            await db.finish_trigger_run(
+                run_id,
+                finished_at=finished_at,
+                status=result['status'],
+                trigger_reason=result['trigger_reason'],
+                matched_conditions=json.dumps(result['matched_conditions'], ensure_ascii=False),
+                exit_code=result['exit_code'],
+                output=result['output'],
+                output_path=result['output_path'],
+                error=result['error'],
+            )
+
+            latest = await db.get_trigger_task(task_id)
+            if latest is None or latest['status'] == 'cancelled':
+                return
+            fire_count = int(latest['fire_count']) + 1
+            failure_count = int(latest['failure_count']) + int(result['status'] in {'failed', 'condition_unmatched'})
+            task_status = 'completed'
+            next_run_at: Optional[float] = None
+            restart_repeat = False
+
+            if latest['schedule_type'] == 'cron':
+                task_status = 'scheduled'
+                next_run_at = cls._next_cron_timestamp(latest)
+            elif latest['repeat'] and result['status'] == 'condition_matched' and not cls._stopping:
+                task_status = 'pending'
+                next_run_at = time.time()
+                restart_repeat = True
+
+            await db.update_trigger_task(
+                task_id,
+                status=task_status,
+                next_run_at=next_run_at,
+                last_finished_at=finished_at,
+                fire_count=fire_count,
+                failure_count=failure_count,
+                last_error=result['error'],
+            )
+            cls._schedule_delivery(run_id)
+
+            if restart_repeat:
+                async def restart_when_current_finishes():
+                    await asyncio.sleep(cls.REPEAT_RESTART_DELAY_SECONDS)
+                    cls._launch_runtime(task_id, time.time(), 'repeat')
+                asyncio.create_task(restart_when_current_finishes())
+
+    @classmethod
+    def _next_cron_timestamp(cls, task: Dict[str, Any]) -> Optional[float]:
+        timezone_value = ZoneInfo(task['timezone'])
+        now = datetime.now(timezone_value)
+        trigger = CronTrigger.from_crontab(task['schedule_expr'], timezone=timezone_value)
+        next_fire = trigger.get_next_fire_time(None, now)
+        return next_fire.timestamp() if next_fire else None
+
+    @classmethod
+    async def _run_trigger_command(cls, task: Dict[str, Any], run_id: str) -> Dict[str, Any]:
+        command = task['command'].strip()
+        blocked, pattern = AgentCommandBlacklist.check(command)
+        if blocked:
+            return {
+                'status': 'failed', 'trigger_reason': 'blacklist',
+                'matched_conditions': [], 'exit_code': -1, 'output': '',
+                'output_path': None,
+                'error': f'命令被安全系统拦截，匹配黑名单: {pattern}',
+            }
+
+        condition = TriggerConditionExpression(task['condition_expr']) if task.get('condition_expr') else None
+        now = datetime.now()
+        output_dir = os.path.join(COMMAND_OUTPUT_DIR, now.strftime('%Y-%m-%d'))
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"trigger_{task['id']}_{run_id}.txt")
+        captured_parts: List[str] = []
+        captured_length = 0
+        output_truncated = False
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        matched = False
+
+        kwargs: Dict[str, Any] = {}
+        if os.name != 'nt':
+            kwargs['start_new_session'] = True
+        else:
+            kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+
+        process = await asyncio.create_subprocess_shell(
+            command,
+            cwd=AgentExecutor.WORK_DIR,
+            env={**os.environ, 'LANG': 'en_US.UTF-8'},
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            **kwargs,
+        )
+        cls._processes[task['id']] = process
+
+        with open(output_path, 'w', encoding='utf-8', errors='replace') as output_file:
+            output_file.write(f"Command:\n{command}\n\nStarted at: {datetime.now().isoformat(timespec='seconds')}\n\nOutput:\n")
+            assert process.stdout is not None
             while True:
-                try:
-                    session = AgentShellSessionManager._get(task.session_id)
-                except KeyError:
-                    await cls._remove_completed_task(task)
-                    return
+                chunk = await process.stdout.read(4096)
+                if not chunk:
+                    break
+                text_chunk = decoder.decode(chunk)
+                output_file.write(text_chunk)
+                if captured_length < cls.MAX_CAPTURE_CHARS:
+                    remaining = cls.MAX_CAPTURE_CHARS - captured_length
+                    captured_parts.append(text_chunk[:remaining])
+                    captured_length += min(len(text_chunk), remaining)
+                    if len(text_chunk) > remaining:
+                        output_truncated = True
+                else:
+                    output_truncated = True
+                if condition and not matched and condition.feed(text_chunk):
+                    matched = True
+                    await terminate_async_process(process)
+            final_text = decoder.decode(b'', final=True)
+            if final_text:
+                output_file.write(final_text)
+                if captured_length < cls.MAX_CAPTURE_CHARS:
+                    captured_parts.append(final_text[:cls.MAX_CAPTURE_CHARS - captured_length])
+            await process.wait()
+            output_file.write(f"\n\nFinished at: {datetime.now().isoformat(timespec='seconds')}\nExit code: {process.returncode}\n")
 
-                with session.lock:
-                    output_start_offset = session.output_start_offset
-                if task.output_offset < output_start_offset:
-                    task.scan_carry = ''
-                delta, task.output_offset = session.read_from_offset(task.output_offset)
-                match_count = cls._consume_matches(task, delta)
-                if match_count:
-                    fire_count = match_count if task.repeat else 1
-                    if not task.repeat:
-                        await cls._remove_completed_task(task)
-                    for _ in range(fire_count):
-                        cls._schedule_execution(task, 'watch')
-                    if not task.repeat:
-                        return
-
-                if task.timeout is not None and time.monotonic() - task.created_monotonic >= task.timeout:
-                    await cls._remove_completed_task(task)
-                    cls._schedule_execution(task, 'timeout')
-                    return
-
-                if not session.is_running():
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, lambda: session.wait_reader_drain(0.3))
-                    final_delta, task.output_offset = session.read_from_offset(task.output_offset)
-                    final_matches = cls._consume_matches(task, final_delta)
-                    if final_matches:
-                        fire_count = final_matches if task.repeat else 1
-                        for _ in range(fire_count):
-                            cls._schedule_execution(task, 'watch')
-                    elif task.trigger_count == 0:
-                        cls._schedule_execution(task, 'session_exit')
-                    await cls._remove_completed_task(task)
-                    return
-
-                await asyncio.sleep(cls.POLL_SECONDS)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            await cls._remove_completed_task(task)
-            logger.error(f"触发任务 {task.task_id} 监控失败: {exc}", exc_info=True)
+        output = ''.join(captured_parts).strip() or '(无输出)'
+        if output_truncated:
+            output += f"\n\n[输出过长，内存结果仅保留前 {cls.MAX_CAPTURE_CHARS} 字符；完整输出见文件]"
+        matched_conditions = condition.matched_literals() if condition else []
+        exit_code = process.returncode if process.returncode is not None else -1
+        if condition:
+            status = 'condition_matched' if matched else 'condition_unmatched'
+            trigger_reason = 'condition_matched' if matched else 'process_exited_before_condition'
+            error = None if matched else '进程已退出，但条件表达式未满足'
+        else:
+            status = 'completed' if exit_code == 0 else 'failed'
+            trigger_reason = 'process_exit'
+            error = None if exit_code == 0 else f'命令退出码为 {exit_code}'
+        return {
+            'status': status,
+            'trigger_reason': trigger_reason,
+            'matched_conditions': matched_conditions,
+            'exit_code': exit_code,
+            'output': output,
+            'output_path': to_display_path(output_path),
+            'error': error,
+        }
 
     @classmethod
-    def _schedule_execution(cls, task: SelfTriggerTask, reason: str):
-        task.trigger_count += 1
-        execution_task = asyncio.create_task(cls._execute_trigger(task, reason))
+    def _schedule_delivery(cls, run_id: str):
+        if cls._stopping:
+            return
+        execution_task = asyncio.create_task(cls._deliver_run(run_id))
         cls._execution_tasks.add(execution_task)
         execution_task.add_done_callback(cls._execution_tasks.discard)
 
     @classmethod
-    async def _execute_trigger(cls, task: SelfTriggerTask, reason: str):
+    async def _deliver_run(cls, run_id: str):
+        db = await BotMemoryDB.get_instance()
+        run = await db.get_trigger_run(run_id)
+        if run is None or run.get('delivered_at') is not None or run.get('finished_at') is None:
+            return
+        task = await db.get_trigger_task(run['task_id'])
+        if task is None:
+            return
+        if task['status'] == 'cancelled':
+            await db.finish_trigger_run(run_id, delivered_at=time.time())
+            return
+        if cls._application is None:
+            logger.warning(f'trigger run {run_id} 暂时无法投递：Application 未初始化')
+            return
+
+        matched_conditions: List[str] = []
+        with contextlib.suppress(Exception):
+            matched_conditions = json.loads(run.get('matched_conditions') or '[]')
         reason_text = {
-            'watch': f"检测到触发暗号: {task.watch}",
-            'timeout': f"超时触发，等待 {task.timeout} 秒后仍未检测到暗号: {task.watch}",
-            'session_exit': f"会话已退出，未检测到暗号: {task.watch}",
-        }.get(reason, reason)
-        trigger_text = (
-            f"[系统触发] {task.context_text or '后台触发任务条件已满足'}\n"
-            f"{reason_text}\n来源会话: {task.session_id}\n触发任务: {task.task_id}"
+            'condition_matched': '输出条件已经满足',
+            'process_exited_before_condition': '进程已退出，但输出条件未完全满足',
+            'process_exit': '后台命令已经结束',
+            'execution_error': '后台命令执行异常',
+            'blacklist': '后台命令被安全策略拦截',
+            'recovery': 'Bot 重启后恢复执行的后台命令已经结束',
+            'cron': 'cron 后台命令本次运行已经结束',
+            'cron_misfire': 'Bot 启动后补跑了一次错过的 cron 任务',
+        }.get(run.get('trigger_reason'), str(run.get('trigger_reason') or '后台任务已产生结果'))
+        output_text = clip_middle_text(str(run.get('output') or '(无输出)'), 24000, '后台输出')
+        original_request = clip_middle_text(str(task.get('origin_user_text') or '(未记录)'), 4000, '原始请求')
+        condition_text = task.get('condition_expr') or '(无；命令退出即完成)'
+        matched_text = ', '.join(matched_conditions) if matched_conditions else '(无)'
+        internal_result = (
+            f"[后台任务结果]\n"
+            f"这是系统在未来时间自动注入的真实执行结果，不是用户刚发送的新请求。"
+            f"请结合原始请求自然地回复用户；不要复述内部协议。需要发送文件时可继续使用 sendfile。\n\n"
+            f"任务 ID: {task['id']}\n"
+            f"原始用户请求: {original_request}\n"
+            f"后台命令: {task['command']}\n"
+            f"结果原因: {reason_text}\n"
+            f"条件表达式: {condition_text}\n"
+            f"已匹配条件: {matched_text}\n"
+            f"退出码: {run.get('exit_code')}\n"
+            f"错误: {run.get('error') or '(无)'}\n"
+            f"完整输出文件: {run.get('output_path') or '(无)'}\n\n"
+            f"命令输出:\n{output_text}"
         )
-        fake_context = task.context_text or '后台触发任务条件已满足，请根据命令结果回复用户。'
-        fake_context = re.sub(r'(?m)^```', '``\u200b`', fake_context)
-        fake_ai_response = f"{fake_context}\n{reason_text}\n```run\n{task.command}\n```"
-        update = _SelfTriggerUpdate(task.bot, task.chat_id)
-        context = _SelfTriggerContext(task.bot)
+
+        bot = cls._application.bot
+        update = _SelfTriggerUpdate(bot, int(task['chat_id']))
+        context = _SelfTriggerContext(bot)
         lock_acquired = asyncio.Event()
         process_task: Optional[asyncio.Task] = None
         wait_notice_task: Optional[asyncio.Task] = None
         try:
             await GlobalRecorder.record_user_message(
-                trigger_text,
+                internal_result,
                 MessageType.USER_TEXT,
-                task.chat_id,
+                int(task['chat_id']),
             )
             process_task = asyncio.create_task(process_conversation(
                 update,
                 context,
-                trigger_text,
-                initial_response=fake_ai_response,
+                internal_result,
                 lock_acquired_event=lock_acquired,
                 force_agent_mode=True,
             ))
             wait_notice_task = asyncio.create_task(
-                cls._notify_if_waiting(task, lock_acquired, process_task)
+                cls._notify_if_waiting(task, bot, lock_acquired, process_task)
             )
             await process_task
+            await db.finish_trigger_run(run_id, delivered_at=time.time())
         except asyncio.CancelledError:
             if process_task and not process_task.done():
                 process_task.cancel()
             raise
         except Exception as exc:
-            logger.error(f"执行触发任务 {task.task_id} 失败: {exc}", exc_info=True)
+            logger.error(f"投递 trigger run {run_id} 失败: {exc}", exc_info=True)
             with contextlib.suppress(Exception):
-                await task.bot.send_message(
-                    chat_id=task.chat_id,
-                    text=f"⚠️ 后台触发任务 {task.task_id} 执行失败: {str(exc)[:200]}",
+                await bot.send_message(
+                    chat_id=int(task['chat_id']),
+                    text=f"⚠️ 后台任务 {task['id']} 已产生结果，但 AI 唤醒失败: {str(exc)[:200]}",
                 )
         finally:
             if wait_notice_task and not wait_notice_task.done():
                 wait_notice_task.cancel()
 
     @classmethod
-    async def _notify_if_waiting(cls, task: SelfTriggerTask, lock_acquired: asyncio.Event,
-                                 process_task: asyncio.Task):
+    async def _notify_if_waiting(cls, task: Dict[str, Any], bot: Any,
+                                 lock_acquired: asyncio.Event, process_task: asyncio.Task):
         try:
             await asyncio.wait_for(lock_acquired.wait(), timeout=cls.WAIT_NOTICE_SECONDS)
         except asyncio.TimeoutError:
             if not process_task.done():
                 with contextlib.suppress(Exception):
-                    await task.bot.send_message(
-                        chat_id=task.chat_id,
-                        text=f"⏳ 后台触发任务 {task.task_id} 已触发，正在等待当前对话处理完成。",
+                    await bot.send_message(
+                        chat_id=int(task['chat_id']),
+                        text=f"⏳ 后台任务 {task['id']} 已完成，正在等待当前对话处理结束。",
                     )
 
 
@@ -12021,7 +12713,6 @@ async def cancel_text_conversation(update: Update):
 
 async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
                                content_override: Optional[Any] = None,
-                               initial_response: Optional[str] = None,
                                lock_acquired_event: Optional[asyncio.Event] = None,
                                force_agent_mode: bool = False):
     """处理对话（全局模式 + Agent 协议执行：命令 / 读文件 / 发文件 / 写文件 / 媒体）"""
@@ -12038,7 +12729,6 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
                 context,
                 text,
                 content_override,
-                initial_response,
                 force_agent_mode,
             )
         finally:
@@ -12048,7 +12738,6 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def _process_conversation_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
                                        content_override: Optional[Any] = None,
-                                       initial_response: Optional[str] = None,
                                        force_agent_mode: bool = False):
     """process_conversation 内部实现"""
     agent_mode = force_agent_mode or UserDataManager.get('agent_mode', False)
@@ -12081,27 +12770,24 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
         else:
             history.append({'role': 'user', 'content': content_override})
     
-    if initial_response is not None:
-        response = initial_response.strip()
-    else:
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id,
-            action=constants.ChatAction.TYPING
-        )
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=constants.ChatAction.TYPING
+    )
 
-        # 根据流式/非流式开关选择回复方式
-        if stream_mode:
-            response = await send_streaming_response(
-                update, context,
-                prov_name, prov_data, model,
-                system_prompt, history
-            )
-        else:
-            response = await send_non_streaming_response(
-                update, context,
-                prov_name, prov_data, model,
-                system_prompt, history
-            )
+    # 根据流式/非流式开关选择回复方式
+    if stream_mode:
+        response = await send_streaming_response(
+            update, context,
+            prov_name, prov_data, model,
+            system_prompt, history
+        )
+    else:
+        response = await send_non_streaming_response(
+            update, context,
+            prov_name, prov_data, model,
+            system_prompt, history
+        )
     
     if not response:
         await db.remove_last_chat_message(cid)
@@ -12606,6 +13292,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             block.get('body') or '',
                             context.bot,
                             update.effective_chat.id,
+                            cid,
+                            text,
+                            response,
                         )
                     except Exception as e:
                         trigger_notice = f"[trigger结果] 操作失败: {str(e)[:300]}"
@@ -13604,6 +14293,10 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 async def setup_bot_commands(app):
     """同步 Telegram 命令菜单，并在启动后发送完整主菜单。"""
     global _startup_commands_synced, _startup_menu_sent
+
+    await UserDataManager.init()
+    await BotMemoryDB.get_instance()
+    await SelfTriggerManager.startup(app)
 
     if not _startup_commands_synced:
         try:
