@@ -119,7 +119,7 @@ Agent 模式开启后，模型可以通过协议块调用真实工具：
 - `stdin`：向已有 shell 会话输入终端宏；普通文本直接写，只有明确控制前缀才有特殊含义；`key:` 发送按键，`line:` 输入文本并回车，`paste:` 或 `paste: <<EOF` 显式粘贴文本，`raw:`/`hex:`/`base64:`/`bytes:` 可表达任意字节；完整语法见 `skill/stdin-syntax.md`。
 - `shellread`：快速读取已有 shell 会话的新输出，只短暂捕获当前输出，不按完整命令等待窗口长等，适合用户明确要求继续观察持续日志、安装进度或服务状态。
 - `shellkill`：关闭不再需要的 shell 会话。
-- `trigger`：创建独立的持久化后台 Shell 任务，块内直接写非交互命令；顶部连续的 `#@after`、`#@at`、`#@cron`、`#@tz`、`#@when`、`#@repeat` 分别配置调度、时区、粘性 AND/OR 字面条件和重复监控。它与 shell 会话无关，不使用 session_id、watch 暗号或 context。创建回复必须在协议块外提供一行自包含的 `任务概述：...`，系统从中提取说明，缺失时回退到原始用户请求或命令。任务与运行结果存入 SQLite；Bot 重启后恢复未来任务、立即补跑逾期单次任务、至多合并补跑一次错过的 cron，并重新执行真正被中断的任务；已完成但未投递的结果只补投递。完成时 Telegram 先显示包含任务概述、结果状态和任务 ID 的系统提醒，再以包含完整上下文的 `[后台任务结果]` 唤醒模型；模型即使没有旧记忆也能判断任务，并可继续使用 `read`、`run`、`sendfile` 等协议。支持 `trigger:show`、`trigger:kill:<id>`、`trigger:kill:all`。
+- `trigger`：创建独立的持久化后台 Shell 任务，块内顶部必须提供自包含的 `#@summary`，并可继续用 `#@after`、`#@at`、`#@cron`、`#@tz`、`#@when`、`#@repeat` 配置调度、时区、粘性 AND/OR 字面条件和重复监控。summary 作为任务元数据持久化，不会作为 Shell 命令执行；旧任务缺少 summary 时回退到历史请求或命令。它与 shell 会话无关，不使用 session_id、watch 暗号或 context。任务与运行结果存入 SQLite；Bot 重启后恢复未来任务、立即补跑逾期单次任务、至多合并补跑一次错过的 cron，并重新执行真正被中断的任务；已完成但未投递的结果只补投递。完成时 Telegram 先显示包含任务概述、结果状态和任务 ID 的系统提醒，再以包含完整上下文的 `[后台任务结果]` 唤醒模型；模型即使没有旧记忆也能判断任务，并可继续使用 `read`、`run`、`sendfile` 等协议。支持 `trigger:show`、`trigger:kill:<id>`、`trigger:kill:all`。
 - `read`：按路径读取文件本体并直接回灌给 AI。文本/代码/JSON/Markdown 等作为完整文本上下文返回，图片作为图片本体返回，其他文件视模型通道能力返回。
 - `sendfile`：把服务器上的文件发送给用户；只把发送结果回灌给 AI，不回灌文件本体。≤50MB 走原生上传；>50MB 且启用了本地 API 容器时自动通过本地 API 直穿（硬链接零拷贝，可达 2GB）；未启用本地 API 时大文件报错。
 - `file:`：创建或覆盖服务器文件；只把写入结果回灌给 AI，不回灌文件本体。支持三种写法：普通三反引号（内容不含 ``` 时）、heredoc 语法 `file:/path <<EOF ... EOF`（内容含 ``` 或特殊字符，推荐用于 Markdown/代码文件）、base64 语法 `file:base64:/path`（二进制安全，解码后按字节写入）。

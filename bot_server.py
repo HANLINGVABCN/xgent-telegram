@@ -1111,6 +1111,7 @@ class BotMemoryDB:
                 chat_id INTEGER NOT NULL,
                 conversation_id TEXT NOT NULL,
                 command TEXT NOT NULL,
+                summary TEXT,
                 schedule_type TEXT NOT NULL,
                 schedule_expr TEXT,
                 timezone TEXT NOT NULL,
@@ -1151,6 +1152,11 @@ class BotMemoryDB:
                 FOREIGN KEY (task_id) REFERENCES trigger_tasks(id)
             )
         ''')
+
+        try:
+            await conn.execute('ALTER TABLE trigger_tasks ADD COLUMN summary TEXT')
+        except Exception:
+            pass
         
         # 索引优化
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_global_timestamp ON global_messages(timestamp)')
@@ -1477,15 +1483,15 @@ class BotMemoryDB:
         conn = await self._get_conn()
         await conn.execute('''
             INSERT INTO trigger_tasks (
-                id, chat_id, conversation_id, command, schedule_type, schedule_expr,
+                id, chat_id, conversation_id, command, summary, schedule_type, schedule_expr,
                 timezone, next_run_at, condition_expr, repeat, status,
                 origin_user_text, origin_assistant_text, created_at, updated_at,
                 last_started_at, last_finished_at, fire_count, failure_count,
                 recovery_count, last_error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             task['id'], task['chat_id'], task['conversation_id'], task['command'],
-            task['schedule_type'], task.get('schedule_expr'), task['timezone'],
+            task.get('summary'), task['schedule_type'], task.get('schedule_expr'), task['timezone'],
             task.get('next_run_at'), task.get('condition_expr'), int(bool(task.get('repeat'))),
             task['status'], task.get('origin_user_text'), task.get('origin_assistant_text'),
             task['created_at'], task['updated_at'], task.get('last_started_at'),
@@ -4773,6 +4779,10 @@ class SelfTriggerManager:
 
     @classmethod
     def _build_task_summary(cls, task: Dict[str, Any]) -> str:
+        stored_summary = cls._compact_task_summary(task.get('summary'))
+        if stored_summary:
+            return stored_summary
+
         for source in (task.get('origin_assistant_text'), task.get('origin_user_text')):
             source_text = str(source or '')
             match = re.search(
@@ -4803,7 +4813,7 @@ class SelfTriggerManager:
 
     @classmethod
     def _parse_definition(cls, body: str) -> Dict[str, Any]:
-        allowed = {'after', 'at', 'cron', 'tz', 'when', 'repeat'}
+        allowed = {'summary', 'after', 'at', 'cron', 'tz', 'when', 'repeat'}
         lines = (body or '').splitlines()
         while lines and not lines[0].strip():
             lines.pop(0)
@@ -4830,6 +4840,13 @@ class SelfTriggerManager:
             raise ValueError('trigger 命令不能为空')
         if any(line.strip() == '```' for line in command.splitlines()):
             raise ValueError('trigger 命令不能包含独立的三反引号围栏')
+
+        summary_source = re.sub(r'\s+', ' ', str(directives.get('summary') or '')).strip()
+        if len(summary_source) > 600:
+            raise ValueError('#@summary 不能超过 600 个字符')
+        summary = cls._compact_task_summary(summary_source)
+        if not summary:
+            raise ValueError('trigger 必须在顶部提供 #@summary 任务概述')
 
         timezone_name = directives.get('tz', cls.DEFAULT_TIMEZONE)
         try:
@@ -4900,6 +4917,7 @@ class SelfTriggerManager:
 
         return {
             'command': command,
+            'summary': summary,
             'schedule_type': schedule_type,
             'schedule_expr': schedule_expr,
             'timezone': timezone_name,
@@ -4956,7 +4974,10 @@ class SelfTriggerManager:
         schedule_text = cls._format_schedule(task)
         condition_text = f"，条件: {definition['condition_expr']}" if definition.get('condition_expr') else ''
         repeat_text = '，命中后自动重新启动' if definition.get('repeat') else ''
-        return f"[trigger结果] 已创建持久化任务 {task_id}，{schedule_text}{condition_text}{repeat_text}"
+        return (
+            f"[trigger结果] 已创建持久化任务 {task_id}，概述: {definition['summary']}，"
+            f"{schedule_text}{condition_text}{repeat_text}"
+        )
 
     @classmethod
     async def cancel(cls, task_id: str) -> str:
@@ -5021,6 +5042,7 @@ class SelfTriggerManager:
             condition_text = task.get('condition_expr') or '(进程退出时触发)'
             lines.append(
                 f"\n#{index} ID: {task['id']}\n"
+                f"概述: {cls._build_task_summary(task)}\n"
                 f"状态: {task['status']}\n计划: {cls._format_schedule(task)}\n"
                 f"条件: {condition_text}\n命令: {task['command']}\n"
                 f"已存在: {elapsed}\n重复监控: {repeat_text}\n"
