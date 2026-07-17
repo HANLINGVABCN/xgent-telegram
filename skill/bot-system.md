@@ -26,7 +26,7 @@ Telegram AI Bot 的提示词结构、拼接逻辑、回复流程和基础功能�
 
 - `prompts/main.txt`：主提示词，当前只定义基础身份。
 - `prompts/global_addon.txt`：全局事实层，说明运行环境、上下文读取和记忆使用规则。
-- `prompts/agent_addon.txt`：Agent 与工具能力说明，定义 `run`、`shell`、`stdin:*`、`shellread:*`、`shellkill:*`、`read`、`file:`、`sendfile`、`media` 等协议。
+- `prompts/agent_addon.txt`：Agent 与工具能力说明，定义 `run`、`shell`、`stdin:*`、`shellread:*`、`shellkill:*`、`trigger:*`、`read`、`file:`、`sendfile`、`media` 等协议。
 - `prompts/agent_disabled_addon.txt`：Agent 关闭时的补充说明。
 - `prompts/extras/idle_message.txt`：空闲提醒消息的生成提示。
 - `prompts/extras/unauthorized_reply_messages.txt`：未授权用户的拒绝回复。
@@ -85,7 +85,7 @@ skill 文件简介只读取 `!` 围栏协议块：
    - `send_streaming_response()`
    - `send_non_streaming_response()`
 6. 回复成功后，写入 `global_messages` 和兼容镜像 `chat_messages`。
-7. 如果 Agent 模式开启，解析模型回复里的协议块并进入最多 10 轮工具执行循环。
+7. 如果 Agent 模式开启，解析模型回复里的协议块并进入最多 10 轮工具执行循环；`trigger:*` 可把 shell 输出条件注册为后台自唤醒任务。
 8. 工具结果会作为新的上下文回灌给模型，直到模型不再请求工具或达到轮数上限。shell/stdin/shellread 会先等到命令结束、交互提示、明显长驻或等待窗口到期，再把当前结果回灌给模型继续自动判断。
 
 停止按钮会设置全局停止事件。命令、媒体生成和 Agent 操作会检查该事件并尽量中断后续流程。
@@ -119,6 +119,7 @@ Agent 模式开启后，模型可以通过协议块调用真实工具：
 - `stdin`：向已有 shell 会话输入终端宏；普通文本直接写，只有明确控制前缀才有特殊含义；`key:` 发送按键，`line:` 输入文本并回车，`paste:` 或 `paste: <<EOF` 显式粘贴文本，`raw:`/`hex:`/`base64:`/`bytes:` 可表达任意字节；完整语法见 `skill/stdin-syntax.md`。
 - `shellread`：快速读取已有 shell 会话的新输出，只短暂捕获当前输出，不按完整命令等待窗口长等，适合用户明确要求继续观察持续日志、安装进度或服务状态。
 - `shellkill`：关闭不再需要的 shell 会话。
+- `trigger:<session_id>`：监控指定 shell 会话的新增输出，检测到 `watch` 暗号、等待超时或会话自然退出时，在 bot 进程内部注入一条带 `run` 的伪装 AI 回复并重新进入正常 Agent 循环。支持 `trigger:show`、`trigger:kill:<id>` 和 `trigger:kill:all` 管理内存中的任务；`repeat: true` 可持续触发。任务不会跨 bot 重启恢复，主动 `shellkill` 会取消关联任务且不触发。
 - `read`：按路径读取文件本体并直接回灌给 AI。文本/代码/JSON/Markdown 等作为完整文本上下文返回，图片作为图片本体返回，其他文件视模型通道能力返回。
 - `sendfile`：把服务器上的文件发送给用户；只把发送结果回灌给 AI，不回灌文件本体。≤50MB 走原生上传；>50MB 且启用了本地 API 容器时自动通过本地 API 直穿（硬链接零拷贝，可达 2GB）；未启用本地 API 时大文件报错。
 - `file:`：创建或覆盖服务器文件；只把写入结果回灌给 AI，不回灌文件本体。支持三种写法：普通三反引号（内容不含 ``` 时）、heredoc 语法 `file:/path <<EOF ... EOF`（内容含 ``` 或特殊字符，推荐用于 Markdown/代码文件）、base64 语法 `file:base64:/path`（二进制安全，解码后按字节写入）。
