@@ -2451,7 +2451,7 @@ class AgentExecutor:
         n = len(lines)
 
         std_tag_re = re.compile(
-            r'^```(?P<tag>run|shell|stdin:[^\n]+|shellread:[^\n]+|shellkill:[^\n]+|'
+            r'^```(?P<tag>run|shell|stdin:[^\n]+|shellread:[^\n]+|shellkill:[^\n]+|trigger:[^\n]+|'
             r'sendfile|read:[^\n]+|read|edit|grep|media|file:[^\n]+)\s*$'
         )
 
@@ -2548,6 +2548,14 @@ class AgentExecutor:
                 blocks.append({
                     'type': 'shellkill',
                     'path': tag[10:].strip(),
+                    'body': raw_body.strip(),
+                    'start_line': block_start,
+                    'end_line': end_i,
+                })
+            elif tag.startswith('trigger:'):
+                blocks.append({
+                    'type': 'trigger',
+                    'path': tag[8:].strip(),
                     'body': raw_body.strip(),
                     'start_line': block_start,
                     'end_line': end_i,
@@ -3596,6 +3604,7 @@ class AgentShellSession:
         self.lock = threading.RLock()
         self.input_lock = threading.Lock()
         self.output = ""
+        self.output_start_offset = 0
         self.read_index = 0
         self.output_chunks = 0
         self.output_events: Deque[Tuple[float, int]] = deque(maxlen=300)
@@ -3655,6 +3664,7 @@ class AgentShellSession:
             overflow = len(self.output) - self.MAX_BUFFER
             if overflow > 0:
                 self.output = self.output[overflow:]
+                self.output_start_offset += overflow
                 self.read_index = max(0, self.read_index - overflow)
 
     def _read_pty_loop(self):
@@ -3720,6 +3730,14 @@ class AgentShellSession:
     def read_recent(self, max_chars: int = 4000) -> str:
         with self.lock:
             return self.output[-max_chars:]
+
+    def read_from_offset(self, offset: int) -> Tuple[str, int]:
+        """按绝对字符偏移读取新增输出，不修改 shellread 使用的 read_index。"""
+        with self.lock:
+            absolute_start = self.output_start_offset
+            absolute_end = absolute_start + len(self.output)
+            relative_start = max(0, min(len(self.output), int(offset) - absolute_start))
+            return self.output[relative_start:], absolute_end
 
     def read_snapshot(self, max_chars: int = 4000) -> str:
         with self.lock:
@@ -4342,6 +4360,9 @@ class AgentShellSessionManager:
     async def kill(cls, session_id: str) -> Dict[str, Any]:
         try:
             session = cls._get(session_id)
+            trigger_manager = globals().get('SelfTriggerManager')
+            if trigger_manager is not None:
+                await trigger_manager.cancel_for_session(session_id)
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, session.terminate)
             output = session.read_delta()
@@ -4353,11 +4374,398 @@ class AgentShellSessionManager:
 
     @classmethod
     def kill_all(cls):
+        trigger_manager = globals().get('SelfTriggerManager')
+        if trigger_manager is not None:
+            trigger_manager.cancel_all_now()
         with cls._lock:
             sessions = list(cls._sessions.values())
             cls._sessions.clear()
         for session in sessions:
             session.terminate()
+
+
+class SelfTriggerTask:
+    def __init__(self, task_id: str, session_id: str, watch: str, command: str,
+                 timeout: Optional[int], repeat: bool, context_text: str,
+                 bot: Any, chat_id: int):
+        self.task_id = task_id
+        self.session_id = session_id
+        self.watch = watch
+        self.command = command
+        self.timeout = timeout
+        self.repeat = repeat
+        self.context_text = context_text
+        self.bot = bot
+        self.chat_id = chat_id
+        self.created_at = time.time()
+        self.created_monotonic = time.monotonic()
+        self.output_offset = 0
+        self.scan_carry = ""
+        self.trigger_count = 0
+        self.monitor_task: Optional[asyncio.Task] = None
+
+
+class _SelfTriggerMessage:
+    def __init__(self, bot: Any, chat_id: int):
+        self.bot = bot
+        self.chat_id = chat_id
+
+    async def reply_text(self, text: str, **kwargs):
+        return await self.bot.send_message(chat_id=self.chat_id, text=text, **kwargs)
+
+
+class _SelfTriggerUpdate:
+    def __init__(self, bot: Any, chat_id: int):
+        self.effective_chat = type('SelfTriggerChat', (), {'id': chat_id})()
+        self.message = _SelfTriggerMessage(bot, chat_id)
+        self.callback_query = None
+
+
+class _SelfTriggerContext:
+    def __init__(self, bot: Any):
+        self.bot = bot
+
+
+class SelfTriggerManager:
+    """监控 shell 输出，并在命中暗号后通过正常 Agent 循环唤醒 AI。"""
+
+    POLL_SECONDS = 3.0
+    WAIT_NOTICE_SECONDS = 60.0
+    _tasks: Dict[str, SelfTriggerTask] = {}
+    _lock = asyncio.Lock()
+    _execution_tasks: set = set()
+
+    @classmethod
+    def _new_task_id(cls) -> str:
+        while True:
+            task_id = f"trg_{uuid.uuid4().hex[:6]}"
+            if task_id not in cls._tasks:
+                return task_id
+
+    @classmethod
+    def _parse_definition(cls, body: str) -> Dict[str, Any]:
+        allowed = {'watch', 'command', 'timeout', 'repeat', 'context'}
+        values: Dict[str, str] = {}
+        current_key: Optional[str] = None
+        for raw_line in (body or '').splitlines():
+            match = re.match(r'^([A-Za-z_]+)\s*:\s*(.*)$', raw_line)
+            if match:
+                key = match.group(1).lower()
+                if key not in allowed:
+                    raise ValueError(f"不支持的字段: {key}")
+                current_key = key
+                values[key] = match.group(2)
+                continue
+            if current_key is not None:
+                values[current_key] = values[current_key] + "\n" + raw_line
+            elif raw_line.strip():
+                raise ValueError(f"无法解析的内容: {raw_line[:80]}")
+
+        watch = values.get('watch', '').strip()
+        command = values.get('command', '').strip()
+        if not watch:
+            raise ValueError("缺少必填字段 watch")
+        if not command:
+            raise ValueError("缺少必填字段 command")
+        if any(line.strip() == '```' for line in command.splitlines()):
+            raise ValueError("command 不能包含独立的三反引号围栏")
+
+        timeout: Optional[int] = None
+        timeout_text = values.get('timeout', '').strip()
+        if timeout_text:
+            try:
+                timeout = int(timeout_text)
+            except ValueError as exc:
+                raise ValueError("timeout 必须是整数秒数") from exc
+            if timeout <= 0:
+                raise ValueError("timeout 必须大于 0")
+
+        repeat_text = values.get('repeat', 'false').strip().lower()
+        if repeat_text not in {'true', 'false'}:
+            raise ValueError("repeat 只能是 true 或 false")
+
+        return {
+            'watch': watch,
+            'command': command,
+            'timeout': timeout,
+            'repeat': repeat_text == 'true',
+            'context': values.get('context', '').strip(),
+        }
+
+    @classmethod
+    async def handle_protocol(cls, target: str, body: str, bot: Any, chat_id: int) -> str:
+        normalized_target = (target or '').strip()
+        if normalized_target == 'show':
+            return await cls.format_active_tasks()
+        if normalized_target.startswith('kill:'):
+            task_id = normalized_target[5:].strip()
+            if task_id == 'all':
+                count = await cls.cancel_all()
+                return f"[trigger:kill 结果] 已取消全部触发任务，共 {count} 个。"
+            return await cls.cancel(task_id)
+        if normalized_target == 'kill':
+            raise ValueError("请使用 trigger:kill:<任务ID> 或 trigger:kill:all")
+        return await cls.register(normalized_target, body, bot, chat_id)
+
+    @classmethod
+    async def register(cls, session_id: str, body: str, bot: Any, chat_id: int) -> str:
+        if not session_id:
+            raise ValueError("缺少 shell 会话 ID")
+        session = AgentShellSessionManager._get(session_id)
+        definition = cls._parse_definition(body)
+        task_id = cls._new_task_id()
+        task = SelfTriggerTask(
+            task_id=task_id,
+            session_id=session_id,
+            watch=definition['watch'],
+            command=definition['command'],
+            timeout=definition['timeout'],
+            repeat=definition['repeat'],
+            context_text=definition['context'],
+            bot=bot,
+            chat_id=chat_id,
+        )
+        task.output_offset = session.output_start_offset
+        async with cls._lock:
+            cls._tasks[task_id] = task
+        task.monitor_task = asyncio.create_task(cls._monitor_loop(task))
+        return (
+            f"[trigger结果] 已创建触发任务 {task_id}，正在监控进程 {session_id}，"
+            f"暗号: {task.watch}"
+        )
+
+    @classmethod
+    async def cancel(cls, task_id: str) -> str:
+        async with cls._lock:
+            task = cls._tasks.pop(task_id, None)
+        if task is None:
+            return f"[trigger:kill 结果] 未找到触发任务: {task_id}"
+        if task.monitor_task and task.monitor_task is not asyncio.current_task():
+            task.monitor_task.cancel()
+        return (
+            f"[trigger:kill 结果] 已取消触发任务: {task.task_id} "
+            f"(监控会话: {task.session_id}, 暗号: {task.watch})"
+        )
+
+    @classmethod
+    async def cancel_for_session(cls, session_id: str) -> int:
+        async with cls._lock:
+            matched = [task for task in cls._tasks.values() if task.session_id == session_id]
+            for task in matched:
+                cls._tasks.pop(task.task_id, None)
+        for task in matched:
+            if task.monitor_task and task.monitor_task is not asyncio.current_task():
+                task.monitor_task.cancel()
+        if matched:
+            logger.info(f"shellkill 已取消会话 {session_id} 的 {len(matched)} 个触发任务")
+        return len(matched)
+
+    @classmethod
+    async def cancel_all(cls) -> int:
+        async with cls._lock:
+            tasks = list(cls._tasks.values())
+            cls._tasks.clear()
+        monitor_tasks = []
+        for task in tasks:
+            if task.monitor_task and task.monitor_task is not asyncio.current_task():
+                task.monitor_task.cancel()
+                monitor_tasks.append(task.monitor_task)
+        if monitor_tasks:
+            await asyncio.gather(*monitor_tasks, return_exceptions=True)
+        return len(tasks)
+
+    @classmethod
+    async def shutdown(cls):
+        await cls.cancel_all()
+        execution_tasks = [task for task in cls._execution_tasks if not task.done()]
+        for execution_task in execution_tasks:
+            execution_task.cancel()
+        if execution_tasks:
+            await asyncio.gather(*execution_tasks, return_exceptions=True)
+
+    @classmethod
+    def cancel_all_now(cls):
+        tasks = list(cls._tasks.values())
+        cls._tasks.clear()
+        for task in tasks:
+            if task.monitor_task and not task.monitor_task.done():
+                task.monitor_task.cancel()
+        for execution_task in list(cls._execution_tasks):
+            if not execution_task.done():
+                execution_task.cancel()
+
+    @classmethod
+    async def format_active_tasks(cls) -> str:
+        async with cls._lock:
+            tasks = list(cls._tasks.values())
+        if not tasks:
+            return "[trigger:show 结果] 当前没有活跃触发任务。"
+        lines = [f"[trigger:show 结果] 当前活跃触发任务: {len(tasks)} 个"]
+        now = time.time()
+        for index, task in enumerate(tasks, start=1):
+            try:
+                running = AgentShellSessionManager._get(task.session_id).is_running()
+                session_status = '运行中' if running else '已退出'
+            except KeyError:
+                session_status = '不存在'
+            elapsed = cls._format_elapsed(now - task.created_at)
+            repeat_text = '是' if task.repeat else '否'
+            if task.repeat:
+                repeat_text += f" (已触发 {task.trigger_count} 次)"
+            context_text = task.context_text or '(无)'
+            lines.append(
+                f"\n#{index} ID: {task.task_id}\n"
+                f"监控会话: {task.session_id} ({session_status})\n"
+                f"暗号: {task.watch}\n命令: {task.command}\n"
+                f"已等待: {elapsed}\n重复: {repeat_text}\n上下文: {context_text}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        if seconds < 60:
+            return f"{seconds}秒"
+        if seconds < 3600:
+            return f"{seconds // 60}分钟"
+        return f"{seconds // 3600}小时{(seconds % 3600) // 60}分钟"
+
+    @classmethod
+    async def _remove_completed_task(cls, task: SelfTriggerTask):
+        async with cls._lock:
+            if cls._tasks.get(task.task_id) is task:
+                cls._tasks.pop(task.task_id, None)
+
+    @classmethod
+    def _consume_matches(cls, task: SelfTriggerTask, delta: str) -> int:
+        combined = task.scan_carry + (delta or '')
+        count = combined.count(task.watch)
+        carry_length = max(0, len(task.watch) - 1)
+        task.scan_carry = combined[-carry_length:] if carry_length else ''
+        return count
+
+    @classmethod
+    async def _monitor_loop(cls, task: SelfTriggerTask):
+        try:
+            while True:
+                try:
+                    session = AgentShellSessionManager._get(task.session_id)
+                except KeyError:
+                    await cls._remove_completed_task(task)
+                    return
+
+                with session.lock:
+                    output_start_offset = session.output_start_offset
+                if task.output_offset < output_start_offset:
+                    task.scan_carry = ''
+                delta, task.output_offset = session.read_from_offset(task.output_offset)
+                match_count = cls._consume_matches(task, delta)
+                if match_count:
+                    fire_count = match_count if task.repeat else 1
+                    if not task.repeat:
+                        await cls._remove_completed_task(task)
+                    for _ in range(fire_count):
+                        cls._schedule_execution(task, 'watch')
+                    if not task.repeat:
+                        return
+
+                if task.timeout is not None and time.monotonic() - task.created_monotonic >= task.timeout:
+                    await cls._remove_completed_task(task)
+                    cls._schedule_execution(task, 'timeout')
+                    return
+
+                if not session.is_running():
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, lambda: session.wait_reader_drain(0.3))
+                    final_delta, task.output_offset = session.read_from_offset(task.output_offset)
+                    final_matches = cls._consume_matches(task, final_delta)
+                    if final_matches:
+                        fire_count = final_matches if task.repeat else 1
+                        for _ in range(fire_count):
+                            cls._schedule_execution(task, 'watch')
+                    elif task.trigger_count == 0:
+                        cls._schedule_execution(task, 'session_exit')
+                    await cls._remove_completed_task(task)
+                    return
+
+                await asyncio.sleep(cls.POLL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await cls._remove_completed_task(task)
+            logger.error(f"触发任务 {task.task_id} 监控失败: {exc}", exc_info=True)
+
+    @classmethod
+    def _schedule_execution(cls, task: SelfTriggerTask, reason: str):
+        task.trigger_count += 1
+        execution_task = asyncio.create_task(cls._execute_trigger(task, reason))
+        cls._execution_tasks.add(execution_task)
+        execution_task.add_done_callback(cls._execution_tasks.discard)
+
+    @classmethod
+    async def _execute_trigger(cls, task: SelfTriggerTask, reason: str):
+        reason_text = {
+            'watch': f"检测到触发暗号: {task.watch}",
+            'timeout': f"超时触发，等待 {task.timeout} 秒后仍未检测到暗号: {task.watch}",
+            'session_exit': f"会话已退出，未检测到暗号: {task.watch}",
+        }.get(reason, reason)
+        trigger_text = (
+            f"[系统触发] {task.context_text or '后台触发任务条件已满足'}\n"
+            f"{reason_text}\n来源会话: {task.session_id}\n触发任务: {task.task_id}"
+        )
+        fake_context = task.context_text or '后台触发任务条件已满足，请根据命令结果回复用户。'
+        fake_context = re.sub(r'(?m)^```', '``\u200b`', fake_context)
+        fake_ai_response = f"{fake_context}\n{reason_text}\n```run\n{task.command}\n```"
+        update = _SelfTriggerUpdate(task.bot, task.chat_id)
+        context = _SelfTriggerContext(task.bot)
+        lock_acquired = asyncio.Event()
+        process_task: Optional[asyncio.Task] = None
+        wait_notice_task: Optional[asyncio.Task] = None
+        try:
+            await GlobalRecorder.record_user_message(
+                trigger_text,
+                MessageType.USER_TEXT,
+                task.chat_id,
+            )
+            process_task = asyncio.create_task(process_conversation(
+                update,
+                context,
+                trigger_text,
+                initial_response=fake_ai_response,
+                lock_acquired_event=lock_acquired,
+                force_agent_mode=True,
+            ))
+            wait_notice_task = asyncio.create_task(
+                cls._notify_if_waiting(task, lock_acquired, process_task)
+            )
+            await process_task
+        except asyncio.CancelledError:
+            if process_task and not process_task.done():
+                process_task.cancel()
+            raise
+        except Exception as exc:
+            logger.error(f"执行触发任务 {task.task_id} 失败: {exc}", exc_info=True)
+            with contextlib.suppress(Exception):
+                await task.bot.send_message(
+                    chat_id=task.chat_id,
+                    text=f"⚠️ 后台触发任务 {task.task_id} 执行失败: {str(exc)[:200]}",
+                )
+        finally:
+            if wait_notice_task and not wait_notice_task.done():
+                wait_notice_task.cancel()
+
+    @classmethod
+    async def _notify_if_waiting(cls, task: SelfTriggerTask, lock_acquired: asyncio.Event,
+                                 process_task: asyncio.Task):
+        try:
+            await asyncio.wait_for(lock_acquired.wait(), timeout=cls.WAIT_NOTICE_SECONDS)
+        except asyncio.TimeoutError:
+            if not process_task.done():
+                with contextlib.suppress(Exception):
+                    await task.bot.send_message(
+                        chat_id=task.chat_id,
+                        text=f"⏳ 后台触发任务 {task.task_id} 已触发，正在等待当前对话处理完成。",
+                    )
 
 
 # --- ☆ 模型调用逻辑 ☆ ---
@@ -11612,24 +12020,38 @@ async def cancel_text_conversation(update: Update):
         logger.debug(f"清空拼接提示更新失败: {e}")
 
 async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
-                               content_override: Optional[Any] = None):
+                               content_override: Optional[Any] = None,
+                               initial_response: Optional[str] = None,
+                               lock_acquired_event: Optional[asyncio.Event] = None,
+                               force_agent_mode: bool = False):
     """处理对话（全局模式 + Agent 协议执行：命令 / 读文件 / 发文件 / 写文件 / 媒体）"""
     global _is_processing, _stop_generation_event
     async with _conversation_processing_lock:
+        if lock_acquired_event is not None:
+            lock_acquired_event.set()
         _is_processing = True
         _stop_generation_event = asyncio.Event()
 
         try:
-            await _process_conversation_inner(update, context, text, content_override)
+            await _process_conversation_inner(
+                update,
+                context,
+                text,
+                content_override,
+                initial_response,
+                force_agent_mode,
+            )
         finally:
             _stop_generation_event = None
             _is_processing = False
 
 
 async def _process_conversation_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
-                                       content_override: Optional[Any] = None):
+                                       content_override: Optional[Any] = None,
+                                       initial_response: Optional[str] = None,
+                                       force_agent_mode: bool = False):
     """process_conversation 内部实现"""
-    agent_mode = UserDataManager.get('agent_mode', False)
+    agent_mode = force_agent_mode or UserDataManager.get('agent_mode', False)
     stream_mode = normalize_bool(UserDataManager.get('stream_mode', True), True)
     db = await BotMemoryDB.get_instance()
     cid, cdata = await get_or_create_chat_session()
@@ -11645,11 +12067,6 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
         return
     assert prov_name is not None
 
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action=constants.ChatAction.TYPING
-    )
-
     await db.add_chat_message(cid, 'user', text)
 
     global_depth = max(1, int(UserDataManager.get('global_depth', 30)))
@@ -11664,19 +12081,27 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
         else:
             history.append({'role': 'user', 'content': content_override})
     
-    # 根据流式/非流式开关选择回复方式
-    if stream_mode:
-        response = await send_streaming_response(
-            update, context,
-            prov_name, prov_data, model,
-            system_prompt, history
-        )
+    if initial_response is not None:
+        response = initial_response.strip()
     else:
-        response = await send_non_streaming_response(
-            update, context,
-            prov_name, prov_data, model,
-            system_prompt, history
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action=constants.ChatAction.TYPING
         )
+
+        # 根据流式/非流式开关选择回复方式
+        if stream_mode:
+            response = await send_streaming_response(
+                update, context,
+                prov_name, prov_data, model,
+                system_prompt, history
+            )
+        else:
+            response = await send_non_streaming_response(
+                update, context,
+                prov_name, prov_data, model,
+                system_prompt, history
+            )
     
     if not response:
         await db.remove_last_chat_message(cid)
@@ -12170,6 +12595,33 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             "说明: 这是一次性命令 run 的真实结果；完整原始输出已经保存到路径。"
                             "请基于返回码、上下文输出和完整输出路径继续判断。"
                         )
+                    })
+                    should_continue = True
+                    continue
+
+                if block_type == 'trigger':
+                    try:
+                        trigger_notice = await SelfTriggerManager.handle_protocol(
+                            block.get('path') or '',
+                            block.get('body') or '',
+                            context.bot,
+                            update.effective_chat.id,
+                        )
+                    except Exception as e:
+                        trigger_notice = f"[trigger结果] 操作失败: {str(e)[:300]}"
+                    await GlobalRecorder.record(
+                        msg_type=MessageType.AGENT_RESULT,
+                        role='system',
+                        content=trigger_notice,
+                        chat_id=update.effective_chat.id,
+                    )
+                    await db.add_chat_message(cid, 'user', trigger_notice)
+                    continuation_messages.append({
+                        'role': 'user',
+                        'content': (
+                            trigger_notice + "\n"
+                            "说明: 这是 trigger 后台触发任务的真实管理结果，请据此回复用户。"
+                        ),
                     })
                     should_continue = True
                     continue
@@ -13282,6 +13734,11 @@ async def send_startup_menu_job(context: ContextTypes.DEFAULT_TYPE):
 async def on_shutdown(app):
     """应用关闭时清理资源"""
     logger.info("🛑 服务正在关闭...")
+    try:
+        await SelfTriggerManager.shutdown()
+        logger.info("✅ 后台触发任务已关闭")
+    except Exception as e:
+        logger.error(f"关闭后台触发任务失败: {e}")
     try:
         AgentShellSessionManager.kill_all()
         logger.info("✅ Agent shell 会话已关闭")
