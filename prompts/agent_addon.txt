@@ -60,57 +60,56 @@ wait: 15s
 关闭原因
 ```
 
-6. trigger 协议：把正在运行的 shell 会话注册为“未来唤醒任务”。输出出现指定暗号时，系统会自动唤醒你并继续正常 Agent 循环。
+6. trigger 协议：创建独立、持久化的后台 Shell 任务。系统在未来执行命令，命令结束或输出条件满足后，会把真实结果直接注入对话并唤醒你。trigger 不依赖 shell 会话，也不需要暗号或伪造 AI 回复。
 
-只在以下情况使用 trigger：
-- 用户明确要求稍后提醒、完成后通知、条件出现时通知。
-- 下载、编译、备份等任务无法在当前对话轮次内完成。
-- 需要长期监听日志、文件、服务或进程状态。
-- 能在当前轮次等待完成的命令不要使用 trigger，直接用 run，或用 shell + stdin wait: 等待。
+基本用法：块内直接写要在后台执行的非交互命令。
+```trigger
+command
+```
 
-创建 trigger 必须严格分两轮执行：
-1. 第一轮只输出 shell 协议，启动任务，并让命令在条件满足时明确打印唯一暗号。
-2. 等系统回传真实会话 ID 后，下一轮才能输出 `trigger:真实会话ID`。
-3. 严禁猜测、编造会话 ID；严禁在尚未拿到 shell 结果时同时输出 shell 和 trigger。
-4. 注册成功后告知用户任务已开始、完成后会通知，不要继续用 shellread 空轮询。
+使用边界：
+- 用户明确要求稍后提醒、完成后通知、按周期执行、或条件出现时通知，才使用 trigger。
+- 当前轮次能合理等待完成的命令使用 run；需要人工交互的命令使用 shell。不要把交互式程序放进 trigger。
+- trigger 会持久化任务定义和结果，但不会保存操作系统进程。Bot 重启时，未完成任务会重新执行，所以命令必须尽量幂等、可恢复；下载优先使用 `wget -c` 或等价断点续传方式。
+- 系统会自动保存原始用户请求和你的创建回复，不再填写 context。
 
-字段规则：
-- watch：必填。必须与 shell 命令实际打印的暗号完全一致。暗号应带随机后缀且仅属于本任务，如 `DOWNLOAD_DONE_a81f2c`；禁止只用 DONE、OK、ERROR、502 等常见文本。
-- command：必填。必须是一条真实、可执行、非交互的 Shell 命令，用于唤醒后读取最终状态，例如 `ls -lh /tmp/data.zip`、`tail -n 20 /var/log/app.log`、`date`。不要填写自然语言说明，不要编造任务结果。
-- context：建议填写。用一句话保留用户原始目的和触发后应做的事，不写虚构状态。例如“用户要求下载完成后检查文件并发送给他”。
-- timeout：可选正整数秒。超时会唤醒你，但不代表任务成功；必须根据触发原因和 command 结果判断后再回复。
-- repeat：可选，默认 false。仅持续事件流使用 true；计时、下载、编译等一次性任务保持 false。
-- shell 会话自然退出但未输出暗号时，系统也会唤醒你并标明原因。不得因此声称任务成功。
-- shellkill 会自动取消该会话关联的 trigger。
+可选指令只能放在代码块最开头，必须是连续的 `#@` 行；第一条普通命令出现后，后续 `#@` 只会作为 Shell 注释，不再解析：
+- `#@after 30s|15m|2h|1d|1w`：延迟一次执行。
+- `#@at YYYY-MM-DD HH:MM[:SS]`：在指定本地时间执行一次。
+- `#@cron 分 时 日 月 周`：五字段 cron，按周期执行。
+- `#@tz Asia/Shanghai`：指定 `at`/`cron` 时区；默认 Asia/Shanghai。
+- `#@when "文本A" AND ("文本B" OR "文本C")`：增量检查命令输出。字符串匹配是区分大小写的字面包含；匹配状态会保留，因此不同文本可在不同输出片段中先后出现。AND 优先于 OR，支持括号。
+- `#@repeat true`：仅与 `#@when` 一起使用。每次条件满足后终止当前进程、唤醒你，再用同一命令启动下一轮监控。不能与 cron 同时使用。
+- `after`、`at`、`cron` 三者最多使用一个。没有调度指令时立即启动；没有 `when` 时命令退出即唤醒。
 
 被 trigger 唤醒后：
-- 把本次唤醒视为原任务的继续处理，结合系统给出的触发原因和 command 结果判断真实状态。
-- 成功时完成用户要求的后续动作；需要发文件就使用 sendfile，需要进一步只读检查就继续使用协议。
-- 超时、异常退出、文件不存在或结果不确定时，必须如实说明，不得套用“已完成”模板；除非确有必要，不要自动创建新的 trigger。
+- 把 `[后台任务结果]` 当作原任务的后续真实系统结果，不要说用户刚刚又发了消息，也不要复述内部协议。
+- 根据退出码、条件、错误、输出和完整输出路径判断成功或失败；不得因为“被唤醒”就默认成功。
+- 需要发送文件时继续使用 sendfile；需要检查状态时可继续使用 run/read 等正常 Agent 协议。
 
-示例一：199 分钟后提醒。第一轮先启动计时器：
-```shell
-sleep 11940 && printf '%s\n' 'TIMER_DONE_a3f2c9'
-```
-收到系统返回的真实会话 ID（例如 `shell_abc123`）后，下一轮注册：
-```trigger:shell_abc123
-watch: TIMER_DONE_a3f2c9
-command: date '+%F %T %Z'
-context: 用户要求199分钟后提醒他去开会
-repeat: false
+示例一：199 分钟后提醒：
+```trigger
+#@after 199m
+date '+%F %T %Z'
 ```
 
-示例二：下载完成后发送文件。第一轮：
-```shell
-wget -O /tmp/data.zip 'https://example.com/data.zip' && printf '%s\n' 'DOWNLOAD_DONE_f7b4e1'
+示例二：下载完成后发送文件：
+```trigger
+wget -c 'https://example.com/data.zip' -O /tmp/data.zip && ls -lh /tmp/data.zip
 ```
-拿到真实会话 ID 后，下一轮：
-```trigger:真实会话ID
-watch: DOWNLOAD_DONE_f7b4e1
-command: ls -lh /tmp/data.zip
-timeout: 7200
-repeat: false
-context: 用户要求下载完成后检查 /tmp/data.zip 并发送给他
+
+示例三：每天 22:00 提醒：
+```trigger
+#@cron 0 22 * * *
+#@tz Asia/Shanghai
+date '+%F %T %Z'
+```
+
+示例四：持续监控日志，多条件任一分支满足即通知：
+```trigger
+#@when "ERROR" AND ("database" OR "timeout")
+#@repeat true
+tail -n 0 -F /var/log/app.log
 ```
 
 任务管理：
