@@ -1594,6 +1594,34 @@ class BotMemoryDB:
         row = await cursor.fetchone()
         return dict(row) if row else None
 
+    async def list_recent_trigger_runs(self, task_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        conn = await self._get_conn()
+        cursor = await conn.execute('''
+            SELECT * FROM trigger_runs
+            WHERE task_id = ? AND finished_at IS NOT NULL
+            ORDER BY finished_at DESC
+            LIMIT ?
+        ''', (task_id, limit))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def suppress_trigger_runs(self, run_ids: List[str], reason: str) -> int:
+        if not run_ids:
+            return 0
+        conn = await self._get_conn()
+        placeholders = ', '.join('?' for _ in run_ids)
+        now = time.time()
+        cursor = await conn.execute(
+            f'''
+            UPDATE trigger_runs
+            SET delivered_at = COALESCE(delivered_at, ?),
+                error = CASE WHEN error IS NULL OR error = '' THEN ? ELSE error END
+            WHERE run_id IN ({placeholders}) AND delivered_at IS NULL
+            ''',
+            (now, reason, *run_ids),
+        )
+        return max(0, int(cursor.rowcount or 0))
+
     async def list_undelivered_trigger_runs(self) -> List[Dict[str, Any]]:
         conn = await self._get_conn()
         cursor = await conn.execute('''
@@ -4754,7 +4782,10 @@ class SelfTriggerManager:
     """持久化执行后台命令，并把完成结果作为内部系统结果唤醒 AI。"""
 
     WAIT_NOTICE_SECONDS = 60.0
-    REPEAT_RESTART_DELAY_SECONDS = 1.0
+    REPEAT_RESTART_DELAY_SECONDS = 5.0
+    REPEAT_STORM_WINDOW_SECONDS = 300.0
+    REPEAT_STORM_IDENTICAL_LIMIT = 3
+    REPEAT_STORM_RUN_LIMIT = 10
     DEFAULT_TIMEZONE = os.getenv('TRIGGER_TIMEZONE', 'Asia/Shanghai')
     MAX_CAPTURE_CHARS = 200000
     _application: Optional[Application] = None
@@ -4763,6 +4794,7 @@ class SelfTriggerManager:
     _task_locks: Dict[str, asyncio.Lock] = {}
     _lock = asyncio.Lock()
     _execution_tasks: set = set()
+    _delivery_run_ids: set = set()
     _stopping = False
     _started = False
 
@@ -4802,6 +4834,46 @@ class SelfTriggerManager:
         if command:
             return f'执行后台命令：{command}'
         return '未记录任务说明'
+
+    @staticmethod
+    def _repeat_result_signature(run: Dict[str, Any]) -> str:
+        payload = {
+            'status': run.get('status'),
+            'trigger_reason': run.get('trigger_reason'),
+            'matched_conditions': run.get('matched_conditions') or '[]',
+            'exit_code': run.get('exit_code'),
+            'output': str(run.get('output') or '').strip(),
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode('utf-8')
+        return hashlib.sha256(encoded).hexdigest()
+
+    @classmethod
+    def _repeat_storm_reason(cls, runs: List[Dict[str, Any]]) -> Optional[str]:
+        matched_runs = [
+            run for run in runs
+            if run.get('status') == 'condition_matched' and run.get('finished_at') is not None
+        ]
+        if len(matched_runs) >= cls.REPEAT_STORM_RUN_LIMIT:
+            newest = float(matched_runs[0]['finished_at'])
+            oldest = float(matched_runs[cls.REPEAT_STORM_RUN_LIMIT - 1]['finished_at'])
+            if newest - oldest <= cls.REPEAT_STORM_WINDOW_SECONDS:
+                return (
+                    f'repeat 任务在 {int(cls.REPEAT_STORM_WINDOW_SECONDS)} 秒内连续产生 '
+                    f'{cls.REPEAT_STORM_RUN_LIMIT} 个结果，已自动暂停以防消息风暴'
+                )
+
+        if len(matched_runs) >= cls.REPEAT_STORM_IDENTICAL_LIMIT:
+            recent = matched_runs[:cls.REPEAT_STORM_IDENTICAL_LIMIT]
+            newest = float(recent[0]['finished_at'])
+            oldest = float(recent[-1]['finished_at'])
+            signatures = {cls._repeat_result_signature(run) for run in recent}
+            if len(signatures) == 1 and newest - oldest <= cls.REPEAT_STORM_WINDOW_SECONDS:
+                return (
+                    f'repeat 任务在 {int(cls.REPEAT_STORM_WINDOW_SECONDS)} 秒内连续产生 '
+                    f'{cls.REPEAT_STORM_IDENTICAL_LIMIT} 个完全相同的结果，已自动暂停；'
+                    f'命令必须只输出新事件并记录已处理状态'
+                )
+        return None
 
     @classmethod
     async def _new_task_id(cls) -> str:
@@ -5027,6 +5099,7 @@ class SelfTriggerManager:
             await asyncio.gather(*delivery_tasks, return_exceptions=True)
         cls._runtime_tasks.clear()
         cls._processes.clear()
+        cls._delivery_run_ids.clear()
 
     @classmethod
     async def format_active_tasks(cls) -> str:
@@ -5093,14 +5166,77 @@ class SelfTriggerManager:
         if interrupted_count:
             logger.warning(f'检测到 {interrupted_count} 个因进程重启中断的 trigger run，将恢复任务')
 
+        active_tasks = await db.list_trigger_tasks(active_only=True)
+        paused_repeat_ids = set()
+        for task in active_tasks:
+            if not task.get('repeat'):
+                continue
+            recent_runs = await db.list_recent_trigger_runs(
+                task['id'], limit=max(cls.REPEAT_STORM_RUN_LIMIT, cls.REPEAT_STORM_IDENTICAL_LIMIT),
+            )
+            storm_reason = cls._repeat_storm_reason(recent_runs)
+            if not storm_reason:
+                continue
+            paused_repeat_ids.add(task['id'])
+            await db.update_trigger_task(
+                task['id'], status='failed', next_run_at=None, last_error=storm_reason,
+                failure_count=int(task['failure_count']) + 1,
+            )
+            logger.error(f"启动时自动暂停 repeat 任务 {task['id']}: {storm_reason}")
+
         undelivered_runs = await db.list_undelivered_trigger_runs()
+        if paused_repeat_ids:
+            paused_run_ids = [
+                run['run_id'] for run in undelivered_runs if run['task_id'] in paused_repeat_ids
+            ]
+            suppressed = await db.suppress_trigger_runs(
+                paused_run_ids, 'repeat 消息风暴已自动暂停，启动时不再重放积压结果',
+            )
+            if suppressed:
+                logger.error(f'已丢弃 {suppressed} 个消息风暴任务的未投递 trigger 结果')
+            undelivered_runs = [
+                run for run in undelivered_runs if run['task_id'] not in paused_repeat_ids
+            ]
+
+        repeat_backlogs: Dict[str, List[Dict[str, Any]]] = {}
+        for run in undelivered_runs:
+            if run.get('repeat'):
+                repeat_backlogs.setdefault(run['task_id'], []).append(run)
+        suppressed_backlog_ids = set()
+        for task_id, runs in repeat_backlogs.items():
+            if len(runs) <= 1:
+                continue
+            runs.sort(key=lambda item: float(item.get('finished_at') or 0), reverse=True)
+            stale_ids = [run['run_id'] for run in runs[1:]]
+            suppressed = await db.suppress_trigger_runs(
+                stale_ids, '旧版 repeat 调度产生积压，启动时仅保留最新结果',
+            )
+            suppressed_backlog_ids.update(stale_ids)
+            logger.warning(
+                f'repeat 任务 {task_id} 有 {len(runs)} 个未投递结果，'
+                f'已合并 {suppressed} 个旧结果，仅保留最新结果'
+            )
+        if suppressed_backlog_ids:
+            undelivered_runs = [
+                run for run in undelivered_runs if run['run_id'] not in suppressed_backlog_ids
+            ]
+
+        repeat_tasks_waiting_delivery = set()
         for run in undelivered_runs:
             await cls._reconcile_finished_run_task(run)
+            if run.get('repeat'):
+                repeat_tasks_waiting_delivery.add(run['task_id'])
+                await db.update_trigger_task(
+                    run['task_id'], status='waiting_delivery', next_run_at=None,
+                )
             cls._schedule_delivery(run['run_id'])
 
         tasks = await db.list_trigger_tasks(active_only=True)
         for task in tasks:
             try:
+                if task.get('repeat') and task['id'] in repeat_tasks_waiting_delivery:
+                    logger.info(f"repeat 任务 {task['id']} 等待上次结果投递完成后再恢复")
+                    continue
                 await cls._activate_task(task, recovery=task['status'] == 'recovering')
             except Exception as exc:
                 logger.error(f"恢复 trigger 任务 {task['id']} 失败: {exc}", exc_info=True)
@@ -5128,7 +5264,7 @@ class SelfTriggerManager:
             )
         elif task['repeat'] and run['status'] == 'condition_matched':
             await db.update_trigger_task(
-                task['id'], status='pending', next_run_at=time.time(),
+                task['id'], status='waiting_delivery', next_run_at=None,
                 last_finished_at=run['finished_at'], **counters,
             )
         else:
@@ -5275,19 +5411,36 @@ class SelfTriggerManager:
             latest = await db.get_trigger_task(task_id)
             if latest is None or latest['status'] == 'cancelled':
                 return
+
+            storm_reason = None
+            if latest['repeat'] and result['status'] == 'condition_matched':
+                recent_runs = await db.list_recent_trigger_runs(
+                    task_id, limit=max(cls.REPEAT_STORM_RUN_LIMIT, cls.REPEAT_STORM_IDENTICAL_LIMIT),
+                )
+                storm_reason = cls._repeat_storm_reason(recent_runs)
+                if storm_reason:
+                    result['status'] = 'failed'
+                    result['trigger_reason'] = 'repeat_storm_paused'
+                    result['error'] = storm_reason
+                    await db.finish_trigger_run(
+                        run_id,
+                        status=result['status'],
+                        trigger_reason=result['trigger_reason'],
+                        error=result['error'],
+                    )
+
             fire_count = int(latest['fire_count']) + 1
             failure_count = int(latest['failure_count']) + int(result['status'] in {'failed', 'condition_unmatched'})
             task_status = 'completed'
             next_run_at: Optional[float] = None
-            restart_repeat = False
 
-            if latest['schedule_type'] == 'cron':
+            if storm_reason:
+                task_status = 'failed'
+            elif latest['schedule_type'] == 'cron':
                 task_status = 'scheduled'
                 next_run_at = cls._next_cron_timestamp(latest)
             elif latest['repeat'] and result['status'] == 'condition_matched' and not cls._stopping:
-                task_status = 'pending'
-                next_run_at = time.time()
-                restart_repeat = True
+                task_status = 'waiting_delivery'
 
             await db.update_trigger_task(
                 task_id,
@@ -5299,12 +5452,6 @@ class SelfTriggerManager:
                 last_error=result['error'],
             )
             cls._schedule_delivery(run_id)
-
-            if restart_repeat:
-                async def restart_when_current_finishes():
-                    await asyncio.sleep(cls.REPEAT_RESTART_DELAY_SECONDS)
-                    cls._launch_runtime(task_id, time.time(), 'repeat')
-                asyncio.create_task(restart_when_current_finishes())
 
     @classmethod
     def _next_cron_timestamp(cls, task: Dict[str, Any]) -> Optional[float]:
@@ -5407,11 +5554,17 @@ class SelfTriggerManager:
 
     @classmethod
     def _schedule_delivery(cls, run_id: str):
-        if cls._stopping:
+        if cls._stopping or run_id in cls._delivery_run_ids:
             return
+        cls._delivery_run_ids.add(run_id)
         execution_task = asyncio.create_task(cls._deliver_run(run_id))
         cls._execution_tasks.add(execution_task)
-        execution_task.add_done_callback(cls._execution_tasks.discard)
+
+        def cleanup(done_task: asyncio.Task):
+            cls._execution_tasks.discard(done_task)
+            cls._delivery_run_ids.discard(run_id)
+
+        execution_task.add_done_callback(cleanup)
 
     @classmethod
     async def _deliver_run(cls, run_id: str):
@@ -5441,6 +5594,7 @@ class SelfTriggerManager:
             'recovery': 'Bot 重启后恢复执行的后台命令已经结束',
             'cron': 'cron 后台命令本次运行已经结束',
             'cron_misfire': 'Bot 启动后补跑了一次错过的 cron 任务',
+            'repeat_storm_paused': '重复任务触发过快，系统已自动暂停',
         }.get(run.get('trigger_reason'), str(run.get('trigger_reason') or '后台任务已产生结果'))
         output_text = clip_middle_text(str(run.get('output') or '(无输出)'), 24000, '后台输出')
         original_request = clip_middle_text(str(task.get('origin_user_text') or '(未记录)'), 4000, '原始请求')
@@ -5515,6 +5669,7 @@ class SelfTriggerManager:
             )
             await process_task
             await db.finish_trigger_run(run_id, delivered_at=time.time())
+            await cls._restart_repeat_after_delivery(task['id'], run)
         except asyncio.CancelledError:
             if process_task and not process_task.done():
                 process_task.cancel()
@@ -5529,6 +5684,25 @@ class SelfTriggerManager:
         finally:
             if wait_notice_task and not wait_notice_task.done():
                 wait_notice_task.cancel()
+
+    @classmethod
+    async def _restart_repeat_after_delivery(cls, task_id: str, run: Dict[str, Any]):
+        if cls._stopping or run.get('status') != 'condition_matched':
+            return
+        db = await BotMemoryDB.get_instance()
+        task = await db.get_trigger_task(task_id)
+        if task is None or not task.get('repeat') or task.get('status') != 'waiting_delivery':
+            return
+
+        await asyncio.sleep(cls.REPEAT_RESTART_DELAY_SECONDS)
+        if cls._stopping:
+            return
+        task = await db.get_trigger_task(task_id)
+        if task is None or not task.get('repeat') or task.get('status') != 'waiting_delivery':
+            return
+        scheduled_at = time.time()
+        await db.update_trigger_task(task_id, status='pending', next_run_at=scheduled_at)
+        cls._launch_runtime(task_id, scheduled_at, 'repeat')
 
     @classmethod
     async def _notify_if_waiting(cls, task: Dict[str, Any], bot: Any,
