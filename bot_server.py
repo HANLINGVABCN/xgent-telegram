@@ -178,6 +178,7 @@ MAX_AGENT_COMMAND_TIMEOUT = 3600
 DEFAULT_AGENT_MAX_ITERATIONS = 10
 MIN_AGENT_MAX_ITERATIONS = 1
 MAX_AGENT_MAX_ITERATIONS = 50
+AGENT_TURN_ITERATION_CONFIG_KEY = 'agent_turn_iteration'
 DEFAULT_IDLE_MESSAGE_INTERVAL = 24 * 3600
 MIN_IDLE_MESSAGE_INTERVAL = 60
 PROVIDER_HTTP_HEADERS = {
@@ -5783,7 +5784,7 @@ class SelfTriggerManager:
             f"任务概述：{task_summary}\n"
             f"结果状态：{reason_text}\n"
             f"任务 ID：{task['id']}\n"
-            f"AI 正在根据完整执行结果继续处理。"
+            f"系统已记录完整执行结果，正在检查是否继续唤醒 AI。"
         )
         internal_result = (
             f"[后台任务结果]\n"
@@ -5848,6 +5849,7 @@ class SelfTriggerManager:
                 internal_result,
                 lock_acquired_event=lock_acquired,
                 force_agent_mode=True,
+                reset_agent_iterations=False,
             ))
             wait_notice_task = asyncio.create_task(
                 cls._notify_if_waiting(task, bot, lock_acquired, process_task)
@@ -8705,7 +8707,7 @@ def build_timeout_settings_text() -> str:
         f"🔁 Agent最大轮数：<b>{_fmt_agent_max_iterations(agent_max_iterations)}</b>\n"
         f"💭 空闲提醒间隔：<b>{_fmt_idle_message_interval(idle_interval)}</b>\n\n"
         "AI回复超时控制等待模型响应的时间；命令等待窗口控制 run 的最长等待，也是 shell 状态判断的硬上限；"
-        "Agent最大轮数控制本轮对话中 AI 自动执行工具并继续思考的最多次数；"
+        "Agent最大轮数控制从最近一条真实用户消息开始，系统结果继续调用 AI 的累计次数；"
         "空闲提醒间隔控制用户多久没发消息后自动生成一条提醒回复。"
     )
 
@@ -11345,8 +11347,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.message.edit_text(
                 f"🔁 <b>Agent最大轮数</b>\n\n"
                 f"当前: <b>{_fmt_agent_max_iterations(current_iterations)}</b>\n"
-                f"这决定每次用户消息里，Agent 最多自动执行多少轮工具操作并继续思考。\n"
-                f"轮数太低会更快停下，轮数较高适合多步骤任务。",
+                f"只有新的真实用户消息会把轮数重置为 0。工具结果和后台 trigger 结果会继续累计；"
+                f"超出上限后仍显示系统结果，但不会继续请求 AI。",
                 reply_markup=get_agent_max_iterations_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
@@ -13174,10 +13176,46 @@ async def cancel_text_conversation(update: Update):
     except Exception as e:
         logger.debug(f"清空拼接提示更新失败: {e}")
 
+async def _reset_agent_turn_iteration(db: BotMemoryDB) -> int:
+    await db.set_config(AGENT_TURN_ITERATION_CONFIG_KEY, 0)
+    return 0
+
+
+async def _reserve_agent_turn_iteration(db: BotMemoryDB) -> int:
+    raw_value = await db.get_config(AGENT_TURN_ITERATION_CONFIG_KEY, 0)
+    try:
+        current = max(0, int(raw_value))
+    except (TypeError, ValueError):
+        current = 0
+    next_iteration = int(current) + 1
+    await db.set_config(AGENT_TURN_ITERATION_CONFIG_KEY, next_iteration)
+    return next_iteration
+
+
+async def _send_agent_iteration_limit_notice(context: ContextTypes.DEFAULT_TYPE,
+                                             chat_id: int, current_iteration: int,
+                                             max_iterations: int):
+    message = (
+        f"⚠️ Agent 当前为第 {current_iteration} 轮，已超过最大 {max_iterations} 轮。\n"
+        "本次系统结果已经保留，但不会继续调用 AI。只有新的用户消息才会重置轮数。"
+    )
+    await safe_send_message(context, chat_id, message)
+    await GlobalRecorder.record_system_op(
+        message,
+        {
+            'agent_iteration': current_iteration,
+            'agent_max_iterations': max_iterations,
+            'ai_call_skipped': True,
+        },
+        chat_id,
+    )
+
+
 async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
                                content_override: Optional[Any] = None,
                                lock_acquired_event: Optional[asyncio.Event] = None,
-                               force_agent_mode: bool = False):
+                               force_agent_mode: bool = False,
+                               reset_agent_iterations: bool = True):
     """处理对话（全局模式 + Agent 协议执行：命令 / 读文件 / 发文件 / 写文件 / 媒体）"""
     global _is_processing, _stop_generation_event
     async with _conversation_processing_lock:
@@ -13193,6 +13231,7 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
                 text,
                 content_override,
                 force_agent_mode,
+                reset_agent_iterations,
             )
         finally:
             _stop_generation_event = None
@@ -13201,12 +13240,29 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def _process_conversation_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
                                        content_override: Optional[Any] = None,
-                                       force_agent_mode: bool = False):
+                                       force_agent_mode: bool = False,
+                                       reset_agent_iterations: bool = True):
     """process_conversation 内部实现"""
     agent_mode = force_agent_mode or UserDataManager.get('agent_mode', False)
     stream_mode = normalize_bool(UserDataManager.get('stream_mode', True), True)
     db = await BotMemoryDB.get_instance()
     cid, cdata = await get_or_create_chat_session()
+    max_agent_iterations = normalize_agent_max_iterations(
+        UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
+    )
+    if reset_agent_iterations:
+        agent_iteration = await _reset_agent_turn_iteration(db)
+    else:
+        agent_iteration = await _reserve_agent_turn_iteration(db)
+        await db.add_chat_message(cid, 'user', text)
+        if agent_iteration > max_agent_iterations:
+            await _send_agent_iteration_limit_notice(
+                context,
+                update.effective_chat.id,
+                agent_iteration,
+                max_agent_iterations,
+            )
+            return
     model = cdata.get('model') or UserDataManager.get('default_model')
     prov_name, prov_data = get_current_provider()
     
@@ -13219,7 +13275,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
         return
     assert prov_name is not None
 
-    await db.add_chat_message(cid, 'user', text)
+    if reset_agent_iterations:
+        await db.add_chat_message(cid, 'user', text)
 
     global_depth = max(1, int(UserDataManager.get('global_depth', 30)))
     system_prompt = build_conversation_system_prompt(agent_mode)
@@ -13264,13 +13321,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     
     # --- Agent 模式：命令 / 读文件 / 发文件 / 写文件 / 媒体协议循环 ---
     if agent_mode:
-        max_agent_iterations = normalize_agent_max_iterations(
-            UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
-        )
-        iteration = 0
-        reached_agent_limit = False
-        
-        while iteration < max_agent_iterations:
+        while True:
             if is_stop_requested():
                 await safe_send_message(
                     context,
@@ -13285,14 +13336,14 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             if not protocol_blocks:
                 break  # AI 没有请求任何操作
             
-            iteration += 1
+            operation_iteration = agent_iteration + 1
             continuation_messages: List[Dict[str, Any]] = []
             should_continue = False
             pause_agent_message: Optional[str] = None
             provider_api_format = str(prov_data.get('api_format', 'openai'))
             agent_stop_msg = await context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text=f"🛠️ 第 {iteration} 轮Agent操作进行中...",
+                text=f"🛠️ 第 {operation_iteration} 轮Agent操作进行中...",
                 reply_markup=build_stop_keyboard()
             )
 
@@ -13991,11 +14042,24 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 break
 
             with contextlib.suppress(Exception):
-                await safe_edit_text(agent_stop_msg, f"🛠️ 第 {iteration} 轮Agent操作完成，正在整理结果...", reply_markup=None)
+                await safe_edit_text(
+                    agent_stop_msg,
+                    f"🛠️ 第 {operation_iteration} 轮Agent操作完成，正在整理结果...",
+                    reply_markup=None,
+                )
 
             # Continue from this turn's in-memory transcript. Re-reading global history here would
             # duplicate just-recorded Agent results and make prompt caching worse.
             if not continuation_messages:
+                break
+            agent_iteration = await _reserve_agent_turn_iteration(db)
+            if agent_iteration > max_agent_iterations:
+                await _send_agent_iteration_limit_notice(
+                    context,
+                    update.effective_chat.id,
+                    agent_iteration,
+                    max_agent_iterations,
+                )
                 break
             next_history = list(agent_turn_history)
             next_history.extend(continuation_messages)
@@ -14020,19 +14084,6 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             await db.add_chat_message(cid, 'assistant', response)
             agent_turn_history = next_history
             agent_turn_history.append({'role': 'assistant', 'content': response})
-
-        if iteration >= max_agent_iterations and AgentExecutor.extract_protocol_blocks(response):
-            reached_agent_limit = True
-
-        if reached_agent_limit:
-            await safe_send_message(
-                context,
-                update.effective_chat.id,
-                (
-                    f"⚠️ Agent 已达到最大执行次数 ({max_agent_iterations}次)，本轮 Agent 操作已停止。\n"
-                    "已经产生的 AI 回复和工具结果都保留在全局记忆里。"
-                )
-            )
 
 # --- ☆ 命令函数 ☆ ---
 async def cmd_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
