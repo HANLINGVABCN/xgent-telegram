@@ -1150,6 +1150,9 @@ class BotMemoryDB:
                 output TEXT,
                 output_path TEXT,
                 error TEXT,
+                notice_started_at REAL,
+                notice_sent_at REAL,
+                delivery_started_at REAL,
                 delivered_at REAL,
                 created_at REAL NOT NULL,
                 UNIQUE(task_id, scheduled_at),
@@ -1166,6 +1169,15 @@ class BotMemoryDB:
             'ALTER TABLE trigger_tasks ADD COLUMN duplicate_count INTEGER NOT NULL DEFAULT 0',
             'ALTER TABLE trigger_tasks ADD COLUMN backoff_seconds REAL NOT NULL DEFAULT 0',
             'ALTER TABLE trigger_tasks ADD COLUMN backoff_until REAL',
+        ):
+            try:
+                await conn.execute(migration)
+            except Exception:
+                pass
+        for migration in (
+            'ALTER TABLE trigger_runs ADD COLUMN notice_started_at REAL',
+            'ALTER TABLE trigger_runs ADD COLUMN notice_sent_at REAL',
+            'ALTER TABLE trigger_runs ADD COLUMN delivery_started_at REAL',
         ):
             try:
                 await conn.execute(migration)
@@ -1568,6 +1580,37 @@ class BotMemoryDB:
                 SET status = 'cancelled', next_run_at = NULL, updated_at = ?
                 WHERE id = ? AND status NOT IN ('completed', 'cancelled', 'failed')
             ''', (now, task_id))
+        if task_id is None:
+            await conn.execute('''
+                UPDATE trigger_runs
+                SET delivered_at = COALESCE(delivered_at, ?)
+                WHERE delivered_at IS NULL
+                  AND task_id IN (
+                      SELECT id FROM trigger_tasks WHERE status = 'cancelled'
+                  )
+            ''', (now,))
+        else:
+            await conn.execute('''
+                UPDATE trigger_runs
+                SET delivered_at = COALESCE(delivered_at, ?)
+                WHERE task_id = ? AND delivered_at IS NULL
+            ''', (now, task_id))
+        return max(0, int(cursor.rowcount or 0))
+
+    async def resume_legacy_auto_paused_repeat_tasks(self) -> int:
+        conn = await self._get_conn()
+        now = time.time()
+        cursor = await conn.execute('''
+            UPDATE trigger_tasks
+            SET status = 'pending', next_run_at = ?, updated_at = ?, last_error = NULL,
+                failure_count = MAX(failure_count - 1, 0),
+                duplicate_count = 0, backoff_seconds = 0, backoff_until = NULL
+            WHERE repeat = 1 AND status = 'failed'
+              AND (
+                  last_error LIKE 'repeat 任务在 %已自动暂停%'
+                  OR last_error LIKE '%消息风暴%自动暂停%'
+              )
+        ''', (now, now))
         return max(0, int(cursor.rowcount or 0))
 
     async def create_trigger_run(self, task_id: str, scheduled_at: float,
@@ -1594,7 +1637,8 @@ class BotMemoryDB:
     async def finish_trigger_run(self, run_id: str, **fields: Any):
         allowed = {
             'finished_at', 'status', 'trigger_reason', 'matched_conditions',
-            'exit_code', 'output', 'output_path', 'error', 'delivered_at',
+            'exit_code', 'output', 'output_path', 'error', 'notice_started_at',
+            'notice_sent_at', 'delivery_started_at', 'delivered_at',
         }
         updates = {key: value for key, value in fields.items() if key in allowed}
         if not updates:
@@ -1617,6 +1661,7 @@ class BotMemoryDB:
         cursor = await conn.execute('''
             SELECT * FROM trigger_runs
             WHERE task_id = ? AND status = 'condition_matched' AND delivered_at IS NOT NULL
+              AND (error IS NULL OR error = '')
             ORDER BY delivered_at DESC
             LIMIT 1
         ''', (task_id,))
@@ -1633,6 +1678,8 @@ class BotMemoryDB:
             f'''
             UPDATE trigger_runs
             SET delivered_at = COALESCE(delivered_at, ?),
+                status = 'suppressed',
+                trigger_reason = 'backlog_suppressed',
                 error = CASE WHEN error IS NULL OR error = '' THEN ? ELSE error END
             WHERE run_id IN ({placeholders}) AND delivered_at IS NULL
             ''',
@@ -1655,6 +1702,33 @@ class BotMemoryDB:
         ''')
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+    async def finalize_interrupted_trigger_deliveries(self) -> List[Dict[str, Any]]:
+        conn = await self._get_conn()
+        cursor = await conn.execute('''
+            SELECT r.*
+            FROM trigger_runs r
+            JOIN trigger_tasks t ON t.id = r.task_id
+            WHERE r.finished_at IS NOT NULL
+              AND r.delivered_at IS NULL
+              AND r.delivery_started_at IS NOT NULL
+              AND t.status != 'cancelled'
+            ORDER BY r.delivery_started_at ASC
+        ''')
+        rows = [dict(row) for row in await cursor.fetchall()]
+        if not rows:
+            return []
+        run_ids = [row['run_id'] for row in rows]
+        placeholders = ', '.join('?' for _ in run_ids)
+        await conn.execute(
+            f'''
+            UPDATE trigger_runs
+            SET delivered_at = ?
+            WHERE run_id IN ({placeholders}) AND delivered_at IS NULL
+            ''',
+            (time.time(), *run_ids),
+        )
+        return rows
 
     async def interrupt_running_trigger_runs(self) -> int:
         conn = await self._get_conn()
@@ -4812,6 +4886,7 @@ class SelfTriggerManager:
     _lock = asyncio.Lock()
     _execution_tasks: set = set()
     _delivery_run_ids: set = set()
+    _delivery_tasks_by_task: Dict[str, set] = {}
     _stopping = False
     _started = False
 
@@ -5062,6 +5137,9 @@ class SelfTriggerManager:
         runtime_task = cls._runtime_tasks.get(task_id)
         if runtime_task and not runtime_task.done():
             runtime_task.cancel()
+        for delivery_task in list(cls._delivery_tasks_by_task.get(task_id, set())):
+            if not delivery_task.done():
+                delivery_task.cancel()
         process = cls._processes.get(task_id)
         if process is not None:
             await terminate_async_process(process)
@@ -5077,6 +5155,9 @@ class SelfTriggerManager:
             runtime_task = cls._runtime_tasks.get(task['id'])
             if runtime_task and not runtime_task.done():
                 runtime_task.cancel()
+            for delivery_task in list(cls._delivery_tasks_by_task.get(task['id'], set())):
+                if not delivery_task.done():
+                    delivery_task.cancel()
             process = cls._processes.get(task['id'])
             if process is not None:
                 await terminate_async_process(process)
@@ -5100,6 +5181,7 @@ class SelfTriggerManager:
         cls._runtime_tasks.clear()
         cls._processes.clear()
         cls._delivery_run_ids.clear()
+        cls._delivery_tasks_by_task.clear()
 
     @classmethod
     async def format_active_tasks(cls) -> str:
@@ -5176,6 +5258,30 @@ class SelfTriggerManager:
         interrupted_count = await db.interrupt_running_trigger_runs()
         if interrupted_count:
             logger.warning(f'检测到 {interrupted_count} 个因进程重启中断的 trigger run，将恢复任务')
+        resumed_legacy_count = await db.resume_legacy_auto_paused_repeat_tasks()
+        if resumed_legacy_count:
+            logger.warning(f'已恢复 {resumed_legacy_count} 个被旧版消息风暴熔断暂停的 repeat 任务')
+        interrupted_deliveries = await db.finalize_interrupted_trigger_deliveries()
+        for run in interrupted_deliveries:
+            task = await db.get_trigger_task(run['task_id'])
+            if task is None or not task.get('repeat') or run.get('status') != 'condition_matched':
+                continue
+            backoff_until = time.time() + cls.REPEAT_DUPLICATE_BACKOFF_BASE_SECONDS
+            await db.update_trigger_task(
+                task['id'],
+                status='pending',
+                next_run_at=backoff_until,
+                last_result_hash=cls._repeat_result_signature(run),
+                duplicate_count=0,
+                backoff_seconds=cls.REPEAT_DUPLICATE_BACKOFF_BASE_SECONDS,
+                backoff_until=backoff_until,
+                last_error=None,
+            )
+        if interrupted_deliveries:
+            logger.warning(
+                f'检测到 {len(interrupted_deliveries)} 个已开始但未确认完成的 trigger 投递，'
+                '为避免重启后重复回复，已停止自动重放'
+            )
 
         active_tasks = await db.list_trigger_tasks(active_only=True)
         active_task_map = {task['id']: task for task in active_tasks}
@@ -5265,7 +5371,7 @@ class SelfTriggerManager:
                 await db.update_trigger_task(
                     run['task_id'], status='waiting_delivery', next_run_at=None,
                 )
-            cls._schedule_delivery(run['run_id'])
+            cls._schedule_delivery(run['run_id'], run['task_id'])
 
         tasks = await db.list_trigger_tasks(active_only=True)
         for task in tasks:
@@ -5515,7 +5621,7 @@ class SelfTriggerManager:
                 failure_count=failure_count,
                 last_error=result['error'],
             )
-            cls._schedule_delivery(run_id)
+            cls._schedule_delivery(run_id, task_id)
 
     @classmethod
     def _next_cron_timestamp(cls, task: Dict[str, Any]) -> Optional[float]:
@@ -5617,16 +5723,22 @@ class SelfTriggerManager:
         }
 
     @classmethod
-    def _schedule_delivery(cls, run_id: str):
+    def _schedule_delivery(cls, run_id: str, task_id: str):
         if cls._stopping or run_id in cls._delivery_run_ids:
             return
         cls._delivery_run_ids.add(run_id)
         execution_task = asyncio.create_task(cls._deliver_run(run_id))
         cls._execution_tasks.add(execution_task)
+        cls._delivery_tasks_by_task.setdefault(task_id, set()).add(execution_task)
 
         def cleanup(done_task: asyncio.Task):
             cls._execution_tasks.discard(done_task)
             cls._delivery_run_ids.discard(run_id)
+            task_deliveries = cls._delivery_tasks_by_task.get(task_id)
+            if task_deliveries is not None:
+                task_deliveries.discard(done_task)
+                if not task_deliveries:
+                    cls._delivery_tasks_by_task.pop(task_id, None)
 
         execution_task.add_done_callback(cleanup)
 
@@ -5698,13 +5810,23 @@ class SelfTriggerManager:
         process_task: Optional[asyncio.Task] = None
         wait_notice_task: Optional[asyncio.Task] = None
         try:
-            try:
-                await bot.send_message(
-                    chat_id=int(task['chat_id']),
-                    text=visible_notice,
-                )
-            except Exception as exc:
-                logger.warning(f"发送 trigger 可见提醒失败 {run_id}: {exc}")
+            if run.get('notice_started_at') is None:
+                await db.finish_trigger_run(run_id, notice_started_at=time.time())
+                try:
+                    await bot.send_message(
+                        chat_id=int(task['chat_id']),
+                        text=visible_notice,
+                    )
+                except Exception as exc:
+                    logger.warning(f"发送 trigger 可见提醒失败 {run_id}: {exc}")
+                else:
+                    await db.finish_trigger_run(run_id, notice_sent_at=time.time())
+
+            latest_task = await db.get_trigger_task(task['id'])
+            if latest_task is None or latest_task['status'] == 'cancelled':
+                await db.finish_trigger_run(run_id, delivered_at=time.time())
+                return
+            await db.finish_trigger_run(run_id, delivery_started_at=time.time())
             await GlobalRecorder.record_system_op(
                 visible_notice,
                 {
@@ -5748,10 +5870,22 @@ class SelfTriggerManager:
         except Exception as exc:
             logger.error(f"投递 trigger run {run_id} 失败: {exc}", exc_info=True)
             with contextlib.suppress(Exception):
+                await db.finish_trigger_run(run_id, delivered_at=time.time())
+                if task.get('repeat') and run.get('status') == 'condition_matched':
+                    await db.update_trigger_task(
+                        task['id'],
+                        last_result_hash=cls._repeat_result_signature(run),
+                        duplicate_count=0,
+                        backoff_seconds=0,
+                        backoff_until=None,
+                    )
+            with contextlib.suppress(Exception):
                 await bot.send_message(
                     chat_id=int(task['chat_id']),
                     text=f"⚠️ 后台任务 {task['id']} 已产生结果，但 AI 唤醒失败: {str(exc)[:200]}",
                 )
+            with contextlib.suppress(Exception):
+                await cls._restart_repeat_after_delivery(task['id'], run)
         finally:
             if wait_notice_task and not wait_notice_task.done():
                 wait_notice_task.cancel()
