@@ -5857,7 +5857,7 @@ class SelfTriggerManager:
         internal_result = (
             f"[后台任务结果]\n"
             f"这是系统在未来时间自动注入的真实执行结果，不是用户刚发送的新请求。"
-            f"Telegram 中已经显示过任务完成系统提醒。请根据任务概述和执行结果自然地继续处理，"
+            f"Telegram 中已经显示过任务完成系统提醒和 Agent 轮数整理提示。请根据任务概述和执行结果自然地继续处理，"
             f"不要重复系统提醒、不要复述内部协议。需要发送文件时可继续使用 sendfile。\n\n"
             f"任务 ID: {task['id']}\n"
             f"任务概述: {task_summary}\n"
@@ -13707,6 +13707,34 @@ async def _reserve_agent_turn_iteration(db: BotMemoryDB) -> int:
     return next_iteration
 
 
+def _build_agent_trigger_round_notice(current_iteration: int, max_iterations: int) -> str:
+    if current_iteration > max_iterations:
+        exceeded = current_iteration - max_iterations
+        return (
+            f"🛠️ 第 {current_iteration} 轮Agent操作完成，但已超出最大 {max_iterations} 轮（超出 {exceeded} 轮）。\n"
+            "后台任务结果已记录，但本次未提交给 AI。\n"
+            "只有新的用户消息才会重置 Agent 轮数。"
+        )
+    return f"🛠️ 第 {current_iteration} 轮Agent操作完成，正在整理结果..."
+
+
+async def _send_agent_trigger_round_notice(context: ContextTypes.DEFAULT_TYPE,
+                                           chat_id: int, current_iteration: int,
+                                           max_iterations: int):
+    message = _build_agent_trigger_round_notice(current_iteration, max_iterations)
+    await safe_send_message(context, chat_id, message)
+    await GlobalRecorder.record_system_op(
+        message,
+        {
+            'agent_iteration': current_iteration,
+            'agent_max_iterations': max_iterations,
+            'background_trigger': True,
+            'ai_call_skipped': current_iteration > max_iterations,
+        },
+        chat_id,
+    )
+
+
 async def _send_agent_iteration_limit_notice(context: ContextTypes.DEFAULT_TYPE,
                                              chat_id: int, current_iteration: int,
                                              max_iterations: int):
@@ -13770,13 +13798,13 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     else:
         agent_iteration = await _reserve_agent_turn_iteration(db)
         await db.add_chat_message(cid, 'user', text)
+        await _send_agent_trigger_round_notice(
+            context,
+            update.effective_chat.id,
+            agent_iteration,
+            max_agent_iterations,
+        )
         if agent_iteration > max_agent_iterations:
-            await _send_agent_iteration_limit_notice(
-                context,
-                update.effective_chat.id,
-                agent_iteration,
-                max_agent_iterations,
-            )
             return
     model = cdata.get('model') or UserDataManager.get('default_model')
     prov_name, prov_data = get_current_provider()
