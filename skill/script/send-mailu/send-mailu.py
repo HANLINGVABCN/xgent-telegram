@@ -4,6 +4,7 @@ Send Mailu 发信工具。
 
 子命令：
   send    发信（默认，可省略子命令直接 send-mailu.py --to ... --body ...）
+  get     按绝对路径读取本地 EML，输出邮件信息和正文预览
   check   检查配置是否可用（格式 + SMTP 实连测试），失败时提示是否开始配置
 """
 import argparse
@@ -21,6 +22,8 @@ from datetime import datetime, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from email.utils import formatdate, make_msgid, parseaddr
 
 # 发信配置路径（支持环境变量覆盖，便于测试/迁移）
@@ -1148,6 +1151,54 @@ def _write_config(config, force):
 
 
 # ============================================================
+# get 子命令（按文件名读取 EML 正文）
+# ============================================================
+
+def cmd_get(args):
+    root = os.path.realpath(os.environ.get("MAILU_MAIL_ROOT", "/mailu/mail"))
+    requested = os.path.expanduser(args.path.strip())
+    if not os.path.isabs(requested):
+        print("Error: get 必须传 EML 绝对路径，例如 /mailu/mail/admin@example.com/new/文件名", file=sys.stderr)
+        sys.exit(EXIT_ERROR)
+
+    path = os.path.realpath(requested)
+    try:
+        inside_root = os.path.commonpath([root, path]) == root
+    except ValueError:
+        inside_root = False
+    if not inside_root:
+        print(f"Error: 邮件路径必须位于 {root} 内", file=sys.stderr)
+        sys.exit(EXIT_ERROR)
+    if not os.path.isfile(path):
+        print(f"Error: 找不到邮件文件: {requested}", file=sys.stderr)
+        sys.exit(EXIT_ERROR)
+
+    try:
+        with open(path, "rb") as handle:
+            msg = BytesParser(policy=email_policy).parse(handle)
+        part = msg.get_body(preferencelist=("plain", "html")) if msg.is_multipart() else msg
+        body = part.get_content() if part is not None else ""
+        if isinstance(body, bytes):
+            body = body.decode(part.get_content_charset() or "utf-8", errors="replace")
+        body = str(body).strip()
+        attachments = [str(item.get_filename() or "[未命名附件]") for item in msg.iter_attachments()]
+
+        print(f"发件人: {msg.get('From', '')}")
+        print(f"收件人: {msg.get('To', '')}")
+        print(f"主题: {msg.get('Subject', '')}")
+        print(f"日期: {msg.get('Date', '')}")
+        print("--- 正文（前 1200 字符）---")
+        print(body[:1200] if body else "[无正文]")
+        if len(body) > 1200:
+            print(f"[正文已截断，共 {len(body)} 字符]")
+        print("--- 附件 ---")
+        print("\n".join(f"- {name}" for name in attachments) if attachments else "[无附件]")
+    except (OSError, ValueError) as exc:
+        print(f"Error: 读取邮件失败: {exc}", file=sys.stderr)
+        sys.exit(EXIT_ERROR)
+
+
+# ============================================================
 # argparse 子命令分发（保持向后兼容：无子命令=发信）
 # ============================================================
 
@@ -1166,13 +1217,17 @@ def _add_send_args(p):
 def build_parser():
     """构建 argparse。关键：子命令可选，无子命令时默认 send。"""
     parser = argparse.ArgumentParser(
-        description="Send Mailu 发信工具（发信 / 检查配置）",
+        description="Mailu 工具（send 发信 / get 读信 / check 检查配置）",
     )
     sub = parser.add_subparsers(dest="command")
 
     # send 子命令
     p_send = sub.add_parser("send", help="发信（默认，可省略子命令）")
     _add_send_args(p_send)
+
+    # get 子命令：只传文件名，递归查找并输出正文
+    p_get = sub.add_parser("get", help="按绝对路径读取 EML 信息和正文预览")
+    p_get.add_argument("path", help="邮件 EML 绝对路径，例如 /mailu/mail/admin@example.com/new/文件名")
 
     # check 子命令（含配置生成功能，失败时可交互配置）
     p_check = sub.add_parser("check", help="检查配置是否可用，失败时可交互配置")
@@ -1191,7 +1246,7 @@ def build_parser():
 
 def main():
     # 关键：无子命令时，把整个 argv 当作发信参数解析（向后兼容）
-    if len(sys.argv) >= 2 and sys.argv[1] in ("send", "check", "-h", "--help"):
+    if len(sys.argv) >= 2 and sys.argv[1] in ("send", "get", "check", "-h", "--help"):
         parser = build_parser()
         args = parser.parse_args()
         command = args.command or "send"
@@ -1204,6 +1259,8 @@ def main():
 
     if command == "send":
         cmd_send(args)
+    elif command == "get":
+        cmd_get(args)
     elif command == "check":
         cmd_check(args)
     else:
