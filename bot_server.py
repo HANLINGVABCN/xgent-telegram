@@ -616,6 +616,7 @@ class BotState:
     ADD_PROV_NAME = 'add_prov_name'
     ADD_PROV_URL = 'add_prov_url'
     ADD_PROV_KEY = 'add_prov_key'
+    EDIT_PROV_NAME = 'edit_prov_name'
     EDIT_PROV_KEY = 'edit_prov_key'
     EDIT_PROV_URL = 'edit_prov_url'
     ADD_MODEL_MANUAL = 'add_model_manual'
@@ -632,6 +633,13 @@ class BotState:
     SET_COMMAND_BLACKLIST = 'set_command_blacklist'
     SET_UPDATE_TOKEN = 'set_update_token'
     SET_MEMORY = 'set_memory'
+    IMPORT_PROVIDER_CONFIG = 'import_provider_config'
+
+PROVIDER_CONFIG_FORMAT = 'telegram-ai-bot-provider-config'
+PROVIDER_CONFIG_VERSION = 1
+PROVIDER_CONFIG_MAX_BYTES = 2 * 1024 * 1024
+PROVIDER_CONFIG_MAX_PROVIDERS = 100
+VALID_PROVIDER_API_FORMATS = {'openai', 'openai_compatible', 'gemini', 'vertex', 'claude'}
 
 # --- ☆ 消息类型定义（用于全局记录）☆ ---
 class MessageType:
@@ -1461,9 +1469,8 @@ class BotMemoryDB:
     async def save_provider(self, name: str, base_url: str, api_key: str,
                             models: Optional[List[str]] = None, api_format: str = 'openai'):
         """保存Provider"""
-        VALID_API_FORMATS = {'openai', 'openai_compatible', 'gemini', 'vertex', 'claude'}
-        if api_format not in VALID_API_FORMATS:
-            raise ValueError(f"无效的 api_format: {api_format}，支持的格式: {', '.join(sorted(VALID_API_FORMATS))}")
+        if api_format not in VALID_PROVIDER_API_FORMATS:
+            raise ValueError(f"无效的 api_format: {api_format}，支持的格式: {', '.join(sorted(VALID_PROVIDER_API_FORMATS))}")
         conn = await self._get_conn()
         await conn.execute('''
             INSERT OR REPLACE INTO providers (name, base_url, api_key, models, api_format)
@@ -1472,6 +1479,66 @@ class BotMemoryDB:
         # 清除缓存
         self._providers_cache = None
     
+    async def import_providers(self, providers: Dict[str, Dict[str, Any]], replace: bool = False):
+        """在单个事务中批量导入 Provider；可合并或先清空后覆盖。"""
+        conn = await self._get_conn()
+        await conn.execute('BEGIN IMMEDIATE')
+        try:
+            if replace:
+                await conn.execute('DELETE FROM providers')
+            for name, provider in providers.items():
+                await conn.execute('''
+                    INSERT OR REPLACE INTO providers (name, base_url, api_key, models, api_format)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (
+                    name,
+                    provider['base_url'],
+                    provider['api_key'],
+                    json.dumps(provider.get('models', []), ensure_ascii=False),
+                    provider.get('api_format', 'openai')
+                ))
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+        self._providers_cache = None
+
+    async def rename_provider(self, old_name: str, new_name: str):
+        """原子重命名 Provider，并同步关联的默认模型提供商配置。"""
+        if old_name == new_name:
+            return
+        conn = await self._get_conn()
+        await conn.execute('BEGIN IMMEDIATE')
+        try:
+            cursor = await conn.execute('SELECT 1 FROM providers WHERE name = ?', (old_name,))
+            if not await cursor.fetchone():
+                raise ValueError(f'提供商不存在：{old_name}')
+            cursor = await conn.execute('SELECT 1 FROM providers WHERE name = ?', (new_name,))
+            if await cursor.fetchone():
+                raise ValueError(f'提供商名称已存在：{new_name}')
+
+            await conn.execute('UPDATE providers SET name = ? WHERE name = ?', (new_name, old_name))
+            old_json = json.dumps(old_name)
+            new_json = json.dumps(new_name)
+            await conn.execute(
+                "UPDATE config SET value = ? WHERE key = 'active_provider' AND value IN (?, ?)",
+                (new_json, old_json, old_name)
+            )
+            await conn.execute(
+                "UPDATE config SET value = ? WHERE key = 'default_media_provider' AND value IN (?, ?)",
+                (new_json, old_json, old_name)
+            )
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+
+        self._providers_cache = None
+        if self._config_cache.get('active_provider') == old_name:
+            self._config_cache['active_provider'] = new_name
+        if self._config_cache.get('default_media_provider') == old_name:
+            self._config_cache['default_media_provider'] = new_name
+
     async def delete_provider(self, name: str):
         """删除Provider"""
         conn = await self._get_conn()
@@ -1828,6 +1895,7 @@ class UserDataManager:
             'temp_back_callback': None,
             'prompt_buffer': '',
             'editing_prompt_key': '',
+            'provider_import_mode': None,
         }
     
     @classmethod
@@ -8902,21 +8970,23 @@ def get_providers_menu():
     providers = UserDataManager.get('providers', {})
     keyboard = []
     for name in providers:
-        # Telegram callback_data 限制 64 字节，跳过名字太长的
-        cb = f"view_prov_{name}"
-        if len(cb.encode('utf-8')) > 64:
-            continue
+        cb = CallbackDataStore.store(f"view_prov_{name}")
         keyboard.append([InlineKeyboardButton(f"{get_provider_usage_badges(name)} {name}", callback_data=cb)])
     keyboard.append([InlineKeyboardButton("➕ 添加提供商", callback_data="act_add_provider")])
+    keyboard.append([
+        InlineKeyboardButton("📤 导出配置", callback_data="export_provider_config"),
+        InlineKeyboardButton("📥 导入配置", callback_data="import_provider_config")
+    ])
     keyboard.append([InlineKeyboardButton("🔙 返回主菜单", callback_data="act_main_menu")])
     return InlineKeyboardMarkup(keyboard)
 
 def get_provider_detail_menu(prov_name):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📦 模型", callback_data=f"prov_models_{prov_name}")],
-        [InlineKeyboardButton("🔑 Key", callback_data=f"edit_pkey_{prov_name}"),
-         InlineKeyboardButton("🔗 URL", callback_data=f"edit_purl_{prov_name}")],
-        [InlineKeyboardButton("🗑️ 删除", callback_data=f"del_prov_{prov_name}")],
+        [InlineKeyboardButton("📦 模型", callback_data=CallbackDataStore.store(f"prov_models_{prov_name}"))],
+        [InlineKeyboardButton("✏️ 名称", callback_data=CallbackDataStore.store(f"edit_pname_{prov_name}")),
+         InlineKeyboardButton("🔗 URL", callback_data=CallbackDataStore.store(f"edit_purl_{prov_name}"))],
+        [InlineKeyboardButton("🔑 Key", callback_data=CallbackDataStore.store(f"edit_pkey_{prov_name}")),
+         InlineKeyboardButton("🗑️ 删除", callback_data=CallbackDataStore.store(f"del_prov_{prov_name}"))],
         [InlineKeyboardButton("🔙 返回", callback_data="menu_providers")]
     ])
 
@@ -10728,10 +10798,223 @@ async def perform_update_system(update: Update, context: ContextTypes.DEFAULT_TY
     await asyncio.sleep(0.4)
     await restart_current_process(update.effective_chat.id, context.bot)
 
+def build_provider_config_export() -> Dict[str, Any]:
+    """构建可移植的 Provider 配置；API Key 会原样包含在导出文件中。"""
+    providers = UserDataManager.get('providers', {}) or {}
+    exported_providers: Dict[str, Dict[str, Any]] = {}
+    for name, provider in providers.items():
+        exported_providers[str(name)] = {
+            'base_url': str(provider.get('base_url', '')),
+            'api_key': str(provider.get('api_key', '')),
+            'models': [str(model) for model in provider.get('models', [])],
+            'api_format': str(provider.get('api_format', 'openai'))
+        }
+
+    return {
+        'format': PROVIDER_CONFIG_FORMAT,
+        'version': PROVIDER_CONFIG_VERSION,
+        'exported_at': datetime.now().astimezone().isoformat(timespec='seconds'),
+        'providers': exported_providers,
+        'defaults': {
+            'active_provider': UserDataManager.get('active_provider_key'),
+            'default_model': UserDataManager.get('default_model'),
+            'default_media_provider': UserDataManager.get('default_media_provider_key'),
+            'default_media_model': UserDataManager.get('default_media_model')
+        }
+    }
+
+
+def parse_provider_config_import(raw_bytes: bytes) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """解析并严格校验 Provider 配置 JSON。"""
+    if not raw_bytes:
+        raise ValueError('配置文件为空')
+    if len(raw_bytes) > PROVIDER_CONFIG_MAX_BYTES:
+        raise ValueError(f'配置文件不能超过 {PROVIDER_CONFIG_MAX_BYTES // 1024 // 1024} MB')
+    try:
+        payload = json.loads(raw_bytes.decode('utf-8-sig'))
+    except UnicodeDecodeError as exc:
+        raise ValueError('配置文件必须使用 UTF-8 编码') from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f'JSON 格式错误：第 {exc.lineno} 行第 {exc.colno} 列') from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError('配置文件根节点必须是 JSON 对象')
+    file_format = payload.get('format')
+    if file_format != PROVIDER_CONFIG_FORMAT:
+        raise ValueError('不是本 Bot 导出的提供商配置文件')
+    version = payload.get('version')
+    if version != PROVIDER_CONFIG_VERSION:
+        raise ValueError(f'不支持的配置版本：{version!r}')
+
+    raw_providers = payload.get('providers')
+    if not isinstance(raw_providers, dict):
+        raise ValueError('providers 必须是 JSON 对象')
+    if not raw_providers:
+        raise ValueError('配置文件中没有提供商')
+    if len(raw_providers) > PROVIDER_CONFIG_MAX_PROVIDERS:
+        raise ValueError(f'一次最多导入 {PROVIDER_CONFIG_MAX_PROVIDERS} 个提供商')
+
+    providers: Dict[str, Dict[str, Any]] = {}
+    for raw_name, raw_provider in raw_providers.items():
+        if not isinstance(raw_name, str):
+            raise ValueError('提供商名称必须是字符串')
+        name = raw_name.strip()
+        if not name or len(name) > 20 or any(ord(ch) < 32 for ch in name):
+            raise ValueError(f'提供商名称无效：{raw_name!r}（不能为空，最多 20 个字符）')
+        if name in providers:
+            raise ValueError(f'提供商名称去除首尾空格后重复：{name}')
+        if not isinstance(raw_provider, dict):
+            raise ValueError(f'提供商 {name} 的配置必须是 JSON 对象')
+
+        base_url = raw_provider.get('base_url')
+        api_key = raw_provider.get('api_key')
+        api_format = raw_provider.get('api_format', 'openai')
+        models = raw_provider.get('models', [])
+        if not isinstance(base_url, str) or not base_url.strip().lower().startswith(('http://', 'https://')):
+            raise ValueError(f'提供商 {name} 的 base_url 必须以 http:// 或 https:// 开头')
+        if not isinstance(api_key, str):
+            raise ValueError(f'提供商 {name} 的 api_key 必须是字符串')
+        if not isinstance(api_format, str) or api_format not in VALID_PROVIDER_API_FORMATS:
+            raise ValueError(f'提供商 {name} 的 api_format 无效')
+        if not isinstance(models, list):
+            raise ValueError(f'提供商 {name} 的 models 必须是数组')
+
+        normalized_models: List[str] = []
+        seen_models = set()
+        for model in models:
+            if not isinstance(model, str):
+                raise ValueError(f'提供商 {name} 的模型名称必须是字符串')
+            model_name = model.strip()
+            if not model_name:
+                continue
+            if len(model_name) > 300:
+                raise ValueError(f'提供商 {name} 存在过长的模型名称')
+            if model_name not in seen_models:
+                normalized_models.append(model_name)
+                seen_models.add(model_name)
+
+        providers[name] = {
+            'base_url': base_url.strip(),
+            'api_key': api_key.replace(' ', ''),
+            'models': normalized_models,
+            'api_format': api_format
+        }
+
+    defaults = payload.get('defaults', {})
+    if defaults is None:
+        defaults = {}
+    if not isinstance(defaults, dict):
+        raise ValueError('defaults 必须是 JSON 对象')
+    return providers, defaults
+
+
+async def apply_provider_config_import(
+        providers: Dict[str, Dict[str, Any]], defaults: Dict[str, Any], mode: str = 'merge') -> Dict[str, Any]:
+    """按 merge/replace 模式导入 Provider，并仅恢复有效的默认模型选择。"""
+    if mode not in {'merge', 'replace'}:
+        raise ValueError(f'无效的导入模式：{mode}')
+    db = await BotMemoryDB.get_instance()
+    existing_names = set((UserDataManager.get('providers', {}) or {}).keys())
+    imported_names = set(providers.keys())
+    overwritten = len(existing_names.intersection(imported_names))
+    removed = len(existing_names - imported_names) if mode == 'replace' else 0
+    await db.import_providers(providers, replace=(mode == 'replace'))
+    for name in existing_names.union(imported_names):
+        PortalManager.remove_portal(name)
+    await UserDataManager.reload_providers()
+    merged = UserDataManager.get('providers', {}) or {}
+
+    restored_defaults: List[str] = []
+    skipped_defaults: List[str] = []
+
+    if mode == 'replace':
+        for target in ('chat', 'media'):
+            meta = get_model_target_meta(target)
+            UserDataManager.set(meta['provider_state_key'], None)
+            UserDataManager.set(meta['model_state_key'], None)
+            await UserDataManager.save_config(meta['provider_config_key'], None)
+            await UserDataManager.save_config(meta['model_config_key'], None)
+
+    async def restore_target(target: str, provider_field: str, model_field: str, label: str):
+        if provider_field not in defaults and model_field not in defaults:
+            return
+        provider_name = defaults.get(provider_field)
+        model_name = defaults.get(model_field)
+        provider = merged.get(provider_name) if isinstance(provider_name, str) else None
+        meta = get_model_target_meta(target)
+        if provider and isinstance(model_name, str) and model_name in provider.get('models', []):
+            await save_model_target_selection(target, provider_name, model_name)
+            restored_defaults.append(label)
+        elif provider_name is None and model_name is None:
+            UserDataManager.set(meta['provider_state_key'], None)
+            UserDataManager.set(meta['model_state_key'], None)
+            await UserDataManager.save_config(meta['provider_config_key'], None)
+            await UserDataManager.save_config(meta['model_config_key'], None)
+            restored_defaults.append(f'{label}（未设置）')
+        else:
+            skipped_defaults.append(label)
+
+    await restore_target('chat', 'active_provider', 'default_model', '默认对话模型')
+    await restore_target(
+        'media', 'default_media_provider', 'default_media_model', '默认媒体模型'
+    )
+    return {
+        'mode': mode,
+        'count': len(providers),
+        'added': len(providers) - overwritten,
+        'overwritten': overwritten,
+        'removed': removed,
+        'restored_defaults': restored_defaults,
+        'skipped_defaults': skipped_defaults
+    }
+
+
+async def send_provider_config_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await UserDataManager.init()
+    await UserDataManager.reload_providers()
+    providers = UserDataManager.get('providers', {}) or {}
+    message = update.message or update.callback_query.message
+    if not providers:
+        await message.reply_text('📭 当前没有可导出的提供商配置。')
+        return
+
+    payload = build_provider_config_export()
+    content = json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
+    buffer = io.BytesIO(content)
+    filename = f"提供商配置-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    await context.bot.send_document(
+        chat_id=update.effective_chat.id,
+        document=InputFile(buffer, filename),
+        caption=(
+            f'✅ 已导出 {len(providers)} 个提供商。\n'
+            '⚠️ 文件包含完整 API Key，请妥善保管，不要转发给他人。'
+        )
+    )
+    await GlobalRecorder.record_system_op('导出提供商配置', {'count': len(providers)})
+
+
+async def cmd_provider_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_authorized_user_middleware(update, context):
+        return
+    await UserDataManager.init()
+    UserDataManager.set('state', BotState.IDLE)
+    UserDataManager.set('provider_import_mode', None)
+    await UserDataManager.reload_providers()
+    await update.message.reply_text(
+        '🔐 <b>提供商配置导入 / 导出</b>\n\n'
+        '导出文件包含提供商 URL、API Key、模型列表和默认模型选择。\n'
+        '导入时可选择合并或覆盖模式。',
+        reply_markup=get_providers_menu(),
+        parse_mode=constants.ParseMode.HTML
+    )
+
+
 async def cmd_providers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
         return
     await UserDataManager.init()
+    UserDataManager.set('state', BotState.IDLE)
+    UserDataManager.set('provider_import_mode', None)
     await UserDataManager.reload_providers()
     await update.message.reply_text(
         "🔌 <b>提供商管理</b>\n\n"
@@ -11692,6 +11975,9 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         # --- Provider 管理 ---
         elif data == "menu_providers":
+            if UserDataManager.get('state') == BotState.IMPORT_PROVIDER_CONFIG:
+                UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('provider_import_mode', None)
             await UserDataManager.reload_providers()
             await query.message.edit_text(
                 "🔌 <b>提供商管理</b>\n\n"
@@ -11699,6 +11985,52 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "默认对话模型 / 媒体模型 请到【默认模型】里单独选择。",
                 reply_markup=get_providers_menu(),
                 parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "export_provider_config":
+            await send_provider_config_export(update, context)
+
+        elif data == "import_provider_config":
+            UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('provider_import_mode', None)
+            await query.message.edit_text(
+                "📥 <b>选择导入方式</b>\n\n"
+                "➕ <b>合并导入</b>\n"
+                "同名提供商覆盖，文件中没有的现有提供商继续保留。\n\n"
+                "♻️ <b>覆盖导入</b>\n"
+                "先删除全部现有提供商，再完全按导入文件重建。\n"
+                "未包含在文件中的提供商会被删除。",
+                parse_mode=constants.ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ 合并导入", callback_data="provider_import_mode_merge")],
+                    [InlineKeyboardButton("♻️ 覆盖导入", callback_data="provider_import_mode_replace")],
+                    [InlineKeyboardButton("🔙 返回", callback_data="menu_providers")]
+                ])
+            )
+
+        elif data in {"provider_import_mode_merge", "provider_import_mode_replace"}:
+            import_mode = 'replace' if data.endswith('_replace') else 'merge'
+            UserDataManager.set('provider_import_mode', import_mode)
+            UserDataManager.set('state', BotState.IMPORT_PROVIDER_CONFIG)
+            mode_label = '覆盖导入' if import_mode == 'replace' else '合并导入'
+            mode_note = (
+                "⚠️ 覆盖导入会删除文件中没有的现有提供商。\n"
+                if import_mode == 'replace'
+                else "同名提供商会更新，其他现有提供商会保留。\n"
+            )
+            await query.message.edit_text(
+                f"📥 <b>{mode_label}</b>\n\n"
+                "请发送由本 Bot 导出的 <code>提供商配置-*.json</code> 文件，"
+                "也可以直接粘贴完整 JSON。\n\n"
+                f"{mode_note}"
+                "只有有效的默认模型选择才会恢复。\n"
+                "配置内含 API Key，请仅在私聊中操作。\n\n"
+                "发送 <code>cancel</code> 可取消。",
+                parse_mode=constants.ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 重新选择方式", callback_data="import_provider_config")],
+                    [InlineKeyboardButton("取消导入", callback_data="menu_providers")]
+                ])
             )
 
         elif data == "menu_default_models":
@@ -11913,6 +12245,17 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=get_providers_menu()
             )
         
+        elif data.startswith("edit_pname_"):
+            provider_name = data[len("edit_pname_"):]
+            if provider_name not in (UserDataManager.get('providers', {}) or {}):
+                await query.answer("⚠️ 找不到这个提供商", show_alert=True)
+                return
+            UserDataManager.set('editing_provider', provider_name)
+            UserDataManager.set('state', BotState.EDIT_PROV_NAME)
+            await query.message.reply_text(
+                "✏️ 请输入新的提供商名称（最多 20 个字符，或发送 cancel）："
+            )
+
         elif data.startswith("edit_pkey_"):
             UserDataManager.set('editing_provider', data.split("_", 2)[2])
             UserDataManager.set('state', BotState.EDIT_PROV_KEY)
@@ -12214,7 +12557,10 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     # 处理中锁（仅对非提示词编辑状态生效）
     await UserDataManager.init()
     state = UserDataManager.get('state')
-    if not is_prompt_edit_state(state) and state != BotState.SET_COMMAND_BLACKLIST and state != BotState.SET_MEMORY:
+    if (not is_prompt_edit_state(state)
+            and state != BotState.SET_COMMAND_BLACKLIST
+            and state != BotState.SET_MEMORY
+            and state != BotState.IMPORT_PROVIDER_CONFIG):
         if _conversation_processing_lock.locked():
             await update.message.reply_text(
                 "⏳ 系统仍在处理上一个请求... 请稍等。"
@@ -12235,6 +12581,71 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         caption = _extract_rich_message_text(update.message).strip()
         if caption:
             logger.warning(f"handle_document_message: extracted caption via rich_message, len={len(caption)}: {caption[:200]}")
+
+    if state == BotState.IMPORT_PROVIDER_CONFIG:
+        await GlobalRecorder.record_user_message(
+            f"[提供商配置文件] {doc_name}",
+            MessageType.USER_FILE,
+            update.effective_chat.id
+        )
+        if not doc_name.lower().endswith('.json'):
+            await update.message.reply_text("⚠️ 请发送 JSON 配置文件，或发送 cancel 取消。")
+            return
+        if doc.file_size and doc.file_size > PROVIDER_CONFIG_MAX_BYTES:
+            await update.message.reply_text(
+                f"⚠️ 配置文件不能超过 {PROVIDER_CONFIG_MAX_BYTES // 1024 // 1024} MB。"
+            )
+            return
+        status_msg = await update.message.reply_text("📥 正在校验并导入提供商配置...")
+        try:
+            content_bytes = bytes(await download_telegram_file(doc))
+            providers, defaults = parse_provider_config_import(content_bytes)
+            import_mode = UserDataManager.get('provider_import_mode')
+            if import_mode not in {'merge', 'replace'}:
+                raise ValueError('请先选择合并导入或覆盖导入')
+            result = await apply_provider_config_import(providers, defaults, import_mode)
+            UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('provider_import_mode', None)
+            restored = '、'.join(result['restored_defaults']) or '无'
+            skipped = (
+                f"\n⚠️ 未恢复：{'、'.join(result['skipped_defaults'])}（提供商或模型不存在）"
+                if result['skipped_defaults'] else ''
+            )
+            await GlobalRecorder.record_system_op(
+                "导入提供商配置",
+                {
+                    'count': result['count'],
+                    'added': result['added'],
+                    'overwritten': result['overwritten'],
+                    'removed': result['removed'],
+                    'mode': result['mode'],
+                    'file_name': doc_name
+                }
+            )
+            mode_label = '覆盖导入' if result['mode'] == 'replace' else '合并导入'
+            removed_line = f"删除旧提供商：{result['removed']} 个\n" if result['mode'] == 'replace' else ''
+            await status_msg.edit_text(
+                f"✅ 提供商配置导入完成。\n"
+                f"方式：{mode_label}\n"
+                f"新增：{result['added']} 个\n"
+                f"更新同名：{result['overwritten']} 个\n"
+                f"{removed_line}"
+                f"默认项：{safe_text(restored)}{safe_text(skipped)}",
+                reply_markup=get_providers_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+        except ValueError as e:
+            await status_msg.edit_text(
+                f"❌ 导入失败：{safe_text(str(e))}\n\n请修正文件后重试，或发送 cancel 取消。",
+                parse_mode=constants.ParseMode.HTML
+            )
+        except Exception as e:
+            logger.exception("Provider config import failed")
+            await status_msg.edit_text(
+                f"❌ 导入失败：{safe_text(format_provider_exception(e))}\n\n请检查日志后重试。",
+                parse_mode=constants.ParseMode.HTML
+            )
+        return
 
     if state == BotState.SET_COMMAND_BLACKLIST:
         await GlobalRecorder.record_user_message(
@@ -12631,6 +13042,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await handle_other_message(update, context)
         return
 
+    # 导入 JSON 时必须使用 Telegram 原始文本，避免 text_markdown 自动转义下划线等字符。
+    if state == BotState.IMPORT_PROVIDER_CONFIG and update.message.text:
+        text = update.message.text.strip()
+
     # 转发消息添加来源信息
     forward_prefix = build_forward_origin_prefix(update.message)
     if forward_prefix:
@@ -12641,6 +13056,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         recorded_text = (
             "[已填入 UPDATE_GITHUB_TOKEN，内容已隐藏]"
             if state == BotState.SET_UPDATE_TOKEN
+            else "[已提交提供商配置 JSON，内容已隐藏]"
+            if state == BotState.IMPORT_PROVIDER_CONFIG
             else "[已填入 API Key，内容已隐藏]"
             if state in (BotState.EDIT_PROV_KEY, BotState.ADD_PROV_KEY)
             else text
@@ -12655,6 +13072,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         UserDataManager.set('prompt_buffer', "")
         UserDataManager.set('command_blacklist_buffer', "")
         UserDataManager.set('memory_buffer', "")
+        UserDataManager.set('provider_import_mode', None)
+        UserDataManager.set('editing_provider', None)
         await update.message.reply_text(
             "🚫 操作已取消。",
             reply_markup=get_main_menu()
@@ -12662,6 +13081,56 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # --- 状态机处理 ---
+    if state == BotState.IMPORT_PROVIDER_CONFIG:
+        status_msg = await update.message.reply_text("📥 正在校验并导入提供商配置...")
+        try:
+            providers, defaults = parse_provider_config_import(text.encode('utf-8'))
+            import_mode = UserDataManager.get('provider_import_mode')
+            if import_mode not in {'merge', 'replace'}:
+                raise ValueError('请先选择合并导入或覆盖导入')
+            result = await apply_provider_config_import(providers, defaults, import_mode)
+            UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('provider_import_mode', None)
+            restored = '、'.join(result['restored_defaults']) or '无'
+            skipped = (
+                f"\n⚠️ 未恢复：{'、'.join(result['skipped_defaults'])}（提供商或模型不存在）"
+                if result['skipped_defaults'] else ''
+            )
+            await GlobalRecorder.record_system_op(
+                "通过文本导入提供商配置",
+                {
+                    'count': result['count'],
+                    'added': result['added'],
+                    'overwritten': result['overwritten'],
+                    'removed': result['removed'],
+                    'mode': result['mode']
+                }
+            )
+            mode_label = '覆盖导入' if result['mode'] == 'replace' else '合并导入'
+            removed_line = f"删除旧提供商：{result['removed']} 个\n" if result['mode'] == 'replace' else ''
+            await status_msg.edit_text(
+                f"✅ 提供商配置导入完成。\n"
+                f"方式：{mode_label}\n"
+                f"新增：{result['added']} 个\n"
+                f"更新同名：{result['overwritten']} 个\n"
+                f"{removed_line}"
+                f"默认项：{safe_text(restored)}{safe_text(skipped)}",
+                reply_markup=get_providers_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+        except ValueError as e:
+            await status_msg.edit_text(
+                f"❌ 导入失败：{safe_text(str(e))}\n\n请重新发送完整 JSON，或发送 cancel 取消。",
+                parse_mode=constants.ParseMode.HTML
+            )
+        except Exception as e:
+            logger.exception("Provider config text import failed")
+            await status_msg.edit_text(
+                f"❌ 导入失败：{safe_text(format_provider_exception(e))}",
+                parse_mode=constants.ParseMode.HTML
+            )
+        return
+
     if state == BotState.SET_UPDATE_TOKEN:
         token = text.strip()
         if not token:
@@ -12946,6 +13415,52 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
     
+    if state == BotState.EDIT_PROV_NAME:
+        old_name = UserDataManager.get('editing_provider')
+        new_name = text.strip()
+        providers = UserDataManager.get('providers', {}) or {}
+        if not old_name or old_name not in providers:
+            UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('editing_provider', None)
+            await update.message.reply_text("⚠️ 原提供商不存在，请重新打开提供商菜单。", reply_markup=get_providers_menu())
+            return
+        if not new_name or len(new_name) > 20 or any(ord(ch) < 32 for ch in new_name):
+            await update.message.reply_text("⚠️ 名称不能为空、最多 20 个字符，且不能包含控制字符。请重新发送。")
+            return
+        if new_name != old_name and new_name in providers:
+            await update.message.reply_text("⚠️ 该名称已存在，请换一个名称。")
+            return
+        if new_name == old_name:
+            UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('editing_provider', new_name)
+            await update.message.reply_text("✅ 名称未改变。", reply_markup=get_provider_detail_menu(new_name))
+            return
+
+        db = await BotMemoryDB.get_instance()
+        try:
+            await db.rename_provider(old_name, new_name)
+        except ValueError as e:
+            await update.message.reply_text(f"⚠️ {safe_text(str(e))}", parse_mode=constants.ParseMode.HTML)
+            return
+        PortalManager.remove_portal(old_name)
+        if UserDataManager.get('active_provider_key') == old_name:
+            UserDataManager.set('active_provider_key', new_name)
+        if UserDataManager.get('default_media_provider_key') == old_name:
+            UserDataManager.set('default_media_provider_key', new_name)
+        await UserDataManager.reload_providers()
+        UserDataManager.set('editing_provider', new_name)
+        UserDataManager.set('state', BotState.IDLE)
+        await GlobalRecorder.record_system_op(
+            f"重命名Provider: {old_name} -> {new_name}",
+            {'old_name': old_name, 'new_name': new_name}
+        )
+        await update.message.reply_text(
+            f"✅ 提供商已重命名为 <b>{safe_text(new_name)}</b>。",
+            reply_markup=get_provider_detail_menu(new_name),
+            parse_mode=constants.ParseMode.HTML
+        )
+        return
+
     if state == BotState.EDIT_PROV_KEY:
         p = UserDataManager.get('editing_provider')
         # 支持多个 Key（英文逗号分隔），忽略所有空格
@@ -14819,6 +15334,7 @@ async def setup_bot_commands(app):
                 BotCommand("config", "打开设置面板"),
                 BotCommand("update", "更新代码并重启"),
                 BotCommand("providers", "管理提供商与模型列表"),
+                BotCommand("provider_config", "导入导出提供商配置"),
                 BotCommand("models", "选择默认模型"),
                 BotCommand("chat_model", "选择默认对话模型"),
                 BotCommand("media_model", "选择默认媒体模型"),
@@ -15013,6 +15529,7 @@ if __name__ == '__main__':
             ("update", cmd_update_system),
             ("restart", cmd_restart_system),
             ("providers", cmd_providers_menu),
+            ("provider_config", cmd_provider_config),
             ("models", cmd_models_menu),
             ("chat_model", cmd_chat_model_menu),
             ("media_model", cmd_media_model_menu),
