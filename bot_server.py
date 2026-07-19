@@ -40,13 +40,18 @@ import aiosqlite
 import json
 import httpx
 import hashlib
-from datetime import datetime
+import codecs
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Optional, Tuple, List, Dict, Any, Deque, cast
 from collections import OrderedDict, deque
 
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from telegram import BotCommand, Update, constants, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import BotCommand, BotCommandScopeAllPrivateChats, Update, constants, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.error import BadRequest, InvalidToken, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
@@ -173,6 +178,9 @@ MAX_AGENT_COMMAND_TIMEOUT = 3600
 DEFAULT_AGENT_MAX_ITERATIONS = 10
 MIN_AGENT_MAX_ITERATIONS = 1
 MAX_AGENT_MAX_ITERATIONS = 50
+AGENT_TURN_ITERATION_CONFIG_KEY = 'agent_turn_iteration'
+DEFAULT_IDLE_MESSAGE_INTERVAL = 24 * 3600
+MIN_IDLE_MESSAGE_INTERVAL = 60
 PROVIDER_HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -266,6 +274,23 @@ def normalize_agent_max_iterations(value: Any, default: int = DEFAULT_AGENT_MAX_
     return iterations
 
 
+def normalize_idle_message_interval(value: Any, default: int = DEFAULT_IDLE_MESSAGE_INTERVAL) -> int:
+    if isinstance(value, str) and value.strip().lower() in {
+        "0", "∞", "inf", "infinite", "none", "no", "off", "disabled", "unlimited",
+        "无限", "关闭", "关", "不触发", "停用",
+    }:
+        return 0
+    try:
+        seconds = int(float(value))
+    except (TypeError, ValueError):
+        seconds = int(default)
+    if seconds <= 0:
+        return 0
+    if seconds < MIN_IDLE_MESSAGE_INTERVAL:
+        return MIN_IDLE_MESSAGE_INTERVAL
+    return seconds
+
+
 def parse_agent_max_iterations(text: str) -> int:
     cleaned = str(text or "").strip().lower()
     cleaned = re.sub(r"(轮|次|rounds?|iterations?|iters?)$", "", cleaned).strip()
@@ -278,6 +303,39 @@ def parse_agent_max_iterations(text: str) -> int:
     if iterations > MAX_AGENT_MAX_ITERATIONS:
         raise ValueError(f"iterations must be at most {MAX_AGENT_MAX_ITERATIONS}")
     return iterations
+
+
+def parse_idle_message_interval(text: str) -> int:
+    cleaned = str(text or "").strip().lower()
+    if cleaned in {
+        "0", "∞", "inf", "infinite", "none", "no", "off", "disabled", "unlimited",
+        "无限", "关闭", "关", "不触发", "停用",
+    }:
+        return 0
+
+    multiplier = 1
+    unit_patterns = [
+        (r"(hours?|hrs?|h|小时|时)$", 3600),
+        (r"(days?|d|天|日)$", 86400),
+        (r"(minutes?|mins?|m|分钟|分)$", 60),
+        (r"(seconds?|secs?|sec|s|秒)$", 1),
+    ]
+    for pattern, unit_multiplier in unit_patterns:
+        if re.search(pattern, cleaned):
+            multiplier = unit_multiplier
+            cleaned = re.sub(pattern, "", cleaned).strip()
+            break
+
+    try:
+        seconds = int(float(cleaned) * multiplier)
+    except (TypeError, ValueError):
+        raise ValueError("idle interval must be a number")
+
+    if seconds <= 0:
+        return 0
+    if seconds < MIN_IDLE_MESSAGE_INTERVAL:
+        raise ValueError(f"idle interval must be at least {MIN_IDLE_MESSAGE_INTERVAL} seconds")
+    return seconds
 
 
 def parse_timeout_seconds(text: str, minimum: int = 1, maximum: Optional[int] = None,
@@ -558,6 +616,7 @@ class BotState:
     ADD_PROV_NAME = 'add_prov_name'
     ADD_PROV_URL = 'add_prov_url'
     ADD_PROV_KEY = 'add_prov_key'
+    EDIT_PROV_NAME = 'edit_prov_name'
     EDIT_PROV_KEY = 'edit_prov_key'
     EDIT_PROV_URL = 'edit_prov_url'
     ADD_MODEL_MANUAL = 'add_model_manual'
@@ -570,9 +629,17 @@ class BotState:
     SET_AI_TIMEOUT = 'set_ai_timeout'
     SET_COMMAND_TIMEOUT = 'set_command_timeout'
     SET_AGENT_MAX_ITERATIONS = 'set_agent_max_iterations'
+    SET_IDLE_MESSAGE_INTERVAL = 'set_idle_message_interval'
     SET_COMMAND_BLACKLIST = 'set_command_blacklist'
     SET_UPDATE_TOKEN = 'set_update_token'
     SET_MEMORY = 'set_memory'
+    IMPORT_PROVIDER_CONFIG = 'import_provider_config'
+
+PROVIDER_CONFIG_FORMAT = 'telegram-ai-bot-provider-config'
+PROVIDER_CONFIG_VERSION = 1
+PROVIDER_CONFIG_MAX_BYTES = 2 * 1024 * 1024
+PROVIDER_CONFIG_MAX_PROVIDERS = 100
+VALID_PROVIDER_API_FORMATS = {'openai', 'openai_compatible', 'gemini', 'vertex', 'claude'}
 
 # --- ☆ 消息类型定义（用于全局记录）☆ ---
 class MessageType:
@@ -1046,6 +1113,85 @@ class BotMemoryDB:
                 timestamp REAL NOT NULL
             )
         ''')
+
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS trigger_tasks (
+                id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                conversation_id TEXT NOT NULL,
+                command TEXT NOT NULL,
+                summary TEXT,
+                schedule_type TEXT NOT NULL,
+                schedule_expr TEXT,
+                timezone TEXT NOT NULL,
+                next_run_at REAL,
+                condition_expr TEXT,
+                repeat INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                origin_user_text TEXT,
+                origin_assistant_text TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                last_started_at REAL,
+                last_finished_at REAL,
+                fire_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                recovery_count INTEGER NOT NULL DEFAULT 0,
+                last_result_hash TEXT,
+                duplicate_count INTEGER NOT NULL DEFAULT 0,
+                backoff_seconds REAL NOT NULL DEFAULT 0,
+                backoff_until REAL,
+                last_error TEXT
+            )
+        ''')
+
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS trigger_runs (
+                run_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                scheduled_at REAL NOT NULL,
+                started_at REAL,
+                finished_at REAL,
+                status TEXT NOT NULL,
+                trigger_reason TEXT,
+                matched_conditions TEXT,
+                exit_code INTEGER,
+                output TEXT,
+                output_path TEXT,
+                error TEXT,
+                notice_started_at REAL,
+                notice_sent_at REAL,
+                delivery_started_at REAL,
+                delivered_at REAL,
+                created_at REAL NOT NULL,
+                UNIQUE(task_id, scheduled_at),
+                FOREIGN KEY (task_id) REFERENCES trigger_tasks(id)
+            )
+        ''')
+
+        try:
+            await conn.execute('ALTER TABLE trigger_tasks ADD COLUMN summary TEXT')
+        except Exception:
+            pass
+        for migration in (
+            'ALTER TABLE trigger_tasks ADD COLUMN last_result_hash TEXT',
+            'ALTER TABLE trigger_tasks ADD COLUMN duplicate_count INTEGER NOT NULL DEFAULT 0',
+            'ALTER TABLE trigger_tasks ADD COLUMN backoff_seconds REAL NOT NULL DEFAULT 0',
+            'ALTER TABLE trigger_tasks ADD COLUMN backoff_until REAL',
+        ):
+            try:
+                await conn.execute(migration)
+            except Exception:
+                pass
+        for migration in (
+            'ALTER TABLE trigger_runs ADD COLUMN notice_started_at REAL',
+            'ALTER TABLE trigger_runs ADD COLUMN notice_sent_at REAL',
+            'ALTER TABLE trigger_runs ADD COLUMN delivery_started_at REAL',
+        ):
+            try:
+                await conn.execute(migration)
+            except Exception:
+                pass
         
         # 索引优化
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_global_timestamp ON global_messages(timestamp)')
@@ -1054,6 +1200,10 @@ class BotMemoryDB:
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id)')
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_chat_messages_time ON chat_messages(timestamp)')
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_unauthorized_access_timestamp ON unauthorized_access_logs(timestamp)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_trigger_tasks_status ON trigger_tasks(status)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_trigger_tasks_next_run ON trigger_tasks(next_run_at)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_trigger_runs_delivery ON trigger_runs(status, delivered_at)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_trigger_runs_task ON trigger_runs(task_id, created_at)')
         
         self._initialized = True
         logger.info("📚 系统记忆数据库初始化完成")
@@ -1319,9 +1469,8 @@ class BotMemoryDB:
     async def save_provider(self, name: str, base_url: str, api_key: str,
                             models: Optional[List[str]] = None, api_format: str = 'openai'):
         """保存Provider"""
-        VALID_API_FORMATS = {'openai', 'openai_compatible', 'gemini', 'vertex', 'claude'}
-        if api_format not in VALID_API_FORMATS:
-            raise ValueError(f"无效的 api_format: {api_format}，支持的格式: {', '.join(sorted(VALID_API_FORMATS))}")
+        if api_format not in VALID_PROVIDER_API_FORMATS:
+            raise ValueError(f"无效的 api_format: {api_format}，支持的格式: {', '.join(sorted(VALID_PROVIDER_API_FORMATS))}")
         conn = await self._get_conn()
         await conn.execute('''
             INSERT OR REPLACE INTO providers (name, base_url, api_key, models, api_format)
@@ -1330,6 +1479,66 @@ class BotMemoryDB:
         # 清除缓存
         self._providers_cache = None
     
+    async def import_providers(self, providers: Dict[str, Dict[str, Any]], replace: bool = False):
+        """在单个事务中批量导入 Provider；可合并或先清空后覆盖。"""
+        conn = await self._get_conn()
+        await conn.execute('BEGIN IMMEDIATE')
+        try:
+            if replace:
+                await conn.execute('DELETE FROM providers')
+            for name, provider in providers.items():
+                await conn.execute('''
+                    INSERT OR REPLACE INTO providers (name, base_url, api_key, models, api_format)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (
+                    name,
+                    provider['base_url'],
+                    provider['api_key'],
+                    json.dumps(provider.get('models', []), ensure_ascii=False),
+                    provider.get('api_format', 'openai')
+                ))
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+        self._providers_cache = None
+
+    async def rename_provider(self, old_name: str, new_name: str):
+        """原子重命名 Provider，并同步关联的默认模型提供商配置。"""
+        if old_name == new_name:
+            return
+        conn = await self._get_conn()
+        await conn.execute('BEGIN IMMEDIATE')
+        try:
+            cursor = await conn.execute('SELECT 1 FROM providers WHERE name = ?', (old_name,))
+            if not await cursor.fetchone():
+                raise ValueError(f'提供商不存在：{old_name}')
+            cursor = await conn.execute('SELECT 1 FROM providers WHERE name = ?', (new_name,))
+            if await cursor.fetchone():
+                raise ValueError(f'提供商名称已存在：{new_name}')
+
+            await conn.execute('UPDATE providers SET name = ? WHERE name = ?', (new_name, old_name))
+            old_json = json.dumps(old_name)
+            new_json = json.dumps(new_name)
+            await conn.execute(
+                "UPDATE config SET value = ? WHERE key = 'active_provider' AND value IN (?, ?)",
+                (new_json, old_json, old_name)
+            )
+            await conn.execute(
+                "UPDATE config SET value = ? WHERE key = 'default_media_provider' AND value IN (?, ?)",
+                (new_json, old_json, old_name)
+            )
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+
+        self._providers_cache = None
+        if self._config_cache.get('active_provider') == old_name:
+            self._config_cache['active_provider'] = new_name
+        if self._config_cache.get('default_media_provider') == old_name:
+            self._config_cache['default_media_provider'] = new_name
+
     async def delete_provider(self, name: str):
         """删除Provider"""
         conn = await self._get_conn()
@@ -1362,7 +1571,257 @@ class BotMemoryDB:
         ''', (limit,))
         rows = await cursor.fetchall()
         return [dict(row) for row in reversed(rows)]
-    
+
+    # --- 持久化后台触发任务 ---
+    async def create_trigger_task(self, task: Dict[str, Any]):
+        conn = await self._get_conn()
+        await conn.execute('''
+            INSERT INTO trigger_tasks (
+                id, chat_id, conversation_id, command, summary, schedule_type, schedule_expr,
+                timezone, next_run_at, condition_expr, repeat, status,
+                origin_user_text, origin_assistant_text, created_at, updated_at,
+                last_started_at, last_finished_at, fire_count, failure_count,
+                recovery_count, last_result_hash, duplicate_count, backoff_seconds,
+                backoff_until, last_error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            task['id'], task['chat_id'], task['conversation_id'], task['command'],
+            task.get('summary'), task['schedule_type'], task.get('schedule_expr'), task['timezone'],
+            task.get('next_run_at'), task.get('condition_expr'), int(bool(task.get('repeat'))),
+            task['status'], task.get('origin_user_text'), task.get('origin_assistant_text'),
+            task['created_at'], task['updated_at'], task.get('last_started_at'),
+            task.get('last_finished_at'), int(task.get('fire_count', 0)),
+            int(task.get('failure_count', 0)), int(task.get('recovery_count', 0)),
+            task.get('last_result_hash'), int(task.get('duplicate_count', 0)),
+            float(task.get('backoff_seconds', 0) or 0), task.get('backoff_until'),
+            task.get('last_error'),
+        ))
+
+    async def get_trigger_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        conn = await self._get_conn()
+        cursor = await conn.execute('SELECT * FROM trigger_tasks WHERE id = ?', (task_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def list_trigger_tasks(self, active_only: bool = True) -> List[Dict[str, Any]]:
+        conn = await self._get_conn()
+        if active_only:
+            cursor = await conn.execute('''
+                SELECT * FROM trigger_tasks
+                WHERE status NOT IN ('completed', 'cancelled', 'failed')
+                ORDER BY created_at ASC
+            ''')
+        else:
+            cursor = await conn.execute('SELECT * FROM trigger_tasks ORDER BY created_at ASC')
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def update_trigger_task(self, task_id: str, **fields: Any):
+        allowed = {
+            'schedule_expr', 'next_run_at', 'status', 'updated_at', 'last_started_at',
+            'last_finished_at', 'fire_count', 'failure_count', 'recovery_count', 'last_error',
+            'last_result_hash', 'duplicate_count', 'backoff_seconds', 'backoff_until',
+        }
+        updates = {key: value for key, value in fields.items() if key in allowed}
+        if not updates:
+            return
+        updates.setdefault('updated_at', time.time())
+        assignments = ', '.join(f'{key} = ?' for key in updates)
+        conn = await self._get_conn()
+        await conn.execute(
+            f'UPDATE trigger_tasks SET {assignments} WHERE id = ?',
+            (*updates.values(), task_id),
+        )
+
+    async def cancel_trigger_tasks(self, task_id: Optional[str] = None) -> int:
+        conn = await self._get_conn()
+        now = time.time()
+        if task_id is None:
+            cursor = await conn.execute('''
+                UPDATE trigger_tasks
+                SET status = 'cancelled', next_run_at = NULL, updated_at = ?
+                WHERE status NOT IN ('completed', 'cancelled', 'failed')
+            ''', (now,))
+        else:
+            cursor = await conn.execute('''
+                UPDATE trigger_tasks
+                SET status = 'cancelled', next_run_at = NULL, updated_at = ?
+                WHERE id = ? AND status NOT IN ('completed', 'cancelled', 'failed')
+            ''', (now, task_id))
+        if task_id is None:
+            await conn.execute('''
+                UPDATE trigger_runs
+                SET delivered_at = COALESCE(delivered_at, ?)
+                WHERE delivered_at IS NULL
+                  AND task_id IN (
+                      SELECT id FROM trigger_tasks WHERE status = 'cancelled'
+                  )
+            ''', (now,))
+        else:
+            await conn.execute('''
+                UPDATE trigger_runs
+                SET delivered_at = COALESCE(delivered_at, ?)
+                WHERE task_id = ? AND delivered_at IS NULL
+            ''', (now, task_id))
+        return max(0, int(cursor.rowcount or 0))
+
+    async def resume_legacy_auto_paused_repeat_tasks(self) -> int:
+        conn = await self._get_conn()
+        now = time.time()
+        cursor = await conn.execute('''
+            UPDATE trigger_tasks
+            SET status = 'pending', next_run_at = ?, updated_at = ?, last_error = NULL,
+                failure_count = MAX(failure_count - 1, 0),
+                duplicate_count = 0, backoff_seconds = 0, backoff_until = NULL
+            WHERE repeat = 1 AND status = 'failed'
+              AND (
+                  last_error LIKE 'repeat 任务在 %已自动暂停%'
+                  OR last_error LIKE '%消息风暴%自动暂停%'
+              )
+        ''', (now, now))
+        return max(0, int(cursor.rowcount or 0))
+
+    async def create_trigger_run(self, task_id: str, scheduled_at: float,
+                                 trigger_reason: str) -> Tuple[Dict[str, Any], bool]:
+        conn = await self._get_conn()
+        run_id = f"trun_{uuid.uuid4().hex[:10]}"
+        now = time.time()
+        cursor = await conn.execute('''
+            INSERT OR IGNORE INTO trigger_runs (
+                run_id, task_id, scheduled_at, started_at, status,
+                trigger_reason, created_at
+            ) VALUES (?, ?, ?, ?, 'running', ?, ?)
+        ''', (run_id, task_id, scheduled_at, now, trigger_reason, now))
+        created = bool(cursor.rowcount)
+        row_cursor = await conn.execute(
+            'SELECT * FROM trigger_runs WHERE task_id = ? AND scheduled_at = ?',
+            (task_id, scheduled_at),
+        )
+        row = await row_cursor.fetchone()
+        if row is None:
+            raise RuntimeError(f'无法创建 trigger run: {task_id}')
+        return dict(row), created
+
+    async def finish_trigger_run(self, run_id: str, **fields: Any):
+        allowed = {
+            'finished_at', 'status', 'trigger_reason', 'matched_conditions',
+            'exit_code', 'output', 'output_path', 'error', 'notice_started_at',
+            'notice_sent_at', 'delivery_started_at', 'delivered_at',
+        }
+        updates = {key: value for key, value in fields.items() if key in allowed}
+        if not updates:
+            return
+        assignments = ', '.join(f'{key} = ?' for key in updates)
+        conn = await self._get_conn()
+        await conn.execute(
+            f'UPDATE trigger_runs SET {assignments} WHERE run_id = ?',
+            (*updates.values(), run_id),
+        )
+
+    async def get_trigger_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        conn = await self._get_conn()
+        cursor = await conn.execute('SELECT * FROM trigger_runs WHERE run_id = ?', (run_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_latest_delivered_trigger_run(self, task_id: str) -> Optional[Dict[str, Any]]:
+        conn = await self._get_conn()
+        cursor = await conn.execute('''
+            SELECT * FROM trigger_runs
+            WHERE task_id = ? AND status = 'condition_matched' AND delivered_at IS NOT NULL
+              AND (error IS NULL OR error = '')
+            ORDER BY delivered_at DESC
+            LIMIT 1
+        ''', (task_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def suppress_trigger_runs(self, run_ids: List[str], reason: str) -> int:
+        if not run_ids:
+            return 0
+        conn = await self._get_conn()
+        placeholders = ', '.join('?' for _ in run_ids)
+        now = time.time()
+        cursor = await conn.execute(
+            f'''
+            UPDATE trigger_runs
+            SET delivered_at = COALESCE(delivered_at, ?),
+                status = 'suppressed',
+                trigger_reason = 'backlog_suppressed',
+                error = CASE WHEN error IS NULL OR error = '' THEN ? ELSE error END
+            WHERE run_id IN ({placeholders}) AND delivered_at IS NULL
+            ''',
+            (now, reason, *run_ids),
+        )
+        return max(0, int(cursor.rowcount or 0))
+
+    async def list_undelivered_trigger_runs(self) -> List[Dict[str, Any]]:
+        conn = await self._get_conn()
+        cursor = await conn.execute('''
+            SELECT r.*, t.chat_id, t.conversation_id, t.command, t.schedule_type,
+                   t.schedule_expr, t.timezone, t.condition_expr, t.repeat,
+                   t.origin_user_text, t.origin_assistant_text
+            FROM trigger_runs r
+            JOIN trigger_tasks t ON t.id = r.task_id
+            WHERE r.finished_at IS NOT NULL AND r.delivered_at IS NULL
+              AND r.status IN ('completed', 'condition_matched', 'condition_unmatched', 'failed', 'interrupted')
+              AND t.status != 'cancelled'
+            ORDER BY r.finished_at ASC
+        ''')
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def finalize_interrupted_trigger_deliveries(self) -> List[Dict[str, Any]]:
+        conn = await self._get_conn()
+        cursor = await conn.execute('''
+            SELECT r.*
+            FROM trigger_runs r
+            JOIN trigger_tasks t ON t.id = r.task_id
+            WHERE r.finished_at IS NOT NULL
+              AND r.delivered_at IS NULL
+              AND r.delivery_started_at IS NOT NULL
+              AND t.status != 'cancelled'
+            ORDER BY r.delivery_started_at ASC
+        ''')
+        rows = [dict(row) for row in await cursor.fetchall()]
+        if not rows:
+            return []
+        run_ids = [row['run_id'] for row in rows]
+        placeholders = ', '.join('?' for _ in run_ids)
+        await conn.execute(
+            f'''
+            UPDATE trigger_runs
+            SET delivered_at = ?
+            WHERE run_id IN ({placeholders}) AND delivered_at IS NULL
+            ''',
+            (time.time(), *run_ids),
+        )
+        return rows
+
+    async def interrupt_running_trigger_runs(self) -> int:
+        conn = await self._get_conn()
+        now = time.time()
+        cursor = await conn.execute('''
+            UPDATE trigger_runs
+            SET status = 'interrupted', finished_at = ?,
+                delivered_at = ?,
+                error = COALESCE(error, 'Bot 进程退出，操作系统子进程不可恢复')
+            WHERE status = 'running' AND finished_at IS NULL
+        ''', (now, now))
+        await conn.execute('''
+            UPDATE trigger_tasks
+            SET status = 'recovering', recovery_count = recovery_count + 1,
+                updated_at = ?, last_error = 'Bot 重启后重新执行任务'
+            WHERE status = 'running'
+              AND EXISTS (
+                  SELECT 1 FROM trigger_runs r
+                  WHERE r.task_id = trigger_tasks.id
+                    AND r.status = 'interrupted'
+                    AND r.delivered_at = ?
+              )
+        ''', (now, now))
+        return max(0, int(cursor.rowcount or 0))
+
     async def close(self):
         """关闭连接"""
         if self._connection:
@@ -1419,6 +1878,9 @@ class UserDataManager:
             'agent_max_iterations': normalize_agent_max_iterations(
                 await cls._require_db().get_config('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
             ),
+            'idle_message_interval': normalize_idle_message_interval(
+                await cls._require_db().get_config('idle_message_interval', DEFAULT_IDLE_MESSAGE_INTERVAL)
+            ),
             # 临时数据（不需要持久化）
             'temp_viewing_prov': None,
             'temp_list_type': None,
@@ -1433,6 +1895,7 @@ class UserDataManager:
             'temp_back_callback': None,
             'prompt_buffer': '',
             'editing_prompt_key': '',
+            'provider_import_mode': None,
         }
     
     @classmethod
@@ -2395,7 +2858,7 @@ class AgentExecutor:
         n = len(lines)
 
         std_tag_re = re.compile(
-            r'^```(?P<tag>run|shell|stdin:[^\n]+|shellread:[^\n]+|shellkill:[^\n]+|'
+            r'^```(?P<tag>run|shell|stdin:[^\n]+|shellread:[^\n]+|shellkill:[^\n]+|trigger(?::[^\n]+)?|'
             r'sendfile|read:[^\n]+|read|edit|grep|media|file:[^\n]+)\s*$'
         )
 
@@ -2493,6 +2956,14 @@ class AgentExecutor:
                     'type': 'shellkill',
                     'path': tag[10:].strip(),
                     'body': raw_body.strip(),
+                    'start_line': block_start,
+                    'end_line': end_i,
+                })
+            elif tag == 'trigger' or tag.startswith('trigger:'):
+                blocks.append({
+                    'type': 'trigger',
+                    'path': tag[8:].strip() if tag.startswith('trigger:') else '',
+                    'body': raw_body,
                     'start_line': block_start,
                     'end_line': end_i,
                 })
@@ -3506,7 +3977,15 @@ async def terminate_async_process(process: Any):
 
             os.killpg(os.getpgid(process.pid), signal.SIGTERM)
         else:
-            process.terminate()
+            try:
+                killer = await asyncio.create_subprocess_exec(
+                    'taskkill', '/PID', str(process.pid), '/T', '/F',
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await killer.communicate()
+            except Exception:
+                process.terminate()
         try:
             await asyncio.wait_for(process.wait(), timeout=3)
         except asyncio.TimeoutError:
@@ -3540,6 +4019,7 @@ class AgentShellSession:
         self.lock = threading.RLock()
         self.input_lock = threading.Lock()
         self.output = ""
+        self.output_start_offset = 0
         self.read_index = 0
         self.output_chunks = 0
         self.output_events: Deque[Tuple[float, int]] = deque(maxlen=300)
@@ -3599,6 +4079,7 @@ class AgentShellSession:
             overflow = len(self.output) - self.MAX_BUFFER
             if overflow > 0:
                 self.output = self.output[overflow:]
+                self.output_start_offset += overflow
                 self.read_index = max(0, self.read_index - overflow)
 
     def _read_pty_loop(self):
@@ -3664,6 +4145,14 @@ class AgentShellSession:
     def read_recent(self, max_chars: int = 4000) -> str:
         with self.lock:
             return self.output[-max_chars:]
+
+    def read_from_offset(self, offset: int) -> Tuple[str, int]:
+        """按绝对字符偏移读取新增输出，不修改 shellread 使用的 read_index。"""
+        with self.lock:
+            absolute_start = self.output_start_offset
+            absolute_end = absolute_start + len(self.output)
+            relative_start = max(0, min(len(self.output), int(offset) - absolute_start))
+            return self.output[relative_start:], absolute_end
 
     def read_snapshot(self, max_chars: int = 4000) -> str:
         with self.lock:
@@ -4302,6 +4791,1206 @@ class AgentShellSessionManager:
             cls._sessions.clear()
         for session in sessions:
             session.terminate()
+
+
+class TriggerConditionExpression:
+    """解析并增量计算由字符串字面量、AND/OR 和括号组成的条件表达式。"""
+
+    def __init__(self, expression: str):
+        self.expression = (expression or '').strip()
+        if not self.expression:
+            raise ValueError('when 条件不能为空')
+        self.tokens = self._tokenize(self.expression)
+        self.index = 0
+        self.ast = self._parse_or()
+        if self.index != len(self.tokens):
+            raise ValueError(f"when 条件存在多余内容: {self.tokens[self.index][1]}")
+        self.literals = list(dict.fromkeys(self._collect_literals(self.ast)))
+        self.matched: set = set()
+        self.carry = ''
+        self.max_literal_length = max(len(item) for item in self.literals)
+
+    @staticmethod
+    def _tokenize(expression: str) -> List[Tuple[str, str]]:
+        tokens: List[Tuple[str, str]] = []
+        index = 0
+        while index < len(expression):
+            char = expression[index]
+            if char.isspace():
+                index += 1
+                continue
+            if char in '()':
+                tokens.append((char, char))
+                index += 1
+                continue
+            if char in {'"', "'"}:
+                quote = char
+                index += 1
+                value: List[str] = []
+                while index < len(expression):
+                    char = expression[index]
+                    if char == '\\' and index + 1 < len(expression):
+                        value.append(expression[index + 1])
+                        index += 2
+                        continue
+                    if char == quote:
+                        break
+                    value.append(char)
+                    index += 1
+                if index >= len(expression) or expression[index] != quote:
+                    raise ValueError('when 条件中的字符串没有闭合')
+                literal = ''.join(value)
+                if not literal:
+                    raise ValueError('when 条件不允许空字符串')
+                tokens.append(('LITERAL', literal))
+                index += 1
+                continue
+            end = index
+            while end < len(expression) and not expression[end].isspace() and expression[end] not in '()':
+                end += 1
+            word = expression[index:end]
+            upper_word = word.upper()
+            if upper_word in {'AND', 'OR'}:
+                tokens.append((upper_word, upper_word))
+            else:
+                tokens.append(('LITERAL', word))
+            index = end
+        if not tokens:
+            raise ValueError('when 条件不能为空')
+        return tokens
+
+    def _accept(self, token_type: str) -> Optional[Tuple[str, str]]:
+        if self.index < len(self.tokens) and self.tokens[self.index][0] == token_type:
+            token = self.tokens[self.index]
+            self.index += 1
+            return token
+        return None
+
+    def _parse_or(self):
+        node = self._parse_and()
+        while self._accept('OR'):
+            node = ('OR', node, self._parse_and())
+        return node
+
+    def _parse_and(self):
+        node = self._parse_primary()
+        while self._accept('AND'):
+            node = ('AND', node, self._parse_primary())
+        return node
+
+    def _parse_primary(self):
+        literal = self._accept('LITERAL')
+        if literal:
+            return ('LITERAL', literal[1])
+        if self._accept('('):
+            node = self._parse_or()
+            if not self._accept(')'):
+                raise ValueError('when 条件缺少右括号')
+            return node
+        found = self.tokens[self.index][1] if self.index < len(self.tokens) else '表达式末尾'
+        raise ValueError(f'when 条件语法错误，意外内容: {found}')
+
+    @classmethod
+    def _collect_literals(cls, node) -> List[str]:
+        if node[0] == 'LITERAL':
+            return [node[1]]
+        return cls._collect_literals(node[1]) + cls._collect_literals(node[2])
+
+    def feed(self, output: str) -> bool:
+        combined = self.carry + (output or '')
+        for literal in self.literals:
+            if literal not in self.matched and literal in combined:
+                self.matched.add(literal)
+        carry_length = max(0, self.max_literal_length - 1)
+        self.carry = combined[-carry_length:] if carry_length else ''
+        return self.is_satisfied()
+
+    def is_satisfied(self) -> bool:
+        def evaluate(node) -> bool:
+            if node[0] == 'LITERAL':
+                return node[1] in self.matched
+            if node[0] == 'AND':
+                return evaluate(node[1]) and evaluate(node[2])
+            return evaluate(node[1]) or evaluate(node[2])
+        return evaluate(self.ast)
+
+    def matched_literals(self) -> List[str]:
+        return [literal for literal in self.literals if literal in self.matched]
+
+
+class _SelfTriggerMessage:
+    def __init__(self, bot: Any, chat_id: int):
+        self.bot = bot
+        self.chat_id = chat_id
+
+    async def reply_text(self, text: str, **kwargs):
+        return await self.bot.send_message(chat_id=self.chat_id, text=text, **kwargs)
+
+
+class _SelfTriggerUpdate:
+    def __init__(self, bot: Any, chat_id: int):
+        self.effective_chat = type('SelfTriggerChat', (), {'id': chat_id})()
+        self.message = _SelfTriggerMessage(bot, chat_id)
+        self.callback_query = None
+
+
+class _SelfTriggerContext:
+    def __init__(self, bot: Any):
+        self.bot = bot
+
+
+class SelfTriggerManager:
+    """持久化执行后台命令，并把完成结果作为内部系统结果唤醒 AI。"""
+
+    WAIT_NOTICE_SECONDS = 60.0
+    REPEAT_RESTART_DELAY_SECONDS = 5.0
+    REPEAT_DUPLICATE_BACKOFF_BASE_SECONDS = 5.0
+    REPEAT_DUPLICATE_BACKOFF_MAX_SECONDS = 300.0
+    DEFAULT_TIMEZONE = os.getenv('TRIGGER_TIMEZONE', 'Asia/Shanghai')
+    MAX_CAPTURE_CHARS = 200000
+    _application: Optional[Application] = None
+    _runtime_tasks: Dict[str, asyncio.Task] = {}
+    _processes: Dict[str, Any] = {}
+    _task_locks: Dict[str, asyncio.Lock] = {}
+    _lock = asyncio.Lock()
+    _execution_tasks: set = set()
+    _delivery_run_ids: set = set()
+    _delivery_tasks_by_task: Dict[str, set] = {}
+    _stopping = False
+    _started = False
+
+    @staticmethod
+    def _compact_task_summary(value: Any, max_chars: int = 600) -> str:
+        text = str(value or '').strip()
+        if not text:
+            return ''
+        text = re.sub(r'```.*?```', ' ', text, flags=re.S)
+        text = re.sub(r'\s+', ' ', text).strip()
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars - 1].rstrip() + '…'
+
+    @classmethod
+    def _build_task_summary(cls, task: Dict[str, Any]) -> str:
+        stored_summary = cls._compact_task_summary(task.get('summary'))
+        if stored_summary:
+            return stored_summary
+
+        for source in (task.get('origin_assistant_text'), task.get('origin_user_text')):
+            source_text = str(source or '')
+            match = re.search(
+                r'(?im)^\s*(?:任务概述|任务说明)\s*[:：]\s*(.+?)\s*$',
+                source_text,
+            )
+            if match:
+                summary = cls._compact_task_summary(match.group(1))
+                if summary:
+                    return summary
+
+        original_request = cls._compact_task_summary(task.get('origin_user_text'))
+        if original_request:
+            return original_request
+
+        command = cls._compact_task_summary(task.get('command'))
+        if command:
+            return f'执行后台命令：{command}'
+        return '未记录任务说明'
+
+    @staticmethod
+    def _repeat_result_signature(run: Dict[str, Any]) -> str:
+        matched_conditions = run.get('matched_conditions') or []
+        if isinstance(matched_conditions, str):
+            with contextlib.suppress(Exception):
+                matched_conditions = json.loads(matched_conditions)
+        payload = {
+            'status': run.get('status'),
+            'trigger_reason': run.get('trigger_reason'),
+            'matched_conditions': matched_conditions,
+            'exit_code': run.get('exit_code'),
+            'output': str(run.get('output') or '').strip(),
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode('utf-8')
+        return hashlib.sha256(encoded).hexdigest()
+
+    @classmethod
+    def _next_duplicate_backoff(cls, task: Dict[str, Any]) -> float:
+        current = float(task.get('backoff_seconds') or 0)
+        if current <= 0:
+            return cls.REPEAT_DUPLICATE_BACKOFF_BASE_SECONDS
+        return min(cls.REPEAT_DUPLICATE_BACKOFF_MAX_SECONDS, current * 2)
+
+    @classmethod
+    async def _new_task_id(cls) -> str:
+        db = await BotMemoryDB.get_instance()
+        while True:
+            task_id = f"trg_{uuid.uuid4().hex[:6]}"
+            if await db.get_trigger_task(task_id) is None:
+                return task_id
+
+    @classmethod
+    def _parse_definition(cls, body: str) -> Dict[str, Any]:
+        allowed = {'summary', 'after', 'at', 'cron', 'tz', 'when', 'repeat'}
+        lines = (body or '').splitlines()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        directives: Dict[str, str] = {}
+        command_start = 0
+        for index, raw_line in enumerate(lines):
+            match = re.match(r'^\s*#@([A-Za-z_]+)(?:\s+(.*?))?\s*$', raw_line)
+            if not match:
+                command_start = index
+                break
+            key = match.group(1).lower()
+            value = (match.group(2) or '').strip()
+            if key not in allowed:
+                raise ValueError(f"不支持的 trigger 指令: #@{key}")
+            if key in directives:
+                raise ValueError(f"trigger 指令不能重复: #@{key}")
+            if not value:
+                raise ValueError(f"trigger 指令缺少参数: #@{key}")
+            directives[key] = value
+            command_start = index + 1
+
+        command = '\n'.join(lines[command_start:]).strip()
+        if not command:
+            raise ValueError('trigger 命令不能为空')
+        if any(line.strip() == '```' for line in command.splitlines()):
+            raise ValueError('trigger 命令不能包含独立的三反引号围栏')
+
+        summary_source = re.sub(r'\s+', ' ', str(directives.get('summary') or '')).strip()
+        if len(summary_source) > 600:
+            raise ValueError('#@summary 不能超过 600 个字符')
+        summary = cls._compact_task_summary(summary_source)
+        if not summary:
+            raise ValueError('trigger 必须在顶部提供 #@summary 任务概述')
+
+        timezone_name = directives.get('tz', cls.DEFAULT_TIMEZONE)
+        try:
+            timezone_value = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f'未知时区: {timezone_name}') from exc
+
+        schedule_directives = [key for key in ('after', 'at', 'cron') if key in directives]
+        if len(schedule_directives) > 1:
+            raise ValueError('#@after、#@at、#@cron 只能使用一个')
+
+        now = datetime.now(timezone_value)
+        schedule_type = 'immediate'
+        schedule_expr: Optional[str] = None
+        next_run_at = now.timestamp()
+        if 'after' in directives:
+            duration_match = re.fullmatch(r'(\d+(?:\.\d+)?)\s*([smhdw])', directives['after'], re.I)
+            if not duration_match:
+                raise ValueError('#@after 格式应为 30s、15m、2h、1d 或 1w')
+            duration_value = float(duration_match.group(1))
+            unit = duration_match.group(2).lower()
+            seconds = duration_value * {'s': 1, 'm': 60, 'h': 3600, 'd': 86400, 'w': 604800}[unit]
+            if seconds <= 0:
+                raise ValueError('#@after 必须大于 0')
+            schedule_type = 'once'
+            schedule_expr = directives['after']
+            next_run_at = (now + timedelta(seconds=seconds)).timestamp()
+        elif 'at' in directives:
+            try:
+                run_at = datetime.fromisoformat(directives['at'])
+            except ValueError as exc:
+                raise ValueError('#@at 格式应为 YYYY-MM-DD HH:MM[:SS]') from exc
+            if run_at.tzinfo is None:
+                run_at = run_at.replace(tzinfo=timezone_value)
+            else:
+                run_at = run_at.astimezone(timezone_value)
+            schedule_type = 'once'
+            schedule_expr = directives['at']
+            next_run_at = run_at.timestamp()
+        elif 'cron' in directives:
+            try:
+                cron_trigger = CronTrigger.from_crontab(directives['cron'], timezone=timezone_value)
+                next_fire = cron_trigger.get_next_fire_time(None, now)
+            except Exception as exc:
+                raise ValueError(f"无效的 cron 表达式: {directives['cron']}") from exc
+            if next_fire is None:
+                raise ValueError('cron 表达式没有可执行的未来时间')
+            schedule_type = 'cron'
+            schedule_expr = directives['cron']
+            next_run_at = next_fire.timestamp()
+
+        condition_expr = directives.get('when')
+        if condition_expr:
+            TriggerConditionExpression(condition_expr)
+
+        repeat_text = directives.get('repeat', 'false').lower()
+        if repeat_text not in {'true', 'false'}:
+            raise ValueError('#@repeat 只能是 true 或 false')
+        repeat = repeat_text == 'true'
+        if repeat and not condition_expr:
+            raise ValueError('#@repeat true 只能与 #@when 一起使用')
+        if repeat and schedule_type == 'cron':
+            raise ValueError('#@repeat true 不能与 #@cron 同时使用')
+
+        blocked, pattern = AgentCommandBlacklist.check(command)
+        if blocked:
+            raise ValueError(f'命令被安全系统拦截，匹配黑名单: {pattern}')
+
+        return {
+            'command': command,
+            'summary': summary,
+            'schedule_type': schedule_type,
+            'schedule_expr': schedule_expr,
+            'timezone': timezone_name,
+            'next_run_at': next_run_at,
+            'condition_expr': condition_expr,
+            'repeat': repeat,
+        }
+
+    @classmethod
+    async def handle_protocol(cls, target: str, body: str, bot: Any, chat_id: int,
+                              conversation_id: str, origin_user_text: str,
+                              origin_assistant_text: str) -> str:
+        normalized_target = (target or '').strip()
+        if normalized_target == 'show':
+            return await cls.format_active_tasks()
+        if normalized_target.startswith('kill:'):
+            task_id = normalized_target[5:].strip()
+            if task_id == 'all':
+                count = await cls.cancel_all()
+                return f"[trigger:kill 结果] 已取消全部触发任务，共 {count} 个。"
+            return await cls.cancel(task_id)
+        if normalized_target == 'kill':
+            raise ValueError("请使用 trigger:kill:<任务ID> 或 trigger:kill:all")
+        if normalized_target:
+            raise ValueError('创建任务请使用裸 ```trigger 协议块')
+        return await cls.register(
+            body, bot, chat_id, conversation_id,
+            origin_user_text, origin_assistant_text,
+        )
+
+    @classmethod
+    async def register(cls, body: str, bot: Any, chat_id: int, conversation_id: str,
+                       origin_user_text: str, origin_assistant_text: str) -> str:
+        definition = cls._parse_definition(body)
+        task_id = await cls._new_task_id()
+        now = time.time()
+        task = {
+            'id': task_id,
+            'chat_id': chat_id,
+            'conversation_id': conversation_id,
+            **definition,
+            'status': 'scheduled' if definition['schedule_type'] in {'once', 'cron'} else 'pending',
+            'origin_user_text': origin_user_text,
+            'origin_assistant_text': origin_assistant_text,
+            'created_at': now,
+            'updated_at': now,
+        }
+        db = await BotMemoryDB.get_instance()
+        await db.create_trigger_task(task)
+        if cls._application is None:
+            cls._application = getattr(bot, '_application', None)
+        await cls._activate_task(task, recovery=False)
+
+        schedule_text = cls._format_schedule(task)
+        condition_text = f"，条件: {definition['condition_expr']}" if definition.get('condition_expr') else ''
+        repeat_text = '，命中后自动重新启动' if definition.get('repeat') else ''
+        return (
+            f"[trigger结果] 已创建持久化任务 {task_id}，概述: {definition['summary']}，"
+            f"{schedule_text}{condition_text}{repeat_text}"
+        )
+
+    @classmethod
+    async def cancel(cls, task_id: str) -> str:
+        db = await BotMemoryDB.get_instance()
+        task = await db.get_trigger_task(task_id)
+        if task is None or task['status'] in {'completed', 'cancelled', 'failed'}:
+            return f"[trigger:kill 结果] 未找到触发任务: {task_id}"
+        await db.cancel_trigger_tasks(task_id)
+        cls._remove_scheduler_job(task_id)
+        runtime_task = cls._runtime_tasks.get(task_id)
+        if runtime_task and not runtime_task.done():
+            runtime_task.cancel()
+        for delivery_task in list(cls._delivery_tasks_by_task.get(task_id, set())):
+            if not delivery_task.done():
+                delivery_task.cancel()
+        process = cls._processes.get(task_id)
+        if process is not None:
+            await terminate_async_process(process)
+        return f"[trigger:kill 结果] 已取消触发任务: {task_id}"
+
+    @classmethod
+    async def cancel_all(cls) -> int:
+        db = await BotMemoryDB.get_instance()
+        tasks = await db.list_trigger_tasks(active_only=True)
+        count = await db.cancel_trigger_tasks()
+        for task in tasks:
+            cls._remove_scheduler_job(task['id'])
+            runtime_task = cls._runtime_tasks.get(task['id'])
+            if runtime_task and not runtime_task.done():
+                runtime_task.cancel()
+            for delivery_task in list(cls._delivery_tasks_by_task.get(task['id'], set())):
+                if not delivery_task.done():
+                    delivery_task.cancel()
+            process = cls._processes.get(task['id'])
+            if process is not None:
+                await terminate_async_process(process)
+        return count
+
+    @classmethod
+    async def shutdown(cls):
+        cls._stopping = True
+        runtime_tasks = [task for task in cls._runtime_tasks.values() if not task.done()]
+        for runtime_task in runtime_tasks:
+            runtime_task.cancel()
+        for process in list(cls._processes.values()):
+            await terminate_async_process(process)
+        if runtime_tasks:
+            await asyncio.gather(*runtime_tasks, return_exceptions=True)
+        delivery_tasks = [task for task in cls._execution_tasks if not task.done()]
+        for delivery_task in delivery_tasks:
+            delivery_task.cancel()
+        if delivery_tasks:
+            await asyncio.gather(*delivery_tasks, return_exceptions=True)
+        cls._runtime_tasks.clear()
+        cls._processes.clear()
+        cls._delivery_run_ids.clear()
+        cls._delivery_tasks_by_task.clear()
+
+    @classmethod
+    async def format_active_tasks(cls) -> str:
+        db = await BotMemoryDB.get_instance()
+        tasks = await db.list_trigger_tasks(active_only=True)
+        if not tasks:
+            return "[trigger:show 结果] 当前没有活跃触发任务。"
+        lines = [f"[trigger:show 结果] 当前活跃触发任务: {len(tasks)} 个"]
+        now = time.time()
+        for index, task in enumerate(tasks, start=1):
+            elapsed = cls._format_elapsed(now - float(task['created_at']))
+            repeat_text = '是' if task['repeat'] else '否'
+            condition_text = task.get('condition_expr') or '(进程退出时触发)'
+            duplicate_count = int(task.get('duplicate_count') or 0)
+            backoff_until = float(task.get('backoff_until') or 0)
+            backoff_text = (
+                f'{max(0, int(backoff_until - now))} 秒后重试'
+                if backoff_until > now else '无'
+            )
+            lines.append(
+                f"\n#{index} ID: {task['id']}\n"
+                f"概述: {cls._build_task_summary(task)}\n"
+                f"状态: {task['status']}\n计划: {cls._format_schedule(task)}\n"
+                f"条件: {condition_text}\n命令: {task['command']}\n"
+                f"已存在: {elapsed}\n重复监控: {repeat_text}\n"
+                f"已触发: {task['fire_count']} 次，恢复: {task['recovery_count']} 次\n"
+                f"连续静默去重: {duplicate_count} 次，当前退避: {backoff_text}"
+            )
+        return "\n".join(lines)
+
+    @classmethod
+    def _format_schedule(cls, task: Dict[str, Any]) -> str:
+        schedule_type = task['schedule_type']
+        next_run_at = task.get('next_run_at')
+        if task.get('repeat') and next_run_at and float(next_run_at) > time.time():
+            timezone_value = ZoneInfo(task['timezone'])
+            local_time = datetime.fromtimestamp(float(next_run_at), timezone_value)
+            return f"重复监控退避至 {local_time.isoformat(sep=' ', timespec='seconds')}"
+        if schedule_type == 'immediate':
+            return '立即执行'
+        if schedule_type == 'cron':
+            return f"cron {task['schedule_expr']} ({task['timezone']})"
+        if next_run_at is None:
+            return '单次任务'
+        timezone_value = ZoneInfo(task['timezone'])
+        local_time = datetime.fromtimestamp(float(next_run_at), timezone_value)
+        return f"单次 {local_time.isoformat(sep=' ', timespec='seconds')}"
+
+    @classmethod
+    def _remove_scheduler_job(cls, task_id: str):
+        if cls._application is None or cls._application.job_queue is None:
+            return
+        job_id = f'self-trigger:{task_id}'
+        with contextlib.suppress(Exception):
+            cls._application.job_queue.scheduler.remove_job(job_id)
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        if seconds < 60:
+            return f"{seconds}秒"
+        if seconds < 3600:
+            return f"{seconds // 60}分钟"
+        return f"{seconds // 3600}小时{(seconds % 3600) // 60}分钟"
+
+    @classmethod
+    async def startup(cls, application: Application):
+        if cls._started and cls._application is application and not cls._stopping:
+            return
+        cls._application = application
+        cls._stopping = False
+        cls._started = True
+        db = await BotMemoryDB.get_instance()
+        interrupted_count = await db.interrupt_running_trigger_runs()
+        if interrupted_count:
+            logger.warning(f'检测到 {interrupted_count} 个因进程重启中断的 trigger run，将恢复任务')
+        resumed_legacy_count = await db.resume_legacy_auto_paused_repeat_tasks()
+        if resumed_legacy_count:
+            logger.warning(f'已恢复 {resumed_legacy_count} 个被旧版消息风暴熔断暂停的 repeat 任务')
+        interrupted_deliveries = await db.finalize_interrupted_trigger_deliveries()
+        for run in interrupted_deliveries:
+            task = await db.get_trigger_task(run['task_id'])
+            if task is None or not task.get('repeat') or run.get('status') != 'condition_matched':
+                continue
+            backoff_until = time.time() + cls.REPEAT_DUPLICATE_BACKOFF_BASE_SECONDS
+            await db.update_trigger_task(
+                task['id'],
+                status='pending',
+                next_run_at=backoff_until,
+                last_result_hash=cls._repeat_result_signature(run),
+                duplicate_count=0,
+                backoff_seconds=cls.REPEAT_DUPLICATE_BACKOFF_BASE_SECONDS,
+                backoff_until=backoff_until,
+                last_error=None,
+            )
+        if interrupted_deliveries:
+            logger.warning(
+                f'检测到 {len(interrupted_deliveries)} 个已开始但未确认完成的 trigger 投递，'
+                '为避免重启后重复回复，已停止自动重放'
+            )
+
+        active_tasks = await db.list_trigger_tasks(active_only=True)
+        active_task_map = {task['id']: task for task in active_tasks}
+        for task in active_tasks:
+            if not task.get('repeat') or task.get('last_result_hash'):
+                continue
+            latest_delivered = await db.get_latest_delivered_trigger_run(task['id'])
+            if latest_delivered is None:
+                continue
+            result_hash = cls._repeat_result_signature(latest_delivered)
+            await db.update_trigger_task(
+                task['id'], last_result_hash=result_hash,
+            )
+            task['last_result_hash'] = result_hash
+
+        undelivered_runs = await db.list_undelivered_trigger_runs()
+
+        repeat_backlogs: Dict[str, List[Dict[str, Any]]] = {}
+        for run in undelivered_runs:
+            if run.get('repeat'):
+                repeat_backlogs.setdefault(run['task_id'], []).append(run)
+        suppressed_backlog_ids = set()
+        for task_id, runs in repeat_backlogs.items():
+            if len(runs) <= 1:
+                continue
+            runs.sort(key=lambda item: float(item.get('finished_at') or 0), reverse=True)
+            stale_ids = [run['run_id'] for run in runs[1:]]
+            suppressed = await db.suppress_trigger_runs(
+                stale_ids, '旧版 repeat 调度产生积压，启动时仅保留最新结果',
+            )
+            suppressed_backlog_ids.update(stale_ids)
+            logger.warning(
+                f'repeat 任务 {task_id} 有 {len(runs)} 个未投递结果，'
+                f'已合并 {suppressed} 个旧结果，仅保留最新结果'
+            )
+        if suppressed_backlog_ids:
+            undelivered_runs = [
+                run for run in undelivered_runs if run['run_id'] not in suppressed_backlog_ids
+            ]
+
+        retained_runs = []
+        for run in undelivered_runs:
+            if not run.get('repeat'):
+                retained_runs.append(run)
+                continue
+            task = active_task_map.get(run['task_id']) or await db.get_trigger_task(run['task_id'])
+            if task is None or not task.get('last_result_hash'):
+                retained_runs.append(run)
+                continue
+            if cls._repeat_result_signature(run) != task['last_result_hash']:
+                retained_runs.append(run)
+                continue
+
+            await db.suppress_trigger_runs(
+                [run['run_id']], '与上次已投递结果完全相同，启动时静默去重',
+            )
+            backoff_seconds = cls._next_duplicate_backoff(task)
+            backoff_until = time.time() + backoff_seconds
+            duplicate_count = int(task.get('duplicate_count') or 0) + 1
+            await db.update_trigger_task(
+                task['id'],
+                status='pending',
+                next_run_at=backoff_until,
+                backoff_until=backoff_until,
+                backoff_seconds=backoff_seconds,
+                duplicate_count=duplicate_count,
+                last_error=None,
+            )
+            task.update({
+                'status': 'pending',
+                'next_run_at': backoff_until,
+                'backoff_until': backoff_until,
+                'backoff_seconds': backoff_seconds,
+                'duplicate_count': duplicate_count,
+            })
+            logger.info(
+                f"repeat 任务 {task['id']} 的积压结果与上次相同，启动时静默去重，"
+                f'{backoff_seconds:g} 秒后继续监控'
+            )
+        undelivered_runs = retained_runs
+
+        repeat_tasks_waiting_delivery = set()
+        for run in undelivered_runs:
+            await cls._reconcile_finished_run_task(run)
+            if run.get('repeat'):
+                repeat_tasks_waiting_delivery.add(run['task_id'])
+                await db.update_trigger_task(
+                    run['task_id'], status='waiting_delivery', next_run_at=None,
+                )
+            cls._schedule_delivery(run['run_id'], run['task_id'])
+
+        tasks = await db.list_trigger_tasks(active_only=True)
+        for task in tasks:
+            try:
+                if task.get('repeat') and task['id'] in repeat_tasks_waiting_delivery:
+                    logger.info(f"repeat 任务 {task['id']} 等待上次结果投递完成后再恢复")
+                    continue
+                await cls._activate_task(task, recovery=task['status'] == 'recovering')
+            except Exception as exc:
+                logger.error(f"恢复 trigger 任务 {task['id']} 失败: {exc}", exc_info=True)
+                await db.update_trigger_task(
+                    task['id'], status='failed', last_error=str(exc)[:1000],
+                    failure_count=int(task['failure_count']) + 1,
+                )
+        logger.info(f'✅ trigger 持久化任务恢复完成，活跃任务 {len(tasks)} 个')
+
+    @classmethod
+    async def _reconcile_finished_run_task(cls, run: Dict[str, Any]):
+        db = await BotMemoryDB.get_instance()
+        task = await db.get_trigger_task(run['task_id'])
+        if task is None or task['status'] != 'running':
+            return
+        counters = {
+            'fire_count': int(task['fire_count']) + 1,
+            'failure_count': int(task['failure_count']) + int(run['status'] in {'failed', 'condition_unmatched'}),
+            'last_error': run.get('error'),
+        }
+        if task['schedule_type'] == 'cron':
+            await db.update_trigger_task(
+                task['id'], status='scheduled', next_run_at=cls._next_cron_timestamp(task),
+                last_finished_at=run['finished_at'], **counters,
+            )
+        elif task['repeat'] and run['status'] == 'condition_matched':
+            await db.update_trigger_task(
+                task['id'], status='waiting_delivery', next_run_at=None,
+                last_finished_at=run['finished_at'], **counters,
+            )
+        else:
+            await db.update_trigger_task(
+                task['id'], status='completed', next_run_at=None,
+                last_finished_at=run['finished_at'], **counters,
+            )
+
+    @classmethod
+    async def _activate_task(cls, task: Dict[str, Any], recovery: bool):
+        if cls._stopping or task['status'] in {'completed', 'cancelled', 'failed'}:
+            return
+        schedule_type = task['schedule_type']
+        now = time.time()
+        next_run_at = float(task.get('next_run_at') or now)
+
+        if task.get('repeat') and next_run_at > now:
+            cls._add_date_job(task['id'], next_run_at, 'repeat_backoff')
+            return
+
+        if schedule_type == 'cron':
+            if next_run_at <= now:
+                cls._launch_runtime(task['id'], next_run_at, 'cron_misfire')
+            cls._add_cron_job(task)
+            return
+
+        if schedule_type == 'once' and next_run_at > now:
+            cls._add_date_job(task['id'], next_run_at, 'scheduled')
+            return
+
+        reason = 'recovery' if recovery else ('overdue' if schedule_type == 'once' else 'immediate')
+        scheduled_at = now if recovery or schedule_type == 'immediate' else next_run_at
+        cls._launch_runtime(task['id'], scheduled_at, reason)
+
+    @classmethod
+    def _add_date_job(cls, task_id: str, scheduled_at: float, reason: str):
+        if cls._application is None or cls._application.job_queue is None:
+            raise RuntimeError('trigger 调度器尚未初始化')
+        cls._application.job_queue.scheduler.add_job(
+            cls._scheduled_job,
+            trigger=DateTrigger(run_date=datetime.fromtimestamp(scheduled_at).astimezone()),
+            args=[task_id, scheduled_at, reason],
+            id=f'self-trigger:{task_id}',
+            replace_existing=True,
+            misfire_grace_time=None,
+        )
+
+    @classmethod
+    def _add_cron_job(cls, task: Dict[str, Any]):
+        if cls._application is None or cls._application.job_queue is None:
+            raise RuntimeError('trigger 调度器尚未初始化')
+        cron_trigger = CronTrigger.from_crontab(
+            task['schedule_expr'],
+            timezone=ZoneInfo(task['timezone']),
+        )
+        cls._application.job_queue.scheduler.add_job(
+            cls._cron_job,
+            trigger=cron_trigger,
+            args=[task['id']],
+            id=f"self-trigger:{task['id']}",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=None,
+        )
+
+    @classmethod
+    async def _scheduled_job(cls, task_id: str, scheduled_at: float, reason: str):
+        cls._launch_runtime(task_id, scheduled_at, reason)
+
+    @classmethod
+    async def _cron_job(cls, task_id: str):
+        scheduled_at = float(int(time.time() // 60) * 60)
+        cls._launch_runtime(task_id, scheduled_at, 'cron')
+
+    @classmethod
+    def _launch_runtime(cls, task_id: str, scheduled_at: float, reason: str):
+        if cls._stopping:
+            return
+        existing = cls._runtime_tasks.get(task_id)
+        if existing and not existing.done():
+            logger.warning(f'trigger 任务 {task_id} 上一次仍在运行，跳过本次 {reason}')
+            return
+        runtime_task = asyncio.create_task(cls._execute_task(task_id, scheduled_at, reason))
+        cls._runtime_tasks[task_id] = runtime_task
+
+        def cleanup(done_task: asyncio.Task):
+            if cls._runtime_tasks.get(task_id) is done_task:
+                cls._runtime_tasks.pop(task_id, None)
+
+        runtime_task.add_done_callback(cleanup)
+
+    @classmethod
+    async def _execute_task(cls, task_id: str, scheduled_at: float, reason: str):
+        task_lock = cls._task_locks.setdefault(task_id, asyncio.Lock())
+        async with task_lock:
+            db = await BotMemoryDB.get_instance()
+            task = await db.get_trigger_task(task_id)
+            if task is None or task['status'] in {'completed', 'cancelled', 'failed'}:
+                return
+
+            run, created = await db.create_trigger_run(task_id, scheduled_at, reason)
+            if not created:
+                return
+            run_id = run['run_id']
+            await db.update_trigger_task(
+                task_id, status='running', last_started_at=time.time(), last_error=None,
+            )
+
+            try:
+                result = await cls._run_trigger_command(task, run_id)
+            except asyncio.CancelledError:
+                process = cls._processes.get(task_id)
+                if process is not None:
+                    await terminate_async_process(process)
+                await db.finish_trigger_run(
+                    run_id, status='interrupted', finished_at=time.time(),
+                    delivered_at=time.time(),
+                    error='Bot 正在关闭，后台进程已终止' if cls._stopping else '任务已取消',
+                )
+                latest = await db.get_trigger_task(task_id)
+                if latest and latest['status'] != 'cancelled':
+                    await db.update_trigger_task(task_id, status='recovering')
+                raise
+            except Exception as exc:
+                logger.error(f'trigger 任务 {task_id} 执行失败: {exc}', exc_info=True)
+                result = {
+                    'status': 'failed', 'trigger_reason': 'execution_error',
+                    'matched_conditions': [], 'exit_code': -1, 'output': '',
+                    'output_path': None, 'error': str(exc)[:2000],
+                }
+            finally:
+                cls._processes.pop(task_id, None)
+
+            finished_at = time.time()
+            await db.finish_trigger_run(
+                run_id,
+                finished_at=finished_at,
+                status=result['status'],
+                trigger_reason=result['trigger_reason'],
+                matched_conditions=json.dumps(result['matched_conditions'], ensure_ascii=False),
+                exit_code=result['exit_code'],
+                output=result['output'],
+                output_path=result['output_path'],
+                error=result['error'],
+            )
+
+            latest = await db.get_trigger_task(task_id)
+            if latest is None or latest['status'] == 'cancelled':
+                return
+
+            if latest['repeat'] and result['status'] == 'condition_matched':
+                result_hash = cls._repeat_result_signature(result)
+                duplicate_result = bool(
+                    latest.get('last_result_hash') and latest['last_result_hash'] == result_hash
+                )
+                if duplicate_result:
+                    backoff_seconds = cls._next_duplicate_backoff(latest)
+                    backoff_until = time.time() + backoff_seconds
+                    result['status'] = 'suppressed'
+                    result['trigger_reason'] = 'duplicate_suppressed'
+                    result['error'] = None
+                    await db.finish_trigger_run(
+                        run_id,
+                        status=result['status'],
+                        trigger_reason=result['trigger_reason'],
+                        delivered_at=time.time(),
+                        error=result['error'],
+                    )
+
+                    fire_count = int(latest['fire_count']) + 1
+                    duplicate_count = int(latest.get('duplicate_count') or 0) + 1
+                    await db.update_trigger_task(
+                        task_id,
+                        status='pending',
+                        next_run_at=backoff_until,
+                        backoff_until=backoff_until,
+                        backoff_seconds=backoff_seconds,
+                        duplicate_count=duplicate_count,
+                        last_finished_at=finished_at,
+                        fire_count=fire_count,
+                        last_error=None,
+                    )
+                    logger.info(
+                        f'repeat 任务 {task_id} 结果与上次相同，静默抑制第 {duplicate_count} 次，'
+                        f'{backoff_seconds:g} 秒后重试'
+                    )
+                    if not cls._stopping:
+                        try:
+                            cls._add_date_job(task_id, backoff_until, 'repeat_backoff')
+                        except Exception as exc:
+                            logger.error(f'repeat 任务 {task_id} 安排退避重试失败: {exc}', exc_info=True)
+                    return
+
+            fire_count = int(latest['fire_count']) + 1
+            failure_count = int(latest['failure_count']) + int(result['status'] in {'failed', 'condition_unmatched'})
+            task_status = 'completed'
+            next_run_at: Optional[float] = None
+
+            if latest['schedule_type'] == 'cron':
+                task_status = 'scheduled'
+                next_run_at = cls._next_cron_timestamp(latest)
+            elif latest['repeat'] and result['status'] == 'condition_matched' and not cls._stopping:
+                task_status = 'waiting_delivery'
+
+            await db.update_trigger_task(
+                task_id,
+                status=task_status,
+                next_run_at=next_run_at,
+                last_finished_at=finished_at,
+                fire_count=fire_count,
+                failure_count=failure_count,
+                last_error=result['error'],
+            )
+            cls._schedule_delivery(run_id, task_id)
+
+    @classmethod
+    def _next_cron_timestamp(cls, task: Dict[str, Any]) -> Optional[float]:
+        timezone_value = ZoneInfo(task['timezone'])
+        now = datetime.now(timezone_value)
+        trigger = CronTrigger.from_crontab(task['schedule_expr'], timezone=timezone_value)
+        next_fire = trigger.get_next_fire_time(None, now)
+        return next_fire.timestamp() if next_fire else None
+
+    @classmethod
+    async def _run_trigger_command(cls, task: Dict[str, Any], run_id: str) -> Dict[str, Any]:
+        command = task['command'].strip()
+        blocked, pattern = AgentCommandBlacklist.check(command)
+        if blocked:
+            return {
+                'status': 'failed', 'trigger_reason': 'blacklist',
+                'matched_conditions': [], 'exit_code': -1, 'output': '',
+                'output_path': None,
+                'error': f'命令被安全系统拦截，匹配黑名单: {pattern}',
+            }
+
+        condition = TriggerConditionExpression(task['condition_expr']) if task.get('condition_expr') else None
+        now = datetime.now()
+        output_dir = os.path.join(COMMAND_OUTPUT_DIR, now.strftime('%Y-%m-%d'))
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"trigger_{task['id']}_{run_id}.txt")
+        captured_parts: List[str] = []
+        captured_length = 0
+        output_truncated = False
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        matched = False
+
+        kwargs: Dict[str, Any] = {}
+        if os.name != 'nt':
+            kwargs['start_new_session'] = True
+        else:
+            kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+
+        process = await asyncio.create_subprocess_shell(
+            command,
+            cwd=AgentExecutor.WORK_DIR,
+            env={**os.environ, 'LANG': 'en_US.UTF-8'},
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            **kwargs,
+        )
+        cls._processes[task['id']] = process
+
+        with open(output_path, 'w', encoding='utf-8', errors='replace') as output_file:
+            output_file.write(f"Command:\n{command}\n\nStarted at: {datetime.now().isoformat(timespec='seconds')}\n\nOutput:\n")
+            assert process.stdout is not None
+            while True:
+                chunk = await process.stdout.read(4096)
+                if not chunk:
+                    break
+                text_chunk = decoder.decode(chunk)
+                output_file.write(text_chunk)
+                if captured_length < cls.MAX_CAPTURE_CHARS:
+                    remaining = cls.MAX_CAPTURE_CHARS - captured_length
+                    captured_parts.append(text_chunk[:remaining])
+                    captured_length += min(len(text_chunk), remaining)
+                    if len(text_chunk) > remaining:
+                        output_truncated = True
+                else:
+                    output_truncated = True
+                if condition and not matched and condition.feed(text_chunk):
+                    matched = True
+                    await terminate_async_process(process)
+            final_text = decoder.decode(b'', final=True)
+            if final_text:
+                output_file.write(final_text)
+                if captured_length < cls.MAX_CAPTURE_CHARS:
+                    captured_parts.append(final_text[:cls.MAX_CAPTURE_CHARS - captured_length])
+            await process.wait()
+            output_file.write(f"\n\nFinished at: {datetime.now().isoformat(timespec='seconds')}\nExit code: {process.returncode}\n")
+
+        output = ''.join(captured_parts).strip() or '(无输出)'
+        if output_truncated:
+            output += f"\n\n[输出过长，内存结果仅保留前 {cls.MAX_CAPTURE_CHARS} 字符；完整输出见文件]"
+        matched_conditions = condition.matched_literals() if condition else []
+        exit_code = process.returncode if process.returncode is not None else -1
+        if condition:
+            status = 'condition_matched' if matched else 'condition_unmatched'
+            trigger_reason = 'condition_matched' if matched else 'process_exited_before_condition'
+            error = None if matched else '进程已退出，但条件表达式未满足'
+        else:
+            status = 'completed' if exit_code == 0 else 'failed'
+            trigger_reason = 'process_exit'
+            error = None if exit_code == 0 else f'命令退出码为 {exit_code}'
+        return {
+            'status': status,
+            'trigger_reason': trigger_reason,
+            'matched_conditions': matched_conditions,
+            'exit_code': exit_code,
+            'output': output,
+            'output_path': to_display_path(output_path),
+            'error': error,
+        }
+
+    @classmethod
+    def _schedule_delivery(cls, run_id: str, task_id: str):
+        if cls._stopping or run_id in cls._delivery_run_ids:
+            return
+        cls._delivery_run_ids.add(run_id)
+        execution_task = asyncio.create_task(cls._deliver_run(run_id))
+        cls._execution_tasks.add(execution_task)
+        cls._delivery_tasks_by_task.setdefault(task_id, set()).add(execution_task)
+
+        def cleanup(done_task: asyncio.Task):
+            cls._execution_tasks.discard(done_task)
+            cls._delivery_run_ids.discard(run_id)
+            task_deliveries = cls._delivery_tasks_by_task.get(task_id)
+            if task_deliveries is not None:
+                task_deliveries.discard(done_task)
+                if not task_deliveries:
+                    cls._delivery_tasks_by_task.pop(task_id, None)
+
+        execution_task.add_done_callback(cleanup)
+
+    @classmethod
+    async def _deliver_run(cls, run_id: str):
+        db = await BotMemoryDB.get_instance()
+        run = await db.get_trigger_run(run_id)
+        if run is None or run.get('delivered_at') is not None or run.get('finished_at') is None:
+            return
+        task = await db.get_trigger_task(run['task_id'])
+        if task is None:
+            return
+        if task['status'] == 'cancelled':
+            await db.finish_trigger_run(run_id, delivered_at=time.time())
+            return
+        if cls._application is None:
+            logger.warning(f'trigger run {run_id} 暂时无法投递：Application 未初始化')
+            return
+
+        matched_conditions: List[str] = []
+        with contextlib.suppress(Exception):
+            matched_conditions = json.loads(run.get('matched_conditions') or '[]')
+        reason_text = {
+            'condition_matched': '输出条件已经满足',
+            'process_exited_before_condition': '进程已退出，但输出条件未完全满足',
+            'process_exit': '后台命令已经结束',
+            'execution_error': '后台命令执行异常',
+            'blacklist': '后台命令被安全策略拦截',
+            'recovery': 'Bot 重启后恢复执行的后台命令已经结束',
+            'cron': 'cron 后台命令本次运行已经结束',
+            'cron_misfire': 'Bot 启动后补跑了一次错过的 cron 任务',
+        }.get(run.get('trigger_reason'), str(run.get('trigger_reason') or '后台任务已产生结果'))
+        output_text = clip_middle_text(str(run.get('output') or '(无输出)'), 24000, '后台输出')
+        original_request = clip_middle_text(str(task.get('origin_user_text') or '(未记录)'), 4000, '原始请求')
+        task_summary = cls._build_task_summary(task)
+        condition_text = task.get('condition_expr') or '(无；命令退出即完成)'
+        matched_text = ', '.join(matched_conditions) if matched_conditions else '(无)'
+        warning_statuses = {'failed', 'condition_unmatched', 'interrupted'}
+        notice_emoji = '⚠️' if run.get('status') in warning_statuses or run.get('error') else '🔔'
+        visible_notice = (
+            f"{notice_emoji} 后台任务已产生结果\n"
+            f"任务概述：{task_summary}\n"
+            f"结果状态：{reason_text}\n"
+            f"任务 ID：{task['id']}\n"
+            f"系统已记录完整执行结果，正在检查是否继续唤醒 AI。"
+        )
+        internal_result = (
+            f"[后台任务结果]\n"
+            f"这是系统在未来时间自动注入的真实执行结果，不是用户刚发送的新请求。"
+            f"Telegram 中已经显示过任务完成系统提醒和 Agent 轮数整理提示。请根据任务概述和执行结果自然地继续处理，"
+            f"不要重复系统提醒、不要复述内部协议。需要发送文件时可继续使用 sendfile。\n\n"
+            f"任务 ID: {task['id']}\n"
+            f"任务概述: {task_summary}\n"
+            f"原始用户请求: {original_request}\n"
+            f"后台命令: {task['command']}\n"
+            f"结果原因: {reason_text}\n"
+            f"条件表达式: {condition_text}\n"
+            f"已匹配条件: {matched_text}\n"
+            f"退出码: {run.get('exit_code')}\n"
+            f"错误: {run.get('error') or '(无)'}\n"
+            f"完整输出文件: {run.get('output_path') or '(无)'}\n\n"
+            f"命令输出:\n{output_text}"
+        )
+
+        bot = cls._application.bot
+        update = _SelfTriggerUpdate(bot, int(task['chat_id']))
+        context = _SelfTriggerContext(bot)
+        lock_acquired = asyncio.Event()
+        process_task: Optional[asyncio.Task] = None
+        wait_notice_task: Optional[asyncio.Task] = None
+        try:
+            if run.get('notice_started_at') is None:
+                await db.finish_trigger_run(run_id, notice_started_at=time.time())
+                try:
+                    await bot.send_message(
+                        chat_id=int(task['chat_id']),
+                        text=visible_notice,
+                    )
+                except Exception as exc:
+                    logger.warning(f"发送 trigger 可见提醒失败 {run_id}: {exc}")
+                else:
+                    await db.finish_trigger_run(run_id, notice_sent_at=time.time())
+
+            latest_task = await db.get_trigger_task(task['id'])
+            if latest_task is None or latest_task['status'] == 'cancelled':
+                await db.finish_trigger_run(run_id, delivered_at=time.time())
+                return
+            await db.finish_trigger_run(run_id, delivery_started_at=time.time())
+            await GlobalRecorder.record_system_op(
+                visible_notice,
+                {
+                    'trigger_task_id': task['id'],
+                    'trigger_run_id': run_id,
+                    'task_summary': task_summary,
+                    'result_reason': reason_text,
+                },
+                int(task['chat_id']),
+            )
+            await GlobalRecorder.record_user_message(
+                internal_result,
+                MessageType.USER_TEXT,
+                int(task['chat_id']),
+            )
+            process_task = asyncio.create_task(process_conversation(
+                update,
+                context,
+                internal_result,
+                lock_acquired_event=lock_acquired,
+                force_agent_mode=True,
+                reset_agent_iterations=False,
+            ))
+            wait_notice_task = asyncio.create_task(
+                cls._notify_if_waiting(task, bot, lock_acquired, process_task)
+            )
+            await process_task
+            await db.finish_trigger_run(run_id, delivered_at=time.time())
+            if task.get('repeat') and run.get('status') == 'condition_matched':
+                await db.update_trigger_task(
+                    task['id'],
+                    last_result_hash=cls._repeat_result_signature(run),
+                    duplicate_count=0,
+                    backoff_seconds=0,
+                    backoff_until=None,
+                )
+            await cls._restart_repeat_after_delivery(task['id'], run)
+        except asyncio.CancelledError:
+            if process_task and not process_task.done():
+                process_task.cancel()
+            raise
+        except Exception as exc:
+            logger.error(f"投递 trigger run {run_id} 失败: {exc}", exc_info=True)
+            with contextlib.suppress(Exception):
+                await db.finish_trigger_run(run_id, delivered_at=time.time())
+                if task.get('repeat') and run.get('status') == 'condition_matched':
+                    await db.update_trigger_task(
+                        task['id'],
+                        last_result_hash=cls._repeat_result_signature(run),
+                        duplicate_count=0,
+                        backoff_seconds=0,
+                        backoff_until=None,
+                    )
+            with contextlib.suppress(Exception):
+                await bot.send_message(
+                    chat_id=int(task['chat_id']),
+                    text=f"⚠️ 后台任务 {task['id']} 已产生结果，但 AI 唤醒失败: {str(exc)[:200]}",
+                )
+            with contextlib.suppress(Exception):
+                await cls._restart_repeat_after_delivery(task['id'], run)
+        finally:
+            if wait_notice_task and not wait_notice_task.done():
+                wait_notice_task.cancel()
+
+    @classmethod
+    async def _restart_repeat_after_delivery(cls, task_id: str, run: Dict[str, Any]):
+        if cls._stopping or run.get('status') != 'condition_matched':
+            return
+        db = await BotMemoryDB.get_instance()
+        task = await db.get_trigger_task(task_id)
+        if task is None or not task.get('repeat') or task.get('status') != 'waiting_delivery':
+            return
+
+        await asyncio.sleep(cls.REPEAT_RESTART_DELAY_SECONDS)
+        if cls._stopping:
+            return
+        task = await db.get_trigger_task(task_id)
+        if task is None or not task.get('repeat') or task.get('status') != 'waiting_delivery':
+            return
+        scheduled_at = time.time()
+        await db.update_trigger_task(task_id, status='pending', next_run_at=scheduled_at)
+        cls._launch_runtime(task_id, scheduled_at, 'repeat')
+
+    @classmethod
+    async def _notify_if_waiting(cls, task: Dict[str, Any], bot: Any,
+                                 lock_acquired: asyncio.Event, process_task: asyncio.Task):
+        try:
+            await asyncio.wait_for(lock_acquired.wait(), timeout=cls.WAIT_NOTICE_SECONDS)
+        except asyncio.TimeoutError:
+            if not process_task.done():
+                with contextlib.suppress(Exception):
+                    await bot.send_message(
+                        chat_id=int(task['chat_id']),
+                        text=f"⏳ 后台任务 {task['id']} 已完成，正在等待当前对话处理结束。",
+                    )
 
 
 # --- ☆ 模型调用逻辑 ☆ ---
@@ -6294,6 +7983,16 @@ def build_memory_prompt_section() -> str:
     return f"\n\n【用户记忆】\n{body}\n"
 
 
+def build_conversation_system_prompt(agent_mode: bool) -> str:
+    """正常聊天与空闲提醒共用的 system prompt。"""
+    return (
+        get_runtime_prompt('assistant_prompt')
+        + get_runtime_prompt('global_prompt_addon')
+        + build_memory_prompt_section()
+        + get_agent_runtime_prompt(agent_mode)
+    )
+
+
 class ArtifactManager:
     ROOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bot_storage')
     UPLOAD_DIR = os.path.join(ROOT_DIR, 'uploads')
@@ -6852,8 +8551,6 @@ def format_chat_name(cid: str, chat_data: dict) -> str:
     return time.strftime("%m-%d %H:%M", time.localtime(ts)) if ts > 0 else cid
 
 def pretty_model_name(name: str) -> str:
-    if len(name) > 25:
-        return "..." + name[-22:]
     return name
 
 def parse_manual_model_names(text: str) -> List[str]:
@@ -6910,29 +8607,17 @@ def build_magic_keyboard(items: List[str], page: int, callback_prefix: str, back
     current_items = display_list[(page - 1) * PER_PAGE : page * PER_PAGE]
     keyboard = []
     
-    row = []
     for m in current_items:
         display_name = pretty_model_name(m)
         if marker_fn:
             marker = marker_fn(m)
             if marker:
                 display_name = f"{display_name} {marker}"
-        is_long = len(display_name) > 16
         # 使用短哈希避免超长
         cb_data = CallbackDataStore.store(f"{callback_prefix}{m}")
         btn = InlineKeyboardButton(display_name, callback_data=cb_data)
-        if is_long:
-            if row:
-                keyboard.append(row)
-                row = []
-            keyboard.append([btn])
-        else:
-            row.append(btn)
-            if len(row) == 2:
-                keyboard.append(row)
-                row = []
-    if row:
-        keyboard.append(row)
+        # 每个模型独占整行，确保长名不被 Telegram 截断为省略号
+        keyboard.append([btn])
     
     nav_row = []
     if total_pages > 1:
@@ -6967,6 +8652,21 @@ def _fmt_command_timeout(val):
 def _fmt_agent_max_iterations(val):
     val = normalize_agent_max_iterations(val)
     return f"{val}轮"
+
+def _fmt_idle_message_interval(val):
+    seconds = normalize_idle_message_interval(val)
+    if seconds <= 0:
+        return "∞关闭"
+    if seconds % 86400 == 0:
+        days = seconds // 86400
+        return f"{days}天"
+    if seconds % 3600 == 0:
+        hours = seconds // 3600
+        return f"{hours}小时"
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"{minutes}分钟"
+    return f"{seconds}s"
 
 def get_main_menu():
     agent_on = UserDataManager.get('agent_mode', False)
@@ -7034,7 +8734,7 @@ def get_more_settings_menu():
         [InlineKeyboardButton(f"📊 深度:{global_depth}", callback_data="cmd_set_global_depth"),
          InlineKeyboardButton("⏱️ 超时", callback_data="menu_timeout_settings")],
         [InlineKeyboardButton("🚫 Agent黑名单", callback_data="menu_command_blacklist"),
-         InlineKeyboardButton("🧹 清空记忆", callback_data="cmd_delete")],
+         InlineKeyboardButton("🧹 清空上下文", callback_data="cmd_delete")],
         [InlineKeyboardButton("ℹ️ 状态", callback_data="cmd_info"),
          InlineKeyboardButton("📤 导出", callback_data="cmd_export_all")],
         [InlineKeyboardButton("⬆️ 更新", callback_data="cmd_update"),
@@ -7053,10 +8753,12 @@ def get_timeout_settings_menu():
     ai_timeout = UserDataManager.get('stream_timeout', 0)
     command_timeout = UserDataManager.get('agent_command_timeout', DEFAULT_AGENT_COMMAND_TIMEOUT)
     agent_max_iterations = UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
+    idle_interval = UserDataManager.get('idle_message_interval', DEFAULT_IDLE_MESSAGE_INTERVAL)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"💬 AI回复超时：{_fmt_timeout(ai_timeout)}", callback_data="cmd_set_ai_timeout")],
         [InlineKeyboardButton(f"⌨️ 命令等待：{_fmt_command_timeout(command_timeout)}", callback_data="cmd_set_command_timeout")],
         [InlineKeyboardButton(f"🔁 Agent轮数：{_fmt_agent_max_iterations(agent_max_iterations)}", callback_data="cmd_set_agent_max_iterations")],
+        [InlineKeyboardButton(f"💭 空闲提醒：{_fmt_idle_message_interval(idle_interval)}", callback_data="cmd_set_idle_message_interval")],
         [InlineKeyboardButton("🔙 返回", callback_data="menu_more_settings")]
     ])
 
@@ -7064,14 +8766,17 @@ def build_timeout_settings_text() -> str:
     ai_timeout = UserDataManager.get('stream_timeout', 0)
     command_timeout = UserDataManager.get('agent_command_timeout', DEFAULT_AGENT_COMMAND_TIMEOUT)
     agent_max_iterations = UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
+    idle_interval = UserDataManager.get('idle_message_interval', DEFAULT_IDLE_MESSAGE_INTERVAL)
     return (
         "⏱️ <b>超时设置</b>\n"
         "━━━━━━━━━━━━━━\n"
         f"💬 AI回复超时：<b>{_fmt_timeout(ai_timeout)}</b>\n"
         f"⌨️ 命令等待窗口：<b>{_fmt_command_timeout(command_timeout)}</b>\n"
-        f"🔁 Agent最大轮数：<b>{_fmt_agent_max_iterations(agent_max_iterations)}</b>\n\n"
+        f"🔁 Agent最大轮数：<b>{_fmt_agent_max_iterations(agent_max_iterations)}</b>\n"
+        f"💭 空闲提醒间隔：<b>{_fmt_idle_message_interval(idle_interval)}</b>\n\n"
         "AI回复超时控制等待模型响应的时间；命令等待窗口控制 run 的最长等待，也是 shell 状态判断的硬上限；"
-        "Agent最大轮数控制本轮对话中 AI 自动执行工具并继续思考的最多次数。"
+        "Agent最大轮数控制从最近一条真实用户消息开始，系统结果继续调用 AI 的累计次数；"
+        "空闲提醒间隔控制用户多久没发消息后自动生成一条提醒回复。"
     )
 
 def get_ai_timeout_menu():
@@ -7102,6 +8807,15 @@ def get_agent_max_iterations_menu():
         [InlineKeyboardButton("20轮", callback_data="set_agent_max_iterations_20"),
          InlineKeyboardButton("30轮", callback_data="set_agent_max_iterations_30")],
         [InlineKeyboardButton("✍️ 自定义", callback_data="set_agent_max_iterations_custom")],
+        [InlineKeyboardButton("🔙 返回", callback_data="menu_timeout_settings")]
+    ])
+
+def get_idle_message_interval_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("1小时", callback_data="set_idle_message_interval_3600"),
+         InlineKeyboardButton("24小时", callback_data="set_idle_message_interval_86400")],
+        [InlineKeyboardButton("∞关闭", callback_data="set_idle_message_interval_0"),
+         InlineKeyboardButton("✍️ 自定义", callback_data="set_idle_message_interval_custom")],
         [InlineKeyboardButton("🔙 返回", callback_data="menu_timeout_settings")]
     ])
 
@@ -7256,21 +8970,23 @@ def get_providers_menu():
     providers = UserDataManager.get('providers', {})
     keyboard = []
     for name in providers:
-        # Telegram callback_data 限制 64 字节，跳过名字太长的
-        cb = f"view_prov_{name}"
-        if len(cb.encode('utf-8')) > 64:
-            continue
+        cb = CallbackDataStore.store(f"view_prov_{name}")
         keyboard.append([InlineKeyboardButton(f"{get_provider_usage_badges(name)} {name}", callback_data=cb)])
     keyboard.append([InlineKeyboardButton("➕ 添加提供商", callback_data="act_add_provider")])
+    keyboard.append([
+        InlineKeyboardButton("📤 导出配置", callback_data="export_provider_config"),
+        InlineKeyboardButton("📥 导入配置", callback_data="import_provider_config")
+    ])
     keyboard.append([InlineKeyboardButton("🔙 返回主菜单", callback_data="act_main_menu")])
     return InlineKeyboardMarkup(keyboard)
 
 def get_provider_detail_menu(prov_name):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📦 模型", callback_data=f"prov_models_{prov_name}")],
-        [InlineKeyboardButton("🔑 Key", callback_data=f"edit_pkey_{prov_name}"),
-         InlineKeyboardButton("🔗 URL", callback_data=f"edit_purl_{prov_name}")],
-        [InlineKeyboardButton("🗑️ 删除", callback_data=f"del_prov_{prov_name}")],
+        [InlineKeyboardButton("📦 模型", callback_data=CallbackDataStore.store(f"prov_models_{prov_name}"))],
+        [InlineKeyboardButton("✏️ 名称", callback_data=CallbackDataStore.store(f"edit_pname_{prov_name}")),
+         InlineKeyboardButton("🔗 URL", callback_data=CallbackDataStore.store(f"edit_purl_{prov_name}"))],
+        [InlineKeyboardButton("🔑 Key", callback_data=CallbackDataStore.store(f"edit_pkey_{prov_name}")),
+         InlineKeyboardButton("🗑️ 删除", callback_data=CallbackDataStore.store(f"del_prov_{prov_name}"))],
         [InlineKeyboardButton("🔙 返回", callback_data="menu_providers")]
     ])
 
@@ -9082,10 +10798,223 @@ async def perform_update_system(update: Update, context: ContextTypes.DEFAULT_TY
     await asyncio.sleep(0.4)
     await restart_current_process(update.effective_chat.id, context.bot)
 
+def build_provider_config_export() -> Dict[str, Any]:
+    """构建可移植的 Provider 配置；API Key 会原样包含在导出文件中。"""
+    providers = UserDataManager.get('providers', {}) or {}
+    exported_providers: Dict[str, Dict[str, Any]] = {}
+    for name, provider in providers.items():
+        exported_providers[str(name)] = {
+            'base_url': str(provider.get('base_url', '')),
+            'api_key': str(provider.get('api_key', '')),
+            'models': [str(model) for model in provider.get('models', [])],
+            'api_format': str(provider.get('api_format', 'openai'))
+        }
+
+    return {
+        'format': PROVIDER_CONFIG_FORMAT,
+        'version': PROVIDER_CONFIG_VERSION,
+        'exported_at': datetime.now().astimezone().isoformat(timespec='seconds'),
+        'providers': exported_providers,
+        'defaults': {
+            'active_provider': UserDataManager.get('active_provider_key'),
+            'default_model': UserDataManager.get('default_model'),
+            'default_media_provider': UserDataManager.get('default_media_provider_key'),
+            'default_media_model': UserDataManager.get('default_media_model')
+        }
+    }
+
+
+def parse_provider_config_import(raw_bytes: bytes) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """解析并严格校验 Provider 配置 JSON。"""
+    if not raw_bytes:
+        raise ValueError('配置文件为空')
+    if len(raw_bytes) > PROVIDER_CONFIG_MAX_BYTES:
+        raise ValueError(f'配置文件不能超过 {PROVIDER_CONFIG_MAX_BYTES // 1024 // 1024} MB')
+    try:
+        payload = json.loads(raw_bytes.decode('utf-8-sig'))
+    except UnicodeDecodeError as exc:
+        raise ValueError('配置文件必须使用 UTF-8 编码') from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f'JSON 格式错误：第 {exc.lineno} 行第 {exc.colno} 列') from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError('配置文件根节点必须是 JSON 对象')
+    file_format = payload.get('format')
+    if file_format != PROVIDER_CONFIG_FORMAT:
+        raise ValueError('不是本 Bot 导出的提供商配置文件')
+    version = payload.get('version')
+    if version != PROVIDER_CONFIG_VERSION:
+        raise ValueError(f'不支持的配置版本：{version!r}')
+
+    raw_providers = payload.get('providers')
+    if not isinstance(raw_providers, dict):
+        raise ValueError('providers 必须是 JSON 对象')
+    if not raw_providers:
+        raise ValueError('配置文件中没有提供商')
+    if len(raw_providers) > PROVIDER_CONFIG_MAX_PROVIDERS:
+        raise ValueError(f'一次最多导入 {PROVIDER_CONFIG_MAX_PROVIDERS} 个提供商')
+
+    providers: Dict[str, Dict[str, Any]] = {}
+    for raw_name, raw_provider in raw_providers.items():
+        if not isinstance(raw_name, str):
+            raise ValueError('提供商名称必须是字符串')
+        name = raw_name.strip()
+        if not name or len(name) > 20 or any(ord(ch) < 32 for ch in name):
+            raise ValueError(f'提供商名称无效：{raw_name!r}（不能为空，最多 20 个字符）')
+        if name in providers:
+            raise ValueError(f'提供商名称去除首尾空格后重复：{name}')
+        if not isinstance(raw_provider, dict):
+            raise ValueError(f'提供商 {name} 的配置必须是 JSON 对象')
+
+        base_url = raw_provider.get('base_url')
+        api_key = raw_provider.get('api_key')
+        api_format = raw_provider.get('api_format', 'openai')
+        models = raw_provider.get('models', [])
+        if not isinstance(base_url, str) or not base_url.strip().lower().startswith(('http://', 'https://')):
+            raise ValueError(f'提供商 {name} 的 base_url 必须以 http:// 或 https:// 开头')
+        if not isinstance(api_key, str):
+            raise ValueError(f'提供商 {name} 的 api_key 必须是字符串')
+        if not isinstance(api_format, str) or api_format not in VALID_PROVIDER_API_FORMATS:
+            raise ValueError(f'提供商 {name} 的 api_format 无效')
+        if not isinstance(models, list):
+            raise ValueError(f'提供商 {name} 的 models 必须是数组')
+
+        normalized_models: List[str] = []
+        seen_models = set()
+        for model in models:
+            if not isinstance(model, str):
+                raise ValueError(f'提供商 {name} 的模型名称必须是字符串')
+            model_name = model.strip()
+            if not model_name:
+                continue
+            if len(model_name) > 300:
+                raise ValueError(f'提供商 {name} 存在过长的模型名称')
+            if model_name not in seen_models:
+                normalized_models.append(model_name)
+                seen_models.add(model_name)
+
+        providers[name] = {
+            'base_url': base_url.strip(),
+            'api_key': api_key.replace(' ', ''),
+            'models': normalized_models,
+            'api_format': api_format
+        }
+
+    defaults = payload.get('defaults', {})
+    if defaults is None:
+        defaults = {}
+    if not isinstance(defaults, dict):
+        raise ValueError('defaults 必须是 JSON 对象')
+    return providers, defaults
+
+
+async def apply_provider_config_import(
+        providers: Dict[str, Dict[str, Any]], defaults: Dict[str, Any], mode: str = 'merge') -> Dict[str, Any]:
+    """按 merge/replace 模式导入 Provider，并仅恢复有效的默认模型选择。"""
+    if mode not in {'merge', 'replace'}:
+        raise ValueError(f'无效的导入模式：{mode}')
+    db = await BotMemoryDB.get_instance()
+    existing_names = set((UserDataManager.get('providers', {}) or {}).keys())
+    imported_names = set(providers.keys())
+    overwritten = len(existing_names.intersection(imported_names))
+    removed = len(existing_names - imported_names) if mode == 'replace' else 0
+    await db.import_providers(providers, replace=(mode == 'replace'))
+    for name in existing_names.union(imported_names):
+        PortalManager.remove_portal(name)
+    await UserDataManager.reload_providers()
+    merged = UserDataManager.get('providers', {}) or {}
+
+    restored_defaults: List[str] = []
+    skipped_defaults: List[str] = []
+
+    if mode == 'replace':
+        for target in ('chat', 'media'):
+            meta = get_model_target_meta(target)
+            UserDataManager.set(meta['provider_state_key'], None)
+            UserDataManager.set(meta['model_state_key'], None)
+            await UserDataManager.save_config(meta['provider_config_key'], None)
+            await UserDataManager.save_config(meta['model_config_key'], None)
+
+    async def restore_target(target: str, provider_field: str, model_field: str, label: str):
+        if provider_field not in defaults and model_field not in defaults:
+            return
+        provider_name = defaults.get(provider_field)
+        model_name = defaults.get(model_field)
+        provider = merged.get(provider_name) if isinstance(provider_name, str) else None
+        meta = get_model_target_meta(target)
+        if provider and isinstance(model_name, str) and model_name in provider.get('models', []):
+            await save_model_target_selection(target, provider_name, model_name)
+            restored_defaults.append(label)
+        elif provider_name is None and model_name is None:
+            UserDataManager.set(meta['provider_state_key'], None)
+            UserDataManager.set(meta['model_state_key'], None)
+            await UserDataManager.save_config(meta['provider_config_key'], None)
+            await UserDataManager.save_config(meta['model_config_key'], None)
+            restored_defaults.append(f'{label}（未设置）')
+        else:
+            skipped_defaults.append(label)
+
+    await restore_target('chat', 'active_provider', 'default_model', '默认对话模型')
+    await restore_target(
+        'media', 'default_media_provider', 'default_media_model', '默认媒体模型'
+    )
+    return {
+        'mode': mode,
+        'count': len(providers),
+        'added': len(providers) - overwritten,
+        'overwritten': overwritten,
+        'removed': removed,
+        'restored_defaults': restored_defaults,
+        'skipped_defaults': skipped_defaults
+    }
+
+
+async def send_provider_config_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await UserDataManager.init()
+    await UserDataManager.reload_providers()
+    providers = UserDataManager.get('providers', {}) or {}
+    message = update.message or update.callback_query.message
+    if not providers:
+        await message.reply_text('📭 当前没有可导出的提供商配置。')
+        return
+
+    payload = build_provider_config_export()
+    content = json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
+    buffer = io.BytesIO(content)
+    filename = f"提供商配置-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    await context.bot.send_document(
+        chat_id=update.effective_chat.id,
+        document=InputFile(buffer, filename),
+        caption=(
+            f'✅ 已导出 {len(providers)} 个提供商。\n'
+            '⚠️ 文件包含完整 API Key，请妥善保管，不要转发给他人。'
+        )
+    )
+    await GlobalRecorder.record_system_op('导出提供商配置', {'count': len(providers)})
+
+
+async def cmd_provider_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_authorized_user_middleware(update, context):
+        return
+    await UserDataManager.init()
+    UserDataManager.set('state', BotState.IDLE)
+    UserDataManager.set('provider_import_mode', None)
+    await UserDataManager.reload_providers()
+    await update.message.reply_text(
+        '🔐 <b>提供商配置导入 / 导出</b>\n\n'
+        '导出文件包含提供商 URL、API Key、模型列表和默认模型选择。\n'
+        '导入时可选择合并或覆盖模式。',
+        reply_markup=get_providers_menu(),
+        parse_mode=constants.ParseMode.HTML
+    )
+
+
 async def cmd_providers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
         return
     await UserDataManager.init()
+    UserDataManager.set('state', BotState.IDLE)
+    UserDataManager.set('provider_import_mode', None)
     await UserDataManager.reload_providers()
     await update.message.reply_text(
         "🔌 <b>提供商管理</b>\n\n"
@@ -9701,8 +11630,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.message.edit_text(
                 f"🔁 <b>Agent最大轮数</b>\n\n"
                 f"当前: <b>{_fmt_agent_max_iterations(current_iterations)}</b>\n"
-                f"这决定每次用户消息里，Agent 最多自动执行多少轮工具操作并继续思考。\n"
-                f"轮数太低会更快停下，轮数较高适合多步骤任务。",
+                f"只有新的真实用户消息会把轮数重置为 0。工具结果和后台 trigger 结果会继续累计；"
+                f"超出上限后仍显示系统结果，但不会继续请求 AI。",
                 reply_markup=get_agent_max_iterations_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
@@ -9721,6 +11650,35 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await GlobalRecorder.record_system_op(f"设置 Agent 最大轮数: {_fmt_agent_max_iterations(iterations)}")
             await query.message.edit_text(
                 f"✅ Agent最大轮数已设为 <b>{_fmt_agent_max_iterations(iterations)}</b>。",
+                reply_markup=get_timeout_settings_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "cmd_set_idle_message_interval":
+            current_interval = UserDataManager.get('idle_message_interval', DEFAULT_IDLE_MESSAGE_INTERVAL)
+            await query.message.edit_text(
+                f"💭 <b>空闲提醒间隔</b>\n\n"
+                f"当前: <b>{_fmt_idle_message_interval(current_interval)}</b>\n"
+                f"到达这个时间没有收到你的消息后，系统会按正常聊天上下文额外追加空闲提醒提示词生成回复。\n"
+                f"设为 ∞关闭 表示不自动触发空闲提醒。",
+                reply_markup=get_idle_message_interval_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "set_idle_message_interval_custom":
+            UserDataManager.set('state', BotState.SET_IDLE_MESSAGE_INTERVAL)
+            await query.message.reply_text(
+                "💭 请输入自定义空闲提醒间隔。\n"
+                "例如: 90m、2h、3天、7200s；发送 0、∞ 或 关闭 可停用。发送 cancel 取消。"
+            )
+
+        elif data.startswith("set_idle_message_interval_"):
+            interval = normalize_idle_message_interval(data.rsplit("_", 1)[1])
+            UserDataManager.set('idle_message_interval', interval)
+            await UserDataManager.save_config('idle_message_interval', interval)
+            await GlobalRecorder.record_system_op(f"设置空闲提醒间隔: {_fmt_idle_message_interval(interval)}")
+            await query.message.edit_text(
+                f"✅ 空闲提醒间隔已设为 <b>{_fmt_idle_message_interval(interval)}</b>。",
                 reply_markup=get_timeout_settings_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
@@ -10017,6 +11975,9 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         # --- Provider 管理 ---
         elif data == "menu_providers":
+            if UserDataManager.get('state') == BotState.IMPORT_PROVIDER_CONFIG:
+                UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('provider_import_mode', None)
             await UserDataManager.reload_providers()
             await query.message.edit_text(
                 "🔌 <b>提供商管理</b>\n\n"
@@ -10024,6 +11985,52 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "默认对话模型 / 媒体模型 请到【默认模型】里单独选择。",
                 reply_markup=get_providers_menu(),
                 parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "export_provider_config":
+            await send_provider_config_export(update, context)
+
+        elif data == "import_provider_config":
+            UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('provider_import_mode', None)
+            await query.message.edit_text(
+                "📥 <b>选择导入方式</b>\n\n"
+                "➕ <b>合并导入</b>\n"
+                "同名提供商覆盖，文件中没有的现有提供商继续保留。\n\n"
+                "♻️ <b>覆盖导入</b>\n"
+                "先删除全部现有提供商，再完全按导入文件重建。\n"
+                "未包含在文件中的提供商会被删除。",
+                parse_mode=constants.ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ 合并导入", callback_data="provider_import_mode_merge")],
+                    [InlineKeyboardButton("♻️ 覆盖导入", callback_data="provider_import_mode_replace")],
+                    [InlineKeyboardButton("🔙 返回", callback_data="menu_providers")]
+                ])
+            )
+
+        elif data in {"provider_import_mode_merge", "provider_import_mode_replace"}:
+            import_mode = 'replace' if data.endswith('_replace') else 'merge'
+            UserDataManager.set('provider_import_mode', import_mode)
+            UserDataManager.set('state', BotState.IMPORT_PROVIDER_CONFIG)
+            mode_label = '覆盖导入' if import_mode == 'replace' else '合并导入'
+            mode_note = (
+                "⚠️ 覆盖导入会删除文件中没有的现有提供商。\n"
+                if import_mode == 'replace'
+                else "同名提供商会更新，其他现有提供商会保留。\n"
+            )
+            await query.message.edit_text(
+                f"📥 <b>{mode_label}</b>\n\n"
+                "请发送由本 Bot 导出的 <code>提供商配置-*.json</code> 文件，"
+                "也可以直接粘贴完整 JSON。\n\n"
+                f"{mode_note}"
+                "只有有效的默认模型选择才会恢复。\n"
+                "配置内含 API Key，请仅在私聊中操作。\n\n"
+                "发送 <code>cancel</code> 可取消。",
+                parse_mode=constants.ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 重新选择方式", callback_data="import_provider_config")],
+                    [InlineKeyboardButton("取消导入", callback_data="menu_providers")]
+                ])
             )
 
         elif data == "menu_default_models":
@@ -10238,6 +12245,17 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=get_providers_menu()
             )
         
+        elif data.startswith("edit_pname_"):
+            provider_name = data[len("edit_pname_"):]
+            if provider_name not in (UserDataManager.get('providers', {}) or {}):
+                await query.answer("⚠️ 找不到这个提供商", show_alert=True)
+                return
+            UserDataManager.set('editing_provider', provider_name)
+            UserDataManager.set('state', BotState.EDIT_PROV_NAME)
+            await query.message.reply_text(
+                "✏️ 请输入新的提供商名称（最多 20 个字符，或发送 cancel）："
+            )
+
         elif data.startswith("edit_pkey_"):
             UserDataManager.set('editing_provider', data.split("_", 2)[2])
             UserDataManager.set('state', BotState.EDIT_PROV_KEY)
@@ -10539,7 +12557,10 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     # 处理中锁（仅对非提示词编辑状态生效）
     await UserDataManager.init()
     state = UserDataManager.get('state')
-    if not is_prompt_edit_state(state) and state != BotState.SET_COMMAND_BLACKLIST and state != BotState.SET_MEMORY:
+    if (not is_prompt_edit_state(state)
+            and state != BotState.SET_COMMAND_BLACKLIST
+            and state != BotState.SET_MEMORY
+            and state != BotState.IMPORT_PROVIDER_CONFIG):
         if _conversation_processing_lock.locked():
             await update.message.reply_text(
                 "⏳ 系统仍在处理上一个请求... 请稍等。"
@@ -10560,6 +12581,71 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         caption = _extract_rich_message_text(update.message).strip()
         if caption:
             logger.warning(f"handle_document_message: extracted caption via rich_message, len={len(caption)}: {caption[:200]}")
+
+    if state == BotState.IMPORT_PROVIDER_CONFIG:
+        await GlobalRecorder.record_user_message(
+            f"[提供商配置文件] {doc_name}",
+            MessageType.USER_FILE,
+            update.effective_chat.id
+        )
+        if not doc_name.lower().endswith('.json'):
+            await update.message.reply_text("⚠️ 请发送 JSON 配置文件，或发送 cancel 取消。")
+            return
+        if doc.file_size and doc.file_size > PROVIDER_CONFIG_MAX_BYTES:
+            await update.message.reply_text(
+                f"⚠️ 配置文件不能超过 {PROVIDER_CONFIG_MAX_BYTES // 1024 // 1024} MB。"
+            )
+            return
+        status_msg = await update.message.reply_text("📥 正在校验并导入提供商配置...")
+        try:
+            content_bytes = bytes(await download_telegram_file(doc))
+            providers, defaults = parse_provider_config_import(content_bytes)
+            import_mode = UserDataManager.get('provider_import_mode')
+            if import_mode not in {'merge', 'replace'}:
+                raise ValueError('请先选择合并导入或覆盖导入')
+            result = await apply_provider_config_import(providers, defaults, import_mode)
+            UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('provider_import_mode', None)
+            restored = '、'.join(result['restored_defaults']) or '无'
+            skipped = (
+                f"\n⚠️ 未恢复：{'、'.join(result['skipped_defaults'])}（提供商或模型不存在）"
+                if result['skipped_defaults'] else ''
+            )
+            await GlobalRecorder.record_system_op(
+                "导入提供商配置",
+                {
+                    'count': result['count'],
+                    'added': result['added'],
+                    'overwritten': result['overwritten'],
+                    'removed': result['removed'],
+                    'mode': result['mode'],
+                    'file_name': doc_name
+                }
+            )
+            mode_label = '覆盖导入' if result['mode'] == 'replace' else '合并导入'
+            removed_line = f"删除旧提供商：{result['removed']} 个\n" if result['mode'] == 'replace' else ''
+            await status_msg.edit_text(
+                f"✅ 提供商配置导入完成。\n"
+                f"方式：{mode_label}\n"
+                f"新增：{result['added']} 个\n"
+                f"更新同名：{result['overwritten']} 个\n"
+                f"{removed_line}"
+                f"默认项：{safe_text(restored)}{safe_text(skipped)}",
+                reply_markup=get_providers_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+        except ValueError as e:
+            await status_msg.edit_text(
+                f"❌ 导入失败：{safe_text(str(e))}\n\n请修正文件后重试，或发送 cancel 取消。",
+                parse_mode=constants.ParseMode.HTML
+            )
+        except Exception as e:
+            logger.exception("Provider config import failed")
+            await status_msg.edit_text(
+                f"❌ 导入失败：{safe_text(format_provider_exception(e))}\n\n请检查日志后重试。",
+                parse_mode=constants.ParseMode.HTML
+            )
+        return
 
     if state == BotState.SET_COMMAND_BLACKLIST:
         await GlobalRecorder.record_user_message(
@@ -10956,6 +13042,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await handle_other_message(update, context)
         return
 
+    # 导入 JSON 时必须使用 Telegram 原始文本，避免 text_markdown 自动转义下划线等字符。
+    if state == BotState.IMPORT_PROVIDER_CONFIG and update.message.text:
+        text = update.message.text.strip()
+
     # 转发消息添加来源信息
     forward_prefix = build_forward_origin_prefix(update.message)
     if forward_prefix:
@@ -10966,6 +13056,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         recorded_text = (
             "[已填入 UPDATE_GITHUB_TOKEN，内容已隐藏]"
             if state == BotState.SET_UPDATE_TOKEN
+            else "[已提交提供商配置 JSON，内容已隐藏]"
+            if state == BotState.IMPORT_PROVIDER_CONFIG
             else "[已填入 API Key，内容已隐藏]"
             if state in (BotState.EDIT_PROV_KEY, BotState.ADD_PROV_KEY)
             else text
@@ -10980,6 +13072,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         UserDataManager.set('prompt_buffer', "")
         UserDataManager.set('command_blacklist_buffer', "")
         UserDataManager.set('memory_buffer', "")
+        UserDataManager.set('provider_import_mode', None)
+        UserDataManager.set('editing_provider', None)
         await update.message.reply_text(
             "🚫 操作已取消。",
             reply_markup=get_main_menu()
@@ -10987,6 +13081,56 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # --- 状态机处理 ---
+    if state == BotState.IMPORT_PROVIDER_CONFIG:
+        status_msg = await update.message.reply_text("📥 正在校验并导入提供商配置...")
+        try:
+            providers, defaults = parse_provider_config_import(text.encode('utf-8'))
+            import_mode = UserDataManager.get('provider_import_mode')
+            if import_mode not in {'merge', 'replace'}:
+                raise ValueError('请先选择合并导入或覆盖导入')
+            result = await apply_provider_config_import(providers, defaults, import_mode)
+            UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('provider_import_mode', None)
+            restored = '、'.join(result['restored_defaults']) or '无'
+            skipped = (
+                f"\n⚠️ 未恢复：{'、'.join(result['skipped_defaults'])}（提供商或模型不存在）"
+                if result['skipped_defaults'] else ''
+            )
+            await GlobalRecorder.record_system_op(
+                "通过文本导入提供商配置",
+                {
+                    'count': result['count'],
+                    'added': result['added'],
+                    'overwritten': result['overwritten'],
+                    'removed': result['removed'],
+                    'mode': result['mode']
+                }
+            )
+            mode_label = '覆盖导入' if result['mode'] == 'replace' else '合并导入'
+            removed_line = f"删除旧提供商：{result['removed']} 个\n" if result['mode'] == 'replace' else ''
+            await status_msg.edit_text(
+                f"✅ 提供商配置导入完成。\n"
+                f"方式：{mode_label}\n"
+                f"新增：{result['added']} 个\n"
+                f"更新同名：{result['overwritten']} 个\n"
+                f"{removed_line}"
+                f"默认项：{safe_text(restored)}{safe_text(skipped)}",
+                reply_markup=get_providers_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+        except ValueError as e:
+            await status_msg.edit_text(
+                f"❌ 导入失败：{safe_text(str(e))}\n\n请重新发送完整 JSON，或发送 cancel 取消。",
+                parse_mode=constants.ParseMode.HTML
+            )
+        except Exception as e:
+            logger.exception("Provider config text import failed")
+            await status_msg.edit_text(
+                f"❌ 导入失败：{safe_text(format_provider_exception(e))}",
+                parse_mode=constants.ParseMode.HTML
+            )
+        return
+
     if state == BotState.SET_UPDATE_TOKEN:
         token = text.strip()
         if not token:
@@ -11152,6 +13296,24 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=get_timeout_settings_menu()
         )
         return
+
+    if state == BotState.SET_IDLE_MESSAGE_INTERVAL:
+        try:
+            interval = parse_idle_message_interval(text)
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ 请输入有效的时间，例如 90m、2h、3天、7200s；发送 0、∞ 或 关闭 可停用。"
+            )
+            return
+        UserDataManager.set('idle_message_interval', interval)
+        UserDataManager.set('state', BotState.IDLE)
+        await UserDataManager.save_config('idle_message_interval', interval)
+        await GlobalRecorder.record_system_op(f"设置空闲提醒间隔: {_fmt_idle_message_interval(interval)}")
+        await update.message.reply_text(
+            f"✅ 空闲提醒间隔已设为 {_fmt_idle_message_interval(interval)}。",
+            reply_markup=get_timeout_settings_menu()
+        )
+        return
     
     if state == BotState.SET_GLOBAL_DEPTH:
         if text.isdigit() and 1 <= int(text) <= 500:
@@ -11253,6 +13415,52 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
     
+    if state == BotState.EDIT_PROV_NAME:
+        old_name = UserDataManager.get('editing_provider')
+        new_name = text.strip()
+        providers = UserDataManager.get('providers', {}) or {}
+        if not old_name or old_name not in providers:
+            UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('editing_provider', None)
+            await update.message.reply_text("⚠️ 原提供商不存在，请重新打开提供商菜单。", reply_markup=get_providers_menu())
+            return
+        if not new_name or len(new_name) > 20 or any(ord(ch) < 32 for ch in new_name):
+            await update.message.reply_text("⚠️ 名称不能为空、最多 20 个字符，且不能包含控制字符。请重新发送。")
+            return
+        if new_name != old_name and new_name in providers:
+            await update.message.reply_text("⚠️ 该名称已存在，请换一个名称。")
+            return
+        if new_name == old_name:
+            UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('editing_provider', new_name)
+            await update.message.reply_text("✅ 名称未改变。", reply_markup=get_provider_detail_menu(new_name))
+            return
+
+        db = await BotMemoryDB.get_instance()
+        try:
+            await db.rename_provider(old_name, new_name)
+        except ValueError as e:
+            await update.message.reply_text(f"⚠️ {safe_text(str(e))}", parse_mode=constants.ParseMode.HTML)
+            return
+        PortalManager.remove_portal(old_name)
+        if UserDataManager.get('active_provider_key') == old_name:
+            UserDataManager.set('active_provider_key', new_name)
+        if UserDataManager.get('default_media_provider_key') == old_name:
+            UserDataManager.set('default_media_provider_key', new_name)
+        await UserDataManager.reload_providers()
+        UserDataManager.set('editing_provider', new_name)
+        UserDataManager.set('state', BotState.IDLE)
+        await GlobalRecorder.record_system_op(
+            f"重命名Provider: {old_name} -> {new_name}",
+            {'old_name': old_name, 'new_name': new_name}
+        )
+        await update.message.reply_text(
+            f"✅ 提供商已重命名为 <b>{safe_text(new_name)}</b>。",
+            reply_markup=get_provider_detail_menu(new_name),
+            parse_mode=constants.ParseMode.HTML
+        )
+        return
+
     if state == BotState.EDIT_PROV_KEY:
         p = UserDataManager.get('editing_provider')
         # 支持多个 Key（英文逗号分隔），忽略所有空格
@@ -11483,28 +13691,121 @@ async def cancel_text_conversation(update: Update):
     except Exception as e:
         logger.debug(f"清空拼接提示更新失败: {e}")
 
+async def _reset_agent_turn_iteration(db: BotMemoryDB) -> int:
+    await db.set_config(AGENT_TURN_ITERATION_CONFIG_KEY, 0)
+    return 0
+
+
+async def _reserve_agent_turn_iteration(db: BotMemoryDB) -> int:
+    raw_value = await db.get_config(AGENT_TURN_ITERATION_CONFIG_KEY, 0)
+    try:
+        current = max(0, int(raw_value))
+    except (TypeError, ValueError):
+        current = 0
+    next_iteration = int(current) + 1
+    await db.set_config(AGENT_TURN_ITERATION_CONFIG_KEY, next_iteration)
+    return next_iteration
+
+
+def _build_agent_trigger_round_notice(current_iteration: int, max_iterations: int) -> str:
+    if current_iteration > max_iterations:
+        exceeded = current_iteration - max_iterations
+        return (
+            f"🛠️ 第 {current_iteration} 轮Agent操作完成，但已超出最大 {max_iterations} 轮（超出 {exceeded} 轮）。\n"
+            "后台任务结果已记录，但本次未提交给 AI。\n"
+            "只有新的用户消息才会重置 Agent 轮数。"
+        )
+    return f"🛠️ 第 {current_iteration} 轮Agent操作完成，正在整理结果..."
+
+
+async def _send_agent_trigger_round_notice(context: ContextTypes.DEFAULT_TYPE,
+                                           chat_id: int, current_iteration: int,
+                                           max_iterations: int):
+    message = _build_agent_trigger_round_notice(current_iteration, max_iterations)
+    await safe_send_message(context, chat_id, message)
+    await GlobalRecorder.record_system_op(
+        message,
+        {
+            'agent_iteration': current_iteration,
+            'agent_max_iterations': max_iterations,
+            'background_trigger': True,
+            'ai_call_skipped': current_iteration > max_iterations,
+        },
+        chat_id,
+    )
+
+
+async def _send_agent_iteration_limit_notice(context: ContextTypes.DEFAULT_TYPE,
+                                             chat_id: int, current_iteration: int,
+                                             max_iterations: int):
+    message = (
+        f"⚠️ Agent 当前为第 {current_iteration} 轮，已超过最大 {max_iterations} 轮。\n"
+        "本次系统结果已经保留，但不会继续调用 AI。只有新的用户消息才会重置轮数。"
+    )
+    await safe_send_message(context, chat_id, message)
+    await GlobalRecorder.record_system_op(
+        message,
+        {
+            'agent_iteration': current_iteration,
+            'agent_max_iterations': max_iterations,
+            'ai_call_skipped': True,
+        },
+        chat_id,
+    )
+
+
 async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
-                               content_override: Optional[Any] = None):
+                               content_override: Optional[Any] = None,
+                               lock_acquired_event: Optional[asyncio.Event] = None,
+                               force_agent_mode: bool = False,
+                               reset_agent_iterations: bool = True):
     """处理对话（全局模式 + Agent 协议执行：命令 / 读文件 / 发文件 / 写文件 / 媒体）"""
     global _is_processing, _stop_generation_event
     async with _conversation_processing_lock:
+        if lock_acquired_event is not None:
+            lock_acquired_event.set()
         _is_processing = True
         _stop_generation_event = asyncio.Event()
 
         try:
-            await _process_conversation_inner(update, context, text, content_override)
+            await _process_conversation_inner(
+                update,
+                context,
+                text,
+                content_override,
+                force_agent_mode,
+                reset_agent_iterations,
+            )
         finally:
             _stop_generation_event = None
             _is_processing = False
 
 
 async def _process_conversation_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
-                                       content_override: Optional[Any] = None):
+                                       content_override: Optional[Any] = None,
+                                       force_agent_mode: bool = False,
+                                       reset_agent_iterations: bool = True):
     """process_conversation 内部实现"""
-    agent_mode = UserDataManager.get('agent_mode', False)
+    agent_mode = force_agent_mode or UserDataManager.get('agent_mode', False)
     stream_mode = normalize_bool(UserDataManager.get('stream_mode', True), True)
     db = await BotMemoryDB.get_instance()
     cid, cdata = await get_or_create_chat_session()
+    max_agent_iterations = normalize_agent_max_iterations(
+        UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
+    )
+    if reset_agent_iterations:
+        agent_iteration = await _reset_agent_turn_iteration(db)
+    else:
+        agent_iteration = await _reserve_agent_turn_iteration(db)
+        await db.add_chat_message(cid, 'user', text)
+        await _send_agent_trigger_round_notice(
+            context,
+            update.effective_chat.id,
+            agent_iteration,
+            max_agent_iterations,
+        )
+        if agent_iteration > max_agent_iterations:
+            return
     model = cdata.get('model') or UserDataManager.get('default_model')
     prov_name, prov_data = get_current_provider()
     
@@ -11517,19 +13818,11 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
         return
     assert prov_name is not None
 
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action=constants.ChatAction.TYPING
-    )
+    if reset_agent_iterations:
+        await db.add_chat_message(cid, 'user', text)
 
-    await db.add_chat_message(cid, 'user', text)
-
-    base_prompt = get_runtime_prompt('assistant_prompt')
-    global_addon = get_runtime_prompt('global_prompt_addon')
     global_depth = max(1, int(UserDataManager.get('global_depth', 30)))
-    system_prompt = base_prompt + global_addon
-    # 用户记忆（始终拼接，独立于 Agent 开关）
-    system_prompt += build_memory_prompt_section()
+    system_prompt = build_conversation_system_prompt(agent_mode)
     history = await db.get_conversation_messages(global_depth)
     if content_override is not None:
         # 文件/图片本体只在本轮临时喂给模型；长期记忆和导出仍只保留路径索引。
@@ -11539,9 +13832,12 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 break
         else:
             history.append({'role': 'user', 'content': content_override})
-    # Agent 提示词始终保留，只切换执行权限状态
-    system_prompt += get_agent_runtime_prompt(agent_mode)
     
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=constants.ChatAction.TYPING
+    )
+
     # 根据流式/非流式开关选择回复方式
     if stream_mode:
         response = await send_streaming_response(
@@ -11568,13 +13864,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     
     # --- Agent 模式：命令 / 读文件 / 发文件 / 写文件 / 媒体协议循环 ---
     if agent_mode:
-        max_agent_iterations = normalize_agent_max_iterations(
-            UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
-        )
-        iteration = 0
-        reached_agent_limit = False
-        
-        while iteration < max_agent_iterations:
+        while True:
             if is_stop_requested():
                 await safe_send_message(
                     context,
@@ -11589,14 +13879,14 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             if not protocol_blocks:
                 break  # AI 没有请求任何操作
             
-            iteration += 1
+            operation_iteration = agent_iteration + 1
             continuation_messages: List[Dict[str, Any]] = []
             should_continue = False
             pause_agent_message: Optional[str] = None
             provider_api_format = str(prov_data.get('api_format', 'openai'))
             agent_stop_msg = await context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text=f"🛠️ 第 {iteration} 轮Agent操作进行中...",
+                text=f"🛠️ 第 {operation_iteration} 轮Agent操作进行中...",
                 reply_markup=build_stop_keyboard()
             )
 
@@ -12052,6 +14342,36 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     should_continue = True
                     continue
 
+                if block_type == 'trigger':
+                    try:
+                        trigger_notice = await SelfTriggerManager.handle_protocol(
+                            block.get('path') or '',
+                            block.get('body') or '',
+                            context.bot,
+                            update.effective_chat.id,
+                            cid,
+                            text,
+                            response,
+                        )
+                    except Exception as e:
+                        trigger_notice = f"[trigger结果] 操作失败: {str(e)[:300]}"
+                    await GlobalRecorder.record(
+                        msg_type=MessageType.AGENT_RESULT,
+                        role='system',
+                        content=trigger_notice,
+                        chat_id=update.effective_chat.id,
+                    )
+                    await db.add_chat_message(cid, 'user', trigger_notice)
+                    continuation_messages.append({
+                        'role': 'user',
+                        'content': (
+                            trigger_notice + "\n"
+                            "说明: 这是 trigger 后台触发任务的真实管理结果，请据此回复用户。"
+                        ),
+                    })
+                    should_continue = True
+                    continue
+
                 if block_type in {'shell', 'stdin', 'shellread', 'shellkill'}:
                     if block_type == 'shell':
                         shell_result = await AgentShellSessionManager.start(block['body'], get_or_create_stop_event())
@@ -12265,11 +14585,24 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 break
 
             with contextlib.suppress(Exception):
-                await safe_edit_text(agent_stop_msg, f"🛠️ 第 {iteration} 轮Agent操作完成，正在整理结果...", reply_markup=None)
+                await safe_edit_text(
+                    agent_stop_msg,
+                    f"🛠️ 第 {operation_iteration} 轮Agent操作完成，正在整理结果...",
+                    reply_markup=None,
+                )
 
             # Continue from this turn's in-memory transcript. Re-reading global history here would
             # duplicate just-recorded Agent results and make prompt caching worse.
             if not continuation_messages:
+                break
+            agent_iteration = await _reserve_agent_turn_iteration(db)
+            if agent_iteration > max_agent_iterations:
+                await _send_agent_iteration_limit_notice(
+                    context,
+                    update.effective_chat.id,
+                    agent_iteration,
+                    max_agent_iterations,
+                )
                 break
             next_history = list(agent_turn_history)
             next_history.extend(continuation_messages)
@@ -12294,19 +14627,6 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             await db.add_chat_message(cid, 'assistant', response)
             agent_turn_history = next_history
             agent_turn_history.append({'role': 'assistant', 'content': response})
-
-        if iteration >= max_agent_iterations and AgentExecutor.extract_protocol_blocks(response):
-            reached_agent_limit = True
-
-        if reached_agent_limit:
-            await safe_send_message(
-                context,
-                update.effective_chat.id,
-                (
-                    f"⚠️ Agent 已达到最大执行次数 ({max_agent_iterations}次)，本轮 Agent 操作已停止。\n"
-                    "已经产生的 AI 回复和工具结果都保留在全局记忆里。"
-                )
-            )
 
 # --- ☆ 命令函数 ☆ ---
 async def cmd_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -12516,19 +14836,25 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
 
         db = await BotMemoryDB.get_instance()
         
+        idle_interval = normalize_idle_message_interval(
+            UserDataManager.get('idle_message_interval', DEFAULT_IDLE_MESSAGE_INTERVAL)
+        )
+        if idle_interval <= 0:
+            return
+
         # 获取用户最后发消息的时间
         last_time = await db.get_last_user_message_time()
         if not last_time:
             return
         
-        # 检查是否超过24小时
+        # 检查是否超过配置的空闲提醒间隔
         hours_passed = (time.time() - last_time) / 3600
-        if hours_passed < 24:
+        if time.time() - last_time < idle_interval:
             return
         
-        # 检查今天是否已经发过
+        # 同一个间隔内最多发一次
         last_idle_notice_time = await db.get_config('last_idle_notice_time', 0)
-        if time.time() - last_idle_notice_time < 86400:
+        if time.time() - last_idle_notice_time < idle_interval:
             return
         
         # 获取Provider
@@ -12542,16 +14868,12 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
         assert prov_name is not None
         
         # 获取全局对话记忆
-        global_depth = UserDataManager.get('global_depth', 30)
+        global_depth = max(1, int(UserDataManager.get('global_depth', 30)))
         global_history = await db.get_conversation_messages(global_depth)
 
-        # 提醒消息只生成自然语言，不执行工具，因此固定按 Agent 关闭态拼完整提示词链
-        base_prompt = get_runtime_prompt('assistant_prompt')
-        global_addon = get_runtime_prompt('global_prompt_addon')
-        agent_runtime_prompt = get_agent_runtime_prompt(False)
-
+        agent_mode = UserDataManager.get('agent_mode', False)
         idle_prompt = (
-            base_prompt + global_addon + agent_runtime_prompt +
+            build_conversation_system_prompt(agent_mode) +
             format_prompt_template('idle_message_prompt', hours_passed=int(hours_passed))
         )
         
@@ -13029,6 +15351,10 @@ async def setup_bot_commands(app):
     """同步 Telegram 命令菜单，并在启动后发送完整主菜单。"""
     global _startup_commands_synced, _startup_menu_sent
 
+    await UserDataManager.init()
+    await BotMemoryDB.get_instance()
+    await SelfTriggerManager.startup(app)
+
     if not _startup_commands_synced:
         try:
             commands = [
@@ -13036,11 +15362,12 @@ async def setup_bot_commands(app):
                 BotCommand("config", "打开设置面板"),
                 BotCommand("update", "更新代码并重启"),
                 BotCommand("providers", "管理提供商与模型列表"),
+                BotCommand("provider_config", "导入导出提供商配置"),
                 BotCommand("models", "选择默认模型"),
                 BotCommand("chat_model", "选择默认对话模型"),
                 BotCommand("media_model", "选择默认媒体模型"),
                 BotCommand("prompts", "管理提示词"),
-                BotCommand("clear_memory", "清空记忆"),
+                BotCommand("clear_memory", "清空上下文"),
                 BotCommand("depth", "设置记忆深度"),
                 BotCommand("timeout", "设置超时"),
                 BotCommand("agent", "开关 Agent 模式"),
@@ -13050,13 +15377,13 @@ async def setup_bot_commands(app):
                 BotCommand("export", "导出全部记忆"),
                 BotCommand("restart", "重启 Bot"),
                 BotCommand("show_chat_info", "查看状态与记忆统计"),
-                BotCommand("show_all", "导出全部记忆"),
             ]
-            await app.bot.delete_my_commands()
-            await app.bot.set_my_commands(commands)
+            private_scope = BotCommandScopeAllPrivateChats()
+            await app.bot.delete_my_commands(scope=private_scope)
+            await app.bot.set_my_commands(commands, scope=private_scope)
             with contextlib.suppress(Exception):
-                await app.bot.delete_my_commands(language_code="zh")
-                await app.bot.set_my_commands(commands, language_code="zh")
+                await app.bot.delete_my_commands(scope=private_scope, language_code="zh")
+                await app.bot.set_my_commands(commands, scope=private_scope, language_code="zh")
             _startup_commands_synced = True
             logger.info("✅ Telegram 命令菜单已同步")
         except Exception as e:
@@ -13158,6 +15485,11 @@ async def on_shutdown(app):
     """应用关闭时清理资源"""
     logger.info("🛑 服务正在关闭...")
     try:
+        await SelfTriggerManager.shutdown()
+        logger.info("✅ 后台触发任务已关闭")
+    except Exception as e:
+        logger.error(f"关闭后台触发任务失败: {e}")
+    try:
         AgentShellSessionManager.kill_all()
         logger.info("✅ Agent shell 会话已关闭")
     except Exception as e:
@@ -13224,6 +15556,7 @@ if __name__ == '__main__':
             ("update", cmd_update_system),
             ("restart", cmd_restart_system),
             ("providers", cmd_providers_menu),
+            ("provider_config", cmd_provider_config),
             ("models", cmd_models_menu),
             ("chat_model", cmd_chat_model_menu),
             ("media_model", cmd_media_model_menu),
@@ -13237,7 +15570,6 @@ if __name__ == '__main__':
             ("status", cmd_show_info),
             ("export", cmd_export_all),
             ("show_chat_info", cmd_show_info),
-            ("show_all", cmd_export_all),
         ]
         for cmd, handler in commands:
             app.add_handler(CommandHandler(cmd, handler))
