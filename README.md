@@ -16,6 +16,8 @@ cd /opt && sudo git clone https://github.com/HANLINGVABCN/telegram-ai-bot.git &&
 
 - 私有单用户访问控制：只有 `.env` 中配置的 Telegram 用户 ID 可以使用。
 - 多提供商支持：OpenAI、OpenAI 兼容接口、Gemini、Vertex、Claude。
+- 提供商详情支持修改名称、URL、API Key 和模型列表；重命名后会同步更新默认模型关联。
+- 提供商配置迁移：可将 URL、API Key、模型列表和默认模型选择导出为 JSON，并在其他实例中合并导入。
 - 默认模型分离：对话模型和媒体模型可以分别配置。
 - 全局记忆：使用 SQLite 保存对话、系统操作、按钮操作和 Agent 结果。
 - 流式回复：支持流式和非流式两种模型请求方式。
@@ -151,6 +153,7 @@ UPDATE_ZIP_URL=https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot/zipball
 | `/start` | 打开主菜单 |
 | `/config` | 打开配置菜单 |
 | `/providers` | 管理提供商与模型列表 |
+| `/provider_config` | 导入导出提供商配置 |
 | `/models` | 选择默认模型 |
 | `/chat_model` | 选择默认对话模型 |
 | `/media_model` | 选择默认媒体模型 |
@@ -167,6 +170,17 @@ UPDATE_ZIP_URL=https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot/zipball
 | `/show_all` | 导出全部记忆，等同 `/export` |
 | `/update` | 更新代码并重启 |
 | `/restart` | 重启 Bot |
+
+## 提供商配置导入导出
+
+在「提供商」菜单中点击「导出配置」可下载 JSON 配置文件；点击「导入配置」后，可发送该 JSON 文件或直接粘贴完整 JSON。
+
+- 导出内容包括提供商 URL、完整 API Key、接口格式、模型列表，以及默认对话/媒体模型选择。
+- 导入前可选择「合并导入」或「覆盖导入」。
+- 合并导入：同名提供商会更新，其他已有提供商会保留。
+- 覆盖导入：先删除全部现有提供商，再完全按导入文件重建；文件中没有的提供商会被删除。
+- 默认模型仅在对应提供商和模型均存在时恢复。
+- 导出文件包含明文 API Key，请勿公开分享或提交到代码仓库。
 
 ## Prompt 说明
 
