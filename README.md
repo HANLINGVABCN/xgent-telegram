@@ -167,7 +167,6 @@ UPDATE_ZIP_URL=https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot/zipball
 | `/status` | 查看状态 |
 | `/show_chat_info` | 查看状态与记忆统计，等同 `/status` |
 | `/export` | 导出全部记忆 |
-| `/show_all` | 导出全部记忆，等同 `/export` |
 | `/update` | 更新代码并重启 |
 | `/restart` | 重启 Bot |
 

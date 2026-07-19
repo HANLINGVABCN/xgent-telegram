@@ -15349,7 +15349,6 @@ async def setup_bot_commands(app):
                 BotCommand("export", "导出全部记忆"),
                 BotCommand("restart", "重启 Bot"),
                 BotCommand("show_chat_info", "查看状态与记忆统计"),
-                BotCommand("show_all", "导出全部记忆"),
             ]
             private_scope = BotCommandScopeAllPrivateChats()
             await app.bot.delete_my_commands(scope=private_scope)
@@ -15543,7 +15542,6 @@ if __name__ == '__main__':
             ("status", cmd_show_info),
             ("export", cmd_export_all),
             ("show_chat_info", cmd_show_info),
-            ("show_all", cmd_export_all),
         ]
         for cmd, handler in commands:
             app.add_handler(CommandHandler(cmd, handler))
