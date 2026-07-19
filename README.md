@@ -155,7 +155,7 @@ UPDATE_ZIP_URL=https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot/zipball
 | `/chat_model` | 选择默认对话模型 |
 | `/media_model` | 选择默认媒体模型 |
 | `/prompts` | 管理提示词 |
-| `/clear_memory` | 清空记忆 |
+| `/clear_memory` | 清空上下文 |
 | `/depth` | 设置记忆深度 |
 | `/timeout` | 设置请求超时 |
 | `/agent` | 开关 Agent 模式 |
