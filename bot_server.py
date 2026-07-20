@@ -1921,15 +1921,24 @@ class UserDataManager:
 # 每个 provider 维护一个轮询计数器，按逗号分隔的多个 key 依次轮询调用。
 _api_key_counters: Dict[str, int] = {}
 
+def parse_api_keys(api_key_field: str) -> List[str]:
+    """解析逗号分隔的 API Key，并移除复制粘贴时混入的空白字符。"""
+    return [
+        re.sub(r'\s+', '', key)
+        for key in str(api_key_field or '').split(',')
+        if re.sub(r'\s+', '', key)
+    ]
+
+
 def get_next_api_key(prov_name: str, api_key_field: str) -> str:
     """从可能包含多个逗号分隔 key 的字段中取出下一个 key（轮询）。
 
-    支持填写多个 API Key，用英文逗号隔开，忽略所有空格。
+    支持填写多个 API Key，用英文逗号隔开，忽略所有空白字符。
     单个 Key 时直接返回；多个 Key 时按轮询方式依次取出。
     """
-    keys = [k for k in api_key_field.replace(' ', '').split(',') if k]
+    keys = parse_api_keys(api_key_field)
     if not keys:
-        return api_key_field
+        return re.sub(r'\s+', '', str(api_key_field or ''))
     if len(keys) == 1:
         return keys[0]
     idx = _api_key_counters.get(prov_name, 0) % len(keys)
@@ -6715,55 +6724,122 @@ class ModelClient:
 
     @staticmethod
     async def fetch_knowledge(prov_name: str, api_key: str, base_url: str, api_format: str = 'openai') -> list:
-        """获取可用模型列表 - 支持多种 API 格式"""
-        if api_format in {'gemini', 'vertex'}:
-            return await ModelClient._fetch_gemini_models(api_key, base_url)
-        elif api_format == 'claude':
-            return await ModelClient._fetch_claude_models()
-        elif api_format == 'openai_compatible':
-            return await ModelClient._fetch_openai_compatible_models(api_key, base_url)
-        
+        """获取可用模型列表；兼容旧调用方，仅返回模型数组。"""
+        models, _ = await ModelClient.fetch_knowledge_detailed(
+            prov_name, api_key, base_url, api_format=api_format
+        )
+        return models
+
+    @staticmethod
+    async def fetch_knowledge_detailed(prov_name: str, api_key: str, base_url: str,
+                                       api_format: str = 'openai') -> Tuple[list, Optional[str]]:
+        """获取模型列表，同时返回适合展示给用户的失败原因。"""
+        selected_key = get_next_api_key(prov_name, api_key)
+        if not selected_key:
+            return [], "没有可用的 API Key。"
+
         try:
-            client = PortalManager.get_portal(prov_name, api_key, base_url)
+            if api_format in {'gemini', 'vertex'}:
+                return await ModelClient._fetch_gemini_models(selected_key, base_url), None
+            if api_format == 'claude':
+                return await ModelClient._fetch_claude_models(), None
+            if api_format == 'openai_compatible':
+                models = await ModelClient._fetch_openai_compatible_models(selected_key, base_url)
+                return models, None
+
+            client = PortalManager.get_portal(prov_name, selected_key, base_url)
             response = await client.models.list()
             model_ids = []
             for m in response.data:
-                if hasattr(m, 'id'): 
+                if hasattr(m, 'id'):
                     model_ids.append(m.id)
-                elif isinstance(m, dict) and 'id' in m: 
+                elif isinstance(m, dict) and 'id' in m:
                     model_ids.append(m['id'])
-                else: 
+                else:
                     model_ids.append(str(m))
-            return sorted([m for m in model_ids if 'embedding' not in m.lower() and 'audio' not in m.lower()])
+            models = sorted([
+                m for m in model_ids
+                if 'embedding' not in m.lower() and 'audio' not in m.lower()
+            ])
+            return models, None
         except Exception as e:
-            logger.error(f"Fetch Error: {e}")
-            return []
-    
+            error_text = format_provider_exception(e)
+            logger.error(f"Fetch Error ({prov_name}/{api_format}): {error_text}")
+            return [], error_text
+
+    @staticmethod
+    def _format_gemini_models_error(status_code: int, response_text: str) -> str:
+        """把 Gemini models.list 错误转换为不泄露 Key 的可操作提示。"""
+        redacted = redact_sensitive_text(response_text or '')
+        message = ''
+        reason = ''
+        try:
+            payload = json.loads(response_text or '{}')
+            error = payload.get('error') or {}
+            message = str(error.get('message') or '').strip()
+            for detail in error.get('details') or []:
+                if isinstance(detail, dict) and detail.get('reason'):
+                    reason = str(detail['reason']).strip()
+                    break
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+        if status_code == 401 and reason == 'ACCESS_TOKEN_TYPE_UNSUPPORTED':
+            return (
+                "Google Gemini 鉴权失败（401 / ACCESS_TOKEN_TYPE_UNSUPPORTED）。"
+                "这不是“没有模型”。该错误也会在 Key 被多出反斜杠、反引号或其他格式字符时出现。"
+                "旧版本读取配置输入时使用了 Telegram Markdown 序列化，可能改写包含连字符或其他特殊字符的 Key。"
+                "请更新并重启机器人，然后在“编辑 Key”中重新粘贴原始 Key。"
+            )
+
+        detail = message or redacted[:800] or '响应正文为空'
+        suffix = f" / {reason}" if reason else ''
+        return f"Gemini 模型列表请求失败（HTTP {status_code}{suffix}）：{detail}"
+
     @staticmethod
     async def _fetch_gemini_models(api_key: str, base_url: str) -> list:
-        """获取 Google 原生 Gemini 模型列表（Gemini / Vertex 通用）"""
+        """获取 Google 原生 Gemini 模型列表，并处理分页及真实鉴权错误。"""
         import httpx
-        try:
-            url = f"{base_url.rstrip('/')}/models"
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(url, headers={**PROVIDER_HTTP_HEADERS, "x-goog-api-key": api_key})
+
+        url = f"{base_url.rstrip('/')}/models"
+        headers = {**PROVIDER_HTTP_HEADERS, "Accept": "application/json", "x-goog-api-key": api_key}
+        models: List[str] = []
+        page_token: Optional[str] = None
+
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            while True:
+                params: Dict[str, Any] = {"pageSize": 1000}
+                if page_token:
+                    params["pageToken"] = page_token
+                resp = await client.get(url, headers=headers, params=params)
                 if resp.status_code != 200:
-                    logger.error(f"Gemini models list error: {resp.status_code}")
-                    return []
+                    error = ModelClient._format_gemini_models_error(resp.status_code, resp.text or '')
+                    logger.error(error)
+                    raise RuntimeError(error)
+
                 data = resp.json()
-                models = []
-                for m in data.get('models', []):
-                    name = m.get('name', '')
+                for model_data in data.get('models', []):
+                    if not isinstance(model_data, dict):
+                        continue
+                    supported_methods = model_data.get('supportedGenerationMethods') or []
+                    if supported_methods and not any(
+                        method in supported_methods
+                        for method in ('generateContent', 'streamGenerateContent')
+                    ):
+                        continue
+                    name = str(model_data.get('name') or '')
                     # name 格式: "models/gemini-2.5-flash" → 取 "gemini-2.5-flash"
                     if '/' in name:
                         name = name.split('/')[-1]
                     if name and 'embedding' not in name.lower():
                         models.append(name)
-                return sorted(models)
-        except Exception as e:
-            logger.error(f"Gemini Fetch Error: {e}")
-            return []
-    
+
+                page_token = data.get('nextPageToken')
+                if not page_token:
+                    break
+
+        return sorted(set(models))
+
     @staticmethod
     async def _fetch_claude_models() -> list:
         """返回 Claude 常用模型列表（Anthropic 不提供 list API）"""
@@ -12413,9 +12489,17 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             target = UserDataManager.get('temp_model_target') or 'chat'
             menu_mode = UserDataManager.get('temp_model_menu_mode') or 'manage'
             await query.message.reply_text("⏳ 正在获取模型列表...")
-            models = await ModelClient.fetch_knowledge(name, prov['api_key'], prov['base_url'], api_format=prov.get('api_format', 'openai'))
+            models, fetch_error = await ModelClient.fetch_knowledge_detailed(
+                name,
+                prov['api_key'],
+                prov['base_url'],
+                api_format=prov.get('api_format', 'openai')
+            )
             if not models:
-                await query.message.reply_text("⚠️ 未找到可用结果。")
+                if fetch_error:
+                    await query.message.reply_text(f"⚠️ 模型列表获取失败。\n\n{fetch_error}")
+                else:
+                    await query.message.reply_text("⚠️ 接口请求成功，但没有返回可用的生成模型。")
                 return
             UserDataManager.set('fetched_cache', models)
             UserDataManager.set('temp_page', 1)
@@ -12932,6 +13016,75 @@ def _rich_block_to_text(block):
     return ''
 
 
+def _rich_part_to_plain_text(part):
+    """提取富文本的原始文字，不添加 Markdown 标记。配置值必须走这个路径。"""
+    if isinstance(part, str):
+        return part
+    if isinstance(part, dict):
+        value = part.get('text')
+        if value is not None:
+            return _rich_part_to_plain_text(value)
+        return ''
+    if isinstance(part, list):
+        return ''.join(_rich_part_to_plain_text(item) for item in part)
+    return ''
+
+
+def _rich_block_to_plain_text(block):
+    if not isinstance(block, dict):
+        return ''
+    if block.get('text') is not None:
+        return _rich_part_to_plain_text(block.get('text'))
+    if isinstance(block.get('blocks'), list):
+        return chr(10).join(
+            _rich_block_to_plain_text(item)
+            for item in block['blocks']
+            if isinstance(item, dict)
+        )
+    if isinstance(block.get('cells'), list):
+        rows = []
+        for row in block['cells']:
+            if not isinstance(row, list):
+                continue
+            rows.append(' | '.join(
+                _rich_part_to_plain_text(cell.get('text', '') if isinstance(cell, dict) else cell)
+                for cell in row
+            ))
+        return chr(10).join(rows)
+    if isinstance(block.get('items'), list):
+        rows = []
+        for item in block['items']:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get('label', '') or '')
+            content = chr(10).join(
+                _rich_block_to_plain_text(child)
+                for child in item.get('blocks', [])
+                if isinstance(child, dict)
+            )
+            rows.append((label + ' ' + content).strip())
+        return chr(10).join(rows)
+    return ''
+
+
+def _extract_rich_message_plain_text(msg):
+    """提取 rich_message 的纯文本，避免把配置值变成 Markdown。"""
+    extra = getattr(msg, 'api_kwargs', None) or {}
+    rich = extra.get('rich_message')
+    if not isinstance(rich, dict):
+        try:
+            rich = (msg.to_dict() if hasattr(msg, 'to_dict') else {}).get('rich_message')
+        except Exception:
+            rich = None
+    if not isinstance(rich, dict) or not isinstance(rich.get('blocks'), list):
+        return ''
+    return chr(10).join(
+        _rich_block_to_plain_text(block)
+        for block in rich['blocks']
+        if isinstance(block, dict)
+    )
+
+
 def _extract_rich_message_text(msg):
     """Extract text from rich_message (Telegram rich text format), preserving formatting as markdown."""
     extra = getattr(msg, 'api_kwargs', None) or {}
@@ -12987,13 +13140,29 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await UserDataManager.init()
     state = UserDataManager.get('state')
-    # 使用 text_markdown 保留格式（粗体/斜体/代码块等）
+    # 普通聊天使用 text_markdown 保留粗体/斜体/代码块等格式。
+    # 但 Key、URL、模型 ID、提供商名称等配置值必须使用 Telegram 原始文本：
+    # Markdown 序列化会给特殊字符插入转义符（例如 \, -, _, `），导致凭据或模型 ID 被改写。
+    exact_value_states = {
+        BotState.ADD_PROV_NAME,
+        BotState.ADD_PROV_URL,
+        BotState.ADD_PROV_KEY,
+        BotState.EDIT_PROV_NAME,
+        BotState.EDIT_PROV_KEY,
+        BotState.EDIT_PROV_URL,
+        BotState.ADD_MODEL_MANUAL,
+        BotState.SEARCH_FETCHED,
+        BotState.IMPORT_PROVIDER_CONFIG,
+    }
     text = ""
     if update.message.text:
-        try:
-            text = (update.message.text_markdown or update.message.text or "").strip()
-        except Exception:
-            text = (update.message.text or "").strip()
+        if state in exact_value_states:
+            text = update.message.text.strip()
+        else:
+            try:
+                text = (update.message.text_markdown or update.message.text or "").strip()
+            except Exception:
+                text = (update.message.text or "").strip()
     else:
         text = (update.message.caption or "").strip()
 
@@ -13031,9 +13200,13 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             logger.warning(f"handle_text_message: forwardMessage fallback failed: {e}")
 
-    # 富文本消息：text 在 rich_message.blocks 结构里，不在 text 字段
+    # 富文本消息：text 在 rich_message.blocks 结构里，不在 text 字段。
+    # 配置值取纯文本；普通聊天才保留 Markdown 标记。
     if not text:
-        text = _extract_rich_message_text(update.message).strip()
+        if state in exact_value_states:
+            text = _extract_rich_message_plain_text(update.message).strip()
+        else:
+            text = _extract_rich_message_text(update.message).strip()
         if text:
             logger.warning(f"handle_text_message: extracted via rich_message.blocks, len={len(text)}: {text[:200]}")
 
@@ -13394,8 +13567,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         name = UserDataManager.get('temp_prov_name')
         url = UserDataManager.get('temp_prov_url')
         api_format = UserDataManager.get('temp_prov_format', 'openai')
-        # 支持多个 Key（英文逗号分隔），忽略所有空格
-        text = text.replace(' ', '')
+        # 支持多个 Key（英文逗号分隔）；只移除复制粘贴混入的空白，不改写连字符。
+        text = ','.join(parse_api_keys(text))
         providers = UserDataManager.get('providers', {})
         providers[name] = {'base_url': url, 'api_key': text, 'models': [], 'api_format': api_format}
         db = await BotMemoryDB.get_instance()
@@ -13463,8 +13636,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if state == BotState.EDIT_PROV_KEY:
         p = UserDataManager.get('editing_provider')
-        # 支持多个 Key（英文逗号分隔），忽略所有空格
-        text = text.replace(' ', '')
+        # 支持多个 Key（英文逗号分隔）；只移除复制粘贴混入的空白，不改写连字符。
+        text = ','.join(parse_api_keys(text))
         providers = UserDataManager.get('providers', {})
         if p and p in providers:
             providers[p]['api_key'] = text
