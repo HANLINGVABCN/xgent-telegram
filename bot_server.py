@@ -1265,10 +1265,11 @@ class BotMemoryDB:
             if is_redundant_agent_command_record(msg_type, msg.get('content')):
                 continue
             
-            # 系统操作和按钮点击转为可理解的格式
+            # 系统操作以 system 角色注入（OpenAI 格式原样支持；Gemini/Claude 在各自构建器里降级为 user），
+            # 避免系统旁白伪装成用户消息、破坏对话轮换结构
             if msg_type == MessageType.SYSTEM_OP:
                 result.append({
-                    'role': 'user',
+                    'role': 'system',
                     'content': f"[系统操作] {msg['content']}"
                 })
             elif msg_type == MessageType.BUTTON_CLICK:
@@ -5905,16 +5906,8 @@ class SelfTriggerManager:
                 await db.finish_trigger_run(run_id, delivered_at=time.time())
                 return
             await db.finish_trigger_run(run_id, delivery_started_at=time.time())
-            await GlobalRecorder.record_system_op(
-                visible_notice,
-                {
-                    'trigger_task_id': task['id'],
-                    'trigger_run_id': run_id,
-                    'task_summary': task_summary,
-                    'result_reason': reason_text,
-                },
-                int(task['chat_id']),
-            )
+            # 🔔 可见提醒只发 Telegram 界面，不写入 AI 历史：任务概述/状态/ID 已全部包含在 internal_result 中，
+            # 避免每次触发在历史里产生 "[系统操作] 🔔" + "[后台任务结果]" 两条重复记录。
             await GlobalRecorder.record_user_message(
                 internal_result,
                 MessageType.USER_TEXT,
@@ -6146,11 +6139,12 @@ class ModelClient:
     def _build_claude_messages(history: list) -> List[Dict[str, Any]]:
         messages = []
         for msg in ModelClient.clean_memories(history):
-            if msg['role'] != 'system':
-                messages.append({
-                    "role": msg['role'],
-                    "content": ModelClient._to_claude_content(msg['content'])
-                })
+            # Claude 消息仅支持 user/assistant；系统旁白（[系统操作] 前缀）降级为 user 保留内容
+            role = 'user' if msg['role'] == 'system' else msg['role']
+            messages.append({
+                "role": role,
+                "content": ModelClient._to_claude_content(msg['content'])
+            })
         return messages
 
     @staticmethod
@@ -7056,12 +7050,13 @@ class ModelClient:
         
         messages = []
         for msg in ModelClient.clean_memories(history):
-            if msg['role'] != 'system':
-                messages.append({
-                    "role": msg['role'],
-                    "content": ModelClient._to_claude_content(msg['content'])
-                })
-        
+            # Claude 消息仅支持 user/assistant；系统旁白（[系统操作] 前缀）降级为 user 保留内容
+            role = 'user' if msg['role'] == 'system' else msg['role']
+            messages.append({
+                "role": role,
+                "content": ModelClient._to_claude_content(msg['content'])
+            })
+
         url = f"{base_url.rstrip('/')}/messages"
         headers = {
             **PROVIDER_HTTP_HEADERS,
@@ -13895,17 +13890,9 @@ async def _send_agent_trigger_round_notice(context: ContextTypes.DEFAULT_TYPE,
                                            chat_id: int, current_iteration: int,
                                            max_iterations: int):
     message = _build_agent_trigger_round_notice(current_iteration, max_iterations)
+    # 只发 Telegram 界面，不写入 AI 历史——与普通 Agent 循环里同名进度提示的处理方式保持一致
+    # （普通循环仅 safe_edit_text 编辑状态消息，从不入库）；轮数状态由 DB 跟踪，无需靠历史记录。
     await safe_send_message(context, chat_id, message)
-    await GlobalRecorder.record_system_op(
-        message,
-        {
-            'agent_iteration': current_iteration,
-            'agent_max_iterations': max_iterations,
-            'background_trigger': True,
-            'ai_call_skipped': current_iteration > max_iterations,
-        },
-        chat_id,
-    )
 
 
 async def _send_agent_iteration_limit_notice(context: ContextTypes.DEFAULT_TYPE,
@@ -13915,16 +13902,8 @@ async def _send_agent_iteration_limit_notice(context: ContextTypes.DEFAULT_TYPE,
         f"⚠️ Agent 当前为第 {current_iteration} 轮，已超过最大 {max_iterations} 轮。\n"
         "本次系统结果已经保留，但不会继续调用 AI。只有新的用户消息才会重置轮数。"
     )
+    # 只发 Telegram 界面，不写入 AI 历史（与 🛠️ 轮数进度提示同原则：协议执行 scaffolding 不进上下文）
     await safe_send_message(context, chat_id, message)
-    await GlobalRecorder.record_system_op(
-        message,
-        {
-            'agent_iteration': current_iteration,
-            'agent_max_iterations': max_iterations,
-            'ai_call_skipped': True,
-        },
-        chat_id,
-    )
 
 
 async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
