@@ -7,7 +7,7 @@ send messages, persist history, or build model continuation context.
 from __future__ import annotations
 
 import html
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 from bot_app.shell_output import format_shell_display_output
 
@@ -45,6 +45,20 @@ def build_run_presentation(result: Mapping[str, Any]) -> str:
         f"完整输出: <code>{escape_html(result.get('output_path'))}</code>\n"
         f"<pre>{escape_html(display_output)}</pre>"
     )
+
+
+
+def build_standard_operation_presentation(
+    result: Mapping[str, Any],
+) -> Optional[str]:
+    """Select the existing presentation for a normalized standard result."""
+    builders = {
+        "edit": build_edit_presentation,
+        "grep": build_grep_presentation,
+        "run": build_run_presentation,
+    }
+    builder = builders.get(str(result.get("kind") or ""))
+    return builder(result) if builder is not None else None
 
 
 def build_shell_presentation(
