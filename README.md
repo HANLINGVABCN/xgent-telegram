@@ -33,6 +33,13 @@ telegram-ai-bot/
 ├─ bot_server.py
 ├─ install.sh
 ├─ requirements.txt
+├─ docs/
+│  └─ architecture.md
+├─ bot_app/
+│  ├─ bootstrap.py
+│  └─ sections/
+├─ tests/
+├─ tools/
 ├─ prompts/
 │  ├─ main.txt
 │  ├─ global_addon.txt
@@ -252,6 +259,19 @@ python3 bot_server.py
 
 ```bash
 python -m py_compile bot_server.py
+```
+
+## 开发与架构
+
+当前入口由 `bot_app/bootstrap.py` 负责引导。它会校验清单并按顺序加载
+`bot_app/sections/` 中的兼容模块。重构阶段、模块职责和后续迁移计划见
+[`docs/architecture.md`](docs/architecture.md)。
+
+完整性检查和测试：
+
+```bash
+python tools/check_split_integrity.py
+python -m unittest discover -s tests -v
 ```
 
 ## License
