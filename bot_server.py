@@ -2859,10 +2859,10 @@ class AgentExecutor:
     def extract_protocol_blocks(cls, ai_response: str) -> List[Dict[str, Any]]:
         """按出现顺序提取 Agent 协议块，支持同一回复里出现多个协议。
 
-        支持的 file 写入形式：
-          - 普通 file:/path + 三反引号（向后兼容）
-          - heredoc: file:/path <<MARKER ... MARKER（内容可含 ```，推荐）
-          - file:base64:/path + base64 body（二进制安全）
+        支持的 file-x 写入形式：
+          - 普通 file-x:/path + 三反引号
+          - heredoc: file-x:/path <<MARKER ... MARKER（内容可含 ```，推荐）
+          - file-x:base64:/path + base64 body（二进制安全）
         """
         blocks: List[Dict[str, Any]] = []
         lines = ai_response.split('\n')
@@ -2870,8 +2870,8 @@ class AgentExecutor:
         n = len(lines)
 
         std_tag_re = re.compile(
-            r'^```(?P<tag>run|shell|stdin:[^\n]+|shellread:[^\n]+|shellkill:[^\n]+|trigger(?::[^\n]+)?|'
-            r'sendfile|read:[^\n]+|read|edit|grep|media|file(?::[^\n]*)?)\s*$'
+            r'^```(?P<tag>run-x|shell-x|stdin-x:[^\n]+|shellread-x:[^\n]+|shellkill-x:[^\n]+|trigger-x(?::[^\n]+)?|'
+            r'sendfile-x|read-x:[^\n]+|read-x|edit-x|grep-x|media-x|file-x(?::[^\n]*)?)\s*$'
         )
 
         while i < n:
@@ -2880,7 +2880,9 @@ class AgentExecutor:
                 i += 1
                 continue
 
-            tag = m.group('tag').strip()
+            external_tag = m.group('tag').strip()
+            # 外部协议统一使用 -x 命名空间；内部仍沿用原类型名，避免影响执行分支。
+            tag = re.sub(r'-x(?=:|$)', '', external_tag, count=1)
             block_start = i
 
             # file:base64:/path  —— 二进制安全写入
@@ -3705,7 +3707,7 @@ class AgentExecutor:
     
     @classmethod
     def extract_file_block(cls, ai_response: str) -> Optional[Tuple[str, str]]:
-        """从 AI 回复中提取 ```file:filename 文件块（创建新文件）"""
+        """从 AI 回复中提取 ```file-x:filename 文件块（创建新文件）"""
         for block in cls.extract_protocol_blocks(ai_response):
             if block['type'] == 'file':
                 return block['path'], block['body']
@@ -3713,7 +3715,7 @@ class AgentExecutor:
 
     @classmethod
     def extract_sendfile(cls, ai_response: str) -> Optional[str]:
-        """从 AI 回复中提取 ```sendfile 块（发送已有服务器文件）"""
+        """从 AI 回复中提取 ```sendfile-x 块（发送已有服务器文件）"""
         for block in cls.extract_protocol_blocks(ai_response):
             if block['type'] == 'sendfile':
                 return block['body']
@@ -3721,7 +3723,7 @@ class AgentExecutor:
 
     @classmethod
     def extract_media_prompt(cls, ai_response: str) -> Optional[str]:
-        """从 AI 回复中提取 ```media 媒体生成提示词块"""
+        """从 AI 回复中提取 ```media-x 媒体生成提示词块"""
         for block in cls.extract_protocol_blocks(ai_response):
             if block['type'] == 'media':
                 prompt = block['body'].strip()
@@ -5175,9 +5177,9 @@ class SelfTriggerManager:
                 return f"[trigger:kill 结果] 已取消全部触发任务，共 {count} 个。"
             return await cls.cancel(task_id)
         if normalized_target == 'kill':
-            raise ValueError("请使用 trigger:kill:<任务ID> 或 trigger:kill:all")
+            raise ValueError("请使用 trigger-x:kill:<任务ID> 或 trigger-x:kill:all")
         if normalized_target:
-            raise ValueError('创建任务请使用裸 ```trigger 协议块')
+            raise ValueError('创建任务请使用裸 ```trigger-x 协议块')
         return await cls.register(
             body, bot, chat_id, conversation_id,
             origin_user_text, origin_assistant_text,
@@ -14506,8 +14508,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         'content': (
                             grep_notice + "\n"
                             "说明: 这是 grep 的真实命中结果（已带 文件:行号:内容 + 上下文）。"
-                            "定位代码请优先用 grep 拿行号，再用 read:路径:区间 看上下文，"
-                            "最后用 edit 精确替换。"
+                            "定位代码请优先用 grep-x 拿行号，再用 read-x:路径:区间 看上下文，"
+                            "最后用 edit-x 精确替换。"
                         )
                     })
                     should_continue = True
