@@ -7,6 +7,18 @@ validation, and section loading live in `bot_app/bootstrap.py`. It loads
 ordered domain sections from `bot_app/sections/` into one shared
 application namespace.
 
+The compatibility loader is now surrounded by importable, dependency-light
+components. The first extracted components are:
+
+| Module | Responsibility |
+| --- | --- |
+| `bot_app/protocols.py` | Parse and strip Agent protocol blocks only; no command execution or messaging |
+| `bot_app/text_utils.py` | Generic text clipping and normalization helpers |
+| `bot_app/shell_output.py` | Format shell display output, model context, and command-result notices |
+
+Legacy names remain available through thin imports/wrappers in the sections so
+existing handlers keep working while the internal boundaries become explicit.
+
 This compatibility layer keeps the existing Telegram handlers and runtime
 contracts unchanged while separating the original large source file into
 reviewable units:
@@ -59,9 +71,11 @@ validation, rendering, triggers, provider adapters, and Telegram handlers.
 
 ## Intended next phases
 
-1. Move configuration and pure utility functions into importable modules.
-2. Introduce explicit service objects for database, model, and Agent state.
-3. Move handlers into modules that receive dependencies instead of reading
+1. Continue moving configuration and pure utility functions into importable modules.
+2. Split Agent execution into protocol parsing, command dispatch, result
+   normalization, context construction, and presentation layers.
+3. Introduce explicit service objects for database, model, and Agent state.
+4. Move handlers into modules that receive dependencies instead of reading
    mutable globals.
-4. Replace the ordered compatibility loader once no section relies on a shared
-   global namespace.
+5. Replace the ordered compatibility loader once no section relies on a
+   shared global namespace.

@@ -1,6 +1,8 @@
 # This file is executed by bot_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
+import inspect
+
 class BotMemoryDB:
     """Bot的永久记忆系统 - 异步SQLite + 连接池"""
     
@@ -10,6 +12,7 @@ class BotMemoryDB:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._connection: Optional[aiosqlite.Connection] = None
+        self._connection_lock = asyncio.Lock()
         self._initialized = False
         # 内存缓存
         self._config_cache: Dict[str, Any] = {}
@@ -27,31 +30,33 @@ class BotMemoryDB:
             return cls._instance
     
     async def _get_conn(self) -> aiosqlite.Connection:
-        # 检查现有连接是否有效
-        if self._connection is not None:
-            try:
-                await self._connection.execute('SELECT 1')
-            except Exception:
-                logger.warning("数据库连接已断开，正在重新连接...")
-                try:
-                    await self._connection.close()
-                except Exception:
-                    pass
-                self._connection = None
-        
-        if self._connection is None:
-            self._connection = await aiosqlite.connect(
-                self.db_path, 
+        # 热路径直接复用连接，避免每次真实 SQL 前额外执行 SELECT 1。
+        connection = self._connection
+        if connection is not None:
+            return connection
+
+        async with self._connection_lock:
+            connection = self._connection
+            if connection is not None:
+                return connection
+
+            connection = await aiosqlite.connect(
+                self.db_path,
                 isolation_level=None  # 自动提交
             )
-            self._connection.row_factory = aiosqlite.Row
-            # 启用 WAL 模式提升并发性能
-            await self._connection.execute("PRAGMA journal_mode=WAL")
-            await self._connection.execute("PRAGMA synchronous=NORMAL")
-            await self._connection.execute("PRAGMA cache_size=10000")
-        connection = self._connection
-        assert connection is not None
-        return connection
+            try:
+                connection.row_factory = aiosqlite.Row
+                # WAL 提升读写并发；busy_timeout 避免短暂写锁直接报错。
+                await connection.execute("PRAGMA journal_mode=WAL")
+                await connection.execute("PRAGMA synchronous=NORMAL")
+                await connection.execute("PRAGMA cache_size=10000")
+                await connection.execute("PRAGMA busy_timeout=5000")
+            except Exception:
+                await connection.close()
+                raise
+
+            self._connection = connection
+            return connection
     
     async def _init_db(self):
         """初始化数据库表结构"""
@@ -848,9 +853,11 @@ class BotMemoryDB:
 
     async def close(self):
         """关闭连接"""
-        if self._connection:
-            await self._connection.close()
+        async with self._connection_lock:
+            connection = self._connection
             self._connection = None
+            if connection is not None:
+                await connection.close()
 
 # --- ☆ 用户数据管理（内存缓存 + 数据库同步）☆ ---
 class UserDataManager:
@@ -945,14 +952,16 @@ class UserDataManager:
 # --- ☆ API Key 轮询（多 Key 支持）☆ ---
 # 每个 provider 维护一个轮询计数器，按逗号分隔的多个 key 依次轮询调用。
 _api_key_counters: Dict[str, int] = {}
+_API_KEY_WHITESPACE_RE = re.compile(r'\s+')
 
 def parse_api_keys(api_key_field: str) -> List[str]:
     """解析逗号分隔的 API Key，并移除复制粘贴时混入的空白字符。"""
-    return [
-        re.sub(r'\s+', '', key)
-        for key in str(api_key_field or '').split(',')
-        if re.sub(r'\s+', '', key)
-    ]
+    keys: List[str] = []
+    for raw_key in str(api_key_field or '').split(','):
+        key = _API_KEY_WHITESPACE_RE.sub('', raw_key)
+        if key:
+            keys.append(key)
+    return keys
 
 
 def get_next_api_key(prov_name: str, api_key_field: str) -> str:
@@ -974,6 +983,20 @@ def get_next_api_key(prov_name: str, api_key_field: str) -> str:
 class PortalManager:
     _portals = {}
 
+    @staticmethod
+    def _schedule_close(client: Any) -> None:
+        """在当前事件循环后台关闭被替换或移除的客户端。"""
+        close_method = getattr(client, 'close', None)
+        if not callable(close_method):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            close_result = close_method()
+            if inspect.isawaitable(close_result):
+                loop.create_task(close_result)
+        except Exception:
+            logger.debug("调度关闭 OpenAI 客户端失败", exc_info=True)
+
     @classmethod
     def get_portal(cls, provider_name: str, api_key: str, base_url: str) -> AsyncOpenAI:
         read_timeout = normalize_stream_timeout(UserDataManager.get('stream_timeout', 0))
@@ -986,6 +1009,8 @@ class PortalManager:
             cached = cls._portals[cache_key]
             if cached['hash'] == config_hash:
                 return cached['client']
+            cls._portals.pop(cache_key, None)
+            cls._schedule_close(cached.get('client'))
 
         import httpx
         client_timeout = httpx.Timeout(connect=20.0, read=read_timeout_value, write=60.0, pool=60.0)
@@ -993,6 +1018,11 @@ class PortalManager:
             timeout=client_timeout,
             headers=PROVIDER_HTTP_HEADERS,
             follow_redirects=True,
+            limits=httpx.Limits(
+                max_connections=16,
+                max_keepalive_connections=8,
+                keepalive_expiry=30.0,
+            ),
         )
         new_client = AsyncOpenAI(
             api_key=api_key,
@@ -1014,12 +1044,31 @@ class PortalManager:
             entry = cls._portals.pop(key, None)
             if entry:
                 client = entry.get('client')
-                if client and hasattr(client, '_client') and hasattr(client._client, 'aclose'):
-                    try:
-                        asyncio.get_event_loop().create_task(client._client.aclose())
-                    except RuntimeError:
-                        pass
+                if client:
+                    cls._schedule_close(client)
         _api_key_counters.pop(provider_name, None)
+
+    @classmethod
+    async def close_all(cls) -> None:
+        """关闭所有缓存的 OpenAI SDK 客户端，供应用生命周期统一调用。"""
+        entries = list(cls._portals.values())
+        cls._portals.clear()
+        _api_key_counters.clear()
+        close_tasks = []
+        for entry in entries:
+            client = entry.get('client')
+            if client is None:
+                continue
+            close_method = getattr(client, 'close', None)
+            if callable(close_method):
+                try:
+                    close_result = close_method()
+                    if inspect.isawaitable(close_result):
+                        close_tasks.append(close_result)
+                except Exception:
+                    logger.debug("关闭 OpenAI 客户端失败", exc_info=True)
+        if close_tasks:
+            await asyncio.gather(*close_tasks, return_exceptions=True)
 
 def build_read_file_context_text(notice: str, mime_type: str, filename: str) -> str:
     return (
