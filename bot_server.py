@@ -621,6 +621,7 @@ class BotState:
     EDIT_PROV_URL = 'edit_prov_url'
     ADD_MODEL_MANUAL = 'add_model_manual'
     SEARCH_FETCHED = 'search_fetched_models'
+    SEARCH_SAVED = 'search_saved_models'
     RENAME_CHAT = 'rename_chat'
     SET_PROMPT = 'set_prompt'
     SET_GLOBAL_PROMPT = 'set_global_prompt'
@@ -1887,6 +1888,7 @@ class UserDataManager:
             'temp_list_type': None,
             'temp_page': 1,
             'temp_filter': None,
+            'temp_saved_filter': None,
             'fetched_cache': [],
             'editing_provider': None,
             'temp_prov_name': None,
@@ -9119,26 +9121,80 @@ def make_fetched_saved_marker_fn(prov_name: str):
     return marker_fn
 
 
-def build_saved_models_keyboard(provider_name: str, target: Optional[str] = None, page: int = 1):
+def build_fetched_models_view(provider_name: str):
+    """根据缓存状态构建联网模型列表，并让搜索结果返回完整列表。"""
+    models = UserDataManager.get('fetched_cache', [])
+    page = UserDataManager.get('temp_page', 1) or 1
+    filter_text = UserDataManager.get('temp_filter')
+    exit_callback = UserDataManager.get('temp_back_callback') or f"mng_saved_{provider_name}"
+    list_back_callback = "back_fetched_all_models" if filter_text else exit_callback
+    kb = build_magic_keyboard(
+        models,
+        page,
+        "pick_fetch_",
+        list_back_callback,
+        "act_search_fetched",
+        filter_text,
+        marker_fn=make_fetched_saved_marker_fn(provider_name)
+    )
+    visible_count = sum(
+        1 for model in models
+        if not filter_text or filter_text.lower() in model.lower()
+    )
+    if filter_text:
+        title = f"🔍 搜索 '{safe_text(filter_text)}'：找到 {visible_count} 个模型:"
+    else:
+        title = f"🌐 找到了 {len(models)} 个模型:"
+    return title, kb
+
+
+def build_saved_models_view(provider_name: str):
+    """根据当前状态构建已保存模型列表；搜索结果返回完整的已保存列表。"""
     providers = UserDataManager.get('providers', {})
     models = providers.get(provider_name, {}).get('models', [])
-    UserDataManager.set('temp_viewing_prov', provider_name)
-    UserDataManager.set('temp_list_type', 'saved')
-    UserDataManager.set('temp_page', page)
-    UserDataManager.set('temp_model_target', target)
-    UserDataManager.set('temp_model_menu_mode', 'manage')
-    UserDataManager.set('temp_back_callback', f"view_prov_{provider_name}")
-    return build_magic_keyboard(
+    page = UserDataManager.get('temp_page', 1) or 1
+    filter_text = UserDataManager.get('temp_saved_filter')
+    list_back_callback = "back_saved_all_models" if filter_text else f"view_prov_{provider_name}"
+    kb = build_magic_keyboard(
         models,
         page,
         f"act_saved_{provider_name}_",
-        f"view_prov_{provider_name}",
+        list_back_callback,
+        "act_search_saved",
+        filter_text,
         extra_buttons=[
             InlineKeyboardButton("➕ 手写", callback_data=f"act_manual_mod_{provider_name}"),
             InlineKeyboardButton("⚡ 联网获取", callback_data=f"fetch_market_{provider_name}"),
         ],
         marker_fn=make_manage_marker_fn(provider_name)
     )
+    visible_count = sum(
+        1 for model in models
+        if not filter_text or filter_text.lower() in model.lower()
+    )
+    if filter_text:
+        title = (
+            f"🔍 <b>{safe_text(provider_name)}</b> 已保存的模型\n\n"
+            f"搜索 '{safe_text(filter_text)}'：找到 {visible_count} 个模型:"
+        )
+    else:
+        title = (
+            f"🧰 <b>{safe_text(provider_name)}</b> 已保存的模型\n\n"
+            "这里可以继续新增、联网获取、搜索，或点击模型进行设置。"
+        )
+    return title, kb
+
+
+def build_saved_models_keyboard(provider_name: str, target: Optional[str] = None, page: int = 1):
+    UserDataManager.set('temp_viewing_prov', provider_name)
+    UserDataManager.set('temp_list_type', 'saved')
+    UserDataManager.set('temp_page', page)
+    UserDataManager.set('temp_saved_filter', None)
+    UserDataManager.set('temp_model_target', target)
+    UserDataManager.set('temp_model_menu_mode', 'manage')
+    UserDataManager.set('temp_back_callback', f"view_prov_{provider_name}")
+    _, kb = build_saved_models_view(provider_name)
+    return kb
 
 
 def build_model_detail_menu(prov_name: str, model_name: str, back_callback: Optional[str] = None):
@@ -12172,7 +12228,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             kb = build_saved_models_keyboard(name)
             await query.message.edit_text(
                 f"🧰 <b>{safe_text(name)}</b> 的模型管理\n\n"
-                "这里可以手写新增、联网获取，或点击模型进行设置。",
+                "这里可以手写新增、联网获取、搜索，或点击模型进行设置。",
                 reply_markup=kb,
                 parse_mode=constants.ParseMode.HTML
             )
@@ -12357,7 +12413,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             kb = build_saved_models_keyboard(name)
             await query.message.edit_text(
                 f"🧰 <b>{safe_text(name)}</b> 已保存的模型\n\n"
-                "这里可以继续新增、联网获取，或点击模型进行设置。",
+                "这里可以继续新增、联网获取、搜索，或点击模型进行设置。",
                 reply_markup=kb,
                 parse_mode=constants.ParseMode.HTML
             )
@@ -12383,7 +12439,16 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             else:
                 model_name = content
 
-            detail_text, detail_kb = build_model_detail_menu(prov_name, model_name)
+            detail_back_callback = (
+                "back_saved_models"
+                if UserDataManager.get('temp_saved_filter')
+                else f"mng_saved_{prov_name}"
+            )
+            detail_text, detail_kb = build_model_detail_menu(
+                prov_name,
+                model_name,
+                back_callback=detail_back_callback
+            )
             await query.message.edit_text(
                 detail_text,
                 reply_markup=detail_kb,
@@ -12435,7 +12500,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.message.edit_text(
                 f"✅ <b>{safe_text(model_name)}</b> 已设为{target_label}！\n\n"
                 f"🧰 <b>{safe_text(prov_name)}</b> 已保存的模型\n\n"
-                "这里可以继续新增、联网获取，或点击模型进行设置。",
+                "这里可以继续新增、联网获取、搜索，或点击模型进行设置。",
                 reply_markup=kb,
                 parse_mode=constants.ParseMode.HTML
             )
@@ -12481,7 +12546,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.message.edit_text(
                 f"🗑️ <b>{safe_text(mname)}</b> 已从模型列表中删除！\n\n"
                 f"🧰 <b>{safe_text(pname)}</b> 已保存的模型\n\n"
-                "这里可以继续新增、联网获取，或点击模型进行设置。",
+                "这里可以继续新增、联网获取、搜索，或点击模型进行设置。",
                 reply_markup=kb,
                 parse_mode=constants.ParseMode.HTML
             )
@@ -12514,14 +12579,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             UserDataManager.set('temp_list_type', 'fetched')
             back_callback = f"mng_saved_{name}" if menu_mode == 'manage' else f"target_{target}_models"
             UserDataManager.set('temp_back_callback', back_callback)
-            kb = build_magic_keyboard(
-                models, 1, "pick_fetch_", back_callback, "act_search_fetched",
-                marker_fn=make_fetched_saved_marker_fn(name)
-            )
-            await query.message.reply_text(
-                f"🌐 找到了 {len(models)} 个模型:",
-                reply_markup=kb
-            )
+            title, kb = build_fetched_models_view(name)
+            await query.message.reply_text(title, reply_markup=kb)
         
         elif data.startswith("pick_fetch_"):
             mname = data[len("pick_fetch_"):]
@@ -12569,6 +12628,44 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                         parse_mode=constants.ParseMode.HTML
                     )
         
+        elif data == "back_saved_models":
+            pname = UserDataManager.get('temp_viewing_prov')
+            providers = UserDataManager.get('providers', {})
+            if not pname or pname not in providers:
+                await query.message.edit_text(
+                    "⚠️ 已保存模型列表已失效，请重新选择提供商。",
+                    reply_markup=get_providers_menu()
+                )
+                return
+            UserDataManager.set('temp_list_type', 'saved')
+            UserDataManager.set('temp_model_menu_mode', 'manage')
+            title, kb = build_saved_models_view(pname)
+            await query.message.edit_text(
+                title,
+                reply_markup=kb,
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "back_saved_all_models":
+            pname = UserDataManager.get('temp_viewing_prov')
+            providers = UserDataManager.get('providers', {})
+            if not pname or pname not in providers:
+                await query.message.edit_text(
+                    "⚠️ 已保存模型列表已失效，请重新选择提供商。",
+                    reply_markup=get_providers_menu()
+                )
+                return
+            UserDataManager.set('temp_saved_filter', None)
+            UserDataManager.set('temp_page', 1)
+            UserDataManager.set('temp_list_type', 'saved')
+            UserDataManager.set('temp_model_menu_mode', 'manage')
+            title, kb = build_saved_models_view(pname)
+            await query.message.edit_text(
+                title,
+                reply_markup=kb,
+                parse_mode=constants.ParseMode.HTML
+            )
+
         elif data == "back_fetched_models":
             pname = UserDataManager.get('temp_viewing_prov')
             models = UserDataManager.get('fetched_cache', [])
@@ -12589,30 +12686,48 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
                 return
 
-            page = UserDataManager.get('temp_page', 1) or 1
-            filter_text = UserDataManager.get('temp_filter')
-            back_callback = UserDataManager.get('temp_back_callback') or f"mng_saved_{pname}"
             UserDataManager.set('temp_list_type', 'fetched')
-            kb = build_magic_keyboard(
-                models,
-                page,
-                "pick_fetch_",
-                back_callback,
-                "act_search_fetched",
-                filter_text,
-                marker_fn=make_fetched_saved_marker_fn(pname)
-            )
-            visible_count = sum(
-                1 for model in models
-                if not filter_text or filter_text.lower() in model.lower()
-            )
-            title = f"🌐 找到了 {len(models)} 个模型:"
-            if filter_text:
-                title = f"🔍 搜索 '{safe_text(filter_text)}'：找到 {visible_count} 个模型:"
+            title, kb = build_fetched_models_view(pname)
             await query.message.edit_text(
                 title,
                 reply_markup=kb,
                 parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "back_fetched_all_models":
+            pname = UserDataManager.get('temp_viewing_prov')
+            models = UserDataManager.get('fetched_cache', [])
+            if not pname or not models:
+                if pname:
+                    kb = build_saved_models_keyboard(pname)
+                    fallback_text = (
+                        f"🧰 <b>{safe_text(pname)}</b> 已保存的模型\n\n"
+                        "⚠️ 获取结果已失效，请点击【⚡ 联网获取】重新拉取。"
+                    )
+                else:
+                    kb = get_providers_menu()
+                    fallback_text = "⚠️ 获取结果已失效，请重新选择提供商并联网获取。"
+                await query.message.edit_text(
+                    fallback_text,
+                    reply_markup=kb,
+                    parse_mode=constants.ParseMode.HTML
+                )
+                return
+
+            UserDataManager.set('temp_filter', None)
+            UserDataManager.set('temp_page', 1)
+            UserDataManager.set('temp_list_type', 'fetched')
+            title, kb = build_fetched_models_view(pname)
+            await query.message.edit_text(
+                title,
+                reply_markup=kb,
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "act_search_saved":
+            UserDataManager.set('state', BotState.SEARCH_SAVED)
+            await query.message.reply_text(
+                "🔍 请输入要搜索的已保存模型名称 (或 'cancel'):"
             )
 
         elif data == "act_search_fetched":
@@ -12632,31 +12747,17 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             if UserDataManager.get('temp_list_type') == 'saved':
                 items = providers.get(pname, {}).get('models', [])
                 menu_mode = UserDataManager.get('temp_model_menu_mode') or 'manage'
-                back_callback = f"view_prov_{pname}" if menu_mode == 'manage' else f"target_{UserDataManager.get('temp_model_target') or 'chat'}_models"
-                extra_buttons = None
-                marker = None
                 if menu_mode == 'manage':
-                    extra_buttons = [
-                        InlineKeyboardButton("➕ 手写", callback_data=f"act_manual_mod_{pname}"),
-                        InlineKeyboardButton("⚡ 联网获取", callback_data=f"fetch_market_{pname}")
-                    ]
-                    marker = make_manage_marker_fn(pname)
+                    _, kb = build_saved_models_view(pname)
                 else:
                     target = UserDataManager.get('temp_model_target') or 'chat'
-                    marker = make_select_marker_fn(target, pname)
-                kb = build_magic_keyboard(
-                    items, page, prefix, back_callback,
-                    extra_buttons=extra_buttons,
-                    marker_fn=marker
-                )
+                    back_callback = f"target_{target}_models"
+                    kb = build_magic_keyboard(
+                        items, page, prefix, back_callback,
+                        marker_fn=make_select_marker_fn(target, pname)
+                    )
             else:
-                items = UserDataManager.get('fetched_cache', [])
-                back_callback = UserDataManager.get('temp_back_callback') or f"view_prov_{pname}"
-                kb = build_magic_keyboard(
-                    items, page, prefix, back_callback,
-                    "act_search_fetched", UserDataManager.get('temp_filter'),
-                    marker_fn=make_fetched_saved_marker_fn(pname)
-                )
+                _, kb = build_fetched_models_view(pname)
             try:
                 await query.message.edit_reply_markup(kb)
             except Exception as e:
@@ -13215,6 +13316,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         BotState.EDIT_PROV_URL,
         BotState.ADD_MODEL_MANUAL,
         BotState.SEARCH_FETCHED,
+        BotState.SEARCH_SAVED,
         BotState.IMPORT_PROVIDER_CONFIG,
     }
     text = ""
@@ -13798,21 +13900,34 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         return
     
+    if state == BotState.SEARCH_SAVED:
+        UserDataManager.set('temp_saved_filter', text)
+        UserDataManager.set('temp_page', 1)
+        UserDataManager.set('state', BotState.IDLE)
+        pname = UserDataManager.get('temp_viewing_prov')
+        providers = UserDataManager.get('providers', {})
+        if not pname or pname not in providers:
+            await update.message.reply_text(
+                "⚠️ 已保存模型列表已失效，请重新选择提供商。",
+                reply_markup=get_providers_menu()
+            )
+            return
+        title, kb = build_saved_models_view(pname)
+        await update.message.reply_text(
+            title,
+            reply_markup=kb,
+            parse_mode=constants.ParseMode.HTML
+        )
+        return
+
     if state == BotState.SEARCH_FETCHED:
         UserDataManager.set('temp_filter', text)
         UserDataManager.set('temp_page', 1)
         UserDataManager.set('state', BotState.IDLE)
         pname = UserDataManager.get('temp_viewing_prov')
         models = UserDataManager.get('fetched_cache', [])
-        kb = build_magic_keyboard(
-            models, 1, "pick_fetch_", UserDataManager.get('temp_back_callback') or f"mng_saved_{pname}",
-            "act_search_fetched", text,
-            marker_fn=make_fetched_saved_marker_fn(pname)
-        )
-        await update.message.reply_text(
-            f"🔍 搜索 '{safe_text(text)}' 的结果:",
-            reply_markup=kb
-        )
+        title, kb = build_fetched_models_view(pname)
+        await update.message.reply_text(title, reply_markup=kb)
         return
     
     if state == BotState.RENAME_CHAT:
