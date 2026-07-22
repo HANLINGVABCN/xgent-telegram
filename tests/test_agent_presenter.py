@@ -7,6 +7,7 @@ from bot_app.agent_presenter import (
     build_grep_presentation,
     build_run_presentation,
     build_shell_presentation,
+    build_standard_operation_presentation,
 )
 
 
@@ -24,6 +25,20 @@ class AgentPresenterTests(unittest.TestCase):
         self.assertTrue(text.startswith("⚠️ <b>Agent Grep</b> 命中 4 处\n<pre>"))
         self.assertEqual(text.count("x"), 2000)
         self.assertTrue(text.endswith("</pre>"))
+
+    def test_standard_presentation_dispatches_visible_kinds_only(self):
+        result = {
+            "kind": "edit",
+            "success": True,
+            "notice": "done",
+        }
+        self.assertEqual(
+            build_standard_operation_presentation(result),
+            build_edit_presentation(result),
+        )
+        self.assertIsNone(
+            build_standard_operation_presentation({"kind": "read"})
+        )
 
     def test_shell_presentation_escapes_status_and_keeps_wait_note(self):
         self.assertEqual(

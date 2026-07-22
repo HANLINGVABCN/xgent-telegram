@@ -1,26 +1,29 @@
 # This file is executed by bot_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
+from bot_app.agent_coordinator import plan_agent_round_transition
 from bot_app.agent_context import (
     build_file_context_message,
     build_sendfile_context_message,
     build_shell_context_message,
     build_trigger_context_message,
 )
-from bot_app.agent_history import persist_agent_result
+from bot_app.agent_history import persist_agent_result, persist_media_result
 from bot_app.agent_dispatch import dispatch_standard_protocol
 from bot_app.agent_shell import execute_shell_protocol
 from bot_app.agent_trigger import execute_trigger_protocol
+from bot_app.agent_file_delivery import send_written_agent_file
 from bot_app.agent_files import (
     write_base64_protocol_file,
     write_text_protocol_file,
 )
 from bot_app.agent_loop_state import AgentRoundState
+from bot_app.agent_media import execute_media_generation
+from bot_app.agent_media_delivery import send_media_generation_result
+from bot_app.agent_sendfile import execute_sendfile_protocol
 from bot_app.agent_presenter import (
-    build_edit_presentation,
-    build_grep_presentation,
-    build_run_presentation,
     build_shell_presentation,
+    build_standard_operation_presentation,
 )
 
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1463,27 +1466,15 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     logger=logger,
                 )
                 if standard_operation is not None:
-                    operation_kind = standard_operation['kind']
                     operation_notice = standard_operation['notice']
-                    if operation_kind == 'edit':
+                    operation_presentation = build_standard_operation_presentation(
+                        standard_operation
+                    )
+                    if operation_presentation is not None:
                         await safe_send_message(
                             context,
                             update.effective_chat.id,
-                            build_edit_presentation(standard_operation),
-                            parse_mode=constants.ParseMode.HTML,
-                        )
-                    elif operation_kind == 'grep':
-                        await safe_send_message(
-                            context,
-                            update.effective_chat.id,
-                            build_grep_presentation(standard_operation),
-                            parse_mode=constants.ParseMode.HTML,
-                        )
-                    elif operation_kind == 'run':
-                        await safe_send_message(
-                            context,
-                            update.effective_chat.id,
-                            build_run_presentation(standard_operation),
+                            operation_presentation,
                             parse_mode=constants.ParseMode.HTML,
                         )
                     await persist_agent_result(
@@ -1500,139 +1491,20 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     continue
 
                 if block_type == 'sendfile':
-                    sendfile_path = block['body']
-                    sendfile_notice = ""
-                    try:
-                        resolved_sendfile_path = AgentExecutor.resolve_file_path(sendfile_path)
-                        if not os.path.exists(resolved_sendfile_path):
-                            sendfile_notice = f"[sendfile结果] 发送失败: 文件不存在: {resolved_sendfile_path}"
-                            await safe_send_message(
-                                context,
-                                update.effective_chat.id,
-                                f"❌ 文件不存在: {safe_text(resolved_sendfile_path)}"
-                            )
-                        else:
-                            fsize = os.path.getsize(resolved_sendfile_path)
-                            fname = os.path.basename(resolved_sendfile_path)
-
-                            if fsize > AgentExecutor.MAX_FILE_SIZE and BotConfig.API_BASE_URL:
-                                # 大文件 + 本地 API：用硬链接(瞬间/零空间)把文件暴露到挂载目录，
-                                # 跨分区(EXDEV)等失败时降级为物理复制
-                                import shutil
-                                import uuid as _sf_uuid
-                                # 临时文件名加唯一后缀，避免并发/重名冲突
-                                _sf_unique_name = f"{fname}.sendfile_{_sf_uuid.uuid4().hex[:8]}"
-                                temp_host_path = os.path.join(_LOCAL_API_HOST_DATA_DIR, _sf_unique_name)
-                                try:
-                                    os.makedirs(_LOCAL_API_HOST_DATA_DIR, exist_ok=True)
-                                    try:
-                                        # 优先硬链接：零拷贝零空间，瞬间完成
-                                        if os.path.exists(temp_host_path):
-                                            os.remove(temp_host_path)
-                                        os.link(resolved_sendfile_path, temp_host_path)
-                                    except OSError as _sf_link_err:
-                                        # 跨分区(EXDEV)或权限不足等 → 降级物理复制
-                                        logger.info(f"sendfile 硬链接失败({type(_sf_link_err).__name__})，降级复制: {temp_host_path}")
-                                        shutil.copy2(resolved_sendfile_path, temp_host_path)
-                                    # 容器内对应路径（卷映射：宿主机 .local-api-data ↔ 容器 /var/lib/telegram-bot-api）
-                                    container_file_path = (
-                                        f"file://{_LOCAL_API_CONTAINER_DATA_DIR}/{_sf_unique_name}"
-                                    )
-                                    # 大文件上行耗时长：先发“正在上传”状态，避免客户端误以为卡死
-                                    # chat_action 每 ~5s 失效，开一个后台 task 周期重发直到发送完成
-                                    _sf_chat_id = update.effective_chat.id
-                                    _sf_keep_alive = {'on': True}
-
-                                    async def _sf_upload_indicator():
-                                        while _sf_keep_alive['on']:
-                                            try:
-                                                await context.bot.send_chat_action(
-                                                    chat_id=_sf_chat_id, action="upload_document"
-                                                )
-                                            except Exception:
-                                                pass
-                                            await asyncio.sleep(4)
-
-                                    _sf_indicator_task = asyncio.create_task(_sf_upload_indicator())
-                                    try:
-                                        # 大文件本地 API 直发：本地 API 容器要把它推到 Telegram 官方服务器，
-                                        # 耗时取决于上行带宽。默认 HTTP 读取超时(10~20s)会提前抛 Timed out，
-                                        # 即使后台仍在继续上传。这里显式给足 read/write timeout。
-                                        # 按文件大小动态估算：每 50MB 给 60s，最少 120s，最多 1800s(30min)
-                                        _sf_read_to = max(120, min(1800, int(fsize / (50 * 1024 * 1024) * 60)))
-                                        await context.bot.send_document(
-                                            chat_id=update.effective_chat.id,
-                                            document=container_file_path,
-                                            filename=fname,
-                                            caption=f"📄 {fname} ({fsize} bytes) [本地API直发]",
-                                            read_timeout=_sf_read_to,
-                                            write_timeout=_sf_read_to,
-                                            connect_timeout=30,
-                                            pool_timeout=30,
-                                        )
-                                        sendfile_notice = (
-                                            f"[sendfile结果] 已发送服务器文件给用户: "
-                                            f"{resolved_sendfile_path} ({fsize} bytes) [本地API直发]"
-                                        )
-                                    finally:
-                                        _sf_keep_alive['on'] = False
-                                        _sf_indicator_task.cancel()
-                                        with contextlib.suppress(asyncio.CancelledError, Exception):
-                                            await _sf_indicator_task
-                                finally:
-                                    # 发送完成（或失败）后清理挂载目录下的临时文件
-                                    try:
-                                        if os.path.exists(temp_host_path):
-                                            os.remove(temp_host_path)
-                                    except OSError as _sf_clean_err:
-                                        logger.warning(f"清理 sendfile 临时文件失败: {temp_host_path} ({_sf_clean_err})")
-
-                            elif fsize > AgentExecutor.MAX_FILE_SIZE:
-                                # 大文件 + 官方 API：无能为力，报错并提示配置本地 API
-                                sendfile_notice = (
-                                    f"[sendfile结果] 发送失败: 文件超过50MB限制({fsize} bytes)，"
-                                    f"且未启用本地 API，无法发送。"
-                                )
-                                await safe_send_message(
-                                    context,
-                                    update.effective_chat.id,
-                                    (
-                                        f"❌ 文件超过50MB限制({fsize} bytes)，官方 API 无法发送。\n"
-                                        f"如需发送大文件，请通过 install.sh 菜单选项 8 启用本地 API 容器。\n"
-                                        f"路径: {safe_text(resolved_sendfile_path)}"
-                                    )
-                                )
-
-                            else:
-                                # 小文件：走原生内存发送
-                                try:
-                                    await context.bot.send_chat_action(
-                                        chat_id=update.effective_chat.id, action="upload_document"
-                                    )
-                                except Exception:
-                                    pass
-                                with open(resolved_sendfile_path, 'rb') as sendfile:
-                                    await context.bot.send_document(
-                                        chat_id=update.effective_chat.id,
-                                        document=sendfile,
-                                        filename=fname,
-                                        caption=f"📄 {fname} ({fsize} bytes)",
-                                        read_timeout=120,
-                                        write_timeout=120,
-                                    )
-                                sendfile_notice = (
-                                    f"[sendfile结果] 已发送服务器文件给用户: "
-                                    f"{resolved_sendfile_path} ({fsize} bytes)"
-                                )
-                    except Exception as e:
-                        logger.error(f"Agent发送服务器文件失败: {e}")
-                        sendfile_notice = f"[sendfile结果] 发送失败: {sendfile_path}。错误: {str(e)[:200]}"
-                        await safe_send_message(
-                            context,
-                            update.effective_chat.id,
-                            f"❌ 发送文件失败: {safe_text(str(e)[:200])}"
-                        )
-
+                    sendfile_notice = await execute_sendfile_protocol(
+                        block['body'],
+                        executor=AgentExecutor,
+                        context=context,
+                        chat_id=update.effective_chat.id,
+                        api_base_url=BotConfig.API_BASE_URL,
+                        local_api_host_data_dir=_LOCAL_API_HOST_DATA_DIR,
+                        local_api_container_data_dir=_LOCAL_API_CONTAINER_DATA_DIR,
+                        max_file_size=AgentExecutor.MAX_FILE_SIZE,
+                        safe_send_message=safe_send_message,
+                        safe_text=safe_text,
+                        logger=logger,
+                        cancel_task_quietly=cancel_task_quietly,
+                    )
                     if sendfile_notice:
                         await persist_agent_result(
                             recorder=GlobalRecorder,
@@ -1649,39 +1521,21 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     continue
 
                 if block_type == 'file':
-                    filename, file_content = block['path'], block['body']
+                    filename = block['path']
                     file_notice = ""
                     try:
                         written_file = await write_text_protocol_file(
                             block, executor=AgentExecutor
                         )
-                        saved_path = written_file['path']
-                        safe_filename = written_file['filename']
-                        saved_size = written_file['size']
-
-                        if saved_size <= AgentExecutor.MAX_FILE_SIZE:
-                            with open(saved_path, 'rb') as saved_file:
-                                await context.bot.send_document(
-                                    chat_id=update.effective_chat.id,
-                                    document=saved_file,
-                                    filename=safe_filename,
-                                    caption=f"📄 已写入服务器并发送: {safe_filename}"
-                                )
-                        else:
-                            await safe_send_message(
-                                context,
-                                update.effective_chat.id,
-                                (
-                                    f"✅ 文件已写入服务器，但超过发送大小限制。\n"
-                                    f"路径: <code>{safe_text(saved_path)}</code>\n"
-                                    f"大小: {saved_size} bytes"
-                                ),
-                                parse_mode=constants.ParseMode.HTML
-                            )
-
-                        file_notice = (
-                            f"[file结果] 已写入服务器文件: {saved_path} "
-                            f"({saved_size} bytes, {'覆盖' if written_file['existed'] else '新建'})"
+                        file_notice = await send_written_agent_file(
+                            written_file,
+                            protocol="file",
+                            context=context,
+                            chat_id=update.effective_chat.id,
+                            max_file_size=AgentExecutor.MAX_FILE_SIZE,
+                            safe_send_message=safe_send_message,
+                            safe_text=safe_text,
+                            html_parse_mode=constants.ParseMode.HTML,
                         )
                     except Exception as e:
                         logger.error(f"Agent写入文件失败: {e}")
@@ -1708,40 +1562,21 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     continue
 
                 if block_type == 'file_base64':
-                    filename, b64_content = block['path'], block['body']
+                    filename = block['path']
                     file_notice = ""
                     try:
                         written_file = await write_base64_protocol_file(
                             block, executor=AgentExecutor
                         )
-                        b64_target_path = written_file['path']
-                        b64_existed = written_file['existed']
-                        b64_saved_size = written_file['size']
-                        b64_safe_filename = written_file['filename']
-
-                        if b64_saved_size <= AgentExecutor.MAX_FILE_SIZE:
-                            with open(b64_target_path, 'rb') as b64_saved_file:
-                                await context.bot.send_document(
-                                    chat_id=update.effective_chat.id,
-                                    document=b64_saved_file,
-                                    filename=b64_safe_filename,
-                                    caption=f"📄 已写入服务器并发送 (base64): {b64_safe_filename}"
-                                )
-                        else:
-                            await safe_send_message(
-                                context,
-                                update.effective_chat.id,
-                                (
-                                    f"✅ base64 文件已写入服务器，但超过发送大小限制。\n"
-                                    f"路径: <code>{safe_text(b64_target_path)}</code>\n"
-                                    f"大小: {b64_saved_size} bytes"
-                                ),
-                                parse_mode=constants.ParseMode.HTML
-                            )
-
-                        file_notice = (
-                            f"[file:base64结果] 已写入服务器文件: {b64_target_path} "
-                            f"({b64_saved_size} bytes, {'覆盖' if b64_existed else '新建'})"
+                        file_notice = await send_written_agent_file(
+                            written_file,
+                            protocol="file:base64",
+                            context=context,
+                            chat_id=update.effective_chat.id,
+                            max_file_size=AgentExecutor.MAX_FILE_SIZE,
+                            safe_send_message=safe_send_message,
+                            safe_text=safe_text,
+                            html_parse_mode=constants.ParseMode.HTML,
                         )
                     except Exception as e:
                         logger.error(f"Agent base64 写入文件失败: {e}")
@@ -1870,70 +1705,36 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         chat_id=update.effective_chat.id
                     )
 
-                    # 启动 typing 状态 + 提示消息
-                    img_typing_stop = asyncio.Event()
-                    img_typing_task = asyncio.create_task(
-                        keep_typing_while_waiting(context, update.effective_chat.id, img_typing_stop)
-                    )
-                    drawing_msg = await context.bot.send_message(
+                    media_execution = await execute_media_generation(
+                        media_prompt,
+                        context=context,
                         chat_id=update.effective_chat.id,
-                        text="🎨 正在生成媒体... 请稍等",
-                        reply_markup=build_stop_keyboard()
+                        generate_media=run_default_media_generation,
+                        keep_typing=keep_typing_while_waiting,
+                        stop_event_factory=get_or_create_stop_event,
+                        stop_requested=is_stop_requested,
+                        build_stop_keyboard=build_stop_keyboard,
+                        safe_edit_text=safe_edit_text,
+                        cancel_task_quietly=cancel_task_quietly,
                     )
-
-                    media_stopped = False
-                    try:
-                        media_task = asyncio.create_task(run_default_media_generation(media_prompt))
-                        stop_task = asyncio.create_task(get_or_create_stop_event().wait())
-                        done, pending = await asyncio.wait(
-                            {media_task, stop_task},
-                            return_when=asyncio.FIRST_COMPLETED
-                        )
-                        if stop_task in done and is_stop_requested():
-                            media_stopped = True
-                            await safe_edit_text(drawing_msg, "⏹️ 媒体生成已停止。", reply_markup=None)
-                            await cancel_task_quietly(media_task, timeout=1.0)
-                            round_state.should_continue = False
-                            break
-                        await cancel_task_quietly(stop_task, timeout=0.2)
-                        media_result = await media_task
-                    finally:
-                        img_typing_stop.set()
-                        img_typing_task.cancel()
-                        try:
-                            await img_typing_task
-                        except asyncio.CancelledError:
-                            pass
-                        if not media_stopped:
-                            # 删除 "正在生成媒体" 的提示消息
-                            try:
-                                await drawing_msg.delete()
-                            except Exception:
-                                pass
+                    if media_execution['stopped']:
+                        round_state.should_continue = False
+                        break
+                    media_result = media_execution['result']
 
                     media_notice, media_artifacts = build_external_media_output(media_result, media_prompt)
 
-                    if media_result.get('success'):
-                        try:
-                            await send_generated_media_artifacts(
-                                context,
-                                update.effective_chat.id,
-                                media_artifacts,
-                                caption=media_notice
-                            )
-                        except Exception as e:
-                            logger.error(f"发送生成媒体失败: {e}")
-                            await safe_send_message(
-                                context,
-                                update.effective_chat.id,
-                                f"⚠️ 媒体已经生成，但发送给用户时出了点问题: {safe_text(str(e)[:200])}"
-                            )
-                    else:
-                        await safe_send_message(
-                            context,
-                            update.effective_chat.id,
-                            f"⚠️ 媒体生成失败: {safe_text(str(media_result.get('error') or '未知错误'))}"
-                        )
+                    await send_media_generation_result(
+                        media_result,
+                        media_artifacts,
+                        media_notice,
+                        context=context,
+                        chat_id=update.effective_chat.id,
+                        send_artifacts=send_generated_media_artifacts,
+                        safe_send_message=safe_send_message,
+                        safe_text=safe_text,
+                        logger=logger,
+                    )
 
                     await persist_media_result(
                         recorder=GlobalRecorder,
@@ -1945,21 +1746,12 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     round_state.add_context(build_media_continuation_message(media_result, media_prompt))
                     round_state.should_continue = True
             
-            if not round_state.should_continue:
-                end_text = (
-                    "⏹️ Agent 操作已停止。"
-                    if is_stop_requested()
-                    else (round_state.pause_message or "🛠️ Agent 操作阶段已结束。")
-                )
-                with contextlib.suppress(Exception):
-                    await safe_edit_text(
-                        agent_stop_msg,
-                        end_text,
-                        reply_markup=None
-                    )
-                break  # 只有发送文件/写文件，无需继续循环
-
-            if is_stop_requested():
+            round_decision = plan_agent_round_transition(
+                round_state,
+                stop_requested=is_stop_requested(),
+                agent_turn_history=agent_turn_history,
+            )
+            if round_decision['send_stop_notice']:
                 await safe_send_message(
                     context,
                     update.effective_chat.id,
@@ -1968,21 +1760,28 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         "已经产生的工具结果会保留在全局记忆里。"
                     )
                 )
-                with contextlib.suppress(Exception):
-                    await safe_edit_text(agent_stop_msg, "⏹️ Agent 操作已停止。", reply_markup=None)
-                break
 
-            with contextlib.suppress(Exception):
-                await safe_edit_text(
-                    agent_stop_msg,
-                    f"🛠️ 第 {operation_iteration} 轮Agent操作完成，正在整理结果...",
-                    reply_markup=None,
-                )
+            if round_decision['status_text'] is not None:
+                with contextlib.suppress(Exception):
+                    await safe_edit_text(
+                        agent_stop_msg,
+                        round_decision['status_text'],
+                        reply_markup=None,
+                    )
+
+            if round_decision['show_completion_status']:
+                with contextlib.suppress(Exception):
+                    await safe_edit_text(
+                        agent_stop_msg,
+                        f"🛠️ 第 {operation_iteration} 轮Agent操作完成，正在整理结果...",
+                        reply_markup=None,
+                    )
+
+            if not round_decision['continue_loop']:
+                break
 
             # Continue from this turn's in-memory transcript. Re-reading global history here would
             # duplicate just-recorded Agent results and make prompt caching worse.
-            if not round_state.has_context:
-                break
             agent_iteration = await _reserve_agent_turn_iteration(db)
             if agent_iteration > max_agent_iterations:
                 await _send_agent_iteration_limit_notice(
@@ -1992,8 +1791,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     max_agent_iterations,
                 )
                 break
-            next_history = list(agent_turn_history)
-            next_history.extend(round_state.continuation_messages)
+            next_history = round_decision['next_history']
 
             if stream_mode:
                 response = await send_streaming_response(
