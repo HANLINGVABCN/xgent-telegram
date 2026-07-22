@@ -2871,7 +2871,7 @@ class AgentExecutor:
 
         std_tag_re = re.compile(
             r'^```(?P<tag>run|shell|stdin:[^\n]+|shellread:[^\n]+|shellkill:[^\n]+|trigger(?::[^\n]+)?|'
-            r'sendfile|read:[^\n]+|read|edit|grep|media|file:[^\n]+)\s*$'
+            r'sendfile|read:[^\n]+|read|edit|grep|media|file(?::[^\n]*)?)\s*$'
         )
 
         while i < n:
@@ -3061,12 +3061,19 @@ class AgentExecutor:
 
     @classmethod
     def resolve_write_path(cls, requested_path: str) -> str:
-        """写文件用的路径解析。仅接受绝对路径。"""
+        """写文件用的路径解析。file 协议必须明确提供绝对路径。"""
         cleaned = requested_path.strip()
+        default_workspace = to_display_path(os.path.join(cls.WORK_DIR, 'workspace'))
         if not cleaned:
-            raise ValueError("文件路径为空")
+            raise ValueError(
+                "file 协议必须指定目标文件的绝对路径；"
+                f"未指定保存位置时，请使用 {default_workspace}/文件名"
+            )
         if not os.path.isabs(cleaned):
-            raise ValueError(f"路径必须是绝对路径（以 / 开头），收到: {cleaned}。请使用项目根目录等绝对路径。")
+            raise ValueError(
+                f"file 协议路径必须是绝对路径，收到: {cleaned}；"
+                f"未指定保存位置时，请使用 {default_workspace}/文件名"
+            )
         return os.path.abspath(cleaned)
 
     @classmethod
