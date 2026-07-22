@@ -2,14 +2,17 @@
 # Keep cross-section names available through the loader until the next decoupling phase.
 
 from bot_app.agent_context import (
-    build_edit_context_message,
     build_file_context_message,
-    build_grep_context_message,
-    build_read_context_message,
-    build_run_context_message,
     build_sendfile_context_message,
     build_shell_context_message,
     build_trigger_context_message,
+)
+from bot_app.agent_results import (
+    failed_result,
+    normalize_edit_result,
+    normalize_grep_result,
+    normalize_read_result,
+    normalize_run_result,
 )
 
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1625,7 +1628,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                     f"[read结果] 读取失败: {read_path}。错误: {str(e)[:200]}"
                                 )},
                             }
-                    read_notice = str(read_result['notice'])
+                    read_operation = normalize_read_result(read_result)
+                    read_notice = read_operation['notice']
                     await GlobalRecorder.record(
                         msg_type=MessageType.AGENT_RESULT,
                         role='system',
@@ -1633,9 +1637,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         chat_id=update.effective_chat.id
                     )
                     await db.add_chat_message(cid, 'user', read_notice)
-                    continuation_messages.append(
-                        build_read_context_message(read_result)
-                    )
+                    continuation_messages.append(read_operation['context_message'])
                     should_continue = True
                     continue
 
@@ -1644,13 +1646,12 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         edit_result = await AgentExecutor.edit_file(block['body'])
                     except Exception as e:
                         logger.error(f"Agent edit 执行异常: {e}")
-                        edit_result = {
-                            'success': False,
-                            'output': f"[edit结果] 执行异常: {str(e)[:200]}",
-                            'notice': f"[edit结果] 执行异常: {str(e)[:200]}",
-                        }
-                    edit_notice = str(edit_result.get('output') or edit_result.get('notice') or '')
-                    success = bool(edit_result.get('success'))
+                        edit_result = failed_result(
+                            'edit', f"[edit结果] 执行异常: {str(e)[:200]}"
+                        )
+                    edit_operation = normalize_edit_result(edit_result)
+                    edit_notice = edit_operation['notice']
+                    success = edit_operation['success']
                     emoji = "✏️" if success else "⚠️"
                     await safe_send_message(
                         context,
@@ -1665,9 +1666,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         chat_id=update.effective_chat.id
                     )
                     await db.add_chat_message(cid, 'user', edit_notice)
-                    continuation_messages.append(
-                        build_edit_context_message(edit_notice)
-                    )
+                    continuation_messages.append(edit_operation['context_message'])
                     should_continue = True
                     continue
 
@@ -1676,16 +1675,15 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         grep_result = await AgentExecutor.grep_search(block['body'])
                     except Exception as e:
                         logger.error(f"Agent grep 执行异常: {e}")
-                        grep_result = {
-                            'success': False,
-                            'output': f"[grep结果] 执行异常: {str(e)[:200]}",
-                            'notice': f"[grep结果] 执行异常: {str(e)[:200]}",
-                        }
-                    grep_notice = str(grep_result.get('output') or grep_result.get('notice') or '')
-                    emoji = "🔎" if grep_result.get('success') else "⚠️"
+                        grep_result = failed_result(
+                            'grep', f"[grep结果] 执行异常: {str(e)[:200]}"
+                        )
+                    grep_operation = normalize_grep_result(grep_result)
+                    grep_notice = grep_operation['notice']
+                    emoji = "🔎" if grep_operation['success'] else "⚠️"
                     # grep 输出可能很长，Telegram 只发摘要，完整结果回灌给 AI
                     preview = grep_notice[:2000]
-                    hits = grep_result.get('hits', 0)
+                    hits = grep_operation.get('hits', 0)
                     await safe_send_message(
                         context,
                         update.effective_chat.id,
@@ -1699,9 +1697,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         chat_id=update.effective_chat.id
                     )
                     await db.add_chat_message(cid, 'user', grep_notice)
-                    continuation_messages.append(
-                        build_grep_context_message(grep_notice)
-                    )
+                    continuation_messages.append(grep_operation['context_message'])
                     should_continue = True
                     continue
 
@@ -1833,7 +1829,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
 
                 if block_type == 'run':
                     run_result = await AgentExecutor.run_command(block['body'], get_or_create_stop_event())
-                    run_notice = build_run_notice(run_result)
+                    run_operation = normalize_run_result(run_result)
+                    run_notice = run_operation['notice']
                     display_output = format_shell_display_output(
                         str(run_result.get('output') or '(无输出)'),
                         running=False,
@@ -1856,9 +1853,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         content=run_notice,
                         chat_id=update.effective_chat.id
                     )
-                    continuation_messages.append(
-                        build_run_context_message(run_notice)
-                    )
+                    continuation_messages.append(run_operation['context_message'])
                     should_continue = True
                     continue
 
