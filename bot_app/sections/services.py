@@ -8,6 +8,7 @@ from bot_app.shell_output import (
     format_shell_display_output,
     get_shell_pause_messages,
 )
+from bot_app.agent_context import build_media_context_message
 class GlobalRecorder:
     """始终记录所有操作（无论什么模式）"""
     
@@ -1172,60 +1173,13 @@ def build_media_result_notice(result: Dict[str, Any], prompt: str) -> str:
 
 
 def build_media_continuation_message(result: Dict[str, Any], prompt: str) -> Dict[str, Any]:
+    """Compatibility wrapper; media context construction lives in agent_context."""
     notice = build_media_result_notice(result, prompt)
-    if not result.get('success'):
-        return {
-            'role': 'user',
-            'content': notice
-        }
-
-    module_text = str(result.get('text') or '').strip() or "外部媒体模块刚生成了一份媒体。"
-    continuation_text = (
-        f"{module_text}\n"
-        "这是外部媒体模块刚生成的完整媒体回复，媒体本体已返回给你，请直接基于它继续回复用户。"
+    return build_media_context_message(
+        result,
+        notice,
+        max_inline_bytes=MEDIA_CONTEXT_MAX_BYTES,
     )
-
-    raw_artifacts = result.get('artifacts')
-    artifacts = [
-        artifact
-        for artifact in raw_artifacts
-        if isinstance(artifact, dict)
-    ] if isinstance(raw_artifacts, list) else []
-    image_artifact = next(
-        (
-            artifact for artifact in artifacts
-            if str(artifact.get('mime_type') or '').startswith('image/')
-            or str(artifact.get('kind') or '') == "图片"
-        ),
-        None
-    )
-
-    fallback_path = result.get('file_path') if str(result.get('mime_type') or '').startswith('image/') else None
-    image_path = (image_artifact or {}).get('path') or fallback_path
-    mime_type = str((image_artifact or {}).get('mime_type') or result.get('mime_type') or 'image/png')
-    if not image_path or not os.path.exists(image_path):
-        return {
-            'role': 'user',
-            'content': continuation_text
-        }
-
-    file_size = os.path.getsize(image_path)
-    if file_size > MEDIA_CONTEXT_MAX_BYTES:
-        return {
-            'role': 'user',
-            'content': continuation_text + "\n说明: 可回灌媒体过大，本轮未把媒体本体再次塞进上下文。"
-        }
-
-    with open(image_path, 'rb') as f:
-        image_b64 = base64.b64encode(f.read()).decode('ascii')
-
-    return {
-        'role': 'user',
-        'content': [
-            {'type': 'text', 'text': continuation_text},
-            {'type': 'image', 'mime_type': mime_type, 'data': image_b64}
-        ]
-    }
 
 
 def get_current_provider() -> Tuple[Optional[str], Optional[Dict]]:

@@ -1,6 +1,17 @@
 # This file is executed by bot_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
+from bot_app.agent_context import (
+    build_edit_context_message,
+    build_file_context_message,
+    build_grep_context_message,
+    build_read_context_message,
+    build_run_context_message,
+    build_sendfile_context_message,
+    build_shell_context_message,
+    build_trigger_context_message,
+)
+
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
         return
@@ -1577,14 +1588,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             chat_id=update.effective_chat.id
                         )
                         await db.add_chat_message(cid, 'user', sendfile_notice)
-                        continuation_messages.append({
-                            'role': 'user',
-                            'content': (
-                                sendfile_notice + "\n"
-                                "说明: sendfile 已执行；这里回灌的是发送结果、路径和大小，"
-                                "不包含文件本体。若需要查看文件内容，请使用 read。"
-                            )
-                        })
+                        continuation_messages.append(
+                            build_sendfile_context_message(sendfile_notice)
+                        )
                         should_continue = True
                     continue
 
@@ -1627,7 +1633,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         chat_id=update.effective_chat.id
                     )
                     await db.add_chat_message(cid, 'user', read_notice)
-                    continuation_messages.append(read_result['message'])
+                    continuation_messages.append(
+                        build_read_context_message(read_result)
+                    )
                     should_continue = True
                     continue
 
@@ -1657,15 +1665,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         chat_id=update.effective_chat.id
                     )
                     await db.add_chat_message(cid, 'user', edit_notice)
-                    continuation_messages.append({
-                        'role': 'user',
-                        'content': (
-                            edit_notice + "\n"
-                            "说明: 这是 edit 原地替换的真实结果。若失败，请按提示"
-                            "重新 grep 拿行号 → read 带行号核对 → 调整 old 串后重试，"
-                            "不要改用 file 全量覆写。"
-                        )
-                    })
+                    continuation_messages.append(
+                        build_edit_context_message(edit_notice)
+                    )
                     should_continue = True
                     continue
 
@@ -1697,15 +1699,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         chat_id=update.effective_chat.id
                     )
                     await db.add_chat_message(cid, 'user', grep_notice)
-                    continuation_messages.append({
-                        'role': 'user',
-                        'content': (
-                            grep_notice + "\n"
-                            "说明: 这是 grep 的真实命中结果（已带 文件:行号:内容 + 上下文）。"
-                            "定位代码请优先用 grep-x 拿行号，再用 read-x:路径:区间 看上下文，"
-                            "最后用 edit-x 精确替换。"
-                        )
-                    })
+                    continuation_messages.append(
+                        build_grep_context_message(grep_notice)
+                    )
                     should_continue = True
                     continue
 
@@ -1759,14 +1755,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             chat_id=update.effective_chat.id
                         )
                         await db.add_chat_message(cid, 'user', file_notice)
-                        continuation_messages.append({
-                            'role': 'user',
-                            'content': (
-                                file_notice + "\n"
-                                "说明: file 已执行；这里回灌的是写入结果、路径和大小，"
-                                "不包含文件本体。若需要查看文件内容，请使用 read。"
-                            )
-                        })
+                        continuation_messages.append(
+                            build_file_context_message(file_notice)
+                        )
                         should_continue = True
                     continue
 
@@ -1834,14 +1825,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             chat_id=update.effective_chat.id
                         )
                         await db.add_chat_message(cid, 'user', file_notice)
-                        continuation_messages.append({
-                            'role': 'user',
-                            'content': (
-                                file_notice + "\n"
-                                "说明: file:base64 已执行；这里回灌的是写入结果、路径和大小，"
-                                "不包含文件本体。若需要查看文件内容，请使用 read。"
-                            )
-                        })
+                        continuation_messages.append(
+                            build_file_context_message(file_notice, protocol="file:base64")
+                        )
                         should_continue = True
                     continue
 
@@ -1870,14 +1856,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         content=run_notice,
                         chat_id=update.effective_chat.id
                     )
-                    continuation_messages.append({
-                        'role': 'user',
-                        'content': (
-                            run_notice + "\n"
-                            "说明: 这是一次性命令 run 的真实结果；完整原始输出已经保存到路径。"
-                            "请基于返回码、上下文输出和完整输出路径继续判断。"
-                        )
-                    })
+                    continuation_messages.append(
+                        build_run_context_message(run_notice)
+                    )
                     should_continue = True
                     continue
 
@@ -1901,13 +1882,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         chat_id=update.effective_chat.id,
                     )
                     await db.add_chat_message(cid, 'user', trigger_notice)
-                    continuation_messages.append({
-                        'role': 'user',
-                        'content': (
-                            trigger_notice + "\n"
-                            "说明: 这是 trigger 后台触发任务的真实管理结果，请据此回复用户。"
-                        ),
-                    })
+                    continuation_messages.append(
+                        build_trigger_context_message(trigger_notice)
+                    )
                     should_continue = True
                     continue
 
@@ -1993,27 +1970,14 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         chat_id=update.effective_chat.id
                     )
                     if shell_result.get('running'):
-                        continuation_messages.append({
-                            'role': 'user',
-                            'content': (
-                                shell_notice + "\n"
-                                "说明: 这是仍在运行的 shell 会话当前真实输出。"
-                                "系统已经根据输出活跃度、静默时长、交互提示和长驻预判做过判断后才回传。"
-                                "请基于这份结果继续判断；需要输入、读取、关闭或继续执行时，可以直接输出相应协议。"
-                                "如果这是持续输出、日志流、服务进程等场景，请不要无意义轮询；"
-                                "应基于当前输出给用户结论，必要时说明会话仍保留。"
-                            )
-                        })
+                        continuation_messages.append(
+                            build_shell_context_message(shell_notice, running=True)
+                        )
                         should_continue = True
                         break
-                    continuation_messages.append({
-                        'role': 'user',
-                        'content': (
-                            shell_notice + "\n"
-                            "说明: 这是可持续交互 shell 会话的真实输出；会话已经结束或本次操作已经得到确定结果，"
-                            "请基于这份结果继续判断。"
-                        )
-                    })
+                    continuation_messages.append(
+                        build_shell_context_message(shell_notice, running=False)
+                    )
                     should_continue = True
                     continue
 
