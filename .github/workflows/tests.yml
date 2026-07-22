@@ -19,6 +19,6 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements.txt
       - run: python tools/check_split_integrity.py
-      - run: python -m compileall -q bot_server.py telegram_ai_bot
+      - run: python -m compileall -q bot_server.py bot_app
       - run: python -m unittest discover -s tests -v
       - run: bash -n install.sh skill/script/mailu-helper/mailu-helper.sh skill/script/notes/install.sh skill/script/proxy-setup/proxy_setup.sh skill/script/webdav-filemanager/install.sh

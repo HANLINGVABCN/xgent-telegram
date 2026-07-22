@@ -20,6 +20,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             "PYTHONIOENCODING": "utf-8",
         })
         with tempfile.TemporaryDirectory() as cwd:
+            env["TELEGRAM_AI_BOT_TRACE_LOG_FILE"] = str(Path(cwd) / "bot_full_trace.log")
             result = subprocess.run(
                 [sys.executable, "-c", code],
                 cwd=cwd,

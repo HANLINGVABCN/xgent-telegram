@@ -173,7 +173,10 @@ UPDATE_SKIP_SUFFIXES = (
 UPDATE_LOCAL_CUSTOM_DIRS = ("prompts", "skill")
 UPDATE_BACKUP_DIR = os.path.join(PROJECT_ROOT, "bot_storage", "update_backups")
 COMMAND_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "bot_storage", "command_outputs")
-FULL_TRACE_LOG_FILE = os.path.join(PROJECT_ROOT, "bot_full_trace.log")
+_TRACE_LOG_OVERRIDE = os.environ.get("TELEGRAM_AI_BOT_TRACE_LOG_FILE", "").strip()
+FULL_TRACE_LOG_FILE = os.path.abspath(
+    os.path.expanduser(_TRACE_LOG_OVERRIDE or os.path.join(PROJECT_ROOT, "bot_full_trace.log"))
+)
 FULL_TRACE_LOCK = threading.Lock()
 DEFAULT_AGENT_COMMAND_TIMEOUT = 30
 MIN_AGENT_COMMAND_TIMEOUT = 5
