@@ -17,6 +17,13 @@ components. The first extracted components are:
 | `bot_app/shell_output.py` | Format shell display output, model context, and command-result notices |
 | `bot_app/agent_context.py` | Build next-turn Agent context for file, read, edit, grep, run, shell, trigger, and media results; no execution, persistence, or Telegram sending |
 | `bot_app/agent_results.py` | Normalize executor dictionaries into a common Agent result contract while preserving legacy fields; no execution, persistence, or Telegram sending |
+| `bot_app/agent_dispatch.py` | Dispatch and normalize read, edit, grep, and run without Telegram or persistence concerns |
+| `bot_app/agent_files.py` | Execute text and base64 file writes; base64 decoding/writing is moved off the event loop |
+| `bot_app/agent_shell.py` | Execute shell/stdin/session protocols and preserve stop-session behavior |
+| `bot_app/agent_trigger.py` | Execute trigger protocols and normalize failure notices |
+| `bot_app/agent_presenter.py` | Build pure Telegram presentation text for Agent results |
+| `bot_app/agent_history.py` | Keep Agent recorder/database write ordering and special media history format |
+| `bot_app/agent_loop_state.py` | Coordinate one Agent operation round's continuation context and pause state |
 
 Legacy names remain available through thin imports/wrappers in the sections so
 existing handlers keep working while the internal boundaries become explicit.
@@ -74,9 +81,10 @@ validation, rendering, triggers, provider adapters, and Telegram handlers.
 ## Intended next phases
 
 1. Continue moving configuration and pure utility functions into importable modules.
-2. Continue splitting Agent execution: context construction and the first result
-   normalization boundary are now isolated; command dispatch, persistence, and
-   Telegram presentation still need explicit boundaries.
+2. Continue splitting Agent execution: context construction, result normalization,
+   standard protocol dispatch, Shell/file/trigger execution, presentation, history,
+   and one-round coordination now have explicit compatibility boundaries. The
+   remaining high-coupling media/sendfile flow should be moved in small stages.
 3. Introduce explicit service objects for database, model, and Agent state.
 4. Move handlers into modules that receive dependencies instead of reading
    mutable globals.

@@ -1,0 +1,72 @@
+from __future__ import annotations
+
+import unittest
+
+from bot_app.agent_presenter import (
+    build_edit_presentation,
+    build_grep_presentation,
+    build_run_presentation,
+    build_shell_presentation,
+)
+
+
+class AgentPresenterTests(unittest.TestCase):
+    def test_edit_presentation_matches_legacy_html(self):
+        self.assertEqual(
+            build_edit_presentation({"success": True, "notice": "a < b"}),
+            "✏️ <b>Agent Edit</b>\n<pre>a &lt; b</pre>",
+        )
+
+    def test_grep_presentation_matches_legacy_html_and_limit(self):
+        result = {"success": False, "notice": "x" * 2100, "hits": 4}
+        text = build_grep_presentation(result)
+
+        self.assertTrue(text.startswith("⚠️ <b>Agent Grep</b> 命中 4 处\n<pre>"))
+        self.assertEqual(text.count("x"), 2000)
+        self.assertTrue(text.endswith("</pre>"))
+
+    def test_shell_presentation_escapes_status_and_keeps_wait_note(self):
+        self.assertEqual(
+            build_shell_presentation(
+                action_label="启动会话",
+                shell_result={
+                    "success": True,
+                    "running": True,
+                    "pty": True,
+                    "status": "running&ok",
+                    "waited_seconds": 2,
+                },
+                session_id="abc<1>",
+                display_output="out",
+                pause_note="\n正在等待。",
+            ),
+            (
+                "🖥️ <b>Agent Shell 启动会话</b>\n"
+                "会话: <code>abc&lt;1&gt;</code> · 运行中 · PTY\n"
+                "✅ 状态: <code>running&amp;ok</code>\n"
+                "本次等待/捕获耗时: 2 秒\n正在等待。\n"
+                "<pre>out</pre>"
+            ),
+        )
+
+    def test_run_presentation_matches_legacy_html(self):
+        self.assertEqual(
+            build_run_presentation(
+                {
+                    "success": True,
+                    "output": "<done>",
+                    "return_code": 0,
+                    "output_path": "/tmp/a&b.log",
+                }
+            ),
+            (
+                "⌨️ <b>Agent Run</b>\n"
+                "✅ 返回码: <code></code>\n"
+                "完整输出: <code>/tmp/a&amp;b.log</code>\n"
+                "<pre>&lt;done&gt;</pre>"
+            ),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
