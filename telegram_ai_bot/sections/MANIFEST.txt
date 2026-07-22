@@ -1,0 +1,16 @@
+core.py
+database.py
+agent.py
+shell_triggers.py
+models.py
+services.py
+ui.py
+rendering.py
+commands.py
+callbacks.py
+messages.py
+command_handlers.py
+idle.py
+other_messages.py
+lifecycle.py
+main.py
