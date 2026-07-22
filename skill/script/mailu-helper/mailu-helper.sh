@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-VERSION="0.1.0"
+VERSION="0.2.1"
 CONFIG_FILE="${MAILU_HELPER_CONFIG:-/root/.mailu-helper.conf}"
 
 COMPOSE_DIR="${COMPOSE_DIR:-}"
@@ -14,6 +14,9 @@ MAIL_DOMAIN="${MAIL_DOMAIN:-}"
 MAIL_HOST="${MAIL_HOST:-}"
 WEB_HTTP_PORT="${WEB_HTTP_PORT:-}"
 CERT_UPDATE_SCRIPT="${CERT_UPDATE_SCRIPT:-}"
+CERT_WATCHER_SCRIPT="${CERT_WATCHER_SCRIPT:-}"
+CERT_SOURCE_DIR="${CERT_SOURCE_DIR:-}"
+CERT_STAGE_DIR="${CERT_STAGE_DIR:-}"
 CERT_WATCHER_SERVICE="${CERT_WATCHER_SERVICE:-mailu-cert-watch.service}"
 
 if [ "$(id -u 2>/dev/null || echo 1)" != "0" ] && [ "$CONFIG_FILE" = "/root/.mailu-helper.conf" ]; then
@@ -303,7 +306,7 @@ load_config() {
     local _key _value
     while IFS='=' read -r _key _value || [ -n "$_key" ]; do
       case "$_key" in
-        COMPOSE_DIR|COMPOSE_FILE|ENV_FILE|MAILU_DATA_DIR|CERT_DIR|POSTFIX_OVERRIDE_DIR|MAIL_DOMAIN|MAIL_HOST|WEB_HTTP_PORT|CERT_UPDATE_SCRIPT|CERT_WATCHER_SERVICE)
+        COMPOSE_DIR|COMPOSE_FILE|ENV_FILE|MAILU_DATA_DIR|CERT_DIR|POSTFIX_OVERRIDE_DIR|MAIL_DOMAIN|MAIL_HOST|WEB_HTTP_PORT|CERT_UPDATE_SCRIPT|CERT_WATCHER_SCRIPT|CERT_SOURCE_DIR|CERT_STAGE_DIR|CERT_WATCHER_SERVICE)
           declare -g "$_key=$_value" ;;
       esac
     done < "$CONFIG_FILE"
@@ -325,6 +328,10 @@ sanitize_loaded_config() {
   bad_saved_path "${ENV_FILE:-}" && ENV_FILE=""
   bad_saved_path "${MAILU_DATA_DIR:-}" && MAILU_DATA_DIR=""
   bad_saved_path "${CERT_DIR:-}" && CERT_DIR=""
+  bad_saved_path "${CERT_UPDATE_SCRIPT:-}" && CERT_UPDATE_SCRIPT=""
+  bad_saved_path "${CERT_WATCHER_SCRIPT:-}" && CERT_WATCHER_SCRIPT=""
+  bad_saved_path "${CERT_SOURCE_DIR:-}" && CERT_SOURCE_DIR=""
+  bad_saved_path "${CERT_STAGE_DIR:-}" && CERT_STAGE_DIR=""
   bad_saved_path "${POSTFIX_OVERRIDE_DIR:-}" && POSTFIX_OVERRIDE_DIR=""
   is_valid_domain "${MAIL_DOMAIN:-}" || MAIL_DOMAIN=""
   is_valid_domain "${MAIL_HOST:-}" || MAIL_HOST=""
@@ -346,6 +353,9 @@ save_config() {
     printf 'MAIL_HOST=%q\n' "${MAIL_HOST:-}"
     printf 'WEB_HTTP_PORT=%q\n' "${WEB_HTTP_PORT:-}"
     printf 'CERT_UPDATE_SCRIPT=%q\n' "${CERT_UPDATE_SCRIPT:-}"
+    printf 'CERT_WATCHER_SCRIPT=%q\n' "${CERT_WATCHER_SCRIPT:-}"
+    printf 'CERT_SOURCE_DIR=%q\n' "${CERT_SOURCE_DIR:-}"
+    printf 'CERT_STAGE_DIR=%q\n' "${CERT_STAGE_DIR:-}"
     printf 'CERT_WATCHER_SERVICE=%q\n' "${CERT_WATCHER_SERVICE:-mailu-cert-watch.service}"
   } > "$CONFIG_FILE"
   ok "配置已保存：$CONFIG_FILE"
@@ -476,26 +486,58 @@ detect_env_file() {
   [ -f "$ENV_FILE" ] || { fail "文件不存在：$ENV_FILE"; return 1; }
 }
 
-service_block() {
+service_block_from_text() {
   local service="$1"
   awk -v svc="$service" '
     $0 ~ "^[[:space:]]{2}" svc ":" { inside=1; next }
     inside && $0 ~ "^[[:space:]]{2}[A-Za-z0-9_-]+:" { exit }
     inside { print }
-  ' "$COMPOSE_FILE"
+  '
+}
+
+service_block() {
+  local service="$1"
+  service_block_from_text "$service" < "$COMPOSE_FILE"
 }
 
 extract_volume_host_from_text() {
   local target="$1"
-  awk -v target="$target" '
-    /^[[:space:]]*-[[:space:]]*/ {
-      line=$0
-      sub(/^[[:space:]]*-[[:space:]]*/, "", line)
-      gsub(/^["'\''"]|["'\''"]$/, "", line)
-      n=split(line, parts, ":")
-      if (n >= 2 && parts[2] == target) {
-        print parts[1]
-        exit
+  awk -v wanted="$target" '
+    function clean(value) {
+      gsub(/\r/, "", value)
+      gsub(/^[[:space:]"\047]+|[[:space:]"\047]+$/, "", value)
+      return value
+    }
+    {
+      # Short syntax: /host/path:/container/path[:ro]
+      if ($0 ~ /^[[:space:]]*-[[:space:]]*/) {
+        line=$0
+        sub(/^[[:space:]]*-[[:space:]]*/, "", line)
+        line=clean(line)
+        n=split(line, parts, ":")
+        if (n >= 2 && parts[2] == wanted) {
+          print parts[1]
+          exit
+        }
+        source=""
+      }
+
+      # Long syntax after `docker compose config`:
+      # source: /host/path
+      # target: /container/path
+      if ($0 ~ /^[[:space:]]+source:[[:space:]]*/) {
+        source=$0
+        sub(/^[[:space:]]+source:[[:space:]]*/, "", source)
+        source=clean(source)
+      }
+      if ($0 ~ /^[[:space:]]+target:[[:space:]]*/) {
+        target_value=$0
+        sub(/^[[:space:]]+target:[[:space:]]*/, "", target_value)
+        target_value=clean(target_value)
+        if (target_value == wanted && source != "") {
+          print source
+          exit
+        }
       }
     }
   '
@@ -508,11 +550,20 @@ extract_volume_host() {
 
 detect_mailu_dirs() {
   [ -n "${COMPOSE_FILE:-}" ] || return 1
-  local cert postfix data mail
-  cert="$(extract_volume_host "/certs" || true)"
-  postfix="$(service_block smtp | extract_volume_host_from_text "/overrides" || true)"
-  data="$(extract_volume_host "/data" || true)"
-  mail="$(extract_volume_host "/mail" || true)"
+  local cert postfix data mail rendered
+
+  rendered="$(dc config 2>/dev/null || true)"
+  if [ -n "$rendered" ]; then
+    cert="$(printf '%s\n' "$rendered" | extract_volume_host_from_text "/certs" || true)"
+    postfix="$(printf '%s\n' "$rendered" | service_block_from_text smtp | extract_volume_host_from_text "/overrides" || true)"
+    data="$(printf '%s\n' "$rendered" | extract_volume_host_from_text "/data" || true)"
+    mail="$(printf '%s\n' "$rendered" | extract_volume_host_from_text "/mail" || true)"
+  else
+    cert="$(extract_volume_host "/certs" || true)"
+    postfix="$(service_block smtp | extract_volume_host_from_text "/overrides" || true)"
+    data="$(extract_volume_host "/data" || true)"
+    mail="$(extract_volume_host "/mail" || true)"
+  fi
 
   [ -n "$cert" ] && CERT_DIR="$cert"
   [ -n "$postfix" ] && POSTFIX_OVERRIDE_DIR="$postfix"
@@ -526,10 +577,10 @@ detect_mailu_dirs() {
   fi
 
   if [ -z "${CERT_DIR:-}" ]; then
-    CERT_DIR="$(ask "请输入 Mailu 证书目录（容器 /certs 对应宿主机目录）" "${CERT_DIR:-/mailu/certs}")"
+    CERT_DIR="$(ask "没有从 compose 识别到 /certs 挂载，请输入宿主机证书目标目录" "${CERT_DIR:-/mailu/certs}")"
   fi
   if [ -z "${POSTFIX_OVERRIDE_DIR:-}" ]; then
-    POSTFIX_OVERRIDE_DIR="$(ask "请输入 Mailu Postfix overrides 目录（smtp 服务 /overrides 对应宿主机目录）" "${POSTFIX_OVERRIDE_DIR:-/mailu/overrides/postfix}")"
+    POSTFIX_OVERRIDE_DIR="$(ask "没有从 compose 识别到 smtp /overrides 挂载，请输入宿主机 Postfix overrides 目录" "${POSTFIX_OVERRIDE_DIR:-/mailu/overrides/postfix}")"
   fi
   if [ -z "${MAILU_DATA_DIR:-}" ]; then
     MAILU_DATA_DIR="$(ask "请输入 Mailu 数据根目录" "${MAILU_DATA_DIR:-/mailu}")"
@@ -1075,8 +1126,10 @@ set_generated_config_defaults() {
   GEN_AUTH_RATELIMIT_USER="50/day"
   GEN_MESSAGE_SIZE_LIMIT="50000000"
   GEN_MESSAGE_RATELIMIT="200/day"
-  GEN_DMARC_RUA="$GEN_POSTMASTER"
-  GEN_DMARC_RUF="$GEN_POSTMASTER"
+  # 默认不在 Mailu 推荐记录中加入 DMARC 报告地址。
+  # 如确实需要接收 RUA/RUF，可在高级配置流程中手动填写本地部分。
+  GEN_DMARC_RUA=""
+  GEN_DMARC_RUF=""
   GEN_FULL_TEXT_SEARCH="en"
   GEN_SECRET_KEY="$(random_secret)"
 }
@@ -1219,9 +1272,9 @@ generate_mailu_config() {
       "500/day|500/day" \
       "手动输入|manual")"
     [ "$GEN_MESSAGE_RATELIMIT" = "manual" ] && GEN_MESSAGE_RATELIMIT="$(ask_default "单用户发信频率（格式：数字/day 或 数字/hour）" "200/day")"
-    printf 'DMARC：默认发给管理员。\n'
-    GEN_DMARC_RUA="$(ask_default "DMARC_RUA 收件人" "$GEN_POSTMASTER")"
-    GEN_DMARC_RUF="$(ask_default "DMARC_RUF 收件人" "$GEN_POSTMASTER")"
+    printf 'DMARC：不生成 Mailu 的 RUA/RUF 报告推荐；请在 Cloudflare DNS 维护 DMARC，并使用 adkim=r; aspf=r。\n'
+    GEN_DMARC_RUA=""
+    GEN_DMARC_RUF=""
     GEN_FULL_TEXT_SEARCH="$(choose_option "全文搜索 FULL_TEXT_SEARCH" "en" "英文 en|en" "英文+中文 en,zh|en,zh" "关闭|off" "手动输入|manual")"
     [ "$GEN_FULL_TEXT_SEARCH" = "manual" ] && GEN_FULL_TEXT_SEARCH="$(ask_default "全文搜索语言（例如 en 或 en,zh；关闭填 off）" "en")"
     GEN_SECRET_KEY="$(ask "SECRET_KEY（直接回车自动生成；也可手动填随机字符串）" "")"
@@ -1370,22 +1423,218 @@ check_local_web() {
   fi
 }
 
+cert_matches_host() {
+  local cert="$1"
+  local host="$2"
+  [ -f "$cert" ] && [ -n "$host" ] && need_cmd openssl || return 1
+  openssl x509 -in "$cert" -noout -checkhost "$host" >/dev/null 2>&1
+}
+
+cert_key_matches() {
+  local cert="$1"
+  local key="$2"
+  local cert_hash key_hash
+  [ -f "$cert" ] && [ -f "$key" ] && need_cmd openssl && need_cmd sha256sum || return 1
+  cert_hash="$(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+  key_hash="$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+  [ -n "$cert_hash" ] && [ "$cert_hash" = "$key_hash" ]
+}
+
+cert_fingerprint_sha256() {
+  local cert="$1"
+  need_cmd openssl || return 1
+  openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//;s/://g'
+}
+
+cert_expiry_text() {
+  local cert="$1"
+  need_cmd openssl || return 1
+  openssl x509 -in "$cert" -noout -enddate 2>/dev/null | sed 's/^notAfter=//'
+}
+
+cert_expiry_epoch() {
+  local cert="$1"
+  local end
+  end="$(cert_expiry_text "$cert" || true)"
+  [ -n "$end" ] || { printf '0'; return 0; }
+  if date -d "$end" +%s >/dev/null 2>&1; then
+    date -d "$end" +%s
+  else
+    printf '0'
+  fi
+}
+
+show_cert_details() {
+  local cert="$1"
+  local key="$2"
+  local host="${3:-}"
+
+  printf '  证书文件：%s\n' "$cert"
+  printf '  私钥文件：%s\n' "$key"
+
+  if ! need_cmd openssl; then
+    warn "未安装 openssl，只能检查文件是否存在。"
+    return 0
+  fi
+
+  printf '\n证书基本信息：\n'
+  openssl x509 -in "$cert" -noout -subject -issuer -dates 2>/dev/null || {
+    fail "无法解析证书：$cert"
+    return 1
+  }
+  printf '\n证书包含的域名（SAN）：\n'
+  openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null || warn "当前 openssl 无法显示 SAN。"
+  printf 'SHA256 指纹：%s\n' "$(cert_fingerprint_sha256 "$cert" 2>/dev/null || printf '无法读取')"
+  printf '到期时间：%s\n' "$(cert_expiry_text "$cert" 2>/dev/null || printf '无法读取')"
+
+  if [ -n "$host" ]; then
+    if cert_matches_host "$cert" "$host"; then
+      ok "证书匹配当前邮件主机：$host"
+    else
+      fail "证书不匹配当前邮件主机：$host"
+    fi
+  fi
+
+  if cert_key_matches "$cert" "$key"; then
+    ok "证书与私钥匹配"
+  else
+    fail "证书与私钥不匹配，或无法验证"
+  fi
+
+  if openssl x509 -in "$cert" -noout -checkend 2592000 >/dev/null 2>&1; then
+    ok "证书未来 30 天内不会过期"
+  else
+    warn "证书可能会在 30 天内过期，请检查续期。"
+  fi
+}
+
+
+show_cert_path_map() {
+  local title="${1:-当前自动识别结果}"
+  local source_dir="${2:-${CERT_SOURCE_DIR:-}}"
+  printf '\n%s\n' "${BOLD}${title}${RESET}"
+  printf '  邮件主机：%s\n' "${MAIL_HOST:-未识别}"
+  printf '  Compose 文件：%s\n' "${COMPOSE_FILE:-未识别}"
+  printf '  Env 文件：%s\n' "${ENV_FILE:-未识别}"
+  printf '  目录1（原证书目录）：%s\n' "${source_dir:-尚未选定，脚本会继续自动搜索}"
+  printf '  目录2（本地中转目录）：%s\n' "${CERT_STAGE_DIR:-尚未配置；选项 4 会自动设置}"
+  printf '  目录3（Mailu 宿主机目标目录）：%s\n' "${CERT_DIR:-未识别}"
+  printf '  Mailu 容器目录：/certs\n'
+  if [ -n "${CERT_DIR:-}" ]; then
+    if [ -n "${CERT_STAGE_DIR:-}" ]; then
+      printf '  目录1/fullchain.pem -> %s/fullchain.pem -> %s/cert.pem -> 容器 /certs/cert.pem\n' "$CERT_STAGE_DIR" "$CERT_DIR"
+      printf '  目录1/privkey.pem   -> %s/privkey.pem   -> %s/key.pem  -> 容器 /certs/key.pem\n' "$CERT_STAGE_DIR" "$CERT_DIR"
+    else
+      printf '  源 fullchain.pem -> %s/cert.pem -> 容器 /certs/cert.pem\n' "$CERT_DIR"
+      printf '  源 privkey.pem   -> %s/key.pem  -> 容器 /certs/key.pem\n' "$CERT_DIR"
+    fi
+  fi
+}
+
+best_matching_cert_pair() {
+  local host="${1:-}"
+  local renewable_only="${2:-no}"
+  local exclude_dir="${3:-}"
+  local line cert key dir expiry preferred
+  local best_line="" best_expiry=0 best_preferred=-1
+  local target_cert="${CERT_DIR:-}/cert.pem"
+  local target_key="${CERT_DIR:-}/key.pem"
+  local cert_real key_real target_cert_real target_key_real
+
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    IFS='|' read -r cert key dir <<< "$line"
+    if [ -n "$exclude_dir" ] && [ "$(readlink -f "$dir" 2>/dev/null || printf '%s' "$dir")" = "$(readlink -f "$exclude_dir" 2>/dev/null || printf '%s' "$exclude_dir")" ]; then
+      continue
+    fi
+    cert_key_matches "$cert" "$key" || continue
+    [ -z "$host" ] || cert_matches_host "$cert" "$host" || continue
+    if need_cmd openssl && ! openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1; then
+      continue
+    fi
+
+    preferred=0
+    case "$(basename "$cert")|$(basename "$key")" in
+      fullchain.pem\|privkey.pem|fullchain*.pem\|privkey*.pem) preferred=3 ;;
+      *fullchain*.cer\|*.key|*.crt\|*.key|*.cer\|*.key) preferred=2 ;;
+      cert.pem\|key.pem) preferred=1 ;;
+    esac
+
+    if [ "$renewable_only" = "yes" ]; then
+      cert_real="$(readlink -f "$cert" 2>/dev/null || printf '%s' "$cert")"
+      key_real="$(readlink -f "$key" 2>/dev/null || printf '%s' "$key")"
+      target_cert_real="$(readlink -f "$target_cert" 2>/dev/null || printf '%s' "$target_cert")"
+      target_key_real="$(readlink -f "$target_key" 2>/dev/null || printf '%s' "$target_key")"
+      if [ "$cert_real" = "$target_cert_real" ] && [ "$key_real" = "$target_key_real" ]; then
+        continue
+      fi
+    fi
+
+    expiry="$(cert_expiry_epoch "$cert")"
+    if [ -z "$best_line" ] || [ "$expiry" -gt "$best_expiry" ] || { [ "$expiry" -eq "$best_expiry" ] && [ "$preferred" -gt "$best_preferred" ]; }; then
+      best_line="$line"
+      best_expiry="$expiry"
+      best_preferred="$preferred"
+    fi
+  done < <(find_cert_pairs "$host")
+
+  [ -n "$best_line" ] || return 1
+  printf '%s\n' "$best_line"
+}
+
+show_selected_source_details() {
+  local pair="$1"
+  local label="${2:-自动选中的证书源}"
+  local cert key dir
+  [ -n "$pair" ] || return 1
+  IFS='|' read -r cert key dir <<< "$pair"
+  printf '\n%s：\n' "$label"
+  printf '  源目录：%s\n' "$dir"
+  printf '  源证书：%s\n' "$cert"
+  printf '  源私钥：%s\n' "$key"
+  printf '  SHA256 指纹：%s\n' "$(cert_fingerprint_sha256 "$cert" 2>/dev/null || printf '无法读取')"
+  printf '  到期时间：%s\n' "$(cert_expiry_text "$cert" 2>/dev/null || printf '无法读取')"
+  [ -z "${MAIL_HOST:-}" ] || {
+    if cert_matches_host "$cert" "$MAIL_HOST"; then
+      ok "证书匹配邮件主机：$MAIL_HOST"
+    else
+      fail "证书不匹配邮件主机：$MAIL_HOST"
+    fi
+  }
+  if cert_key_matches "$cert" "$key"; then
+    ok "证书与私钥匹配"
+  else
+    fail "证书与私钥不匹配"
+  fi
+}
+
 check_certs() {
-  printf '\n%s\n' "${BOLD}证书文件${RESET}"
+  printf '\n%s\n' "${BOLD}Mailu 当前证书检查${RESET}"
   local cert="${CERT_DIR:-}/cert.pem"
   local key="${CERT_DIR:-}/key.pem"
-  if [ -f "$cert" ]; then
-    ok "cert.pem 存在：$cert"
-    ls -l "$cert"
-  else
-    fail "cert.pem 不存在：$cert"
+  local source_cert="${CERT_DIR:-}/fullchain.pem"
+  local source_key="${CERT_DIR:-}/privkey.pem"
+  local host="${MAIL_HOST:-}"
+
+  printf '宿主机目标目录：%s\n' "${CERT_DIR:-未识别}"
+  printf 'Mailu 容器内目录：/certs\n'
+  printf 'Mailu 最终需要：\n'
+  printf '  宿主机 %s/cert.pem -> 容器 /certs/cert.pem\n' "${CERT_DIR:-未识别}"
+  printf '  宿主机 %s/key.pem  -> 容器 /certs/key.pem\n' "${CERT_DIR:-未识别}"
+  [ -n "$host" ] && printf '当前邮件主机（从配置读取）：%s\n' "$host"
+
+  if [ ! -f "$cert" ] || [ ! -f "$key" ]; then
+    [ -f "$cert" ] && ok "cert.pem 存在：$cert" || fail "cert.pem 不存在：$cert"
+    [ -f "$key" ] && ok "key.pem 存在：$key" || fail "key.pem 不存在：$key"
+    if [ -f "$source_cert" ] && [ -f "$source_key" ]; then
+      warn "检测到证书管理工具推送的 fullchain.pem 和 privkey.pem，但还没有转换为 Mailu 需要的 cert.pem/key.pem。"
+      printf '请返回证书菜单，选择“自动诊断/推荐”。\n'
+    fi
+    return 1
   fi
-  if [ -f "$key" ]; then
-    ok "key.pem 存在：$key"
-    ls -l "$key"
-  else
-    fail "key.pem 不存在：$key"
-  fi
+
+  ls -l "$cert" "$key"
+  show_cert_details "$cert" "$key" "$host"
 }
 
 check_environment() {
@@ -1455,91 +1704,195 @@ resolve_cert_pair_from_dir() {
 find_cert_pairs() {
   local domain="${1:-}"
   local roots=()
-  local root dir pair
+  local root dir pair depth
 
   [ -n "$domain" ] && roots+=("/etc/letsencrypt/live/$domain" "/root/.acme.sh/$domain" "/root/.acme.sh/${domain}_ecc")
+  [ -n "${CERT_DIR:-}" ] && roots+=("$CERT_DIR")
+  [ -n "${COMPOSE_DIR:-}" ] && roots+=("$COMPOSE_DIR")
   roots+=(
     "/etc/letsencrypt/live"
     "/root/.acme.sh"
-    "/www/server/panel/vhost/cert"
-    "/www/server/panel/ssl"
-    "/opt/1panel"
-    "/opt/1panel/resource/cert"
-    "/opt/1panel/docker/compose"
+    "/opt"
+    "/www"
+    "/data"
+    "/srv"
+    "/home"
     "/etc/ssl"
     "/root"
   )
 
   for root in "${roots[@]}"; do
-    [ -e "$root" ] || continue
-    if [ -d "$root" ]; then
-      pair="$(resolve_cert_pair_from_dir "$root" 2>/dev/null || true)"
-      [ -n "$pair" ] && printf '%s|%s\n' "$pair" "$root"
-      while IFS= read -r dir; do
-        pair="$(resolve_cert_pair_from_dir "$dir" 2>/dev/null || true)"
-        [ -n "$pair" ] && printf '%s|%s\n' "$pair" "$dir"
-      done < <(find "$root" -maxdepth 4 -type d 2>/dev/null)
-    fi
+    [ -d "$root" ] || continue
+    case "$root" in
+      /opt|/www|/data|/srv|/home|/root) depth=8 ;;
+      *) depth=5 ;;
+    esac
+
+    pair="$(resolve_cert_pair_from_dir "$root" 2>/dev/null || true)"
+    [ -n "$pair" ] && printf '%s|%s\n' "$pair" "$root"
+
+    while IFS= read -r dir; do
+      [ -n "$dir" ] || continue
+      pair="$(resolve_cert_pair_from_dir "$dir" 2>/dev/null || true)"
+      [ -n "$pair" ] && printf '%s|%s\n' "$pair" "$dir"
+    done < <(
+      find "$root" -maxdepth "$depth" -type f \
+        \( -name 'fullchain.pem' -o -name 'fullchain*.pem' -o -name '*fullchain*.cer' -o -name 'cert.pem' -o -name '*.crt' -o -name '*.cer' \) \
+        -printf '%h\n' 2>/dev/null | sort -u
+    )
   done | awk -F'|' '!seen[$1 "|" $2]++'
 }
 
 choose_cert_pair() {
   local domain="${1:-}"
+  local matched_pairs=()
+  local matched_labels=()
+  local other_pairs=()
+  local other_labels=()
   local pairs=()
   local labels=()
-  local line cert key dir choice
+  local line cert key dir choice i
 
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    pairs+=("$line")
     IFS='|' read -r cert key dir <<< "$line"
-    labels+=("$dir  ->  $(basename "$cert") / $(basename "$key")")
+    local pair_status fingerprint expiry_text
+    if cert_key_matches "$cert" "$key"; then
+      pair_status="公私钥匹配"
+    else
+      pair_status="公私钥不匹配或无法验证"
+    fi
+    fingerprint="$(cert_fingerprint_sha256 "$cert" 2>/dev/null || printf '无法读取')"
+    expiry_text="$(cert_expiry_text "$cert" 2>/dev/null || printf '无法读取')"
+    if [ -n "$domain" ] && cert_matches_host "$cert" "$domain"; then
+      matched_pairs+=("$line")
+      matched_labels+=("[匹配 $domain][$pair_status] $dir  ->  $(basename "$cert") / $(basename "$key")
+       证书：$cert
+       私钥：$key
+       SHA256：$fingerprint
+       到期：$expiry_text")
+    else
+      other_pairs+=("$line")
+      if [ -n "$domain" ]; then
+        other_labels+=("[不匹配或未验证 $domain][$pair_status] $dir  ->  $(basename "$cert") / $(basename "$key")
+       证书：$cert
+       私钥：$key
+       SHA256：$fingerprint
+       到期：$expiry_text")
+      else
+        other_labels+=("[未指定域名][$pair_status] $dir  ->  $(basename "$cert") / $(basename "$key")
+       证书：$cert
+       私钥：$key
+       SHA256：$fingerprint
+       到期：$expiry_text")
+      fi
+    fi
   done < <(find_cert_pairs "$domain")
+
+  pairs=("${matched_pairs[@]}" "${other_pairs[@]}")
+  labels=("${matched_labels[@]}" "${other_labels[@]}")
 
   if [ "${#pairs[@]}" -eq 0 ]; then
     warn "没有自动找到证书对。"
     return 1
   fi
 
-  choice="$(select_from_list "发现以下证书，请选择：" "${labels[@]}")" || return 1
-  local i
-  for i in "${!labels[@]}"; do
-    if [ "${labels[$i]}" = "$choice" ]; then
-      printf '%s\n' "${pairs[$i]}"
-      return 0
-    fi
+  printf '\n%s\n' "发现以下证书：" >&2
+  i=1
+  for line in "${labels[@]}"; do
+    printf '  %s) %s\n' "$i" "$line" >&2
+    i=$((i + 1))
   done
-  return 1
+  printf '\n不要直接回车，也不要只看目录名。请选择明确标注为“匹配”的证书。\n' >&2
+  printf '输入编号；输入 0 取消并返回：' >&2
+  IFS= read -r choice || choice="0"
+  choice="${choice:-0}"
+  case "$choice" in
+    0) return 1 ;;
+    *[!0-9]*) warn "无效编号，已取消。" >&2; return 1 ;;
+  esac
+  if [ "$choice" -lt 1 ] || [ "$choice" -gt "${#pairs[@]}" ]; then
+    warn "编号超出范围，已取消。" >&2
+    return 1
+  fi
+
+  line="${pairs[$((choice - 1))]}"
+  IFS='|' read -r cert key dir <<< "$line"
+  if [ -n "$domain" ] && ! cert_matches_host "$cert" "$domain"; then
+    warn "你选择的证书没有通过 $domain 域名匹配检查。" >&2
+    confirm "仍然继续使用这张证书？" || return 1
+  fi
+  printf '%s\n' "$line"
 }
 
 install_mailu_cert_pair() {
   local source_cert="$1"
   local source_key="$2"
   local restart_front="${3:-ask}"
+  local target_cert target_key
 
-  CERT_DIR="$(ask "Mailu 证书目录（容器 /certs 对应宿主机目录）" "${CERT_DIR:-/mailu/certs}")"
+  if [ -z "${CERT_DIR:-}" ]; then
+    CERT_DIR="$(ask "Mailu 宿主机证书目标目录（不是源证书目录；脚本会把文件复制到这里）" "/mailu/certs")"
+  fi
+  [ -d "$CERT_DIR" ] || printf '已识别/将使用 Mailu 目标目录：%s（不存在时会自动创建）\n' "$CERT_DIR"
   [ -f "$source_cert" ] || { fail "证书文件不存在：$source_cert"; return 1; }
   [ -f "$source_key" ] || { fail "私钥文件不存在：$source_key"; return 1; }
+  target_cert="$CERT_DIR/cert.pem"
+  target_key="$CERT_DIR/key.pem"
+
+  printf '\n将执行以下复制和改名：\n'
+  printf '  源证书：%s\n' "$source_cert"
+  printf '  源私钥：%s\n' "$source_key"
+  printf '  目标证书：%s\n' "$target_cert"
+  printf '  目标私钥：%s\n' "$target_key"
+  printf '  容器看到：/certs/cert.pem 和 /certs/key.pem\n'
+  [ -n "${MAIL_HOST:-}" ] && printf '  需要匹配的邮件主机：%s\n' "$MAIL_HOST"
+
+  show_cert_details "$source_cert" "$source_key" "${MAIL_HOST:-}" || return 1
+  if [ -n "${MAIL_HOST:-}" ] && ! cert_matches_host "$source_cert" "$MAIL_HOST"; then
+    fail "为避免邮件客户端证书报错，默认禁止复制不匹配 $MAIL_HOST 的证书。"
+    confirm "我确认知道风险，仍然继续复制？" "N" || return 1
+  fi
+  if ! cert_key_matches "$source_cert" "$source_key"; then
+    fail "证书和私钥不是一对，已停止复制。"
+    return 1
+  fi
+  confirm "确认复制这张证书到 Mailu？" "Y" || return 0
 
   safe_mkdir "$CERT_DIR" || return 1
-  backup_file "$CERT_DIR/cert.pem"
-  backup_file "$CERT_DIR/key.pem"
-  install -m 0644 "$source_cert" "$CERT_DIR/cert.pem"
-  install -m 0600 "$source_key" "$CERT_DIR/key.pem"
+  if [ "$(readlink -f "$source_cert" 2>/dev/null || printf '%s' "$source_cert")" != "$(readlink -f "$target_cert" 2>/dev/null || printf '%s' "$target_cert")" ]; then
+    backup_file "$target_cert"
+    install -m 0644 "$source_cert" "$target_cert"
+  else
+    chmod 0644 "$target_cert"
+  fi
+  if [ "$(readlink -f "$source_key" 2>/dev/null || printf '%s' "$source_key")" != "$(readlink -f "$target_key" 2>/dev/null || printf '%s' "$target_key")" ]; then
+    backup_file "$target_key"
+    install -m 0600 "$source_key" "$target_key"
+  else
+    chmod 0600 "$target_key"
+  fi
+
   ok "已复制并改名："
-  printf '  %s -> %s/cert.pem\n' "$source_cert" "$CERT_DIR"
-  printf '  %s -> %s/key.pem\n' "$source_key" "$CERT_DIR"
+  printf '  %s -> %s\n' "$source_cert" "$target_cert"
+  printf '  %s -> %s\n' "$source_key" "$target_key"
   save_config
 
-  if [ "$restart_front" = "yes" ] || { [ "$restart_front" = "ask" ] && confirm "是否现在重启 Mailu front？"; }; then
+  if [ "$restart_front" = "yes" ] || { [ "$restart_front" = "ask" ] && confirm "是否现在重启 Mailu front 让新证书生效？" "Y"; }; then
     dc restart front
   fi
+  printf '\n复制后的最终检查：\n'
+  check_certs || true
 }
 
 manual_cert_copy() {
   ensure_context || return 1
   local source input pair fullchain privkey
-  input="$(ask "请输入证书目录，或 fullchain/cert 文件路径" "")"
+  printf '\n手动复制只需要填写“源证书位置”；目标位置已经自动从 Mailu Compose 的 /certs 挂载中识别。\n'
+  show_cert_path_map "手动复制前的目录"
+  printf '源目录中通常应有：fullchain.pem + privkey.pem。\n'
+  printf '文件流向：源 fullchain.pem -> %s/cert.pem；源 privkey.pem -> %s/key.pem。\n' "${CERT_DIR:-/mailu/certs}" "${CERT_DIR:-/mailu/certs}"
+  input="$(ask "请输入源证书目录，或 fullchain/cert 文件完整路径" "${CERT_SOURCE_DIR:-}")"
   [ -n "$input" ] || { fail "路径不能为空"; return 1; }
 
   if [ -d "$input" ]; then
@@ -1553,6 +1906,7 @@ manual_cert_copy() {
     fullchain="$input"
     privkey="$(ask "请输入私钥 privkey/key 文件路径" "")"
   fi
+  CERT_SOURCE_DIR="$(dirname "$fullchain")"
   install_mailu_cert_pair "$fullchain" "$privkey" "ask"
 }
 
@@ -1560,89 +1914,377 @@ auto_find_and_copy_cert() {
   ensure_context || return 1
   load_env_defaults
   local domain pair fullchain privkey source_dir
-  domain="$(ask "要查找证书的域名" "${MAIL_HOST:-}")"
+  printf '\n%s\n' "${BOLD}搜索证书后手动选择${RESET}"
+  show_cert_path_map "搜索前的目录"
+  printf '脚本会显示每个候选的完整目录、证书文件、私钥文件、域名匹配、指纹和到期时间。\n'
+  printf '这里不会默认选第一个；只有你输入编号后才会复制。\n'
+  domain="$(ask "要验证的邮件主机名（留空则使用自动识别值）" "${MAIL_HOST:-}")"
+  domain="${domain:-${MAIL_HOST:-}}"
   pair="$(choose_cert_pair "$domain" || true)"
   if [ -z "$pair" ]; then
-    printf '你可以把证书目录直接输入到“指定目录/文件复制改名”。常见文件名是 fullchain.pem 和 privkey.pem。\n'
+    printf '已取消选择。你可以使用“手动指定源证书目录”，或使用菜单 1 自动诊断。\n'
     return 1
   fi
   IFS='|' read -r fullchain privkey source_dir <<< "$pair"
+  CERT_SOURCE_DIR="$source_dir"
   install_mailu_cert_pair "$fullchain" "$privkey" "ask"
+}
+
+auto_diagnose_and_fix_cert() {
+  ensure_context || return 1
+  load_env_defaults
+  local host target_cert target_key target_ok="no" target_fp="" target_expiry=0
+  local line cert key dir fp expiry expiry_text preferred
+  local best_cert="" best_key="" best_dir="" best_fp="" best_expiry=0 best_preferred=0
+  local valid_count=0 total_count=0
+  local -A fingerprint_count=()
+
+  host="${MAIL_HOST:-}"
+  CERT_DIR="${CERT_DIR:-/mailu/certs}"
+  target_cert="$CERT_DIR/cert.pem"
+  target_key="$CERT_DIR/key.pem"
+
+  printf '\n%s\n' "${BOLD}自动检查并修复 Mailu 证书${RESET}"
+  printf '脚本会自动完成：识别 Mailu 目标目录、检查现有证书、搜索常见证书目录、比较域名/指纹/有效期，并在需要时建议复制。\n'
+  printf '\n当前识别结果：\n'
+  printf '  邮件主机：%s\n' "${host:-未识别}"
+  printf '  Compose 文件：%s\n' "${COMPOSE_FILE:-未识别}"
+  printf '  宿主机证书目标目录：%s\n' "$CERT_DIR"
+  printf '  容器证书目录：/certs\n'
+  printf '  最终证书：%s\n' "$target_cert"
+  printf '  最终私钥：%s\n' "$target_key"
+
+  if [ -z "$host" ]; then
+    fail "没有识别到邮件主机名，无法判断证书是否匹配。"
+    host="$(ask "请输入邮件客户端实际连接的主机名" "")"
+    [ -n "$host" ] || return 1
+    MAIL_HOST="$host"
+  fi
+
+  printf '\n第一步：检查 Mailu 当前最终证书\n'
+  if [ -f "$target_cert" ] && [ -f "$target_key" ]; then
+    if cert_matches_host "$target_cert" "$host" && cert_key_matches "$target_cert" "$target_key"; then
+      target_ok="yes"
+      target_fp="$(cert_fingerprint_sha256 "$target_cert" || true)"
+      target_expiry="$(cert_expiry_epoch "$target_cert")"
+      ok "当前 cert.pem/key.pem 有效并匹配 $host"
+      printf '  当前指纹：%s\n' "${target_fp:-无法读取}"
+      printf '  当前到期：%s\n' "$(cert_expiry_text "$target_cert" || printf '无法读取')"
+    else
+      fail "当前 cert.pem/key.pem 不完整、不匹配主机名，或公私钥不匹配。"
+      show_cert_details "$target_cert" "$target_key" "$host" || true
+    fi
+  else
+    warn "Mailu 当前最终证书不完整："
+    [ -f "$target_cert" ] && printf '  已有：%s\n' "$target_cert" || printf '  缺少：%s\n' "$target_cert"
+    [ -f "$target_key" ] && printf '  已有：%s\n' "$target_key" || printf '  缺少：%s\n' "$target_key"
+  fi
+
+  printf '\n第二步：自动搜索证书源目录\n'
+  printf '会搜索 Mailu 目标目录、Compose 目录、/etc/letsencrypt、/root/.acme.sh、/www/server、/opt、/etc/ssl 等常见位置。\n'
+
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    total_count=$((total_count + 1))
+    IFS='|' read -r cert key dir <<< "$line"
+    printf '\n候选 %s：%s\n' "$total_count" "$dir"
+    printf '  证书：%s\n' "$cert"
+    printf '  私钥：%s\n' "$key"
+
+    if ! cert_key_matches "$cert" "$key"; then
+      warn "跳过：证书和私钥不匹配或无法验证。"
+      continue
+    fi
+    if ! cert_matches_host "$cert" "$host"; then
+      warn "跳过：证书不匹配当前邮件主机 $host。"
+      continue
+    fi
+
+    fp="$(cert_fingerprint_sha256 "$cert" || true)"
+    expiry="$(cert_expiry_epoch "$cert")"
+    expiry_text="$(cert_expiry_text "$cert" || printf '无法读取')"
+    preferred=0
+    case "$(basename "$cert")|$(basename "$key")" in
+      fullchain.pem\|privkey.pem|fullchain*.pem\|privkey*.pem) preferred=1 ;;
+    esac
+
+    valid_count=$((valid_count + 1))
+    [ -n "$fp" ] && fingerprint_count["$fp"]=$(( ${fingerprint_count["$fp"]:-0} + 1 ))
+    ok "可用：匹配 $host，证书与私钥一致"
+    printf '  SHA256 指纹：%s\n' "${fp:-无法读取}"
+    printf '  到期时间：%s\n' "$expiry_text"
+
+    if [ -z "$best_cert" ] || [ "$expiry" -gt "$best_expiry" ] || { [ "$expiry" -eq "$best_expiry" ] && [ "$preferred" -gt "$best_preferred" ]; }; then
+      best_cert="$cert"
+      best_key="$key"
+      best_dir="$dir"
+      best_fp="$fp"
+      best_expiry="$expiry"
+      best_preferred="$preferred"
+    fi
+  done < <(find_cert_pairs "$host")
+
+  printf '\n第三步：自动判断\n'
+  printf '  共发现候选：%s 对\n' "$total_count"
+  printf '  通过域名和公私钥检查：%s 对\n' "$valid_count"
+
+  if [ "$valid_count" -eq 0 ]; then
+    if [ "$target_ok" = "yes" ]; then
+      ok "虽然没有找到其他源证书，但 Mailu 当前证书已经正确，无需复制。"
+      if confirm "是否重启 Mailu front 重新加载当前证书？"; then
+        dc restart front
+      fi
+      return 0
+    fi
+    fail "没有找到匹配 $host 的可用证书。"
+    printf '请使用菜单 3 手动指定源证书目录，或先让证书管理工具生成 fullchain.pem 和 privkey.pem。\n'
+    return 1
+  fi
+
+  if [ -n "$best_fp" ] && [ "${fingerprint_count["$best_fp"]:-0}" -gt 1 ]; then
+    ok "检测到 ${fingerprint_count["$best_fp"]} 个目录中的证书 SHA256 指纹相同。"
+    printf '这些目录中的证书内容相同，一次性复制时任选其中一份效果相同；脚本已自动选择文件名更标准或有效期更合适的来源。\n'
+  fi
+
+  printf '自动选出的最佳来源：\n'
+  printf '  源目录：%s\n' "$best_dir"
+  printf '  源证书：%s\n' "$best_cert"
+  printf '  源私钥：%s\n' "$best_key"
+  printf '  源指纹：%s\n' "${best_fp:-无法读取}"
+  printf '  源到期：%s\n' "$(cert_expiry_text "$best_cert" || printf '无法读取')"
+  printf '  目标证书：%s\n' "$target_cert"
+  printf '  目标私钥：%s\n' "$target_key"
+  CERT_SOURCE_DIR="$best_dir"
+  save_config
+
+  if [ "$target_ok" = "yes" ] && [ -n "$target_fp" ] && [ "$target_fp" = "$best_fp" ]; then
+    ok "Mailu 当前证书与自动找到的最佳源证书完全相同，无需再次复制。"
+    if confirm "是否重启 Mailu front 重新加载当前证书？"; then
+      dc restart front
+    fi
+    return 0
+  fi
+
+  if [ "$target_ok" = "yes" ] && [ "$target_expiry" -gt "$best_expiry" ]; then
+    ok "Mailu 当前证书的到期时间比搜索到的源证书更晚，保留当前证书。"
+    return 0
+  fi
+
+  warn "Mailu 当前证书需要补齐或更新。"
+  install_mailu_cert_pair "$best_cert" "$best_key" "ask"
 }
 
 write_panel_cert_hook() {
   ensure_context || return 1
-  local source_dir hook_path
-  source_dir="$(ask "面板证书目录（后置脚本运行时所在目录；不知道可填证书实际目录）" "")"
-  [ -n "$source_dir" ] || source_dir="$COMPOSE_DIR"
-  hook_path="$(ask "后置脚本保存路径" "$source_dir/update-mailu-cert.sh")"
+  load_env_defaults
+  local hook_path pair fullchain="" privkey="" selected_source=""
+  CERT_STAGE_DIR="${CERT_STAGE_DIR:-${COMPOSE_DIR:-/mailu}/cert-deploy}"
+
+  printf '\n%s\n' "${BOLD}生成证书续期后置脚本（目录1 -> 目录2 -> 目录3）${RESET}"
+  printf '正确流程分成三层：\n'
+  printf '  目录1：证书管理工具保存原证书的位置，续期后原文件先在这里更新。\n'
+  printf '  目录2：本地部署/中转目录，由证书管理工具把目录1的证书复制到这里。\n'
+  printf '  目录3：Mailu 的 /certs 宿主机挂载目录，后置脚本把目录2复制并改名到这里。\n'
+  printf '也就是说：证书管理工具负责“目录1 -> 目录2”，本 helper 生成的后置脚本负责“目录2 -> 目录3”。\n'
+
+  pair="$(best_matching_cert_pair "${MAIL_HOST:-}" yes "$CERT_STAGE_DIR" || true)"
+  if [ -n "$pair" ]; then
+    IFS='|' read -r fullchain privkey selected_source <<< "$pair"
+    CERT_SOURCE_DIR="$selected_source"
+    show_selected_source_details "$pair" "目录1：自动找到的原证书"
+  else
+    warn "当前还没有自动找到同时匹配邮件主机的原证书。"
+    CERT_SOURCE_DIR="$(ask "目录1：原证书目录（只用于识别和首次初始化）" "${CERT_SOURCE_DIR:-}")"
+    if [ -n "$CERT_SOURCE_DIR" ]; then
+      pair="$(resolve_cert_pair_from_dir "$CERT_SOURCE_DIR" 2>/dev/null || true)"
+      if [ -n "$pair" ]; then
+        IFS='|' read -r fullchain privkey <<< "$pair"
+        pair="$fullchain|$privkey|$CERT_SOURCE_DIR"
+        show_selected_source_details "$pair" "目录1：手动指定的原证书"
+      fi
+    fi
+  fi
+
+  CERT_STAGE_DIR="$(ask "目录2：证书管理工具复制/部署证书的本地目录" "$CERT_STAGE_DIR")"
+  while [ -z "$CERT_STAGE_DIR" ] || { [ -n "${CERT_DIR:-}" ] && [ "$(readlink -f "$CERT_STAGE_DIR" 2>/dev/null || printf '%s' "$CERT_STAGE_DIR")" = "$(readlink -f "$CERT_DIR" 2>/dev/null || printf '%s' "$CERT_DIR")" ]; }; do
+    warn "目录2不能为空，也不能和目录3相同。目录2应是独立的本地中转目录。"
+    CERT_STAGE_DIR="$(ask "请重新填写目录2" "${COMPOSE_DIR:-/mailu}/cert-deploy")"
+  done
+
+  show_cert_path_map "三个目录的最终规划" "$CERT_SOURCE_DIR"
+  printf '\n实际文件流向：\n'
+  printf '  目录1：%s/{fullchain.pem,privkey.pem}\n' "${CERT_SOURCE_DIR:-由证书管理工具内部保存}"
+  printf '      ↓ 证书管理工具复制/部署\n'
+  printf '  目录2：%s/{fullchain.pem,privkey.pem}\n' "$CERT_STAGE_DIR"
+  printf '      ↓ 后置脚本复制并改名\n'
+  printf '  目录3：%s/{cert.pem,key.pem} -> 容器 /certs/{cert.pem,key.pem}\n' "$CERT_DIR"
+
+  if [ -n "$fullchain" ] && [ -n "$privkey" ] && [ -f "$fullchain" ] && [ -f "$privkey" ]; then
+    if confirm "是否现在先把目录1的当前证书复制到目录2，方便立即测试？" "Y"; then
+      safe_mkdir "$CERT_STAGE_DIR" || return 1
+      install -m 0644 "$fullchain" "$CERT_STAGE_DIR/fullchain.pem"
+      install -m 0600 "$privkey" "$CERT_STAGE_DIR/privkey.pem"
+      ok "目录2已初始化："
+      printf '  %s -> %s/fullchain.pem\n' "$fullchain" "$CERT_STAGE_DIR"
+      printf '  %s -> %s/privkey.pem\n' "$privkey" "$CERT_STAGE_DIR"
+    fi
+  else
+    warn "目录1没有可用于首次初始化的证书；可以先生成后置脚本，之后让证书管理工具部署到目录2。"
+  fi
+
+  hook_path="$(ask "后置脚本保存路径（脚本文件位置，不是目录1/2/3）" "${CERT_UPDATE_SCRIPT:-${COMPOSE_DIR:-/mailu}/update-mailu-cert.sh}")"
   safe_mkdir "$(dirname "$hook_path")" || return 1
-  CERT_DIR="$(ask "Mailu 证书目录" "${CERT_DIR:-/mailu/certs}")"
 
   cat > "$hook_path" <<EOF
 #!/usr/bin/env bash
 # Generated by mailu-helper.sh
-set -e
+set -euo pipefail
 
-SOURCE_DIR="\${1:-\$(pwd)}"
-[ -d "\$SOURCE_DIR" ] || SOURCE_DIR="$source_dir"
+# 目录1只由证书管理工具管理；本脚本不修改目录1。
+ORIGINAL_DIR="$CERT_SOURCE_DIR"
+# 目录2由证书管理工具在续期后写入 fullchain.pem/privkey.pem。
+DEPLOY_DIR="$CERT_STAGE_DIR"
+# 目录3是 Mailu /certs 的宿主机挂载目录。
+TARGET_DIR="$CERT_DIR"
+MAIL_HOST="$MAIL_HOST"
+COMPOSE_DIR="$COMPOSE_DIR"
+COMPOSE_FILE="$COMPOSE_FILE"
+ENV_FILE="$ENV_FILE"
 
-find_pair() {
+find_pair_in_dir() {
   local dir="\$1"
+  [ -d "\$dir" ] || return 1
   if [ -f "\$dir/fullchain.pem" ] && [ -f "\$dir/privkey.pem" ]; then
-    printf '%s|%s\n' "\$dir/fullchain.pem" "\$dir/privkey.pem"
+    printf '%s|%s' "\$dir/fullchain.pem" "\$dir/privkey.pem"
+  elif [ -f "\$dir/fullchain.cer" ] && [ -f "\$dir/privkey.pem" ]; then
+    printf '%s|%s' "\$dir/fullchain.cer" "\$dir/privkey.pem"
   elif [ -f "\$dir/cert.pem" ] && [ -f "\$dir/key.pem" ]; then
-    printf '%s|%s\n' "\$dir/cert.pem" "\$dir/key.pem"
+    printf '%s|%s' "\$dir/cert.pem" "\$dir/key.pem"
   else
     return 1
   fi
 }
 
-PAIR="\$(find_pair "\$SOURCE_DIR" || true)"
+pair_is_valid() {
+  local pair="\$1" cert key cert_hash key_hash
+  cert="\${pair%%|*}"
+  key="\${pair#*|}"
+  [ -f "\$cert" ] && [ -f "\$key" ] || return 1
+  if command -v openssl >/dev/null 2>&1; then
+    openssl x509 -in "\$cert" -noout -checkend 0 >/dev/null 2>&1 || return 1
+    [ -z "\$MAIL_HOST" ] || openssl x509 -in "\$cert" -noout -checkhost "\$MAIL_HOST" >/dev/null 2>&1 || return 1
+    cert_hash="\$(openssl x509 -in "\$cert" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print \$1}')"
+    key_hash="\$(openssl pkey -in "\$key" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print \$1}')"
+    [ -n "\$cert_hash" ] && [ "\$cert_hash" = "\$key_hash" ] || return 1
+  fi
+}
+
+# 第一个参数可显式指定目录2；没有参数时优先使用预设目录2，再尝试当前执行目录。
+SOURCE_ARG="\${1:-}"
+PAIR=""
+for dir in "\$SOURCE_ARG" "\$DEPLOY_DIR" "\$(pwd)"; do
+  [ -n "\$dir" ] || continue
+  candidate="\$(find_pair_in_dir "\$dir" 2>/dev/null || true)"
+  if [ -n "\$candidate" ] && pair_is_valid "\$candidate"; then
+    PAIR="\$candidate"
+    break
+  fi
+done
+
 if [ -z "\$PAIR" ]; then
-  echo "No certificate pair found in \$SOURCE_DIR"
-  echo "Expected fullchain.pem + privkey.pem, or cert.pem + key.pem"
+  echo "目录2中没有找到匹配且公私钥一致的证书。"
+  echo "目录1（仅供参考）：\$ORIGINAL_DIR"
+  echo "目录2（脚本读取）：\$DEPLOY_DIR"
+  echo "目录3（Mailu 目标）：\$TARGET_DIR"
+  echo "请确认目录2中存在 fullchain.pem 和 privkey.pem。"
   exit 1
 fi
 
 CERT="\${PAIR%%|*}"
 KEY="\${PAIR#*|}"
-mkdir -p "$CERT_DIR"
-install -m 0644 "\$CERT" "$CERT_DIR/cert.pem"
-install -m 0600 "\$KEY" "$CERT_DIR/key.pem"
+mkdir -p "\$TARGET_DIR"
+install -m 0644 "\$CERT" "\$TARGET_DIR/cert.pem"
+install -m 0600 "\$KEY" "\$TARGET_DIR/key.pem"
 
-cd "$COMPOSE_DIR"
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" restart front
+cd "\$COMPOSE_DIR"
+if [ -n "\$ENV_FILE" ] && [ -f "\$ENV_FILE" ]; then
+  docker compose --env-file "\$ENV_FILE" -f "\$COMPOSE_FILE" restart front
+else
+  docker compose -f "\$COMPOSE_FILE" restart front
+fi
 
-echo "Mailu certificate updated: \$CERT -> $CERT_DIR/cert.pem"
+echo "Mailu 证书已更新。"
+echo "目录1 原证书目录（由证书管理工具负责）：\$ORIGINAL_DIR"
+echo "目录2 读取证书：\$CERT"
+echo "目录2 读取私钥：\$KEY"
+echo "目录3 Mailu 证书：\$TARGET_DIR/cert.pem"
+echo "目录3 Mailu 私钥：\$TARGET_DIR/key.pem"
 EOF
   chmod +x "$hook_path"
   CERT_UPDATE_SCRIPT="$hook_path"
   save_config
-  ok "已生成面板后置脚本：$hook_path"
-  printf '\n有面板时这样用：\n'
-  printf '  1. 在 1Panel / 宝塔 / acme.sh / certbot 里申请或续签证书。\n'
-  printf '  2. 把这个脚本路径填到“证书更新后执行脚本/后置脚本”：\n'
-  printf '     %s\n' "$hook_path"
-  printf '  3. 如果面板支持传入证书目录，就传证书目录；否则脚本会使用你刚才填的默认目录。\n'
+  ok "已生成后置脚本：$hook_path"
+
+  printf '\n%s\n' "${BOLD}证书管理工具里这样填写${RESET}"
+  printf '1. 目录1“原证书目录”：%s\n' "${CERT_SOURCE_DIR:-由证书管理工具内部维护，不需要手动改}"
+  printf '   目录1只保存原始证书，通常不要直接改名、覆盖或让 Mailu 使用。\n'
+  printf '2. “证书复制目录/部署目录/推送目录”：填写目录2：%s\n' "$CERT_STAGE_DIR"
+  printf '   证书管理工具续期后应把 fullchain.pem 和 privkey.pem 复制到目录2。\n'
+  printf '3. “续期后执行脚本/后置脚本路径”：填写：%s\n' "$hook_path"
+  printf '4. 如果只有“执行命令”输入框：填写：bash %s %s\n' "$hook_path" "$CERT_STAGE_DIR"
+  printf '5. 如果只有“脚本内容”输入框：复制下面完整脚本内容，不要只填路径。\n'
+  printf '6. 目录3由 helper 从 Mailu Compose 自动识别：%s\n' "$CERT_DIR"
+  printf '   后置脚本会执行：目录2/fullchain.pem -> 目录3/cert.pem；目录2/privkey.pem -> 目录3/key.pem。\n'
+
+  printf '\n可以先手动测试一次：\n'
+  printf '  bash %s %s\n' "$hook_path" "$CERT_STAGE_DIR"
+  printf '\n完整脚本内容：\n%s\n' '------------------------------------------------------------'
+  cat "$hook_path"
+  printf '%s\n' '------------------------------------------------------------'
 }
 
 write_cert_watcher() {
   ensure_context || return 1
   load_env_defaults
-  local watch_dir watcher interval
-  watch_dir="$(ask "要监控的证书目录；留空则自动寻找" "")"
-  interval="$(ask "检查间隔秒数" "300")"
-  watcher="$(ask "监控脚本保存路径" "$COMPOSE_DIR/watch-mailu-cert.sh")"
-  CERT_DIR="$(ask "Mailu 证书目录" "${CERT_DIR:-/mailu/certs}")"
+  local watch_dir watcher interval pair fullchain privkey source_dir
+  CERT_STAGE_DIR="${CERT_STAGE_DIR:-${COMPOSE_DIR:-/mailu}/cert-stage}"
+
+  printf '\n%s\n' "${BOLD}生成证书自动监控脚本（没有续期后置功能时使用）${RESET}"
+  printf '这个选项适合证书工具无法在续期后执行脚本的情况。\n'
+  printf '监控脚本会按“目录1 -> 目录2 -> 目录3”同步证书，内容改变后重启 Mailu front。\n'
+  show_cert_path_map "生成前自动识别的目录"
+
+  pair="$(best_matching_cert_pair "${MAIL_HOST:-}" yes "$CERT_STAGE_DIR" || true)"
+  if [ -n "$pair" ]; then
+    IFS='|' read -r fullchain privkey source_dir <<< "$pair"
+    CERT_SOURCE_DIR="$source_dir"
+    show_selected_source_details "$pair" "自动找到的监控源"
+  else
+    warn "没有自动找到可续期的源证书目录。"
+    CERT_SOURCE_DIR="$(ask "目录1：要监控的原证书目录（应有 fullchain.pem 和 privkey.pem）" "${CERT_SOURCE_DIR:-${CERT_DIR:-/mailu/certs}}")"
+  fi
+
+  CERT_STAGE_DIR="$(ask "目录2：本地中转目录（回车使用自动目录）" "$CERT_STAGE_DIR")"
+  while [ -n "$CERT_STAGE_DIR" ] && [ -n "${CERT_DIR:-}" ] && [ "$(readlink -f "$CERT_STAGE_DIR" 2>/dev/null || printf '%s' "$CERT_STAGE_DIR")" = "$(readlink -f "$CERT_DIR" 2>/dev/null || printf '%s' "$CERT_DIR")" ]; do
+    warn "目录2不能和目录3相同，否则无法看清中转过程。"
+    CERT_STAGE_DIR="$(ask "请重新填写目录2：本地中转目录" "${COMPOSE_DIR:-/mailu}/cert-stage")"
+  done
+
+  interval="$(ask "检查间隔秒数（通常无需修改）" "300")"
+  case "$interval" in
+    ''|*[!0-9]*) warn "间隔无效，已改用 300 秒"; interval=300 ;;
+  esac
+  [ "$interval" -ge 30 ] || { warn "最短按 30 秒处理"; interval=30; }
+  watcher="$(ask "监控脚本保存路径（不是证书目录）" "${CERT_WATCHER_SCRIPT:-${COMPOSE_DIR:-/mailu}/watch-mailu-cert.sh}")"
   safe_mkdir "$(dirname "$watcher")" || return 1
 
   cat > "$watcher" <<EOF
 #!/usr/bin/env bash
 # Generated by mailu-helper.sh
-set -e
+set -u
 
-WATCH_DIR="$watch_dir"
+SOURCE_HINT="$CERT_SOURCE_DIR"
+STAGE_DIR="$CERT_STAGE_DIR"
 MAIL_HOST="$MAIL_HOST"
 TARGET_CERT="$CERT_DIR/cert.pem"
 TARGET_KEY="$CERT_DIR/key.pem"
@@ -1650,55 +2292,95 @@ COMPOSE_DIR="$COMPOSE_DIR"
 COMPOSE_FILE="$COMPOSE_FILE"
 ENV_FILE="$ENV_FILE"
 INTERVAL="$interval"
-STATE_FILE="$COMPOSE_DIR/.mailu-cert-watch.sha256"
+STATE_FILE="${COMPOSE_DIR:-/mailu}/.mailu-cert-watch.sha256"
 
 find_pair_in_dir() {
   local dir="\$1"
+  [ -d "\$dir" ] || return 1
   if [ -f "\$dir/fullchain.pem" ] && [ -f "\$dir/privkey.pem" ]; then
-    printf '%s|%s\n' "\$dir/fullchain.pem" "\$dir/privkey.pem"
-  elif [ -f "\$dir/cert.pem" ] && [ -f "\$dir/key.pem" ]; then
-    printf '%s|%s\n' "\$dir/cert.pem" "\$dir/key.pem"
-  elif [ -n "\$MAIL_HOST" ] && [ -f "\$dir/\$MAIL_HOST.cer" ] && [ -f "\$dir/\$MAIL_HOST.key" ]; then
-    printf '%s|%s\n' "\$dir/\$MAIL_HOST.cer" "\$dir/\$MAIL_HOST.key"
+    printf '%s|%s' "\$dir/fullchain.pem" "\$dir/privkey.pem"
+  elif [ -f "\$dir/fullchain.cer" ] && [ -f "\$dir/privkey.pem" ]; then
+    printf '%s|%s' "\$dir/fullchain.cer" "\$dir/privkey.pem"
   else
     return 1
   fi
 }
 
-auto_find_pair() {
-  local root dir pair
-  for root in "\$WATCH_DIR" "/etc/letsencrypt/live/\$MAIL_HOST" "/root/.acme.sh/\$MAIL_HOST" "/root/.acme.sh/\${MAIL_HOST}_ecc" "/www/server/panel/vhost/cert" "/www/server/panel/ssl" "/opt/1panel" "/etc/letsencrypt/live"; do
+pair_is_valid() {
+  local pair="\$1" cert key cert_hash key_hash
+  cert="\${pair%%|*}"
+  key="\${pair#*|}"
+  [ -f "\$cert" ] && [ -f "\$key" ] || return 1
+  command -v openssl >/dev/null 2>&1 || return 0
+  openssl x509 -in "\$cert" -noout -checkend 0 >/dev/null 2>&1 || return 1
+  [ -z "\$MAIL_HOST" ] || openssl x509 -in "\$cert" -noout -checkhost "\$MAIL_HOST" >/dev/null 2>&1 || return 1
+  cert_hash="\$(openssl x509 -in "\$cert" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print \$1}')"
+  key_hash="\$(openssl pkey -in "\$key" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print \$1}')"
+  [ -n "\$cert_hash" ] && [ "\$cert_hash" = "\$key_hash" ]
+}
+
+find_best_pair() {
+  local root dir pair cert expiry best_pair="" best_expiry=0
+  for root in "\$SOURCE_HINT" /etc/letsencrypt/live /root/.acme.sh /opt /www /data /srv /home; do
     [ -n "\$root" ] && [ -d "\$root" ] || continue
     pair="\$(find_pair_in_dir "\$root" 2>/dev/null || true)"
-    [ -n "\$pair" ] && { printf '%s\n' "\$pair"; return 0; }
+    if [ -n "\$pair" ] && pair_is_valid "\$pair"; then
+      cert="\${pair%%|*}"
+      expiry="\$(date -d "\$(openssl x509 -in "\$cert" -noout -enddate 2>/dev/null | cut -d= -f2-)" +%s 2>/dev/null || printf '0')"
+      if [ -z "\$best_pair" ] || [ "\$expiry" -gt "\$best_expiry" ]; then best_pair="\$pair"; best_expiry="\$expiry"; fi
+    fi
     while IFS= read -r dir; do
       pair="\$(find_pair_in_dir "\$dir" 2>/dev/null || true)"
-      [ -n "\$pair" ] && { printf '%s\n' "\$pair"; return 0; }
-    done < <(find "\$root" -maxdepth 4 -type d 2>/dev/null)
+      [ -n "\$pair" ] && pair_is_valid "\$pair" || continue
+      cert="\${pair%%|*}"
+      expiry="\$(date -d "\$(openssl x509 -in "\$cert" -noout -enddate 2>/dev/null | cut -d= -f2-)" +%s 2>/dev/null || printf '0')"
+      if [ -z "\$best_pair" ] || [ "\$expiry" -gt "\$best_expiry" ]; then best_pair="\$pair"; best_expiry="\$expiry"; fi
+    done < <(find "\$root" -maxdepth 8 -type d 2>/dev/null)
   done
-  return 1
+  [ -n "\$best_pair" ] || return 1
+  printf '%s' "\$best_pair"
 }
 
 copy_if_changed() {
-  local pair cert key current last
-  pair="\$(auto_find_pair || true)"
+  local pair cert key current target_current STAGE_CERT STAGE_KEY
+  pair="\$(find_best_pair || true)"
   if [ -z "\$pair" ]; then
-    echo "\$(date '+%F %T') no certificate pair found"
+    echo "\$(date '+%F %T') 没有找到匹配且公私钥一致的源证书；预设源目录：\$SOURCE_HINT"
     return 0
   fi
   cert="\${pair%%|*}"
   key="\${pair#*|}"
   current="\$(sha256sum "\$cert" "\$key" | sha256sum | awk '{print \$1}')"
-  last="\$(cat "\$STATE_FILE" 2>/dev/null || true)"
-  if [ "\$current" != "\$last" ]; then
-    mkdir -p "$(dirname "$CERT_DIR/cert.pem")"
-    install -m 0644 "\$cert" "\$TARGET_CERT"
-    install -m 0600 "\$key" "\$TARGET_KEY"
-    printf '%s\n' "\$current" > "\$STATE_FILE"
-    cd "\$COMPOSE_DIR"
-    docker compose --env-file "\$ENV_FILE" -f "\$COMPOSE_FILE" restart front
-    echo "\$(date '+%F %T') updated Mailu certificate from \$cert"
+  target_current="\$(cat "\$STATE_FILE" 2>/dev/null || true)"
+  if [ "\$current" = "\$target_current" ] && [ -f "\$TARGET_CERT" ] && [ -f "\$TARGET_KEY" ]; then
+    return 0
   fi
+
+  STAGE_CERT="\$STAGE_DIR/fullchain.pem"
+  STAGE_KEY="\$STAGE_DIR/privkey.pem"
+  mkdir -p "\$STAGE_DIR" "\$(dirname "\$TARGET_CERT")"
+  install -m 0644 "\$cert" "\$STAGE_CERT"
+  install -m 0600 "\$key" "\$STAGE_KEY"
+  if ! pair_is_valid "\$STAGE_CERT|\$STAGE_KEY"; then
+    echo "目录2中的证书与私钥检查失败：\$STAGE_DIR"
+    return 0
+  fi
+  install -m 0644 "\$STAGE_CERT" "\$TARGET_CERT"
+  install -m 0600 "\$STAGE_KEY" "\$TARGET_KEY"
+  printf '%s\n' "\$current" > "\$STATE_FILE"
+  cd "\$COMPOSE_DIR"
+  if [ -n "\$ENV_FILE" ] && [ -f "\$ENV_FILE" ]; then
+    docker compose --env-file "\$ENV_FILE" -f "\$COMPOSE_FILE" restart front
+  else
+    docker compose -f "\$COMPOSE_FILE" restart front
+  fi
+  echo "\$(date '+%F %T') 已更新 Mailu 证书"
+  echo "  目录1 原证书：\$cert"
+  echo "  目录1 原私钥：\$key"
+  echo "  目录2 中转证书：\$STAGE_CERT"
+  echo "  目录2 中转私钥：\$STAGE_KEY"
+  echo "  目录3 Mailu 证书：\$TARGET_CERT"
+  echo "  目录3 Mailu 私钥：\$TARGET_KEY"
 }
 
 while true; do
@@ -1707,18 +2389,23 @@ while true; do
 done
 EOF
   chmod +x "$watcher"
-  CERT_UPDATE_SCRIPT="$watcher"
+  CERT_WATCHER_SCRIPT="$watcher"
   save_config
-  ok "已生成无面板证书监控脚本：$watcher"
-  printf '\n无面板时这样用：\n'
-  printf '  临时运行：nohup %s >/var/log/mailu-cert-watch.log 2>&1 &\n' "$watcher"
-  printf '  它会循环查找证书，一旦发现 fullchain/privkey 变化，就复制为 %s/cert.pem 和 %s/key.pem，并重启 front。\n' "$CERT_DIR" "$CERT_DIR"
+  ok "已生成证书监控脚本：$watcher"
+  printf '\n自动识别并写入的路径：\n'
+  printf '  目录1 原证书目录：%s\n' "$CERT_SOURCE_DIR"
+  printf '  目录2 本地中转目录：%s\n' "$CERT_STAGE_DIR"
+  printf '  目录3 Mailu 目标目录：%s\n' "$CERT_DIR"
+  printf '  监控脚本：%s\n' "$watcher"
+  printf '  检查间隔：%s 秒\n' "$interval"
+  printf '  日志查看：journalctl -u %s -f\n' "${CERT_WATCHER_SERVICE:-mailu-cert-watch.service}"
+  printf '\n注意：如果已经使用选项 4 的续期后置脚本，就不需要再运行此监控服务。\n'
   if need_cmd systemctl; then
-    if confirm "是否安装为 systemd 常驻服务？"; then
+    if confirm "是否现在自动安装并启动 systemd 常驻服务？" "Y"; then
       install_cert_watcher_service "$watcher"
     fi
   else
-    warn "当前系统没有 systemctl，不能自动安装常驻服务；可使用上面的 nohup 命令临时后台运行。"
+    warn "当前系统没有 systemctl，不能安装常驻服务。可临时运行：nohup $watcher >/var/log/mailu-cert-watch.log 2>&1 &"
   fi
 }
 
@@ -1734,11 +2421,11 @@ require_root_for_systemd() {
 }
 
 install_cert_watcher_service() {
-  local watcher="${1:-${CERT_UPDATE_SCRIPT:-}}"
+  local watcher="${1:-${CERT_WATCHER_SCRIPT:-}}"
   local service_file bash_path
   require_root_for_systemd || return 1
   need_cmd systemctl || { fail "未找到 systemctl"; return 1; }
-  [ -n "$watcher" ] && [ -f "$watcher" ] || { fail "监控脚本不存在，请先生成无面板证书监控脚本。"; return 1; }
+  [ -n "$watcher" ] && [ -f "$watcher" ] || { fail "监控脚本不存在，请先使用证书菜单 5 生成监控脚本。"; return 1; }
 
   CERT_WATCHER_SERVICE="$(ask "systemd 服务名" "${CERT_WATCHER_SERVICE:-mailu-cert-watch.service}")"
   case "$CERT_WATCHER_SERVICE" in
@@ -1812,26 +2499,46 @@ uninstall_cert_watcher_service() {
 }
 
 manage_cert_watcher_service() {
-  load_config
+  ensure_context || return 1
   while true; do
     printf '\n%s\n' "${BOLD}证书监控常驻服务${RESET}"
-    printf '说明：主脚本不常驻；只有这里安装的证书监控服务会持续运行。\n'
-    printf '1. 安装/覆盖 systemd 服务\n'
+    printf '用途：只负责让“选项 5 生成的监控脚本”长期运行；它不申请证书，也不生成证书。\n'
+    printf '如果已经使用选项 4 的续期后置脚本，就不需要安装这个服务。\n'
+    show_cert_path_map "服务管理自动识别结果"
+    printf '  选项 4 后置脚本：%s%s\n' "${CERT_UPDATE_SCRIPT:-未生成}" "$([ -n "${CERT_UPDATE_SCRIPT:-}" ] && [ -f "$CERT_UPDATE_SCRIPT" ] && printf '（存在）' || true)"
+    printf '  选项 5 监控脚本：%s%s\n' "${CERT_WATCHER_SCRIPT:-未生成}" "$([ -n "${CERT_WATCHER_SCRIPT:-}" ] && [ -f "$CERT_WATCHER_SCRIPT" ] && printf '（存在）' || true)"
+    printf '  systemd 服务文件：%s\n' "$(cert_watcher_service_file)"
+    printf '\n1. 安装/覆盖 systemd 服务（自动使用选项 5 的脚本）\n'
     printf '2. 启动/重启服务\n'
     printf '3. 停止服务\n'
-    printf '4. 查看状态\n'
-    printf '5. 卸载服务\n'
+    printf '4. 查看状态和最近日志\n'
+    printf '5. 卸载服务（不会删除证书和监控脚本）\n'
     printf '0. 返回\n'
     local choice watcher
     choice="$(read_menu_choice)"
     case "$choice" in
       1)
-        watcher="$(ask "监控脚本路径" "${CERT_UPDATE_SCRIPT:-$COMPOSE_DIR/watch-mailu-cert.sh}")"
-        install_cert_watcher_service "$watcher"
+        watcher="${CERT_WATCHER_SCRIPT:-}"
+        if [ -z "$watcher" ] || [ ! -f "$watcher" ]; then
+          warn "没有找到选项 5 生成的监控脚本。"
+          watcher="$(ask "监控脚本完整路径；不知道请返回并先选择证书菜单 5" "${COMPOSE_DIR:-/mailu}/watch-mailu-cert.sh")"
+        fi
+        if [ -f "$watcher" ]; then
+          CERT_WATCHER_SCRIPT="$watcher"
+          install_cert_watcher_service "$watcher"
+        else
+          fail "监控脚本不存在：$watcher"
+        fi
         ;;
       2) start_cert_watcher_service ;;
       3) stop_cert_watcher_service ;;
-      4) cert_watcher_service_status ;;
+      4)
+        cert_watcher_service_status
+        if need_cmd journalctl; then
+          printf '\n最近 30 行日志：\n'
+          journalctl -u "${CERT_WATCHER_SERVICE:-mailu-cert-watch.service}" -n 30 --no-pager 2>/dev/null || true
+        fi
+        ;;
       5) uninstall_cert_watcher_service ;;
       0) return 0 ;;
       *) warn "无效选择" ;;
@@ -1842,37 +2549,77 @@ manage_cert_watcher_service() {
 
 show_cert_guidance() {
   ensure_context || return 1
-  printf '\n%s\n' "${BOLD}证书使用提醒${RESET}"
-  printf 'Mailu 邮件 TLS 需要容器 /certs 里有：\n'
-  printf '  cert.pem  权限 0644\n'
-  printf '  key.pem   权限 0600\n'
-  printf '当前宿主机目录：%s\n\n' "${CERT_DIR:-未识别}"
-  printf '有面板：先在面板申请/续签证书，然后把“生成面板后置脚本”的路径填到证书更新后执行脚本。\n'
-  printf '无面板：用“生成无面板自动监控脚本”，脚本会定时找证书，发现更新就复制改名并重启 Mailu front。\n'
-  printf '手动：用“指定目录/文件复制改名”，把 fullchain.pem/privkey.pem 或 cert.pem/key.pem 复制到 Mailu 证书目录。\n'
+  load_env_defaults
+  printf '\n%s\n' "${BOLD}证书小白说明：源目录、目标目录、容器目录${RESET}"
+  show_cert_path_map "当前自动识别结果"
+
+  printf '\n一、自动续期要记住三个目录\n'
+  printf '  目录1：证书管理工具保存原证书的位置。\n'
+  printf '  目录2：证书管理工具把目录1复制/部署到的本地目录。\n'
+  printf '  目录3：Mailu 实际读取证书的宿主机目录。\n'
+  printf '  目录1/fullchain.pem -> 目录2/fullchain.pem -> 目录3/cert.pem\n'
+  printf '  目录1/privkey.pem   -> 目录2/privkey.pem   -> 目录3/key.pem\n'
+  printf '  目录1->目录2由证书管理工具负责；目录2->目录3由后置脚本负责。\n'
+  printf '  目录3/cert.pem 和 key.pem 会挂载到容器 /certs。\n'
+  printf '\n二、每个选项到底做什么\n'
+  printf '  1：最推荐。不知道任何目录时用它；自动找 Compose、/certs 目标、证书源，检查域名、公私钥、指纹、有效期，必要时复制。\n'
+  printf '  2：脚本自动搜索，但你自己输入编号；适合想在多个证书目录中明确挑选。\n'
+  printf '  3：你已经知道源目录或文件时使用；目标目录仍由脚本自动识别。\n'
+  printf '  4：有证书管理工具时使用；规划目录1/2/3，生成“目录2 -> 目录3”的后置脚本。\n'
+  printf '  5：没有续期后置功能时使用；监控脚本自动完成“目录1 -> 目录2 -> 目录3”。\n'
+  printf '  6：安装、启动、停止、查看或卸载选项 5 的 systemd 常驻服务。\n'
+  printf '  7：只检查 Mailu 最终正在使用的 cert.pem/key.pem，不复制文件。\n'
+  printf '  8：查看本说明，不复制文件。\n'
+
+  printf '\n三、选项 4 生成脚本后，证书管理工具里怎么填\n'
+  printf '  1. 目录1通常由证书管理工具内部维护，不要把 Mailu 目录填成目录1。\n'
+  printf '  2. “证书复制目录/部署目录/推送目录”：填写脚本显示的目录2。续期后目录2应有 fullchain.pem 和 privkey.pem。\n'
+  printf '  3. “续期后执行脚本/后置脚本路径”：填写脚本生成的 update-mailu-cert.sh 完整路径。\n'
+  printf '  4. 如果只有“执行命令”输入框：填写 bash 后置脚本完整路径 目录2路径。\n'
+  printf '  5. 如果只有“脚本内容”输入框：复制 helper 最后打印的完整脚本内容，不要只粘贴文件路径。\n'
+  printf '  6. 脚本会检查目录2，然后复制：目录2/fullchain.pem -> 目录3/cert.pem；目录2/privkey.pem -> 目录3/key.pem。\n'
+  printf '  7. 目录3由脚本自动从 Compose 的 /certs 挂载识别，不需要你手动猜。\n'
+
+  printf '\n四、选项 5 和选项 6 怎么配合\n'
+  printf '  选项 5 生成 watch-mailu-cert.sh；它会定时搜索目录1，复制到目录2，再复制改名到目录3。\n'
+  printf '  选项 5 结束时可以直接安装并启动服务，也可以稍后进入选项 6 管理。\n'
+  printf '  选项 4 和选项 5 二选一即可，不要同时启用，避免重复复制和重复重启。\n'
+
+  printf '\n五、为什么要显示指纹、域名和有效期\n'
+  printf '  目录名字相同不代表证书相同；脚本用 SHA256 指纹比较证书，用 SAN 检查邮件主机，用公钥检查证书和私钥是否成对。\n'
+  printf '  多个目录如果指纹相同，说明证书内容相同；如果指纹不同，优先选择匹配邮件主机且到期时间更晚的一份。\n'
+
+  printf '\n六、多个邮箱域名是否需要多份证书\n'
+  printf '  通常不需要。证书验证的是客户端连接的邮件主机名，不是邮箱地址后缀。只要所有客户端连接的主机名都被同一张证书覆盖，一套 cert.pem/key.pem 即可。\n'
 }
 
 setup_cert() {
+  load_config
   while true; do
-    printf '\n%s\n' "${BOLD}配置证书挂载${RESET}"
-    printf '1. 自动寻找证书并复制改名到 Mailu\n'
-    printf '2. 指定证书目录/文件复制改名到 Mailu\n'
-    printf '3. 有面板：生成证书更新后置脚本\n'
-    printf '4. 无面板：生成自动监控证书脚本\n'
-    printf '5. 管理证书监控常驻服务\n'
-    printf '6. 查看当前 Mailu 证书文件\n'
-    printf '7. 证书使用提醒\n'
+    printf '\n%s\n' "${BOLD}配置 Mailu TLS 证书${RESET}"
+    printf '用途：让 SMTP 465/587、IMAP 993 和 Mailu front 使用可信证书。\n'
+    printf '脚本会显示实际源目录、目标目录、容器目录、域名、证书指纹和有效期。\n'
+    printf '不确定怎么办：直接选择 1。\n\n'
+    printf '1. ★ [自动诊断/推荐] 自动寻找所有目录、检查配置，必要时复制并重启 front\n'
+    printf '2.   [搜索后手选] 自动搜索候选目录，显示详情后由你选择\n'
+    printf '3.   [手动复制] 只填写源证书位置，目标目录自动识别\n'
+    printf '4.   [自动续期/有管理工具] 规划目录1/2/3，生成“目录2 -> 目录3”后置脚本\n'
+    printf '5.   [自动续期/无后置功能] 自动完成“目录1 -> 目录2 -> 目录3”监控同步\n'
+    printf '6.   [管理] 管理选项 5 生成的证书监控 systemd 服务\n'
+    printf '7.   [检查] 检查 Mailu 最终 cert.pem/key.pem、域名和有效期\n'
+    printf '8.   [说明] 显示所有目录、文件流向和填写教程\n'
     printf '0. 返回\n'
     local choice
     choice="$(read_menu_choice)"
     case "$choice" in
-      1) auto_find_and_copy_cert ;;
-      2) manual_cert_copy ;;
-      3) write_panel_cert_hook ;;
-      4) write_cert_watcher ;;
-      5) manage_cert_watcher_service ;;
-      6) ensure_context && check_certs ;;
-      7) show_cert_guidance ;;
+      1) auto_diagnose_and_fix_cert ;;
+      2) auto_find_and_copy_cert ;;
+      3) manual_cert_copy ;;
+      4) write_panel_cert_hook ;;
+      5) write_cert_watcher ;;
+      6) manage_cert_watcher_service ;;
+      7) ensure_context && load_env_defaults && check_certs ;;
+      8) show_cert_guidance ;;
       0) return 0 ;;
       *) warn "无效选择" ;;
     esac
@@ -1937,19 +2684,22 @@ show_catchall_dns_records() {
   MAIL_HOST="$host"
   save_config
 
-  printf '\n说明：根域名 catch-all（例如 *@example.com）不需要额外 DNS；任意子域名 catch-all（例如 *@*.example.com）需要通配 MX/SPF。\n'
+  printf '\n说明：根域名 catch-all（例如 %%@example.com）不需要额外 DNS；任意子域名收发（例如 anything@random.example.com）需要通配 MX/SPF。\n'
+  printf '以下按 Cloudflare DNS 面板的 Type / Name / Content 格式展示。\n'
   for domain in "${SELECTED_DOMAINS[@]}"; do
     printf '\n%s\n' "${BOLD}${domain}${RESET}"
-    printf '  根域名：\n'
-    printf '    %s.        MX   10 %s.\n' "$domain" "$host"
-    printf '    %s.        TXT  Mailu 后台给你的 SPF\n' "$domain"
-    printf '    selector._domainkey.%s. TXT  Mailu 后台 DKIM\n' "$domain"
-    printf '    _dmarc.%s. TXT  \"v=DMARC1; p=none; sp=none; rua=mailto:admin@%s\"\n' "$domain" "$domain"
-    printf '  任意子域名 catch-all 额外添加：\n'
-    printf '    *.%s.      MX   10 %s.\n' "$domain" "$host"
-    printf '    *.%s.      TXT  \"v=spf1 mx a:%s ~all\"\n' "$domain" "$host"
+    printf '  根域名记录：\n'
+    printf '    MX   @                  %s                 优先级 10\n' "$host"
+    printf '    TXT  @                  \"v=spf1 mx a:%s ~all\"\n' "$host"
+    printf '    TXT  selector._domainkey  Mailu 后台给出的 DKIM 值\n'
+    printf '    TXT  _dmarc             \"v=DMARC1; p=reject; sp=reject; adkim=r; aspf=r\"\n'
+    printf '  任意子域名收发额外添加：\n'
+    printf '    MX   *                  %s                 优先级 10\n' "$host"
+    printf '    TXT  *                  \"v=spf1 mx a:%s ~all\"\n' "$host"
   done
-  printf '\n注意：通配记录 *.example.com 不包含 example.com 本身；本体记录和通配记录都要有。\n'
+  printf '\n注意：Cloudflare 通配记录 * 不包含根域名 @；根域名和通配记录都要有。\n'
+  printf '如果某个具体子域名已有 A/CNAME/MX 等记录，它可能遮蔽通配记录；请单独为该子域补 MX/SPF。\n'
+  printf '邮件主机 %s 的 A/AAAA 必须是 DNS only（灰云）；Cloudflare 普通代理不转发 SMTP/IMAP。\n' "$host"
   printf 'PTR 反向解析仍然要在服务器/VPS 商后台设置到 %s。\n' "$host"
 
   if confirm "是否现在检查所选域名的通配 MX/SPF 是否生效？"; then
@@ -1990,9 +2740,9 @@ check_dns() {
 
   printf '\nDKIM：请在 Mailu 后台复制 DKIM 记录后检查对应 selector，例如：dig TXT selector._domainkey.%s\n' "$domain"
   printf 'PTR：需要在 VPS/服务器提供商后台设置反向解析到 %s，普通 DNS 面板通常改不了。\n' "$host"
-  printf 'DMARC 报告建议发回本域名，例如 rua=mailto:admin@%s；发到其他域名需要额外 _report._dmarc 授权。\n' "$domain"
-  printf '跨域报告授权示例：%s._report._dmarc.接收报告域名 TXT \"v=DMARC1;\"\n' "$domain"
-  printf '\n如果你开启任意子域名 catch-all，还需要额外添加：*.%s MX 10 %s 和 *.%s TXT \"v=spf1 mx a:%s ~all\"。\n' "$domain" "$host" "$domain" "$host"
+  printf 'DMARC 建议在 Cloudflare 手动使用 relaxed 对齐：adkim=r; aspf=r。\n'
+  printf '\n如果你开启任意子域名收发，还需要在 Cloudflare 添加：MX 名称 *、目标 %s、优先级 10；以及 TXT 名称 *、内容 \"v=spf1 mx a:%s ~all\"。\n' "$host" "$host"
+  printf '邮件主机 %s 的 A/AAAA 记录必须使用 DNS only（灰云），不能走 Cloudflare HTTP 代理。\n' "$host"
   if confirm "是否查看 catch-all / 任意子域名需要补充的 DNS 记录？"; then
     show_catchall_dns_records
   fi
@@ -2034,9 +2784,12 @@ admin_accounts() {
 root_catchall() {
   printf '\n%s\n' "${BOLD}根域名 catch-all 引导${RESET}"
   printf '根域名 catch-all 不需要额外 DNS。\n'
-  printf '请在 Mailu 后台添加别名：名称填 *，域名选择对应根域名，目标填本地接收邮箱（例如 admin@example.com）。\n'
+  printf '登录 Mailu 管理后台，进入 Mail domains，点击主域名，再切换到 Aliases。\n'
+  printf '添加别名时：Alias 填 %%（不是 *），勾选 “Use SQL LIKE Syntax”，Destination 选择本地接收邮箱（例如 admin@example.com）。\n'
+  printf '新版 Mailu 的 catch-all 使用 SQL LIKE 通配符 %%；单独填写 * 只会成为字面量别名，不能匹配所有前缀。\n'
   printf '如果要转发到 QQ/Gmail/Outlook，请到这个本地接收邮箱的用户设置里配置转发。\n'
-  printf '如果要收任意子域名邮箱（例如 anything@sub.example.com），请使用菜单 8。\n'
+  printf 'Mailu UI 的通配别名只匹配当前域名的邮箱前缀，不能声明无限随机子域名。\n'
+  printf '如果要收任意子域名邮箱（例如 anything@sub.example.com），请使用菜单 8 的 Postfix overrides。\n'
 }
 
 escape_regex() {
@@ -2363,6 +3116,27 @@ test_wildcard_postmap_rule() {
   fi
 }
 
+test_configured_subdomain_catchall() {
+  ensure_context || return 1
+  ensure_postfix_override_dir || return 1
+  local domains_file="$POSTFIX_OVERRIDE_DIR/wildcard_domains"
+  local aliases_file="$POSTFIX_OVERRIDE_DIR/wildcard_aliases"
+  local domain
+
+  [ -s "$domains_file" ] || { fail "通配域名规则不存在或为空：$domains_file"; return 1; }
+  [ -s "$aliases_file" ] || { fail "通配别名规则不存在或为空：$aliases_file"; return 1; }
+
+  select_catchall_domains "选择要测试 Postfix 通配规则的域名" || return 1
+
+  printf '\n当前 smtp 容器使用的相关配置：\n'
+  dc exec -T smtp postconf virtual_mailbox_domains virtual_alias_maps 2>/dev/null || \
+    warn "无法读取 smtp Postfix 配置，请确认 smtp 容器正在运行。"
+
+  for domain in "${SELECTED_DOMAINS[@]}"; do
+    test_wildcard_postmap_rule "$domain" "test.$domain" "anything@test.$domain"
+  done
+}
+
 add_temporary_subdomain_catchall() {
   ensure_context || return 1
   ensure_postfix_override_dir || return 1
@@ -2404,7 +3178,7 @@ show_subdomain_catchall_list() {
     awk -F'|' '{printf "域名: %-30s 目标: %-30s 包含根域名: %s\n", $1, $2, $3}' "$list"
   else
     warn "列表不存在：$list"
-    printf '\n如果要为这些域名生成任意子域名 catch-all，请选择菜单 3。\n'
+    printf '\n如果要生成规则，请进入“任意子域名接收”并选择长效开启。\n'
   fi
 }
 
@@ -2492,12 +3266,14 @@ manage_subdomain_catchall() {
 check_sender_spoofing() {
   printf '\n%s\n' "${BOLD}任意身份发信检查${RESET}"
   printf '需要在 Mailu 后台给对应用户开启：允许用户仿冒发件人。\n'
-  printf 'SMTP 登录账号仍然是真实账号；From 发件人可以是你控制域名下的具体地址。\n'
-  printf 'Webmail 不能填 *@*.domain.com 这种通配身份，必须添加具体身份。\n'
+  printf 'SMTP 登录账号仍然是真实账号；From 可填写具体地址，例如 random@sub.example.com。\n'
+  warn '安全边界：Mailu 的 sender spoofing 是“可作为任意地址发信”，不是只限定在你的域名内；只给专用账号开启。'
+  printf 'Webmail 不能保存 *@*.domain.com 这种通配身份，必须添加具体身份；SMTP/API 客户端可逐封指定具体 From。\n'
   printf '\n建议检查：\n'
-  printf '  1. 目标 From 地址所在域名有正确 MX/SPF/DKIM/DMARC。\n'
-  printf '  2. Mailu 用户权限已开启 sender spoofing。\n'
-  printf '  3. 客户端使用 587 STARTTLS 或 465 SSL/TLS 登录发信。\n'
+  printf '  1. Cloudflare 已配置根域名和通配子域名的 MX/SPF，邮件主机为 DNS only。\n'
+  printf '  2. DKIM 使用 Mailu 后台给出的记录；DMARC 使用 adkim=r; aspf=r 以允许根域 DKIM 与子域 From 对齐。\n'
+  printf '  3. Mailu 用户权限已开启 sender spoofing。\n'
+  printf '  4. 客户端使用 587 STARTTLS 或 465 SSL/TLS 登录发信。\n'
 }
 
 show_client_config() {
@@ -2601,51 +3377,64 @@ cleanup_helper() {
   if [ -n "${CERT_UPDATE_SCRIPT:-}" ] && [ -f "$CERT_UPDATE_SCRIPT" ]; then
     if grep -q 'Generated by mailu-helper' "$CERT_UPDATE_SCRIPT" 2>/dev/null || confirm "证书更新脚本不是明确的生成文件，仍要删除？"; then
       rm -f "$CERT_UPDATE_SCRIPT"
-      ok "已删除证书更新脚本：$CERT_UPDATE_SCRIPT"
+      ok "已删除证书更新后置脚本：$CERT_UPDATE_SCRIPT"
       CERT_UPDATE_SCRIPT=""
-      save_config
     fi
   fi
+  if [ -n "${CERT_WATCHER_SCRIPT:-}" ] && [ -f "$CERT_WATCHER_SCRIPT" ]; then
+    if grep -q 'Generated by mailu-helper' "$CERT_WATCHER_SCRIPT" 2>/dev/null || confirm "证书监控脚本不是明确的生成文件，仍要删除？"; then
+      rm -f "$CERT_WATCHER_SCRIPT"
+      ok "已删除证书监控脚本：$CERT_WATCHER_SCRIPT"
+      CERT_WATCHER_SCRIPT=""
+    fi
+  fi
+  save_config
 }
 
 main_menu() {
   while true; do
     clear 2>/dev/null || true
-    printf '%s\n' "${BOLD}====== Mailu Helper v$VERSION ======${RESET}"
-    printf '\n'
-    printf '1. 安装 / 启动 Mailu\n'
-    printf '2. 环境检查\n'
-    printf '3. 配置证书挂载\n'
-    printf '4. 检查反向代理\n'
-    printf '5. DNS 检查\n'
-    printf '6. 管理员账号\n'
-    printf '7. 根域名 catch-all 引导\n'
-    printf '8. 任意子域名 catch-all 管理\n'
-    printf '9. 任意身份发信检查\n'
-    printf '10. 邮件客户端配置说明\n'
-    printf '11. 日志查看\n'
-    printf '12. 备份 / 恢复\n'
-    printf '13. 卸载辅助配置\n'
-    printf '14. 常驻服务管理\n'
-    printf '0. 退出\n'
+    printf '%s\n' "${BOLD}====== Mailu Helper ======${RESET}"
+    printf '★ 表示实现“任意子域名任意前缀安全收发”的必要步骤；已经完成的项目无需重复执行。\n'
+    printf '\n%s\n' "${BOLD}一、安装与维护${RESET}"
+    printf '  1. ★ [执行] 安装/启动 Mailu\n'
+    printf '  2.   [检查] Mailu 环境状态\n'
+    printf '  3.   [执行] 管理管理员和用户\n'
+    printf '  4.   [查看] 查看日志\n'
+    printf '  5.   [执行] 备份/恢复\n'
+    printf '\n%s\n' "${BOLD}二、邮件收发${RESET}"
+    printf '  6.   [说明] 根域名 catch-all 配置\n'
+    printf '  7. ★ [执行] 任意子域名接收\n'
+    printf '  8. ★ [说明] 任意地址发信配置\n'
+    printf '  9.   [测试] 测试 Postfix 通配规则\n'
+    printf '\n%s\n' "${BOLD}三、DNS 与网络${RESET}"
+    printf ' 10. ★ [说明] 生成 Cloudflare DNS 记录\n'
+    printf ' 11.   [检查] 检查 DNS\n'
+    printf ' 12.   [检查] 检查反向代理\n'
+    printf ' 13. ★ [执行] 配置证书\n'
+    printf '\n%s\n' "${BOLD}四、其他${RESET}"
+    printf ' 14.   [说明] 邮件客户端参数\n'
+    printf ' 15.   [执行] 卸载 helper 辅助配置\n'
+    printf '  0. 退出\n'
     printf '\n'
     local choice
     choice="$(read_menu_choice)"
     case "$choice" in
       1) install_mailu ;;
       2) check_environment ;;
-      3) setup_cert ;;
-      4) check_proxy ;;
-      5) ensure_context && check_dns ;;
-      6) admin_accounts ;;
-      7) root_catchall ;;
-      8) manage_subdomain_catchall ;;
-      9) check_sender_spoofing ;;
-      10) show_client_config ;;
-      11) show_logs ;;
-      12) backup_mailu ;;
-      13) cleanup_helper ;;
-      14) manage_cert_watcher_service ;;
+      3) admin_accounts ;;
+      4) show_logs ;;
+      5) backup_mailu ;;
+      6) root_catchall ;;
+      7) manage_subdomain_catchall ;;
+      8) check_sender_spoofing ;;
+      9) test_configured_subdomain_catchall ;;
+      10) show_catchall_dns_records ;;
+      11) ensure_context && check_dns ;;
+      12) check_proxy ;;
+      13) setup_cert ;;
+      14) show_client_config ;;
+      15) cleanup_helper ;;
       0) exit 0 ;;
       *) warn "无效选择" ;;
     esac
@@ -2665,6 +3454,8 @@ Mailu Helper v$VERSION
   ./mailu-helper.sh proxy           反向代理检查
   ./mailu-helper.sh client          输出客户端配置
   ./mailu-helper.sh catchall        任意子域名 catch-all 管理
+  ./mailu-helper.sh postfix-test    测试已配置的 Postfix 通配规则
+  ./mailu-helper.sh cloudflare-dns  输出 Cloudflare DNS 记录
   ./mailu-helper.sh cert-service    管理证书监控常驻服务
 
 环境变量：
@@ -2681,6 +3472,8 @@ main() {
     proxy) check_proxy ;;
     client) show_client_config ;;
     catchall) manage_subdomain_catchall ;;
+    postfix-test) test_configured_subdomain_catchall ;;
+    cloudflare-dns) show_catchall_dns_records ;;
     cert-service) manage_cert_watcher_service ;;
     -h|--help|help) usage ;;
     *) usage; return 1 ;;

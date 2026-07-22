@@ -621,6 +621,7 @@ class BotState:
     EDIT_PROV_URL = 'edit_prov_url'
     ADD_MODEL_MANUAL = 'add_model_manual'
     SEARCH_FETCHED = 'search_fetched_models'
+    SEARCH_SAVED = 'search_saved_models'
     RENAME_CHAT = 'rename_chat'
     SET_PROMPT = 'set_prompt'
     SET_GLOBAL_PROMPT = 'set_global_prompt'
@@ -1265,10 +1266,11 @@ class BotMemoryDB:
             if is_redundant_agent_command_record(msg_type, msg.get('content')):
                 continue
             
-            # 系统操作和按钮点击转为可理解的格式
+            # 系统操作以 system 角色注入（OpenAI 格式原样支持；Gemini/Claude 在各自构建器里降级为 user），
+            # 避免系统旁白伪装成用户消息、破坏对话轮换结构
             if msg_type == MessageType.SYSTEM_OP:
                 result.append({
-                    'role': 'user',
+                    'role': 'system',
                     'content': f"[系统操作] {msg['content']}"
                 })
             elif msg_type == MessageType.BUTTON_CLICK:
@@ -1886,6 +1888,7 @@ class UserDataManager:
             'temp_list_type': None,
             'temp_page': 1,
             'temp_filter': None,
+            'temp_saved_filter': None,
             'fetched_cache': [],
             'editing_provider': None,
             'temp_prov_name': None,
@@ -1921,15 +1924,24 @@ class UserDataManager:
 # 每个 provider 维护一个轮询计数器，按逗号分隔的多个 key 依次轮询调用。
 _api_key_counters: Dict[str, int] = {}
 
+def parse_api_keys(api_key_field: str) -> List[str]:
+    """解析逗号分隔的 API Key，并移除复制粘贴时混入的空白字符。"""
+    return [
+        re.sub(r'\s+', '', key)
+        for key in str(api_key_field or '').split(',')
+        if re.sub(r'\s+', '', key)
+    ]
+
+
 def get_next_api_key(prov_name: str, api_key_field: str) -> str:
     """从可能包含多个逗号分隔 key 的字段中取出下一个 key（轮询）。
 
-    支持填写多个 API Key，用英文逗号隔开，忽略所有空格。
+    支持填写多个 API Key，用英文逗号隔开，忽略所有空白字符。
     单个 Key 时直接返回；多个 Key 时按轮询方式依次取出。
     """
-    keys = [k for k in api_key_field.replace(' ', '').split(',') if k]
+    keys = parse_api_keys(api_key_field)
     if not keys:
-        return api_key_field
+        return re.sub(r'\s+', '', str(api_key_field or ''))
     if len(keys) == 1:
         return keys[0]
     idx = _api_key_counters.get(prov_name, 0) % len(keys)
@@ -2847,10 +2859,10 @@ class AgentExecutor:
     def extract_protocol_blocks(cls, ai_response: str) -> List[Dict[str, Any]]:
         """按出现顺序提取 Agent 协议块，支持同一回复里出现多个协议。
 
-        支持的 file 写入形式：
-          - 普通 file:/path + 三反引号（向后兼容）
-          - heredoc: file:/path <<MARKER ... MARKER（内容可含 ```，推荐）
-          - file:base64:/path + base64 body（二进制安全）
+        支持的 file-x 写入形式：
+          - 普通 file-x:/path + 三反引号
+          - heredoc: file-x:/path <<MARKER ... MARKER（内容可含 ```，推荐）
+          - file-x:base64:/path + base64 body（二进制安全）
         """
         blocks: List[Dict[str, Any]] = []
         lines = ai_response.split('\n')
@@ -2858,8 +2870,8 @@ class AgentExecutor:
         n = len(lines)
 
         std_tag_re = re.compile(
-            r'^```(?P<tag>run|shell|stdin:[^\n]+|shellread:[^\n]+|shellkill:[^\n]+|trigger(?::[^\n]+)?|'
-            r'sendfile|read:[^\n]+|read|edit|grep|media|file:[^\n]+)\s*$'
+            r'^```(?P<tag>run-x|shell-x|stdin-x:[^\n]+|shellread-x:[^\n]+|shellkill-x:[^\n]+|trigger-x(?::[^\n]+)?|'
+            r'sendfile-x|read-x:[^\n]+|read-x|edit-x|grep-x|media-x|file-x(?::[^\n]*)?)\s*$'
         )
 
         while i < n:
@@ -2868,7 +2880,9 @@ class AgentExecutor:
                 i += 1
                 continue
 
-            tag = m.group('tag').strip()
+            external_tag = m.group('tag').strip()
+            # 外部协议统一使用 -x 命名空间；内部仍沿用原类型名，避免影响执行分支。
+            tag = re.sub(r'-x(?=:|$)', '', external_tag, count=1)
             block_start = i
 
             # file:base64:/path  —— 二进制安全写入
@@ -3049,12 +3063,19 @@ class AgentExecutor:
 
     @classmethod
     def resolve_write_path(cls, requested_path: str) -> str:
-        """写文件用的路径解析。仅接受绝对路径。"""
+        """写文件用的路径解析。file 协议必须明确提供绝对路径。"""
         cleaned = requested_path.strip()
+        default_workspace = to_display_path(os.path.join(cls.WORK_DIR, 'workspace'))
         if not cleaned:
-            raise ValueError("文件路径为空")
+            raise ValueError(
+                "file 协议必须指定目标文件的绝对路径；"
+                f"未指定保存位置时，请使用 {default_workspace}/文件名"
+            )
         if not os.path.isabs(cleaned):
-            raise ValueError(f"路径必须是绝对路径（以 / 开头），收到: {cleaned}。请使用项目根目录等绝对路径。")
+            raise ValueError(
+                f"file 协议路径必须是绝对路径，收到: {cleaned}；"
+                f"未指定保存位置时，请使用 {default_workspace}/文件名"
+            )
         return os.path.abspath(cleaned)
 
     @classmethod
@@ -3686,7 +3707,7 @@ class AgentExecutor:
     
     @classmethod
     def extract_file_block(cls, ai_response: str) -> Optional[Tuple[str, str]]:
-        """从 AI 回复中提取 ```file:filename 文件块（创建新文件）"""
+        """从 AI 回复中提取 ```file-x:filename 文件块（创建新文件）"""
         for block in cls.extract_protocol_blocks(ai_response):
             if block['type'] == 'file':
                 return block['path'], block['body']
@@ -3694,7 +3715,7 @@ class AgentExecutor:
 
     @classmethod
     def extract_sendfile(cls, ai_response: str) -> Optional[str]:
-        """从 AI 回复中提取 ```sendfile 块（发送已有服务器文件）"""
+        """从 AI 回复中提取 ```sendfile-x 块（发送已有服务器文件）"""
         for block in cls.extract_protocol_blocks(ai_response):
             if block['type'] == 'sendfile':
                 return block['body']
@@ -3702,7 +3723,7 @@ class AgentExecutor:
 
     @classmethod
     def extract_media_prompt(cls, ai_response: str) -> Optional[str]:
-        """从 AI 回复中提取 ```media 媒体生成提示词块"""
+        """从 AI 回复中提取 ```media-x 媒体生成提示词块"""
         for block in cls.extract_protocol_blocks(ai_response):
             if block['type'] == 'media':
                 prompt = block['body'].strip()
@@ -5156,9 +5177,9 @@ class SelfTriggerManager:
                 return f"[trigger:kill 结果] 已取消全部触发任务，共 {count} 个。"
             return await cls.cancel(task_id)
         if normalized_target == 'kill':
-            raise ValueError("请使用 trigger:kill:<任务ID> 或 trigger:kill:all")
+            raise ValueError("请使用 trigger-x:kill:<任务ID> 或 trigger-x:kill:all")
         if normalized_target:
-            raise ValueError('创建任务请使用裸 ```trigger 协议块')
+            raise ValueError('创建任务请使用裸 ```trigger-x 协议块')
         return await cls.register(
             body, bot, chat_id, conversation_id,
             origin_user_text, origin_assistant_text,
@@ -5896,16 +5917,8 @@ class SelfTriggerManager:
                 await db.finish_trigger_run(run_id, delivered_at=time.time())
                 return
             await db.finish_trigger_run(run_id, delivery_started_at=time.time())
-            await GlobalRecorder.record_system_op(
-                visible_notice,
-                {
-                    'trigger_task_id': task['id'],
-                    'trigger_run_id': run_id,
-                    'task_summary': task_summary,
-                    'result_reason': reason_text,
-                },
-                int(task['chat_id']),
-            )
+            # 🔔 可见提醒只发 Telegram 界面，不写入 AI 历史：任务概述/状态/ID 已全部包含在 internal_result 中，
+            # 避免每次触发在历史里产生 "[系统操作] 🔔" + "[后台任务结果]" 两条重复记录。
             await GlobalRecorder.record_user_message(
                 internal_result,
                 MessageType.USER_TEXT,
@@ -6137,11 +6150,12 @@ class ModelClient:
     def _build_claude_messages(history: list) -> List[Dict[str, Any]]:
         messages = []
         for msg in ModelClient.clean_memories(history):
-            if msg['role'] != 'system':
-                messages.append({
-                    "role": msg['role'],
-                    "content": ModelClient._to_claude_content(msg['content'])
-                })
+            # Claude 消息仅支持 user/assistant；系统旁白（[系统操作] 前缀）降级为 user 保留内容
+            role = 'user' if msg['role'] == 'system' else msg['role']
+            messages.append({
+                "role": role,
+                "content": ModelClient._to_claude_content(msg['content'])
+            })
         return messages
 
     @staticmethod
@@ -6715,55 +6729,122 @@ class ModelClient:
 
     @staticmethod
     async def fetch_knowledge(prov_name: str, api_key: str, base_url: str, api_format: str = 'openai') -> list:
-        """获取可用模型列表 - 支持多种 API 格式"""
-        if api_format in {'gemini', 'vertex'}:
-            return await ModelClient._fetch_gemini_models(api_key, base_url)
-        elif api_format == 'claude':
-            return await ModelClient._fetch_claude_models()
-        elif api_format == 'openai_compatible':
-            return await ModelClient._fetch_openai_compatible_models(api_key, base_url)
-        
+        """获取可用模型列表；兼容旧调用方，仅返回模型数组。"""
+        models, _ = await ModelClient.fetch_knowledge_detailed(
+            prov_name, api_key, base_url, api_format=api_format
+        )
+        return models
+
+    @staticmethod
+    async def fetch_knowledge_detailed(prov_name: str, api_key: str, base_url: str,
+                                       api_format: str = 'openai') -> Tuple[list, Optional[str]]:
+        """获取模型列表，同时返回适合展示给用户的失败原因。"""
+        selected_key = get_next_api_key(prov_name, api_key)
+        if not selected_key:
+            return [], "没有可用的 API Key。"
+
         try:
-            client = PortalManager.get_portal(prov_name, api_key, base_url)
+            if api_format in {'gemini', 'vertex'}:
+                return await ModelClient._fetch_gemini_models(selected_key, base_url), None
+            if api_format == 'claude':
+                return await ModelClient._fetch_claude_models(), None
+            if api_format == 'openai_compatible':
+                models = await ModelClient._fetch_openai_compatible_models(selected_key, base_url)
+                return models, None
+
+            client = PortalManager.get_portal(prov_name, selected_key, base_url)
             response = await client.models.list()
             model_ids = []
             for m in response.data:
-                if hasattr(m, 'id'): 
+                if hasattr(m, 'id'):
                     model_ids.append(m.id)
-                elif isinstance(m, dict) and 'id' in m: 
+                elif isinstance(m, dict) and 'id' in m:
                     model_ids.append(m['id'])
-                else: 
+                else:
                     model_ids.append(str(m))
-            return sorted([m for m in model_ids if 'embedding' not in m.lower() and 'audio' not in m.lower()])
+            models = sorted([
+                m for m in model_ids
+                if 'embedding' not in m.lower() and 'audio' not in m.lower()
+            ])
+            return models, None
         except Exception as e:
-            logger.error(f"Fetch Error: {e}")
-            return []
-    
+            error_text = format_provider_exception(e)
+            logger.error(f"Fetch Error ({prov_name}/{api_format}): {error_text}")
+            return [], error_text
+
+    @staticmethod
+    def _format_gemini_models_error(status_code: int, response_text: str) -> str:
+        """把 Gemini models.list 错误转换为不泄露 Key 的可操作提示。"""
+        redacted = redact_sensitive_text(response_text or '')
+        message = ''
+        reason = ''
+        try:
+            payload = json.loads(response_text or '{}')
+            error = payload.get('error') or {}
+            message = str(error.get('message') or '').strip()
+            for detail in error.get('details') or []:
+                if isinstance(detail, dict) and detail.get('reason'):
+                    reason = str(detail['reason']).strip()
+                    break
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+        if status_code == 401 and reason == 'ACCESS_TOKEN_TYPE_UNSUPPORTED':
+            return (
+                "Google Gemini 鉴权失败（401 / ACCESS_TOKEN_TYPE_UNSUPPORTED）。"
+                "这不是“没有模型”。该错误也会在 Key 被多出反斜杠、反引号或其他格式字符时出现。"
+                "旧版本读取配置输入时使用了 Telegram Markdown 序列化，可能改写包含连字符或其他特殊字符的 Key。"
+                "请更新并重启机器人，然后在“编辑 Key”中重新粘贴原始 Key。"
+            )
+
+        detail = message or redacted[:800] or '响应正文为空'
+        suffix = f" / {reason}" if reason else ''
+        return f"Gemini 模型列表请求失败（HTTP {status_code}{suffix}）：{detail}"
+
     @staticmethod
     async def _fetch_gemini_models(api_key: str, base_url: str) -> list:
-        """获取 Google 原生 Gemini 模型列表（Gemini / Vertex 通用）"""
+        """获取 Google 原生 Gemini 模型列表，并处理分页及真实鉴权错误。"""
         import httpx
-        try:
-            url = f"{base_url.rstrip('/')}/models"
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(url, headers={**PROVIDER_HTTP_HEADERS, "x-goog-api-key": api_key})
+
+        url = f"{base_url.rstrip('/')}/models"
+        headers = {**PROVIDER_HTTP_HEADERS, "Accept": "application/json", "x-goog-api-key": api_key}
+        models: List[str] = []
+        page_token: Optional[str] = None
+
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            while True:
+                params: Dict[str, Any] = {"pageSize": 1000}
+                if page_token:
+                    params["pageToken"] = page_token
+                resp = await client.get(url, headers=headers, params=params)
                 if resp.status_code != 200:
-                    logger.error(f"Gemini models list error: {resp.status_code}")
-                    return []
+                    error = ModelClient._format_gemini_models_error(resp.status_code, resp.text or '')
+                    logger.error(error)
+                    raise RuntimeError(error)
+
                 data = resp.json()
-                models = []
-                for m in data.get('models', []):
-                    name = m.get('name', '')
+                for model_data in data.get('models', []):
+                    if not isinstance(model_data, dict):
+                        continue
+                    supported_methods = model_data.get('supportedGenerationMethods') or []
+                    if supported_methods and not any(
+                        method in supported_methods
+                        for method in ('generateContent', 'streamGenerateContent')
+                    ):
+                        continue
+                    name = str(model_data.get('name') or '')
                     # name 格式: "models/gemini-2.5-flash" → 取 "gemini-2.5-flash"
                     if '/' in name:
                         name = name.split('/')[-1]
                     if name and 'embedding' not in name.lower():
                         models.append(name)
-                return sorted(models)
-        except Exception as e:
-            logger.error(f"Gemini Fetch Error: {e}")
-            return []
-    
+
+                page_token = data.get('nextPageToken')
+                if not page_token:
+                    break
+
+        return sorted(set(models))
+
     @staticmethod
     async def _fetch_claude_models() -> list:
         """返回 Claude 常用模型列表（Anthropic 不提供 list API）"""
@@ -6980,12 +7061,13 @@ class ModelClient:
         
         messages = []
         for msg in ModelClient.clean_memories(history):
-            if msg['role'] != 'system':
-                messages.append({
-                    "role": msg['role'],
-                    "content": ModelClient._to_claude_content(msg['content'])
-                })
-        
+            # Claude 消息仅支持 user/assistant；系统旁白（[系统操作] 前缀）降级为 user 保留内容
+            role = 'user' if msg['role'] == 'system' else msg['role']
+            messages.append({
+                "role": role,
+                "content": ModelClient._to_claude_content(msg['content'])
+            })
+
         url = f"{base_url.rstrip('/')}/messages"
         headers = {
             **PROVIDER_HTTP_HEADERS,
@@ -9037,30 +9119,96 @@ def make_select_marker_fn(target: str, prov_name: str):
     return marker_fn
 
 
-def build_saved_models_keyboard(provider_name: str, target: Optional[str] = None, page: int = 1):
+def make_fetched_saved_marker_fn(prov_name: str):
+    """联网获取列表标记：模型已经保存到该提供商时返回 ✅。"""
+    providers = UserDataManager.get('providers', {})
+    saved_models = set(providers.get(prov_name, {}).get('models', []))
+
+    def marker_fn(model_name: str) -> Optional[str]:
+        return "✅" if model_name in saved_models else None
+
+    return marker_fn
+
+
+def build_fetched_models_view(provider_name: str):
+    """根据缓存状态构建联网模型列表，并让搜索结果返回完整列表。"""
+    models = UserDataManager.get('fetched_cache', [])
+    page = UserDataManager.get('temp_page', 1) or 1
+    filter_text = UserDataManager.get('temp_filter')
+    exit_callback = UserDataManager.get('temp_back_callback') or f"mng_saved_{provider_name}"
+    list_back_callback = "back_fetched_all_models" if filter_text else exit_callback
+    kb = build_magic_keyboard(
+        models,
+        page,
+        "pick_fetch_",
+        list_back_callback,
+        "act_search_fetched",
+        filter_text,
+        marker_fn=make_fetched_saved_marker_fn(provider_name)
+    )
+    visible_count = sum(
+        1 for model in models
+        if not filter_text or filter_text.lower() in model.lower()
+    )
+    if filter_text:
+        title = f"🔍 搜索 '{safe_text(filter_text)}'：找到 {visible_count} 个模型:"
+    else:
+        title = f"🌐 找到了 {len(models)} 个模型:"
+    return title, kb
+
+
+def build_saved_models_view(provider_name: str):
+    """根据当前状态构建已保存模型列表；搜索结果返回完整的已保存列表。"""
     providers = UserDataManager.get('providers', {})
     models = providers.get(provider_name, {}).get('models', [])
-    UserDataManager.set('temp_viewing_prov', provider_name)
-    UserDataManager.set('temp_list_type', 'saved')
-    UserDataManager.set('temp_page', page)
-    UserDataManager.set('temp_model_target', target)
-    UserDataManager.set('temp_model_menu_mode', 'manage')
-    UserDataManager.set('temp_back_callback', f"view_prov_{provider_name}")
-    return build_magic_keyboard(
+    page = UserDataManager.get('temp_page', 1) or 1
+    filter_text = UserDataManager.get('temp_saved_filter')
+    list_back_callback = "back_saved_all_models" if filter_text else f"view_prov_{provider_name}"
+    kb = build_magic_keyboard(
         models,
         page,
         f"act_saved_{provider_name}_",
-        f"view_prov_{provider_name}",
+        list_back_callback,
+        "act_search_saved",
+        filter_text,
         extra_buttons=[
             InlineKeyboardButton("➕ 手写", callback_data=f"act_manual_mod_{provider_name}"),
             InlineKeyboardButton("⚡ 联网获取", callback_data=f"fetch_market_{provider_name}"),
         ],
         marker_fn=make_manage_marker_fn(provider_name)
     )
+    visible_count = sum(
+        1 for model in models
+        if not filter_text or filter_text.lower() in model.lower()
+    )
+    if filter_text:
+        title = (
+            f"🔍 <b>{safe_text(provider_name)}</b> 已保存的模型\n\n"
+            f"搜索 '{safe_text(filter_text)}'：找到 {visible_count} 个模型:"
+        )
+    else:
+        title = (
+            f"🧰 <b>{safe_text(provider_name)}</b> 已保存的模型\n\n"
+            "这里可以继续新增、联网获取、搜索，或点击模型进行设置。"
+        )
+    return title, kb
 
 
-def build_model_detail_menu(prov_name: str, model_name: str):
-    """构建模型详情菜单：设为对话模型、设为媒体模型、删除模型"""
+def build_saved_models_keyboard(provider_name: str, target: Optional[str] = None, page: int = 1):
+    UserDataManager.set('temp_viewing_prov', provider_name)
+    UserDataManager.set('temp_list_type', 'saved')
+    UserDataManager.set('temp_page', page)
+    UserDataManager.set('temp_saved_filter', None)
+    UserDataManager.set('temp_model_target', target)
+    UserDataManager.set('temp_model_menu_mode', 'manage')
+    UserDataManager.set('temp_back_callback', f"view_prov_{provider_name}")
+    _, kb = build_saved_models_view(provider_name)
+    return kb
+
+
+def build_model_detail_menu(prov_name: str, model_name: str, back_callback: Optional[str] = None):
+    """构建模型详情菜单：设为对话模型、设为媒体模型、删除模型。"""
+    back_callback = back_callback or f"mng_saved_{prov_name}"
     set_chat_cb = CallbackDataStore.store(f"set_mdl|chat|{prov_name}|{model_name}")
     set_media_cb = CallbackDataStore.store(f"set_mdl|media|{prov_name}|{model_name}")
     del_cb = CallbackDataStore.store(f"do_del|{prov_name}|{model_name}")
@@ -9081,7 +9229,7 @@ def build_model_detail_menu(prov_name: str, model_name: str):
         [InlineKeyboardButton("💬 设为对话模型", callback_data=set_chat_cb)],
         [InlineKeyboardButton("🖼️ 设为媒体模型", callback_data=set_media_cb)],
         [InlineKeyboardButton("🗑️ 删除模型", callback_data=del_cb)],
-        [InlineKeyboardButton("🔙 返回", callback_data=f"mng_saved_{prov_name}")]
+        [InlineKeyboardButton("🔙 返回", callback_data=back_callback)]
     ])
     text = (
         f"⚙️ <b>{safe_text(model_name)}</b>\n"
@@ -12089,7 +12237,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             kb = build_saved_models_keyboard(name)
             await query.message.edit_text(
                 f"🧰 <b>{safe_text(name)}</b> 的模型管理\n\n"
-                "这里可以手写新增、联网获取，或点击模型进行设置。",
+                "这里可以手写新增、联网获取、搜索，或点击模型进行设置。",
                 reply_markup=kb,
                 parse_mode=constants.ParseMode.HTML
             )
@@ -12274,7 +12422,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             kb = build_saved_models_keyboard(name)
             await query.message.edit_text(
                 f"🧰 <b>{safe_text(name)}</b> 已保存的模型\n\n"
-                "这里可以继续新增、联网获取，或点击模型进行设置。",
+                "这里可以继续新增、联网获取、搜索，或点击模型进行设置。",
                 reply_markup=kb,
                 parse_mode=constants.ParseMode.HTML
             )
@@ -12300,7 +12448,16 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             else:
                 model_name = content
 
-            detail_text, detail_kb = build_model_detail_menu(prov_name, model_name)
+            detail_back_callback = (
+                "back_saved_models"
+                if UserDataManager.get('temp_saved_filter')
+                else f"mng_saved_{prov_name}"
+            )
+            detail_text, detail_kb = build_model_detail_menu(
+                prov_name,
+                model_name,
+                back_callback=detail_back_callback
+            )
             await query.message.edit_text(
                 detail_text,
                 reply_markup=detail_kb,
@@ -12352,7 +12509,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.message.edit_text(
                 f"✅ <b>{safe_text(model_name)}</b> 已设为{target_label}！\n\n"
                 f"🧰 <b>{safe_text(prov_name)}</b> 已保存的模型\n\n"
-                "这里可以继续新增、联网获取，或点击模型进行设置。",
+                "这里可以继续新增、联网获取、搜索，或点击模型进行设置。",
                 reply_markup=kb,
                 parse_mode=constants.ParseMode.HTML
             )
@@ -12398,7 +12555,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.message.edit_text(
                 f"🗑️ <b>{safe_text(mname)}</b> 已从模型列表中删除！\n\n"
                 f"🧰 <b>{safe_text(pname)}</b> 已保存的模型\n\n"
-                "这里可以继续新增、联网获取，或点击模型进行设置。",
+                "这里可以继续新增、联网获取、搜索，或点击模型进行设置。",
                 reply_markup=kb,
                 parse_mode=constants.ParseMode.HTML
             )
@@ -12413,9 +12570,17 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             target = UserDataManager.get('temp_model_target') or 'chat'
             menu_mode = UserDataManager.get('temp_model_menu_mode') or 'manage'
             await query.message.reply_text("⏳ 正在获取模型列表...")
-            models = await ModelClient.fetch_knowledge(name, prov['api_key'], prov['base_url'], api_format=prov.get('api_format', 'openai'))
+            models, fetch_error = await ModelClient.fetch_knowledge_detailed(
+                name,
+                prov['api_key'],
+                prov['base_url'],
+                api_format=prov.get('api_format', 'openai')
+            )
             if not models:
-                await query.message.reply_text("⚠️ 未找到可用结果。")
+                if fetch_error:
+                    await query.message.reply_text(f"⚠️ 模型列表获取失败。\n\n{fetch_error}")
+                else:
+                    await query.message.reply_text("⚠️ 接口请求成功，但没有返回可用的生成模型。")
                 return
             UserDataManager.set('fetched_cache', models)
             UserDataManager.set('temp_page', 1)
@@ -12423,11 +12588,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             UserDataManager.set('temp_list_type', 'fetched')
             back_callback = f"mng_saved_{name}" if menu_mode == 'manage' else f"target_{target}_models"
             UserDataManager.set('temp_back_callback', back_callback)
-            kb = build_magic_keyboard(models, 1, "pick_fetch_", back_callback, "act_search_fetched")
-            await query.message.reply_text(
-                f"🌐 找到了 {len(models)} 个模型:",
-                reply_markup=kb
-            )
+            title, kb = build_fetched_models_view(name)
+            await query.message.reply_text(title, reply_markup=kb)
         
         elif data.startswith("pick_fetch_"):
             mname = data[len("pick_fetch_"):]
@@ -12447,7 +12609,13 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 else:
                     await query.answer("⚠️ 该模型已存在", show_alert=False)
                 if menu_mode == 'manage':
-                    detail_text, detail_kb = build_model_detail_menu(pname, mname)
+                    # 从联网获取列表进入详情时，返回按钮应回到缓存的获取结果，
+                    # 而不是跳到已保存模型列表并丢失当前页码/搜索条件。
+                    detail_text, detail_kb = build_model_detail_menu(
+                        pname,
+                        mname,
+                        back_callback="back_fetched_models"
+                    )
                     await query.message.edit_text(
                         f"✅ 模型已保存。\n\n{detail_text}",
                         reply_markup=detail_kb,
@@ -12469,6 +12637,108 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                         parse_mode=constants.ParseMode.HTML
                     )
         
+        elif data == "back_saved_models":
+            pname = UserDataManager.get('temp_viewing_prov')
+            providers = UserDataManager.get('providers', {})
+            if not pname or pname not in providers:
+                await query.message.edit_text(
+                    "⚠️ 已保存模型列表已失效，请重新选择提供商。",
+                    reply_markup=get_providers_menu()
+                )
+                return
+            UserDataManager.set('temp_list_type', 'saved')
+            UserDataManager.set('temp_model_menu_mode', 'manage')
+            title, kb = build_saved_models_view(pname)
+            await query.message.edit_text(
+                title,
+                reply_markup=kb,
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "back_saved_all_models":
+            pname = UserDataManager.get('temp_viewing_prov')
+            providers = UserDataManager.get('providers', {})
+            if not pname or pname not in providers:
+                await query.message.edit_text(
+                    "⚠️ 已保存模型列表已失效，请重新选择提供商。",
+                    reply_markup=get_providers_menu()
+                )
+                return
+            UserDataManager.set('temp_saved_filter', None)
+            UserDataManager.set('temp_page', 1)
+            UserDataManager.set('temp_list_type', 'saved')
+            UserDataManager.set('temp_model_menu_mode', 'manage')
+            title, kb = build_saved_models_view(pname)
+            await query.message.edit_text(
+                title,
+                reply_markup=kb,
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "back_fetched_models":
+            pname = UserDataManager.get('temp_viewing_prov')
+            models = UserDataManager.get('fetched_cache', [])
+            if not pname or not models:
+                if pname:
+                    kb = build_saved_models_keyboard(pname)
+                    fallback_text = (
+                        f"🧰 <b>{safe_text(pname)}</b> 已保存的模型\n\n"
+                        "⚠️ 获取结果已失效，请点击【⚡ 联网获取】重新拉取。"
+                    )
+                else:
+                    kb = get_providers_menu()
+                    fallback_text = "⚠️ 获取结果已失效，请重新选择提供商并联网获取。"
+                await query.message.edit_text(
+                    fallback_text,
+                    reply_markup=kb,
+                    parse_mode=constants.ParseMode.HTML
+                )
+                return
+
+            UserDataManager.set('temp_list_type', 'fetched')
+            title, kb = build_fetched_models_view(pname)
+            await query.message.edit_text(
+                title,
+                reply_markup=kb,
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "back_fetched_all_models":
+            pname = UserDataManager.get('temp_viewing_prov')
+            models = UserDataManager.get('fetched_cache', [])
+            if not pname or not models:
+                if pname:
+                    kb = build_saved_models_keyboard(pname)
+                    fallback_text = (
+                        f"🧰 <b>{safe_text(pname)}</b> 已保存的模型\n\n"
+                        "⚠️ 获取结果已失效，请点击【⚡ 联网获取】重新拉取。"
+                    )
+                else:
+                    kb = get_providers_menu()
+                    fallback_text = "⚠️ 获取结果已失效，请重新选择提供商并联网获取。"
+                await query.message.edit_text(
+                    fallback_text,
+                    reply_markup=kb,
+                    parse_mode=constants.ParseMode.HTML
+                )
+                return
+
+            UserDataManager.set('temp_filter', None)
+            UserDataManager.set('temp_page', 1)
+            UserDataManager.set('temp_list_type', 'fetched')
+            title, kb = build_fetched_models_view(pname)
+            await query.message.edit_text(
+                title,
+                reply_markup=kb,
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "act_search_saved":
+            UserDataManager.set('state', BotState.SEARCH_SAVED)
+            await query.message.reply_text(
+                "🔍 请输入要搜索的已保存模型名称 (或 'cancel'):"
+            )
+
         elif data == "act_search_fetched":
             UserDataManager.set('state', BotState.SEARCH_FETCHED)
             await query.message.reply_text(
@@ -12486,30 +12756,17 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             if UserDataManager.get('temp_list_type') == 'saved':
                 items = providers.get(pname, {}).get('models', [])
                 menu_mode = UserDataManager.get('temp_model_menu_mode') or 'manage'
-                back_callback = f"view_prov_{pname}" if menu_mode == 'manage' else f"target_{UserDataManager.get('temp_model_target') or 'chat'}_models"
-                extra_buttons = None
-                marker = None
                 if menu_mode == 'manage':
-                    extra_buttons = [
-                        InlineKeyboardButton("➕ 手写", callback_data=f"act_manual_mod_{pname}"),
-                        InlineKeyboardButton("⚡ 联网获取", callback_data=f"fetch_market_{pname}")
-                    ]
-                    marker = make_manage_marker_fn(pname)
+                    _, kb = build_saved_models_view(pname)
                 else:
                     target = UserDataManager.get('temp_model_target') or 'chat'
-                    marker = make_select_marker_fn(target, pname)
-                kb = build_magic_keyboard(
-                    items, page, prefix, back_callback,
-                    extra_buttons=extra_buttons,
-                    marker_fn=marker
-                )
+                    back_callback = f"target_{target}_models"
+                    kb = build_magic_keyboard(
+                        items, page, prefix, back_callback,
+                        marker_fn=make_select_marker_fn(target, pname)
+                    )
             else:
-                items = UserDataManager.get('fetched_cache', [])
-                back_callback = UserDataManager.get('temp_back_callback') or f"view_prov_{pname}"
-                kb = build_magic_keyboard(
-                    items, page, prefix, back_callback,
-                    "act_search_fetched", UserDataManager.get('temp_filter')
-                )
+                _, kb = build_fetched_models_view(pname)
             try:
                 await query.message.edit_reply_markup(kb)
             except Exception as e:
@@ -12932,6 +13189,75 @@ def _rich_block_to_text(block):
     return ''
 
 
+def _rich_part_to_plain_text(part):
+    """提取富文本的原始文字，不添加 Markdown 标记。配置值必须走这个路径。"""
+    if isinstance(part, str):
+        return part
+    if isinstance(part, dict):
+        value = part.get('text')
+        if value is not None:
+            return _rich_part_to_plain_text(value)
+        return ''
+    if isinstance(part, list):
+        return ''.join(_rich_part_to_plain_text(item) for item in part)
+    return ''
+
+
+def _rich_block_to_plain_text(block):
+    if not isinstance(block, dict):
+        return ''
+    if block.get('text') is not None:
+        return _rich_part_to_plain_text(block.get('text'))
+    if isinstance(block.get('blocks'), list):
+        return chr(10).join(
+            _rich_block_to_plain_text(item)
+            for item in block['blocks']
+            if isinstance(item, dict)
+        )
+    if isinstance(block.get('cells'), list):
+        rows = []
+        for row in block['cells']:
+            if not isinstance(row, list):
+                continue
+            rows.append(' | '.join(
+                _rich_part_to_plain_text(cell.get('text', '') if isinstance(cell, dict) else cell)
+                for cell in row
+            ))
+        return chr(10).join(rows)
+    if isinstance(block.get('items'), list):
+        rows = []
+        for item in block['items']:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get('label', '') or '')
+            content = chr(10).join(
+                _rich_block_to_plain_text(child)
+                for child in item.get('blocks', [])
+                if isinstance(child, dict)
+            )
+            rows.append((label + ' ' + content).strip())
+        return chr(10).join(rows)
+    return ''
+
+
+def _extract_rich_message_plain_text(msg):
+    """提取 rich_message 的纯文本，避免把配置值变成 Markdown。"""
+    extra = getattr(msg, 'api_kwargs', None) or {}
+    rich = extra.get('rich_message')
+    if not isinstance(rich, dict):
+        try:
+            rich = (msg.to_dict() if hasattr(msg, 'to_dict') else {}).get('rich_message')
+        except Exception:
+            rich = None
+    if not isinstance(rich, dict) or not isinstance(rich.get('blocks'), list):
+        return ''
+    return chr(10).join(
+        _rich_block_to_plain_text(block)
+        for block in rich['blocks']
+        if isinstance(block, dict)
+    )
+
+
 def _extract_rich_message_text(msg):
     """Extract text from rich_message (Telegram rich text format), preserving formatting as markdown."""
     extra = getattr(msg, 'api_kwargs', None) or {}
@@ -12987,13 +13313,30 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await UserDataManager.init()
     state = UserDataManager.get('state')
-    # 使用 text_markdown 保留格式（粗体/斜体/代码块等）
+    # 普通聊天使用 text_markdown 保留粗体/斜体/代码块等格式。
+    # 但 Key、URL、模型 ID、提供商名称等配置值必须使用 Telegram 原始文本：
+    # Markdown 序列化会给特殊字符插入转义符（例如 \, -, _, `），导致凭据或模型 ID 被改写。
+    exact_value_states = {
+        BotState.ADD_PROV_NAME,
+        BotState.ADD_PROV_URL,
+        BotState.ADD_PROV_KEY,
+        BotState.EDIT_PROV_NAME,
+        BotState.EDIT_PROV_KEY,
+        BotState.EDIT_PROV_URL,
+        BotState.ADD_MODEL_MANUAL,
+        BotState.SEARCH_FETCHED,
+        BotState.SEARCH_SAVED,
+        BotState.IMPORT_PROVIDER_CONFIG,
+    }
     text = ""
     if update.message.text:
-        try:
-            text = (update.message.text_markdown or update.message.text or "").strip()
-        except Exception:
-            text = (update.message.text or "").strip()
+        if state in exact_value_states:
+            text = update.message.text.strip()
+        else:
+            try:
+                text = (update.message.text_markdown or update.message.text or "").strip()
+            except Exception:
+                text = (update.message.text or "").strip()
     else:
         text = (update.message.caption or "").strip()
 
@@ -13031,9 +13374,13 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             logger.warning(f"handle_text_message: forwardMessage fallback failed: {e}")
 
-    # 富文本消息：text 在 rich_message.blocks 结构里，不在 text 字段
+    # 富文本消息：text 在 rich_message.blocks 结构里，不在 text 字段。
+    # 配置值取纯文本；普通聊天才保留 Markdown 标记。
     if not text:
-        text = _extract_rich_message_text(update.message).strip()
+        if state in exact_value_states:
+            text = _extract_rich_message_plain_text(update.message).strip()
+        else:
+            text = _extract_rich_message_text(update.message).strip()
         if text:
             logger.warning(f"handle_text_message: extracted via rich_message.blocks, len={len(text)}: {text[:200]}")
 
@@ -13394,8 +13741,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         name = UserDataManager.get('temp_prov_name')
         url = UserDataManager.get('temp_prov_url')
         api_format = UserDataManager.get('temp_prov_format', 'openai')
-        # 支持多个 Key（英文逗号分隔），忽略所有空格
-        text = text.replace(' ', '')
+        # 支持多个 Key（英文逗号分隔）；只移除复制粘贴混入的空白，不改写连字符。
+        text = ','.join(parse_api_keys(text))
         providers = UserDataManager.get('providers', {})
         providers[name] = {'base_url': url, 'api_key': text, 'models': [], 'api_format': api_format}
         db = await BotMemoryDB.get_instance()
@@ -13463,8 +13810,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if state == BotState.EDIT_PROV_KEY:
         p = UserDataManager.get('editing_provider')
-        # 支持多个 Key（英文逗号分隔），忽略所有空格
-        text = text.replace(' ', '')
+        # 支持多个 Key（英文逗号分隔）；只移除复制粘贴混入的空白，不改写连字符。
+        text = ','.join(parse_api_keys(text))
         providers = UserDataManager.get('providers', {})
         if p and p in providers:
             providers[p]['api_key'] = text
@@ -13562,20 +13909,34 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         return
     
+    if state == BotState.SEARCH_SAVED:
+        UserDataManager.set('temp_saved_filter', text)
+        UserDataManager.set('temp_page', 1)
+        UserDataManager.set('state', BotState.IDLE)
+        pname = UserDataManager.get('temp_viewing_prov')
+        providers = UserDataManager.get('providers', {})
+        if not pname or pname not in providers:
+            await update.message.reply_text(
+                "⚠️ 已保存模型列表已失效，请重新选择提供商。",
+                reply_markup=get_providers_menu()
+            )
+            return
+        title, kb = build_saved_models_view(pname)
+        await update.message.reply_text(
+            title,
+            reply_markup=kb,
+            parse_mode=constants.ParseMode.HTML
+        )
+        return
+
     if state == BotState.SEARCH_FETCHED:
         UserDataManager.set('temp_filter', text)
         UserDataManager.set('temp_page', 1)
         UserDataManager.set('state', BotState.IDLE)
         pname = UserDataManager.get('temp_viewing_prov')
         models = UserDataManager.get('fetched_cache', [])
-        kb = build_magic_keyboard(
-            models, 1, "pick_fetch_", UserDataManager.get('temp_back_callback') or f"mng_saved_{pname}",
-            "act_search_fetched", text
-        )
-        await update.message.reply_text(
-            f"🔍 搜索 '{safe_text(text)}' 的结果:",
-            reply_markup=kb
-        )
+        title, kb = build_fetched_models_view(pname)
+        await update.message.reply_text(title, reply_markup=kb)
         return
     
     if state == BotState.RENAME_CHAT:
@@ -13722,17 +14083,9 @@ async def _send_agent_trigger_round_notice(context: ContextTypes.DEFAULT_TYPE,
                                            chat_id: int, current_iteration: int,
                                            max_iterations: int):
     message = _build_agent_trigger_round_notice(current_iteration, max_iterations)
+    # 只发 Telegram 界面，不写入 AI 历史——与普通 Agent 循环里同名进度提示的处理方式保持一致
+    # （普通循环仅 safe_edit_text 编辑状态消息，从不入库）；轮数状态由 DB 跟踪，无需靠历史记录。
     await safe_send_message(context, chat_id, message)
-    await GlobalRecorder.record_system_op(
-        message,
-        {
-            'agent_iteration': current_iteration,
-            'agent_max_iterations': max_iterations,
-            'background_trigger': True,
-            'ai_call_skipped': current_iteration > max_iterations,
-        },
-        chat_id,
-    )
 
 
 async def _send_agent_iteration_limit_notice(context: ContextTypes.DEFAULT_TYPE,
@@ -13742,16 +14095,8 @@ async def _send_agent_iteration_limit_notice(context: ContextTypes.DEFAULT_TYPE,
         f"⚠️ Agent 当前为第 {current_iteration} 轮，已超过最大 {max_iterations} 轮。\n"
         "本次系统结果已经保留，但不会继续调用 AI。只有新的用户消息才会重置轮数。"
     )
+    # 只发 Telegram 界面，不写入 AI 历史（与 🛠️ 轮数进度提示同原则：协议执行 scaffolding 不进上下文）
     await safe_send_message(context, chat_id, message)
-    await GlobalRecorder.record_system_op(
-        message,
-        {
-            'agent_iteration': current_iteration,
-            'agent_max_iterations': max_iterations,
-            'ai_call_skipped': True,
-        },
-        chat_id,
-    )
 
 
 async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
@@ -14163,8 +14508,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         'content': (
                             grep_notice + "\n"
                             "说明: 这是 grep 的真实命中结果（已带 文件:行号:内容 + 上下文）。"
-                            "定位代码请优先用 grep 拿行号，再用 read:路径:区间 看上下文，"
-                            "最后用 edit 精确替换。"
+                            "定位代码请优先用 grep-x 拿行号，再用 read-x:路径:区间 看上下文，"
+                            "最后用 edit-x 精确替换。"
                         )
                     })
                     should_continue = True

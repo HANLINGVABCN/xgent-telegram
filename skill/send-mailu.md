@@ -1,15 +1,8 @@
 ```!
-Mailu 发信/读信技能：
-1. 【免密发信】：严禁索要密码！执行命令：`python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py --to "<收件人>" --from-addr "<发件人>" --subject "<主题>" --body "<正文>"` (增强参数：--body-file, --html, --cc, --bcc, --attach)。
-   发信脚本支持任意前缀和任意自定义子域名邮箱。
-   发信流程：获取可用的发信地址再进行发信，禁止自己胡编乱造一级域名，若 ai 不知道可用发件邮箱，可通过 check 命令获取。AI发信后，若返回 exit code 2（配置缺失/损坏）或认证全部失败（exit 1），提示用户运行 `sudo python3 .../send-mailu.py check`。
-   check 是配置入口：逐项检查 config.json（含逐域名 SMTP 实连 ✓/✗）；全部通过则输出实测可用账号清单（exit 0），任一失败且在交互终端时自动提示「是否开始配置？」，确认后进入配置流程——此时扫 Mailu SQLite 发现全部域名/账号并逐个问密码，配置完自动复查。
-   归档（可选）：config 的 sent_archive.enabled=true 时，每封信发信成功后自动 IMAP APPEND 一份到「已发送」文件夹（复用同一账号登录 IMAP），失败仅告警不影响发信。check 末尾会打印 IMAP 归档探针结果（不计入可用性判定）。
-2. 【本地读信】：免密检索本地 EML 文件，严禁修改或删除。
-   物理路径（<账号>需完整邮箱，如 admin@example.com）：
-   - 收件箱: `/mailu/mail/<账号>/[new|cur]`
-   - 其他文件夹: `/mailu/mail/<账号>/.[Junk|Sent|Trash|Drafts]/[new|cur]`
-   如需高级检索 Python 代码，请 read 本文档全文。
+Mailu 发信/读信（使用既有配置，严禁向用户索要密码）。
+- 发信：`python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py send --to "<收件人>" --from-addr "<发件人>" --subject "<主题>" --body "<正文>"`；`--from-addr` 必填，支持已配置域名及其子域的任意前缀；地址未知先运行 `sudo python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check`，不得编造。
+- `check`：逐账号检测 SMTP 发信配置和 IMAP/Sent 已发送归档功能，并输出可用发件邮箱。
+- 读本地 EML：`python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py get "<EML绝对路径>"`。增强参数、配置和故障处理按需读取本文档。
 ```
 
 # 邮件发信助手 (send-mailu)
@@ -23,7 +16,7 @@ Mailu 发信/读信技能：
 发信脚本依赖 `/etc/send-mailu/config.json`（含 SMTP 登录凭证，支持多域名）。首次部署或配置丢失时用 `check` 命令检查并交互配置：
 
 ```bash
-sudo python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
+sudo python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
 ```
 
 `check` 会先检查配置状态，**若检查失败，自动提示「是否开始配置？」**，用户确认后进入交互配置流程。
@@ -38,23 +31,31 @@ sudo python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
 ### 验证配置 & 获取可用账号清单
 
 ```bash
-sudo python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
+sudo python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
 ```
 
 `check` 有三重用途：
 
 - **健康检查**：文件存在 → JSON 合法 → 必填字段齐全 → 凭证非空 → 安全模式合法，逐项打印 ✓/✗。
-- **账号发现**：**逐个域名实测 SMTP 登录**（默认开启，每个域名单独一行结果，带 `[域名]` 标注）。这相当于一份"当前实际可用账号清单"——AI 发信前可先跑 `check`，确认目标域名账号是 ✓ 再发，避免发到一半认证失败。
+- **账号发现**：对配置中的**每个邮箱逐个实测**：先逐账号登录 SMTP（只登录、不发测试邮件），再逐账号登录 IMAP 并检查该账号自己的 Sent 文件夹。输出会明确分成“基础配置 / SMTP 逐账号实测 / IMAP 逐账号实测 / 汇总”，不能把某一个账号的成功推断成全部账号成功。
 - **自动引导配置**：检查失败时自动提示「是否开始配置？」，确认后进入交互配置流程。
 
-全部 ✓ 则 exit 0；任一 ✗ 则打印失败项并提示配置。
+SMTP 与基础配置全部 ✓ 则 exit 0；任一 SMTP/基础配置 ✗ 则打印失败项并提示配置。IMAP 归档仍属于“尽力而为”，每个账号都会实测和展示，但不改变发信配置的 exit code。
 
-- `check --no-connect`：跳过 SMTP 实连测试，仅做格式检查（适合部署时网络未通或快速校验；此时不输出可用账号清单）。
+输出语义必须按以下规则理解：
+
+- `default_domain`：仅在发件域名凭证匹配失败时作兜底；**不是自动发件地址，也不是归档仓库**。
+- `--from-addr`：发信时必填。
+- SMTP 行：只代表该行邮箱自己的 SMTP 登录结果。
+- IMAP 行：只代表该行邮箱能否登录自己的 IMAP、找到自己的 Sent。
+- 实际归档：哪个账号最终成功登录 SMTP 发出邮件，就用同一账号把副本写入它自己的 Sent。
+
+- `check --no-connect`：跳过全部 SMTP/IMAP 实连测试，仅做格式检查（适合部署时网络未通或快速校验；此时不输出实测可用账号清单）。
 
 ### 非交互批量配置（脚本调用）
 
 ```bash
-sudo python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py check \
+sudo python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check \
   --domains "example.com,example.net,example.org,example.io" \
   --username-prefix admin --passwords "pw1,pw2,pw3,pw4" \
   --smtp-host 127.0.0.1 --smtp-port 587 --security starttls --force
@@ -68,7 +69,7 @@ sudo python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py check \
 
 ```
 当用户要发信时，AI 直接运行发信命令：
-1. 运行 python3 send-mailu.py --to ... --body ...
+1. 运行 python3 send-mailu.py send --to ... --body ...
 2. 若返回 exit code 2（配置缺失/损坏）→ 提示用户：
      "发信配置不存在，请在服务器运行： sudo python3 .../send-mailu.py check"
 3. 用户运行 check → 自动检查 → 失败时提示配置 → 填完密码 → 重新发信
@@ -83,7 +84,7 @@ AI 不需要在对话中索要用户的明文密码。直接在服务器上调�
 
 ### 执行命令（最小调用）
 
-python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
+python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py send \
   --to "<收件人>" \
   --from-addr "<发件人>" \
   --subject "<主题>" \
@@ -109,28 +110,28 @@ python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
 
 **带附件（可重复传多个）：**
 
-python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
+python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py send \
   --to "user@example.com" --from-addr "admin@example.com" \
   --subject "月度报告" --body "附件请查收" \
   --attach "/tmp/report.pdf" --attach "/tmp/data.xlsx"
 
 **HTML 正文（自动带纯文本降级）：**
 
-python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
+python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py send \
   --to "user@example.com" --from-addr "admin@example.com" \
   --subject "通知" --body "纯文本降级内容" \
   --html "<h1>通知</h1><p>这是 <b>HTML</b> 正文。</p>"
 
 **抄送 + 密送：**
 
-python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
+python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py send \
   --to "user@example.com" --from-addr "admin@example.com" \
   --subject "会议纪要" --body "见正文" \
   --cc "a@example.com,b@example.com" --bcc "boss@example.com"
 
 **正文从文件读取（避免大段正文走命令行）：**
 
-python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py \
+python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py send \
   --to "user@example.com" --from-addr "admin@example.com" \
   --subject "日志" --body-file "/tmp/long-body.txt"
 
@@ -178,110 +179,43 @@ SMTP 只负责"把邮件投递出去"，本身不会在发件箱留下副本—�
 
 归档是**尽力而为**：未配置、连接失败、文件夹不存在等情况都只在 stderr 打印 `Warning: ...`，**不影响发信本身的成功结果**。归档用的账号/密码就是 SMTP 登录成功的那套凭证（即 `domains.匹配域名.username/password`），因此**只有"真实登录发信"的那个账号**的"已发送"里会出现副本，`--from-addr` 用到的别名账号不会单独归档。
 
-`check` 末尾会打印一段 IMAP 归档探针（不计入可用性判定），告诉你归档能否真正跑通、目标文件夹是否存在。**失败时会自动探测可用端口并给出可直接照抄的 `sent_archive` 配置建议**：
+`check` 末尾会对配置中的**每个邮箱分别执行 IMAP 登录和 Sent 文件夹检查**（不计入发信可用性判定）。每一行只代表该邮箱自己，绝不使用 `default_domain` 的单次结果代替其他邮箱。**全部失败且检测到连接参数错误时，会自动探测并修正 IMAP 端口后，再逐个重测**：
 
 ```
-  --- 已发送归档（IMAP）探针（不计入可用性判定）---
-  [✓] 已发送归档: IMAP 登录成功，文件夹「Sent」存在 (admin@example.com@1.2.3.4:993/ssl)
+--- IMAP Sent 逐邮箱测试（不影响发信判定）---
+  每个邮箱检查自己的 Sent；实际用谁登录发信，就归档到谁的 Sent。
+  [✓] admin@example.com：IMAP 登录成功；自己的文件夹「Sent」存在（1.2.3.4:993/ssl）
+  [✓] admin@example.net：IMAP 登录成功；自己的文件夹「Sent」存在（1.2.3.4:993/ssl）
+  结果：2/2 通过
 ```
 
 失败示例（自动给出修复建议）：
 
 ```
-  [✗] 已发送归档: IMAP 连接/登录失败 (admin@example.com@1.2.3.4:143/starttls) — [Errno 111] Connection refused
-      💡 探测到可用 IMAP: ssl @ 1.2.3.4:993
-         建议把 sent_archive 改为: host='1.2.3.4', port=993, security='ssl'
+  💡 部分账号未通过；请检查失败账号的密码或 Sent 文件夹。
+  [✓] admin@example.com：IMAP 登录成功；自己的文件夹「Sent」存在（1.2.3.4:993/ssl）
+  [✗] admin@example.net：IMAP 连接/登录失败（1.2.3.4:993/ssl）— authentication failed
+  结果：1/2 通过
 ```
 
 > 旧 config 升级：直接重跑 `sudo python3 .../send-mailu.py check`（检查失败时确认配置 → 自动重填含探测结果的 sent_archive），或手动按上面字段补 `host`/`port`/`security`。
 
 ---
 
-## 核心读信策略 (Maildir Reader)
+## 核心读信策略
 
-### 1. 物理路径规范
-- <账号> 必须包含域名（例如 admin@example.com）。
-- 收件箱: /mailu/mail/<账号>/[new|cur]
-- 其他目录: /mailu/mail/<账号>/.[Junk|Sent|Trash|Drafts]/[new|cur]
+按 EML 绝对路径读取邮件信息和正文预览：
 
-### 2. 邮件列表检索
+```bash
+python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py get "/mailu/mail/admin@example.com/new/邮件文件名"
+```
 
-export MAIL_DIR="/mailu/mail/admin@example.com/new"
-export SEARCH_KEY="" # 可选关键词
+邮箱文件路径固定为：
 
-python3 -c '
-import os, email, sys
-from email.parser import BytesParser
-from email.policy import default
+- 收件箱：`/mailu/mail/<完整邮箱>/new/<文件名>` 或 `/mailu/mail/<完整邮箱>/cur/<文件名>`
+- 其他目录：`/mailu/mail/<完整邮箱>/.[Junk|Sent|Trash|Drafts]/[new|cur]/<文件名>`
 
-mail_dir = os.environ.get("MAIL_DIR")
-search_key = os.environ.get("SEARCH_KEY", "").lower()
-
-if not os.path.exists(mail_dir):
-    print(f"目录不存在: {mail_dir}")
-    sys.exit()
-
-files = [os.path.join(mail_dir, f) for f in os.listdir(mail_dir) if os.path.isfile(os.path.join(mail_dir, f))]
-files.sort(key=os.path.getmtime, reverse=True)
-
-print(f"--- 邮件列表 (共 {len(files)} 封) ---")
-count = 0
-for filepath in files:
-    with open(filepath, "rb") as f:
-        msg = BytesParser(policy=default).parse(f)
-        subject = str(msg["Subject"])
-        sender = str(msg["From"])
-        if search_key and search_key not in subject.lower() and search_key not in sender.lower():
-            continue
-        print(f"[{count+1}] 文件名: {os.path.basename(filepath)}\n    发件人: {sender}\n    主题: {subject}\n    日期: {msg[\"Date\"]}\n" + "-"*40)
-        count += 1
-        if count >= 15:
-            break
-'
-
-### 3. 读取单封邮件
-
-export MAIL_FILE="/mailu/mail/admin@example.com/new/filename"
-
-python3 -c '
-import email, sys, os
-from email.parser import BytesParser
-from email.policy import default
-
-filepath = os.environ.get("MAIL_FILE")
-if not os.path.exists(filepath):
-    print(f"文件不存在: {filepath}")
-    sys.exit()
-
-with open(filepath, "rb") as f:
-    msg = BytesParser(policy=default).parse(f)
-    print("=" * 50)
-    print(f"发件人: {msg[\"From\"]}\n收件人: {msg[\"To\"]}\n主题: {msg[\"Subject\"]}\n日期: {msg[\"Date\"]}")
-    print("=" * 50)
-  
-    body = ""
-    attachments = []
-    if msg.is_multipart():
-        for part in msg.walk():
-            ctype = part.get_content_type()
-            cdisp = str(part.get("Content-Disposition"))
-            if "attachment" in cdisp or part.get_filename():
-                attachments.append(part.get_filename() or "Unknown_File")
-                continue
-            if ctype == "text/plain" and not body:
-                body = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", errors="ignore")
-            elif ctype == "text/html" and not body:
-                body = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", errors="ignore")
-                body = "[HTML] " + body.replace("<br>", "\n").replace("</p>", "\n")
-    else:
-        body = msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8", errors="ignore")
-      
-    print(body.strip() if body else "[无内容]")
-    if attachments:
-        print("\n--- 附件 ---")
-        for att in attachments:
-            print(f"- {att}")
-'
+`get` 只接受 `/mailu/mail` 内的 EML 绝对路径，输出发件人、收件人、主题、日期、正文前 1200 字符和附件名称；不搜索文件名，不读取账号配置或本技能全文。
 
 ---
 
