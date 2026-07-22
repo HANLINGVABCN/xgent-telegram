@@ -9108,6 +9108,17 @@ def make_select_marker_fn(target: str, prov_name: str):
     return marker_fn
 
 
+def make_fetched_saved_marker_fn(prov_name: str):
+    """联网获取列表标记：模型已经保存到该提供商时返回 ✅。"""
+    providers = UserDataManager.get('providers', {})
+    saved_models = set(providers.get(prov_name, {}).get('models', []))
+
+    def marker_fn(model_name: str) -> Optional[str]:
+        return "✅" if model_name in saved_models else None
+
+    return marker_fn
+
+
 def build_saved_models_keyboard(provider_name: str, target: Optional[str] = None, page: int = 1):
     providers = UserDataManager.get('providers', {})
     models = providers.get(provider_name, {}).get('models', [])
@@ -12502,7 +12513,10 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             UserDataManager.set('temp_list_type', 'fetched')
             back_callback = f"mng_saved_{name}" if menu_mode == 'manage' else f"target_{target}_models"
             UserDataManager.set('temp_back_callback', back_callback)
-            kb = build_magic_keyboard(models, 1, "pick_fetch_", back_callback, "act_search_fetched")
+            kb = build_magic_keyboard(
+                models, 1, "pick_fetch_", back_callback, "act_search_fetched",
+                marker_fn=make_fetched_saved_marker_fn(name)
+            )
             await query.message.reply_text(
                 f"🌐 找到了 {len(models)} 个模型:",
                 reply_markup=kb
@@ -12587,7 +12601,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 back_callback = UserDataManager.get('temp_back_callback') or f"view_prov_{pname}"
                 kb = build_magic_keyboard(
                     items, page, prefix, back_callback,
-                    "act_search_fetched", UserDataManager.get('temp_filter')
+                    "act_search_fetched", UserDataManager.get('temp_filter'),
+                    marker_fn=make_fetched_saved_marker_fn(pname)
                 )
             try:
                 await query.message.edit_reply_markup(kb)
@@ -13738,7 +13753,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         models = UserDataManager.get('fetched_cache', [])
         kb = build_magic_keyboard(
             models, 1, "pick_fetch_", UserDataManager.get('temp_back_callback') or f"mng_saved_{pname}",
-            "act_search_fetched", text
+            "act_search_fetched", text,
+            marker_fn=make_fetched_saved_marker_fn(pname)
         )
         await update.message.reply_text(
             f"🔍 搜索 '{safe_text(text)}' 的结果:",
