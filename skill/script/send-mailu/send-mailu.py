@@ -5,7 +5,7 @@ Send Mailu 发信工具。
 子命令：
   send    发信（默认，可省略子命令直接 send-mailu.py --to ... --body ...）
   get     按绝对路径读取本地 EML，输出邮件信息和正文预览
-  check   检查配置是否可用（格式 + SMTP 实连测试），失败时提示是否开始配置
+  check   检查配置是否可用（格式 + 每账号 SMTP/IMAP 实连测试），失败时提示是否开始配置
 """
 import argparse
 import base64
@@ -506,7 +506,7 @@ def _run_check(do_connect):
     config, err = load_config()
     if err:
         results.append((False, f"读取配置: {err}"))
-        _emit_check_results(results, do_connect)
+        _emit_check_results(results, [], do_connect)
         return False
     results.append((True, f"读取配置: {CONFIG_PATH}"))
 
@@ -548,7 +548,8 @@ def _run_check(do_connect):
         results.append((False, f"解析安全模式失败: {e}"))
         security = None
 
-    # 5) SMTP 实连测试（逐个域名凭证，每个都测，全部打印）
+    # 5) SMTP 实连测试：每个配置账号都实际登录一次，不能只测代表账号。
+    smtp_results = []
     if do_connect and field_ok and cred_ok and security:
         for dom, cred in domains_cfg.items():
             uname = cred.get("username")
@@ -556,31 +557,44 @@ def _run_check(do_connect):
             try:
                 srv = smtp_connect(smtp_host, smtp_port, security, uname, upass)
                 close_smtp(srv)
-                results.append((True, f"SMTP 实连测试 [{dom}]: 登录成功 ({uname})"))
+                smtp_results.append((True, f"{uname}：登录成功"))
             except smtplib.SMTPAuthenticationError as e:
-                results.append((False, f"SMTP 实连测试 [{dom}]: 认证失败 ({uname}) — {e}"))
+                smtp_results.append((False, f"{uname}：认证失败 — {e}"))
             except Exception as e:
-                results.append((False, f"SMTP 实连测试 [{dom}]: 连接失败 ({uname}) — {e}"))
+                smtp_results.append((False, f"{uname}：连接失败 — {e}"))
 
-    _emit_check_results(results, do_connect)
+    _emit_check_results(results, smtp_results, do_connect)
 
-    # 6) IMAP 归档探针（建议性，不计入可用性判定，仅提示是否能归档到「已发送」）
-    #    用 default_domain 的凭证做代表探测；其他域名假设配置一致。
+    # 6) IMAP 归档逐账号测试（建议性，不计入 config 可用性判定）。
+    #    发信时使用哪个账号成功登录 SMTP，就使用哪个账号登录 IMAP 并归档到它自己的 Sent。
+    imap_results = []
+    imap_notes = []
     if do_connect and field_ok and cred_ok and security:
-        imap_info = _probe_imap_and_autofix(config, domains_cfg, security)
-        # 单独打印（不进 results，不影响可用性判定）
-        print("  --- 已发送归档（IMAP）探针（不计入可用性判定）---")
-        for ok, msg in imap_info:
-            mark = "·" if ok is None else ("✓" if ok else "✗")
+        imap_notes, imap_results = _probe_imap_all_accounts(config, domains_cfg, security)
+        print("\n--- IMAP Sent 逐邮箱测试（不影响发信判定）---")
+        print("  每个邮箱检查自己的 Sent；实际用谁登录发信，就归档到谁的 Sent。")
+        for note in imap_notes:
+            print(f"  {note}")
+        for ok, msg in imap_results:
+            mark = "✓" if ok else "✗"
             print(f"  [{mark}] {msg}")
+        if imap_results:
+            imap_ok_count = sum(1 for ok, _ in imap_results if ok)
+            print(f"  结果：{imap_ok_count}/{len(imap_results)} 通过")
+    elif not do_connect:
+        print("\n--- IMAP Sent 逐邮箱测试 ---")
+        print("  [·] --no-connect：已跳过")
+    else:
+        print("\n--- IMAP Sent 逐邮箱测试 ---")
+        print("  [·] 基础配置未通过，未测试")
 
-    return all(ok for ok, _ in results)
+    return all(ok for ok, _ in (results + smtp_results))
 
 
 def _probe_imap_once(imap_settings, uname, upass):
     """
     用给定 IMAP 设置登录一次，检查目标文件夹是否存在。
-    返回 (status, message)：status ∈ {True, False, None}，None 表示文件夹名匹配失败（可恢复）。
+    返回 (status, message)：status 为 True/False。
     """
     host = imap_settings["host"]
     port = imap_settings["port"]
@@ -606,11 +620,11 @@ def _probe_imap_once(imap_settings, uname, upass):
                     folders.append(str(item))
         folder_match = any(folder.lower() in f.lower() for f in folders)
         if folder_match:
-            return (True, f"已发送归档: IMAP 登录成功，文件夹「{folder}」存在 ({uname}@{host}:{port}/{sec})")
+            return (True, f"{uname}：IMAP 登录成功；自己的文件夹「{folder}」存在（{host}:{port}/{sec}）")
         sample = ", ".join(folders[:8]) if folders else "(空)"
-        return (False, f'已发送归档: IMAP 登录成功，但文件夹「{folder}」未找到。请改 sent_archive.folder。现有: {sample}')
+        return (False, f'{uname}：IMAP 登录成功，但自己的文件夹「{folder}」未找到；请检查 sent_archive.folder。现有文件夹：{sample}')
     except Exception as e:
-        return (False, f"已发送归档: IMAP 连接/登录失败 ({uname}@{host}:{port}/{sec}) — {e}")
+        return (False, f"{uname}：IMAP 连接/登录失败（{host}:{port}/{sec}）— {e}")
     finally:
         if imap is not None:
             try:
@@ -619,68 +633,87 @@ def _probe_imap_once(imap_settings, uname, upass):
                 pass
 
 
-def _probe_imap_and_autofix(config, domains_cfg, security):
+def _probe_imap_all_accounts(config, domains_cfg, security):
+    """逐个账号检查 IMAP 登录和各自的 Sent 文件夹。
+
+    返回 (notes, results)。IMAP 是发信后的尽力归档能力，因此结果不影响
+    SMTP/config 的 exit code；但每个账号都会单独输出，避免把 default_domain
+    误解成统一归档邮箱。
     """
-    探测 IMAP 归档；首次失败时若探测到可用端口，自动 patch config 并重验一次。
+    arch_cfg = config.get("sent_archive")
+    enabled = isinstance(arch_cfg, dict) and bool(arch_cfg.get("enabled", False))
+    enabled_str = str(arch_cfg.get("enabled", "")).strip().lower() if isinstance(arch_cfg, dict) else ""
+    if enabled_str in ("0", "false", "no", "off"):
+        enabled = False
+    if not enabled:
+        return (["归档功能未开启（sent_archive.enabled=false/缺省）；发信不会写入 Sent。"], [])
 
-    返回 imap_info 列表供调用方打印。整段不计入 check 可用性判定。
-    """
-    default_dom_probe = config.get("default_domain", "")
-    cred = domains_cfg.get(default_dom_probe, {})
-    uname = cred.get("username")
-    upass = cred.get("password")
+    def run_all(test_config):
+        account_results = []
+        for dom, cred in domains_cfg.items():
+            if not isinstance(cred, dict):
+                account_results.append((False, f"{dom}：凭证结构无效"))
+                continue
+            uname = cred.get("username")
+            upass = cred.get("password")
+            settings = resolve_imap_settings(test_config, dom, uname, upass, security)
+            if not settings:
+                account_results.append((False, f"{uname or dom}：没有可用归档凭证或配置"))
+                continue
+            ok, msg = _probe_imap_once(settings, uname, upass)
+            account_results.append((ok, msg))
+        return account_results
 
-    imap_settings = resolve_imap_settings(config, default_dom_probe, uname, upass, security)
-    if not imap_settings:
-        return [(None, "已发送归档: 未配置或未开启 (sent_archive.enabled=false/缺省)，发信不会归档")]
+    results = run_all(config)
+    notes = []
 
-    # 第一次探测
-    ok, msg = _probe_imap_once(imap_settings, uname, upass)
-    if ok:
-        return [(ok, msg)]
+    # 仅当所有账号都未通过时，尝试一次端口自动修正；已有账号通过时，
+    # 其他失败应保留为各账号自身的密码/文件夹问题，不要误改全局配置。
+    if results and not any(ok for ok, _ in results):
+        detected = detect_imap_settings(config.get("smtp_host", "127.0.0.1"))
+        current = resolve_imap_settings(config, "", "probe", "probe", security)
+        if detected and current and (
+            detected["host"] != current["host"]
+            or detected["port"] != current["port"]
+            or detected["security"] != current["security"]
+        ):
+            patched = patch_sent_archive({
+                "host": detected["host"],
+                "port": detected["port"],
+                "security": detected["security"],
+            })
+            if patched:
+                notes.append(
+                    f"🔧 当前 IMAP 参数不可用，已自动改为 {detected['security']} @ "
+                    f"{detected['host']}:{detected['port']}，下面是重新测试结果。"
+                )
+                retry_config = dict(config)
+                retry_config["sent_archive"] = dict(arch_cfg)
+                retry_config["sent_archive"].update({
+                    "host": detected["host"],
+                    "port": detected["port"],
+                    "security": detected["security"],
+                })
+                results = run_all(retry_config)
+            else:
+                notes.append(
+                    f"💡 检测到可用 IMAP：{detected['security']} @ {detected['host']}:{detected['port']}；"
+                    "自动写入配置失败，请手动修改 sent_archive。"
+                )
+        elif not detected:
+            notes.append("💡 993/143 均无法连通；可能是防火墙、容器端口或 IMAP 服务未开放。")
+        else:
+            notes.append("💡 当前 IMAP 连接参数可达但所有账号均未通过，请分别检查各账号密码和 Sent 文件夹名称。")
+    elif results and not all(ok for ok, _ in results):
+        notes.append("💡 部分账号未通过；连接参数已被通过的账号验证可用，请检查失败行对应账号的密码或 Sent 文件夹。")
 
-    # 失败了：探测可用端口
-    detected = detect_imap_settings(config.get("smtp_host", "127.0.0.1"))
-    if not detected:
-        # 探测不到可用端口，只报原始错误
-        return [(False, msg + "\n      （993/143 均连不上：可能是防火墙拦截，或需把 sent_archive.host 改成容器 IP）")]
-
-    # 当前配置已经和探测结果一致却还失败 → 不重复 patch，只报错（避免死循环）
-    cur = imap_settings
-    if detected["host"] == cur["host"] and detected["port"] == cur["port"] and detected["security"] == cur["security"]:
-        return [(False, msg + "\n      （探测到的端口与当前配置相同，仍失败：可能是凭证问题或文件夹名不对）")]
-
-    # 自动 patch config（只改 sent_archive，其余不动，保留 0600 权限）
-    patched = patch_sent_archive({
-        "host": detected["host"],
-        "port": detected["port"],
-        "security": detected["security"],
-    })
-    note = (
-        f"\n      🔧 探测到可用 IMAP: {detected['security']} @ {detected['host']}:{detected['port']}"
-    )
-    if not patched:
-        # 没权限改 config（非 root 等），退化成建议
-        note += (
-            f"\n         自动修改 config 失败（权限不足？请用 sudo 重跑）"
-            f"\n         请手动改 sent_archive: host={detected['host']!r}, port={detected['port']}, security={detected['security']!r}"
-        )
-        return [(False, msg + note)]
-    note += "\n      已自动修改 config 的 sent_archive，重验中..."
-
-    # 用新设置重探
-    new_settings = dict(imap_settings)
-    new_settings.update({"host": detected["host"], "port": detected["port"], "security": detected["security"]})
-    ok2, msg2 = _probe_imap_once(new_settings, uname, upass)
-    if ok2:
-        return [(False, msg + note), (True, msg2 + "（自动修正成功）")]
-    return [(False, msg + note), (False, msg2)]
+    return notes, results
 
 
 
 def cmd_check(args):
     """
-    检查 config.json：格式 + 字段 +（可选）SMTP 实连测试。
+    检查 config.json：格式 + 字段 +（可选）逐账号 SMTP/IMAP 实连测试。
     失败时提示用户是否开始交互配置。
     """
     do_connect = not args.no_connect
@@ -709,19 +742,27 @@ def cmd_check(args):
     sys.exit(EXIT_ERROR)
 
 
-def _emit_check_results(results, do_connect):
-    """格式化打印 check 结果。"""
+def _emit_check_results(results, smtp_results, do_connect):
+    """简洁打印基础配置和逐邮箱 SMTP 测试结果。"""
     print(f"检查配置: {CONFIG_PATH}")
+    print("\n--- 基础配置 ---")
     for ok, msg in results:
         mark = "✓" if ok else "✗"
         print(f"  [{mark}] {msg}")
-    all_ok = all(ok for ok, _ in results)
-    if all_ok:
-        print("✓ config 可用")
+
+    print("\n--- SMTP 逐邮箱测试（只登录，不发信）---")
+    if do_connect:
+        for ok, msg in smtp_results:
+            mark = "✓" if ok else "✗"
+            print(f"  [{mark}] {msg}")
+        if smtp_results:
+            smtp_ok_count = sum(1 for ok, _ in smtp_results if ok)
+            print(f"  结果：{smtp_ok_count}/{len(smtp_results)} 通过")
+        else:
+            print("  [·] 基础配置未通过，未测试")
     else:
-        print("✗ config 不可用")
-        if not do_connect:
-            print("  （已跳过 SMTP 实连测试，加 --connect 或省略 --no-connect 可深度验证）", file=sys.stderr)
+        print("  [·] --no-connect：已跳过")
+
 
 
 # ============================================================
@@ -1231,7 +1272,7 @@ def build_parser():
 
     # check 子命令（含配置生成功能，失败时可交互配置）
     p_check = sub.add_parser("check", help="检查配置是否可用，失败时可交互配置")
-    p_check.add_argument("--no-connect", action="store_true", help="跳过 SMTP 实连测试，仅做格式检查")
+    p_check.add_argument("--no-connect", action="store_true", help="跳过全部 SMTP/IMAP 实连测试，仅做格式检查")
     # 以下参数用于批量配置模式（合并原 init 功能）
     p_check.add_argument("--domains", help="所有域名，逗号/分号/空格分隔（批量配置模式）")
     p_check.add_argument("--username-prefix", help="每域账号前缀（默认 admin，批量配置模式可用）")
