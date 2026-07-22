@@ -1,12 +1,8 @@
 ```!
-Mailu 发信/读信技能：
-1. 【免密发信】：严禁索要密码！执行命令：`python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py send --to "<收件人>" --from-addr "<发件人>" --subject "<主题>" --body "<正文>"` (增强参数：--body-file, --html, --cc, --bcc, --attach)。
-   发信脚本支持任意前缀和任意自定义子域名邮箱。
-   发信流程：获取可用的发信地址再进行发信，禁止自己胡编乱造一级域名，若 ai 不知道可用发件邮箱，可通过 check 命令获取。AI发信后，若返回 exit code 2（配置缺失/损坏）或认证全部失败（exit 1），提示用户运行 `sudo python3 .../send-mailu.py check`。
-   check 是配置入口：逐项检查 config.json，并对配置中的**每个邮箱分别实测 SMTP 登录和 IMAP/Sent**，每个账号单独一行 ✓/✗ 与汇总；不再用 default_domain 代替其他账号测试。全部 SMTP 通过则 config 发信检查 exit 0，任一 SMTP/基础配置失败且在交互终端时自动提示「是否开始配置？」。
-   归档（可选）：config 的 sent_archive.enabled=true 时，每封信发信成功后自动 IMAP APPEND 一份到**真实 SMTP 登录账号自己的**「已发送」文件夹，失败仅告警不影响发信。`default_domain` 只是凭证匹配失败时的兜底域名，**不是默认发件邮箱、不是统一归档邮箱**；`--from-addr` 始终必填。
-   AI解释 `check` 输出时必须逐行读取每个邮箱的 SMTP/IMAP 结果并按账号汇总；严禁把 `default_domain` 描述成“特殊归档账号”，严禁根据一个账号的结果猜测其他账号。
-2. 【本地读信】：直接执行 `python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py get "<EML绝对路径>"`。邮件路径必须写完整，例如 `/mailu/mail/admin@example.com/new/邮件文件名` 或 `/mailu/mail/admin@example.com/cur/邮件文件名`。命令直接返回发件人、收件人、主题、日期、正文前 1200 字符和附件名称；不需要账号，不读取 `config.json`，不读取本文档全文。
+Mailu 发信/读信（使用既有配置，严禁向用户索要密码）。
+- 发信：`python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py send --to "<收件人>" --from-addr "<发件人>" --subject "<主题>" --body "<正文>"`；`--from-addr` 必填，支持已配置域名及其子域的任意前缀；地址未知先运行 `sudo python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check`，不得编造。
+- `check`：逐账号检测 SMTP 发信配置和 IMAP/Sent 已发送归档功能，并输出可用发件邮箱。
+- 读本地 EML：`python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py get "<EML绝对路径>"`。增强参数、配置和故障处理按需读取本文档。
 ```
 
 # 邮件发信助手 (send-mailu)
