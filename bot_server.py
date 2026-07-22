@@ -9141,8 +9141,9 @@ def build_saved_models_keyboard(provider_name: str, target: Optional[str] = None
     )
 
 
-def build_model_detail_menu(prov_name: str, model_name: str):
-    """构建模型详情菜单：设为对话模型、设为媒体模型、删除模型"""
+def build_model_detail_menu(prov_name: str, model_name: str, back_callback: Optional[str] = None):
+    """构建模型详情菜单：设为对话模型、设为媒体模型、删除模型。"""
+    back_callback = back_callback or f"mng_saved_{prov_name}"
     set_chat_cb = CallbackDataStore.store(f"set_mdl|chat|{prov_name}|{model_name}")
     set_media_cb = CallbackDataStore.store(f"set_mdl|media|{prov_name}|{model_name}")
     del_cb = CallbackDataStore.store(f"do_del|{prov_name}|{model_name}")
@@ -9163,7 +9164,7 @@ def build_model_detail_menu(prov_name: str, model_name: str):
         [InlineKeyboardButton("💬 设为对话模型", callback_data=set_chat_cb)],
         [InlineKeyboardButton("🖼️ 设为媒体模型", callback_data=set_media_cb)],
         [InlineKeyboardButton("🗑️ 删除模型", callback_data=del_cb)],
-        [InlineKeyboardButton("🔙 返回", callback_data=f"mng_saved_{prov_name}")]
+        [InlineKeyboardButton("🔙 返回", callback_data=back_callback)]
     ])
     text = (
         f"⚙️ <b>{safe_text(model_name)}</b>\n"
@@ -12540,7 +12541,13 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 else:
                     await query.answer("⚠️ 该模型已存在", show_alert=False)
                 if menu_mode == 'manage':
-                    detail_text, detail_kb = build_model_detail_menu(pname, mname)
+                    # 从联网获取列表进入详情时，返回按钮应回到缓存的获取结果，
+                    # 而不是跳到已保存模型列表并丢失当前页码/搜索条件。
+                    detail_text, detail_kb = build_model_detail_menu(
+                        pname,
+                        mname,
+                        back_callback="back_fetched_models"
+                    )
                     await query.message.edit_text(
                         f"✅ 模型已保存。\n\n{detail_text}",
                         reply_markup=detail_kb,
@@ -12562,6 +12569,52 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                         parse_mode=constants.ParseMode.HTML
                     )
         
+        elif data == "back_fetched_models":
+            pname = UserDataManager.get('temp_viewing_prov')
+            models = UserDataManager.get('fetched_cache', [])
+            if not pname or not models:
+                if pname:
+                    kb = build_saved_models_keyboard(pname)
+                    fallback_text = (
+                        f"🧰 <b>{safe_text(pname)}</b> 已保存的模型\n\n"
+                        "⚠️ 获取结果已失效，请点击【⚡ 联网获取】重新拉取。"
+                    )
+                else:
+                    kb = get_providers_menu()
+                    fallback_text = "⚠️ 获取结果已失效，请重新选择提供商并联网获取。"
+                await query.message.edit_text(
+                    fallback_text,
+                    reply_markup=kb,
+                    parse_mode=constants.ParseMode.HTML
+                )
+                return
+
+            page = UserDataManager.get('temp_page', 1) or 1
+            filter_text = UserDataManager.get('temp_filter')
+            back_callback = UserDataManager.get('temp_back_callback') or f"mng_saved_{pname}"
+            UserDataManager.set('temp_list_type', 'fetched')
+            kb = build_magic_keyboard(
+                models,
+                page,
+                "pick_fetch_",
+                back_callback,
+                "act_search_fetched",
+                filter_text,
+                marker_fn=make_fetched_saved_marker_fn(pname)
+            )
+            visible_count = sum(
+                1 for model in models
+                if not filter_text or filter_text.lower() in model.lower()
+            )
+            title = f"🌐 找到了 {len(models)} 个模型:"
+            if filter_text:
+                title = f"🔍 搜索 '{safe_text(filter_text)}'：找到 {visible_count} 个模型:"
+            await query.message.edit_text(
+                title,
+                reply_markup=kb,
+                parse_mode=constants.ParseMode.HTML
+            )
+
         elif data == "act_search_fetched":
             UserDataManager.set('state', BotState.SEARCH_FETCHED)
             await query.message.reply_text(
