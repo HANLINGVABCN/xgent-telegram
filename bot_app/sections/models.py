@@ -3,6 +3,46 @@
 
 class ModelClient:
     _VALID_ROLES = {'user', 'assistant', 'system'}
+    _http_client: Optional[Any] = None
+    _http_client_lock = None  # 延迟创建，避免在导入阶段绑定事件循环
+
+    @classmethod
+    async def _get_http_client(cls) -> Any:
+        """获取进程级共享 HTTP 客户端，复用连接池与 TLS 会话。"""
+        client = cls._http_client
+        if client is not None and not client.is_closed:
+            return client
+
+        if cls._http_client_lock is None:
+            cls._http_client_lock = asyncio.Lock()
+
+        async with cls._http_client_lock:
+            client = cls._http_client
+            if client is None or client.is_closed:
+                cls._http_client = httpx.AsyncClient(
+                    timeout=None,  # 各请求显式传入原有 timeout，避免改变语义
+                    follow_redirects=True,
+                    limits=httpx.Limits(
+                        max_connections=32,
+                        max_keepalive_connections=16,
+                        keepalive_expiry=30.0,
+                    ),
+                )
+            return cls._http_client
+
+    @classmethod
+    @contextlib.asynccontextmanager
+    async def _http_client_context(cls):
+        """借用共享客户端；退出上下文时只释放响应，不关闭连接池。"""
+        yield await cls._get_http_client()
+
+    @classmethod
+    async def close_http_client(cls) -> None:
+        """关闭共享连接池；后续请求会按需创建新客户端。"""
+        client = cls._http_client
+        cls._http_client = None
+        if client is not None and not client.is_closed:
+            await client.aclose()
     
     @staticmethod
     def clean_memories(history_list: list) -> list:
@@ -318,8 +358,12 @@ class ModelClient:
         import httpx
         url = f"{base_url.rstrip('/')}/models"
         try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                resp = await client.get(url, headers=ModelClient._openai_compatible_headers(api_key))
+            async with ModelClient._http_client_context() as client:
+                resp = await client.get(
+                    url,
+                    headers=ModelClient._openai_compatible_headers(api_key),
+                    timeout=15.0,
+                )
             if resp.status_code >= 400:
                 logger.error(f"OpenAI compatible models list error: {resp.status_code}: {redact_sensitive_text(resp.text or '')[:500]}")
                 return []
@@ -368,11 +412,12 @@ class ModelClient:
         })
 
         try:
-            async with httpx.AsyncClient(timeout=ModelClient._build_stream_timeout(), follow_redirects=True) as client:
+            async with ModelClient._http_client_context() as client:
                 resp = await client.post(
                     url,
                     json=body,
                     headers=ModelClient._openai_compatible_headers(api_key),
+                    timeout=ModelClient._build_stream_timeout(),
                 )
             if resp.status_code >= 400:
                 error_text = redact_sensitive_text(resp.text or '')
@@ -460,12 +505,13 @@ class ModelClient:
 
         yielded_any_text = False
         try:
-            async with httpx.AsyncClient(timeout=ModelClient._build_stream_timeout(), follow_redirects=True) as client:
+            async with ModelClient._http_client_context() as client:
                 async with client.stream(
                     "POST",
                     url,
                     json=body,
                     headers=ModelClient._openai_compatible_headers(api_key, "text/event-stream"),
+                    timeout=ModelClient._build_stream_timeout(),
                 ) as resp:
                     if resp.status_code >= 400:
                         error_body = await resp.aread()
@@ -558,7 +604,7 @@ class ModelClient:
         url = f"{base_url.rstrip('/')}/models/{model}:generateContent"
         headers = {**PROVIDER_HTTP_HEADERS, "Accept": "application/json", "x-goog-api-key": api_key}
         try:
-            async with httpx.AsyncClient(timeout=ModelClient._build_stream_timeout()) as client:
+            async with ModelClient._http_client_context() as client:
                 generation_config = {"temperature": 0.7}
                 if max_tokens is not None:
                     generation_config["maxOutputTokens"] = max_tokens
@@ -581,7 +627,12 @@ class ModelClient:
                     "stream": False,
                     "request_body": body,
                 })
-                resp = await client.post(url, json=body, headers=headers)
+                resp = await client.post(
+                    url,
+                    json=body,
+                    headers=headers,
+                    timeout=ModelClient._build_stream_timeout(),
+                )
 
                 if resp.status_code != 200:
                     error_text = redact_sensitive_text(resp.text or '')
@@ -653,7 +704,7 @@ class ModelClient:
             "accept": "application/json"
         }
         try:
-            async with httpx.AsyncClient(timeout=ModelClient._build_stream_timeout()) as client:
+            async with ModelClient._http_client_context() as client:
                 body = {
                     "model": model,
                     "system": system_prompt,
@@ -667,7 +718,12 @@ class ModelClient:
                     "stream": False,
                     "request_body": body,
                 })
-                resp = await client.post(url, json=body, headers=headers)
+                resp = await client.post(
+                    url,
+                    json=body,
+                    headers=headers,
+                    timeout=ModelClient._build_stream_timeout(),
+                )
 
                 if resp.status_code != 200:
                     error_text = redact_sensitive_text(resp.text or '')
@@ -805,12 +861,12 @@ class ModelClient:
         models: List[str] = []
         page_token: Optional[str] = None
 
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        async with ModelClient._http_client_context() as client:
             while True:
                 params: Dict[str, Any] = {"pageSize": 1000}
                 if page_token:
                     params["pageToken"] = page_token
-                resp = await client.get(url, headers=headers, params=params)
+                resp = await client.get(url, headers=headers, params=params, timeout=15.0)
                 if resp.status_code != 200:
                     error = ModelClient._format_gemini_models_error(resp.status_code, resp.text or '')
                     logger.error(error)
@@ -977,8 +1033,14 @@ class ModelClient:
             event_count = 0
             text_event_count = 0
             last_payload_time = time.monotonic()
-            async with httpx.AsyncClient(timeout=ModelClient._build_stream_timeout()) as client:
-                async with client.stream('POST', url, json=body, headers=headers) as resp:
+            async with ModelClient._http_client_context() as client:
+                async with client.stream(
+                    'POST',
+                    url,
+                    json=body,
+                    headers=headers,
+                    timeout=ModelClient._build_stream_timeout(),
+                ) as resp:
                     if resp.status_code != 200:
                         error_body = await resp.aread()
                         error_text = redact_sensitive_text(error_body.decode(errors='replace'))
@@ -1087,8 +1149,14 @@ class ModelClient:
         })
         
         try:
-            async with httpx.AsyncClient(timeout=ModelClient._build_stream_timeout()) as client:
-                async with client.stream('POST', url, json=body, headers=headers) as resp:
+            async with ModelClient._http_client_context() as client:
+                async with client.stream(
+                    'POST',
+                    url,
+                    json=body,
+                    headers=headers,
+                    timeout=ModelClient._build_stream_timeout(),
+                ) as resp:
                     if resp.status_code != 200:
                         error_body = await resp.aread()
                         error_text = redact_sensitive_text(error_body.decode(errors='replace'))

@@ -53,6 +53,57 @@ print(json.dumps({
         self.assertEqual("handle_button_click", data["callback"])
         self.assertGreaterEqual(data["sections"], 10)
 
+    def test_shared_http_client_and_database_connection_reuse(self):
+        output = self.run_probe(r'''
+import asyncio
+import json
+import tempfile
+from pathlib import Path
+import bot_server as bot
+
+async def main():
+    http_client_a = await bot.ModelClient._get_http_client()
+    http_client_b = await bot.ModelClient._get_http_client()
+    http_same = http_client_a is http_client_b
+    await bot.ModelClient.close_http_client()
+    http_closed = http_client_a.is_closed
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db = bot.BotMemoryDB(str(Path(temp_dir) / "memory.db"))
+        connections = await asyncio.gather(*[db._get_conn() for _ in range(8)])
+        db_same = all(connection is connections[0] for connection in connections)
+        await db.close()
+        db_closed = db._connection is None
+
+    class FakePortal:
+        def __init__(self):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    fake_portal = FakePortal()
+    bot.PortalManager._portals = {"test|key": {"client": fake_portal, "hash": "x"}}
+    await bot.PortalManager.close_all()
+    portal_closed = fake_portal.closed and not bot.PortalManager._portals
+
+    print(json.dumps({
+        "http_same": http_same,
+        "http_closed": http_closed,
+        "db_same": db_same,
+        "db_closed": db_closed,
+        "portal_closed": portal_closed,
+    }))
+
+asyncio.run(main())
+''')
+        data = json.loads(output.strip().splitlines()[-1])
+        self.assertTrue(data["http_same"])
+        self.assertTrue(data["http_closed"])
+        self.assertTrue(data["db_same"])
+        self.assertTrue(data["db_closed"])
+        self.assertTrue(data["portal_closed"])
+
     def test_protocol_and_normalization_behavior(self):
         output = self.run_probe(r'''
 import json

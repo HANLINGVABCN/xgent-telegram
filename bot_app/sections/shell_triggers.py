@@ -1,18 +1,7 @@
 # This file is executed by bot_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
-def clip_middle_text(text: str, limit: int, label: str = "内容") -> str:
-    if len(text) <= limit:
-        return text
-    marker = f"\n... ({label}已省略 {len(text) - limit} 字符，保留开头和末尾) ...\n"
-    available = limit - len(marker)
-    if available < 80:
-        return text[:limit]
-    head_len = max(1, available // 3)
-    tail_len = max(1, available - head_len)
-    return text[:head_len].rstrip() + marker + text[-tail_len:].lstrip()
-
-
+from bot_app.text_utils import clip_middle_text
 def strip_terminal_control_sequences(text: str) -> str:
     cleaned = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text or '')
     cleaned = re.sub(r'\x1b\][^\x07]*(?:\x07|\x1b\\)', '', cleaned)

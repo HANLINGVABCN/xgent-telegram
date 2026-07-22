@@ -180,6 +180,16 @@ async def on_shutdown(app):
     except Exception as e:
         logger.error(f"关闭数据库失败: {e}")
     try:
+        await PortalManager.close_all()
+        logger.info("✅ OpenAI SDK 客户端池已关闭")
+    except Exception as e:
+        logger.error(f"关闭 OpenAI SDK 客户端池失败: {e}")
+    try:
+        await ModelClient.close_http_client()
+        logger.info("✅ 模型 HTTP 连接池已关闭")
+    except Exception as e:
+        logger.error(f"关闭模型 HTTP 连接池失败: {e}")
+    try:
         if TelegramRichAPI._client and not TelegramRichAPI._client.is_closed:
             await TelegramRichAPI._client.aclose()
             logger.info("✅ Rich API httpx 客户端已关闭")
