@@ -1,11 +1,11 @@
 ```!
 Mailu 发信/读信技能：
-1. 【免密发信】：严禁索要密码！执行命令：`python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py send --to "<收件人>" --from-addr "<发件人>" --subject "<主题>" --body "<正文>"` (增强参数：--body-file, --html, --cc, --bcc, --attach)。
+1. 【免密发信】：严禁索要密码！执行命令：`python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py send --to "<收件人>" --from-addr "<发件人>" --subject "<主题>" --body "<正文>"` (增强参数：--body-file, --html, --cc, --bcc, --attach)。
    发信脚本支持任意前缀和任意自定义子域名邮箱。
    发信流程：获取可用的发信地址再进行发信，禁止自己胡编乱造一级域名，若 ai 不知道可用发件邮箱，可通过 check 命令获取。AI发信后，若返回 exit code 2（配置缺失/损坏）或认证全部失败（exit 1），提示用户运行 `sudo python3 .../send-mailu.py check`。
    check 是配置入口：逐项检查 config.json（含逐域名 SMTP 实连 ✓/✗）；全部通过则输出实测可用账号清单（exit 0），任一失败且在交互终端时自动提示「是否开始配置？」，确认后进入配置流程——此时扫 Mailu SQLite 发现全部域名/账号并逐个问密码，配置完自动复查。
    归档（可选）：config 的 sent_archive.enabled=true 时，每封信发信成功后自动 IMAP APPEND 一份到「已发送」文件夹（复用同一账号登录 IMAP），失败仅告警不影响发信。check 末尾会打印 IMAP 归档探针结果（不计入可用性判定）。
-2. 【本地读信】：直接执行 `python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py get "<EML绝对路径>"`。邮件路径必须写完整，例如 `/mailu/mail/admin@example.com/new/邮件文件名` 或 `/mailu/mail/admin@example.com/cur/邮件文件名`。命令直接返回发件人、收件人、主题、日期、正文前 1200 字符和附件名称；不需要账号，不读取 `config.json`，不读取本文档全文。
+2. 【本地读信】：直接执行 `python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py get "<EML绝对路径>"`。邮件路径必须写完整，例如 `/mailu/mail/admin@example.com/new/邮件文件名` 或 `/mailu/mail/admin@example.com/cur/邮件文件名`。命令直接返回发件人、收件人、主题、日期、正文前 1200 字符和附件名称；不需要账号，不读取 `config.json`，不读取本文档全文。
 ```
 
 # 邮件发信助手 (send-mailu)
@@ -19,7 +19,7 @@ Mailu 发信/读信技能：
 发信脚本依赖 `/etc/send-mailu/config.json`（含 SMTP 登录凭证，支持多域名）。首次部署或配置丢失时用 `check` 命令检查并交互配置：
 
 ```bash
-sudo python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
+sudo python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
 ```
 
 `check` 会先检查配置状态，**若检查失败，自动提示「是否开始配置？」**，用户确认后进入交互配置流程。
@@ -34,7 +34,7 @@ sudo python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
 ### 验证配置 & 获取可用账号清单
 
 ```bash
-sudo python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
+sudo python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
 ```
 
 `check` 有三重用途：
@@ -50,7 +50,7 @@ sudo python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py check
 ### 非交互批量配置（脚本调用）
 
 ```bash
-sudo python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py check \
+sudo python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py check \
   --domains "example.com,example.net,example.org,example.io" \
   --username-prefix admin --passwords "pw1,pw2,pw3,pw4" \
   --smtp-host 127.0.0.1 --smtp-port 587 --security starttls --force
@@ -79,7 +79,7 @@ AI 不需要在对话中索要用户的明文密码。直接在服务器上调�
 
 ### 执行命令（最小调用）
 
-python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py send \
+python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py send \
   --to "<收件人>" \
   --from-addr "<发件人>" \
   --subject "<主题>" \
@@ -105,28 +105,28 @@ python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py send \
 
 **带附件（可重复传多个）：**
 
-python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py send \
+python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py send \
   --to "user@example.com" --from-addr "admin@example.com" \
   --subject "月度报告" --body "附件请查收" \
   --attach "/tmp/report.pdf" --attach "/tmp/data.xlsx"
 
 **HTML 正文（自动带纯文本降级）：**
 
-python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py send \
+python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py send \
   --to "user@example.com" --from-addr "admin@example.com" \
   --subject "通知" --body "纯文本降级内容" \
   --html "<h1>通知</h1><p>这是 <b>HTML</b> 正文。</p>"
 
 **抄送 + 密送：**
 
-python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py send \
+python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py send \
   --to "user@example.com" --from-addr "admin@example.com" \
   --subject "会议纪要" --body "见正文" \
   --cc "a@example.com,b@example.com" --bcc "boss@example.com"
 
 **正文从文件读取（避免大段正文走命令行）：**
 
-python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py send \
+python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py send \
   --to "user@example.com" --from-addr "admin@example.com" \
   --subject "日志" --body-file "/tmp/long-body.txt"
 
@@ -198,7 +198,7 @@ SMTP 只负责"把邮件投递出去"，本身不会在发件箱留下副本—�
 按 EML 绝对路径读取邮件信息和正文预览：
 
 ```bash
-python3 telegram-ai-bot/skill/script/send-mailu/send-mailu.py get "/mailu/mail/admin@example.com/new/邮件文件名"
+python3 /opt/telegram-ai-bot/skill/script/send-mailu/send-mailu.py get "/mailu/mail/admin@example.com/new/邮件文件名"
 ```
 
 邮箱文件路径固定为：
