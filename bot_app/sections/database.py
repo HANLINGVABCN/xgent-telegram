@@ -1070,10 +1070,4 @@ class PortalManager:
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
 
-def build_read_file_context_text(notice: str, mime_type: str, filename: str) -> str:
-    return (
-        f"{notice}。这就是系统刚按路径重新读取并直接交给你的文件本体，"
-        f"类型为 {mime_type}，文件名为 {filename}，请直接基于文件本体继续处理。"
-    )
-
 # --- ☆ Agent 命令执行器 ☆ ---

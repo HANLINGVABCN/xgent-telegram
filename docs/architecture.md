@@ -15,6 +15,7 @@ components. The first extracted components are:
 | `bot_app/protocols.py` | Parse and strip Agent protocol blocks only; no command execution or messaging |
 | `bot_app/text_utils.py` | Generic text clipping and normalization helpers |
 | `bot_app/shell_output.py` | Format shell display output, model context, and command-result notices |
+| `bot_app/agent_context.py` | Build next-turn Agent context for file, read, edit, grep, run, shell, trigger, and media results; no execution, persistence, or Telegram sending |
 
 Legacy names remain available through thin imports/wrappers in the sections so
 existing handlers keep working while the internal boundaries become explicit.
@@ -72,8 +73,9 @@ validation, rendering, triggers, provider adapters, and Telegram handlers.
 ## Intended next phases
 
 1. Continue moving configuration and pure utility functions into importable modules.
-2. Split Agent execution into protocol parsing, command dispatch, result
-   normalization, context construction, and presentation layers.
+2. Continue splitting Agent execution: context construction is now isolated;
+   command dispatch, result normalization, persistence, and Telegram presentation
+   still need explicit boundaries.
 3. Introduce explicit service objects for database, model, and Agent state.
 4. Move handlers into modules that receive dependencies instead of reading
    mutable globals.
