@@ -32,7 +32,6 @@ logs/
 
 # Python
 __pycache__/
-tests/
 *.py[cod]
 *$py.class
 .python-version
@@ -58,10 +57,6 @@ pip-delete-this-directory.txt
 
 # 本地临时测试脚本
 test_memory_offline.py
-test_*.py
-test_*
-*test*
-test/
 
 # Build and package artifacts
 build/
