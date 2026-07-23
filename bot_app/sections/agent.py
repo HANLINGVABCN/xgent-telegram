@@ -1469,7 +1469,7 @@ class AgentExecutor:
     
     @classmethod
     def extract_file_block(cls, ai_response: str) -> Optional[Tuple[str, str]]:
-        """从 AI 回复中提取 V2 file-x 文件块（创建新文件）"""
+        """从 AI 回复中提取 file-x 文件块（创建新文件）"""
         for block in cls.extract_protocol_blocks(ai_response):
             if block['type'] == 'file':
                 return block['path'], block['body']
@@ -1477,7 +1477,7 @@ class AgentExecutor:
 
     @classmethod
     def extract_sendfile(cls, ai_response: str) -> Optional[str]:
-        """从 AI 回复中提取 V2 sendfile-x 块（发送已有服务器文件）"""
+        """从 AI 回复中提取 sendfile-x 块（发送已有服务器文件）"""
         for block in cls.extract_protocol_blocks(ai_response):
             if block['type'] == 'sendfile':
                 return block['body']
@@ -1485,7 +1485,7 @@ class AgentExecutor:
 
     @classmethod
     def extract_media_prompt(cls, ai_response: str) -> Optional[str]:
-        """从 AI 回复中提取 V2 media-x 媒体生成提示词块"""
+        """从 AI 回复中提取 media-x 媒体生成提示词块"""
         for block in cls.extract_protocol_blocks(ai_response):
             if block['type'] == 'media':
                 prompt = block['body'].strip()

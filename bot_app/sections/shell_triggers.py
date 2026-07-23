@@ -1309,9 +1309,9 @@ class SelfTriggerManager:
                 return f"[trigger:kill 结果] 已取消全部触发任务，共 {count} 个。"
             return await cls.cancel(task_id)
         if normalized_target == 'kill':
-            raise ValueError("请使用 V2 trigger-x:kill:<任务ID> 或 trigger-x:kill:all 协议")
+            raise ValueError("请使用 trigger-x:kill:<任务ID> 或 trigger-x:kill:all 协议")
         if normalized_target:
-            raise ValueError('创建任务请使用 V2 trigger-x 协议块')
+            raise ValueError('创建任务请使用 trigger-x 协议块')
         return await cls.register(
             body, bot, chat_id, conversation_id,
             origin_user_text, origin_assistant_text,
