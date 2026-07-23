@@ -2,6 +2,7 @@
 # Keep cross-section names available through the loader until the next decoupling phase.
 
 from bot_app.text_utils import clip_middle_text
+from bot_app.agent_status import AgentTurnOrigin
 def strip_terminal_control_sequences(text: str) -> str:
     cleaned = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text or '')
     cleaned = re.sub(r'\x1b\][^\x07]*(?:\x07|\x1b\\)', '', cleaned)
@@ -1208,8 +1209,6 @@ class SelfTriggerManager:
         command = '\n'.join(lines[command_start:]).strip()
         if not command:
             raise ValueError('trigger 命令不能为空')
-        if any(line.strip() == '```' for line in command.splitlines()):
-            raise ValueError('trigger 命令不能包含独立的三反引号围栏')
 
         summary_source = re.sub(r'\s+', ' ', str(directives.get('summary') or '')).strip()
         if len(summary_source) > 600:
@@ -1310,9 +1309,9 @@ class SelfTriggerManager:
                 return f"[trigger:kill 结果] 已取消全部触发任务，共 {count} 个。"
             return await cls.cancel(task_id)
         if normalized_target == 'kill':
-            raise ValueError("请使用 trigger-x:kill:<任务ID> 或 trigger-x:kill:all")
+            raise ValueError("请使用 V2 trigger-x:kill:<任务ID> 或 trigger-x:kill:all 协议")
         if normalized_target:
-            raise ValueError('创建任务请使用裸 ```trigger-x 协议块')
+            raise ValueError('创建任务请使用 V2 trigger-x 协议块')
         return await cls.register(
             body, bot, chat_id, conversation_id,
             origin_user_text, origin_assistant_text,
@@ -1980,6 +1979,9 @@ class SelfTriggerManager:
         if cls._application is None:
             logger.warning(f'trigger run {run_id} 暂时无法投递：Application 未初始化')
             return
+        if not await db.claim_trigger_run_delivery(run_id, time.time()):
+            logger.info(f'trigger run {run_id} 已由其他投递协程领取，跳过重复投递')
+            return
 
         matched_conditions: List[str] = []
         with contextlib.suppress(Exception):
@@ -2049,7 +2051,6 @@ class SelfTriggerManager:
             if latest_task is None or latest_task['status'] == 'cancelled':
                 await db.finish_trigger_run(run_id, delivered_at=time.time())
                 return
-            await db.finish_trigger_run(run_id, delivery_started_at=time.time())
             # 🔔 可见提醒只发 Telegram 界面，不写入 AI 历史：任务概述/状态/ID 已全部包含在 internal_result 中，
             # 避免每次触发在历史里产生 "[系统操作] 🔔" + "[后台任务结果]" 两条重复记录。
             await GlobalRecorder.record_user_message(
@@ -2064,6 +2065,7 @@ class SelfTriggerManager:
                 lock_acquired_event=lock_acquired,
                 force_agent_mode=True,
                 reset_agent_iterations=False,
+                agent_origin=AgentTurnOrigin.trigger(task['id'], run_id),
             ))
             wait_notice_task = asyncio.create_task(
                 cls._notify_if_waiting(task, bot, lock_acquired, process_task)

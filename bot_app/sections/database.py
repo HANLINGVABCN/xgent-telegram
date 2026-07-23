@@ -747,6 +747,19 @@ class BotMemoryDB:
             (*updates.values(), run_id),
         )
 
+    async def claim_trigger_run_delivery(self, run_id: str, claimed_at: float) -> bool:
+        """Atomically claim one finished trigger run for exactly-once delivery."""
+        conn = await self._get_conn()
+        cursor = await conn.execute('''
+            UPDATE trigger_runs
+            SET delivery_started_at = ?
+            WHERE run_id = ?
+              AND finished_at IS NOT NULL
+              AND delivered_at IS NULL
+              AND delivery_started_at IS NULL
+        ''', (claimed_at, run_id))
+        return bool(cursor.rowcount)
+
     async def get_trigger_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         conn = await self._get_conn()
         cursor = await conn.execute('SELECT * FROM trigger_runs WHERE run_id = ?', (run_id,))
