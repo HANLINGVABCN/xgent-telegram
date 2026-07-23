@@ -8,7 +8,11 @@ from bot_app.agent_context import (
     build_shell_context_message,
     build_trigger_context_message,
 )
-from bot_app.agent_history import persist_agent_result, persist_media_result
+from bot_app.agent_history import (
+    persist_agent_result,
+    persist_media_result,
+    persist_standard_operation_result,
+)
 from bot_app.agent_dispatch import dispatch_standard_protocol
 from bot_app.agent_shell import execute_shell_protocol
 from bot_app.agent_trigger import execute_trigger_protocol
@@ -1477,14 +1481,13 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             operation_presentation,
                             parse_mode=constants.ParseMode.HTML,
                         )
-                    await persist_agent_result(
+                    await persist_standard_operation_result(
                         recorder=GlobalRecorder,
                         message_type=MessageType.AGENT_RESULT,
                         database=db,
                         conversation_id=cid,
                         chat_id=update.effective_chat.id,
-                        notice=operation_notice,
-                        add_to_conversation=operation_kind != 'run',
+                        operation=standard_operation,
                     )
                     round_state.add_context(standard_operation['context_message'])
                     round_state.should_continue = True

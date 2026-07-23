@@ -30,6 +30,27 @@ async def persist_agent_result(
         await database.add_chat_message(conversation_id, "user", notice)
 
 
+async def persist_standard_operation_result(
+    *,
+    recorder: Any,
+    message_type: Any,
+    database: Any,
+    conversation_id: Any,
+    chat_id: Any,
+    operation: dict[str, Any],
+) -> None:
+    """Persist a normalized standard operation with its legacy history policy."""
+    await persist_agent_result(
+        recorder=recorder,
+        message_type=message_type,
+        database=database,
+        conversation_id=conversation_id,
+        chat_id=chat_id,
+        notice=operation["notice"],
+        add_to_conversation=operation["kind"] != "run",
+    )
+
+
 async def persist_media_result(
     *,
     recorder: Any,
