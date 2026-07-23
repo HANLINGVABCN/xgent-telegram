@@ -17,17 +17,15 @@ async def persist_agent_result(
     conversation_id: Any,
     chat_id: Any,
     notice: str,
-    add_to_conversation: bool = True,
 ) -> None:
-    """Record an Agent result, then optionally append it to model history."""
+    """Record an Agent result in both global and conversation history."""
     await recorder.record(
         msg_type=message_type,
         role="system",
         content=notice,
         chat_id=chat_id,
     )
-    if add_to_conversation:
-        await database.add_chat_message(conversation_id, "user", notice)
+    await database.add_chat_message(conversation_id, "user", notice)
 
 
 async def persist_standard_operation_result(
@@ -39,7 +37,7 @@ async def persist_standard_operation_result(
     chat_id: Any,
     operation: dict[str, Any],
 ) -> None:
-    """Persist a normalized standard operation with its legacy history policy."""
+    """Persist every normalized standard operation in both history views."""
     await persist_agent_result(
         recorder=recorder,
         message_type=message_type,
@@ -47,7 +45,6 @@ async def persist_standard_operation_result(
         conversation_id=conversation_id,
         chat_id=chat_id,
         notice=operation["notice"],
-        add_to_conversation=operation["kind"] != "run",
     )
 
 
