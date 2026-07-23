@@ -3,7 +3,11 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock
 
-from bot_app.agent_history import persist_agent_result, persist_media_result
+from bot_app.agent_history import (
+    persist_agent_result,
+    persist_media_result,
+    persist_standard_operation_result,
+)
 
 
 class AgentHistoryTests(unittest.IsolatedAsyncioTestCase):
@@ -31,6 +35,40 @@ class AgentHistoryTests(unittest.IsolatedAsyncioTestCase):
             chat_id=9,
         )
         database.add_chat_message.assert_awaited_once_with(7, "user", "notice")
+
+    async def test_standard_read_result_is_added_to_conversation_history(self):
+        recorder = AsyncMock()
+        database = AsyncMock()
+
+        await persist_standard_operation_result(
+            recorder=recorder,
+            message_type="agent-result",
+            database=database,
+            conversation_id=7,
+            chat_id=9,
+            operation={"kind": "read", "notice": "read notice"},
+        )
+
+        recorder.record.assert_awaited_once()
+        database.add_chat_message.assert_awaited_once_with(
+            7, "user", "read notice"
+        )
+
+    async def test_standard_run_result_keeps_legacy_global_only_history(self):
+        recorder = AsyncMock()
+        database = AsyncMock()
+
+        await persist_standard_operation_result(
+            recorder=recorder,
+            message_type="agent-result",
+            database=database,
+            conversation_id=7,
+            chat_id=9,
+            operation={"kind": "run", "notice": "run notice"},
+        )
+
+        recorder.record.assert_awaited_once()
+        database.add_chat_message.assert_not_awaited()
 
     async def test_media_persistence_keeps_special_history_prefix(self):
         recorder = AsyncMock()
