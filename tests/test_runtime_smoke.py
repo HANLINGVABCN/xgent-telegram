@@ -159,7 +159,7 @@ asyncio.run(main())
         output = self.run_probe(r'''
 import json
 import bot_server as bot
-sample = "before\n```run-x <<AGENT_END_0123456789ABCDEF\necho ok\nAGENT_END_0123456789ABCDEF\n```\nafter"
+sample = "before\n```run-x <<AGENT_BEGIN_0123456789AB\necho ok\nAGENT_END_0123456789AB\n```\nafter"
 blocks = bot.AgentExecutor.extract_protocol_blocks(sample)
 print(json.dumps({
     "bool_true": bot.normalize_bool("yes"),
