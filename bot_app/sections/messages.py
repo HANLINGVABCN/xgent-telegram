@@ -2,6 +2,7 @@
 # Keep cross-section names available through the loader until the next decoupling phase.
 
 from bot_app.agent_coordinator import plan_agent_round_transition
+from bot_app.agent_status import AgentTurnOrigin, build_agent_round_status
 from bot_app.agent_context import (
     build_file_context_message,
     build_sendfile_context_message,
@@ -1291,34 +1292,57 @@ async def _reserve_agent_turn_iteration(db: BotMemoryDB) -> int:
     return next_iteration
 
 
-def _build_agent_trigger_round_notice(current_iteration: int, max_iterations: int) -> str:
+def _build_agent_trigger_round_notice(
+    current_iteration: int,
+    max_iterations: int,
+    origin: Optional[AgentTurnOrigin] = None,
+) -> str:
+    origin = origin or AgentTurnOrigin.user()
     if current_iteration > max_iterations:
-        exceeded = current_iteration - max_iterations
-        return (
-            f"🛠️ 第 {current_iteration} 轮Agent操作完成，但已超出最大 {max_iterations} 轮（超出 {exceeded} 轮）。\n"
-            "后台任务结果已记录，但本次未提交给 AI。\n"
-            "只有新的用户消息才会重置 Agent 轮数。"
+        return build_agent_round_status(
+            current_iteration,
+            "limit",
+            origin=origin,
+            max_iterations=max_iterations,
         )
-    return f"🛠️ 第 {current_iteration} 轮Agent操作完成，正在整理结果..."
-
-
-async def _send_agent_trigger_round_notice(context: ContextTypes.DEFAULT_TYPE,
-                                           chat_id: int, current_iteration: int,
-                                           max_iterations: int):
-    message = _build_agent_trigger_round_notice(current_iteration, max_iterations)
-    # 只发 Telegram 界面，不写入 AI 历史——与普通 Agent 循环里同名进度提示的处理方式保持一致
-    # （普通循环仅 safe_edit_text 编辑状态消息，从不入库）；轮数状态由 DB 跟踪，无需靠历史记录。
-    await safe_send_message(context, chat_id, message)
-
-
-async def _send_agent_iteration_limit_notice(context: ContextTypes.DEFAULT_TYPE,
-                                             chat_id: int, current_iteration: int,
-                                             max_iterations: int):
-    message = (
-        f"⚠️ Agent 当前为第 {current_iteration} 轮，已超过最大 {max_iterations} 轮。\n"
-        "本次系统结果已经保留，但不会继续调用 AI。只有新的用户消息才会重置轮数。"
+    return build_agent_round_status(
+        current_iteration,
+        "waiting_ai",
+        origin=origin,
     )
-    # 只发 Telegram 界面，不写入 AI 历史（与 🛠️ 轮数进度提示同原则：协议执行 scaffolding 不进上下文）
+
+
+async def _send_agent_trigger_round_notice(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    current_iteration: int,
+    max_iterations: int,
+    origin: Optional[AgentTurnOrigin] = None,
+):
+    message = _build_agent_trigger_round_notice(
+        current_iteration,
+        max_iterations,
+        origin=origin,
+    )
+    # 只发 Telegram 界面，不写入 AI 历史；轮数状态仍由同一个 DB 配置键跟踪。
+    sent = await safe_send_message(context, chat_id, message)
+    return sent[0] if sent else None
+
+
+async def _send_agent_iteration_limit_notice(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    current_iteration: int,
+    max_iterations: int,
+    origin: Optional[AgentTurnOrigin] = None,
+):
+    message = build_agent_round_status(
+        current_iteration,
+        "limit",
+        origin=origin,
+        max_iterations=max_iterations,
+    )
+    # 只发 Telegram 界面，不写入 AI 历史。
     await safe_send_message(context, chat_id, message)
 
 
@@ -1326,7 +1350,8 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
                                content_override: Optional[Any] = None,
                                lock_acquired_event: Optional[asyncio.Event] = None,
                                force_agent_mode: bool = False,
-                               reset_agent_iterations: bool = True):
+                               reset_agent_iterations: bool = True,
+                               agent_origin: Optional[AgentTurnOrigin] = None):
     """处理对话（全局模式 + Agent 协议执行：命令 / 读文件 / 发文件 / 写文件 / 媒体）"""
     global _is_processing, _stop_generation_event
     async with _conversation_processing_lock:
@@ -1343,6 +1368,7 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
                 content_override,
                 force_agent_mode,
                 reset_agent_iterations,
+                agent_origin,
             )
         finally:
             _stop_generation_event = None
@@ -1352,32 +1378,49 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
 async def _process_conversation_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
                                        content_override: Optional[Any] = None,
                                        force_agent_mode: bool = False,
-                                       reset_agent_iterations: bool = True):
+                                       reset_agent_iterations: bool = True,
+                                       agent_origin: Optional[AgentTurnOrigin] = None):
     """process_conversation 内部实现"""
     agent_mode = force_agent_mode or UserDataManager.get('agent_mode', False)
+    agent_origin = agent_origin or AgentTurnOrigin.user()
     stream_mode = normalize_bool(UserDataManager.get('stream_mode', True), True)
     db = await BotMemoryDB.get_instance()
     cid, cdata = await get_or_create_chat_session()
     max_agent_iterations = normalize_agent_max_iterations(
         UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
     )
+    trigger_status_msg = None
+    trigger_status_iteration = None
     if reset_agent_iterations:
         agent_iteration = await _reset_agent_turn_iteration(db)
     else:
         agent_iteration = await _reserve_agent_turn_iteration(db)
         await db.add_chat_message(cid, 'user', text)
-        await _send_agent_trigger_round_notice(
+        trigger_status_msg = await _send_agent_trigger_round_notice(
             context,
             update.effective_chat.id,
             agent_iteration,
             max_agent_iterations,
+            origin=agent_origin,
         )
+        trigger_status_iteration = agent_iteration
         if agent_iteration > max_agent_iterations:
             return
     model = cdata.get('model') or UserDataManager.get('default_model')
     prov_name, prov_data = get_current_provider()
     
     if not prov_data or not model:
+        if trigger_status_msg is not None and trigger_status_iteration is not None:
+            with contextlib.suppress(Exception):
+                await safe_edit_text(
+                    trigger_status_msg,
+                    build_agent_round_status(
+                        trigger_status_iteration,
+                        "failed",
+                        origin=agent_origin,
+                    ),
+                    reply_markup=None,
+                )
         message = update.message or update.callback_query.message
         await message.reply_text(
             "对话能力尚未配置。请先在【提供商】添加线路，并在【默认模型】中选择对话模型。",
@@ -1421,6 +1464,17 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
         )
     
     if not response:
+        if trigger_status_msg is not None and trigger_status_iteration is not None:
+            with contextlib.suppress(Exception):
+                await safe_edit_text(
+                    trigger_status_msg,
+                    build_agent_round_status(
+                        trigger_status_iteration,
+                        "failed",
+                        origin=agent_origin,
+                    ),
+                    reply_markup=None,
+                )
         await db.remove_last_chat_message(cid)
         return
     
@@ -1431,9 +1485,23 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     agent_turn_history.append({'role': 'assistant', 'content': response})
     
     # --- Agent 模式：命令 / 读文件 / 发文件 / 写文件 / 媒体协议循环 ---
+    pending_round_status_msg = trigger_status_msg
+    pending_round_iteration = trigger_status_iteration
+
     if agent_mode:
         while True:
             if is_stop_requested():
+                if pending_round_status_msg is not None and pending_round_iteration is not None:
+                    with contextlib.suppress(Exception):
+                        await safe_edit_text(
+                            pending_round_status_msg,
+                            build_agent_round_status(
+                                pending_round_iteration,
+                                "stopped",
+                                origin=agent_origin,
+                            ),
+                            reply_markup=None,
+                        )
                 await safe_send_message(
                     context,
                     update.effective_chat.id,
@@ -1444,15 +1512,35 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 )
                 break
             protocol_blocks = AgentExecutor.extract_protocol_blocks(response)
+            if pending_round_status_msg is not None and pending_round_iteration is not None:
+                pending_phase = "continued" if protocol_blocks else "completed"
+                with contextlib.suppress(Exception):
+                    await safe_edit_text(
+                        pending_round_status_msg,
+                        build_agent_round_status(
+                            pending_round_iteration,
+                            pending_phase,
+                            origin=agent_origin,
+                            next_iteration=pending_round_iteration + 1,
+                        ),
+                        reply_markup=None,
+                    )
+                pending_round_status_msg = None
+                pending_round_iteration = None
             if not protocol_blocks:
                 break  # AI 没有请求任何操作
-            
+
             operation_iteration = agent_iteration + 1
             round_state = AgentRoundState()
             provider_api_format = str(prov_data.get('api_format', 'openai'))
             agent_stop_msg = await context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text=f"🛠️ 第 {operation_iteration} 轮Agent操作进行中...",
+                text=build_agent_round_status(
+                    operation_iteration,
+                    "running",
+                    origin=agent_origin,
+                    operation_count=len(protocol_blocks),
+                ),
                 reply_markup=build_stop_keyboard()
             )
 
@@ -1691,7 +1779,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             build_shell_context_message(shell_notice, running=True)
                         )
                         round_state.should_continue = True
-                        break
+                        # 会话仍在运行不代表本次回复的后续协议无效；继续按原顺序处理，
+                        # 这样同一回复中的 shellread/stdin/shellkill 不会被静默跳过。
+                        continue
                     round_state.add_context(
                         build_shell_context_message(shell_notice, running=False)
                     )
@@ -1771,29 +1861,50 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         reply_markup=None,
                     )
 
-            if round_decision['show_completion_status']:
-                with contextlib.suppress(Exception):
-                    await safe_edit_text(
-                        agent_stop_msg,
-                        f"🛠️ 第 {operation_iteration} 轮Agent操作完成，正在整理结果...",
-                        reply_markup=None,
-                    )
-
             if not round_decision['continue_loop']:
+                if round_decision['show_completion_status'] and round_decision['status_text'] is None:
+                    with contextlib.suppress(Exception):
+                        await safe_edit_text(
+                            agent_stop_msg,
+                            build_agent_round_status(
+                                operation_iteration,
+                                "completed",
+                                origin=agent_origin,
+                            ),
+                            reply_markup=None,
+                        )
                 break
 
             # Continue from this turn's in-memory transcript. Re-reading global history here would
             # duplicate just-recorded Agent results and make prompt caching worse.
             agent_iteration = await _reserve_agent_turn_iteration(db)
             if agent_iteration > max_agent_iterations:
-                await _send_agent_iteration_limit_notice(
-                    context,
-                    update.effective_chat.id,
-                    agent_iteration,
-                    max_agent_iterations,
-                )
+                with contextlib.suppress(Exception):
+                    await safe_edit_text(
+                        agent_stop_msg,
+                        build_agent_round_status(
+                            agent_iteration,
+                            "limit",
+                            origin=agent_origin,
+                            max_iterations=max_agent_iterations,
+                        ),
+                        reply_markup=None,
+                    )
                 break
+
             next_history = round_decision['next_history']
+            with contextlib.suppress(Exception):
+                await safe_edit_text(
+                    agent_stop_msg,
+                    build_agent_round_status(
+                        operation_iteration,
+                        "waiting_ai",
+                        origin=agent_origin,
+                    ),
+                    reply_markup=None,
+                )
+            pending_round_status_msg = agent_stop_msg
+            pending_round_iteration = operation_iteration
 
             if stream_mode:
                 response = await send_streaming_response(
@@ -1809,6 +1920,19 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 )
             
             if not response:
+                if pending_round_status_msg is not None and pending_round_iteration is not None:
+                    with contextlib.suppress(Exception):
+                        await safe_edit_text(
+                            pending_round_status_msg,
+                            build_agent_round_status(
+                                pending_round_iteration,
+                                "failed",
+                                origin=agent_origin,
+                            ),
+                            reply_markup=None,
+                        )
+                    pending_round_status_msg = None
+                    pending_round_iteration = None
                 break
 
             await GlobalRecorder.record_ai_reply(response, update.effective_chat.id)
