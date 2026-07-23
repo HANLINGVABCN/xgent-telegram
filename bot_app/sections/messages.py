@@ -1685,7 +1685,6 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         conversation_id=cid,
                         chat_id=update.effective_chat.id,
                         notice=shell_notice,
-                        add_to_conversation=False,
                     )
                     if shell_result.get('running'):
                         round_state.add_context(

@@ -54,7 +54,7 @@ class AgentHistoryTests(unittest.IsolatedAsyncioTestCase):
             7, "user", "read notice"
         )
 
-    async def test_standard_run_result_keeps_legacy_global_only_history(self):
+    async def test_standard_run_result_is_also_added_to_conversation_history(self):
         recorder = AsyncMock()
         database = AsyncMock()
 
@@ -68,7 +68,9 @@ class AgentHistoryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         recorder.record.assert_awaited_once()
-        database.add_chat_message.assert_not_awaited()
+        database.add_chat_message.assert_awaited_once_with(
+            7, "user", "run notice"
+        )
 
     async def test_media_persistence_keeps_special_history_prefix(self):
         recorder = AsyncMock()
@@ -86,23 +88,6 @@ class AgentHistoryTests(unittest.IsolatedAsyncioTestCase):
         database.add_chat_message.assert_awaited_once_with(
             7, "user", "[外部媒体模块回复]\nmedia"
         )
-
-    async def test_can_preserve_run_behavior_without_database_write(self):
-        recorder = AsyncMock()
-        database = AsyncMock()
-
-        await persist_agent_result(
-            recorder=recorder,
-            message_type="agent-result",
-            database=database,
-            conversation_id=7,
-            chat_id=9,
-            notice="run notice",
-            add_to_conversation=False,
-        )
-
-        recorder.record.assert_awaited_once()
-        database.add_chat_message.assert_not_awaited()
 
 
 if __name__ == "__main__":
