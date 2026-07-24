@@ -23,6 +23,10 @@ class AgentStatusTests(unittest.TestCase):
             build_agent_round_status(3, "completed"),
             "✅ Agent 第 3 轮 · 本轮处理完成",
         )
+        self.assertEqual(
+            build_agent_round_status(3, "completed", operation_count=3),
+            "✅ Agent 第 3 轮 · 3 个操作已完成",
+        )
 
     def test_trigger_origin_changes_label_not_iteration(self):
         origin = AgentTurnOrigin.trigger("trg_demo", "trun_demo")

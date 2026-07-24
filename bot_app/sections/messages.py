@@ -1882,6 +1882,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                 operation_iteration,
                                 "completed",
                                 origin=agent_origin,
+                                operation_count=len(protocol_blocks),
                             ),
                             reply_markup=None,
                         )
