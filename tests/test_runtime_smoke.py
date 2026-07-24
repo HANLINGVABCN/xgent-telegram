@@ -178,6 +178,70 @@ print(json.dumps({
         self.assertEqual("echo ok", data["block_body"])
         self.assertEqual("before\nafter", data["stripped"])
 
+    def test_reply_context_prefix_behavior(self):
+        output = self.run_probe(r'''
+import json
+from types import SimpleNamespace as NS
+import bot_server as bot
+
+user = NS(full_name="张三", first_name="张三", title=None, username="zhang")
+replied = NS(from_user=user, sender_chat=None, text="把服务器重启一下", caption=None)
+
+plain = bot.build_reply_context_prefix(
+    NS(reply_to_message=replied, external_reply=None, quote=None))
+
+quoted = bot.build_reply_context_prefix(
+    NS(reply_to_message=replied, external_reply=None, quote=NS(text="服务器")))
+
+media = bot.build_reply_context_prefix(
+    NS(reply_to_message=NS(from_user=user, sender_chat=None, text=None, caption=None,
+                           photo=[NS(file_id="p1")], document=None, sticker=None),
+       external_reply=None, quote=None))
+
+doc = bot.build_reply_context_prefix(
+    NS(reply_to_message=NS(from_user=user, sender_chat=None, text=None, caption=None,
+                           photo=None,
+                           document=NS(file_name="日志.txt"),
+                           sticker=None),
+       external_reply=None, quote=None))
+
+none_case = bot.build_reply_context_prefix(
+    NS(reply_to_message=None, external_reply=None, quote=None))
+
+external = bot.build_reply_context_prefix(
+    NS(reply_to_message=None,
+       external_reply=NS(origin=NS(type="user", sender_user=NS(
+           full_name="李四", first_name="李四", username="li"))),
+       quote=None))
+
+long_text = "长" * 600
+truncated = bot.build_reply_context_prefix(
+    NS(reply_to_message=NS(from_user=user, sender_chat=None, text=long_text, caption=None),
+       external_reply=None, quote=None))
+
+combined = bot.build_incoming_context_prefix(
+    NS(reply_to_message=replied, external_reply=None, quote=None,
+       forward_origin=NS(type="hidden_user", sender_user_name="老王"),
+       forward_from=None, forward_from_chat=None))
+
+print(json.dumps({
+    "plain": plain, "quoted": quoted, "media": media, "doc": doc,
+    "none": none_case, "external": external, "truncated": truncated,
+    "combined": combined,
+}, ensure_ascii=False))
+''')
+        data = json.loads(output.strip().splitlines()[-1])
+        self.assertIn("张三", data["plain"])
+        self.assertIn("把服务器重启一下", data["plain"])
+        self.assertIn("[引用片段：服务器]", data["quoted"])
+        self.assertIn("[图片]", data["media"])
+        self.assertIn("[文件：日志.txt]", data["doc"])
+        self.assertEqual("", data["none"])
+        self.assertIn("李四", data["external"])
+        self.assertTrue(data["truncated"].endswith("…]"))
+        self.assertIn("老王", data["combined"])
+        self.assertIn("张三", data["combined"])
+
 
 if __name__ == "__main__":
     unittest.main()

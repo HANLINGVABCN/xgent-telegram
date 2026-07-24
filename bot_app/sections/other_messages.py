@@ -121,10 +121,10 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
             "data": image_b64
         })
 
-        forward_prefix = build_forward_origin_prefix(update.message)
-        if forward_prefix:
-            memory_text = f"{forward_prefix}\n{memory_text}"
-            multimodal_content.insert(0, {"type": "text", "text": forward_prefix})
+        context_prefix = build_incoming_context_prefix(update.message)
+        if context_prefix:
+            memory_text = f"{context_prefix}\n{memory_text}"
+            multimodal_content.insert(0, {"type": "text", "text": context_prefix})
 
         await process_conversation(
             update,
@@ -157,9 +157,9 @@ async def handle_sticker_message(update: Update, context: ContextTypes.DEFAULT_T
     model = UserDataManager.get('default_model')
     if prov_data and model and emoji:
         sticker_conv_text = f"[用户发送了一个贴纸: {emoji}]"
-        forward_prefix = build_forward_origin_prefix(update.message)
-        if forward_prefix:
-            sticker_conv_text = f"{forward_prefix}\n{sticker_conv_text}"
+        context_prefix = build_incoming_context_prefix(update.message)
+        if context_prefix:
+            sticker_conv_text = f"{context_prefix}\n{sticker_conv_text}"
         await process_conversation(update, context, sticker_conv_text)
     else:
         await update.message.reply_text(f"已收到贴纸 {emoji} ")
@@ -211,6 +211,125 @@ def build_forward_origin_prefix(msg) -> str:
         return f"[转发消息，来源：{name}]"
 
     return "[转发消息]"
+
+
+def _truncate_context_preview(text: str, limit: int) -> str:
+    """截断上下文预览文本，超长时追加省略号。"""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
+
+
+def _describe_message_media(m) -> str:
+    """为无文字消息生成简短的媒体类型标签。"""
+    if m is None:
+        return "[非文字消息]"
+    if getattr(m, 'photo', None):
+        return "[图片]"
+    document = getattr(m, 'document', None)
+    if document is not None:
+        file_name = getattr(document, 'file_name', None)
+        return f"[文件：{file_name}]" if file_name else "[文件]"
+    sticker = getattr(m, 'sticker', None)
+    if sticker is not None:
+        emoji = getattr(sticker, 'emoji', None) or ""
+        return f"[贴纸 {emoji}]".rstrip()
+    for attr, label in (
+        ('video', '[视频]'),
+        ('voice', '[语音]'),
+        ('audio', '[音频]'),
+        ('animation', '[动图]'),
+        ('video_note', '[视频消息]'),
+        ('location', '[位置]'),
+        ('venue', '[地点]'),
+        ('contact', '[联系人]'),
+        ('poll', '[投票]'),
+        ('story', '[快拍]'),
+        ('game', '[游戏]'),
+    ):
+        if getattr(m, attr, None):
+            return label
+    return "[非文字消息]"
+
+
+def _sender_display_name(m) -> str:
+    """取消息发送者的可读名称（用户或频道/群组）。"""
+    for attr in ('from_user', 'sender_chat'):
+        sender = getattr(m, attr, None)
+        if sender is None:
+            continue
+        name = (
+            getattr(sender, 'full_name', None)
+            or getattr(sender, 'first_name', None)
+            or getattr(sender, 'title', None)
+            or getattr(sender, 'username', None)
+        )
+        if name:
+            return str(name)
+    return "对方"
+
+
+def _describe_external_reply_origin(origin) -> str:
+    """从 MessageOrigin 提取来源标签，用于跨聊天引用回复。"""
+    origin_type = getattr(origin, 'type', '')
+    if origin_type == 'user':
+        sender = getattr(origin, 'sender_user', None)
+        name = (
+            (getattr(sender, 'full_name', None) or getattr(sender, 'first_name', None)
+             or getattr(sender, 'username', None)) if sender else None
+        )
+        return name or "未知用户"
+    if origin_type == 'hidden_user':
+        return getattr(origin, 'sender_user_name', None) or "隐藏用户"
+    if origin_type in ('chat', 'channel'):
+        chat = getattr(origin, 'sender_chat', None) or getattr(origin, 'chat', None)
+        name = (getattr(chat, 'title', None) or getattr(chat, 'username', None)) if chat else None
+        return name or "未知聊天"
+    return "未知来源"
+
+
+def build_reply_context_prefix(msg) -> str:
+    """提取引用回复上下文，返回前缀字符串。非回复消息返回空字符串。
+
+    覆盖：直接回复（被回复消息正文截断预览或媒体类型标签）、
+    部分引用（quote 片段）与跨聊天引用（external_reply，仅来源与媒体类型，
+    Bot API 不向其提供正文）。
+    """
+    reply = getattr(msg, 'reply_to_message', None)
+    external = getattr(msg, 'external_reply', None)
+    if reply is None and external is None:
+        return ""
+
+    lines: List[str] = []
+    if reply is not None:
+        name = _sender_display_name(reply)
+        content = (getattr(reply, 'text', None) or getattr(reply, 'caption', None) or "").strip()
+        preview = _truncate_context_preview(content, 500) if content else _describe_message_media(reply)
+        lines.append(f"[回复 {name} 的消息：{preview}]")
+    else:
+        origin_label = _describe_external_reply_origin(getattr(external, 'origin', None))
+        media_label = _describe_message_media(external)
+        lines.append(f"[回复来自 {origin_label} 的消息：{media_label}]")
+
+    quote = getattr(msg, 'quote', None)
+    quote_text = _truncate_context_preview(getattr(quote, 'text', None) or "", 200)
+    if quote_text:
+        lines.append(f"[引用片段：{quote_text}]")
+
+    return "\n".join(lines)
+
+
+def build_incoming_context_prefix(msg) -> str:
+    """组合转发来源与引用回复上下文前缀，供所有消息入口统一使用。"""
+    parts: List[str] = []
+    forward_prefix = build_forward_origin_prefix(msg)
+    if forward_prefix:
+        parts.append(forward_prefix)
+    reply_prefix = build_reply_context_prefix(msg)
+    if reply_prefix:
+        parts.append(reply_prefix)
+    return "\n".join(parts)
 
 
 async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -380,9 +499,9 @@ async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYP
             logger.warning(f"handle_other_message: forwardMessage fallback failed: {e}")
 
     if extracted_text:
-        forward_prefix = build_forward_origin_prefix(msg)
-        if forward_prefix:
-            extracted_text = f"{forward_prefix}\n{extracted_text}"
+        context_prefix = build_incoming_context_prefix(msg)
+        if context_prefix:
+            extracted_text = f"{context_prefix}\n{extracted_text}"
         if _conversation_processing_lock.locked():
             await msg.reply_text("⏳ 系统仍在处理上一个请求... 请稍后再发送新请求。")
             return
@@ -390,10 +509,10 @@ async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     # 无法提取文字内容
-    forward_prefix = build_forward_origin_prefix(msg)
-    if forward_prefix:
-        # 转发消息但无法提取文字：仍然送入对话流程，让 AI 自然回复
-        conv_text = f"{forward_prefix}（此消息未包含可读取的文字内容）"
+    context_prefix = build_incoming_context_prefix(msg)
+    if context_prefix:
+        # 转发/回复消息但无法提取文字：仍然送入对话流程，让 AI 自然回复
+        conv_text = f"{context_prefix}（此消息未包含可读取的文字内容）"
         if _conversation_processing_lock.locked():
             await msg.reply_text("⏳ 系统仍在处理上一个请求... 请稍后再发送新请求。")
             return

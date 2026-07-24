@@ -279,9 +279,9 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
                 )
             })
 
-        forward_prefix = build_forward_origin_prefix(update.message)
-        if forward_prefix:
-            memory_text = f"{forward_prefix}\n{memory_text}"
+        context_prefix = build_incoming_context_prefix(update.message)
+        if context_prefix:
+            memory_text = f"{context_prefix}\n{memory_text}"
 
         await process_conversation(
             update,
@@ -618,9 +618,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         text = update.message.text.strip()
 
     # 转发消息添加来源信息
-    forward_prefix = build_forward_origin_prefix(update.message)
-    if forward_prefix:
-        text = f"{forward_prefix}\n{text}"
+    context_prefix = build_incoming_context_prefix(update.message)
+    if context_prefix:
+        text = f"{context_prefix}\n{text}"
 
     # 普通聊天按拼接模式决定：直接发送，或累计到“完成”按钮后再写入记忆。
     if state != BotState.IDLE:
@@ -1172,9 +1172,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     # --- 正常对话处理 ---
-    forward_prefix = build_forward_origin_prefix(update.message)
-    if forward_prefix:
-        text = f"{forward_prefix}\n{text}"
+    context_prefix = build_incoming_context_prefix(update.message)
+    if context_prefix:
+        text = f"{context_prefix}\n{text}"
     await handle_normal_text_conversation(update, context, text)
 
 
