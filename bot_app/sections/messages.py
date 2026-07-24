@@ -1929,17 +1929,10 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 break
 
             next_history = round_decision['next_history']
-            # 等待 AI 期间的临时提示；下一条响应到达时即删除
-            with contextlib.suppress(Exception):
-                pending_round_status_msg = await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=build_agent_round_status(
-                        operation_iteration,
-                        "waiting_ai",
-                        origin=agent_origin,
-                    ),
-                )
-            pending_round_iteration = operation_iteration
+            # 等待 AI 期间不再发临时提示，保持聊天只有"进行中/已完成"两条状态；
+            # 顶栏 typing 保活已足够提示系统仍在工作。
+            pending_round_status_msg = None
+            pending_round_iteration = None
 
             if stream_mode:
                 response = await send_streaming_response(
