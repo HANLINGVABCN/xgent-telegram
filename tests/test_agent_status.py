@@ -9,7 +9,7 @@ class AgentStatusTests(unittest.TestCase):
     def test_user_round_phases_are_unambiguous(self):
         self.assertEqual(
             build_agent_round_status(3, "running", operation_count=2),
-            "🛠️ Agent 第 3 轮 · 正在执行 2 个操作",
+            "Agent 第 3 轮 · 2 个操作进行中",
         )
         self.assertEqual(
             build_agent_round_status(3, "waiting_ai"),
@@ -38,7 +38,7 @@ class AgentStatusTests(unittest.TestCase):
         )
         self.assertEqual(
             build_agent_round_status(7, "running", origin=origin, operation_count=1),
-            "🛠️ Agent 第 7 轮 · 后台任务 trg_demo · 正在执行 1 个操作",
+            "Agent 第 7 轮 · 后台任务 trg_demo · 1 个操作进行中",
         )
 
     def test_terminal_states_are_explicit(self):

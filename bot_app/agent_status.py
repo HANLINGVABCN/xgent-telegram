@@ -58,11 +58,11 @@ def build_agent_round_status(
 
     if phase == "running":
         detail = (
-            f"正在执行 {max(0, int(operation_count))} 个操作"
+            f"{max(0, int(operation_count))} 个操作进行中"
             if operation_count is not None
-            else "正在执行操作"
+            else "操作进行中"
         )
-        return f"🛠️ Agent 第 {iteration} 轮{source_prefix} · {detail}"
+        return f"Agent 第 {iteration} 轮{source_prefix} · {detail}"
 
     if phase == "waiting_ai":
         if origin.is_trigger:
