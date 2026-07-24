@@ -74,7 +74,12 @@ def build_agent_round_status(
         return f"✅ Agent 第 {iteration} 轮 · 已完成，进入第 {int(target)} 轮"
 
     if phase == "completed":
-        return f"✅ Agent 第 {iteration} 轮{source_prefix} · 本轮处理完成"
+        detail = (
+            f"{max(0, int(operation_count))} 个操作已完成"
+            if operation_count is not None
+            else "本轮处理完成"
+        )
+        return f"✅ Agent 第 {iteration} 轮{source_prefix} · {detail}"
 
     if phase == "stopped":
         return f"⏹️ Agent 第 {iteration} 轮{source_prefix} · 已停止"
