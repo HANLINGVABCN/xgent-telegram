@@ -1544,6 +1544,15 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 reply_markup=build_stop_keyboard()
             )
 
+            # 命令执行期间保持聊天顶栏 typing 状态；max_duration 仅作异常防泄漏兜底，
+            # 正常路径在操作循环结束后立即停止。
+            typing_stop = asyncio.Event()
+            typing_task = asyncio.create_task(
+                keep_typing_while_waiting(
+                    context, update.effective_chat.id, typing_stop, max_duration=1800.0
+                )
+            )
+
             for block in protocol_blocks:
                 if is_stop_requested():
                     round_state.should_continue = False
@@ -1838,6 +1847,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     round_state.add_context(build_media_continuation_message(media_result, media_prompt))
                     round_state.should_continue = True
             
+            typing_stop.set()
+            await cancel_task_quietly(typing_task)
+
             round_decision = plan_agent_round_transition(
                 round_state,
                 stop_requested=is_stop_requested(),

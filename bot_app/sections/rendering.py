@@ -2,9 +2,17 @@
 # Keep cross-section names available through the loader until the next decoupling phase.
 
 async def keep_typing_while_waiting(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
-                                    stop_event: asyncio.Event, interval: float = 4.0):
-    """Keep Telegram typing status alive while the model is still working."""
+                                    stop_event: asyncio.Event, interval: float = 4.0,
+                                    max_duration: Optional[float] = None):
+    """Keep Telegram typing status alive while the model is still working.
+
+    ``max_duration`` 是防泄漏兜底：调用方异常退出而未设置 stop_event 时，
+    任务也会在超时后自行结束，不会无限发送 typing 状态。
+    """
+    started_at = time.monotonic()
     while not stop_event.is_set():
+        if max_duration is not None and time.monotonic() - started_at >= max_duration:
+            return
         try:
             await context.bot.send_chat_action(
                 chat_id=chat_id,
