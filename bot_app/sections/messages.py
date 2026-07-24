@@ -1292,6 +1292,24 @@ async def _reserve_agent_turn_iteration(db: BotMemoryDB) -> int:
     return next_iteration
 
 
+async def _move_status_message_to_bottom(msg, context, chat_id: int, text: str) -> None:
+    """删除原轮次状态消息并在聊天底部重发。
+
+    状态消息在执行前发送、执行后原地编辑，导致"完成"标记停在执行结果上方；
+    完成时删除重发可让它排到所有执行结果之后。删除失败时退化为原地编辑。
+    """
+    deleted = False
+    with contextlib.suppress(Exception):
+        await msg.delete()
+        deleted = True
+    if deleted:
+        with contextlib.suppress(Exception):
+            await safe_send_message(context, chat_id, text)
+            return
+    with contextlib.suppress(Exception):
+        await safe_edit_text(msg, text, reply_markup=None)
+
+
 def _build_agent_trigger_round_notice(
     current_iteration: int,
     max_iterations: int,
@@ -1487,6 +1505,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     # --- Agent 模式：命令 / 读文件 / 发文件 / 写文件 / 媒体协议循环 ---
     pending_round_status_msg = trigger_status_msg
     pending_round_iteration = trigger_status_iteration
+    pending_round_op_count: Optional[int] = None
 
     if agent_mode:
         while True:
@@ -1514,19 +1533,34 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             protocol_blocks = AgentExecutor.extract_protocol_blocks(response)
             if pending_round_status_msg is not None and pending_round_iteration is not None:
                 pending_phase = "continued" if protocol_blocks else "completed"
-                with contextlib.suppress(Exception):
-                    await safe_edit_text(
+                if pending_phase == "completed":
+                    # 完成状态放到所有执行结果之后，不再原地编辑
+                    await _move_status_message_to_bottom(
                         pending_round_status_msg,
+                        context,
+                        update.effective_chat.id,
                         build_agent_round_status(
                             pending_round_iteration,
-                            pending_phase,
+                            "completed",
                             origin=agent_origin,
-                            next_iteration=pending_round_iteration + 1,
+                            operation_count=pending_round_op_count,
                         ),
-                        reply_markup=None,
                     )
+                else:
+                    with contextlib.suppress(Exception):
+                        await safe_edit_text(
+                            pending_round_status_msg,
+                            build_agent_round_status(
+                                pending_round_iteration,
+                                pending_phase,
+                                origin=agent_origin,
+                                next_iteration=pending_round_iteration + 1,
+                            ),
+                            reply_markup=None,
+                        )
                 pending_round_status_msg = None
                 pending_round_iteration = None
+                pending_round_op_count = None
             if not protocol_blocks:
                 break  # AI 没有请求任何操作
 
@@ -1875,17 +1909,18 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
 
             if not round_decision['continue_loop']:
                 if round_decision['show_completion_status'] and round_decision['status_text'] is None:
-                    with contextlib.suppress(Exception):
-                        await safe_edit_text(
-                            agent_stop_msg,
-                            build_agent_round_status(
-                                operation_iteration,
-                                "completed",
-                                origin=agent_origin,
-                                operation_count=len(protocol_blocks),
-                            ),
-                            reply_markup=None,
-                        )
+                    # 完成状态放到所有执行结果之后，不再原地编辑
+                    await _move_status_message_to_bottom(
+                        agent_stop_msg,
+                        context,
+                        update.effective_chat.id,
+                        build_agent_round_status(
+                            operation_iteration,
+                            "completed",
+                            origin=agent_origin,
+                            operation_count=len(protocol_blocks),
+                        ),
+                    )
                 break
 
             # Continue from this turn's in-memory transcript. Re-reading global history here would
@@ -1918,6 +1953,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 )
             pending_round_status_msg = agent_stop_msg
             pending_round_iteration = operation_iteration
+            pending_round_op_count = len(protocol_blocks)
 
             if stream_mode:
                 response = await send_streaming_response(
