@@ -14,7 +14,7 @@ from typing import Any, Dict, List
 class ProtocolParser:
     """解析使用唯一成对标记的 Agent 协议。"""
 
-    _NONCE_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_-]{11,31}"
+    _NONCE_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_-]{5,31}"
     _OPEN_RE = re.compile(
         r"^```(?P<tag>"
         r"run-x|shell-x|stdin-x:[^\n<]+|shellread-x:[^\n<]+|shellkill-x:[^\n<]+|"

@@ -135,12 +135,12 @@ class ProtocolParserTests(unittest.TestCase):
         response = "```file-x:/tmp/demo.txt <<EOF\ncontent\nEOF\n```"
         self.assertEqual([], ProtocolParser.extract_protocol_blocks(response))
 
-    def test_nonce_with_11_characters_is_rejected(self):
-        response = protocol_block("run-x", "echo unsafe", "123456789AB")
+    def test_nonce_with_5_characters_is_rejected(self):
+        response = protocol_block("run-x", "echo unsafe", "12345")
         self.assertEqual([], ProtocolParser.extract_protocol_blocks(response))
 
-    def test_nonce_with_12_characters_is_accepted(self):
-        response = protocol_block("run-x", "echo ok", "A23456789_-B")
+    def test_nonce_with_6_characters_is_accepted(self):
+        response = protocol_block("run-x", "echo ok", "A23_-B")
         self.assertEqual("echo ok", ProtocolParser.extract_protocol_blocks(response)[0]["body"])
 
     def test_nonce_with_32_characters_is_accepted(self):
