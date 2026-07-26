@@ -1,4 +1,4 @@
-# This file is executed by bot_server.py in the shared application namespace.
+# This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
 async def handle_photo_message_legacy(update: Update, context: ContextTypes.DEFAULT_TYPE):

@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-from bot_app.agent_shell import execute_shell_protocol
+from xgent_app.agent_shell import execute_shell_protocol
 
 
 class AgentShellTests(unittest.IsolatedAsyncioTestCase):

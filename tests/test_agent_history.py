@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock
 
-from bot_app.agent_history import (
+from xgent_app.agent_history import (
     persist_agent_result,
     persist_media_result,
     persist_standard_operation_result,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-from bot_app.agent_dispatch import dispatch_standard_protocol
+from xgent_app.agent_dispatch import dispatch_standard_protocol
 
 
 class AgentDispatchTests(unittest.IsolatedAsyncioTestCase):

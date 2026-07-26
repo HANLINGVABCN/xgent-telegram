@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from bot_app.agent_coordinator import plan_agent_round_transition
-from bot_app.agent_loop_state import AgentRoundState
+from xgent_app.agent_coordinator import plan_agent_round_transition
+from xgent_app.agent_loop_state import AgentRoundState
 
 
 class AgentCoordinatorTests(unittest.TestCase):

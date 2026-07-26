@@ -7,8 +7,8 @@ secrets.json
 credentials.yaml
 
 # Runtime data
-bot_memory.db
-bot_memory.db-*
+xgent_memory.db
+xgent_memory.db-*
 *.sqlite
 *.sqlite3
 *.db
@@ -16,15 +16,24 @@ bot_memory.db-*
 *.db-shm
 *.db-wal
 *db*
+xgent_storage/
+
+# Pre-XGent runtime names kept ignored during compatibility migration
+bot_memory.db
+bot_memory.db-*
 bot_storage/
+bot_output.log
+bot_server.log
+bot_full_trace.log
+bot.pid
 
 # 用户记忆（每条一个文件，含用户私密事实/偏好，绝不上传）
 memory/
 
 # Logs
-bot_output.log
-bot_server.log
-bot_full_trace.log
+xgent_output.log
+xgent_server.log
+xgent_full_trace.log
 *.log
 *.pid
 logs/

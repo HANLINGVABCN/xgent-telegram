@@ -5,7 +5,7 @@
 
 from typing import Any, Dict, Tuple
 
-from bot_app.text_utils import clip_middle_text
+from xgent_app.text_utils import clip_middle_text
 
 
 def build_shell_notice(action_label: str, shell_result: Dict[str, Any],

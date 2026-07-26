@@ -1,8 +1,8 @@
-# This file is executed by bot_server.py in the shared application namespace.
+# This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
-from bot_app.text_utils import clip_middle_text
-from bot_app.agent_status import AgentTurnOrigin
+from xgent_app.text_utils import clip_middle_text
+from xgent_app.agent_status import AgentTurnOrigin
 def strip_terminal_control_sequences(text: str) -> str:
     cleaned = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text or '')
     cleaned = re.sub(r'\x1b\][^\x07]*(?:\x07|\x1b\\)', '', cleaned)

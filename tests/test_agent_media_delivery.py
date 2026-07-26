@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-from bot_app.agent_media_delivery import send_media_generation_result
+from xgent_app.agent_media_delivery import send_media_generation_result
 
 
 class AgentMediaDeliveryTests(unittest.IsolatedAsyncioTestCase):

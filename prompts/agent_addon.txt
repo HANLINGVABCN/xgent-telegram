@@ -114,8 +114,8 @@ async def greet(name):
 AGENT_END_1414213562373095
 ```
 
-11. file-x：创建或整体覆盖文件。`file-x:` 后必须明确填写目标文件的绝对路径；省略路径或使用相对路径都会报错。用户未指定保存位置时，默认在 `/telegram-ai-bot/workspace/` 下自行命名。
-```file-x:/telegram-ai-bot/workspace/deploy.sh <<AGENT_BEGIN_1732050807568877
+11. file-x：创建或整体覆盖文件。`file-x:` 后必须明确填写目标文件的绝对路径；省略路径或使用相对路径都会报错。用户未指定保存位置时，默认在“当前运行目录绝对路径”所指项目根目录的 `workspace/` 下自行命名。
+```file-x:<项目根目录绝对路径>/workspace/deploy.sh <<AGENT_BEGIN_1732050807568877
 文件内容
 AGENT_END_1732050807568877
 ```

@@ -1,11 +1,11 @@
 import unittest
 
-from bot_app.shell_output import (
+from xgent_app.shell_output import (
     build_run_notice,
     format_shell_context_output,
     format_shell_display_output,
 )
-from bot_app.text_utils import clip_middle_text
+from xgent_app.text_utils import clip_middle_text
 
 
 class ShellOutputTests(unittest.TestCase):

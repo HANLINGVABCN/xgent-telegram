@@ -4,7 +4,7 @@
 
 # proxy_setup.sh 使用说明
 
-本文是 Telegram AI Bot 项目内置 skill 文档，用于指导 Agent 模式在服务器上使用 `skill/script/proxy-setup/proxy_setup.sh` 部署代理节点。
+本文是 XGent for Telegram 项目内置 skill 文档，用于指导 Agent 模式在服务器上使用 `skill/script/proxy-setup/proxy_setup.sh` 部署代理节点。
 
 ## 脚本位置
 

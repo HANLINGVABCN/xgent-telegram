@@ -9,7 +9,7 @@ from __future__ import annotations
 import html
 from typing import Any, Mapping, Optional
 
-from bot_app.shell_output import format_shell_display_output
+from xgent_app.shell_output import format_shell_display_output
 
 
 def escape_html(value: Any) -> str:

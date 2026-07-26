@@ -1,14 +1,14 @@
-# This file is executed by bot_server.py in the shared application namespace.
+# This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
-from bot_app.shell_output import (
+from xgent_app.shell_output import (
     build_run_notice,
     build_shell_notice,
     format_shell_context_output,
     format_shell_display_output,
     get_shell_pause_messages,
 )
-from bot_app.agent_context import build_media_context_message
+from xgent_app.agent_context import build_media_context_message
 class GlobalRecorder:
     """始终记录所有操作（无论什么模式）"""
     
@@ -201,7 +201,7 @@ def should_send_github_update_token(update_url: str) -> bool:
 
 def build_update_download_request() -> urllib.request.Request:
     headers = {
-        "User-Agent": "telegram-ai-bot-updater",
+        "User-Agent": "xgent-telegram-updater",
         "Accept": "application/vnd.github+json",
     }
     if BotConfig.UPDATE_GITHUB_TOKEN and should_send_github_update_token(BotConfig.UPDATE_ZIP_URL):
@@ -225,7 +225,7 @@ def download_and_apply_project_update(overwrite_local_custom_files: bool = True)
     skipped_local_custom_files = 0
     backup_path = backup_local_custom_dirs() if overwrite_local_custom_files else None
 
-    with tempfile.TemporaryDirectory(prefix="telegram-ai-bot-update-") as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix="xgent-telegram-update-") as tmp_dir:
         zip_path = os.path.join(tmp_dir, "source.zip")
         request = build_update_download_request()
 
@@ -602,7 +602,7 @@ def build_skill_prompt_section() -> str:
 def build_absolute_path_prompt_section() -> str:
     project_root = to_display_path(os.path.dirname(os.path.abspath(__file__)))
     skill_dir = to_display_path(SKILL_DIR)
-    upload_dir = to_display_path(os.path.join(project_root, 'bot_storage', 'uploads'))
+    upload_dir = to_display_path(os.path.join(project_root, 'xgent_storage', 'uploads'))
     return (
         "\n\n---\n"
         "【当前运行目录绝对路径】\n"
@@ -708,7 +708,7 @@ def build_conversation_system_prompt(agent_mode: bool) -> str:
 
 
 class ArtifactManager:
-    ROOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bot_storage')
+    ROOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'xgent_storage')
     UPLOAD_DIR = os.path.join(ROOT_DIR, 'uploads')
     GENERATED_MEDIA_DIR = os.path.join(ROOT_DIR, 'generated_media')
     MAX_INLINE_TEXT_BYTES = 120 * 1024

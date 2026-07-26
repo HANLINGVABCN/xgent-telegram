@@ -14,8 +14,10 @@ cd "$SCRIPT_DIR"
 VENV_DIR="$SCRIPT_DIR/venv"
 VENV_ACTIVATE="$VENV_DIR/bin/activate"
 VENV_PYTHON="$VENV_DIR/bin/python3"
-APP_ENTRY="bot_server.py"
-PM2_APP_NAME="telegram-ai-bot"
+APP_ENTRY="xgent_server.py"
+PM2_APP_NAME="xgent-telegram"
+LEGACY_PM2_APP_NAME="telegram-ai-bot"
+LEGACY_APP_ENTRY="bot_server.py"
 STATE_DIR="$SCRIPT_DIR/.install-state"
 APT_STATE_FILE="$STATE_DIR/apt-packages.txt"
 IP_MODE_FILE="$STATE_DIR/ip-mode"
@@ -31,7 +33,7 @@ LOCAL_API_ALLOWED_IPS_FILE="$STATE_DIR/local-api-allowed-ips"
 print_banner() {
     echo -e "${CYAN}"
     echo "========================================================"
-    echo " Telegram AI Bot 启动器"
+    echo " XGent for Telegram 启动器"
     echo " 异步 SQLite + 快速流式输出部署助手"
     echo "========================================================"
     echo -e "${NC}"
@@ -61,11 +63,43 @@ ensure_state_dir() {
     mkdir -p "$STATE_DIR"
 }
 
+migrate_env_key() {
+    local old_key="$1" new_key="$2" old_value="" new_value="" selected_value="" tmp_file
+    [ -f ".env" ] || return 0
+
+    old_value="$(grep -E "^${old_key}=" .env 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+    [ -n "$old_value" ] || return 0
+    new_value="$(grep -E "^${new_key}=" .env 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+    selected_value="${new_value:-$old_value}"
+
+    tmp_file="$(mktemp)"
+    grep -vE "^(${old_key}|${new_key})=" .env > "$tmp_file" || true
+    printf '%s=%s\n' "$new_key" "$selected_value" >> "$tmp_file"
+    mv "$tmp_file" .env
+    chmod 600 .env 2>/dev/null || true
+    success "已迁移 .env 配置: ${old_key} -> ${new_key}"
+}
+
+
+migrate_legacy_installation() {
+    migrate_env_key "TELEGRAM_AI_BOT_IP_MODE" "XGENT_IP_MODE"
+    migrate_env_key "TELEGRAM_AI_BOT_SOCKS5_PROXY" "XGENT_SOCKS5_PROXY"
+    migrate_env_key "TELEGRAM_AI_BOT_TRACE_LOG_FILE" "XGENT_TRACE_LOG_FILE"
+
+    # Runtime database/storage/log migration is performed by the new Python
+    # bootstrap before those paths are opened. Renaming only the PID marker here
+    # lets the installer stop a legacy nohup process safely.
+    if [ -f "bot.pid" ] && [ ! -e "xgent.pid" ]; then
+        mv -- "bot.pid" "xgent.pid"
+        success "已迁移旧进程标记: bot.pid -> xgent.pid"
+    fi
+}
+
 get_ip_mode() {
     local mode=""
 
     if [ -f ".env" ]; then
-        mode="$(grep -E "^TELEGRAM_AI_BOT_IP_MODE=" .env 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '[:space:]' || true)"
+        mode="$(grep -E "^(XGENT_IP_MODE|TELEGRAM_AI_BOT_IP_MODE)=" .env 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '[:space:]' || true)"
     fi
 
     case "$mode" in
@@ -81,7 +115,7 @@ get_ip_mode() {
 # 读取 SOCKS5 代理地址（仅当 IP 模式为 sock5 时有效）
 get_socks5_proxy() {
     if [ -f ".env" ]; then
-        grep -E "^TELEGRAM_AI_BOT_SOCKS5_PROXY=" .env 2>/dev/null | tail -n 1 | cut -d= -f2- || true
+        grep -E "^(XGENT_SOCKS5_PROXY|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env 2>/dev/null | tail -n 1 | cut -d= -f2- || true
     fi
 }
 
@@ -114,9 +148,9 @@ set_ip_mode() {
         ipv4|ipv6)
             tmp_file="$(mktemp)"
             if [ -f ".env" ]; then
-                grep -vE "^(TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env > "$tmp_file" || true
+                grep -vE "^(XGENT_IP_MODE|XGENT_SOCKS5_PROXY|TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env > "$tmp_file" || true
             fi
-            printf 'TELEGRAM_AI_BOT_IP_MODE=%s\n' "$mode" >> "$tmp_file"
+            printf 'XGENT_IP_MODE=%s\n' "$mode" >> "$tmp_file"
             mv "$tmp_file" .env
             chmod 600 .env 2>/dev/null || true
             ;;
@@ -127,17 +161,17 @@ set_ip_mode() {
             fi
             tmp_file="$(mktemp)"
             if [ -f ".env" ]; then
-                grep -vE "^(TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env > "$tmp_file" || true
+                grep -vE "^(XGENT_IP_MODE|XGENT_SOCKS5_PROXY|TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env > "$tmp_file" || true
             fi
-            printf 'TELEGRAM_AI_BOT_IP_MODE=%s\n' "$mode" >> "$tmp_file"
-            printf 'TELEGRAM_AI_BOT_SOCKS5_PROXY=%s\n' "$socks5_url" >> "$tmp_file"
+            printf 'XGENT_IP_MODE=%s\n' "$mode" >> "$tmp_file"
+            printf 'XGENT_SOCKS5_PROXY=%s\n' "$socks5_url" >> "$tmp_file"
             mv "$tmp_file" .env
             chmod 600 .env 2>/dev/null || true
             ;;
         default)
             if [ -f ".env" ]; then
                 tmp_file="$(mktemp)"
-                grep -vE "^(TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env > "$tmp_file" || true
+                grep -vE "^(XGENT_IP_MODE|XGENT_SOCKS5_PROXY|TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env > "$tmp_file" || true
                 mv "$tmp_file" .env
                 chmod 600 .env 2>/dev/null || true
             fi
@@ -161,12 +195,13 @@ run_bot_python() {
     local mode pythonpath app_entry socks5_url
     mode="$(get_ip_mode)"
     pythonpath="$(pythonpath_with_project)"
-    app_entry="${TELEGRAM_AI_BOT_APP_ENTRY:-$APP_ENTRY}"
+    app_entry="${XGENT_APP_ENTRY:-${TELEGRAM_AI_BOT_APP_ENTRY:-$APP_ENTRY}}"
 
     case "$mode" in
         default)
-            env -u TELEGRAM_AI_BOT_IP_MODE -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
-                TELEGRAM_AI_BOT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
+            env -u XGENT_IP_MODE -u XGENT_SOCKS5_PROXY \
+                -u TELEGRAM_AI_BOT_IP_MODE -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
+                XGENT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
             ;;
         sock5)
             socks5_url="$(get_socks5_proxy)"
@@ -174,12 +209,14 @@ run_bot_python() {
                 error "[错误] SOCKS5 模式已启用但未配置代理地址，请在 IP 出站模式中重新设置。"
                 exit 1
             fi
-            env TELEGRAM_AI_BOT_IP_MODE="$mode" TELEGRAM_AI_BOT_SOCKS5_PROXY="$socks5_url" \
-                TELEGRAM_AI_BOT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
+            env -u TELEGRAM_AI_BOT_IP_MODE -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
+                XGENT_IP_MODE="$mode" XGENT_SOCKS5_PROXY="$socks5_url" \
+                XGENT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
             ;;
         *)
-            env -u TELEGRAM_AI_BOT_SOCKS5_PROXY TELEGRAM_AI_BOT_IP_MODE="$mode" \
-                TELEGRAM_AI_BOT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
+            env -u XGENT_SOCKS5_PROXY -u TELEGRAM_AI_BOT_IP_MODE -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
+                XGENT_IP_MODE="$mode" \
+                XGENT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
             ;;
     esac
 }
@@ -190,14 +227,14 @@ import errno
 import os
 import socket
 
-_ip_mode = (os.environ.get("TELEGRAM_AI_BOT_IP_MODE") or "").strip().lower()
+_ip_mode = (os.environ.get("XGENT_IP_MODE") or os.environ.get("TELEGRAM_AI_BOT_IP_MODE") or "").strip().lower()
 _allowed_family = None
 _blocked_family = None
 
 # SOCKS5 代理模式：把代理地址写入标准代理环境变量，让 httpx / OpenAI SDK 自动走代理。
 # 必须在任何 httpx 客户端创建之前完成，因此放在本预加载段执行。
 if _ip_mode in {"sock5", "socks5"}:
-    _socks5_url = (os.environ.get("TELEGRAM_AI_BOT_SOCKS5_PROXY") or "").strip()
+    _socks5_url = (os.environ.get("XGENT_SOCKS5_PROXY") or os.environ.get("TELEGRAM_AI_BOT_SOCKS5_PROXY") or "").strip()
     if _socks5_url:
         # httpx 读取 HTTPS_PROXY / HTTP_PROXY / ALL_PROXY
         for _proxy_key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
@@ -227,7 +264,7 @@ if _allowed_family is not None and _blocked_family is not None:
     def _blocked_error():
         return OSError(
             errno.EAFNOSUPPORT,
-            f"{_family_name(_blocked_family)} is disabled by TELEGRAM_AI_BOT_IP_MODE={_ip_mode}",
+            f"{_family_name(_blocked_family)} is disabled by XGENT_IP_MODE={_ip_mode}",
         )
 
     def _restricted_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
@@ -266,7 +303,7 @@ import os
 import runpy
 from pathlib import Path
 
-_app_entry = os.environ.get("TELEGRAM_AI_BOT_APP_ENTRY") or "bot_server.py"
+_app_entry = os.environ.get("XGENT_APP_ENTRY") or os.environ.get("TELEGRAM_AI_BOT_APP_ENTRY") or "xgent_server.py"
 _app_path = Path(_app_entry)
 if not _app_path.is_absolute():
     _app_path = Path.cwd() / _app_path
@@ -484,7 +521,7 @@ confirm_uninstall() {
     fi
 
     warn "即将卸载本安装脚本创建的运行环境和服务记录。"
-    echo "   会清理: venv、本项目 nohup/PM2 进程、bot.pid、脚本记录的 apt 下载包。"
+    echo "   会清理: venv、本项目 nohup/PM2 进程、xgent.pid、脚本记录的 apt 下载包。"
     echo "   会保留: 项目文件、.env、数据库、日志、skill/ 下脚本服务、PM2 程序本体。"
     echo ""
     read -r -p "确认继续？输入 y 继续: " answer
@@ -498,27 +535,27 @@ stop_background_process() {
     local pid cmdline
     local found_extra=0
 
-    if [ -f "bot.pid" ]; then
-        pid="$(cat bot.pid 2>/dev/null || true)"
+    if [ -f "xgent.pid" ]; then
+        pid="$(cat xgent.pid 2>/dev/null || true)"
         if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
-            warn "   bot.pid 内容不是有效 PID，已移除 PID 文件。"
-            rm -f bot.pid
+            warn "   xgent.pid 内容不是有效 PID，已移除 PID 文件。"
+            rm -f xgent.pid
         elif ! ps -p "$pid" >/dev/null 2>&1; then
-            rm -f bot.pid
-            success "已清理过期 bot.pid"
+            rm -f xgent.pid
+            success "已清理过期 xgent.pid"
         else
             cmdline="$(ps -p "$pid" -o args= 2>/dev/null || true)"
-            if [[ "$cmdline" == *"$APP_ENTRY"* ]] && { [[ "$cmdline" == *"$SCRIPT_DIR"* ]] || [[ "$cmdline" == *"$VENV_PYTHON"* ]]; }; then
+            if { [[ "$cmdline" == *"$APP_ENTRY"* ]] || [[ "$cmdline" == *"$LEGACY_APP_ENTRY"* ]]; } && { [[ "$cmdline" == *"$SCRIPT_DIR"* ]] || [[ "$cmdline" == *"$VENV_PYTHON"* ]]; }; then
                 info "[卸载] 正在停止 nohup 后台进程: $pid"
                 kill "$pid" 2>/dev/null || true
                 sleep 2
                 if ps -p "$pid" >/dev/null 2>&1; then
                     kill -TERM "$pid" 2>/dev/null || true
                 fi
-                rm -f bot.pid
+                rm -f xgent.pid
                 success "nohup 后台进程已停止"
             else
-                warn "   bot.pid 指向的进程不像本项目进程，已跳过停止: $pid"
+                warn "   xgent.pid 指向的进程不像本项目进程，已跳过停止: $pid"
             fi
         fi
     fi
@@ -531,7 +568,7 @@ stop_background_process() {
             continue
         fi
 
-        if [[ "$cmdline" == *"$APP_ENTRY"* ]] && { [[ "$cmdline" == *"$SCRIPT_DIR"* ]] || [[ "$cmdline" == *"$VENV_PYTHON"* ]] || [[ "$cmdline" == *"TELEGRAM_AI_BOT_APP_ENTRY"* ]]; }; then
+        if { [[ "$cmdline" == *"$APP_ENTRY"* ]] || [[ "$cmdline" == *"$LEGACY_APP_ENTRY"* ]]; } && { [[ "$cmdline" == *"$SCRIPT_DIR"* ]] || [[ "$cmdline" == *"$VENV_PYTHON"* ]] || { [[ "$cmdline" == *"XGENT_APP_ENTRY"* ]] || [[ "$cmdline" == *"TELEGRAM_AI_BOT_APP_ENTRY"* ]]; }; }; then
             found_extra=1
             info "[卸载] 正在停止残留进程: $pid"
             kill "$pid" 2>/dev/null || true
@@ -545,24 +582,30 @@ stop_background_process() {
 }
 
 remove_pm2_process() {
+    local app_name found=0
     if ! command_exists pm2; then
         warn "   未检测到 PM2，跳过 PM2 进程清理。"
         return
     fi
 
-    if pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
-        info "[卸载] 正在移除 PM2 进程: $PM2_APP_NAME"
-        pm2 delete "$PM2_APP_NAME" >/dev/null 2>&1 || warn "   PM2 进程移除失败，请手动执行: pm2 delete $PM2_APP_NAME"
+    for app_name in "$PM2_APP_NAME" "$LEGACY_PM2_APP_NAME"; do
+        if pm2 describe "$app_name" >/dev/null 2>&1; then
+            found=1
+            info "[卸载] 正在移除 PM2 进程: $app_name"
+            pm2 delete "$app_name" >/dev/null 2>&1 || warn "   PM2 进程移除失败，请手动执行: pm2 delete $app_name"
+        fi
+    done
+
+    if [ "$found" -eq 1 ]; then
         if pm2 save >/dev/null 2>&1; then
             success "PM2 进程记录已更新"
         else
             warn "   PM2 进程列表保存失败，请手动执行: pm2 save"
         fi
     else
-        echo "   未发现 PM2 进程: $PM2_APP_NAME"
+        echo "   未发现 PM2 进程: $PM2_APP_NAME / $LEGACY_PM2_APP_NAME"
     fi
 }
-
 remove_virtualenv() {
     if [ -e "$VENV_DIR" ]; then
         info "[卸载] 正在删除虚拟环境: $VENV_DIR"
@@ -636,11 +679,11 @@ remove_ip_mode_state() {
         cleaned=1
     fi
     # 清理 .env 中的 IP 模式和 SOCKS5 代理设置
-    if [ -f ".env" ] && grep -qE "^(TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env 2>/dev/null; then
+    if [ -f ".env" ] && grep -qE "^(XGENT_IP_MODE|XGENT_SOCKS5_PROXY|TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env 2>/dev/null; then
         info "[卸载] 正在清理 .env 中的 IP 出站模式 / SOCKS5 代理设置"
         local tmp_file
         tmp_file="$(mktemp)"
-        grep -vE "^(TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env > "$tmp_file" || true
+        grep -vE "^(XGENT_IP_MODE|XGENT_SOCKS5_PROXY|TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env > "$tmp_file" || true
         mv "$tmp_file" .env
         chmod 600 .env 2>/dev/null || true
         cleaned=1
@@ -664,7 +707,7 @@ uninstall_app() {
 
     echo ""
     echo -e "${CYAN}========================================================${NC}"
-    echo -e "${CYAN} Telegram AI Bot 主安装内容已卸载。${NC}"
+    echo -e "${CYAN} XGent for Telegram 主安装内容已卸载。${NC}"
     echo -e "${CYAN} 已保留项目文件、配置、数据库、日志、skill 服务和 PM2 本体。${NC}"
     echo -e "${CYAN}========================================================${NC}"
 }
@@ -1105,10 +1148,12 @@ PY
 check_database() {
     info "[检查] 正在检查数据库..."
 
-    if [ -f "bot_memory.db" ]; then
+    if [ -f "xgent_memory.db" ]; then
         local db_size
-        db_size="$(du -h bot_memory.db | cut -f1)"
+        db_size="$(du -h xgent_memory.db | cut -f1)"
         echo "   数据库已存在，大小: $db_size"
+    elif [ -f "bot_memory.db" ]; then
+        echo "   检测到旧版数据库，将在 XGent for Telegram 下次启动前自动迁移。"
     else
         echo "   数据库会在首次运行时自动创建。"
     fi
@@ -1189,7 +1234,7 @@ setup_pm2_startup() {
 }
 
 start_foreground() {
-    info "[运行] 正在前台启动 Telegram AI Bot..."
+    info "[运行] 正在前台启动 XGent for Telegram..."
     echo "   IP 出站模式: $(ip_mode_label)"
     run_bot_python python -c "$(bot_python_code)"
 }
@@ -1197,12 +1242,12 @@ start_foreground() {
 start_background() {
     local mode pythonpath code socks5_url
 
-    info "[运行] 正在后台启动 Telegram AI Bot..."
+    info "[运行] 正在后台启动 XGent for Telegram..."
 
     # 彻底停止旧进程
-    if [ -f "bot.pid" ]; then
+    if [ -f "xgent.pid" ]; then
         local old_pid
-        old_pid="$(cat bot.pid)"
+        old_pid="$(cat xgent.pid)"
         if [[ "$old_pid" =~ ^[0-9]+$ ]] && ps -p "$old_pid" >/dev/null 2>&1; then
             echo "   正在停止旧进程: $old_pid"
             kill "$old_pid" 2>/dev/null || true
@@ -1211,7 +1256,7 @@ start_background() {
                 kill -9 "$old_pid" 2>/dev/null || true
             fi
         fi
-        rm -f bot.pid
+        rm -f xgent.pid
     fi
 
     echo "   IP 出站模式: $(ip_mode_label)"
@@ -1220,9 +1265,10 @@ start_background() {
     code="$(bot_python_code)"
     case "$mode" in
         default)
-            env -u TELEGRAM_AI_BOT_IP_MODE -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
-                TELEGRAM_AI_BOT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" \
-                nohup "$VENV_PYTHON" -c "$code" > bot_output.log 2>&1 &
+            env -u XGENT_IP_MODE -u XGENT_SOCKS5_PROXY \
+                -u TELEGRAM_AI_BOT_IP_MODE -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
+                XGENT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" \
+                nohup "$VENV_PYTHON" -c "$code" > xgent_output.log 2>&1 &
             ;;
         sock5)
             socks5_url="$(get_socks5_proxy)"
@@ -1230,30 +1276,42 @@ start_background() {
                 error "[错误] SOCKS5 模式已启用但未配置代理地址。"
                 exit 1
             fi
-            env TELEGRAM_AI_BOT_IP_MODE="$mode" TELEGRAM_AI_BOT_SOCKS5_PROXY="$socks5_url" \
-                TELEGRAM_AI_BOT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" \
-                nohup "$VENV_PYTHON" -c "$code" > bot_output.log 2>&1 &
+            env -u TELEGRAM_AI_BOT_IP_MODE -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
+                XGENT_IP_MODE="$mode" XGENT_SOCKS5_PROXY="$socks5_url" \
+                XGENT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" \
+                nohup "$VENV_PYTHON" -c "$code" > xgent_output.log 2>&1 &
             ;;
         *)
-            env -u TELEGRAM_AI_BOT_SOCKS5_PROXY TELEGRAM_AI_BOT_IP_MODE="$mode" \
-                TELEGRAM_AI_BOT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" \
-                nohup "$VENV_PYTHON" -c "$code" > bot_output.log 2>&1 &
+            env -u XGENT_SOCKS5_PROXY -u TELEGRAM_AI_BOT_IP_MODE -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
+                XGENT_IP_MODE="$mode" \
+                XGENT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" \
+                nohup "$VENV_PYTHON" -c "$code" > xgent_output.log 2>&1 &
             ;;
     esac
     local pid=$!
-    echo "$pid" > bot.pid
+    echo "$pid" > xgent.pid
     sleep 2
 
     if ps -p "$pid" >/dev/null 2>&1; then
         echo "   后台启动成功，PID: $pid"
-        echo "   日志文件: bot_output.log"
-        echo "   停止命令: kill \$(cat bot.pid)"
-        echo "   查看日志: tail -f bot_output.log"
+        echo "   日志文件: xgent_output.log"
+        echo "   停止命令: kill \$(cat xgent.pid)"
+        echo "   查看日志: tail -f xgent_output.log"
         echo "   彻底重启: bash install.sh restart"
     else
-        error "[错误] 后台启动失败，请查看 bot_output.log。"
-        tail -20 bot_output.log || true
+        error "[错误] 后台启动失败，请查看 xgent_output.log。"
+        tail -20 xgent_output.log || true
         exit 1
+    fi
+}
+
+migrate_legacy_pm2_process() {
+    if command_exists pm2 \
+        && ! pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1 \
+        && pm2 describe "$LEGACY_PM2_APP_NAME" >/dev/null 2>&1; then
+        info "[迁移] 正在把 PM2 进程 ${LEGACY_PM2_APP_NAME} 迁移为 ${PM2_APP_NAME}..."
+        pm2 delete "$LEGACY_PM2_APP_NAME" >/dev/null 2>&1 || true
+        success "旧 PM2 进程记录已移除，将使用新名称重建"
     fi
 }
 
@@ -1261,8 +1319,9 @@ start_with_pm2() {
     local code mode env_mode socks5_url
 
     ensure_pm2
+    migrate_legacy_pm2_process
 
-    info "[运行] 正在使用 PM2 启动 Telegram AI Bot..."
+    info "[运行] 正在使用 PM2 启动 XGent for Telegram..."
     echo "   IP 出站模式: $(ip_mode_label)"
 
     # 进程已存在时原地重启（pm_id 不变），并用 --update-env 刷新环境变量。
@@ -1274,8 +1333,9 @@ start_with_pm2() {
         [ "$mode" = "default" ] && env_mode=""
         socks5_url=""
         [ "$mode" = "sock5" ] && socks5_url="$(get_socks5_proxy)"
-        env TELEGRAM_AI_BOT_IP_MODE="$env_mode" TELEGRAM_AI_BOT_SOCKS5_PROXY="$socks5_url" \
-            TELEGRAM_AI_BOT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$(pythonpath_with_project)" \
+        env XGENT_IP_MODE="$env_mode" XGENT_SOCKS5_PROXY="$socks5_url" \
+            TELEGRAM_AI_BOT_IP_MODE="" TELEGRAM_AI_BOT_SOCKS5_PROXY="" \
+            XGENT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$(pythonpath_with_project)" \
             pm2 restart "$PM2_APP_NAME" --update-env
         echo "   PM2 原地重启成功（进程 ID 保持不变）。"
         echo "   查看日志: pm2 logs $PM2_APP_NAME"
@@ -1327,14 +1387,14 @@ set -u
   # 复用原 pm_id，避免进程 ID 不断增加。
 
   # 设置 IP 模式环境变量（ipv4 / ipv6 / sock5 互斥）
-  unset TELEGRAM_AI_BOT_SOCKS5_PROXY || true
+  unset XGENT_SOCKS5_PROXY TELEGRAM_AI_BOT_IP_MODE TELEGRAM_AI_BOT_SOCKS5_PROXY || true
   if [ "$mode" = "default" ]; then
-    unset TELEGRAM_AI_BOT_IP_MODE || true
+    unset XGENT_IP_MODE || true
   elif [ "$mode" = "sock5" ]; then
-    export TELEGRAM_AI_BOT_IP_MODE="$mode"
-    export TELEGRAM_AI_BOT_SOCKS5_PROXY="$socks5_url"
+    export XGENT_IP_MODE="$mode"
+    export XGENT_SOCKS5_PROXY="$socks5_url"
   else
-    export TELEGRAM_AI_BOT_IP_MODE="$mode"
+    export XGENT_IP_MODE="$mode"
   fi
 
   # 彻底重启：重新准备环境并启动
@@ -1356,8 +1416,9 @@ EOF
 # 彻底重建 PM2 进程：删除后重新创建，会重新加载 PM2 启动参数
 # （注意：pm_id 会 +1，日常重启请用 restart / 菜单选项 5）
 rebuild_pm2_app() {
-    if command_exists pm2 && pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
+    if command_exists pm2 && { pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1 || pm2 describe "$LEGACY_PM2_APP_NAME" >/dev/null 2>&1; }; then
         pm2 delete "$PM2_APP_NAME" 2>/dev/null || true
+        pm2 delete "$LEGACY_PM2_APP_NAME" 2>/dev/null || true
         sleep 1
         start_with_pm2
     else
@@ -1366,15 +1427,15 @@ rebuild_pm2_app() {
 }
 
 restart_app() {
-    info "[重启] 正在彻底重启 Telegram AI Bot..."
+    info "[重启] 正在彻底重启 XGent for Telegram..."
 
-    if command_exists pm2 && pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
+    if command_exists pm2 && { pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1 || pm2 describe "$LEGACY_PM2_APP_NAME" >/dev/null 2>&1; }; then
         echo "   检测到 PM2 进程，将原地重启并刷新环境变量（进程 ID 保持不变）。"
         restart_pm2_detached
         return
     fi
 
-    if [ -f "bot.pid" ]; then
+    if [ -f "xgent.pid" ]; then
         echo "   检测到 nohup 进程，将彻底停止并重新启动以确保加载最新配置。"
         stop_background_process
         sleep 1
@@ -1751,6 +1812,7 @@ parse_uninstall_options() {
 
 prepare_environment() {
     fix_line_endings
+    migrate_legacy_installation
     ensure_python
     ensure_virtualenv
     activate_virtualenv
@@ -1815,7 +1877,7 @@ main() {
 
     echo ""
     echo -e "${CYAN}========================================================${NC}"
-    echo -e "${CYAN} Telegram AI Bot 已准备就绪。${NC}"
+    echo -e "${CYAN} XGent for Telegram 已准备就绪。${NC}"
     echo -e "${CYAN} 已增强: 自动补环境、venv 自愈、PM2 自动安装${NC}"
     echo -e "${CYAN}========================================================${NC}"
 }

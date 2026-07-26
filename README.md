@@ -1,4 +1,4 @@
-# Telegram AI Bot
+# XGent for Telegram
 
 <p align="center">
   <strong>把你的 Linux 服务器装进 Telegram。</strong>
@@ -9,8 +9,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/HANLINGVABCN/telegram-ai-bot/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/HANLINGVABCN/telegram-ai-bot/actions/workflows/tests.yml/badge.svg"></a>
-  <a href="https://github.com/HANLINGVABCN/telegram-ai-bot/blob/main/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
+  <a href="https://github.com/HANLINGVABCN/xgent-telegram/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/HANLINGVABCN/xgent-telegram/actions/workflows/tests.yml/badge.svg"></a>
+  <a href="https://github.com/HANLINGVABCN/xgent-telegram/blob/main/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
   <img alt="Python 3.8+" src="https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white">
   <img alt="Self-hosted" src="https://img.shields.io/badge/Self--hosted-private-24A1DE?logo=telegram&logoColor=white">
 </p>
@@ -78,7 +78,7 @@ AI：当前主要问题是 /var/log 占用增长过快……
 
 ```mermaid
 flowchart LR
-    U[Telegram 用户] -->|消息 / 文件 / 图片| B[Telegram AI Bot]
+    U[Telegram 用户] -->|消息 / 文件 / 图片| B[XGent for Telegram]
     B --> M[模型提供商]
     B --> D[(SQLite 记忆)]
     B --> S[Skill 索引]
@@ -103,10 +103,10 @@ flowchart LR
 
 ### 一键命令
 
-以下命令会将项目安装到 `/opt/telegram-ai-bot`；可将 `/opt` 换成其他目录。
+以下命令会将项目安装到 `/opt/xgent-telegram`；可将 `/opt` 换成其他目录。
 
 ```bash
-cd /opt && sudo git clone https://github.com/HANLINGVABCN/telegram-ai-bot.git && sudo chown -R "$USER":"$USER" telegram-ai-bot && cd telegram-ai-bot && chmod +x install.sh && ./install.sh
+cd /opt && sudo git clone https://github.com/HANLINGVABCN/xgent-telegram.git && sudo chown -R "$USER":"$USER" xgent-telegram && cd xgent-telegram && chmod +x install.sh && ./install.sh
 ```
 
 安装脚本会完成环境检查、虚拟环境创建、依赖安装、`.env` 创建与 Telegram Token 校验，然后让你选择启动方式：
@@ -120,9 +120,9 @@ cd /opt && sudo git clone https://github.com/HANLINGVABCN/telegram-ai-bot.git &&
 
 ```bash
 cd /opt
-sudo git clone https://github.com/HANLINGVABCN/telegram-ai-bot.git
-sudo chown -R "$USER":"$USER" telegram-ai-bot
-cd telegram-ai-bot
+sudo git clone https://github.com/HANLINGVABCN/xgent-telegram.git
+sudo chown -R "$USER":"$USER" xgent-telegram
+cd xgent-telegram
 chmod +x install.sh
 ./install.sh
 ```
@@ -139,7 +139,7 @@ AUTHORIZED_USER_ID=你的 Telegram 用户 ID
 ```env
 # Fine-grained token 只需要该仓库 Contents: Read-only。
 UPDATE_GITHUB_TOKEN=你的 GitHub Token
-UPDATE_ZIP_URL=https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot/zipball/main
+UPDATE_ZIP_URL=https://api.github.com/repos/HANLINGVABCN/xgent-telegram/zipball/main
 ```
 
 `UPDATE_ZIP_URL` 可省略，默认使用上面的公开仓库地址。私有仓库没有配置 Token 时，GitHub 会返回 404/403，在线更新将失败。
@@ -220,7 +220,7 @@ UPDATE_ZIP_URL=https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot/zipball
 执行 `/update` 时，可选择保留或覆盖 `prompts/` 与 `skill/`。覆盖前，当前内容会备份到：
 
 ```text
-bot_storage/update_backups/custom_时间戳/
+xgent_storage/update_backups/custom_时间戳/
 ```
 
 ## Agent 模式
@@ -239,7 +239,7 @@ Agent 协议只接受 nonce 相同的 `AGENT_BEGIN` / `AGENT_END` 成对标记�
 一次性命令的完整输出保存在：
 
 ```text
-bot_storage/command_outputs/
+xgent_storage/command_outputs/
 ```
 
 命令黑名单位于：
@@ -258,7 +258,7 @@ Agent 模式拥有真实服务器权限。建议至少执行以下措施：
 2. **默认关闭 Agent**，确认模型、Prompt 和权限配置后再开启。
 3. **限制运行账号可访问的目录和密钥**，不要让它读取无关服务的凭据。
 4. **维护命令黑名单**，但不要把黑名单当作完整沙箱。
-5. **不要提交敏感文件**：`.env`、数据库、日志和 `bot_storage/`。
+5. **不要提交敏感文件**：`.env`、数据库、日志和 `xgent_storage/`。
 6. **谨慎处理外部内容**：网页、文件和转发消息可能包含提示词注入内容。
 7. Token 或 API Key 泄露后，应立即在对应平台撤销并重新生成。
 
@@ -276,11 +276,11 @@ Agent 模式拥有真实服务器权限。建议至少执行以下措施：
 ## 项目结构
 
 ```text
-telegram-ai-bot/
-├─ bot_server.py              # 可执行入口
+xgent-telegram/
+├─ xgent_server.py              # 可执行入口
 ├─ install.sh                 # 安装、启动、更新与维护脚本
 ├─ requirements.txt
-├─ bot_app/
+├─ xgent_app/
 │  ├─ bootstrap.py            # 模块加载与完整性检查
 │  └─ sections/               # Bot 功能模块
 ├─ prompts/                   # 系统与 Agent 提示词
@@ -294,18 +294,18 @@ telegram-ai-bot/
 运行后会自动生成：
 
 - `.env`：Bot Token、授权用户 ID 等环境配置；
-- `bot_memory.db`：SQLite 数据库；
-- `bot_storage/`：上传文件、命令输出、生成媒体和更新备份；
-- `bot_server.log`：服务日志；
-- `bot_output.log`：nohup 后台输出；
-- `bot.pid`：nohup 进程 ID。
+- `xgent_memory.db`：SQLite 数据库；
+- `xgent_storage/`：上传文件、命令输出、生成媒体和更新备份；
+- `xgent_server.log`：服务日志；
+- `xgent_output.log`：nohup 后台输出；
+- `xgent.pid`：nohup 进程 ID。
 
 ## 开发与检查
 
 安装依赖后可直接运行：
 
 ```bash
-python3 bot_server.py
+python3 xgent_server.py
 ```
 
 执行完整性检查和测试：
@@ -317,7 +317,7 @@ python -m unittest discover -s tests -v
 
 GitHub Actions 会在 Python 3.10、3.11 和 3.12 上执行完整性检查、编译检查、单元测试及 Shell 语法检查。
 
-入口由 `bot_app/bootstrap.py` 引导，并按清单加载 `bot_app/sections/` 中的兼容模块。详细职责和后续迁移计划见 [`docs/architecture.md`](docs/architecture.md)。
+入口由 `xgent_app/bootstrap.py` 引导，并按清单加载 `xgent_app/sections/` 中的兼容模块。详细职责和后续迁移计划见 [`docs/architecture.md`](docs/architecture.md)。
 
 ## 发布维护
 

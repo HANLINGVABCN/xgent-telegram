@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Mapping, Optional
 
-from bot_app.agent_results import (
+from xgent_app.agent_results import (
     AgentOperationResult,
     failed_result,
     normalize_edit_result,
