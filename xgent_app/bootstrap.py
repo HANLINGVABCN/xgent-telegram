@@ -10,12 +10,46 @@ bootstrap machinery in the public entrypoint.
 from __future__ import annotations
 
 from pathlib import Path
+import os
 from typing import MutableMapping, Optional, Tuple
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 DEFAULT_SECTION_DIR = PACKAGE_ROOT / "sections"
 MANIFEST_FILENAME = "MANIFEST.txt"
+
+LEGACY_RUNTIME_PATHS = (
+    ("bot_memory.db", "xgent_memory.db"),
+    ("bot_memory.db-wal", "xgent_memory.db-wal"),
+    ("bot_memory.db-shm", "xgent_memory.db-shm"),
+    ("bot_storage", "xgent_storage"),
+    ("bot_server.log", "xgent_server.log"),
+    ("bot_output.log", "xgent_output.log"),
+    ("bot_full_trace.log", "xgent_full_trace.log"),
+    ("bot.pid", "xgent.pid"),
+)
+
+
+def migrate_legacy_runtime_paths(project_root: Optional[Path] = None) -> Tuple[Tuple[str, str], ...]:
+    """Move pre-XGent runtime data to canonical names when safe.
+
+    Existing canonical paths always win; legacy paths are only moved when the
+    destination does not exist.  This keeps upgrades non-destructive.
+    """
+
+    root = (project_root or PACKAGE_ROOT.parent).resolve()
+    migrated = []
+    for legacy_name, canonical_name in LEGACY_RUNTIME_PATHS:
+        legacy_path = root / legacy_name
+        canonical_path = root / canonical_name
+        if not legacy_path.exists() or canonical_path.exists():
+            continue
+        try:
+            os.replace(legacy_path, canonical_path)
+        except OSError:
+            continue
+        migrated.append((legacy_name, canonical_name))
+    return tuple(migrated)
 
 
 class SectionManifestError(RuntimeError):

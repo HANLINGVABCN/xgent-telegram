@@ -1,10 +1,10 @@
-# This file is executed by bot_server.py in the shared application namespace.
+# This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
 if __name__ == '__main__':
     try:
         print("=" * 60)
-        print("Telegram AI Bot starting...")
+        print("XGent for Telegram starting...")
         if BotConfig.API_BASE_URL:
             print(f"Using LOCAL Telegram Bot API: {BotConfig.API_BASE_URL}")
         print("=" * 60)
@@ -94,7 +94,7 @@ if __name__ == '__main__':
         app.add_error_handler(global_error_handler)
         
         logger.info("=" * 50)
-        logger.info("Telegram AI Bot ready.")
+        logger.info("XGent for Telegram ready.")
         logger.info("Features: Async SQLite | Fast Stream | Correct Storage")
         logger.info("=" * 50)
         

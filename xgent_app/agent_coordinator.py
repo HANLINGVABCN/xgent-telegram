@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, Optional, Sequence, TypedDict
 
-from bot_app.agent_loop_state import AgentRoundState
+from xgent_app.agent_loop_state import AgentRoundState
 
 
 class AgentRoundDecision(TypedDict):

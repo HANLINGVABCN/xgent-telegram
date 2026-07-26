@@ -4,7 +4,7 @@
 
 ## 把你的 Linux 服务器装进 Telegram
 
-Telegram AI Bot 是一个面向单用户私有部署的 AI Agent。它不仅能完成多模型对话，还可以在授权服务器上执行命令、管理 Shell 会话、处理文件并通过 Skill 扩展工作流。
+XGent for Telegram 是一个面向单用户私有部署的 AI Agent。它不仅能完成多模型对话，还可以在授权服务器上执行命令、管理 Shell 会话、处理文件并通过 Skill 扩展工作流。
 
 ## 主要能力
 
@@ -24,7 +24,7 @@ Telegram AI Bot 是一个面向单用户私有部署的 AI Agent。它不仅能�
 准备一台安装了 Python 3.8+ 的 Linux 服务器，然后执行：
 
 ```bash
-cd /opt && sudo git clone https://github.com/HANLINGVABCN/telegram-ai-bot.git && sudo chown -R "$USER":"$USER" telegram-ai-bot && cd telegram-ai-bot && chmod +x install.sh && ./install.sh
+cd /opt && sudo git clone https://github.com/HANLINGVABCN/xgent-telegram.git && sudo chown -R "$USER":"$USER" xgent-telegram && cd xgent-telegram && chmod +x install.sh && ./install.sh
 ```
 
 首次安装需要：

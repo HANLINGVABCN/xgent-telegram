@@ -10,14 +10,14 @@ from __future__ import annotations
 
 from typing import Any, Dict, Mapping, Optional, TypedDict
 
-from bot_app.agent_context import (
+from xgent_app.agent_context import (
     AgentMessage,
     build_edit_context_message,
     build_grep_context_message,
     build_read_context_message,
     build_run_context_message,
 )
-from bot_app.shell_output import build_run_notice
+from xgent_app.shell_output import build_run_notice
 
 
 class AgentOperationResult(TypedDict, total=False):

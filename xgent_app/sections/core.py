@@ -1,9 +1,9 @@
-# This file is executed by bot_server.py in the shared application namespace.
+# This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
 # pyright: reportOptionalMemberAccess=false, reportAttributeAccessIssue=false
-# bot_server.py
-# Telegram AI Bot - 私有 Telegram AI 助手服务端。
+# xgent_server.py
+# XGent for Telegram - 私有 Telegram AI 助手服务端。
 #
 # 核心职责：
 # - 单用户访问控制与未授权用户处理。
@@ -102,9 +102,9 @@ class BotConfig:
         AUTHORIZED_USER_ID = 0
     # 本地 Telegram Bot API server 支持（不配置则用官方 api.telegram.org）
     API_BASE_URL = (os.getenv("TELEGRAM_API_URL") or "").strip().rstrip("/")
-    DB_FILE = "bot_memory.db"
-    NORMAL_UPDATE_ZIP_URL = "https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot/zipball/main"
-    TEST_UPDATE_ZIP_URL = "https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot-test/zipball/main"
+    DB_FILE = "xgent_memory.db"
+    NORMAL_UPDATE_ZIP_URL = "https://api.github.com/repos/HANLINGVABCN/xgent-telegram/zipball/main"
+    TEST_UPDATE_ZIP_URL = "https://api.github.com/repos/HANLINGVABCN/xgent-telegram-test/zipball/main"
     DEFAULT_UPDATE_ZIP_URL = NORMAL_UPDATE_ZIP_URL
     _ENV_UPDATE_ZIP_URL = (os.getenv("UPDATE_ZIP_URL") or "").strip()
     UPDATE_ZIP_URL = _ENV_UPDATE_ZIP_URL or DEFAULT_UPDATE_ZIP_URL
@@ -157,11 +157,11 @@ async def download_telegram_file(telegram_obj) -> bytes:
 UPDATE_SKIP_NAMES = {
     ".env",
     ".git",
-    "bot_memory.db",
-    "bot_output.log",
-    "bot_server.log",
-    "bot.pid",
-    "bot_storage",
+    "xgent_memory.db",
+    "xgent_output.log",
+    "xgent_server.log",
+    "xgent.pid",
+    "xgent_storage",
     "venv",
     "__pycache__",
 }
@@ -171,11 +171,15 @@ UPDATE_SKIP_SUFFIXES = (
     ".pyc",
 )
 UPDATE_LOCAL_CUSTOM_DIRS = ("prompts", "skill")
-UPDATE_BACKUP_DIR = os.path.join(PROJECT_ROOT, "bot_storage", "update_backups")
-COMMAND_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "bot_storage", "command_outputs")
-_TRACE_LOG_OVERRIDE = os.environ.get("TELEGRAM_AI_BOT_TRACE_LOG_FILE", "").strip()
+UPDATE_BACKUP_DIR = os.path.join(PROJECT_ROOT, "xgent_storage", "update_backups")
+COMMAND_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "xgent_storage", "command_outputs")
+_TRACE_LOG_OVERRIDE = (
+    os.environ.get("XGENT_TRACE_LOG_FILE")
+    or os.environ.get("TELEGRAM_AI_BOT_TRACE_LOG_FILE")
+    or ""
+).strip()
 FULL_TRACE_LOG_FILE = os.path.abspath(
-    os.path.expanduser(_TRACE_LOG_OVERRIDE or os.path.join(PROJECT_ROOT, "bot_full_trace.log"))
+    os.path.expanduser(_TRACE_LOG_OVERRIDE or os.path.join(PROJECT_ROOT, "xgent_full_trace.log"))
 )
 FULL_TRACE_LOCK = threading.Lock()
 DEFAULT_AGENT_COMMAND_TIMEOUT = 30
@@ -589,7 +593,7 @@ def setup_logging():
     stream_handler.setFormatter(log_format)
     _logger.addHandler(stream_handler)
     
-    log_file = os.path.join(os.getcwd(), "bot_server.log")
+    log_file = os.path.join(os.getcwd(), "xgent_server.log")
     file_handler = RotatingFileHandler(
         log_file, encoding='utf-8',
         maxBytes=10 * 1024 * 1024,  # 10MB per file
@@ -642,7 +646,8 @@ class BotState:
     SET_MEMORY = 'set_memory'
     IMPORT_PROVIDER_CONFIG = 'import_provider_config'
 
-PROVIDER_CONFIG_FORMAT = 'telegram-ai-bot-provider-config'
+PROVIDER_CONFIG_FORMAT = 'xgent-telegram-provider-config'
+LEGACY_PROVIDER_CONFIG_FORMATS = {'telegram-ai-bot-provider-config'}
 PROVIDER_CONFIG_VERSION = 1
 PROVIDER_CONFIG_MAX_BYTES = 2 * 1024 * 1024
 PROVIDER_CONFIG_MAX_PROVIDERS = 100

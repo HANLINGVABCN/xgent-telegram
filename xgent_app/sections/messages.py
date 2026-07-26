@@ -1,32 +1,32 @@
-# This file is executed by bot_server.py in the shared application namespace.
+# This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
-from bot_app.agent_coordinator import plan_agent_round_transition
-from bot_app.agent_status import AgentTurnOrigin, build_agent_round_status
-from bot_app.agent_context import (
+from xgent_app.agent_coordinator import plan_agent_round_transition
+from xgent_app.agent_status import AgentTurnOrigin, build_agent_round_status
+from xgent_app.agent_context import (
     build_file_context_message,
     build_sendfile_context_message,
     build_shell_context_message,
     build_trigger_context_message,
 )
-from bot_app.agent_history import (
+from xgent_app.agent_history import (
     persist_agent_result,
     persist_media_result,
     persist_standard_operation_result,
 )
-from bot_app.agent_dispatch import dispatch_standard_protocol
-from bot_app.agent_shell import execute_shell_protocol
-from bot_app.agent_trigger import execute_trigger_protocol
-from bot_app.agent_file_delivery import send_written_agent_file
-from bot_app.agent_files import (
+from xgent_app.agent_dispatch import dispatch_standard_protocol
+from xgent_app.agent_shell import execute_shell_protocol
+from xgent_app.agent_trigger import execute_trigger_protocol
+from xgent_app.agent_file_delivery import send_written_agent_file
+from xgent_app.agent_files import (
     write_base64_protocol_file,
     write_text_protocol_file,
 )
-from bot_app.agent_loop_state import AgentRoundState
-from bot_app.agent_media import execute_media_generation
-from bot_app.agent_media_delivery import send_media_generation_result
-from bot_app.agent_sendfile import execute_sendfile_protocol
-from bot_app.agent_presenter import (
+from xgent_app.agent_loop_state import AgentRoundState
+from xgent_app.agent_media import execute_media_generation
+from xgent_app.agent_media_delivery import send_media_generation_result
+from xgent_app.agent_sendfile import execute_sendfile_protocol
+from xgent_app.agent_presenter import (
     build_shell_presentation,
     build_standard_operation_presentation,
 )

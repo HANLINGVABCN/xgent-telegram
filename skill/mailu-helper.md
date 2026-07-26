@@ -4,7 +4,7 @@ Mailu 辅助技能：用于部署、检查和维护 Mailu，并通过 Postfix ov
 
 # Mailu Helper 使用说明
 
-本文是 Telegram AI Bot 项目内置 skill 文档，说明 `skill/script/mailu-helper/mailu-helper.sh` 的用途、菜单、实际修改项和提示项。
+本文是 XGent for Telegram 项目内置 skill 文档，说明 `skill/script/mailu-helper/mailu-helper.sh` 的用途、菜单、实际修改项和提示项。
 
 ## 文件位置
 

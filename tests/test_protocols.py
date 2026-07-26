@@ -1,6 +1,6 @@
 import unittest
 
-from bot_app.protocols import ProtocolParser
+from xgent_app.protocols import ProtocolParser
 
 
 NONCE_A = "0123456789AB"

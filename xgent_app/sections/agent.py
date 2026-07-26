@@ -1,12 +1,12 @@
-# This file is executed by bot_server.py in the shared application namespace.
+# This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
-from bot_app.agent_context import (
+from xgent_app.agent_context import (
     build_read_attachment_context_message,
     build_read_ranged_context_message,
     build_read_text_context_message,
 )
-from bot_app.protocols import ProtocolParser
+from xgent_app.protocols import ProtocolParser
 class AgentExecutor:
     """安全地执行 AI 请求的 shell 命令"""
     

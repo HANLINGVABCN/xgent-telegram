@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
-from bot_app.agent_files import (
+from xgent_app.agent_files import (
     write_base64_protocol_file,
     write_text_protocol_file,
 )

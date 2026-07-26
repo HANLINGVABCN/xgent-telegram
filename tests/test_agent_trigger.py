@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-from bot_app.agent_trigger import execute_trigger_protocol
+from xgent_app.agent_trigger import execute_trigger_protocol
 
 
 class AgentTriggerTests(unittest.IsolatedAsyncioTestCase):

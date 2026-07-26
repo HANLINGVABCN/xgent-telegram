@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from bot_app.agent_loop_state import AgentRoundState
+from xgent_app.agent_loop_state import AgentRoundState
 
 
 class AgentRoundStateTests(unittest.TestCase):

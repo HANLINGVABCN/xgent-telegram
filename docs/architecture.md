@@ -2,9 +2,9 @@
 
 ## Current refactor phase
 
-`bot_server.py` is now a minimal executable entrypoint. Manifest parsing,
-validation, and section loading live in `bot_app/bootstrap.py`. It loads
-ordered domain sections from `bot_app/sections/` into one shared
+`xgent_server.py` is now a minimal executable entrypoint. Manifest parsing,
+validation, and section loading live in `xgent_app/bootstrap.py`. It loads
+ordered domain sections from `xgent_app/sections/` into one shared
 application namespace.
 
 The compatibility loader is now surrounded by importable, dependency-light
@@ -12,23 +12,23 @@ components. The first extracted components are:
 
 | Module | Responsibility |
 | --- | --- |
-| `bot_app/protocols.py` | Parse and strip Agent protocol blocks only; no command execution or messaging |
-| `bot_app/text_utils.py` | Generic text clipping and normalization helpers |
-| `bot_app/shell_output.py` | Format shell display output, model context, and command-result notices |
-| `bot_app/agent_context.py` | Build next-turn Agent context for file, read, edit, grep, run, shell, trigger, and media results; no execution, persistence, or Telegram sending |
-| `bot_app/agent_results.py` | Normalize executor dictionaries into a common Agent result contract while preserving legacy fields; no execution, persistence, or Telegram sending |
-| `bot_app/agent_dispatch.py` | Dispatch and normalize read, edit, grep, and run without Telegram or persistence concerns |
-| `bot_app/agent_files.py` | Execute text and base64 file writes; base64 decoding/writing is moved off the event loop |
-| `bot_app/agent_file_delivery.py` | Send files produced by `file`/`file:base64` and preserve their Telegram captions and size-limit notices |
-| `bot_app/agent_sendfile.py` | Execute server-file delivery, including local Bot API hard-link/copy fallback, upload indicator, timeout, and cleanup |
-| `bot_app/agent_shell.py` | Execute shell/stdin/session protocols and preserve stop-session behavior |
-| `bot_app/agent_trigger.py` | Execute trigger protocols and normalize failure notices |
-| `bot_app/agent_presenter.py` | Build pure Telegram presentation text for Agent results |
-| `bot_app/agent_history.py` | Keep Agent recorder/database write ordering and special media history format |
-| `bot_app/agent_loop_state.py` | Hold one Agent operation round's continuation context and pause state |
-| `bot_app/agent_coordinator.py` | Plan stop/end/continue transitions and build the next in-memory transcript without I/O |
-| `bot_app/agent_media.py` | Manage media generation waiting, stop cancellation, typing state, and progress-message cleanup |
-| `bot_app/agent_media_delivery.py` | Deliver generated media or the existing failure warning without persistence/context concerns |
+| `xgent_app/protocols.py` | Parse and strip Agent protocol blocks only; no command execution or messaging |
+| `xgent_app/text_utils.py` | Generic text clipping and normalization helpers |
+| `xgent_app/shell_output.py` | Format shell display output, model context, and command-result notices |
+| `xgent_app/agent_context.py` | Build next-turn Agent context for file, read, edit, grep, run, shell, trigger, and media results; no execution, persistence, or Telegram sending |
+| `xgent_app/agent_results.py` | Normalize executor dictionaries into a common Agent result contract while preserving legacy fields; no execution, persistence, or Telegram sending |
+| `xgent_app/agent_dispatch.py` | Dispatch and normalize read, edit, grep, and run without Telegram or persistence concerns |
+| `xgent_app/agent_files.py` | Execute text and base64 file writes; base64 decoding/writing is moved off the event loop |
+| `xgent_app/agent_file_delivery.py` | Send files produced by `file`/`file:base64` and preserve their Telegram captions and size-limit notices |
+| `xgent_app/agent_sendfile.py` | Execute server-file delivery, including local Bot API hard-link/copy fallback, upload indicator, timeout, and cleanup |
+| `xgent_app/agent_shell.py` | Execute shell/stdin/session protocols and preserve stop-session behavior |
+| `xgent_app/agent_trigger.py` | Execute trigger protocols and normalize failure notices |
+| `xgent_app/agent_presenter.py` | Build pure Telegram presentation text for Agent results |
+| `xgent_app/agent_history.py` | Keep Agent recorder/database write ordering and special media history format |
+| `xgent_app/agent_loop_state.py` | Hold one Agent operation round's continuation context and pause state |
+| `xgent_app/agent_coordinator.py` | Plan stop/end/continue transitions and build the next in-memory transcript without I/O |
+| `xgent_app/agent_media.py` | Manage media generation waiting, stop cancellation, typing state, and progress-message cleanup |
+| `xgent_app/agent_media_delivery.py` | Deliver generated media or the existing failure warning without persistence/context concerns |
 
 Legacy names remain available through thin imports/wrappers in the sections so
 existing handlers keep working while the internal boundaries become explicit.
@@ -58,7 +58,7 @@ reviewable units:
 
 ## Bootstrap contract
 
-`bot_app.bootstrap.read_section_manifest()` validates that the manifest:
+`xgent_app.bootstrap.read_section_manifest()` validates that the manifest:
 
 - exists and is not empty;
 - has no duplicate entries;

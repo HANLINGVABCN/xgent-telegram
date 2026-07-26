@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from bot_app.agent_status import AgentTurnOrigin, build_agent_round_status
+from xgent_app.agent_status import AgentTurnOrigin, build_agent_round_status
 
 
 class AgentStatusTests(unittest.TestCase):

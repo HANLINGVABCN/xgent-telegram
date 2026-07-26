@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
-from bot_app.agent_file_delivery import send_written_agent_file
+from xgent_app.agent_file_delivery import send_written_agent_file
 
 
 class AgentFileDeliveryTests(unittest.IsolatedAsyncioTestCase):

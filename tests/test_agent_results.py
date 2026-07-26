@@ -2,20 +2,20 @@ from __future__ import annotations
 
 import unittest
 
-from bot_app.agent_context import (
+from xgent_app.agent_context import (
     build_edit_context_message,
     build_grep_context_message,
     build_read_context_message,
     build_run_context_message,
 )
-from bot_app.agent_results import (
+from xgent_app.agent_results import (
     failed_result,
     normalize_edit_result,
     normalize_grep_result,
     normalize_read_result,
     normalize_run_result,
 )
-from bot_app.shell_output import build_run_notice
+from xgent_app.shell_output import build_run_notice
 
 
 class AgentResultsTests(unittest.TestCase):

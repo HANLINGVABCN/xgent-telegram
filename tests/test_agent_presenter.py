@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from bot_app.agent_presenter import (
+from xgent_app.agent_presenter import (
     build_edit_presentation,
     build_grep_presentation,
     build_run_presentation,

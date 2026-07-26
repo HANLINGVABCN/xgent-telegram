@@ -7,8 +7,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from bot_app.bootstrap import read_section_manifest
-SECTION_DIR = ROOT / "bot_app" / "sections"
+from xgent_app.bootstrap import read_section_manifest
+SECTION_DIR = ROOT / "xgent_app" / "sections"
 MANIFEST = read_section_manifest(SECTION_DIR)
 
 chunks = []

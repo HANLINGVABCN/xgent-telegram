@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-from bot_app.agent_media import execute_media_generation
+from xgent_app.agent_media import execute_media_generation
 
 
 class _Message:

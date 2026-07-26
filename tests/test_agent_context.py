@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bot_app.agent_context import (
+from xgent_app.agent_context import (
     build_edit_context_message,
     build_file_context_message,
     build_media_context_message,

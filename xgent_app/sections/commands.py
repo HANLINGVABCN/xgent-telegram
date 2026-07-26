@@ -1,4 +1,4 @@
-# This file is executed by bot_server.py in the shared application namespace.
+# This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
 def build_start_menu_text() -> str:
@@ -11,7 +11,7 @@ def build_start_menu_text() -> str:
     stitch_mode = get_text_stitch_mode_label()
 
     welcome_msg = (
-        f"<b>Telegram AI Bot 已就绪</b>\n"
+        f"<b>XGent for Telegram 已就绪</b>\n"
         f"━━━━━━━━━━━━━━\n"
         f"🛡️ 防御系统: <b>已开启</b>\n"
         f"📡 当前对话提供商: <b>{safe_text(active_prov)}</b>\n"
@@ -86,7 +86,7 @@ async def restart_current_process(chat_id: int, bot: Any = None):
     install_sh = os.path.join(PROJECT_ROOT, 'install.sh')
     has_install_sh = os.path.exists(install_sh)
     is_pm2 = any(k in os.environ for k in ('PM2_HOME', 'pm_id', 'PM2_USAGE'))
-    is_nohup = os.path.exists(os.path.join(PROJECT_ROOT, 'bot.pid'))
+    is_nohup = os.path.exists(os.path.join(PROJECT_ROOT, 'xgent.pid'))
     # systemd 会在被托管进程的环境里注入 INVOCATION_ID（及 JOURNAL_STREAM）
     is_systemd = 'INVOCATION_ID' in os.environ or 'JOURNAL_STREAM' in os.environ
 
@@ -95,7 +95,7 @@ async def restart_current_process(chat_id: int, bot: Any = None):
         logger.info("检测到 PM2 环境，调用 install.sh restart 彻底重启")
         restart_via_install = True
     elif is_nohup and has_install_sh:
-        logger.info("检测到 nohup（bot.pid）环境，调用 install.sh restart 彻底重启")
+        logger.info("检测到 nohup（xgent.pid）环境，调用 install.sh restart 彻底重启")
         restart_via_install = True
     elif is_systemd:
         # systemd 会按 unit 的 Restart= 策略自动拉起新进程
@@ -156,8 +156,8 @@ async def send_update_source_menu(message: Any):
     await message.reply_text(
         "⬆️ <b>选择更新来源</b>\n\n"
         "请选择这次要从哪里拉取最新代码：\n"
-        "1. 正常更新：从 <code>telegram-ai-bot</code> 项目拉取。\n"
-        "2. Test 更新：从 <code>telegram-ai-bot-test</code> 私有目录拉取，需要 GitHub Token。",
+        "1. 正常更新：从 <code>xgent-telegram</code> 项目拉取。\n"
+        "2. Test 更新：从 <code>xgent-telegram-test</code> 私有目录拉取，需要 GitHub Token。",
         parse_mode=constants.ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("1 正常更新（bot 项目）", callback_data="select_update_source_normal")],
@@ -327,8 +327,8 @@ def parse_provider_config_import(raw_bytes: bytes) -> Tuple[Dict[str, Dict[str, 
     if not isinstance(payload, dict):
         raise ValueError('配置文件根节点必须是 JSON 对象')
     file_format = payload.get('format')
-    if file_format != PROVIDER_CONFIG_FORMAT:
-        raise ValueError('不是本 Bot 导出的提供商配置文件')
+    if file_format != PROVIDER_CONFIG_FORMAT and file_format not in LEGACY_PROVIDER_CONFIG_FORMATS:
+        raise ValueError('不是 XGent for Telegram 导出的提供商配置文件')
     version = payload.get('version')
     if version != PROVIDER_CONFIG_VERSION:
         raise ValueError(f'不支持的配置版本：{version!r}')

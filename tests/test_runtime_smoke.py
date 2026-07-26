@@ -20,7 +20,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             "PYTHONIOENCODING": "utf-8",
         })
         with tempfile.TemporaryDirectory() as cwd:
-            env["TELEGRAM_AI_BOT_TRACE_LOG_FILE"] = str(Path(cwd) / "bot_full_trace.log")
+            env["XGENT_TRACE_LOG_FILE"] = str(Path(cwd) / "xgent_full_trace.log")
             result = subprocess.run(
                 [sys.executable, "-c", code],
                 cwd=cwd,
@@ -34,10 +34,23 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.fail(f"probe failed\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
         return result.stdout
 
-    def test_import_and_core_symbols(self):
+    def test_legacy_entrypoint_shim(self):
         output = self.run_probe(r'''
 import json
 import bot_server as bot
+print(json.dumps({
+    "config": bot.BotConfig.AUTHORIZED_USER_ID,
+    "sections": len(bot._SECTION_FILES),
+}))
+''')
+        data = json.loads(output.strip().splitlines()[-1])
+        self.assertEqual(1, data["config"])
+        self.assertGreaterEqual(data["sections"], 10)
+
+    def test_import_and_core_symbols(self):
+        output = self.run_probe(r'''
+import json
+import xgent_server as bot
 print(json.dumps({
     "config": bot.BotConfig.AUTHORIZED_USER_ID,
     "agent": bot.AgentExecutor.__name__,
@@ -53,13 +66,44 @@ print(json.dumps({
         self.assertEqual("handle_button_click", data["callback"])
         self.assertGreaterEqual(data["sections"], 10)
 
+    def test_provider_config_accepts_legacy_format_and_exports_xgent_format(self):
+        output = self.run_probe(r'''
+import json
+import xgent_server as bot
+payload = {
+    "format": "telegram-ai-bot-provider-config",
+    "version": 1,
+    "providers": {
+        "legacy": {
+            "base_url": "https://example.com/v1",
+            "api_key": "secret",
+            "models": ["model-a"],
+            "api_format": "openai",
+        }
+    },
+    "defaults": {},
+}
+providers, defaults = bot.parse_provider_config_import(
+    json.dumps(payload).encode("utf-8")
+)
+print(json.dumps({
+    "imported": sorted(providers),
+    "defaults": defaults,
+    "export_format": bot.PROVIDER_CONFIG_FORMAT,
+}))
+''')
+        data = json.loads(output.strip().splitlines()[-1])
+        self.assertEqual(["legacy"], data["imported"])
+        self.assertEqual({}, data["defaults"])
+        self.assertEqual("xgent-telegram-provider-config", data["export_format"])
+
     def test_shared_http_client_and_database_connection_reuse(self):
         output = self.run_probe(r'''
 import asyncio
 import json
 import tempfile
 from pathlib import Path
-import bot_server as bot
+import xgent_server as bot
 
 async def main():
     http_client_a = await bot.ModelClient._get_http_client()
@@ -111,7 +155,7 @@ import json
 import tempfile
 import time
 from pathlib import Path
-import bot_server as bot
+import xgent_server as bot
 
 async def main():
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -158,7 +202,7 @@ asyncio.run(main())
     def test_protocol_and_normalization_behavior(self):
         output = self.run_probe(r'''
 import json
-import bot_server as bot
+import xgent_server as bot
 sample = "before\n```run-x <<AGENT_BEGIN_0123456789AB\necho ok\nAGENT_END_0123456789AB\n```\nafter"
 blocks = bot.AgentExecutor.extract_protocol_blocks(sample)
 print(json.dumps({
@@ -182,7 +226,7 @@ print(json.dumps({
         output = self.run_probe(r'''
 import json
 from types import SimpleNamespace as NS
-import bot_server as bot
+import xgent_server as bot
 
 user = NS(full_name="张三", first_name="张三", title=None, username="zhang")
 replied = NS(from_user=user, sender_chat=None, text="把服务器重启一下", caption=None)

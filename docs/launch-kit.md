@@ -83,7 +83,7 @@ Self-hosted · Multi-model · Memory · Files · Real Shell Agent
 ### 正文
 
 ```text
-最近做了一个自托管的 Telegram AI Bot。
+最近做了一个自托管的 XGent for Telegram。
 
 它不只是把模型 API 接到 Telegram：开启 Agent 后，可以在自己的服务器上执行命令、查看持续日志、读写文件，并把服务器文件直接发回 Telegram。
 
