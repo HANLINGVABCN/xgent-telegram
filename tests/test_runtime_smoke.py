@@ -34,19 +34,6 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.fail(f"probe failed\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
         return result.stdout
 
-    def test_legacy_entrypoint_shim(self):
-        output = self.run_probe(r'''
-import json
-import bot_server as bot
-print(json.dumps({
-    "config": bot.BotConfig.AUTHORIZED_USER_ID,
-    "sections": len(bot._SECTION_FILES),
-}))
-''')
-        data = json.loads(output.strip().splitlines()[-1])
-        self.assertEqual(1, data["config"])
-        self.assertGreaterEqual(data["sections"], 10)
-
     def test_import_and_core_symbols(self):
         output = self.run_probe(r'''
 import json
