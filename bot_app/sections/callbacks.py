@@ -1200,14 +1200,28 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             target_label = get_model_target_label(target)
             await query.answer(f"✅ 已设为{target_label}")
-            kb = build_saved_models_keyboard(prov_name)
-            await query.message.edit_text(
-                f"✅ <b>{safe_text(model_name)}</b> 已设为{target_label}！\n\n"
-                f"🧰 <b>{safe_text(prov_name)}</b> 已保存的模型\n\n"
-                "这里可以继续新增、联网获取、搜索，或点击模型进行设置。",
-                reply_markup=kb,
-                parse_mode=constants.ParseMode.HTML
-            )
+            # 若详情页是从联网获取列表进入的，操作完成后回到联网列表，
+            # 保留当前页码/搜索条件，而不是跳到已保存模型列表。
+            if (
+                UserDataManager.get('temp_list_type') == 'fetched'
+                and UserDataManager.get('temp_viewing_prov') == prov_name
+                and UserDataManager.get('fetched_cache')
+            ):
+                title, kb = build_fetched_models_view(prov_name)
+                await query.message.edit_text(
+                    f"✅ <b>{safe_text(model_name)}</b> 已设为{target_label}！\n\n{title}",
+                    reply_markup=kb,
+                    parse_mode=constants.ParseMode.HTML
+                )
+            else:
+                kb = build_saved_models_keyboard(prov_name)
+                await query.message.edit_text(
+                    f"✅ <b>{safe_text(model_name)}</b> 已设为{target_label}！\n\n"
+                    f"🧰 <b>{safe_text(prov_name)}</b> 已保存的模型\n\n"
+                    "这里可以继续新增、联网获取、搜索，或点击模型进行设置。",
+                    reply_markup=kb,
+                    parse_mode=constants.ParseMode.HTML
+                )
 
         elif data.startswith("do_use|") or data.startswith("do_use_"):
             if data.startswith("do_use|"):
@@ -1246,14 +1260,27 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await db.update_provider_models(pname, providers[pname]['models'])
                 await GlobalRecorder.record_system_op(f"删除模型: {mname}", {"provider": pname})
             await query.answer(f"🗑️ 已删除 {mname}")
-            kb = build_saved_models_keyboard(pname)
-            await query.message.edit_text(
-                f"🗑️ <b>{safe_text(mname)}</b> 已从模型列表中删除！\n\n"
-                f"🧰 <b>{safe_text(pname)}</b> 已保存的模型\n\n"
-                "这里可以继续新增、联网获取、搜索，或点击模型进行设置。",
-                reply_markup=kb,
-                parse_mode=constants.ParseMode.HTML
-            )
+            # 同上：从联网获取列表进入的详情页，删除后回到联网列表。
+            if (
+                UserDataManager.get('temp_list_type') == 'fetched'
+                and UserDataManager.get('temp_viewing_prov') == pname
+                and UserDataManager.get('fetched_cache')
+            ):
+                title, kb = build_fetched_models_view(pname)
+                await query.message.edit_text(
+                    f"🗑️ <b>{safe_text(mname)}</b> 已从模型列表中删除！\n\n{title}",
+                    reply_markup=kb,
+                    parse_mode=constants.ParseMode.HTML
+                )
+            else:
+                kb = build_saved_models_keyboard(pname)
+                await query.message.edit_text(
+                    f"🗑️ <b>{safe_text(mname)}</b> 已从模型列表中删除！\n\n"
+                    f"🧰 <b>{safe_text(pname)}</b> 已保存的模型\n\n"
+                    "这里可以继续新增、联网获取、搜索，或点击模型进行设置。",
+                    reply_markup=kb,
+                    parse_mode=constants.ParseMode.HTML
+                )
         
         elif data.startswith("fetch_market_"):
             name = data.split("_", 2)[2]
