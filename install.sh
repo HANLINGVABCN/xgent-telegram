@@ -178,7 +178,7 @@ run_bot_python() {
                 TELEGRAM_AI_BOT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
             ;;
         *)
-            env TELEGRAM_AI_BOT_IP_MODE="$mode" -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
+            env -u TELEGRAM_AI_BOT_SOCKS5_PROXY TELEGRAM_AI_BOT_IP_MODE="$mode" \
                 TELEGRAM_AI_BOT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
             ;;
     esac
@@ -1235,7 +1235,7 @@ start_background() {
                 nohup "$VENV_PYTHON" -c "$code" > bot_output.log 2>&1 &
             ;;
         *)
-            env TELEGRAM_AI_BOT_IP_MODE="$mode" -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
+            env -u TELEGRAM_AI_BOT_SOCKS5_PROXY TELEGRAM_AI_BOT_IP_MODE="$mode" \
                 TELEGRAM_AI_BOT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" \
                 nohup "$VENV_PYTHON" -c "$code" > bot_output.log 2>&1 &
             ;;
@@ -1258,16 +1258,32 @@ start_background() {
 }
 
 start_with_pm2() {
-    local code
+    local code mode env_mode socks5_url
 
     ensure_pm2
 
     info "[运行] 正在使用 PM2 启动 Telegram AI Bot..."
     echo "   IP 出站模式: $(ip_mode_label)"
 
-    # 彻底删除旧进程，确保不会保留旧配置
-    pm2 delete "$PM2_APP_NAME" 2>/dev/null || true
-    sleep 1
+    # 进程已存在时原地重启（pm_id 不变），并用 --update-env 刷新环境变量。
+    # 变量设为空串而不是 unset：Bot 侧把空串视为默认模式，
+    # 这样 --update-env 才能覆盖掉旧进程里残留的模式设置。
+    if pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
+        mode="$(get_ip_mode)"
+        env_mode="$mode"
+        [ "$mode" = "default" ] && env_mode=""
+        socks5_url=""
+        [ "$mode" = "sock5" ] && socks5_url="$(get_socks5_proxy)"
+        env TELEGRAM_AI_BOT_IP_MODE="$env_mode" TELEGRAM_AI_BOT_SOCKS5_PROXY="$socks5_url" \
+            TELEGRAM_AI_BOT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$(pythonpath_with_project)" \
+            pm2 restart "$PM2_APP_NAME" --update-env
+        echo "   PM2 原地重启成功（进程 ID 保持不变）。"
+        echo "   查看日志: pm2 logs $PM2_APP_NAME"
+        if pm2 save >/dev/null; then
+            echo "   PM2 进程列表已保存。"
+        fi
+        return
+    fi
 
     code="$(bot_python_code)"
     run_bot_python pm2 start "$VENV_PYTHON" \
@@ -1307,12 +1323,8 @@ set -u
   echo "===== $PM2_APP_NAME detached restart started at \$(date '+%F %T') ====="
   cd "$SCRIPT_DIR" || exit 1
 
-  # 彻底停止旧进程
-  if pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
-    echo "Stopping PM2 process: $PM2_APP_NAME"
-    pm2 delete "$PM2_APP_NAME" >/dev/null 2>&1 || true
-    sleep 1
-  fi
+  # 不再 pm2 delete：由 start_with_pm2 对已存在的进程做原地 restart，
+  # 复用原 pm_id，避免进程 ID 不断增加。
 
   # 设置 IP 模式环境变量（ipv4 / ipv6 / sock5 互斥）
   unset TELEGRAM_AI_BOT_SOCKS5_PROXY || true
@@ -1341,11 +1353,23 @@ EOF
     echo "   如果当前 Bot 短暂断开，请等待 5-10 秒后重新 /start。"
 }
 
+# 彻底重建 PM2 进程：删除后重新创建，会重新加载 PM2 启动参数
+# （注意：pm_id 会 +1，日常重启请用 restart / 菜单选项 5）
+rebuild_pm2_app() {
+    if command_exists pm2 && pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
+        pm2 delete "$PM2_APP_NAME" 2>/dev/null || true
+        sleep 1
+        start_with_pm2
+    else
+        restart_app
+    fi
+}
+
 restart_app() {
     info "[重启] 正在彻底重启 Telegram AI Bot..."
 
     if command_exists pm2 && pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
-        echo "   检测到 PM2 进程，将彻底删除并重新创建以确保加载最新配置。"
+        echo "   检测到 PM2 进程，将原地重启并刷新环境变量（进程 ID 保持不变）。"
         restart_pm2_detached
         return
     fi
@@ -1695,6 +1719,7 @@ show_menu() {
     echo "  7) 卸载本脚本安装的运行内容"
     echo "  8) 本地 API 容器 (Docker) - 启动/关闭本地 Telegram Bot API server"
     echo "  9) 退出"
+    echo " 10) 彻底重建 PM2 进程 (重新加载 PM2 启动参数，进程 ID 会 +1)"
     echo ""
 }
 
@@ -1702,7 +1727,8 @@ show_usage() {
     echo "用法:"
     echo "  ./install.sh                 打开数字菜单"
     echo "  ./install.sh install         打开数字菜单"
-    echo "  ./install.sh restart         重启当前 PM2/nohup Bot 进程"
+    echo "  ./install.sh restart         重启当前 PM2/nohup Bot 进程 (原地重启，进程 ID 不变)"
+    echo "  ./install.sh rebuild         彻底重建 PM2 进程 (重新加载 PM2 启动参数，进程 ID 会 +1)"
     echo "  ./install.sh uninstall       卸载本脚本安装的运行内容"
     echo "  ./install.sh uninstall -y    跳过确认直接卸载"
 }
@@ -1738,7 +1764,7 @@ main() {
     print_banner
 
     show_menu
-    read -r -p "请输入选项 [1/2/3/4/5/6/7/8/9，默认 1]: " choice
+    read -r -p "请输入选项 [1-10，默认 1]: " choice
 
     case "$choice" in
         ""|1)
@@ -1768,6 +1794,10 @@ main() {
         7)
             uninstall_app --no-banner
             exit 0
+            ;;
+        10)
+            prepare_environment
+            rebuild_pm2_app
             ;;
         8)
             manage_local_api
@@ -1802,6 +1832,11 @@ case "${1:-}" in
         print_banner
         prepare_environment
         restart_app
+        ;;
+    rebuild|--rebuild)
+        print_banner
+        prepare_environment
+        rebuild_pm2_app
         ;;
     uninstall|--uninstall|remove|--remove)
         shift
