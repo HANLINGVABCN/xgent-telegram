@@ -1328,7 +1328,16 @@ EOF
         case "$proto_num" in
             1) PROTOCOL="reality"; return 0 ;;
             2) PROTOCOL="ss2022"; return 0 ;;
-            3) [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ] && { PROTOCOL="hysteria2"; return 0; } || red "当前模式不可用" ;;
+            3)
+                # NAT 菜单里 3 是 SOCKS5；标准/低配菜单里 3 是 Hysteria2
+                if [ "$MACHINE_MODE" = "nat" ]; then
+                    PROTOCOL="socks5"; return 0
+                elif [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ]; then
+                    PROTOCOL="hysteria2"; return 0
+                else
+                    red "当前模式不可用"
+                fi
+                ;;
             4) [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ] && { PROTOCOL="tuic"; return 0; } || red "当前模式不可用" ;;
             5) [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ] && { PROTOCOL="vless-ws"; return 0; } || red "当前模式不可用" ;;
             6) [ "$MACHINE_MODE" = "standard" ] || [ "$MACHINE_MODE" = "low" ] && { PROTOCOL="vmess-ws"; return 0; } || red "当前模式不可用" ;;
