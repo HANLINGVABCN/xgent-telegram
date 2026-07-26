@@ -201,6 +201,7 @@ run_bot_python() {
         default)
             env -u XGENT_IP_MODE -u XGENT_SOCKS5_PROXY \
                 -u TELEGRAM_AI_BOT_IP_MODE -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
+                -u TELEGRAM_AI_BOT_APP_ENTRY \
                 XGENT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
             ;;
         sock5)
@@ -210,11 +211,13 @@ run_bot_python() {
                 exit 1
             fi
             env -u TELEGRAM_AI_BOT_IP_MODE -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
+                -u TELEGRAM_AI_BOT_APP_ENTRY \
                 XGENT_IP_MODE="$mode" XGENT_SOCKS5_PROXY="$socks5_url" \
                 XGENT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
             ;;
         *)
             env -u XGENT_SOCKS5_PROXY -u TELEGRAM_AI_BOT_IP_MODE -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
+                -u TELEGRAM_AI_BOT_APP_ENTRY \
                 XGENT_IP_MODE="$mode" \
                 XGENT_APP_ENTRY="$app_entry" PYTHONPATH="$pythonpath" "$@"
             ;;
@@ -1236,7 +1239,8 @@ setup_pm2_startup() {
 start_foreground() {
     info "[运行] 正在前台启动 XGent for Telegram..."
     echo "   IP 出站模式: $(ip_mode_label)"
-    run_bot_python python -c "$(bot_python_code)"
+    XGENT_APP_ENTRY="$APP_ENTRY" TELEGRAM_AI_BOT_APP_ENTRY="" \
+        run_bot_python python -c "$(bot_python_code)"
 }
 
 start_background() {
@@ -1267,6 +1271,7 @@ start_background() {
         default)
             env -u XGENT_IP_MODE -u XGENT_SOCKS5_PROXY \
                 -u TELEGRAM_AI_BOT_IP_MODE -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
+                -u TELEGRAM_AI_BOT_APP_ENTRY \
                 XGENT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" \
                 nohup "$VENV_PYTHON" -c "$code" > xgent_output.log 2>&1 &
             ;;
@@ -1277,12 +1282,14 @@ start_background() {
                 exit 1
             fi
             env -u TELEGRAM_AI_BOT_IP_MODE -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
+                -u TELEGRAM_AI_BOT_APP_ENTRY \
                 XGENT_IP_MODE="$mode" XGENT_SOCKS5_PROXY="$socks5_url" \
                 XGENT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" \
                 nohup "$VENV_PYTHON" -c "$code" > xgent_output.log 2>&1 &
             ;;
         *)
             env -u XGENT_SOCKS5_PROXY -u TELEGRAM_AI_BOT_IP_MODE -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
+                -u TELEGRAM_AI_BOT_APP_ENTRY \
                 XGENT_IP_MODE="$mode" \
                 XGENT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" \
                 nohup "$VENV_PYTHON" -c "$code" > xgent_output.log 2>&1 &
@@ -1335,7 +1342,8 @@ start_with_pm2() {
         [ "$mode" = "sock5" ] && socks5_url="$(get_socks5_proxy)"
         env XGENT_IP_MODE="$env_mode" XGENT_SOCKS5_PROXY="$socks5_url" \
             TELEGRAM_AI_BOT_IP_MODE="" TELEGRAM_AI_BOT_SOCKS5_PROXY="" \
-            XGENT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$(pythonpath_with_project)" \
+            TELEGRAM_AI_BOT_APP_ENTRY="" XGENT_APP_ENTRY="$APP_ENTRY" \
+            PYTHONPATH="$(pythonpath_with_project)" \
             pm2 restart "$PM2_APP_NAME" --update-env
         echo "   PM2 原地重启成功（进程 ID 保持不变）。"
         echo "   查看日志: pm2 logs $PM2_APP_NAME"
@@ -1346,7 +1354,8 @@ start_with_pm2() {
     fi
 
     code="$(bot_python_code)"
-    run_bot_python pm2 start "$VENV_PYTHON" \
+    XGENT_APP_ENTRY="$APP_ENTRY" TELEGRAM_AI_BOT_APP_ENTRY="" \
+        run_bot_python pm2 start "$VENV_PYTHON" \
         --name "$PM2_APP_NAME" \
         --cwd "$SCRIPT_DIR" \
         --interpreter none \
@@ -1388,6 +1397,7 @@ set -u
 
   # 设置 IP 模式环境变量（ipv4 / ipv6 / sock5 互斥）
   unset XGENT_SOCKS5_PROXY TELEGRAM_AI_BOT_IP_MODE TELEGRAM_AI_BOT_SOCKS5_PROXY || true
+  unset XGENT_APP_ENTRY TELEGRAM_AI_BOT_APP_ENTRY || true
   if [ "$mode" = "default" ]; then
     unset XGENT_IP_MODE || true
   elif [ "$mode" = "sock5" ]; then
