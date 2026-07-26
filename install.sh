@@ -1176,23 +1176,109 @@ ensure_npm() {
     fi
 }
 
+prepend_path_dir() {
+    local directory="${1:-}"
+
+    [ -n "$directory" ] && [ -d "$directory" ] || return 0
+    case ":$PATH:" in
+        *":$directory:"*) ;;
+        *)
+            PATH="$directory:$PATH"
+            export PATH
+            ;;
+    esac
+}
+
+refresh_npm_global_bin_path() {
+    local npm_prefix="" npm_root="" npm_bin=""
+
+    command_exists npm || return 0
+
+    # npm 的全局可执行文件通常位于 "$(npm prefix -g)/bin"。部分托管
+    # 容器会把 prefix 改到 /app 或用户目录，却没有同步更新 PATH。
+    npm_prefix="$(npm prefix -g 2>/dev/null || true)"
+    if [ -n "$npm_prefix" ]; then
+        prepend_path_dir "$npm_prefix/bin"
+    fi
+
+    # 兼容只提供 npm root -g 或 prefix 输出异常的环境。
+    npm_root="$(npm root -g 2>/dev/null || true)"
+    if [ -n "$npm_root" ]; then
+        npm_bin="$(dirname "$(dirname "$npm_root")")/bin"
+        prepend_path_dir "$npm_bin"
+    fi
+
+    hash -r
+}
+
+persist_pm2_command() {
+    local pm2_bin target_dir="${XGENT_PM2_LINK_DIR:-/usr/local/bin}" target
+
+    pm2_bin="$(command -v pm2 2>/dev/null || true)"
+    [ -n "$pm2_bin" ] || return 1
+
+    # 标准目录中的 PM2 不需要额外处理。
+    case "$pm2_bin" in
+        /usr/bin/*|/usr/local/bin/*)
+            return 0
+            ;;
+    esac
+
+    # 仅当 /usr/local/bin 本来就在 PATH 中时创建兼容链接。这样安装脚本
+    # 退出后，新终端和用户直接执行 pm2 也不会再次遇到 PATH 问题。
+    case ":$PATH:" in
+        *":$target_dir:"*) ;;
+        *) return 0 ;;
+    esac
+
+    target="$target_dir/pm2"
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        if [ "$(readlink -f "$target" 2>/dev/null || true)" = "$(readlink -f "$pm2_bin" 2>/dev/null || true)" ]; then
+            return 0
+        fi
+        warn "   $target 已存在且不是当前 PM2，已保留原文件。"
+        return 0
+    fi
+
+    if run_privileged ln -s -- "$pm2_bin" "$target"; then
+        hash -r
+        success "已创建 PM2 命令链接: $target"
+    else
+        warn "   无法创建 $target；安装脚本内仍可正常使用 PM2。"
+    fi
+}
+
 ensure_pm2() {
     if command_exists pm2; then
+        persist_pm2_command
         success "PM2 已可用"
         return
     fi
 
     ensure_npm
+    refresh_npm_global_bin_path
+
+    # PM2 可能已经安装在非标准 npm prefix 下，只是尚未进入 PATH。
+    if command_exists pm2; then
+        persist_pm2_command
+        success "PM2 已可用（已修复 npm 全局命令 PATH）"
+        return
+    fi
 
     info "[pm2] 正在全局安装 PM2..."
     run_privileged npm install -g pm2
-    hash -r
+    refresh_npm_global_bin_path
 
     if ! command_exists pm2; then
-        error "[错误] PM2 安装完成，但命令仍未进入 PATH。"
+        local npm_prefix
+        npm_prefix="$(npm prefix -g 2>/dev/null || true)"
+        error "[错误] PM2 安装完成，但仍无法定位命令。"
+        [ -n "$npm_prefix" ] && echo "   npm 全局前缀: $npm_prefix"
+        echo "   请确认该目录下的 bin/pm2 是否存在。"
         exit 1
     fi
 
+    persist_pm2_command
     success "PM2 安装完成"
 }
 
