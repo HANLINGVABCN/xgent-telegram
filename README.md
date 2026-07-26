@@ -1,157 +1,158 @@
 # Telegram AI Bot
 
-一个面向个人使用的 Telegram AI 助手服务端。项目支持多模型提供商、全局记忆、流式回复、文件与图片上下文，以及可选的 Agent 工具执行能力。
+<p align="center">
+  <strong>把你的 Linux 服务器装进 Telegram。</strong>
+</p>
 
-公开仓库地址：[HANLINGVABCN/telegram-ai-bot](https://github.com/HANLINGVABCN/telegram-ai-bot)
+<p align="center">
+  一个部署在自己服务器上的私有 AI Agent：不仅能聊天，还能执行命令、处理文件、管理长驻任务，并通过 Skill 扩展能力。
+</p>
 
-## 一键命令
+<p align="center">
+  <a href="https://github.com/HANLINGVABCN/telegram-ai-bot/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/HANLINGVABCN/telegram-ai-bot/actions/workflows/tests.yml/badge.svg"></a>
+  <a href="https://github.com/HANLINGVABCN/telegram-ai-bot/blob/main/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
+  <img alt="Python 3.8+" src="https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white">
+  <img alt="Self-hosted" src="https://img.shields.io/badge/Self--hosted-private-24A1DE?logo=telegram&logoColor=white">
+</p>
 
-以下命令会把项目下载到 `/opt` 目录下，生成 `/opt/telegram-ai-bot` 文件夹，然后进入该文件夹并运行安装脚本。`/opt` 可以换成任意想安装的位置。
+> [!IMPORTANT]
+> 本项目面向**单用户私有部署**。Agent 模式能够在服务器上执行真实命令，不是完整沙箱；请先阅读[安全说明](#安全说明)，并使用独立的低权限账号运行。
+
+## 它能做什么
+
+| 场景 | 你可以直接在 Telegram 里说 |
+| --- | --- |
+| 服务器排障 | “检查磁盘为什么快满了，找出最大的文件并给我一份报告。” |
+| 文件处理 | “找到今天生成的备份，压缩后直接发给我。” |
+| 长驻任务 | “启动这个服务，持续观察日志，遇到异常时告诉我。” |
+| 私人助理 | “结合之前的对话和这份文件，整理一份执行清单。” |
+| 媒体生成 | “用默认媒体模型生成一张封面图并发给我。” |
+| 自定义能力 | 通过 `skill/` 增加邮件、笔记、WebDAV 文件管理等工作流。 |
+
+### 典型交互（示意）
+
+```text
+你：检查服务器状态，重点看看磁盘和内存，再把完整报告发给我。
+
+AI：我会先采集系统状态，然后分析异常项。
+    ✓ 执行磁盘检查
+    ✓ 执行内存与进程检查
+    ✓ 生成诊断报告
+    ✓ 已将 report.md 发送到 Telegram
+
+AI：当前主要问题是 /var/log 占用增长过快……
+```
+
+这不是一个公开群聊机器人，也不只是把模型 API 接到 Telegram。它更适合把 Telegram 变成你的**私人 AI 控制台**。
+
+## 核心能力
+
+- **真实 Agent 执行**：运行一次性命令，管理交互式或持续输出的 Shell 会话。
+- **服务器文件操作**：读取、创建、覆盖和发送服务器文件，命令完整输出自动归档。
+- **多模型提供商**：支持 OpenAI、OpenAI 兼容接口、Gemini、Vertex 和 Claude。
+- **对话与媒体模型分离**：可分别设置默认聊天模型和默认媒体模型。
+- **全局记忆**：使用 SQLite 保存对话、系统操作、按钮操作和 Agent 结果。
+- **多模态上下文**：接收文件、图片和贴纸，并按路径索引保存上下文。
+- **流式回复**：支持流式与非流式请求，并可在 Telegram 中随时切换。
+- **Skill 扩展**：Skill 只按索引进入提示词，需要时再由模型读取具体说明。
+- **配置迁移**：提供商、模型和默认选择可导出为 JSON，并在其他实例中合并或覆盖导入。
+- **私有访问控制**：只有 `.env` 中指定的 Telegram 用户 ID 可以使用机器人。
+- **在线维护**：支持通过 Telegram 更新代码、重启 Bot 和管理常用配置。
+
+## 适合与不适合
+
+**适合你，如果你：**
+
+- 有一台 Linux VPS、家庭服务器或开发机；
+- 日常使用 Telegram，希望随时处理服务器任务；
+- 已有模型 API Key，并希望数据与运行环境由自己掌控；
+- 理解 Shell 权限边界，愿意为 Agent 使用独立低权限账号。
+
+**可能不适合你，如果你：**
+
+- 想要无需服务器、注册即用的托管服务；
+- 需要多人共享、公开群聊或完善的租户权限系统；
+- 希望 Agent 在强隔离沙箱中执行不受信任的命令。
+
+## 工作方式
+
+```mermaid
+flowchart LR
+    U[Telegram 用户] -->|消息 / 文件 / 图片| B[Telegram AI Bot]
+    B --> M[模型提供商]
+    B --> D[(SQLite 记忆)]
+    B --> S[Skill 索引]
+    B --> A{Agent 模式}
+    A -->|run| C[一次性命令]
+    A -->|shell| P[长驻 / 交互式进程]
+    A --> F[服务器文件]
+    C --> B
+    P --> B
+    F --> B
+    B -->|回复 / 文件 / 媒体| U
+```
+
+## 快速部署
+
+### 准备
+
+- Linux 服务器与可用的 Python 3.8+
+- 从 [BotFather](https://t.me/BotFather) 获取的 Telegram Bot Token
+- 你的 Telegram 用户 ID
+- 至少一个可用的模型 API Key
+
+### 一键命令
+
+以下命令会将项目安装到 `/opt/telegram-ai-bot`；可将 `/opt` 换成其他目录。
 
 ```bash
 cd /opt && sudo git clone https://github.com/HANLINGVABCN/telegram-ai-bot.git && sudo chown -R "$USER":"$USER" telegram-ai-bot && cd telegram-ai-bot && chmod +x install.sh && ./install.sh
 ```
 
-## 功能特性
-
-- 私有单用户访问控制：只有 `.env` 中配置的 Telegram 用户 ID 可以使用。
-- 多提供商支持：OpenAI、OpenAI 兼容接口、Gemini、Vertex、Claude。
-- 提供商详情支持修改名称、URL、API Key 和模型列表；重命名后会同步更新默认模型关联。
-- 提供商配置迁移：可将 URL、API Key、模型列表和默认模型选择导出为 JSON，并在其他实例中合并导入。
-- 默认模型分离：对话模型和媒体模型可以分别配置。
-- 全局记忆：使用 SQLite 保存对话、系统操作、按钮操作和 Agent 结果。
-- 流式回复：支持流式和非流式两种模型请求方式。
-- 文件与图片处理：可接收文件、图片、贴纸，并按路径索引保存上下文。
-- Prompt 管理：主提示词、全局附加提示词、Agent 提示词均可通过文件维护。
-- Agent 模式：通过 shell 会话执行命令、读写文件、发送服务器文件、管理交互式 shell 会话、调用媒体生成。
-- 命令黑名单：Agent 命令可通过 `prompts/extras/agent_command_blacklist.txt` 管理拦截规则。
-
-## 项目结构
-
-```text
-telegram-ai-bot/
-├─ bot_server.py
-├─ install.sh
-├─ requirements.txt
-├─ docs/
-│  └─ architecture.md
-├─ bot_app/
-│  ├─ bootstrap.py
-│  └─ sections/
-├─ tests/
-├─ tools/
-├─ prompts/
-│  ├─ main.txt
-│  ├─ global_addon.txt
-│  ├─ agent_addon.txt
-│  ├─ agent_disabled_addon.txt
-│  └─ extras/
-│     ├─ agent_command_blacklist.txt
-│     ├─ idle_message.txt
-│     └─ unauthorized_reply_messages.txt
-└─ skill/
-   ├─ bot-system.md
-   ├─ proxy-setup.md
-   ├─ speedtest.md
-   └─ script/
-      ├─ proxy-setup/
-      │  └─ proxy_setup.sh
-      └─ speedtest/
-         └─ deploy_speedtest.sh
-```
-
-运行后会自动生成：
-
-- `.env`：Telegram Bot Token 和授权用户 ID。
-- `bot_memory.db`：SQLite 数据库。
-- `bot_storage/`：上传文件、命令输出、生成媒体等存储目录。
-- `bot_server.log`：服务日志。
-- `bot_output.log`：后台 nohup 运行时的输出日志。
-- `bot.pid`：后台 nohup 运行时的进程 ID 文件。
-
-## 环境要求
-
-- Python 3.8+
-- Telegram Bot Token
-- 至少一个可用的模型 API Key
-
-依赖见 `requirements.txt`：
-
-```text
-python-telegram-bot[job-queue]
-openai
-python-dotenv
-aiosqlite
-```
-
-## 快速开始
-
-克隆项目。下面的命令会把项目下载到 `/opt` 目录下，并生成 `/opt/telegram-ai-bot` 文件夹。`/opt` 可以换成任意想安装的位置：
-
-```bash
-cd /opt
-sudo git clone https://github.com/HANLINGVABCN/telegram-ai-bot.git
-sudo chown -R "$USER":"$USER" telegram-ai-bot
-cd telegram-ai-bot
-```
-
-运行安装脚本：
-
-```bash
-chmod +x install.sh
-./install.sh
-```
-
-`install.sh` 会自动完成环境检查、虚拟环境创建、依赖安装、`.env` 检查和 Telegram Token 校验。
-
-如果项目根目录下还没有 `.env`，脚本会自动创建。若缺少必要配置，脚本会在终端中提示输入：
-
-```env
-BOT_TOKEN=你的 Telegram Bot Token
-AUTHORIZED_USER_ID=你的 Telegram 用户 ID
-
-# 私有仓库更新需要。Fine-grained token 只需要该仓库 Contents: Read-only。
-UPDATE_GITHUB_TOKEN=你的 GitHub Token
-UPDATE_ZIP_URL=https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot/zipball/main
-```
-
-`UPDATE_ZIP_URL` 可以不写，默认就是上面的地址。仓库改为 private 后，`/update` 仍可使用，但必须给运行中的机器人配置 `UPDATE_GITHUB_TOKEN`；否则 GitHub 会返回 404/403，更新会失败。
-
-配置写入完成后，脚本会继续进入启动方式菜单：
+安装脚本会完成环境检查、虚拟环境创建、依赖安装、`.env` 创建与 Telegram Token 校验，然后让你选择启动方式：
 
 - 前台运行
 - 后台运行
 - PM2 守护运行
 - 仅检查环境
 
-### PM2 重启后列表为空
+### 分步安装
 
-选择 PM2 守护运行时，安装脚本会自动执行 `pm2 startup` 和 `pm2 save`，用于保存当前进程列表并配置系统重启后自动恢复。
+```bash
+cd /opt
+sudo git clone https://github.com/HANLINGVABCN/telegram-ai-bot.git
+sudo chown -R "$USER":"$USER" telegram-ai-bot
+cd telegram-ai-bot
+chmod +x install.sh
+./install.sh
+```
 
-如果服务器重启后 `pm2 list` 仍然为空，优先检查这几件事：
+首次安装时，脚本会提示填写：
 
-- 是否用同一个 Linux 用户执行命令。`pm2 list` 和 `sudo pm2 list` 是两套不同的进程表。
-- 手动确认保存状态：`pm2 save`。
-- 手动恢复保存的进程表：`pm2 resurrect`。
-- 手动重新配置开机自启：`pm2 startup`，按它输出的命令执行后再运行 `pm2 save`。
+```env
+BOT_TOKEN=你的 Telegram Bot Token
+AUTHORIZED_USER_ID=你的 Telegram 用户 ID
+```
 
-## 获取 Telegram 配置
+如果仓库以后改为私有，并希望继续使用 `/update`，可额外配置：
 
-1. 在 Telegram 中打开 [BotFather](https://t.me/BotFather)。
-2. 使用 `/newbot` 创建机器人，获取 Bot Token。
-3. 获取自己的 Telegram 用户 ID，可以使用 `@userinfobot` 或其他 ID 查询机器人。
-4. 运行 `./install.sh`，按提示输入 Token 和用户 ID。
+```env
+# Fine-grained token 只需要该仓库 Contents: Read-only。
+UPDATE_GITHUB_TOKEN=你的 GitHub Token
+UPDATE_ZIP_URL=https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot/zipball/main
+```
 
-## 首次使用
+`UPDATE_ZIP_URL` 可省略，默认使用上面的公开仓库地址。私有仓库没有配置 Token 时，GitHub 会返回 404/403，在线更新将失败。
 
-启动服务后，向机器人发送 `/start` 打开主菜单。
+## 第一次使用
 
-常用步骤：
+1. 在 Telegram 中向机器人发送 `/start`。
+2. 打开「提供商」，添加 API URL、API Key 和模型列表。
+3. 打开「默认模型」，选择默认对话模型。
+4. 如需媒体生成，再选择默认媒体模型。
+5. 确认安全边界后，根据需要开启 Agent 模式。
 
-1. 进入「提供商」添加 API 连接。
-2. 进入「默认模型」选择默认对话模型。
-3. 如需媒体生成，再选择默认媒体模型。
-4. 根据需要开启或关闭 Agent 模式、流式输出、记忆深度等设置。
+配置完成后，可以直接发送普通消息、图片或文件，无需使用专门的聊天命令。
 
 ## Telegram 命令
 
@@ -177,40 +178,37 @@ UPDATE_ZIP_URL=https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot/zipball
 | `/update` | 更新代码并重启 |
 | `/restart` | 重启 Bot |
 
-## 提供商配置导入导出
+## 提供商配置迁移
 
 在「提供商」菜单中点击「导出配置」可下载 JSON 配置文件；点击「导入配置」后，可发送该 JSON 文件或直接粘贴完整 JSON。
 
-- 导出内容包括提供商 URL、完整 API Key、接口格式、模型列表，以及默认对话/媒体模型选择。
-- 导入前可选择「合并导入」或「覆盖导入」。
-- 合并导入：同名提供商会更新，其他已有提供商会保留。
-- 覆盖导入：先删除全部现有提供商，再完全按导入文件重建；文件中没有的提供商会被删除。
+- 导出内容包括提供商 URL、完整 API Key、接口格式、模型列表和默认模型选择。
+- **合并导入**：更新同名提供商，保留其他已有提供商。
+- **覆盖导入**：删除现有提供商，再按导入文件完整重建。
 - 默认模型仅在对应提供商和模型均存在时恢复。
-- 导出文件包含明文 API Key，请勿公开分享或提交到代码仓库。
 
-## Prompt 说明
+> [!CAUTION]
+> 导出的 JSON 包含明文 API Key。不要公开分享，也不要提交到代码仓库。
 
-项目的提示词由 `prompts/` 目录维护：
+## Prompt 与 Skill
+
+项目提示词位于 `prompts/`：
 
 - `main.txt`：基础身份提示。
 - `global_addon.txt`：运行环境、上下文读取和记忆规则。
 - `agent_addon.txt`：Agent 工具协议和执行规则。
 - `agent_disabled_addon.txt`：Agent 关闭时的限制说明。
 
-每轮请求会按以下顺序拼接系统提示词：
+每轮请求按以下顺序拼接系统提示词：
 
-1. 主提示词。
-2. 全局附加提示词。
-3. Agent 提示词。
-4. 当前运行目录、上传目录、命令输出目录等绝对路径信息。
-5. `skill/` 文件索引。
-6. 如果 Agent 关闭，追加 Agent 关闭说明。
+1. 主提示词；
+2. 全局附加提示词；
+3. Agent 提示词；
+4. 当前运行目录、上传目录、命令输出目录等路径信息；
+5. `skill/` 文件索引；
+6. Agent 关闭时的限制说明。
 
-`skill/` 目录只会以索引形式进入提示词，不会自动全文注入。模型需要时应通过 `read` 工具读取具体文件。
-
-`/update` 更新时会询问是否覆盖 `prompts/` 与 `skill/`。选择保留会跳过这两个目录；选择覆盖会先把当前 `prompts/` 和 `skill/` 一起备份到 `bot_storage/update_backups/custom_时间戳/`，再应用更新包里的最新版本。
-
-skill 文件简介只使用 `!` 围栏协议块；同一文件内多个 `!` 块会按出现顺序合并到索引中：
+`skill/` 只以索引形式进入提示词，模型需要时才读取具体文件。Skill 文件简介使用 `!` 围栏协议块；同一文件中的多个 `!` 块会按出现顺序合并：
 
 ````text
 ```!
@@ -219,64 +217,113 @@ skill 文件简介只使用 `!` 围栏协议块；同一文件内多个 `!` 块�
 ```
 ````
 
+执行 `/update` 时，可选择保留或覆盖 `prompts/` 与 `skill/`。覆盖前，当前内容会备份到：
+
+```text
+bot_storage/update_backups/custom_时间戳/
+```
+
 ## Agent 模式
 
-Agent 模式开启后，模型可以通过协议块调用真实工具能力：
+Agent 模式开启后，模型可通过内部协议调用真实工具能力：
 
-Agent 协议仅接受 nonce 相同的 `AGENT_BEGIN` / `AGENT_END` 成对标记；旧格式不会被执行。nonce 长度为 12～32 位且每块唯一。协议正文按不透明文本处理，内部 Markdown 或协议示例不会被二次解析。
+- `run`：执行一次性命令并保存完整结果；
+- `shell`：管理长驻、持续输出和交互式命令；
+- `read`：读取服务器文件；
+- `file`：创建或覆盖服务器文件；
+- `sendfile`：将服务器文件发送到 Telegram；
+- 媒体协议：调用默认媒体模型生成内容。
 
+Agent 协议只接受 nonce 相同的 `AGENT_BEGIN` / `AGENT_END` 成对标记。nonce 长度为 6～32 位且每块唯一；协议正文按不透明文本处理，内部 Markdown 或协议示例不会被二次解析。
 
-- 通过 run 协议执行一次性命令并保存结果。
-- 通过 shell 协议管理长驻、持续输出和交互式命令。
-- 管理交互式 shell 会话。
-- 读取服务器文件。
-- 创建或覆盖服务器文件。
-- 发送服务器文件给用户。
-- 调用默认媒体模型生成媒体。
+一次性命令的完整输出保存在：
 
-Agent 命令会受到自定义黑名单影响。一次性命令优先使用 `run`，完整输出会保存到 `bot_storage/command_outputs/`；交互式、长驻或持续输出命令使用 `shell`。黑名单文件位于：
+```text
+bot_storage/command_outputs/
+```
+
+命令黑名单位于：
 
 ```text
 prompts/extras/agent_command_blacklist.txt
 ```
 
-每行写一个禁止片段，命令中包含该片段时会被拦截。
+每行填写一个禁止片段；待执行命令包含该片段时会被拦截。黑名单只能降低风险，不能替代操作系统权限隔离。
 
-## 安全提示
+## 安全说明
 
-- 不要提交 `.env`、数据库、日志或 `bot_storage/` 目录。
-- Agent 模式具备真实服务器执行能力，只建议在可信环境中开启。
-- 项目不是完整沙箱；请根据部署环境维护命令黑名单。
-- 建议使用单独的低权限服务器账号运行服务。
-- 如果 API Key 或 Telegram Token 泄露，请立即在对应平台重置。
+Agent 模式拥有真实服务器权限。建议至少执行以下措施：
+
+1. **使用独立低权限 Linux 用户运行 Bot**，不要直接使用 `root`。
+2. **默认关闭 Agent**，确认模型、Prompt 和权限配置后再开启。
+3. **限制运行账号可访问的目录和密钥**，不要让它读取无关服务的凭据。
+4. **维护命令黑名单**，但不要把黑名单当作完整沙箱。
+5. **不要提交敏感文件**：`.env`、数据库、日志和 `bot_storage/`。
+6. **谨慎处理外部内容**：网页、文件和转发消息可能包含提示词注入内容。
+7. Token 或 API Key 泄露后，应立即在对应平台撤销并重新生成。
+
+项目当前不是强隔离执行环境。如果你的威胁模型包含恶意用户、不可信模型或高价值服务器，请在容器、虚拟机或专用主机中进一步隔离。
+
+## PM2 重启后列表为空
+
+安装脚本在选择 PM2 守护运行时，会执行 `pm2 startup` 和 `pm2 save`，保存进程列表并配置开机恢复。如果服务器重启后 `pm2 list` 为空，请检查：
+
+- 当前命令是否由安装时的同一 Linux 用户执行；`pm2 list` 与 `sudo pm2 list` 属于不同进程表。
+- 手动保存：`pm2 save`。
+- 手动恢复：`pm2 resurrect`。
+- 重新配置：执行 `pm2 startup` 输出的命令，再运行 `pm2 save`。
+
+## 项目结构
+
+```text
+telegram-ai-bot/
+├─ bot_server.py              # 可执行入口
+├─ install.sh                 # 安装、启动、更新与维护脚本
+├─ requirements.txt
+├─ bot_app/
+│  ├─ bootstrap.py            # 模块加载与完整性检查
+│  └─ sections/               # Bot 功能模块
+├─ prompts/                   # 系统与 Agent 提示词
+├─ skill/                     # Skill 说明及配套脚本
+├─ tests/                     # 单元测试
+├─ tools/                     # 开发检查工具
+└─ docs/
+   └─ architecture.md         # 架构与重构说明
+```
+
+运行后会自动生成：
+
+- `.env`：Bot Token、授权用户 ID 等环境配置；
+- `bot_memory.db`：SQLite 数据库；
+- `bot_storage/`：上传文件、命令输出、生成媒体和更新备份；
+- `bot_server.log`：服务日志；
+- `bot_output.log`：nohup 后台输出；
+- `bot.pid`：nohup 进程 ID。
 
 ## 开发与检查
 
-如果只是本地开发或排错，也可以在安装依赖后直接运行主程序：
+安装依赖后可直接运行：
 
 ```bash
 python3 bot_server.py
 ```
 
-语法检查：
-
-```bash
-python -m py_compile bot_server.py
-```
-
-## 开发与架构
-
-当前入口由 `bot_app/bootstrap.py` 负责引导。它会校验清单并按顺序加载
-`bot_app/sections/` 中的兼容模块。重构阶段、模块职责和后续迁移计划见
-[`docs/architecture.md`](docs/architecture.md)。
-
-完整性检查和测试：
+执行完整性检查和测试：
 
 ```bash
 python tools/check_split_integrity.py
 python -m unittest discover -s tests -v
 ```
 
+GitHub Actions 会在 Python 3.10、3.11 和 3.12 上执行完整性检查、编译检查、单元测试及 Shell 语法检查。
+
+入口由 `bot_app/bootstrap.py` 引导，并按清单加载 `bot_app/sections/` 中的兼容模块。详细职责和后续迁移计划见 [`docs/architecture.md`](docs/architecture.md)。
+
+## 发布维护
+
+- [`v0.1.0` GitHub Release 草稿](docs/release-draft-v0.1.0.md)
+- [GitHub 元数据、演示脚本与社区发布文案](docs/launch-kit.md)
+
 ## License
 
-本项目基于 MIT License 开源，详见 [LICENSE](./LICENSE)。
+本项目基于 [MIT License](LICENSE) 开源。
