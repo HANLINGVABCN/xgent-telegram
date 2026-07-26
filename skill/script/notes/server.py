@@ -621,6 +621,11 @@ def hash_password(password, salt):
     return base64.b64encode(digest).decode()
 
 
+# 会话有效期（秒）：Cookie 内签发时间超过该值即视为过期，
+# 避免旧签名无限期有效（服务端此前从不校验时间戳）。
+SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
+
+
 def make_cookie(username, secret):
     ts = str(int(time.time()))
     payload = f"{username}:{ts}"
@@ -636,7 +641,12 @@ def verify_cookie(value, auth):
             return False
         payload = f"{username}:{ts}"
         expected = hmac.new(auth["secret"].encode(), payload.encode(), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(sig, expected)
+        if not hmac.compare_digest(sig, expected):
+            return False
+        # 签发时间超过 TTL 视为过期，避免旧 Cookie 永久有效
+        if int(time.time()) - int(ts) > SESSION_TTL_SECONDS:
+            return False
+        return True
     except Exception:
         return False
 
@@ -717,7 +727,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json({"error": "账号或密码错误"}, status=403)
             return
         session = make_cookie(username, auth["secret"])
-        self.send_json({"ok": True}, headers={"Set-Cookie": f"notes_session={session}; Path=/; HttpOnly; SameSite=Lax"})
+        cookie = f"notes_session={session}; Path=/; Max-Age={SESSION_TTL_SECONDS}; HttpOnly; SameSite=Lax"
+        self.send_json({"ok": True}, headers={"Set-Cookie": cookie})
 
     def handle_get_notes(self):
         parsed = urllib.parse.urlparse(self.path)
