@@ -1,15 +1,15 @@
 ```!
-Telegram AI Bot 的提示词结构、拼接逻辑、回复流程和基础功能说明。
+XGent for Telegram 的提示词结构、拼接逻辑、回复流程和基础功能说明。
 用于快速定位系统提示词拼接、Agent 协议、记忆/上下文和更新机制。
 ```
 
-# Telegram AI Bot 系统说明
+# XGent for Telegram 系统说明
 
-本文用于快速理解当前项目的运行结构。若本文与代码不一致，以 `bot_server.py` 的当前实现为准。
+本文用于快速理解当前项目的运行结构。若本文与代码不一致，以 `xgent_server.py` 的当前实现为准。
 
 ## 1. 基本定位
 
-这是一个私有 Telegram AI Bot，主程序是 `bot_server.py`。系统使用单一授权用户模式，只有 `.env` 中 `AUTHORIZED_USER_ID` 对应的 Telegram 用户可以正常使用。
+这是一个私有 XGent for Telegram，主程序是 `xgent_server.py`。系统使用单一授权用户模式，只有 `.env` 中 `AUTHORIZED_USER_ID` 对应的 Telegram 用户可以正常使用。
 
 核心能力包括：
 
@@ -105,7 +105,7 @@ skill 文件简介只读取 `!` 围栏协议块：
 - 当前工具循环可以把真实内容交给模型。
 - `read` 会把文件本体直接回灌给当前工具循环：文本/代码/JSON/Markdown 等作为完整文本，图片作为图片本体。
 - `read` 的文件本体通常不会完整写入长期记忆；长期记忆通常只保存读取提示、路径和简短说明。
-- `run` 会等待一次性命令结束，把完整输出保存到 `bot_storage/command_outputs/`，并把返回码、输出路径和截断输出写入全局记忆。
+- `run` 会等待一次性命令结束，把完整输出保存到 `xgent_storage/command_outputs/`，并把返回码、输出路径和截断输出写入全局记忆。
 - `shell` 用于交互式或长驻会话；长驻/日志类/等待输入的命令仍在运行时会记录当前输出并回灌给 AI，AI 可继续自动决定 `stdin`、`shellread`、`shellkill` 或回复用户。
 - `file:` 与 `sendfile` 执行后会把执行结果回灌给 AI 并写入上下文，但只包含状态、路径、大小和错误信息，不包含文件本体；需要内容时应使用 `read`。
 - 后续需要完整内容时，应按路径重新读取。
@@ -133,12 +133,12 @@ Agent 命令会受 `prompts/extras/agent_command_blacklist.txt` 管理。一次�
 
 更新会从配置的更新源下载最新代码并覆盖当前项目文件，完成后自动重启。
 
-默认更新源为 GitHub zipball API：`https://api.github.com/repos/HANLINGVABCN/telegram-ai-bot/zipball/main`。如果仓库是私有仓库，需要在 `.env` 配置 `UPDATE_GITHUB_TOKEN`，token 至少要有该仓库 Contents 只读权限。
+默认更新源为 GitHub zipball API：`https://api.github.com/repos/HANLINGVABCN/xgent-telegram/zipball/main`。如果仓库是私有仓库，需要在 `.env` 配置 `UPDATE_GITHUB_TOKEN`，token 至少要有该仓库 Contents 只读权限。
 
 更新前会先询问本地提示词与 skill 文件处理方式：
 
 - 保留当前提示词和 skill：跳过 `prompts/` 与 `skill/` 下的文件，适合服务器上已经手动调过提示词或技能说明的场景。
-- 覆盖并备份提示词和 skill：先把当前 `prompts/` 与 `skill/` 一起备份到 `bot_storage/update_backups/custom_时间戳/`，再覆盖为 GitHub 最新版本。
+- 覆盖并备份提示词和 skill：先把当前 `prompts/` 与 `skill/` 一起备份到 `xgent_storage/update_backups/custom_时间戳/`，再覆盖为 GitHub 最新版本。
 
 运行数据、数据库、日志、存储目录、虚拟环境和 Git 目录不会被更新流程覆盖。
 

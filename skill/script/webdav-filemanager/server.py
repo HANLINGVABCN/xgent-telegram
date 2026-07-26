@@ -1020,12 +1020,32 @@ class FileManagerHandler(BaseHTTPRequestHandler):
                 return False
             return True
 
+    def _request_proto(self):
+        """Detect the effective external scheme (http/https), honoring reverse-proxy headers.
+
+        The backend only listens on plain HTTP, so a real HTTPS deployment terminates
+        TLS at a reverse proxy that forwards X-Forwarded-Proto / Forwarded. Direct HTTP
+        access reports 'http' and must NOT receive a Secure cookie, or the browser drops
+        it and the web login loops forever.
+        """
+        forwarded = forwarded_header_params(self.headers.get('Forwarded', ''))
+        proto = (
+            normalize_external_proto(forwarded.get('proto'))
+            or normalize_external_proto(self.headers.get('X-Forwarded-Proto'))
+            or normalize_external_proto(self.headers.get('X-Url-Scheme'))
+        )
+        if not proto:
+            ssl_hint = clean_forwarded_value(self.headers.get('X-Forwarded-Ssl')).lower()
+            proto = 'https' if ssl_hint == 'on' else 'http'
+        return proto
+
     def _new_session_cookie(self):
         self._clear_expired_sessions()
         token = secrets.token_urlsafe(32)
         with SESSIONS_LOCK:
             SESSIONS[token] = time.time() + SESSION_MAX_AGE
-        return f'{SESSION_COOKIE}={token}; Path=/; Max-Age={SESSION_MAX_AGE}; HttpOnly; Secure; SameSite=Lax'
+        secure = '; Secure' if self._request_proto() == 'https' else ''
+        return f'{SESSION_COOKIE}={token}; Path=/; Max-Age={SESSION_MAX_AGE}; HttpOnly{secure}; SameSite=Lax'
 
     def _expired_session_cookie(self):
         token = self._session_token()
@@ -1597,14 +1617,7 @@ class FileManagerHandler(BaseHTTPRequestHandler):
 
     def _external_origin(self):
         forwarded = forwarded_header_params(self.headers.get('Forwarded', ''))
-        proto = (
-            normalize_external_proto(forwarded.get('proto'))
-            or normalize_external_proto(self.headers.get('X-Forwarded-Proto'))
-            or normalize_external_proto(self.headers.get('X-Url-Scheme'))
-        )
-        if not proto:
-            ssl_hint = clean_forwarded_value(self.headers.get('X-Forwarded-Ssl')).lower()
-            proto = 'https' if ssl_hint == 'on' else 'http'
+        proto = self._request_proto()
         host = normalize_external_host(
             forwarded.get('host') or self.headers.get('X-Forwarded-Host') or self.headers.get('Host'),
             self.headers.get('X-Forwarded-Port'),

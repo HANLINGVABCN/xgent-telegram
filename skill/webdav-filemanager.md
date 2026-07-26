@@ -4,7 +4,7 @@ WebDAV网盘技能：一键部署网页网盘及WebDAV服务。安装: sudo bash
 
 # 服务器网盘 + WebDAV + HTTP 测速文件管理器
 
-本文是 Telegram AI Bot 项目内置 skill 文档，用于指导 Agent 模式在服务器上使用 `skill/script/webdav-filemanager/install.sh` 搭建一个带网页文件管理界面、WebDAV 协议支持和 HTTP 测速能力的私有网盘。
+本文是 XGent for Telegram 项目内置 skill 文档，用于指导 Agent 模式在服务器上使用 `skill/script/webdav-filemanager/install.sh` 搭建一个带网页文件管理界面、WebDAV 协议支持和 HTTP 测速能力的私有网盘。
 
 ## 1. 文件位置
 
@@ -491,7 +491,7 @@ pm2 show webdav-filemanager
 推荐命令：
 
 ```bash
-cd /path/to/telegram-ai-bot
+cd "<项目根目录绝对路径>"
 git pull  # 如果需要从 git 仓库拉取最新代码
 sudo bash skill/script/webdav-filemanager/install.sh update
 pm2 show webdav-filemanager
