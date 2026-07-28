@@ -915,8 +915,12 @@ class TelegramStreamRenderer:
 async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                    prov_name: str, prov_data: Dict, model: str,
                                    system_prompt: str, history: List[Dict],
-                                   extra_media_artifacts: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
-    """流式回复：上游边生成，Telegram 边按字符刷新显示。"""
+                                   extra_media_artifacts: Optional[List[Dict[str, Any]]] = None,
+                                   stopped_partial_sink: Optional[List[str]] = None) -> Optional[str]:
+    """流式回复：上游边生成，Telegram 边按字符刷新显示。
+
+    stopped_partial_sink：可选出参。用户中途手动停止时，把已经生成的部分文本
+    append 进去（可能为空串），供调用方记录“当前回复已被用户手动停止”。"""
     global _stop_generation_event
     chat_id = update.effective_chat.id
     TELEGRAM_MSG_LIMIT = RICH_MESSAGE_CHAR_LIMIT
@@ -1021,6 +1025,8 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
                 "usage": usage_sink[0] if usage_sink else None,
                 "elapsed_seconds": time.monotonic() - generation_started_at,
             })
+            if stopped_partial_sink is not None:
+                stopped_partial_sink.append(''.join(raw_response_parts).strip())
             return None
 
         if not native_media_detected and renderer and has_media_artifacts(extra_media_artifacts):
@@ -1045,6 +1051,8 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
                 "usage": usage_sink[0] if usage_sink else None,
                 "elapsed_seconds": time.monotonic() - generation_started_at,
             })
+            if stopped_partial_sink is not None:
+                stopped_partial_sink.append(full_response)
             return None
 
         if full_response:
@@ -1136,8 +1144,11 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
 async def send_non_streaming_response(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                        prov_name: str, prov_data: Dict, model: str,
                                        system_prompt: str, history: List[Dict],
-                                       extra_media_artifacts: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
-    """非流式回复：等待完整回复后一次性发送"""
+                                       extra_media_artifacts: Optional[List[Dict[str, Any]]] = None,
+                                       stopped_partial_sink: Optional[List[str]] = None) -> Optional[str]:
+    """非流式回复：等待完整回复后一次性发送。
+
+    stopped_partial_sink：可选出参，语义同流式版本。"""
     global _stop_generation_event
     chat_id = update.effective_chat.id
     TELEGRAM_MSG_LIMIT = RICH_MESSAGE_CHAR_LIMIT
@@ -1189,6 +1200,8 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
                 "usage": usage_sink[0] if usage_sink else None,
                 "elapsed_seconds": time.monotonic() - generation_started_at,
             })
+            if stopped_partial_sink is not None:
+                stopped_partial_sink.append("")
             return None
 
         await cancel_task_quietly(stop_task, timeout=0.2)
@@ -1205,6 +1218,8 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
                 await safe_edit_text(msg, "⏹️ 已停止。", reply_markup=None)
             except Exception:
                 pass
+            if stopped_partial_sink is not None:
+                stopped_partial_sink.append(response or "")
             return None
 
         if error:
