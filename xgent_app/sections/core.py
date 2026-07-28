@@ -769,6 +769,48 @@ def has_pending_text_conversation(update: Update) -> bool:
         return key in _pending_text_conversations
 
 
+# ---------------------------------------------------------------------------
+# Album (media_group) photo buffering
+#
+# Telegram delivers each photo of an album as a separate update that all
+# share the same ``media_group_id``. Buffer them per ``(chat_id, media_group_id)``
+# and flush once the quiet window elapses so the whole album reaches the AI as
+# a single multimodal message instead of one conversation per photo.
+# ---------------------------------------------------------------------------
+
+ALBUM_FLUSH_QUIET_SECONDS = 3.0
+ALBUM_MAX_PHOTOS = 10  # Telegram album hard cap; defensive truncation.
+
+
+class PendingAlbumConversation:
+    """Collect photos sharing one Telegram ``media_group_id`` until the quiet window elapses."""
+
+    def __init__(self, update: Update, context: ContextTypes.DEFAULT_TYPE, media_group_id: str):
+        self.update = update  # representative update (caption-bearing, falls back to first)
+        self.context = context
+        self.media_group_id = media_group_id
+        self.photos: List[Dict[str, str]] = []  # each: {image_b64, saved_notice, index_text}
+        self.caption: str = ""
+        self.flush_task: Optional[Any] = None
+        self.closed: bool = False
+
+    def add_photo(self, image_b64: str, saved_notice: str, index_text: str,
+                  caption: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.photos.append({
+            "image_b64": image_b64,
+            "saved_notice": saved_notice,
+            "index_text": index_text,
+        })
+        if caption and not self.caption:
+            self.caption = caption
+            self.update = update
+            self.context = context
+
+
+_pending_album_conversations: Dict[Tuple[int, str], "PendingAlbumConversation"] = {}
+_pending_album_conversations_lock = threading.RLock()
+
+
 REDUNDANT_AGENT_COMMAND_PREFIXES: Tuple[str, ...] = ()
 
 def is_redundant_agent_command_record(msg_type: str, content: Any) -> bool:
