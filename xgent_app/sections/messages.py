@@ -1364,6 +1364,17 @@ async def _send_agent_iteration_limit_notice(
     await safe_send_message(context, chat_id, message)
 
 
+async def _record_user_stopped_reply(db, cid, chat_id, partial_text: str) -> str:
+    """用户在接收 AI 回复期间手动停止：把已生成的部分文本 + 停止标记写入
+    全局记录与模型可见历史，返回写入内容。与正常回复保存路径一致。"""
+    marker = "⏹️ 当前回复已被用户手动停止"
+    partial = (partial_text or "").strip()
+    content = f"{partial}\n\n{marker}" if partial else marker
+    await GlobalRecorder.record_ai_reply(content, chat_id)
+    await db.add_chat_message(cid, 'assistant', content)
+    return content
+
+
 async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
                                content_override: Optional[Any] = None,
                                lock_acquired_event: Optional[asyncio.Event] = None,
@@ -1468,20 +1479,42 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     )
 
     # 根据流式/非流式开关选择回复方式
+    stop_partial: List[str] = []
     if stream_mode:
         response = await send_streaming_response(
             update, context,
             prov_name, prov_data, model,
-            system_prompt, history
+            system_prompt, history,
+            stopped_partial_sink=stop_partial
         )
     else:
         response = await send_non_streaming_response(
             update, context,
             prov_name, prov_data, model,
-            system_prompt, history
+            system_prompt, history,
+            stopped_partial_sink=stop_partial
         )
     
     if not response:
+        if is_stop_requested():
+            # 用户在接收 AI 回复期间手动停止：保留用户消息与已生成的部分，
+            # 记录“当前回复已被用户手动停止”，并跳过后续 Agent 协议执行。
+            if trigger_status_msg is not None and trigger_status_iteration is not None:
+                with contextlib.suppress(Exception):
+                    await safe_edit_text(
+                        trigger_status_msg,
+                        build_agent_round_status(
+                            trigger_status_iteration,
+                            "stopped",
+                            origin=agent_origin,
+                        ),
+                        reply_markup=None,
+                    )
+            await _record_user_stopped_reply(
+                db, cid, update.effective_chat.id,
+                stop_partial[0] if stop_partial else "",
+            )
+            return
         if trigger_status_msg is not None and trigger_status_iteration is not None:
             with contextlib.suppress(Exception):
                 await safe_edit_text(
@@ -1934,20 +1967,43 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             pending_round_status_msg = None
             pending_round_iteration = None
 
+            stop_partial = []
             if stream_mode:
                 response = await send_streaming_response(
                     update, context,
                     prov_name, prov_data, model,
-                    system_prompt, next_history
+                    system_prompt, next_history,
+                    stopped_partial_sink=stop_partial
                 )
             else:
                 response = await send_non_streaming_response(
                     update, context,
                     prov_name, prov_data, model,
-                    system_prompt, next_history
+                    system_prompt, next_history,
+                    stopped_partial_sink=stop_partial
                 )
             
             if not response:
+                if is_stop_requested():
+                    # Agent 后续回复期间被用户手动停止：记录“当前回复已被用户手动停止”后结束本轮。
+                    if pending_round_status_msg is not None and pending_round_iteration is not None:
+                        with contextlib.suppress(Exception):
+                            await safe_edit_text(
+                                pending_round_status_msg,
+                                build_agent_round_status(
+                                    pending_round_iteration,
+                                    "stopped",
+                                    origin=agent_origin,
+                                ),
+                                reply_markup=None,
+                            )
+                        pending_round_status_msg = None
+                        pending_round_iteration = None
+                    await _record_user_stopped_reply(
+                        db, cid, update.effective_chat.id,
+                        stop_partial[0] if stop_partial else "",
+                    )
+                    break
                 if pending_round_status_msg is not None and pending_round_iteration is not None:
                     with contextlib.suppress(Exception):
                         await safe_edit_text(
