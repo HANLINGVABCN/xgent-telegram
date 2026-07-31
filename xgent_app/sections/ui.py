@@ -167,18 +167,56 @@ def get_more_settings_menu():
          InlineKeyboardButton("⏱️ 超时", callback_data="menu_timeout_settings")],
         [InlineKeyboardButton("🚫 Agent黑名单", callback_data="menu_command_blacklist"),
          InlineKeyboardButton("🧹 清空上下文", callback_data="cmd_delete")],
-        [InlineKeyboardButton("ℹ️ 状态", callback_data="cmd_info"),
-         InlineKeyboardButton("📤 导出", callback_data="cmd_export_all")],
-        [InlineKeyboardButton("⬆️ 更新", callback_data="cmd_update"),
-         InlineKeyboardButton("🔄 重启", callback_data="cmd_restart")],
+        [InlineKeyboardButton(f"🌐 联网搜索:{'开' if BotConfig.TAVILY_API_KEY else '未配置'}", callback_data="menu_search_settings"),
+         InlineKeyboardButton("ℹ️ 状态", callback_data="cmd_info")],
+        [InlineKeyboardButton("📤 导出", callback_data="cmd_export_all"),
+         InlineKeyboardButton("⬆️ 更新", callback_data="cmd_update")],
+        [InlineKeyboardButton("🔄 重启", callback_data="cmd_restart")],
         [InlineKeyboardButton("🔙 返回", callback_data="act_main_menu")]
     ])
+
+
+def get_search_settings_menu():
+    configured = bool(BotConfig.TAVILY_API_KEY)
+    rows = [
+        [InlineKeyboardButton(
+            "🔑 修改 API Key" if configured else "🔑 设置 API Key",
+            callback_data="act_set_search_key"
+        )],
+    ]
+    if configured:
+        rows.append([InlineKeyboardButton("🧪 测试搜索", callback_data="act_test_search")])
+        rows.append([InlineKeyboardButton("🗑️ 清除 Key", callback_data="confirm_clear_search_key")])
+    rows.append([InlineKeyboardButton("🔙 返回", callback_data="menu_more_settings")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_search_settings_text() -> str:
+    key = BotConfig.TAVILY_API_KEY
+    status = (
+        f"✅ 已配置 <code>{safe_text(mask_search_api_key(key))}</code>"
+        if key else "⚠️ 未配置"
+    )
+    hint = (
+        "Agent 可以使用 <code>search-x</code> 联网搜索、<code>fetch-x</code> 抓取网页正文。\n"
+        if key else
+        "配置后 Agent 才能联网搜索。未配置时不影响其他功能。\n"
+    )
+    return (
+        "🌐 <b>联网搜索设置</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"状态：{status}\n"
+        "服务商：<b>Tavily</b>\n\n"
+        f"{hint}\n"
+        "免费额度 1000 次/月，在 <code>tavily.com</code> 注册后获取 Key。\n"
+        "Key 会写入项目根目录的 <code>.env</code>，保存后立即生效，无需重启。"
+    )
 
 def build_settings_menu_text() -> str:
     return (
         "⚙️ <b>更多设置</b>\n"
         "━━━━━━━━━━━━━━\n"
-        "调整记忆深度、超时、Agent 黑名单、更新与重启。"
+        "调整记忆深度、超时、Agent 黑名单、联网搜索、更新与重启。"
     )
 
 def get_timeout_settings_menu():

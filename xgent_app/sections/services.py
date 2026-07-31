@@ -9,6 +9,7 @@ from xgent_app.shell_output import (
     get_shell_pause_messages,
 )
 from xgent_app.agent_context import build_media_context_message
+from xgent_app.agent_search import run_search
 class GlobalRecorder:
     """始终记录所有操作（无论什么模式）"""
     
@@ -194,6 +195,33 @@ def persist_update_github_token(token: str, update_url: Optional[str] = None):
     update_env_values({
         "UPDATE_GITHUB_TOKEN": token,
     })
+
+def persist_search_api_key(api_key: str):
+    """把 Tavily Key 写入 .env 并立即生效，无需重启。"""
+    api_key = str(api_key or "").replace("\r", "").replace("\n", "").strip()
+    if not api_key:
+        raise ValueError("搜索 API Key 不能为空")
+    BotConfig.TAVILY_API_KEY = api_key
+    os.environ["TAVILY_API_KEY"] = api_key
+    update_env_values({"TAVILY_API_KEY": api_key})
+
+
+def clear_search_api_key():
+    """清除已保存的搜索 Key，search-x 会回到未配置提示。"""
+    BotConfig.TAVILY_API_KEY = ""
+    os.environ.pop("TAVILY_API_KEY", None)
+    update_env_values({"TAVILY_API_KEY": ""})
+
+
+def mask_search_api_key(api_key: str) -> str:
+    """只显示尾部 4 位，避免完整 Key 出现在聊天记录里。"""
+    api_key = str(api_key or "").strip()
+    if not api_key:
+        return "未配置"
+    if len(api_key) <= 8:
+        return "*" * len(api_key)
+    return f"{api_key[:6]}...{api_key[-4:]}"
+
 
 def should_send_github_update_token(update_url: str) -> bool:
     host = (urllib.parse.urlparse(update_url).hostname or "").lower()
