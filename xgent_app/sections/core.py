@@ -646,6 +646,7 @@ class BotState:
     SET_IDLE_MESSAGE_INTERVAL = 'set_idle_message_interval'
     SET_COMMAND_BLACKLIST = 'set_command_blacklist'
     SET_UPDATE_TOKEN = 'set_update_token'
+    SET_SEARCH_KEY = 'set_search_key'
     SET_MEMORY = 'set_memory'
     IMPORT_PROVIDER_CONFIG = 'import_provider_config'
 

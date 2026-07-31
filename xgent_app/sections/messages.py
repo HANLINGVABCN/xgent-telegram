@@ -555,6 +555,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         BotState.SET_UPDATE_TOKEN,
         # 黑名单是命令匹配模式，转义 * 和 _ 会让通配符规则失效。
         BotState.SET_COMMAND_BLACKLIST,
+        # 搜索 Key 同样含下划线和连字符，必须保持原样。
+        BotState.SET_SEARCH_KEY,
     }
     text = ""
     if update.message.text:
@@ -629,6 +631,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         recorded_text = (
             "[已填入 UPDATE_GITHUB_TOKEN，内容已隐藏]"
             if state == BotState.SET_UPDATE_TOKEN
+            else "[已填入搜索 API Key，内容已隐藏]"
+            if state == BotState.SET_SEARCH_KEY
             else "[已提交提供商配置 JSON，内容已隐藏]"
             if state == BotState.IMPORT_PROVIDER_CONFIG
             else "[已填入 API Key，内容已隐藏]"
@@ -732,6 +736,53 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode=constants.ParseMode.HTML
         )
         await send_update_confirmation_message(status_msg)
+        return
+
+    if state == BotState.SET_SEARCH_KEY:
+        api_key = text.strip()
+        if not api_key:
+            await update.message.reply_text("⚠️ API Key 不能为空。请重新发送，或发送 cancel 取消。")
+            return
+        try:
+            await asyncio.to_thread(persist_search_api_key, api_key)
+        except Exception as e:
+            logger.exception("保存搜索 API Key 失败")
+            await update.message.reply_text(
+                f"❌ 保存失败：<code>{safe_text(format_provider_exception(e))}</code>",
+                parse_mode=constants.ParseMode.HTML
+            )
+            return
+
+        UserDataManager.set('state', BotState.IDLE)
+        await GlobalRecorder.record_system_op(
+            "保存搜索 API Key",
+            {"masked": mask_search_api_key(api_key)},
+            update.effective_chat.id
+        )
+        status_msg = await update.message.reply_text(
+            f"✅ 已保存 <code>{safe_text(mask_search_api_key(api_key))}</code>，正在验证...",
+            parse_mode=constants.ParseMode.HTML
+        )
+        # 立即验证一次，避免 Key 填错但用户以为已生效。
+        try:
+            result = await run_search("hello world\nmax: 1", BotConfig.TAVILY_API_KEY)
+        except Exception as e:
+            logger.exception("搜索 Key 验证失败")
+            result = {"success": False, "output": format_provider_exception(e)}
+        if result.get('success'):
+            await status_msg.edit_text(
+                "✅ 搜索 API Key 已保存并验证通过。\n"
+                "Agent 现在可以使用 search-x 联网搜索、fetch-x 抓取网页正文了。",
+                reply_markup=get_search_settings_menu()
+            )
+        else:
+            await status_msg.edit_text(
+                "⚠️ Key 已保存，但验证未通过：\n"
+                f"<code>{safe_text(str(result.get('output') or '')[:600])}</code>\n\n"
+                "请检查 Key 是否正确，或稍后用“测试搜索”重试。",
+                reply_markup=get_search_settings_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
         return
 
     if state == BotState.SET_PROMPT:
