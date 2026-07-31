@@ -48,6 +48,26 @@ def build_run_presentation(result: Mapping[str, Any]) -> str:
 
 
 
+def build_search_presentation(result: Mapping[str, Any]) -> str:
+    notice = str(result.get("notice") or result.get("output") or "")
+    emoji = "🌐" if result.get("success") else "⚠️"
+    hits = len(result.get("results") or [])
+    return (
+        f"{emoji} <b>Agent Search</b> 命中 {hits} 条\n"
+        f"<pre>{escape_html(notice[:2500])}</pre>"
+    )
+
+
+def build_fetch_presentation(result: Mapping[str, Any]) -> str:
+    notice = str(result.get("notice") or result.get("output") or "")
+    emoji = "📄" if result.get("success") else "⚠️"
+    pages = len(result.get("results") or [])
+    return (
+        f"{emoji} <b>Agent Fetch</b> 抓取 {pages} 个页面\n"
+        f"<pre>{escape_html(notice[:2500])}</pre>"
+    )
+
+
 def build_standard_operation_presentation(
     result: Mapping[str, Any],
 ) -> Optional[str]:
@@ -56,6 +76,8 @@ def build_standard_operation_presentation(
         "edit": build_edit_presentation,
         "grep": build_grep_presentation,
         "run": build_run_presentation,
+        "search": build_search_presentation,
+        "fetch": build_fetch_presentation,
     }
     builder = builders.get(str(result.get("kind") or ""))
     return builder(result) if builder is not None else None

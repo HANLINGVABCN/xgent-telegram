@@ -113,6 +113,8 @@ class BotConfig:
         or os.getenv("GITHUB_TOKEN")
         or ""
     ).strip()
+    # 联网搜索（search-x / fetch-x）。未配置时协议返回配置指引而不是报错。
+    TAVILY_API_KEY = (os.getenv("TAVILY_API_KEY") or "").strip()
 
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -208,6 +210,7 @@ def redact_sensitive_text(text: str) -> str:
     secrets = {
         BotConfig.TOKEN: "[REDACTED_BOT_TOKEN]",
         BotConfig.UPDATE_GITHUB_TOKEN: "[REDACTED_UPDATE_GITHUB_TOKEN]",
+        BotConfig.TAVILY_API_KEY: "[REDACTED_TAVILY_API_KEY]",
     }
     for secret, replacement in secrets.items():
         if secret:

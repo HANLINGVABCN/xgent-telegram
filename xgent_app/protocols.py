@@ -19,6 +19,7 @@ class ProtocolParser:
         r"^```(?P<tag>"
         r"run-x|shell-x|stdin-x:[^\n<]+|shellread-x:[^\n<]+|shellkill-x:[^\n<]+|"
         r"trigger-x(?::[^\n<]+)?|sendfile-x|read-x:[^\n<]+|read-x|edit-x|grep-x|"
+        r"search-x|fetch-x|"
         r"media-x|file-x(?::[^\n<]*?)?"
         r")\s+<<AGENT_BEGIN_(?P<nonce>" + _NONCE_PATTERN + r")\s*$"
     )
