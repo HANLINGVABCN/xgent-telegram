@@ -29,6 +29,16 @@ class ProtocolParserTests(unittest.TestCase):
         self.assertEqual("echo ok", blocks[0]["body"])
         self.assertEqual("/tmp/demo.txt:1-3", blocks[1]["path"])
 
+    def test_search_and_fetch_blocks_keep_multiline_body(self):
+        response = (
+            f"{protocol_block('search-x', 'nginx 502\nmax: 3', NONCE_A)}\n"
+            f"{protocol_block('fetch-x', 'https://x.example', NONCE_B)}\n"
+        )
+        blocks = ProtocolParser.extract_protocol_blocks(response)
+        self.assertEqual(["search", "fetch"], [block["type"] for block in blocks])
+        self.assertEqual("nginx 502\nmax: 3", blocks[0]["body"])
+        self.assertEqual("https://x.example", blocks[1]["body"])
+
     def test_body_is_opaque_until_matching_end_sequence(self):
         response = protocol_block(
             "run-x",
