@@ -727,12 +727,29 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         UserDataManager.set('state', BotState.IDLE)
         UserDataManager.set('pending_update_zip_url', "")
         await GlobalRecorder.record_system_op(
-            "保存 UPDATE_GITHUB_TOKEN 并继续更新确认",
+            "保存 UPDATE_GITHUB_TOKEN",
             {"update_source": BotConfig.UPDATE_ZIP_URL},
             update.effective_chat.id
         )
         status_msg = await update.message.reply_text(
-            "✅ Token 已保存，信息已加密",
+            f"✅ 已保存 <code>{safe_text(mask_update_github_token(token))}</code>，正在验证...",
+            parse_mode=constants.ParseMode.HTML
+        )
+        # 立即验证，避免坏 Token 一路存进去、直到点更新才 401。
+        verification = await asyncio.to_thread(
+            verify_update_github_token, token, BotConfig.UPDATE_ZIP_URL
+        )
+        if not verification['ok']:
+            await status_msg.edit_text(
+                f"❌ <b>Token 验证未通过</b>\n\n{verification['message']}\n\n"
+                "<i>修正后重新发送，或点下方按钮管理。</i>",
+                reply_markup=get_github_token_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+            return
+
+        await status_msg.edit_text(
+            f"✅ Token 已保存并验证通过。\n{verification['message']}",
             parse_mode=constants.ParseMode.HTML
         )
         await send_update_confirmation_message(status_msg)
