@@ -551,6 +551,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         BotState.SEARCH_FETCHED,
         BotState.SEARCH_SAVED,
         BotState.IMPORT_PROVIDER_CONFIG,
+        # GitHub Token 含大量下划线，转义后写进 .env 会导致更新下载 401。
+        BotState.SET_UPDATE_TOKEN,
+        # 黑名单是命令匹配模式，转义 * 和 _ 会让通配符规则失效。
+        BotState.SET_COMMAND_BLACKLIST,
     }
     text = ""
     if update.message.text:
@@ -617,10 +621,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if state == BotState.IMPORT_PROVIDER_CONFIG and update.message.text:
         text = update.message.text.strip()
 
-    # 转发消息添加来源信息
-    context_prefix = build_incoming_context_prefix(update.message)
-    if context_prefix:
-        text = f"{context_prefix}\n{text}"
+    # 转发/引用来源前缀只加在正常对话上（见文件末尾的正常对话分支）。
+    # 配置状态下必须保持原样：前缀会被当成 Token、API Key 或黑名单规则本身存进配置。
 
     # 普通聊天按拼接模式决定：直接发送，或累计到“完成”按钮后再写入记忆。
     if state != BotState.IDLE:
