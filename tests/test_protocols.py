@@ -30,13 +30,15 @@ class ProtocolParserTests(unittest.TestCase):
         self.assertEqual("/tmp/demo.txt:1-3", blocks[1]["path"])
 
     def test_search_and_fetch_blocks_keep_multiline_body(self):
+        # 反斜杠不能出现在 f-string 表达式里（Python 3.12 前）。
+        search_body = "nginx 502\nmax: 3"
         response = (
-            f"{protocol_block('search-x', 'nginx 502\nmax: 3', NONCE_A)}\n"
+            f"{protocol_block('search-x', search_body, NONCE_A)}\n"
             f"{protocol_block('fetch-x', 'https://x.example', NONCE_B)}\n"
         )
         blocks = ProtocolParser.extract_protocol_blocks(response)
         self.assertEqual(["search", "fetch"], [block["type"] for block in blocks])
-        self.assertEqual("nginx 502\nmax: 3", blocks[0]["body"])
+        self.assertEqual(search_body, blocks[0]["body"])
         self.assertEqual("https://x.example", blocks[1]["body"])
 
     def test_body_is_opaque_until_matching_end_sequence(self):
