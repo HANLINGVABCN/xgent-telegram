@@ -219,6 +219,78 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode=constants.ParseMode.HTML
             )
 
+        # --- 凭据配置 ---
+        elif data == "menu_credentials":
+            UserDataManager.set('state', BotState.IDLE)
+            await query.message.edit_text(
+                build_credentials_text(),
+                reply_markup=get_credentials_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "menu_github_token":
+            UserDataManager.set('state', BotState.IDLE)
+            await query.message.edit_text(
+                build_github_token_text(),
+                reply_markup=get_github_token_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "act_set_github_token":
+            UserDataManager.set('state', BotState.SET_UPDATE_TOKEN)
+            UserDataManager.set('pending_update_zip_url', BotConfig.UPDATE_ZIP_URL)
+            await query.message.reply_text(
+                "🔑 <b>设置 GitHub Token</b>\n"
+                "━━━━━━━━━━━━━━\n"
+                "请发送 Fine-grained GitHub Token（<code>github_pat_</code> 开头）。\n\n"
+                "生成时必须同时满足：\n"
+                "1️⃣ <b>Repository access</b> → <code>Only select repositories</code> "
+                "→ 勾上目标仓库\n"
+                "2️⃣ <b>Permissions</b> → <code>Repository permissions</code> → "
+                "<code>Contents</code> → <b>Read-only</b>\n\n"
+                "<i>第 2 条默认是 No access，最容易漏。</i>\n"
+                "━━━━━━━━━━━━━━\n"
+                "保存时会自动验证，聊天记录里只保留掩码形式。\n"
+                "<i>发送 cancel 取消。</i>",
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "act_test_github_token":
+            status_msg = await query.message.reply_text("🔍 正在验证 Token...")
+            result = await asyncio.to_thread(
+                verify_update_github_token,
+                BotConfig.UPDATE_GITHUB_TOKEN,
+                BotConfig.UPDATE_ZIP_URL,
+            )
+            icon = "✅" if result['ok'] else "❌"
+            await status_msg.edit_text(
+                f"{icon} {result['message']}",
+                reply_markup=get_github_token_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "confirm_clear_github_token":
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ 确认清除", callback_data="do_clear_github_token")],
+                [InlineKeyboardButton("🔙 返回", callback_data="menu_github_token")]
+            ])
+            await query.message.edit_text(
+                "⚠️ <b>确认清除 GitHub Token？</b>\n\n"
+                "清除后无法从私有仓库拉取更新（会返回 404）。\n"
+                "正常更新源不受影响。",
+                reply_markup=kb,
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "do_clear_github_token":
+            await asyncio.to_thread(clear_update_github_token)
+            await GlobalRecorder.record_system_op("清除 GitHub Token")
+            await query.message.edit_text(
+                build_github_token_text(),
+                reply_markup=get_github_token_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
         # --- 联网搜索设置 ---
         elif data == "menu_search_settings":
             UserDataManager.set('state', BotState.IDLE)

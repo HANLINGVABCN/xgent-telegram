@@ -167,13 +167,86 @@ def get_more_settings_menu():
          InlineKeyboardButton("⏱️ 超时", callback_data="menu_timeout_settings")],
         [InlineKeyboardButton("🚫 Agent黑名单", callback_data="menu_command_blacklist"),
          InlineKeyboardButton("🧹 清空上下文", callback_data="cmd_delete")],
-        [InlineKeyboardButton(f"🌐 联网搜索:{'开' if BotConfig.TAVILY_API_KEY else '未配置'}", callback_data="menu_search_settings"),
+        [InlineKeyboardButton(f"🔐 凭据配置{_credentials_badge()}", callback_data="menu_credentials"),
          InlineKeyboardButton("ℹ️ 状态", callback_data="cmd_info")],
         [InlineKeyboardButton("📤 导出", callback_data="cmd_export_all"),
          InlineKeyboardButton("⬆️ 更新", callback_data="cmd_update")],
         [InlineKeyboardButton("🔄 重启", callback_data="cmd_restart")],
         [InlineKeyboardButton("🔙 返回", callback_data="act_main_menu")]
     ])
+
+
+def _credentials_badge() -> str:
+    """在按钮上直接显示已配置了几项，省得点进去才知道。"""
+    done = sum([
+        bool(BotConfig.UPDATE_GITHUB_TOKEN),
+        bool(BotConfig.TAVILY_API_KEY),
+    ])
+    return f":{done}/2"
+
+
+def get_credentials_menu():
+    """凭据集中配置：GitHub Token 与搜索 Key。"""
+    gh = bool(BotConfig.UPDATE_GITHUB_TOKEN)
+    tv = bool(BotConfig.TAVILY_API_KEY)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"🔑 GitHub Token：{'已配置' if gh else '未配置'}",
+            callback_data="menu_github_token"
+        )],
+        [InlineKeyboardButton(
+            f"🌐 搜索 API Key：{'已配置' if tv else '未配置'}",
+            callback_data="menu_search_settings"
+        )],
+        [InlineKeyboardButton("🔙 返回", callback_data="menu_more_settings")]
+    ])
+
+
+def build_credentials_text() -> str:
+    gh = BotConfig.UPDATE_GITHUB_TOKEN
+    tv = BotConfig.TAVILY_API_KEY
+    return (
+        "🔐 <b>凭据配置</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🔑 GitHub Token：{'✅ ' + safe_text(mask_update_github_token(gh)) if gh else '⚠️ 未配置'}\n"
+        f"🌐 搜索 API Key：{'✅ ' + safe_text(mask_search_api_key(tv)) if tv else '⚠️ 未配置'}\n\n"
+        "GitHub Token 用于从私有仓库拉取更新；搜索 Key 用于 Agent 联网搜索。\n"
+        "都会写入项目根目录的 <code>.env</code>，保存后立即生效，无需重启。"
+    )
+
+
+def get_github_token_menu():
+    configured = bool(BotConfig.UPDATE_GITHUB_TOKEN)
+    rows = [
+        [InlineKeyboardButton(
+            "🔑 修改 Token" if configured else "🔑 设置 Token",
+            callback_data="act_set_github_token"
+        )],
+    ]
+    if configured:
+        rows.append([InlineKeyboardButton("🧪 验证 Token", callback_data="act_test_github_token")])
+        rows.append([InlineKeyboardButton("🗑️ 清除 Token", callback_data="confirm_clear_github_token")])
+    rows.append([InlineKeyboardButton("🔙 返回", callback_data="menu_credentials")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_github_token_text() -> str:
+    token = BotConfig.UPDATE_GITHUB_TOKEN
+    status = (
+        f"✅ 已配置 <code>{safe_text(mask_update_github_token(token))}</code>"
+        if token else "⚠️ 未配置"
+    )
+    return (
+        "🔑 <b>GitHub Token</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"状态：{status}\n"
+        f"更新源：<code>{safe_text(get_update_source_label(BotConfig.UPDATE_ZIP_URL))}</code>\n\n"
+        "从私有仓库拉取更新时需要。保存时会自动验证，"
+        "能区分「Token 无效」和「没授权这个仓库」两种情况。\n\n"
+        "生成 Fine-grained Token 时注意：\n"
+        "1️⃣ <b>Repository access</b> → <code>Only select repositories</code> → 勾上目标仓库\n"
+        "2️⃣ <b>Permissions</b> → <code>Contents</code> → <b>Read-only</b>（默认是 No access，容易漏）"
+    )
 
 
 def get_search_settings_menu():
@@ -187,7 +260,7 @@ def get_search_settings_menu():
     if configured:
         rows.append([InlineKeyboardButton("🧪 测试搜索", callback_data="act_test_search")])
         rows.append([InlineKeyboardButton("🗑️ 清除 Key", callback_data="confirm_clear_search_key")])
-    rows.append([InlineKeyboardButton("🔙 返回", callback_data="menu_more_settings")])
+    rows.append([InlineKeyboardButton("🔙 返回", callback_data="menu_credentials")])
     return InlineKeyboardMarkup(rows)
 
 
