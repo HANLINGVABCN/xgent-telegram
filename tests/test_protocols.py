@@ -41,6 +41,48 @@ class ProtocolParserTests(unittest.TestCase):
         self.assertEqual(search_body, blocks[0]["body"])
         self.assertEqual("https://x.example", blocks[1]["body"])
 
+    def test_nonce_accepts_arbitrary_characters(self):
+        for label, nonce in [
+            ("字母数字", "abc123XYZ"),
+            ("中文", "随机标记甲乙丙"),
+            ("emoji", "🎲🎯🎨🎪🎭🎬"),
+            ("符号", "a!@#$%^&*()b"),
+            ("点与括号", "a.b[c]d+e*f"),
+            ("下划线连字符", "old_style-nonce"),
+        ]:
+            with self.subTest(label):
+                blocks = ProtocolParser.extract_protocol_blocks(
+                    protocol_block("run-x", "echo ok", nonce)
+                )
+                self.assertEqual(1, len(blocks), label)
+                self.assertEqual("echo ok", blocks[0]["body"])
+
+    def test_nonce_rejects_whitespace_and_backticks(self):
+        # 空白会让结束标记无法独占一行精确比较；反引号与围栏语法冲突。
+        for label, nonce in [
+            ("含空格", "abc def"),
+            ("含反引号", "abc```def"),
+            ("全反引号", "``````"),
+            ("含制表符", "abc\tdef"),
+        ]:
+            with self.subTest(label):
+                self.assertEqual(
+                    [],
+                    ProtocolParser.extract_protocol_blocks(
+                        protocol_block("run-x", "echo ok", nonce)
+                    ),
+                    label,
+                )
+
+    def test_mismatched_nonce_does_not_close_block(self):
+        response = (
+            "```run-x <<AGENT_BEGIN_中文标记甲乙丙\n"
+            "echo ok\n"
+            "AGENT_END_中文标记丁戊己\n"          # 不同标记，不能闭合
+            "```"
+        )
+        self.assertEqual([], ProtocolParser.extract_protocol_blocks(response))
+
     def test_body_is_opaque_until_matching_end_sequence(self):
         response = protocol_block(
             "run-x",
