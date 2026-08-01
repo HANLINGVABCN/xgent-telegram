@@ -507,7 +507,7 @@ def _run_check(do_connect):
     if err:
         results.append((False, f"读取配置: {err}"))
         _emit_check_results(results, [], do_connect)
-        return False
+        return False, []
     results.append((True, f"读取配置: {CONFIG_PATH}"))
 
     # 2) 必填字段
