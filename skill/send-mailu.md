@@ -1,7 +1,7 @@
 ```!
 Mailu 发信/读信（使用既有配置，严禁向用户索要密码）。
 - 发信：`python3 skill/script/send-mailu/send-mailu.py send --to "<收件人>" --from-addr "<发件人>" --subject "<主题>" --body "<正文>"`；`--from-addr` 必填，支持已配置域名及其子域的任意前缀；地址未知先运行 `sudo python3 skill/script/send-mailu/send-mailu.py check`，不得编造。
-- `check`：逐账号检测 SMTP 发信配置和 IMAP/Sent 已发送归档功能，并输出可用发件邮箱。
+- `check`：先自动扫描 Mailu，把缺失账户自动补进 config（密码留空）；再逐账号检测 SMTP 发信配置和 IMAP/Sent 已发送归档功能。SMTP 登录失败时弹菜单：1 给失败邮箱输密码、2 手动加账户、0 退出；基础配置失败则提示是否全量配置。输出可用发件邮箱。
 - 读本地 EML：`python3 skill/script/send-mailu/send-mailu.py get "<EML绝对路径>"`。增强参数、配置和故障处理按需读取本文档。
 ```
 
@@ -26,7 +26,7 @@ sudo python3 skill/script/send-mailu/send-mailu.py check
 1. **优先扫描 Mailu SQLite 数据库**（`/mailu/data/main.db` 等，只读打开）：直接读到**全部域名**和**全部账号**列表（Mailu `domain` / `user` 表），无需手动罗列。
 2. **数据库不可用时回退读 `mailu.env`**：Mailu 的环境变量配置文件（`/mailu/mailu.env`），里面通常只有 `DOMAIN=example.com`（单数主域名），只能推出一个 `admin@域名` 账号，无法枚举多域名。
 
-发现域名/账号后，密码**无法自动获取**——Mailu 数据库里存的是 hash（SHA512-Crypt/bcrypt），不能逆向出明文用于 SMTP 登录。所以配置流程会列出发现到的账号，**逐个交互询问明文密码**（不回显）。
+发现域名/账号后，密码**无法自动获取**——Mailu 数据库里存的是 hash（SHA512-Crypt/bcrypt），不能逆向出明文用于 SMTP 登录。所以 `check` 会**自动把扫到的账户加进 config（密码留空）**，再在 SMTP 实连测试时让密码空/错的账号暴露为「登录失败」，由失败菜单逐个补明文密码（不回显）。
 
 ### 验证配置 & 获取可用账号清单
 
@@ -36,9 +36,9 @@ sudo python3 skill/script/send-mailu/send-mailu.py check
 
 `check` 有三重用途：
 
-- **健康检查**：文件存在 → JSON 合法 → 必填字段齐全 → 凭证非空 → 安全模式合法，逐项打印 ✓/✗。
+- **健康检查**：文件存在 → JSON 合法 → 必填字段齐全 → 凭证格式齐全（username 必填，password 可空）→ 安全模式合法，逐项打印 ✓/✗。
 - **账号发现**：对配置中的**每个邮箱逐个实测**：先逐账号登录 SMTP（只登录、不发测试邮件），再逐账号登录 IMAP 并检查该账号自己的 Sent 文件夹。输出会明确分成“基础配置 / SMTP 逐账号实测 / IMAP 逐账号实测 / 汇总”，不能把某一个账号的成功推断成全部账号成功。
-- **自动引导配置**：检查失败时自动提示「是否开始配置？」，确认后进入交互配置流程。
+- **自动引导配置**：SMTP 实连有登录失败时弹失败菜单（输密码 / 手动加 / 退出）；基础配置未通过或 `--no-connect` 时提示「是否开始全量配置？」，确认后进入交互配置流程。
 
 SMTP 与基础配置全部 ✓ 则 exit 0；任一 SMTP/基础配置 ✗ 则打印失败项并提示配置。IMAP 归档仍属于“尽力而为”，每个账号都会实测和展示，但不改变发信配置的 exit code。
 
@@ -52,18 +52,37 @@ SMTP 与基础配置全部 ✓ 则 exit 0；任一 SMTP/基础配置 ✗ 则打�
 
 - `check --no-connect`：跳过全部 SMTP/IMAP 实连测试，仅做格式检查（适合部署时网络未通或快速校验；此时不输出实测可用账号清单）。
 
-### 非交互批量配置（脚本调用）
+### 自动扫描补齐账户 + 失败菜单补密码
 
-```bash
-sudo python3 skill/script/send-mailu/send-mailu.py check \
-  --domains "example.com,example.net,example.org,example.io" \
-  --username-prefix admin --passwords "pw1,pw2,pw3,pw4" \
-  --smtp-host 127.0.0.1 --smtp-port 587 --security starttls --force
+`check` 开始前先自动扫描 Mailu（优先读 SQLite 库的 `user`/`domain` 表，回退 `.env`），把 Mailu 里存在、但 `config.json` 里尚未配置的域名**自动加进 config**：
+
+- 自动取每个域的登录账号（优先 `admin@域名`，否则该域第一个账户），**密码留空**；
+- **不逐个问 y/n**，扫到就加，并入现有 config，**不动已配置的域名和其余字段**；
+- 每个域名只存一个登录账号。
+
+然后跑基础配置 + 逐账号 SMTP/IMAP 实连测试。密码留空/填错的账号会在 SMTP 行显示 `✗ 登录失败`，随后弹失败菜单：
+
+```
+--- 登录失败处理 ---
+失败账号:
+  1. admin@xxx.top  (认证失败 — ...)
+  2. admin@yyy.com  (认证失败 — ...)
+  按 1：给失败邮箱输密码（再选哪个）
+  按 2：手动添加账户和密码（扫描没扫到的）
+  按 0：退出
+> 1
+选哪个（1-2）: 1
+  admin@xxx.top 的密码:    ← 不回显
+✓ admin@xxx.top：登录成功，已从失败列表移除
 ```
 
-- `--domains`：所有域名，逗号/分号/空格分隔。
-- `--username-prefix`：每个域的账号前缀（默认 `admin`，生成 `admin@example.com` 等）。
-- `--passwords`：各域密码，逗号/分号分隔，数量须与域名一致；**或只传一个密码广播到所有域**。
+- 按 1：选一个失败邮箱 → 不回显输密码 → 更新该域名凭证 → **只重测这一个** → 通过就从失败列表移除，不过仍留在列表可再试；
+- 按 2：手动输完整邮箱 + 密码（扫描没扫到的）→ merge → 单测它；
+- 按 0：退出（仍有失败则 exit 非 0）；
+- 失败列表清空 = 全部通过，`check` 成功返回；
+- 基础配置未通过（`default_domain` 缺、`domains` 空、`security` 解析失败等）或 `--no-connect`：不走失败菜单，直接提示「是否开始全量配置？」。
+
+`check` 全程交互一条路：人 SSH 手敲、AI 用 `shell-x` + `stdin-x` 喂 `1`/`2`/`0` 和密码，走的都是同一套问答。
 
 ### AI 发信排查流程
 
@@ -72,7 +91,7 @@ sudo python3 skill/script/send-mailu/send-mailu.py check \
 1. 运行 python3 send-mailu.py send --to ... --body ...
 2. 若返回 exit code 2（配置缺失/损坏）→ 提示用户：
      "发信配置不存在，请在服务器运行： sudo python3 .../send-mailu.py check"
-3. 用户运行 check → 自动检查 → 失败时提示配置 → 填完密码 → 重新发信
+3. 用户运行 check → 自动扫描补齐账户 → SMTP 失败弹菜单逐个补密码 → 全部通过 → 重新发信
 4. 若仍认证失败 → 提示用户运行 sudo python3 .../send-mailu.py check --force 重新配置
 ```
 
