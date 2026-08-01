@@ -906,7 +906,7 @@ def cmd_check(args):
     # 基础配置未通过（default_domain 缺、domains 空、security 解析失败等）或 --no-connect：
     # 提示是否开始全量配置
     try:
-        answer = input("\n检查未通过，是否开始配置？(y/n): ").strip().lower()
+        answer = input("\n检查未通过。按 y 开始配置（扫 Mailu 找账号 → 逐项确认 SMTP/域名 → 逐个输密码 → 生成 config）；按 n 退出。(y/n): ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
         sys.exit(EXIT_ERROR)
