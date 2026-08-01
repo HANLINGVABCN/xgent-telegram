@@ -722,6 +722,56 @@ def _probe_imap_all_accounts(config, domains_cfg, security):
 
 
 
+def _auto_init_from_mailu():
+    """config 不存在时，用 detect_defaults 从 Mailu 自动建基础 config
+    （smtp_host/port/security + default_domain + 扫到的账户密码留空）。扫不到
+    Mailu（source 为空）或没域名时返回 False，交给 y/n 全量配置。返回是否已建。
+    """
+    defaults = detect_defaults()
+    if not defaults.get("source"):
+        return False
+    smtp_host = defaults.get("smtp_host") or "127.0.0.1"
+    smtp_port = defaults.get("smtp_port") or 587
+    security = defaults.get("security") or "starttls"
+    domains = defaults.get("domains") or []
+    accounts = defaults.get("accounts") or []
+    if not domains:
+        return False
+    domain_to_accounts = {}
+    for em in accounts:
+        if "@" in em:
+            domain_to_accounts.setdefault(em.split("@", 1)[1], []).append(em)
+    domains_cfg = {}
+    for dom in domains:
+        accs = domain_to_accounts.get(dom, [])
+        if accs:
+            uname = next((a for a in accs if a.split("@", 1)[0] == DEFAULT_POSTMASTER), accs[0])
+        else:
+            uname = f"{DEFAULT_POSTMASTER}@{dom}"
+        domains_cfg[dom] = {"username": uname, "password": ""}
+    arch = {"enabled": True, "folder": _DEFAULT_SENT_FOLDER}
+    imap_detected = detect_imap_settings(smtp_host)
+    if imap_detected:
+        arch.update(imap_detected)
+    config = {
+        "smtp_host": smtp_host,
+        "smtp_port": smtp_port,
+        "smtp_security": security,
+        "default_domain": domains[0],
+        "domains": domains_cfg,
+        "sent_archive": arch,
+    }
+    try:
+        _write_config(config, force=True)
+    except SystemExit:
+        print("Error: 自动写入 config 失败，转全量配置。", file=sys.stderr)
+        return False
+    print("\n--- 自动从 Mailu 建立配置 ---")
+    print(f"✓ 已从 Mailu 自动建立 config: {CONFIG_PATH}")
+    print(f"  SMTP {smtp_host}:{smtp_port} ({security})，{len(domains_cfg)} 个域名，账户已加、密码留空待补")
+    return True
+
+
 def _auto_add_missing_accounts():
     """扫描 Mailu，把 config 中缺失的域名自动加进去（只加账户，密码留空），不询问。
 
@@ -892,7 +942,12 @@ def cmd_check(args):
     --no-connect 时，提示是否开始全量配置。
     """
     do_connect = not args.no_connect
-    _auto_add_missing_accounts()
+    config, _err = load_config()
+    if _err:
+        # config 不存在：先尝试用 Mailu 自动建基础 config（smtp + 扫到的账户密码空）
+        _auto_init_from_mailu()  # 扫不到 Mailu 返回 False，下面 _run_check 显示 err → 走 y/n 全量
+    else:
+        _auto_add_missing_accounts()
     all_ok, failures = _run_check(do_connect)
 
     if all_ok:
