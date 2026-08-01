@@ -193,6 +193,9 @@ MAX_AGENT_MAX_ITERATIONS = 50
 AGENT_TURN_ITERATION_CONFIG_KEY = 'agent_turn_iteration'
 DEFAULT_IDLE_MESSAGE_INTERVAL = 24 * 3600
 MIN_IDLE_MESSAGE_INTERVAL = 60
+# AI 回复超时设为“不限”时，非流式请求的兜底上限。非流式没有增量输出，
+# 连接静默挂起会让界面永远停在“非流式输出中...”，必须有个硬上限。
+NONSTREAM_FALLBACK_TIMEOUT_SECONDS = 600.0
 PROVIDER_HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
