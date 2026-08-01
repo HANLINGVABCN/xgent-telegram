@@ -861,44 +861,71 @@ def _retest_one(dom, do_connect):
         return (False, f"连接失败 — {e}")
 
 
-def _failure_menu(args, do_connect, failures):
-    """对 SMTP 登录失败的账号循环提供菜单：1 给失败邮箱输密码（单测） /
-    2 手动添加账户+密码 / 0 退出。failures: [(dom, uname, reason), ...]。
-
-    全部失败账号处理并通过后返回；按 0 直接 sys.exit(EXIT_ERROR)。
+def _main_menu(args, do_connect, failures, all_ok=True):
+    """check 后主菜单：无论通过与否都显示交互选项。
+    failures 非空 → 按1 为失败账户输密码重测；
+    failures 空   → 按1 列出所有账户、选一个输密码重测。
+    按2 手动添加账户+密码；按0 退出（有失败/未通过时 exit 1）。
     """
-    if not failures:
-        return
-    while failures:
-        print("\n--- 登录失败处理 ---")
-        print("失败账号:")
-        for i, (dom, uname, reason) in enumerate(failures, 1):
-            print(f"  {i}. {uname}  ({reason})")
-        print("  按 1：给失败邮箱输密码（再选哪个）")
-        print("  按 2：手动添加账户和密码（扫描没扫到的）")
-        print("  按 0：退出")
+    while True:
+        print("\n--- 操作菜单 ---")
+        if failures:
+            print(f"登录失败账号（{len(failures)} 个）:")
+            for i, (dom, uname, reason) in enumerate(failures, 1):
+                print(f"  {i}. {uname}@{dom}  ({reason})")
+            print("按1: 为失败账户输入密码并重新测试")
+        elif all_ok:
+            print("✓ 所有账户 SMTP/IMAP 全部通过")
+            print("按1: 为某账户输入密码并重新测试")
+        else:
+            print("✗ 基础配置未通过（详见上方）")
+            print("按1: 为某账户输入密码并重新测试")
+        print("按2: 手动添加账户+密码")
+        print("按0: 退出")
         try:
-            choice = input("> ").strip()
+            choice = input("选择: ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             sys.exit(EXIT_ERROR)
 
         if choice == "0":
-            sys.exit(EXIT_ERROR)
+            if failures or not all_ok:
+                sys.exit(EXIT_ERROR)
+            return
 
         if choice == "1":
-            if len(failures) == 1:
-                pick = 0
+            if failures:
+                if len(failures) == 1:
+                    pick = 0
+                else:
+                    try:
+                        pick = int(input(f"选哪个（1-{len(failures)}）: ").strip()) - 1
+                    except (EOFError, KeyboardInterrupt):
+                        print(); sys.exit(EXIT_ERROR)
+                    except ValueError:
+                        print("  输入无效，跳过。"); continue
+                    if pick < 0 or pick >= len(failures):
+                        print("  编号超出范围，跳过。"); continue
+                dom, uname, _reason = failures[pick]
             else:
+                config, _ = load_config()
+                domains_cfg = config.get("domains") or {}
+                doms = sorted(domains_cfg.keys())
+                if not doms:
+                    print("  没有已配置的域名"); continue
+                for i, d in enumerate(doms, 1):
+                    u = (domains_cfg[d].get("username") or "admin")
+                    print(f"  {i}. {u}@{d}")
                 try:
-                    pick = int(input(f"选哪个（1-{len(failures)}）: ").strip()) - 1
+                    pick = int(input(f"选哪个（1-{len(doms)}）: ").strip()) - 1
                 except (EOFError, KeyboardInterrupt):
                     print(); sys.exit(EXIT_ERROR)
                 except ValueError:
                     print("  输入无效，跳过。"); continue
-                if pick < 0 or pick >= len(failures):
+                if pick < 0 or pick >= len(doms):
                     print("  编号超出范围，跳过。"); continue
-            dom, uname, _reason = failures[pick]
+                dom = doms[pick]
+                uname = (domains_cfg[dom].get("username") or "admin")
             pw = _ask_password_for(uname)
             if not pw:
                 print(f"  密码为空，{uname} 未更新。"); continue
@@ -906,11 +933,14 @@ def _failure_menu(args, do_connect, failures):
                 print(f"  Error: 写入失败，{uname} 未保存。", file=sys.stderr); continue
             ok, msg = _retest_one(dom, do_connect)
             if ok:
-                print(f"  ✓ {uname}：登录成功，已从失败列表移除")
-                failures.pop(pick)
+                print(f"  ✓ {uname}@{dom}：登录成功")
+                failures = [f for f in failures if f[0] != dom]
+                if not failures:
+                    all_ok = True
             else:
-                print(f"  ✗ {uname}：{msg}（仍在失败列表，可再试或改账号）")
-                failures[pick] = (dom, uname, msg)
+                print(f"  ✗ {uname}@{dom}：{msg}")
+                failures = [f for f in failures if f[0] != dom] + [(dom, uname, msg)]
+                all_ok = False
 
         elif choice == "2":
             uname = _ask("手动添加的登录账号（完整邮箱）", "")
@@ -924,24 +954,21 @@ def _failure_menu(args, do_connect, failures):
                 print(f"  Error: 写入失败，{uname} 未保存。", file=sys.stderr); continue
             ok, msg = _retest_one(dom, do_connect)
             if ok:
-                print(f"  ✓ {uname}：登录成功")
+                print(f"  ✓ {uname}@{dom}：登录成功")
                 failures = [f for f in failures if f[0] != dom]
             else:
-                print(f"  ✗ {uname}：{msg}")
-                failures.append((dom, uname, msg))
+                print(f"  ✗ {uname}@{dom}：{msg}")
+                failures = [f for f in failures if f[0] != dom] + [(dom, uname, msg)]
 
         else:
             print("  输入无效，请输 0/1/2。")
-
-    print("\n✓ 全部失败账号已处理并通过。")
 
 
 def cmd_check(args):
     """
     检查 config.json：先自动扫描 Mailu、把缺失账户自动加进 config（密码留空），
-    再跑基础配置 + 逐账号 SMTP/IMAP 实连测试。SMTP 有登录失败时弹失败菜单
-    （1 给失败邮箱输密码 / 2 手动加账户+密码 / 0 退出）；基础配置未通过或
-    --no-connect 时，提示是否开始全量配置。
+    再跑基础配置 + 逐账号 SMTP/IMAP 实连测试。无论通过与否都弹操作菜单：
+    按1 为账户输密码并重测 / 按2 手动添加账户+密码 / 按0 退出。
     """
     do_connect = not args.no_connect
     config, _err = load_config()
@@ -951,33 +978,8 @@ def cmd_check(args):
     else:
         _auto_add_missing_accounts()
     all_ok, failures = _run_check(do_connect)
-
-    if all_ok:
-        return
-
-    if do_connect and failures:
-        # SMTP 实连有失败：弹失败菜单（输密码 / 手动加 / 退出）
-        _failure_menu(args, do_connect, failures)
-        return
-
-    # 基础配置未通过（default_domain 缺、domains 空、security 解析失败等）或 --no-connect：
-    # 提示是否开始全量配置
-    try:
-        answer = input("\n检查未通过。按 y 开始配置（扫 Mailu 找账号 → 逐项确认 SMTP/域名 → 逐个输密码 → 生成 config）；按 n 退出。(y/n): ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        sys.exit(EXIT_ERROR)
-    if answer in ('y', 'yes'):
-        args.force = True  # 用户确认重新配置，允许覆盖
-        cmd_init(args)
-        # 配置完成后重新检查
-        print("\n--- 重新检查配置 ---")
-        recheck_ok, _ = _run_check(do_connect)
-        if not recheck_ok:
-            sys.exit(EXIT_ERROR)
-        return
-
-    sys.exit(EXIT_ERROR)
+    # 无论通过与否，都显示操作菜单（输密码重测 / 手动加账户 / 退出）
+    _main_menu(args, do_connect, failures, all_ok)
 
 
 def _emit_check_results(results, smtp_results, do_connect):
