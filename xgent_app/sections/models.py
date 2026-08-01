@@ -1250,7 +1250,12 @@ class ModelClient:
                 "stream": False,
                 "request": request_kwargs,
             })
-            completion = await ModelClient._chat_completions_api(client).create(**request_kwargs)
+            # 必须显式设超时：连接静默中断（TCP 半开、代理丢包）时 SDK 默认会
+            # 一直挂着，非流式又没有增量输出，界面会永远停在“非流式输出中...”。
+            completion = await ModelClient._chat_completions_api(client).create(
+                **request_kwargs,
+                timeout=ModelClient._build_stream_timeout(),
+            )
             if not completion or not completion.choices:
                 return None, "对方暂时没反应，用户稍后再试试？"
             record_token_usage(usage_sink, _value_from_obj(completion, 'usage'))

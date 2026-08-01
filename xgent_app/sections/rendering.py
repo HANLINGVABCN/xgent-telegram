@@ -1141,6 +1141,22 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
                 pass
 
 
+def _nonstream_hard_timeout_seconds() -> float:
+    """非流式请求的兜底上限（秒）。
+
+    用户把 AI 回复超时设为“不限”（0）时，底层 HTTP 也不会超时，一旦连接
+    静默挂起就再也不会返回，界面永远停在“非流式输出中...”。非流式没有
+    增量输出可以保留，所以这里给一个足够宽松的硬上限兜底。
+
+    用户设了具体秒数时，在其基础上留余量，让底层 HTTP 超时先触发，
+    保留原有的错误信息。
+    """
+    configured = normalize_stream_timeout(UserDataManager.get('stream_timeout', 0))
+    if configured <= 0:
+        return NONSTREAM_FALLBACK_TIMEOUT_SECONDS
+    return configured + 30.0
+
+
 async def send_non_streaming_response(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                        prov_name: str, prov_data: Dict, model: str,
                                        system_prompt: str, history: List[Dict],
@@ -1181,10 +1197,38 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
             trace_id=trace_id
         ))
         stop_task = asyncio.create_task(stop_event.wait())
+        # 兜底硬上限必须加在这个 wait 上：模型无响应时 response_task 和
+        # stop_task 都不会完成，没有 timeout 就会永久阻塞在这里，界面
+        # 永远停在“非流式输出中...”。
         done, pending = await asyncio.wait(
             {response_task, stop_task},
-            return_when=asyncio.FIRST_COMPLETED
+            return_when=asyncio.FIRST_COMPLETED,
+            timeout=_nonstream_hard_timeout_seconds(),
         )
+        if not done:
+            await cancel_task_quietly(response_task, timeout=1.0)
+            await cancel_task_quietly(stop_task, timeout=0.2)
+            waited = int(time.monotonic() - generation_started_at)
+            timeout_text = (
+                f"⏱️ 等待模型回复超过 {waited} 秒仍无响应，已中断本次请求。\n"
+                "可以直接重发这条消息；如果经常发生，可在"
+                "「更多设置 → 超时」调整 AI 回复超时，或换一个提供商试试。"
+            )
+            write_model_trace("model_error", {
+                "trace_id": trace_id,
+                "provider": prov_name,
+                "provider_format": prov_data.get('api_format', 'openai'),
+                "model": model,
+                "stream": False,
+                "error": "non-stream hard timeout",
+                "usage": usage_sink[0] if usage_sink else None,
+                "elapsed_seconds": time.monotonic() - generation_started_at,
+            })
+            try:
+                await safe_edit_text(msg, timeout_text, reply_markup=None)
+            except Exception:
+                pass
+            return timeout_text
         if stop_task in done and stop_event.is_set():
             try:
                 await safe_edit_text(msg, "⏹️ 已停止。非流式请求已取消，未产生可保留的增量内容。", reply_markup=None)

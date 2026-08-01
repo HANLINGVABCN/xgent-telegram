@@ -1678,6 +1678,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     provider_api_format=provider_api_format,
                     stop_event_factory=get_or_create_stop_event,
                     logger=logger,
+                    search_api_key=BotConfig.TAVILY_API_KEY,
                 )
                 if standard_operation is not None:
                     operation_notice = standard_operation['notice']
