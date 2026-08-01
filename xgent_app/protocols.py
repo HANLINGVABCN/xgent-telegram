@@ -14,7 +14,10 @@ from typing import Any, Dict, List
 class ProtocolParser:
     """解析使用唯一成对标记的 Agent 协议。"""
 
-    _NONCE_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_-]{5,31}"
+    # 随机标记允许任意字符，但排除空白和反引号：
+    # - 空白：结束标记要独占一行做精确比较，含空白会导致永不闭合
+    # - 反引号：AGENT_END_a```b 这类标记与围栏语法混淆，模型也难原样复现
+    _NONCE_PATTERN = r"[^\s`]{6,32}"
     _OPEN_RE = re.compile(
         r"^```(?P<tag>"
         r"run-x|shell-x|stdin-x:[^\n<]+|shellread-x:[^\n<]+|shellkill-x:[^\n<]+|"
