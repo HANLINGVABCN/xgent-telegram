@@ -801,11 +801,13 @@ def _auto_add_missing_accounts():
     else:
         return 0
 
+    print("\n--- 账户自动扫描 ---")
+    print(f"Mailu 检测到 {len(candidate_domains)} 个域名账户，config 已有 {len(existing)} 个")
     missing = [d for d in candidate_domains if d not in existing]
     if not missing:
-        return 0  # 全部已添加
+        print("✓ 全部已在 config 中，无需添加")
+        return 0
 
-    print("\n--- 账户自动扫描 ---")
     print(f"检测到 {len(missing)} 个域名尚未配置: {', '.join(missing)}")
     print("自动添加账户（密码留空，稍后由 SMTP 失败菜单逐个补密码）。\n")
 
