@@ -1093,12 +1093,13 @@ class AgentCommandBlacklist:
     def init(cls):
         os.makedirs(os.path.dirname(cls.FILE_PATH), exist_ok=True)
         if not os.path.exists(cls.FILE_PATH):
-            # 首次创建就写入推荐名单。以前这里只写注释头，等于开箱即用状态下
-            # 黑名单是空的、任何命令都放行，而推荐名单要用户自己去菜单里点
-            # “追加推荐名单”才生效——没人点就等于没有防护。
+            # 只写注释头，不预填规则：拦哪些命令由用户自己决定。
+            # 运维场景下 shutdown / killall / systemctl disable 都是正常操作，
+            # 默认拦下来会挡住真实用途。推荐名单放在 RECOMMENDED_PATTERNS，
+            # 用户可在菜单「⭐ 查看推荐名单」/「➕ 追加推荐名单」按需启用。
             with open(cls.FILE_PATH, 'w', encoding='utf-8') as f:
-                f.write(cls.HEADER + "\n" + "\n".join(cls.RECOMMENDED_PATTERNS) + "\n")
-            logger.info(f"已创建 Agent 命令黑名单文件，写入 {len(cls.RECOMMENDED_PATTERNS)} 条推荐规则")
+                f.write(cls.HEADER)
+            logger.info("已创建 Agent 命令黑名单文件（默认为空，可在菜单里追加推荐名单）")
         cls.reload()
 
     @classmethod

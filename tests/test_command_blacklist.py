@@ -38,24 +38,43 @@ def _load_blacklist_class(prompts_dir: str):
 
 
 class BlacklistDefaultsTests(unittest.TestCase):
-    def test_fresh_install_writes_recommended_patterns(self):
-        """首次创建必须写入推荐名单，不能只写注释头。"""
+    def test_fresh_install_starts_empty(self):
+        """默认不预填规则：拦哪些命令由用户自己决定。
+
+        运维场景下 shutdown / killall / systemctl disable 都是正常操作，
+        默认拦下来会挡住真实用途。推荐名单通过菜单按需追加。
+        """
         with tempfile.TemporaryDirectory() as temp_dir:
             blacklist = _load_blacklist_class(temp_dir)
             blacklist.init()
 
-            self.assertGreater(
-                len(blacklist.get_patterns()), 0,
-                '开箱即用状态下黑名单为空，等于任何命令都放行',
+            self.assertEqual(
+                [], blacklist.get_patterns(),
+                '默认应为空白名单，推荐规则交给用户在菜单里追加',
             )
-            blocked, _ = blacklist.check('rm -rf /')
-            self.assertTrue(blocked, '默认规则没有拦住 rm -rf /')
+
+    def test_recommended_patterns_are_available_to_add(self):
+        """推荐名单本身要可用，且追加后确实生效。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            blacklist = _load_blacklist_class(temp_dir)
+            blacklist.init()
+            self.assertGreater(
+                len(blacklist.RECOMMENDED_PATTERNS), 0,
+                '推荐名单不能是空的，菜单按钮依赖它',
+            )
+
+            added = blacklist.add(blacklist.RECOMMENDED_PATTERNS)
+            self.assertGreater(added, 0)
+            blocked, _pattern = blacklist.check('rm -rf /')
+            self.assertTrue(blocked, '追加推荐名单后应能拦住 rm -rf /')
 
     def test_reload_failure_keeps_previous_rules(self):
         """读取失败必须保留旧规则，不能 fail-open 清空。"""
         with tempfile.TemporaryDirectory() as temp_dir:
             blacklist = _load_blacklist_class(temp_dir)
             blacklist.init()
+            # 先放几条规则进去，才能验证"失败时是否被清空"
+            blacklist.add(blacklist.RECOMMENDED_PATTERNS)
             loaded = len(blacklist.get_patterns())
             self.assertGreater(loaded, 0)
 
@@ -70,11 +89,15 @@ class BlacklistDefaultsTests(unittest.TestCase):
 
 
 class BlacklistMatchingTests(unittest.TestCase):
+    """匹配逻辑测试：显式装入推荐名单后验证绕过手法是否被拦住。"""
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.blacklist = _load_blacklist_class(self.temp.name)
         self.blacklist.init()
+        # 默认是空白名单，这里显式追加推荐规则来测匹配算法
+        self.blacklist.add(self.blacklist.RECOMMENDED_PATTERNS)
 
     def assert_blocked(self, command: str):
         blocked, pattern = self.blacklist.check(command)
