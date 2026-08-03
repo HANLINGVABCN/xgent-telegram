@@ -976,9 +976,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif data == "export_provider_config":
             await send_provider_config_export(update, context)
 
-        elif data == "export_provider_config_secrets":
-            await send_provider_config_export(update, context, include_secrets=True)
-
         elif data == "import_provider_config":
             UserDataManager.set('state', BotState.IDLE)
             UserDataManager.set('provider_import_mode', None)

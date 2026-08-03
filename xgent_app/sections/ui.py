@@ -520,9 +520,6 @@ def get_providers_menu():
         InlineKeyboardButton("📤 导出配置", callback_data="export_provider_config"),
         InlineKeyboardButton("📥 导入配置", callback_data="import_provider_config")
     ])
-    keyboard.append([
-        InlineKeyboardButton("🔓 含密钥导出（迁移用）", callback_data="export_provider_config_secrets")
-    ])
     keyboard.append([InlineKeyboardButton("🔙 返回主菜单", callback_data="act_main_menu")])
     return InlineKeyboardMarkup(keyboard)
 

@@ -285,29 +285,19 @@ async def perform_update_system(update: Update, context: ContextTypes.DEFAULT_TY
     await asyncio.sleep(0.4)
     await restart_current_process(update.effective_chat.id, context.bot)
 
-def mask_api_key_for_export(api_key: str) -> str:
-    """导出时的 api_key 掩码：保留头尾便于辨认是哪一个 key。"""
-    key = str(api_key or '')
-    if not key:
-        return ''
-    if len(key) <= 8:
-        return '***'
-    return f'{key[:4]}...{key[-4:]}'
+def build_provider_config_export() -> Dict[str, Any]:
+    """构建可移植的 Provider 配置；API Key 会原样包含在导出文件中。
 
-
-def build_provider_config_export(include_secrets: bool = False) -> Dict[str, Any]:
-    """构建可移植的 Provider 配置。
-
-    默认对 api_key 掩码：导出文件经 Telegram 云聊传输（默认非端到端加密），
-    明文密钥会留在聊天记录里。只有用户显式选择“含密钥导出”时才原样输出。
+    刻意不做掩码：导出的唯一用途就是迁移/恢复，掩码后的文件无法导入，
+    默认给一份不可用的文件只会把主流程弄坏。接收方是已授权的用户本人，
+    发送时会附带明确的保管提示。
     """
     providers = UserDataManager.get('providers', {}) or {}
     exported_providers: Dict[str, Dict[str, Any]] = {}
     for name, provider in providers.items():
-        raw_key = str(provider.get('api_key', ''))
         exported_providers[str(name)] = {
             'base_url': str(provider.get('base_url', '')),
-            'api_key': raw_key if include_secrets else mask_api_key_for_export(raw_key),
+            'api_key': str(provider.get('api_key', '')),
             'models': [str(model) for model in provider.get('models', [])],
             'api_format': str(provider.get('api_format', 'openai'))
         }
@@ -316,7 +306,6 @@ def build_provider_config_export(include_secrets: bool = False) -> Dict[str, Any
         'format': PROVIDER_CONFIG_FORMAT,
         'version': PROVIDER_CONFIG_VERSION,
         'exported_at': datetime.now().astimezone().isoformat(timespec='seconds'),
-        'api_keys_masked': not include_secrets,
         'providers': exported_providers,
         'defaults': {
             'active_provider': UserDataManager.get('active_provider_key'),
@@ -352,11 +341,6 @@ def parse_provider_config_import(raw_bytes: bytes) -> Tuple[Dict[str, Dict[str, 
     raw_providers = payload.get('providers')
     if not isinstance(raw_providers, dict):
         raise ValueError('providers 必须是 JSON 对象')
-    if payload.get('api_keys_masked') is True:
-        raise ValueError(
-            '这是「已掩码」的导出文件，api_key 不是真实值，无法导入。'
-            '请在导出时选择「含密钥导出（迁移用）」。'
-        )
     if not raw_providers:
         raise ValueError('配置文件中没有提供商')
     if len(raw_providers) > PROVIDER_CONFIG_MAX_PROVIDERS:
@@ -477,8 +461,7 @@ async def apply_provider_config_import(
     }
 
 
-async def send_provider_config_export(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                                      include_secrets: bool = False):
+async def send_provider_config_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await UserDataManager.init()
     await UserDataManager.reload_providers()
     providers = UserDataManager.get('providers', {}) or {}
@@ -487,31 +470,20 @@ async def send_provider_config_export(update: Update, context: ContextTypes.DEFA
         await message.reply_text('📭 当前没有可导出的提供商配置。')
         return
 
-    payload = build_provider_config_export(include_secrets=include_secrets)
+    payload = build_provider_config_export()
     content = json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
     buffer = io.BytesIO(content)
-    suffix = '含密钥' if include_secrets else '已掩码'
-    filename = f"提供商配置-{suffix}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
-    if include_secrets:
-        caption = (
-            f'✅ 已导出 {len(providers)} 个提供商（含完整 API Key）。\n'
-            '⚠️ Telegram 聊天默认不是端到端加密，密钥会留在聊天记录里。'
-            '请妥善保管，用完建议删除这条消息。'
-        )
-    else:
-        caption = (
-            f'✅ 已导出 {len(providers)} 个提供商（API Key 已掩码）。\n'
-            'ℹ️ 掩码后的文件不能直接用于导入。需要迁移时请选择「含密钥导出」。'
-        )
+    filename = f"提供商配置-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
     await context.bot.send_document(
         chat_id=update.effective_chat.id,
         document=InputFile(buffer, filename),
-        caption=caption
+        caption=(
+            f'✅ 已导出 {len(providers)} 个提供商。\n'
+            '⚠️ 文件包含完整 API Key，请妥善保管，不要转发给他人。\n'
+            'ℹ️ Telegram 聊天默认不是端到端加密；用完建议删除这条消息。'
+        )
     )
-    await GlobalRecorder.record_system_op(
-        '导出提供商配置',
-        {'count': len(providers), 'include_secrets': include_secrets}
-    )
+    await GlobalRecorder.record_system_op('导出提供商配置', {'count': len(providers)})
 
 
 async def cmd_provider_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
