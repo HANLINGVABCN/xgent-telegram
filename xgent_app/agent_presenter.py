@@ -13,8 +13,15 @@ from xgent_app.shell_output import format_shell_display_output
 
 
 def escape_html(value: Any) -> str:
-    """Match the legacy ``safe_text`` behavior used by Agent messages."""
-    return html.escape(str(value)) if value else ""
+    """Match the legacy ``safe_text`` behavior used by Agent messages.
+
+    Only ``None`` renders as empty.  A plain falsy check would turn the integer
+    ``0`` into an empty string, so a successful command's ``return_code`` showed
+    up as an empty ``<code></code>`` while the model-facing context said ``0``.
+    """
+    if value is None:
+        return ""
+    return html.escape(str(value))
 
 
 def build_edit_presentation(result: Mapping[str, Any]) -> str:
@@ -39,10 +46,15 @@ def build_run_presentation(result: Mapping[str, Any]) -> str:
         running=False,
     )
     status_emoji = "✅" if result.get("success") else "❌"
+    output_path = result.get("output_path")
+    path_line = (
+        f"完整输出: <code>{escape_html(output_path)}</code>\n"
+        if output_path else "完整输出: <i>存档失败，仅保留上方内容</i>\n"
+    )
     return (
         "⌨️ <b>Agent Run</b>\n"
         f"{status_emoji} 返回码: <code>{escape_html(result.get('return_code'))}</code>\n"
-        f"完整输出: <code>{escape_html(result.get('output_path'))}</code>\n"
+        f"{path_line}"
         f"<pre>{escape_html(display_output)}</pre>"
     )
 

@@ -166,6 +166,11 @@ async def on_shutdown(app):
     """应用关闭时清理资源"""
     logger.info("🛑 服务正在关闭...")
     try:
+        # trace 现在是后台线程异步落盘，退出前把队列里剩下的写完。
+        await asyncio.to_thread(flush_model_trace)
+    except Exception as e:
+        logger.debug(f"刷新 trace 队列失败: {e}")
+    try:
         await SelfTriggerManager.shutdown()
         logger.info("✅ 后台触发任务已关闭")
     except Exception as e:

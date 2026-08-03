@@ -109,5 +109,11 @@ async def dispatch_standard_protocol(
             )
         return normalize_fetch_result(raw_result)
 
-    raw_result = await executor.run_command(block["body"], stop_event_factory())
+    try:
+        raw_result = await executor.run_command(block["body"], stop_event_factory())
+    except Exception as exc:
+        logger.error(f"Agent run 执行异常: {exc}")
+        raw_result = failed_result(
+            "run", f"[run结果] 执行异常: {str(exc)[:200]}"
+        )
     return normalize_run_result(raw_result)

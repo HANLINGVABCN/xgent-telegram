@@ -1,3 +1,7 @@
+
+
+
+
 # This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
@@ -8,7 +12,10 @@ from xgent_app.shell_output import (
     format_shell_display_output,
     get_shell_pause_messages,
 )
-from xgent_app.agent_context import build_media_context_message
+from xgent_app.agent_context import (
+    build_media_context_message,
+    build_media_context_message_async,
+)
 from xgent_app.agent_search import run_search
 class GlobalRecorder:
     """始终记录所有操作（无论什么模式）"""
@@ -17,28 +24,39 @@ class GlobalRecorder:
     async def record(msg_type: str, role: str, content: str,
                      chat_id: Optional[int] = None, user_id: Optional[int] = None,
                      session_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None):
-        """记录消息到全局表 - 始终记录"""
-        db = await BotMemoryDB.get_instance()
-        await db.record_global_message(
-            chat_id=chat_id or BotConfig.AUTHORIZED_USER_ID,
-            user_id=user_id or 0,
-            msg_type=msg_type,
-            role=role,
-            content=content,
-            session_id=session_id or UserDataManager.get('current_chat_id'),
-            metadata=metadata
-        )
+        """记录消息到全局表 - 始终记录。
+
+        记录是旁路：数据库抖动、磁盘满不应该中断用户正在进行的对话。
+        这里的 91 处调用点全是主流程里的裸 await，异常会直接冒到用户面前。
+        """
+        try:
+            db = await BotMemoryDB.get_instance()
+            await db.record_global_message(
+                chat_id=chat_id or BotConfig.AUTHORIZED_USER_ID,
+                user_id=user_id or 0,
+                msg_type=msg_type,
+                role=role,
+                content=content,
+                session_id=session_id or UserDataManager.get('current_chat_id'),
+                metadata=metadata
+            )
+        except Exception as e:
+            logger.error(f"全局消息记录失败（已忽略，不中断主流程）: {e}")
+
         if msg_type == MessageType.AI_REPLY:
             return
-        write_model_trace("operation", {
-            "msg_type": msg_type,
-            "role": role,
-            "chat_id": chat_id or BotConfig.AUTHORIZED_USER_ID,
-            "user_id": user_id or 0,
-            "session_id": session_id or UserDataManager.get('current_chat_id'),
-            "content": content,
-            "metadata": metadata,
-        })
+        try:
+            write_model_trace("operation", {
+                "msg_type": msg_type,
+                "role": role,
+                "chat_id": chat_id or BotConfig.AUTHORIZED_USER_ID,
+                "user_id": user_id or 0,
+                "session_id": session_id or UserDataManager.get('current_chat_id'),
+                "content": content,
+                "metadata": metadata,
+            })
+        except Exception as e:
+            logger.error(f"trace 记录失败（已忽略，不中断主流程）: {e}")
     
     @staticmethod
     async def record_user_message(content: str, msg_type: str = MessageType.USER_TEXT,
@@ -1330,10 +1348,14 @@ def build_media_result_notice(result: Dict[str, Any], prompt: str) -> str:
     return text
 
 
-def build_media_continuation_message(result: Dict[str, Any], prompt: str) -> Dict[str, Any]:
-    """Compatibility wrapper; media context construction lives in agent_context."""
+async def build_media_continuation_message(result: Dict[str, Any], prompt: str) -> Dict[str, Any]:
+    """Compatibility wrapper; media context construction lives in agent_context.
+
+    异步版本：读取并 base64 编码最多 8MB 的媒体本体会阻塞事件循环，
+    而这条路径持有全局对话锁。
+    """
     notice = build_media_result_notice(result, prompt)
-    return build_media_context_message(
+    return await build_media_context_message_async(
         result,
         notice,
         max_inline_bytes=MEDIA_CONTEXT_MAX_BYTES,

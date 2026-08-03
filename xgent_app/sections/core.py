@@ -31,6 +31,7 @@ import random
 import uuid
 import subprocess
 import re
+import queue
 import threading
 import contextlib
 import copy
@@ -514,8 +515,52 @@ def trace_json_safe(value: Any) -> Any:
     return repr(value)
 
 
+_TRACE_QUEUE: "queue.Queue[Optional[str]]" = queue.Queue(maxsize=2000)
+_TRACE_WRITER_THREAD: Optional[threading.Thread] = None
+_TRACE_WRITER_LOCK = threading.Lock()
+_TRACE_DROPPED = 0
+
+
+def _trace_writer_loop():
+    """后台线程：串行地把 trace 行落盘。"""
+    while True:
+        line = _TRACE_QUEUE.get()
+        try:
+            if line is None:
+                return
+            with FULL_TRACE_LOCK:
+                with open(FULL_TRACE_LOG_FILE, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+        except Exception as e:
+            logger.debug(f"模型全量日志写入失败: {e}")
+        finally:
+            _TRACE_QUEUE.task_done()
+
+
+def _ensure_trace_writer():
+    global _TRACE_WRITER_THREAD
+    thread = _TRACE_WRITER_THREAD
+    if thread is not None and thread.is_alive():
+        return
+    with _TRACE_WRITER_LOCK:
+        thread = _TRACE_WRITER_THREAD
+        if thread is not None and thread.is_alive():
+            return
+        thread = threading.Thread(
+            target=_trace_writer_loop, name="model-trace-writer", daemon=True
+        )
+        thread.start()
+        _TRACE_WRITER_THREAD = thread
+
+
 def write_model_trace(event: str, payload: Dict[str, Any]):
-    """Append every full-fidelity action/model event to one chronological JSONL log."""
+    """Append every full-fidelity action/model event to one chronological JSONL log.
+
+    序列化在调用线程做，落盘丢给后台线程：这个函数在对话热路径上被同步调用，
+    而 FULL_TRACE_LOCK 是 threading.Lock——直接在事件循环里持锁写文件会把
+    整个 bot 卡住。队列满时丢弃并计数，日志不能反过来拖垮主流程。
+    """
+    global _TRACE_DROPPED
     try:
         record = {
             "ts": datetime.now().isoformat(timespec="milliseconds"),
@@ -526,11 +571,25 @@ def write_model_trace(event: str, payload: Dict[str, Any]):
         # 落盘前脱敏：trace 里包含完整 prompt 和响应体，provider 的 api_key
         # 会随请求头/错误体一起被记进去。
         line = redact_sensitive_text(line)
-        with FULL_TRACE_LOCK:
-            with open(FULL_TRACE_LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+        _ensure_trace_writer()
+        try:
+            _TRACE_QUEUE.put_nowait(line)
+        except queue.Full:
+            _TRACE_DROPPED += 1
+            if _TRACE_DROPPED % 100 == 1:
+                logger.warning(f"trace 队列已满，累计丢弃 {_TRACE_DROPPED} 条")
     except Exception as e:
         logger.debug(f"模型全量日志写入失败: {e}")
+
+
+def flush_model_trace(timeout: float = 3.0) -> None:
+    """等待后台 trace 线程把队列写完（关闭时调用）。"""
+    thread = _TRACE_WRITER_THREAD
+    if thread is None or not thread.is_alive():
+        return
+    deadline = time.monotonic() + timeout
+    while not _TRACE_QUEUE.empty() and time.monotonic() < deadline:
+        time.sleep(0.05)
 
 
 def extract_token_usage(raw_usage: Any) -> Optional[Dict[str, int]]:

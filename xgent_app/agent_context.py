@@ -11,6 +11,7 @@ send Telegram messages, write to the database, or record history.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 from typing import Any, Dict, Mapping, Optional
@@ -240,6 +241,26 @@ def build_media_context_message(
             {"type": "image", "mime_type": mime_type, "data": image_b64},
         ],
     }
+
+
+async def build_media_context_message_async(
+    result: Mapping[str, Any],
+    notice: str,
+    *,
+    max_inline_bytes: int = 8 * 1024 * 1024,
+) -> AgentMessage:
+    """Async wrapper that keeps the up-to-8MB read and base64 encode off the loop.
+
+    ``build_media_context_message`` does blocking file IO plus base64 encoding.
+    Running that inline on the event loop stalls every other handler while the
+    global conversation lock is held, so production callers should use this.
+    """
+    return await asyncio.to_thread(
+        build_media_context_message,
+        result,
+        notice,
+        max_inline_bytes=max_inline_bytes,
+    )
 
 
 def build_shell_context_message(notice: str, running: bool) -> AgentMessage:

@@ -123,6 +123,20 @@ def save_command_output(command: str, output: str) -> Dict[str, Any]:
     }
 
 
+async def save_command_output_async(command: str, output: str) -> Dict[str, Any]:
+    """把命令输出落盘丢到线程里。
+
+    输出可能有好几 MB，在事件循环上同步写会阻塞整个 bot，而这条路径还持有
+    全局对话锁。写失败也不能让整条命令的结果丢掉——命令本身已经跑完了，
+    存档失败只是少一个文件。
+    """
+    try:
+        return await asyncio.to_thread(save_command_output, command, output)
+    except Exception as e:
+        logger.error(f"命令输出存档失败: {e}")
+        return {'path': None, 'bytes': 0}
+
+
 async def terminate_async_process(process: Any):
     if process is None or process.returncode is not None:
         return

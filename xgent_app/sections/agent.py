@@ -1579,7 +1579,7 @@ class AgentExecutor:
             output = output or '(无输出)'
 
             elapsed_seconds = round(max(0.0, time.monotonic() - started_at), 2)
-            saved = save_command_output(command, output)
+            saved = await save_command_output_async(command, output)
             rc = process.returncode if process else -1
             return {
                 'success': bool(not stopped and not timed_out and rc == 0),
@@ -1599,7 +1599,7 @@ class AgentExecutor:
             logger.error(f"run 命令执行异常: {e}")
             output = f"执行异常: {str(e)[:200]}"
             elapsed_seconds = round(max(0.0, time.monotonic() - started_at), 2)
-            saved = save_command_output(command, output)
+            saved = await save_command_output_async(command, output)
             return {
                 'success': False,
                 'command': command,
