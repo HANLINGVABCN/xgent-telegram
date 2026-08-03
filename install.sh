@@ -775,9 +775,15 @@ upsert_env_value() {
     local value="$2"
     local tmp_file
 
-    tmp_file="$(mktemp)"
+    # 临时文件建在 .env 同目录：mktemp 默认落在 /tmp，跨文件系统时 mv 会退化成
+    # 复制+删除，复制中途失败会把含 BOT_TOKEN 和全部 api_key 的 .env 截断且无备份。
+    # 同目录下 mv 是原子 rename。
+    tmp_file="$(mktemp ./.env.XXXXXX)"
+    chmod 600 "$tmp_file"
     if [ -f ".env" ]; then
-        grep -vF "${key}=" .env > "$tmp_file" || true
+        # 必须锚定到行首：grep -vF "KEY=" 会匹配行内任意位置，
+        # 写 BOT_TOKEN 会顺手删掉 XGENT_BOT_TOKEN 等所有含该串的行。
+        grep -v "^${key}=" .env > "$tmp_file" || true
     fi
     printf '%s=%s\n' "$key" "$value" >> "$tmp_file"
     mv "$tmp_file" .env
@@ -792,8 +798,9 @@ remove_env_value() {
     fi
 
     local tmp_file
-    tmp_file="$(mktemp)"
-    grep -vF "${key}=" .env > "$tmp_file" || true
+    tmp_file="$(mktemp ./.env.XXXXXX)"
+    chmod 600 "$tmp_file"
+    grep -v "^${key}=" .env > "$tmp_file" || true
     mv "$tmp_file" .env
     chmod 600 .env
 }
@@ -1033,16 +1040,27 @@ telegram_log_out() {
     info "[本地 API] 正在调用 logOut (从 ${base} 登出 bot token)..."
     # telegram logOut 成功返回 {"ok":true,...}，未登录/网络错误返回非 0 或 {"ok":false}
     local http_code body
+    # URL 里带着 BOT_TOKEN，不能直接放进命令行——同机任何用户 ps aux 都能看到。
+    # curl 走 --config 从文件读 URL；wget 没有等价能力，退化用环境变量。
+    local url_file
+    url_file="$(mktemp)"
+    chmod 600 "$url_file"
     set +e
     if command_exists curl; then
-        body="$(curl -sS --max-time 15 -X POST -d '' "${base}/bot${token}/logOut" 2>/dev/null || true)"
+        printf 'url = "%s/bot%s/logOut"\n' "$base" "$token" > "$url_file"
+        body="$(curl -sS --max-time 15 -X POST -d '' --config "$url_file" 2>/dev/null || true)"
     elif command_exists wget; then
+        # wget 没有从文件读 URL 的能力，token 仍会出现在 argv。
+        # 这条只是 curl 不存在时的降级路径。
+        warn "   未找到 curl，改用 wget；此路径下 token 会短暂出现在进程列表中。"
         body="$(wget -qO- --timeout=15 --post-data='' "${base}/bot${token}/logOut" 2>/dev/null || true)"
     else
+        rm -f "$url_file"
         set -euo pipefail
         warn "   未找到 curl/wget，跳过 logOut。"
         return 1
     fi
+    rm -f "$url_file"
     set -euo pipefail
 
     if [ -n "$body" ] && printf '%s' "$body" | grep -q '"ok":true'; then
@@ -1058,6 +1076,7 @@ telegram_log_out() {
 ensure_env_value() {
     local key="$1"
     local prompt="$2"
+    local secret="${3:-}"
     local current_value=""
     local new_value=""
 
@@ -1071,7 +1090,13 @@ ensure_env_value() {
 
     warn "   .env 中缺少 $key，请现在输入。"
     while [ -z "$new_value" ]; do
-        read -r -p "$prompt: " new_value
+        if [ "$secret" = "secret" ]; then
+            # 密钥类输入不回显，避免留在终端回滚缓冲和录屏里
+            read -r -s -p "$prompt: " new_value
+            echo
+        else
+            read -r -p "$prompt: " new_value
+        fi
     done
     upsert_env_value "$key" "$new_value"
 }
@@ -1084,7 +1109,7 @@ ensure_env_file() {
         : > .env
     fi
 
-    ensure_env_value "BOT_TOKEN" "请输入 Telegram Bot Token"
+    ensure_env_value "BOT_TOKEN" "请输入 Telegram Bot Token（输入时不显示）" secret
     ensure_env_value "AUTHORIZED_USER_ID" "请输入 Telegram 用户 ID"
 
     success ".env 配置已就绪"
@@ -1618,16 +1643,19 @@ start_local_api_container() {
     info "[本地 API] 正在准备容器..."
     mkdir -p "$LOCAL_API_DATA_DIR"
 
-    # 清掉可能存在的旧容器
-    if docker inspect "$LOCAL_API_CONTAINER" >/dev/null 2>&1; then
-        info "[本地 API] 正在移除旧容器: $LOCAL_API_CONTAINER"
-        docker rm -f "$LOCAL_API_CONTAINER" >/dev/null
-    fi
-
+    # 先拉镜像再删旧容器：反过来的话拉取失败就会留下「旧容器已删、新容器没起」
+    # 的空窗，本地 Bot API 直接停摆，而此时 token 已经还给官方 API 了。
     info "[本地 API] 正在拉取镜像 $LOCAL_API_IMAGE（首次较慢）..."
     if ! docker pull "$LOCAL_API_IMAGE"; then
         error "[错误] 拉取镜像失败，请检查网络或手动执行: docker pull $LOCAL_API_IMAGE"
+        error "       旧容器未改动，本地 API 仍按原状运行。"
         return 1
+    fi
+
+    # 镜像就绪后再清掉旧容器
+    if docker inspect "$LOCAL_API_CONTAINER" >/dev/null 2>&1; then
+        info "[本地 API] 正在移除旧容器: $LOCAL_API_CONTAINER"
+        docker rm -f "$LOCAL_API_CONTAINER" >/dev/null
     fi
 
     info "[本地 API] 正在启动容器..."

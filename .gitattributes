@@ -1,1 +1,12 @@
+# 统一换行：Python/JSON/MD 此前不受管，Windows 检出的 CRLF 不会被规范化。
+# 注意 xgent_app/sections 的完整性哈希经 Path.read_text 读取，对 CRLF/LF
+# 不敏感，所以这条不会影响 SOURCE_BASELINE。
+* text=auto eol=lf
 *.sh text eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary

@@ -839,6 +839,11 @@ class AgentExecutor:
     def strip_protocol_blocks(cls, ai_response: str) -> str:
         """兼容入口：只移除协议块，不参与执行或消息发送。"""
         return ProtocolParser.strip_protocol_blocks(ai_response)
+
+    @classmethod
+    def has_unclosed_protocol_block(cls, ai_response: str) -> bool:
+        """兼容入口：是否存在开始行有效但未闭合的协议块。"""
+        return ProtocolParser.has_unclosed_block(ai_response)
     @classmethod
     def resolve_file_path(cls, requested_path: str) -> str:
         """将文件路径解析为服务器上的实际路径。仅接受绝对路径。"""

@@ -155,13 +155,6 @@ async def setup_bot_commands(app):
             # 发送失败也不回滚 flag：避免并发/重连再次触发导致重复发送
             logger.warning(f"启动主菜单发送失败（不再重试，用户可手动 /start）: {e}")
 
-async def send_startup_menu_job(context: ContextTypes.DEFAULT_TYPE):
-    """JobQueue 兜底：启动后主动发送完整 /start 主菜单。"""
-    try:
-        await setup_bot_commands(context.application)
-    except Exception as e:
-        logger.warning(f"启动主菜单兜底任务失败: {e}")
-
 async def on_shutdown(app):
     """应用关闭时清理资源"""
     logger.info("🛑 服务正在关闭...")

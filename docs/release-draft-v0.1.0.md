@@ -21,7 +21,7 @@ XGent for Telegram 是一个面向单用户私有部署的 AI Agent。它不仅�
 
 ## 安装
 
-准备一台安装了 Python 3.10+ 的 Linux 服务器，然后执行：
+准备一台安装了 Python 3.10+ 的 Linux 服务器（install.sh 的自动补依赖只支持 Debian/Ubuntu），然后执行：
 
 ```bash
 cd /opt && sudo git clone https://github.com/HANLINGVABCN/xgent-telegram.git && sudo chown -R "$USER":"$USER" xgent-telegram && cd xgent-telegram && chmod +x install.sh && ./install.sh

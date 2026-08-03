@@ -26,7 +26,7 @@ XGent for Telegram 的提示词结构、拼接逻辑、回复流程和基础功�
 
 - `prompts/main.txt`：主提示词，当前只定义基础身份。
 - `prompts/global_addon.txt`：全局事实层，说明运行环境、上下文读取和记忆使用规则。
-- `prompts/agent_addon.txt`：Agent 与工具能力说明，定义 `run`、`shell`、`stdin:*`、`shellread:*`、`shellkill:*`、`trigger:*`、`read`、`file:`、`sendfile`、`media` 等协议。
+- `prompts/agent_addon.txt`：Agent 与工具能力说明，定义 `run`、`shell`、`stdin:*`、`shellread:*`、`shellkill:*`、`trigger:*`、`read`、`edit`、`grep`、`file:`、`sendfile`、`search`、`fetch`、`media` 等协议。
 - `prompts/agent_disabled_addon.txt`：Agent 关闭时的补充说明。
 - `prompts/extras/idle_message.txt`：空闲提醒消息的生成提示。
 - `prompts/extras/unauthorized_reply_messages.txt`：未授权用户的拒绝回复。
@@ -123,6 +123,10 @@ Agent 模式开启后，模型可以通过协议块调用真实工具：
 - `read`：按路径读取文件本体并直接回灌给 AI。文本/代码/JSON/Markdown 等作为完整文本上下文返回，图片作为图片本体返回，其他文件视模型通道能力返回。
 - `sendfile`：把服务器上的文件发送给用户；只把发送结果回灌给 AI，不回灌文件本体。≤50MB 走原生上传；>50MB 且启用了本地 API 容器时自动通过本地 API 直穿（硬链接零拷贝，可达 2GB）；未启用本地 API 时大文件报错。
 - `file:`：创建或覆盖服务器文件；只把写入结果回灌给 AI，不回灌文件本体。支持三种写法：普通三反引号（内容不含 ``` 时）、heredoc 语法 `file:/path <<EOF ... EOF`（内容含 ``` 或特殊字符，推荐用于 Markdown/代码文件）、base64 语法 `file:base64:/path`（二进制安全，解码后按字节写入）。
+- `edit`：按精确匹配替换文件中的片段，避免整文件重写。
+- `grep`：在文件或目录中检索内容，返回命中位置与上下文。
+- `search`：联网检索并回灌摘要结果，需要配置 Tavily API Key。
+- `fetch`：抓取指定网页正文并回灌给模型。
 - `media`：调用默认媒体模型生成图片或其他媒体。
 
 Agent 命令会受 `prompts/extras/agent_command_blacklist.txt` 管理。一次性命令优先走 `run`；交互、长驻或持续输出命令走 `shell`，仍在运行时会记录当前输出并回灌给 AI 继续判断。

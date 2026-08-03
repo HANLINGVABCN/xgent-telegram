@@ -1537,7 +1537,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             reply_markup=get_main_menu()
         )
         return
-    assert prov_name is not None
+    if prov_name is None:
+        raise RuntimeError("provider 校验通过但名称为空，状态不一致")
 
     if reset_agent_iterations:
         await db.add_chat_message(cid, 'user', text)
@@ -1652,6 +1653,15 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 pending_round_status_msg = None
                 pending_round_iteration = None
             if not protocol_blocks:
+                if AgentExecutor.has_unclosed_protocol_block(response):
+                    # 有开始行但没闭合：解析器会停止扫描，后面的协议全部不执行。
+                    # 以前这是完全静默的，用户只看到 AI 说要做事却什么也没发生。
+                    await safe_send_message(
+                        context,
+                        update.effective_chat.id,
+                        "⚠️ 检测到未闭合的协议块（缺少结束标记或收尾的三反引号），"
+                        "本轮没有执行任何操作。可以让 AI 重新输出一次。",
+                    )
                 break  # AI 没有请求任何操作
 
             operation_iteration = agent_iteration + 1

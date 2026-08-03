@@ -252,7 +252,8 @@ class AgentShellSession:
                 self.read_index = max(0, self.read_index - overflow)
 
     def _read_pty_loop(self):
-        assert self.controller_fd is not None
+        if self.controller_fd is None:
+            raise RuntimeError("PTY 读取线程启动时 controller_fd 为空")
         while True:
             try:
                 chunk = os.read(self.controller_fd, 4096)
@@ -308,7 +309,11 @@ class AgentShellSession:
             delta = self.output[self.read_index:]
             self.read_index = len(self.output)
         if len(delta) > max_chars:
-            return delta[-max_chars:]
+            # read_index 已经推进过整段，被裁掉的部分再也读不回来了。
+            # 以前这里直接返回尾部 max_chars，中间内容静默消失，模型据此
+            # 推理时完全不知道自己少看了东西（滚过去的报错就此隐形）。
+            # 和 read_snapshot 保持一致：保留首尾并标注省略量。
+            return clip_middle_text(delta, max_chars, "shell 增量输出")
         return delta
 
     def read_recent(self, max_chars: int = 4000) -> str:

@@ -18,6 +18,12 @@
 > [!IMPORTANT]
 > 本项目面向**单用户私有部署**。Agent 模式能够在服务器上执行真实命令，不是完整沙箱；请先阅读[安全说明](#安全说明)，并使用独立的低权限账号运行。
 
+> [!NOTE]
+> **本仓库（`xgent-telegram-test`）是发布仓库 `xgent-telegram` 的测试副本。**
+> 下面的徽章、克隆命令和默认更新源都指向发布仓库，这是有意为之。
+> `/update` 会先弹菜单让你选更新源（正常更新 = 发布仓库，测试更新 = 本仓库），
+> 不会自动跨仓覆盖。在本仓库做的改动需要同步到发布仓库才会进入正式发布。
+
 ## 它能做什么
 
 | 场景 | 你可以直接在 Telegram 里说 |
@@ -97,6 +103,7 @@ flowchart LR
 ### 准备
 
 - Linux 服务器与可用的 Python 3.10+
+  （install.sh 的自动补依赖只支持 Debian/Ubuntu；其它发行版需先手动装好 Python 3.10+、pip、git、curl）
 - 从 [BotFather](https://t.me/BotFather) 获取的 Telegram Bot Token
 - 你的 Telegram 用户 ID
 - 至少一个可用的模型 API Key
@@ -230,11 +237,15 @@ Agent 模式开启后，模型可通过内部协议调用真实工具能力：
 - `run`：执行一次性命令并保存完整结果；
 - `shell`：管理长驻、持续输出和交互式命令；
 - `read`：读取服务器文件；
+- `edit`：按精确匹配替换文件中的片段；
+- `grep`：在文件或目录中检索内容；
 - `file`：创建或覆盖服务器文件；
 - `sendfile`：将服务器文件发送到 Telegram；
+- `search`：联网检索（需配置 Tavily API Key）；
+- `fetch`：抓取指定网页内容；
 - 媒体协议：调用默认媒体模型生成内容。
 
-Agent 协议只接受 nonce 相同的 `AGENT_BEGIN` / `AGENT_END` 成对标记。nonce 长度为 6～32 位且每块唯一；协议正文按不透明文本处理，内部 Markdown 或协议示例不会被二次解析。
+Agent 协议只接受 nonce 相同的 `AGENT_BEGIN` / `AGENT_END` 成对标记。nonce 长度为 6～32 位且每块唯一（提示词要求模型使用 10～32 位，解析器放宽以免短标记被静默丢弃）；协议正文按不透明文本处理，内部 Markdown 或协议示例不会被二次解析。
 
 一次性命令的完整输出保存在：
 

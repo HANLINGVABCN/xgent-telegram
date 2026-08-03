@@ -1669,7 +1669,17 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await cmd_delete_chat(update, context)
         elif data in {"cmd_new_chat", "cmd_save", "cmd_list_chats", "cmd_rename_chat"} or data.startswith("load_chat_"):
             await query.answer("现在只有一份全局记忆，不再支持分段管理。", show_alert=True)
-    
+        else:
+            # 没有任何分支命中。最常见的原因是重启后旧按钮里的短 ID 已经从
+            # 内存映射表里消失（CallbackDataStore 是纯内存的）。以前这里
+            # 直接静默结束：转圈已经被 query.answer() 清掉了，用户看到的是
+            # 一个"点了但什么都没发生"的按钮。
+            logger.warning(f"未识别的 callback data: {data!r}")
+            await query.answer(
+                "这个按钮已失效（可能是重启前的旧消息）。请重新打开菜单。",
+                show_alert=True,
+            )
+
     except Exception as e:
         logger.error(f"Callback Error: {e}\n{traceback.format_exc()}")
         await query.message.reply_text("操作失败，请稍后重试。")

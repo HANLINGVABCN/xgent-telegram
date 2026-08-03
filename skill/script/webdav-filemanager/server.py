@@ -26,6 +26,8 @@ import hmac
 import secrets
 import uuid
 import time
+import socket
+import ipaddress
 import threading
 import zipfile
 import tarfile
@@ -60,6 +62,10 @@ SHARE_SESSION_GAP = 30 * 60
 WEBDAV_DIR_NAME = 'webdav'
 DOWNLOAD_DIR_NAME = 'download'
 REMOTE_TASK_SAMPLE_LIMIT = 240
+# 远程下载的单文件上限，避免一条链接把磁盘刷爆。
+MAX_REMOTE_DOWNLOAD_SIZE = int(os.environ.get('WEBDAV_MAX_REMOTE_DOWNLOAD', 20 * 1024 * 1024 * 1024))
+# 允许远程下载访问内网地址（默认关闭）。自建内网源站时可显式打开。
+ALLOW_PRIVATE_REMOTE = os.environ.get('WEBDAV_ALLOW_PRIVATE_REMOTE', '').lower() in ('1', 'true', 'yes')
 REMOTE_TASKS = {}
 REMOTE_TASKS_LOCK = threading.Lock()
 UPLOAD_BATCH_DIRS = {}
@@ -75,6 +81,11 @@ _login_attempts = {}
 _login_attempts_lock = threading.Lock()
 LOGIN_MAX_FAILS = 5
 LOGIN_LOCKOUT_SECONDS = 60
+# 可信反向代理的 IP 列表（逗号分隔）。为空时一律忽略 X-Forwarded-For，
+# 只用真实对端地址做限速，否则伪造该头即可绕过登录锁定。
+TRUSTED_PROXIES = {
+    ip.strip() for ip in os.environ.get('WEBDAV_TRUSTED_PROXIES', '').split(',') if ip.strip()
+}
 
 # Background cache for root directory size calculation
 _root_size_cache = {
@@ -498,6 +509,74 @@ def remote_task_speed_update(task, now=None, force=False):
     task['lastBytes'] = loaded
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """禁用自动跳转，把重定向目标交回给调用方逐跳校验。
+
+    默认的 urlopen 会自动跟随 302，攻击者只要用一个公网地址跳到
+    169.254.169.254（云元数据）或 127.0.0.1，任何只检查初始 URL 的
+    校验都会被绕过。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise _RedirectTo(newurl)
+
+
+class _RedirectTo(Exception):
+    def __init__(self, url):
+        super().__init__(url)
+        self.url = url
+
+
+def validate_remote_url(url):
+    """校验远程下载目标。返回 (ok, 错误文案)。
+
+    解析出真实 IP 后拒绝环回/私网/链路本地/保留地址，防止把这个下载器
+    当成打内网和云元数据服务的跳板。
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        return False, '请输入有效的 http/https 链接'
+    if ALLOW_PRIVATE_REMOTE:
+        return True, ''
+    host = parsed.hostname
+    if not host:
+        return False, '链接缺少主机名'
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == 'https' else 80),
+                                   proto=socket.IPPROTO_TCP)
+    except OSError:
+        return False, f'无法解析主机: {host}'
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return False, f'无法识别的地址: {addr}'
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False, (
+                f'拒绝访问内网/保留地址 ({addr})。'
+                '确需下载内网资源时，请设置环境变量 WEBDAV_ALLOW_PRIVATE_REMOTE=1 后重启。'
+            )
+    return True, ''
+
+
+def open_remote_url(url, headers, timeout=30, max_redirects=5):
+    """打开远程 URL，逐跳校验重定向目标，防止跳转绕过 SSRF 检查。"""
+    opener = urllib.request.build_opener(_NoRedirect)
+    current = url
+    for _ in range(max_redirects + 1):
+        ok, err = validate_remote_url(current)
+        if not ok:
+            raise ValueError(err)
+        req = urllib.request.Request(current, headers=headers)
+        try:
+            return opener.open(req, timeout=timeout)
+        except _RedirectTo as redirect:
+            current = urllib.parse.urljoin(current, redirect.url)
+    raise ValueError('重定向次数过多')
+
+
 def remote_download_worker(task_id):
     temp_path = ''
     last_save = 0.0
@@ -531,8 +610,7 @@ def remote_download_worker(task_id):
         headers = {'User-Agent': 'WebDAV-FileManager/1.0'}
         if existing > 0:
             headers['Range'] = f'bytes={existing}-'
-        req = urllib.request.Request(url, headers=headers)
-        resp = urllib.request.urlopen(req, timeout=30)
+        resp = open_remote_url(url, headers, timeout=30)
         status = getattr(resp, 'status', None) or resp.getcode()
         is_resume = (status == 206)
         content_total = int(resp.headers.get('Content-Length') or 0)
@@ -579,6 +657,9 @@ def remote_download_worker(task_id):
 
         save_task(merge_remote_task_for_persist(REMOTE_TASKS.get(task_id)))
 
+        # 断点续传时把已有的部分算进总量，上限针对最终文件大小。
+        written_total = existing if mode == 'ab' else 0
+
         with open(temp_path, mode) as out:
             while True:
                 with REMOTE_TASKS_LOCK:
@@ -593,6 +674,11 @@ def remote_download_worker(task_id):
                 if not chunk:
                     break
                 out.write(chunk)
+                written_total += len(chunk)
+                if written_total > MAX_REMOTE_DOWNLOAD_SIZE:
+                    raise ValueError(
+                        f'远程文件超过上限 {format_size(MAX_REMOTE_DOWNLOAD_SIZE)}，已中止下载'
+                    )
                 with REMOTE_TASKS_LOCK:
                     task = REMOTE_TASKS.get(task_id)
                     if task:
@@ -949,9 +1035,28 @@ class FileManagerHandler(BaseHTTPRequestHandler):
     server_version = 'WebDAV-FileManager/1.0'
 
     def log_message(self, fmt, *args):
-        """Minimal logging - only log requests with status info."""
+        """Minimal logging - only log requests with status info.
+
+        路径里含机密文件名和分享 token（/s/<token>），日志会进 systemd journal，
+        所以只记录路径前缀和查询串的键名，不记具体值。
+        """
         ts = self.log_date_time_string()
-        sys.stderr.write(f'[{ts}] {self.command} {self.path} - {fmt % args}\n')
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            # /s/<token> 这类分享链接只保留前缀
+            if path.startswith('/s/'):
+                path = '/s/<token>'
+            elif len(path) > 80:
+                path = path[:80] + '...'
+            if parsed.query:
+                keys = sorted({
+                    kv.split('=', 1)[0] for kv in parsed.query.split('&') if kv
+                })
+                path = f'{path}?{"&".join(keys)}=<redacted>'
+        except Exception:
+            path = '<unparsable>'
+        sys.stderr.write(f'[{ts}] {self.command} {path} - {fmt % args}\n')
 
     # ----------------------------------------------------------
     # Authentication
@@ -971,13 +1076,22 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         if not AUTH_CRED:
             return True
         auth = self.headers.get('Authorization', '')
-        if auth.startswith('Basic '):
-            try:
-                decoded = base64.b64decode(auth[6:]).decode('utf-8')
-                if self._safe_equal(decoded, AUTH_CRED):
-                    return True
-            except Exception:
-                pass
+        if not auth.startswith('Basic '):
+            return False
+        # Basic 认证此前完全不限速：限速只作用于 /api/auth/login，
+        # 直接对 /dav/ 或 /api/list 打 Basic 头可以无限次爆破口令，
+        # 连伪造 X-Forwarded-For 都不需要。
+        client_ip = self._get_client_ip()
+        if not self._check_login_rate(client_ip):
+            return False
+        try:
+            decoded = base64.b64decode(auth[6:]).decode('utf-8')
+            if self._safe_equal(decoded, AUTH_CRED):
+                self._clear_login_fails(client_ip)
+                return True
+        except Exception:
+            pass
+        self._record_login_fail(client_ip)
         return False
 
     def _session_token(self):
@@ -1214,11 +1328,26 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         self.send_err(404, 'API not found')
 
     def _get_client_ip(self):
-        """Get client IP, respecting X-Forwarded-For for reverse proxies."""
+        """取客户端 IP 用于限速。
+
+        只有显式配置了可信代理时才认 X-Forwarded-For：这个头由客户端提供，
+        攻击者每次换一个伪造值就能让每个"IP"都拿到独立的失败计数，
+        5 次/60 秒的锁定形同虚设。
+        """
+        peer = self.client_address[0] if self.client_address else '0.0.0.0'
+        if not TRUSTED_PROXIES:
+            return peer
+        if peer not in TRUSTED_PROXIES:
+            # 直连来源不可信，忽略它声称的转发链
+            return peer
         forwarded = self.headers.get('X-Forwarded-For', '')
         if forwarded:
-            return forwarded.split(',')[0].strip()
-        return self.client_address[0] if self.client_address else '0.0.0.0'
+            # 取最右一个非可信跳，即可信代理实际看到的对端
+            hops = [h.strip() for h in forwarded.split(',') if h.strip()]
+            for hop in reversed(hops):
+                if hop not in TRUSTED_PROXIES:
+                    return hop
+        return peer
 
     def _check_login_rate(self, ip):
         """Return True if login is allowed, False if rate-limited."""
@@ -1744,9 +1873,36 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         }
         handler = routes.get(path)
         if handler:
+            if not self._check_csrf():
+                return
             handler()
         else:
             self.send_err(404, 'API not found')
+
+    def _check_csrf(self):
+        """同源校验，防跨站请求伪造。
+
+        这些接口全部靠 Cookie 认证，而 SameSite=Lax 并不拦截顶层表单 POST，
+        且处理器只调 read_json() 从不校验 Content-Type——任意站点用一个
+        enctype="text/plain" 的表单就能在用户登录状态下删掉整个根目录。
+        """
+        origin = (self.headers.get('Origin') or '').strip()
+        referer = (self.headers.get('Referer') or '').strip()
+        source = origin or referer
+        if not source:
+            # 浏览器发起的跨站请求一定带 Origin；两个头都没有时通常是
+            # curl/脚本客户端，此时 Cookie 也不会被自动附带，放行。
+            return True
+        try:
+            parsed = urllib.parse.urlparse(source)
+        except ValueError:
+            self.send_err(403, '来源校验失败')
+            return False
+        host_header = (self.headers.get('Host') or '').strip()
+        if parsed.netloc and host_header and parsed.netloc == host_header:
+            return True
+        self.send_err(403, '跨站请求被拒绝')
+        return False
 
     def _sanitize_error(self, e):
         """Sanitize error message to avoid leaking internal paths."""
@@ -2511,9 +2667,9 @@ class FileManagerHandler(BaseHTTPRequestHandler):
     def _api_remote_download_start(self):
         data = self.read_json()
         url = str(data.get('url', '')).strip()
-        parsed = urllib.parse.urlparse(url)
-        if parsed.scheme not in ('http', 'https') or not parsed.netloc:
-            return self.send_err(400, '请输入有效的 http/https 链接')
+        ok, err = validate_remote_url(url)
+        if not ok:
+            return self.send_err(400, err)
         task_id = secrets.token_urlsafe(16)
         now = time.time()
         task = {
@@ -2748,8 +2904,16 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         fp = safe_join(ROOT_DIR, path)
         if not fp or not os.path.exists(fp):
             return self.send_err(404, '文件不存在')
+        root_real = os.path.realpath(ROOT_DIR)
+        # 不能重命名根目录本身：safe_join(ROOT_DIR, '/') 会返回 ROOT_DIR，
+        # 于是 path='/' 能把整个根目录改名成兄弟目录，服务直接瘫痪。
+        if os.path.realpath(fp) == root_real:
+            return self.send_err(403, '不能重命名根目录')
         new_fp = os.path.join(os.path.dirname(fp), new_name)
-        if not os.path.realpath(new_fp).startswith(os.path.realpath(ROOT_DIR)):
+        # 必须用 == root 或 root + os.sep 判断：裸 startswith 会让
+        # /data/root_evil 匹配上 /data/root。
+        new_real = os.path.realpath(new_fp)
+        if not (new_real == root_real or new_real.startswith(root_real + os.sep)):
             return self.send_err(403, '路径非法')
         if os.path.exists(new_fp):
             return self.send_err(400, '已存在同名文件或文件夹')
@@ -3165,10 +3329,19 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         if not dest_full:
             return self.send_empty(403)
 
-        overwrite = self.headers.get('Overwrite', 'T').upper() == 'T'
+        overwrite_header = self.headers.get('Overwrite')
+        # RFC 4918 规定缺省为 T，保持兼容；但"没写这个头"和"明确要求覆盖"
+        # 不该等价于可以递归删掉一整棵非空目录——客户端一个畸形请求就能
+        # 无提示地毁掉整个目录树，且没有回收站。
+        overwrite = (overwrite_header or 'T').upper() == 'T'
         existed = os.path.exists(dest_full)
 
         if existed and not overwrite:
+            return self.send_empty(412)
+
+        if (existed and overwrite_header is None
+                and os.path.isdir(dest_full) and os.listdir(dest_full)):
+            # 目标是非空目录且客户端未显式声明 Overwrite：拒绝，要求显式表态
             return self.send_empty(412)
 
         try:
@@ -3206,10 +3379,19 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         if not dest_full:
             return self.send_empty(403)
 
-        overwrite = self.headers.get('Overwrite', 'T').upper() == 'T'
+        overwrite_header = self.headers.get('Overwrite')
+        # RFC 4918 规定缺省为 T，保持兼容；但"没写这个头"和"明确要求覆盖"
+        # 不该等价于可以递归删掉一整棵非空目录——客户端一个畸形请求就能
+        # 无提示地毁掉整个目录树，且没有回收站。
+        overwrite = (overwrite_header or 'T').upper() == 'T'
         existed = os.path.exists(dest_full)
 
         if existed and not overwrite:
+            return self.send_empty(412)
+
+        if (existed and overwrite_header is None
+                and os.path.isdir(dest_full) and os.listdir(dest_full)):
+            # 目标是非空目录且客户端未显式声明 Overwrite：拒绝，要求显式表态
             return self.send_empty(412)
 
         try:
@@ -3372,6 +3554,8 @@ def main():
                         help='认证信息，格式: 用户名:密码')
     parser.add_argument('-H', '--host', default='0.0.0.0',
                         help='监听地址 (默认: 0.0.0.0)')
+    parser.add_argument('--allow-no-auth', action='store_true',
+                        help='允许在没有配置认证时启动（危险：任何能访问端口的人都有完整权限）')
     args = parser.parse_args()
 
     ROOT_DIR = os.path.realpath(args.root)
@@ -3381,6 +3565,25 @@ def main():
 
     # Security: prefer env var over CLI arg; local auth file persists web password changes.
     AUTH_CRED = load_auth_cred() or os.environ.get('WEBDAV_AUTH') or args.auth
+    if not AUTH_CRED:
+        # 无认证时所有鉴权检查都直接放行（完整的上传/下载/删除/分享能力），
+        # 而默认监听 0.0.0.0，等于把整块磁盘交给能访问该端口的任何人。
+        # 明确要求显式表态，而不是静默地不设防启动。
+        if args.allow_no_auth:
+            _print_safe(
+                '[WARN] 已按 --allow-no-auth 在无认证模式下启动。'
+                '任何能访问该端口的人都拥有完整文件管理权限。'
+            )
+        else:
+            _print_safe(
+                '[ERROR] 未配置认证信息，拒绝启动。\n'
+                '        请任选其一：\n'
+                '          -a 用户名:密码\n'
+                '          环境变量 WEBDAV_AUTH=用户名:密码\n'
+                '        确实需要无认证（例如仅绑定 127.0.0.1 供本机使用）时，\n'
+                '        请显式加上 --allow-no-auth。'
+            )
+            sys.exit(1)
     if AUTH_CRED and not os.path.isfile(AUTH_FILE):
         try:
             save_auth_cred(AUTH_CRED)

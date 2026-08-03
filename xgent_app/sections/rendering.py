@@ -97,31 +97,6 @@ class TelegramRichAPI:
             raise TelegramError(f"sendRichMessageDraft failed: {result.get('description', result)}")
         return result
 
-async def rich_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str,
-                            reply_markup: Optional[InlineKeyboardMarkup] = None,
-                            **kwargs: Any) -> List[Any]:
-    """优先使用 Rich Message 发送，失败时 fallback 到旧 HTML 模式。"""
-    try:
-        # 将 InlineKeyboardMarkup 转为可 JSON 序列化的 dict
-        markup_dict = None
-        if reply_markup:
-            markup_dict = reply_markup.to_dict() if hasattr(reply_markup, 'to_dict') else None
-
-        result = await TelegramRichAPI.send_rich_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=markup_dict,
-        )
-        # 返回 Message 对象需要适配——此处返回原始结果供上层使用
-        return [result]
-    except Exception as e:
-        logger.warning(f"Rich Message 发送失败，降级为 HTML 模式: {e}")
-        html_text = markdown_to_telegram_html(text)
-        return await safe_send_message(context, chat_id, html_text,
-                                        parse_mode=constants.ParseMode.HTML,
-                                        reply_markup=reply_markup, **kwargs)
-
-
 async def rich_finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
                                        msg: Any, response: str, limit: int = RICH_MESSAGE_CHAR_LIMIT):
     """使用 Rich Message 发送最终回复。失败时 fallback 到旧 HTML 编辑模式。"""
@@ -279,7 +254,9 @@ def _inline_markdown_to_html(text: str) -> str:
     def _save_link(m: re.Match) -> str:
         idx = len(link_blocks)
         link_text = html.escape(m.group(1), quote=False)
-        link_url = m.group(2)  # URL 不做 html.escape，避免 & 被转成 &amp;
+        # URL 必须转义：href 属性里的 & 要写成 &amp;，否则 Telegram 报
+        # "can't parse entities"；URL 里的引号会直接闭合属性。
+        link_url = html.escape(m.group(2), quote=True)
         link_blocks.append(f'<a href="{link_url}">{link_text}</a>')
         return f'\x01LK{idx}\x01'
 

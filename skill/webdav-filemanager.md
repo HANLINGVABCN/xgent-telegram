@@ -603,6 +603,9 @@ dnf install -y python3
 python3 server.py -H 0.0.0.0 -p 8989 -r /data/files -a admin:你的密码
 ```
 
+> 服务器在没有配置认证时会拒绝启动（`-a`、环境变量 `WEBDAV_AUTH` 任选其一）。
+> 确需无认证运行（例如只绑定 `127.0.0.1` 给本机用）时，要显式加 `--allow-no-auth`。
+
 ### 12.4 登录失败
 
 如果仍能登录，可在网页右上角设置里修改登录账号或密码。

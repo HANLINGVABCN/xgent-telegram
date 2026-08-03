@@ -108,6 +108,45 @@ class ProtocolParserTests(unittest.TestCase):
         self.assertEqual([], ProtocolParser.extract_protocol_blocks(response))
         self.assertEqual(response, ProtocolParser.strip_protocol_blocks(response))
 
+    def test_duplicate_nonce_block_is_stripped_from_visible_text(self):
+        """重复 nonce 的块不执行，但也不能把原始协议标记漏给用户看。"""
+        response = (
+            "前言\n"
+            f"{protocol_block('run-x', 'echo one', NONCE_A)}\n"
+            f"{protocol_block('run-x', 'echo two', NONCE_A)}\n"
+            "结尾"
+        )
+        blocks = ProtocolParser.extract_protocol_blocks(response)
+        self.assertEqual(1, len(blocks), "重复 nonce 的块不应该被执行")
+        self.assertEqual("echo one", blocks[0]["body"])
+
+        stripped = ProtocolParser.strip_protocol_blocks(response)
+        self.assertNotIn("AGENT_BEGIN", stripped, "重复块的原始标记泄漏给了用户")
+        self.assertNotIn("echo two", stripped)
+        self.assertIn("前言", stripped)
+        self.assertIn("结尾", stripped)
+
+    def test_has_unclosed_block_detects_missing_end_marker(self):
+        """未闭合会让后续协议全部不执行，必须能被检测到并提示。"""
+        response = (
+            f"```run-x <<AGENT_BEGIN_{NONCE_A}\n"
+            "echo ok\n"
+            "（这里少了结束标记）"
+        )
+        self.assertEqual([], ProtocolParser.extract_protocol_blocks(response))
+        self.assertTrue(ProtocolParser.has_unclosed_block(response))
+
+    def test_has_unclosed_block_false_for_well_formed(self):
+        response = (
+            "文字\n"
+            f"{protocol_block('run-x', 'echo ok', NONCE_A)}\n"
+            f"{protocol_block('read-x', '/tmp/a', NONCE_B)}"
+        )
+        self.assertFalse(ProtocolParser.has_unclosed_block(response))
+
+    def test_has_unclosed_block_false_for_plain_text(self):
+        self.assertFalse(ProtocolParser.has_unclosed_block("普通回复，没有协议。"))
+
     def test_end_marker_without_closing_fence_remains_body(self):
         end_marker = f"AGENT_END_{NONCE_A}"
         response = (

@@ -9,6 +9,7 @@ import json
 import os
 import secrets
 import socketserver
+import threading
 import time
 import urllib.parse
 from pathlib import Path
@@ -624,6 +625,13 @@ def hash_password(password, salt):
 # 会话有效期（秒）：Cookie 内签发时间超过该值即视为过期，
 # 避免旧签名无限期有效（服务端此前从不校验时间戳）。
 SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
+# 请求体上限：parse_json 在鉴权之前就会被调用，没有上限等于开放未认证内存 DoS。
+MAX_REQUEST_BODY = 5 * 1024 * 1024
+# 登录限速：此前完全没有，可无限次在线爆破口令。
+LOGIN_MAX_FAILS = 5
+LOGIN_LOCKOUT_SECONDS = 60
+_login_attempts = {}
+_login_attempts_lock = threading.Lock()
 
 
 def make_cookie(username, secret):
@@ -696,9 +704,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_error(404)
 
     def parse_json(self):
+        # 上限必不可少：这个方法在 /api/login 里先于任何鉴权被调用，
+        # 而 ThreadingHTTPServer 会为每个连接开线程——若干个声称 Content-Length
+        # 是好几 GB 的未认证请求就能把内存打爆。
         length = int(self.headers.get("Content-Length") or "0")
         if length <= 0:
             return {}
+        if length > MAX_REQUEST_BODY:
+            self.send_json({"error": "请求体过大"}, status=413)
+            raise ValueError("request body too large")
         return json.loads(self.rfile.read(length).decode("utf-8"))
 
     def note_id_from_path(self):
@@ -717,17 +731,69 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_json({"error": "unauthorized"}, status=401)
         return False
 
+    def _client_ip(self):
+        # 刻意不读 X-Forwarded-For：该头由客户端提供，攻击者每次伪造一个新值
+        # 就能让每个"IP"都拿到独立的失败计数，限速形同虚设。
+        return self.client_address[0] if self.client_address else "0.0.0.0"
+
+    def _login_allowed(self, ip):
+        now = time.time()
+        with _login_attempts_lock:
+            rec = _login_attempts.get(ip)
+            if not rec:
+                return True
+            if rec["locked_until"] > now:
+                return False
+            if rec["fails"] >= LOGIN_MAX_FAILS:
+                rec["locked_until"] = now + LOGIN_LOCKOUT_SECONDS
+                return False
+            return True
+
+    def _record_login_fail(self, ip):
+        now = time.time()
+        with _login_attempts_lock:
+            rec = _login_attempts.setdefault(ip, {"fails": 0, "locked_until": 0})
+            rec["fails"] += 1
+            if rec["fails"] >= LOGIN_MAX_FAILS:
+                rec["locked_until"] = now + LOGIN_LOCKOUT_SECONDS
+
+    def _clear_login_fails(self, ip):
+        with _login_attempts_lock:
+            _login_attempts.pop(ip, None)
+
+    def _cookie_is_secure(self):
+        """仅在外部访问确实是 HTTPS 时加 Secure。
+
+        后端只监听明文 HTTP，真实 HTTPS 部署由反向代理终止 TLS；
+        直连 HTTP 时加 Secure 会让浏览器直接丢弃 Cookie，登录进入死循环。
+        """
+        proto = (self.headers.get("X-Forwarded-Proto") or "").strip().lower()
+        if not proto:
+            ssl_hint = (self.headers.get("X-Forwarded-Ssl") or "").strip().lower()
+            proto = "https" if ssl_hint == "on" else "http"
+        return proto.split(",")[0].strip() == "https"
+
     def handle_login(self):
+        client_ip = self._client_ip()
+        if not self._login_allowed(client_ip):
+            self.send_json({"error": "登录尝试过于频繁，请稍后再试"}, status=429)
+            return
         data = self.parse_json()
         auth = self.server.store.load_auth()
         username = str(data.get("username") or "")
         password = str(data.get("password") or "")
         password_hash = hash_password(password, auth["salt"])
         if username != auth["username"] or not hmac.compare_digest(password_hash, auth["password_hash"]):
+            self._record_login_fail(client_ip)
             self.send_json({"error": "账号或密码错误"}, status=403)
             return
+        self._clear_login_fails(client_ip)
         session = make_cookie(username, auth["secret"])
-        cookie = f"notes_session={session}; Path=/; Max-Age={SESSION_TTL_SECONDS}; HttpOnly; SameSite=Lax"
+        secure = "; Secure" if self._cookie_is_secure() else ""
+        cookie = (
+            f"notes_session={session}; Path=/; Max-Age={SESSION_TTL_SECONDS}; "
+            f"HttpOnly{secure}; SameSite=Lax"
+        )
         self.send_json({"ok": True}, headers={"Set-Cookie": cookie})
 
     def handle_get_notes(self):

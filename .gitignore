@@ -15,7 +15,6 @@ xgent_memory.db-*
 *.db-journal
 *.db-shm
 *.db-wal
-*db*
 xgent_storage/
 
 # Pre-XGent runtime names kept ignored during compatibility migration
@@ -86,10 +85,8 @@ desktop.ini
 *.swp
 *.swo
 *.tmp
-*.bak
-*.bak.*
-*.editbak.*
 *.bak*
+*.editbak.*
 *.orig
 *~
 *.code-workspace

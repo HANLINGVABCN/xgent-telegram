@@ -17,7 +17,7 @@ components. The first extracted components are:
 | `xgent_app/shell_output.py` | Format shell display output, model context, and command-result notices |
 | `xgent_app/agent_context.py` | Build next-turn Agent context for file, read, edit, grep, run, shell, trigger, and media results; no execution, persistence, or Telegram sending |
 | `xgent_app/agent_results.py` | Normalize executor dictionaries into a common Agent result contract while preserving legacy fields; no execution, persistence, or Telegram sending |
-| `xgent_app/agent_dispatch.py` | Dispatch and normalize read, edit, grep, and run without Telegram or persistence concerns |
+| `xgent_app/agent_dispatch.py` | Dispatch and normalize read, edit, grep, run, search, and fetch without Telegram or persistence concerns |
 | `xgent_app/agent_files.py` | Execute text and base64 file writes; base64 decoding/writing is moved off the event loop |
 | `xgent_app/agent_file_delivery.py` | Send files produced by `file`/`file:base64` and preserve their Telegram captions and size-limit notices |
 | `xgent_app/agent_sendfile.py` | Execute server-file delivery, including local Bot API hard-link/copy fallback, upload indicator, timeout, and cleanup |

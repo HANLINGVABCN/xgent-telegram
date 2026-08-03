@@ -1,39 +1,6 @@
 # This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
-async def cmd_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_authorized_user_middleware(update, context):
-        return
-    
-    await UserDataManager.init()
-    message = update.message or update.callback_query.message
-    await message.reply_text(
-        "现在只有一份全局记忆，不再新建分段。用户可以直接继续聊天。",
-        reply_markup=get_main_menu()
-    )
-
-async def cmd_save_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_authorized_user_middleware(update, context):
-        return
-    
-    await UserDataManager.init()
-    message = update.message or update.callback_query.message
-    await message.reply_text(
-        "📝 现在使用的是单一全局记忆，不需要额外“保存”。对话本身一直都会直接记进去。",
-        reply_markup=get_main_menu()
-    )
-
-async def cmd_list_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_authorized_user_middleware(update, context):
-        return
-    
-    await UserDataManager.init()
-    message = update.message or update.callback_query.message
-    await message.reply_text(
-        "📂 现在只有一份全局记忆，不再提供分段列表。",
-        reply_markup=get_main_menu()
-    )
-
 async def cmd_delete_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
         return
@@ -188,16 +155,5 @@ async def cmd_export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption="导出完成。"
     )
     await status_msg.delete()
-
-async def cmd_rename_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_authorized_user_middleware(update, context):
-        return
-    
-    await UserDataManager.init()
-    message = update.message or update.callback_query.message
-    await message.reply_text(
-        "🏷️ 现在只有一份全局记忆，不再支持给当前对话单独起名。",
-        reply_markup=get_main_menu()
-    )
 
 # --- ☆ 空闲提醒系统（仅全局模式下工作）☆ ---

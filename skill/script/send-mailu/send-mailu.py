@@ -16,6 +16,7 @@ import os
 import sqlite3
 import sys
 import imaplib
+import ipaddress
 import smtplib
 import ssl
 from datetime import datetime, timezone
@@ -118,12 +119,34 @@ def resolve_security(config, smtp_port):
     return "starttls"
 
 
+def _is_ip_literal(host):
+    """host 是否是 IP 字面量（而不是域名）。"""
+    try:
+        ipaddress.ip_address(str(host or "").strip().strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
+def _tls_context(host):
+    """构造 TLS 上下文。
+
+    只有连 IP 时才关闭主机名校验（证书 CN 通常不含 IP）；连域名时保留校验。
+    以前是无条件全局关闭，等于对域名连接也放弃了主机名绑定，
+    任何持有其它受信任证书的中间人都能截获发信凭证。
+    证书链校验（verify_mode=CERT_REQUIRED）始终保持开启。
+    """
+    ctx = ssl.create_default_context()
+    if _is_ip_literal(host):
+        ctx.check_hostname = False
+    return ctx
+
+
 def smtp_connect(host, port, security, username, password):
     """
     按指定安全模式建立 SMTP 连接并登录。返回已登录的 server，失败抛异常。
     """
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False  # 允许 IP 地址连接（证书 CN 通常不含 IP）
+    ctx = _tls_context(host)
     if security == "ssl":
         server = smtplib.SMTP_SSL(host, port, timeout=10, context=ctx)
     else:
@@ -236,14 +259,12 @@ def archive_to_sent(imap_settings, raw_message):
     imap = None
     try:
         if security == "ssl":
-            imap_ctx = ssl.create_default_context()
-            imap_ctx.check_hostname = False  # 允许 IP 地址连接
+            imap_ctx = _tls_context(host)
             imap = imaplib.IMAP4_SSL(host, port, timeout=10, ssl_context=imap_ctx)
         else:
             imap = imaplib.IMAP4(host, port, timeout=10)
             if security == "starttls":
-                imap_ctx = ssl.create_default_context()
-                imap_ctx.check_hostname = False
+                imap_ctx = _tls_context(host)
                 imap.starttls(imap_ctx)
         imap.login(username, password)
 
