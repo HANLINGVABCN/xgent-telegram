@@ -490,10 +490,12 @@ ensure_python() {
 
     echo "   Python 版本: $(python3 --version)"
 
-    if python3 -c "import sys; exit(0 if sys.version_info >= (3, 8) else 1)"; then
-        success "Python 版本满足要求 (>= 3.8)"
+    if python3 -c "import sys; exit(0 if sys.version_info >= (3, 10) else 1)"; then
+        success "Python 版本满足要求 (>= 3.10)"
     else
-        error "[错误] 需要 Python 3.8 或更高版本。"
+        error "[错误] 需要 Python 3.10 或更高版本。"
+        error "       代码使用了 zoneinfo（3.9+）和 str.removesuffix（3.9+），"
+        error "       而 CI 只在 3.10/3.11/3.12 上验证，更低版本装完会在导入时崩溃。"
         exit 1
     fi
 }

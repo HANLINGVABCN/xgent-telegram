@@ -777,9 +777,11 @@ class AgentShellSessionManager:
 
         blocked, pattern = AgentCommandBlacklist.check(command)
         if blocked:
+            # 命中的规则只写日志，不回灌给模型。
+            logger.warning(f"shell 命令被黑名单拦截，命中规则: {pattern} | 命令: {command[:200]}")
             return {
                 'success': False,
-                'output': f'⛔ 命令被安全系统拦截: 命令匹配用户黑名单: {pattern}',
+                'output': BLACKLIST_BLOCKED_NOTICE,
                 'return_code': -1,
             }
 
@@ -1103,6 +1105,10 @@ class SelfTriggerManager:
     REPEAT_DUPLICATE_BACKOFF_MAX_SECONDS = 300.0
     DEFAULT_TIMEZONE = os.getenv('TRIGGER_TIMEZONE', 'Asia/Shanghai')
     MAX_CAPTURE_CHARS = 200000
+    # 触发器命令的硬上限。没有它的话，一个挂起的命令会一直占着 _task_locks
+    # 和 _runtime_tasks 槽位，之后每次调度都只记录“上一次仍在运行，跳过”，
+    # 这个任务到进程重启前都是死的，而且用户完全看不到任何提示。
+    MAX_RUN_SECONDS = float(os.getenv('TRIGGER_MAX_RUN_SECONDS', '3600'))
     _application: Optional[Application] = None
     _runtime_tasks: Dict[str, asyncio.Task] = {}
     _processes: Dict[str, Any] = {}
@@ -1282,7 +1288,8 @@ class SelfTriggerManager:
 
         blocked, pattern = AgentCommandBlacklist.check(command)
         if blocked:
-            raise ValueError(f'命令被安全系统拦截，匹配黑名单: {pattern}')
+            logger.warning(f"trigger 命令被黑名单拦截，命中规则: {pattern} | 命令: {command[:200]}")
+            raise ValueError(BLACKLIST_BLOCKED_NOTICE)
 
         return {
             'command': command,
@@ -1858,11 +1865,14 @@ class SelfTriggerManager:
         command = task['command'].strip()
         blocked, pattern = AgentCommandBlacklist.check(command)
         if blocked:
+            logger.warning(
+                f"触发器命令被黑名单拦截，命中规则: {pattern} | 命令: {command[:200]}"
+            )
             return {
                 'status': 'failed', 'trigger_reason': 'blacklist',
                 'matched_conditions': [], 'exit_code': -1, 'output': '',
                 'output_path': None,
-                'error': f'命令被安全系统拦截，匹配黑名单: {pattern}',
+                'error': BLACKLIST_BLOCKED_NOTICE,
             }
 
         condition = TriggerConditionExpression(task['condition_expr']) if task.get('condition_expr') else None
@@ -1892,12 +1902,27 @@ class SelfTriggerManager:
             **kwargs,
         )
         cls._processes[task['id']] = process
+        run_deadline = time.monotonic() + cls.MAX_RUN_SECONDS
+        run_timed_out = False
 
         with open(output_path, 'w', encoding='utf-8', errors='replace') as output_file:
             output_file.write(f"Command:\n{command}\n\nStarted at: {datetime.now().isoformat(timespec='seconds')}\n\nOutput:\n")
-            assert process.stdout is not None
+            if process.stdout is None:
+                raise RuntimeError('触发器子进程没有可读的 stdout')
             while True:
-                chunk = await process.stdout.read(4096)
+                remaining = run_deadline - time.monotonic()
+                if remaining <= 0:
+                    run_timed_out = True
+                    await terminate_async_process(process)
+                    break
+                try:
+                    chunk = await asyncio.wait_for(
+                        process.stdout.read(4096), timeout=remaining
+                    )
+                except asyncio.TimeoutError:
+                    run_timed_out = True
+                    await terminate_async_process(process)
+                    break
                 if not chunk:
                     break
                 text_chunk = decoder.decode(chunk)
@@ -1919,6 +1944,10 @@ class SelfTriggerManager:
                 if captured_length < cls.MAX_CAPTURE_CHARS:
                     captured_parts.append(final_text[:cls.MAX_CAPTURE_CHARS - captured_length])
             await process.wait()
+            if run_timed_out:
+                output_file.write(
+                    f"\n\n[超时] 命令运行超过 {int(cls.MAX_RUN_SECONDS)} 秒，已被强制终止。\n"
+                )
             output_file.write(f"\n\nFinished at: {datetime.now().isoformat(timespec='seconds')}\nExit code: {process.returncode}\n")
 
         output = ''.join(captured_parts).strip() or '(无输出)'
@@ -1926,7 +1955,14 @@ class SelfTriggerManager:
             output += f"\n\n[输出过长，内存结果仅保留前 {cls.MAX_CAPTURE_CHARS} 字符；完整输出见文件]"
         matched_conditions = condition.matched_literals() if condition else []
         exit_code = process.returncode if process.returncode is not None else -1
-        if condition:
+        if run_timed_out:
+            # 超时要覆盖条件判定：条件未命中不是因为进程正常退出，
+            # 而是被我们杀掉的，必须如实告诉用户和模型。
+            output += f"\n\n[超时] 命令运行超过 {int(cls.MAX_RUN_SECONDS)} 秒，已被强制终止。"
+            status = 'failed'
+            trigger_reason = 'timeout'
+            error = f'命令运行超过 {int(cls.MAX_RUN_SECONDS)} 秒未结束，已被强制终止'
+        elif condition:
             status = 'condition_matched' if matched else 'condition_unmatched'
             trigger_reason = 'condition_matched' if matched else 'process_exited_before_condition'
             error = None if matched else '进程已退出，但条件表达式未满足'

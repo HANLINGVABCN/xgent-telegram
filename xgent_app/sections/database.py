@@ -13,11 +13,39 @@ class BotMemoryDB:
         self.db_path = db_path
         self._connection: Optional[aiosqlite.Connection] = None
         self._connection_lock = asyncio.Lock()
+        # 全进程共用一条连接，且是自动提交模式。显式事务期间的每个 await 都会
+        # 让出控制权，别的协程此时发出的写会落进这个未关闭的事务里，跟着一起
+        # 提交或回滚（后台触发器、消息记录都是并发写，可真实触发）。所有写操作
+        # 都必须持这把锁，才能保证事务的原子性。
+        self._write_lock = asyncio.Lock()
         self._initialized = False
         # 内存缓存
         self._config_cache: Dict[str, Any] = {}
         self._providers_cache: Optional[Dict] = None
         self._cache_dirty = False
+
+    @contextlib.asynccontextmanager
+    async def _transaction(self):
+        """持写锁的显式事务：整段串行化，保证不会混入其他协程的写。"""
+        async with self._write_lock:
+            conn = await self._get_conn()
+            await conn.execute('BEGIN IMMEDIATE')
+            try:
+                yield conn
+            except BaseException:
+                try:
+                    await conn.rollback()
+                except Exception as rollback_err:
+                    logger.error(f"事务回滚失败: {rollback_err}")
+                raise
+            else:
+                await conn.commit()
+
+    @contextlib.asynccontextmanager
+    async def _write(self):
+        """单语句写：持锁即可，自动提交模式下每条语句自成事务。"""
+        async with self._write_lock:
+            yield await self._get_conn()
     
     @classmethod
     async def get_instance(cls) -> 'BotMemoryDB':
@@ -51,6 +79,9 @@ class BotMemoryDB:
                 await connection.execute("PRAGMA synchronous=NORMAL")
                 await connection.execute("PRAGMA cache_size=10000")
                 await connection.execute("PRAGMA busy_timeout=5000")
+                # 注意：这里刻意没有开启 PRAGMA foreign_keys。表里声明的
+                # FOREIGN KEY 目前不生效，开启会让历史库中已存在的孤儿行相关
+                # 写入开始报错，需要配套的数据清理和回归测试再动。
             except Exception:
                 await connection.close()
                 raise
@@ -241,12 +272,12 @@ class BotMemoryDB:
                                      role: str, content: str, session_id: Optional[str] = None,
                                      metadata: Optional[Dict[str, Any]] = None):
         """记录一条全局消息"""
-        conn = await self._get_conn()
-        await conn.execute('''
-            INSERT INTO global_messages (chat_id, user_id, msg_type, role, content, timestamp, session_id, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (chat_id, user_id, msg_type, role, content, time.time(), session_id, 
-              json.dumps(metadata) if metadata else None))
+        async with self._write() as conn:
+            await conn.execute('''
+                INSERT INTO global_messages (chat_id, user_id, msg_type, role, content, timestamp, session_id, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (chat_id, user_id, msg_type, role, content, time.time(), session_id,
+                  json.dumps(metadata) if metadata else None))
     
     async def get_global_messages(self, limit: int = 50,
                                    include_types: Optional[List[str]] = None) -> List[Dict]:
@@ -341,12 +372,12 @@ class BotMemoryDB:
     # --- 会话管理 ---
     async def create_session(self, session_id: str, model: Optional[str] = None) -> str:
         """创建新会话"""
-        conn = await self._get_conn()
         now = time.time()
-        await conn.execute('''
-            INSERT OR REPLACE INTO chat_sessions (id, name, model, last_active, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (session_id, None, model, now, now))
+        async with self._write() as conn:
+            await conn.execute('''
+                INSERT OR REPLACE INTO chat_sessions (id, name, model, last_active, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (session_id, None, model, now, now))
         return session_id
     
     async def get_session(self, session_id: str) -> Optional[Dict]:
@@ -360,12 +391,12 @@ class BotMemoryDB:
 
     async def update_session(self, session_id: str, **kwargs):
         """更新会话信息"""
-        conn = await self._get_conn()
-        for key, value in kwargs.items():
-            if key not in self._ALLOWED_SESSION_COLUMNS:
-                logger.warning(f"尝试更新非法列名: {key}，已拒绝")
-                continue
-            await conn.execute(f'UPDATE chat_sessions SET {key} = ? WHERE id = ?', (value, session_id))
+        async with self._transaction() as conn:
+            for key, value in kwargs.items():
+                if key not in self._ALLOWED_SESSION_COLUMNS:
+                    logger.warning(f"尝试更新非法列名: {key}，已拒绝")
+                    continue
+                await conn.execute(f'UPDATE chat_sessions SET {key} = ? WHERE id = ?', (value, session_id))
     
     async def get_all_sessions(self) -> List[Dict]:
         """获取所有会话"""
@@ -376,50 +407,50 @@ class BotMemoryDB:
     
     async def delete_session(self, session_id: str, delete_global_messages: bool = False) -> int:
         """删除会话及其消息，可选同时删除关联的全局记忆"""
-        conn = await self._get_conn()
         deleted_global_messages = 0
-        if delete_global_messages:
-            cursor = await conn.execute(
-                'SELECT COUNT(*) AS count FROM global_messages WHERE session_id = ?',
-                (session_id,)
-            )
-            row = await cursor.fetchone()
-            deleted_global_messages = int(row['count']) if row and row['count'] is not None else 0
-            await conn.execute('DELETE FROM global_messages WHERE session_id = ?', (session_id,))
-        await conn.execute('DELETE FROM chat_messages WHERE session_id = ?', (session_id,))
-        await conn.execute('DELETE FROM chat_sessions WHERE id = ?', (session_id,))
+        async with self._transaction() as conn:
+            if delete_global_messages:
+                cursor = await conn.execute(
+                    'SELECT COUNT(*) AS count FROM global_messages WHERE session_id = ?',
+                    (session_id,)
+                )
+                row = await cursor.fetchone()
+                deleted_global_messages = int(row['count']) if row and row['count'] is not None else 0
+                await conn.execute('DELETE FROM global_messages WHERE session_id = ?', (session_id,))
+            await conn.execute('DELETE FROM chat_messages WHERE session_id = ?', (session_id,))
+            await conn.execute('DELETE FROM chat_sessions WHERE id = ?', (session_id,))
         return deleted_global_messages
 
     async def clear_all_conversation_memory(self) -> Dict[str, int]:
         """清空对话相关记忆，保留 providers、config、prompts 等配置"""
-        conn = await self._get_conn()
+        async with self._transaction() as conn:
 
-        async def _count(table_name: str) -> int:
-            cursor = await conn.execute(f'SELECT COUNT(*) AS count FROM {table_name}')
-            row = await cursor.fetchone()
-            return int(row['count']) if row and row['count'] is not None else 0
+            async def _count(table_name: str) -> int:
+                cursor = await conn.execute(f'SELECT COUNT(*) AS count FROM {table_name}')
+                row = await cursor.fetchone()
+                return int(row['count']) if row and row['count'] is not None else 0
 
-        counts = {
-            'global_messages': await _count('global_messages'),
-            'chat_messages': await _count('chat_messages'),
-            'chat_sessions': await _count('chat_sessions'),
-        }
+            counts = {
+                'global_messages': await _count('global_messages'),
+                'chat_messages': await _count('chat_messages'),
+                'chat_sessions': await _count('chat_sessions'),
+            }
 
-        await conn.execute('DELETE FROM global_messages')
-        await conn.execute('DELETE FROM chat_messages')
-        await conn.execute('DELETE FROM chat_sessions')
+            await conn.execute('DELETE FROM global_messages')
+            await conn.execute('DELETE FROM chat_messages')
+            await conn.execute('DELETE FROM chat_sessions')
         return counts
-    
+
     # --- 内部兼容镜像消息 ---
     async def add_chat_message(self, session_id: str, role: str, content: str):
         """添加消息到内部兼容镜像"""
-        conn = await self._get_conn()
-        await conn.execute('''
-            INSERT INTO chat_messages (session_id, role, content, timestamp)
-            VALUES (?, ?, ?, ?)
-        ''', (session_id, role, content, time.time()))
-        await conn.execute('UPDATE chat_sessions SET last_active = ? WHERE id = ?', 
-                          (time.time(), session_id))
+        async with self._transaction() as conn:
+            await conn.execute('''
+                INSERT INTO chat_messages (session_id, role, content, timestamp)
+                VALUES (?, ?, ?, ?)
+            ''', (session_id, role, content, time.time()))
+            await conn.execute('UPDATE chat_sessions SET last_active = ? WHERE id = ?',
+                               (time.time(), session_id))
     
     async def get_chat_messages(self, session_id: str, limit: Optional[int] = None) -> List[Dict]:
         """获取内部兼容镜像消息"""
@@ -441,14 +472,14 @@ class BotMemoryDB:
     
     async def remove_last_chat_message(self, session_id: str):
         """移除最后一条消息"""
-        conn = await self._get_conn()
-        await conn.execute('''
-            DELETE FROM chat_messages WHERE id = (
-                SELECT id FROM chat_messages WHERE session_id = ? 
-                ORDER BY timestamp DESC LIMIT 1
-            )
-        ''', (session_id,))
-    
+        async with self._write() as conn:
+            await conn.execute('''
+                DELETE FROM chat_messages WHERE id = (
+                    SELECT id FROM chat_messages WHERE session_id = ? 
+                    ORDER BY timestamp DESC LIMIT 1
+                )
+            ''', (session_id,))
+
     # --- 配置管理（带缓存）---
     async def get_config(self, key: str, default: Any = None) -> Any:
         """获取配置"""
@@ -469,19 +500,26 @@ class BotMemoryDB:
     
     async def set_config(self, key: str, value: Any):
         """设置配置"""
-        self._config_cache[key] = value
-        conn = await self._get_conn()
+        # 先落库再更新缓存：反过来的话写库失败会让缓存与 DB 一直不一致，
+        # 直到进程重启为止。
         json_value = json.dumps(value)
-        await conn.execute('''
-            INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)
-        ''', (key, json_value))
+        async with self._write() as conn:
+            await conn.execute('''
+                INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)
+            ''', (key, json_value))
+        self._config_cache[key] = value
     
     # --- Provider管理（带缓存）---
     async def get_providers(self) -> Dict[str, Dict]:
-        """获取所有Provider"""
+        """获取所有Provider。
+
+        返回副本而不是缓存本身：调用方普遍会先就地改动（del/新增）再调用
+        save_provider/delete_provider 落库，直接交出内部字典会让写库失败后
+        缓存永久保持错误状态。
+        """
         if self._providers_cache is not None:
-            return self._providers_cache
-        
+            return copy.deepcopy(self._providers_cache)
+
         conn = await self._get_conn()
         cursor = await conn.execute('SELECT * FROM providers')
         result = {}
@@ -493,26 +531,24 @@ class BotMemoryDB:
                 'api_format': row['api_format'] if 'api_format' in row.keys() else 'openai'
             }
         self._providers_cache = result
-        return result
+        return copy.deepcopy(result)
     
     async def save_provider(self, name: str, base_url: str, api_key: str,
                             models: Optional[List[str]] = None, api_format: str = 'openai'):
         """保存Provider"""
         if api_format not in VALID_PROVIDER_API_FORMATS:
             raise ValueError(f"无效的 api_format: {api_format}，支持的格式: {', '.join(sorted(VALID_PROVIDER_API_FORMATS))}")
-        conn = await self._get_conn()
-        await conn.execute('''
-            INSERT OR REPLACE INTO providers (name, base_url, api_key, models, api_format)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (name, base_url, api_key, json.dumps(models or []), api_format))
-        # 清除缓存
-        self._providers_cache = None
+        async with self._write() as conn:
+            await conn.execute('''
+                INSERT OR REPLACE INTO providers (name, base_url, api_key, models, api_format)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (name, base_url, api_key, json.dumps(models or []), api_format))
+            # 清除缓存
+            self._providers_cache = None
     
     async def import_providers(self, providers: Dict[str, Dict[str, Any]], replace: bool = False):
         """在单个事务中批量导入 Provider；可合并或先清空后覆盖。"""
-        conn = await self._get_conn()
-        await conn.execute('BEGIN IMMEDIATE')
-        try:
+        async with self._transaction() as conn:
             if replace:
                 await conn.execute('DELETE FROM providers')
             for name, provider in providers.items():
@@ -526,19 +562,13 @@ class BotMemoryDB:
                     json.dumps(provider.get('models', []), ensure_ascii=False),
                     provider.get('api_format', 'openai')
                 ))
-            await conn.commit()
-        except Exception:
-            await conn.rollback()
-            raise
         self._providers_cache = None
 
     async def rename_provider(self, old_name: str, new_name: str):
         """原子重命名 Provider，并同步关联的默认模型提供商配置。"""
         if old_name == new_name:
             return
-        conn = await self._get_conn()
-        await conn.execute('BEGIN IMMEDIATE')
-        try:
+        async with self._transaction() as conn:
             cursor = await conn.execute('SELECT 1 FROM providers WHERE name = ?', (old_name,))
             if not await cursor.fetchone():
                 raise ValueError(f'提供商不存在：{old_name}')
@@ -557,10 +587,6 @@ class BotMemoryDB:
                 "UPDATE config SET value = ? WHERE key = 'default_media_provider' AND value IN (?, ?)",
                 (new_json, old_json, old_name)
             )
-            await conn.commit()
-        except Exception:
-            await conn.rollback()
-            raise
 
         self._providers_cache = None
         if self._config_cache.get('active_provider') == old_name:
@@ -570,26 +596,26 @@ class BotMemoryDB:
 
     async def delete_provider(self, name: str):
         """删除Provider"""
-        conn = await self._get_conn()
-        await conn.execute('DELETE FROM providers WHERE name = ?', (name,))
-        self._providers_cache = None
+        async with self._write() as conn:
+            await conn.execute('DELETE FROM providers WHERE name = ?', (name,))
+            self._providers_cache = None
     
     async def update_provider_models(self, name: str, models: List[str]):
         """更新Provider的模型列表"""
-        conn = await self._get_conn()
-        await conn.execute('UPDATE providers SET models = ? WHERE name = ?', 
-                          (json.dumps(models), name))
-        self._providers_cache = None
-    
+        async with self._write() as conn:
+            await conn.execute('UPDATE providers SET models = ? WHERE name = ?', 
+                              (json.dumps(models), name))
+            self._providers_cache = None
+
     # --- 未授权用户记录 ---
     async def record_unauthorized_access(self, user_id: int, username: Optional[str], full_name: Optional[str],
                                action_type: str, content: str, bot_reply: str):
         """记录未授权用户入侵"""
-        conn = await self._get_conn()
-        await conn.execute('''
-            INSERT INTO unauthorized_access_logs (user_id, username, full_name, action_type, content, bot_reply, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, username, full_name, action_type, content, bot_reply, time.time()))
+        async with self._write() as conn:
+            await conn.execute('''
+                INSERT INTO unauthorized_access_logs (user_id, username, full_name, action_type, content, bot_reply, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (user_id, username, full_name, action_type, content, bot_reply, time.time()))
     
     async def get_unauthorized_access_logs(self, limit: int = 500) -> List[Dict]:
         """获取未授权用户记录"""
@@ -603,28 +629,28 @@ class BotMemoryDB:
 
     # --- 持久化后台触发任务 ---
     async def create_trigger_task(self, task: Dict[str, Any]):
-        conn = await self._get_conn()
-        await conn.execute('''
-            INSERT INTO trigger_tasks (
-                id, chat_id, conversation_id, command, summary, schedule_type, schedule_expr,
-                timezone, next_run_at, condition_expr, repeat, status,
-                origin_user_text, origin_assistant_text, created_at, updated_at,
-                last_started_at, last_finished_at, fire_count, failure_count,
-                recovery_count, last_result_hash, duplicate_count, backoff_seconds,
-                backoff_until, last_error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            task['id'], task['chat_id'], task['conversation_id'], task['command'],
-            task.get('summary'), task['schedule_type'], task.get('schedule_expr'), task['timezone'],
-            task.get('next_run_at'), task.get('condition_expr'), int(bool(task.get('repeat'))),
-            task['status'], task.get('origin_user_text'), task.get('origin_assistant_text'),
-            task['created_at'], task['updated_at'], task.get('last_started_at'),
-            task.get('last_finished_at'), int(task.get('fire_count', 0)),
-            int(task.get('failure_count', 0)), int(task.get('recovery_count', 0)),
-            task.get('last_result_hash'), int(task.get('duplicate_count', 0)),
-            float(task.get('backoff_seconds', 0) or 0), task.get('backoff_until'),
-            task.get('last_error'),
-        ))
+        async with self._write() as conn:
+            await conn.execute('''
+                INSERT INTO trigger_tasks (
+                    id, chat_id, conversation_id, command, summary, schedule_type, schedule_expr,
+                    timezone, next_run_at, condition_expr, repeat, status,
+                    origin_user_text, origin_assistant_text, created_at, updated_at,
+                    last_started_at, last_finished_at, fire_count, failure_count,
+                    recovery_count, last_result_hash, duplicate_count, backoff_seconds,
+                    backoff_until, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                task['id'], task['chat_id'], task['conversation_id'], task['command'],
+                task.get('summary'), task['schedule_type'], task.get('schedule_expr'), task['timezone'],
+                task.get('next_run_at'), task.get('condition_expr'), int(bool(task.get('repeat'))),
+                task['status'], task.get('origin_user_text'), task.get('origin_assistant_text'),
+                task['created_at'], task['updated_at'], task.get('last_started_at'),
+                task.get('last_finished_at'), int(task.get('fire_count', 0)),
+                int(task.get('failure_count', 0)), int(task.get('recovery_count', 0)),
+                task.get('last_result_hash'), int(task.get('duplicate_count', 0)),
+                float(task.get('backoff_seconds', 0) or 0), task.get('backoff_until'),
+                task.get('last_error'),
+            ))
 
     async def get_trigger_task(self, task_id: str) -> Optional[Dict[str, Any]]:
         conn = await self._get_conn()
@@ -656,80 +682,81 @@ class BotMemoryDB:
             return
         updates.setdefault('updated_at', time.time())
         assignments = ', '.join(f'{key} = ?' for key in updates)
-        conn = await self._get_conn()
-        await conn.execute(
-            f'UPDATE trigger_tasks SET {assignments} WHERE id = ?',
-            (*updates.values(), task_id),
-        )
+        async with self._write() as conn:
+            await conn.execute(
+                f'UPDATE trigger_tasks SET {assignments} WHERE id = ?',
+                (*updates.values(), task_id),
+            )
 
     async def cancel_trigger_tasks(self, task_id: Optional[str] = None) -> int:
-        conn = await self._get_conn()
         now = time.time()
-        if task_id is None:
-            cursor = await conn.execute('''
-                UPDATE trigger_tasks
-                SET status = 'cancelled', next_run_at = NULL, updated_at = ?
-                WHERE status NOT IN ('completed', 'cancelled', 'failed')
-            ''', (now,))
-        else:
-            cursor = await conn.execute('''
-                UPDATE trigger_tasks
-                SET status = 'cancelled', next_run_at = NULL, updated_at = ?
-                WHERE id = ? AND status NOT IN ('completed', 'cancelled', 'failed')
-            ''', (now, task_id))
-        if task_id is None:
-            await conn.execute('''
-                UPDATE trigger_runs
-                SET delivered_at = COALESCE(delivered_at, ?)
-                WHERE delivered_at IS NULL
-                  AND task_id IN (
-                      SELECT id FROM trigger_tasks WHERE status = 'cancelled'
-                  )
-            ''', (now,))
-        else:
-            await conn.execute('''
-                UPDATE trigger_runs
-                SET delivered_at = COALESCE(delivered_at, ?)
-                WHERE task_id = ? AND delivered_at IS NULL
-            ''', (now, task_id))
-        return max(0, int(cursor.rowcount or 0))
+        async with self._transaction() as conn:
+            if task_id is None:
+                cursor = await conn.execute('''
+                    UPDATE trigger_tasks
+                    SET status = 'cancelled', next_run_at = NULL, updated_at = ?
+                    WHERE status NOT IN ('completed', 'cancelled', 'failed')
+                ''', (now,))
+            else:
+                cursor = await conn.execute('''
+                    UPDATE trigger_tasks
+                    SET status = 'cancelled', next_run_at = NULL, updated_at = ?
+                    WHERE id = ? AND status NOT IN ('completed', 'cancelled', 'failed')
+                ''', (now, task_id))
+            if task_id is None:
+                await conn.execute('''
+                    UPDATE trigger_runs
+                    SET delivered_at = COALESCE(delivered_at, ?)
+                    WHERE delivered_at IS NULL
+                      AND task_id IN (
+                          SELECT id FROM trigger_tasks WHERE status = 'cancelled'
+                      )
+                ''', (now,))
+            else:
+                await conn.execute('''
+                    UPDATE trigger_runs
+                    SET delivered_at = COALESCE(delivered_at, ?)
+                    WHERE task_id = ? AND delivered_at IS NULL
+                ''', (now, task_id))
+            return max(0, int(cursor.rowcount or 0))
 
     async def resume_legacy_auto_paused_repeat_tasks(self) -> int:
-        conn = await self._get_conn()
-        now = time.time()
-        cursor = await conn.execute('''
-            UPDATE trigger_tasks
-            SET status = 'pending', next_run_at = ?, updated_at = ?, last_error = NULL,
-                failure_count = MAX(failure_count - 1, 0),
-                duplicate_count = 0, backoff_seconds = 0, backoff_until = NULL
-            WHERE repeat = 1 AND status = 'failed'
-              AND (
-                  last_error LIKE 'repeat 任务在 %已自动暂停%'
-                  OR last_error LIKE '%消息风暴%自动暂停%'
-              )
-        ''', (now, now))
-        return max(0, int(cursor.rowcount or 0))
+        async with self._write() as conn:
+            now = time.time()
+            cursor = await conn.execute('''
+                UPDATE trigger_tasks
+                SET status = 'pending', next_run_at = ?, updated_at = ?, last_error = NULL,
+                    failure_count = MAX(failure_count - 1, 0),
+                    duplicate_count = 0, backoff_seconds = 0, backoff_until = NULL
+                WHERE repeat = 1 AND status = 'failed'
+                  AND (
+                      last_error LIKE 'repeat 任务在 %已自动暂停%'
+                      OR last_error LIKE '%消息风暴%自动暂停%'
+                  )
+            ''', (now, now))
+            return max(0, int(cursor.rowcount or 0))
 
     async def create_trigger_run(self, task_id: str, scheduled_at: float,
                                  trigger_reason: str) -> Tuple[Dict[str, Any], bool]:
-        conn = await self._get_conn()
-        run_id = f"trun_{uuid.uuid4().hex[:10]}"
-        now = time.time()
-        cursor = await conn.execute('''
-            INSERT OR IGNORE INTO trigger_runs (
-                run_id, task_id, scheduled_at, started_at, status,
-                trigger_reason, created_at
-            ) VALUES (?, ?, ?, ?, 'running', ?, ?)
-        ''', (run_id, task_id, scheduled_at, now, trigger_reason, now))
-        created = bool(cursor.rowcount)
-        row_cursor = await conn.execute(
-            'SELECT * FROM trigger_runs WHERE task_id = ? AND scheduled_at = ?',
-            (task_id, scheduled_at),
-        )
-        row = await row_cursor.fetchone()
-        if row is None:
-            raise RuntimeError(f'无法创建 trigger run: {task_id}')
-        return dict(row), created
+        # INSERT 之后要按 (task_id, scheduled_at) 把同一行读回来，必须同事务。
+        async with self._transaction() as conn:
+            run_id = f"trun_{uuid.uuid4().hex[:10]}"
+            now = time.time()
+            cursor = await conn.execute('''
+                INSERT OR IGNORE INTO trigger_runs (
+                    run_id, task_id, scheduled_at, started_at, status,
+                    trigger_reason, created_at
+                ) VALUES (?, ?, ?, ?, 'running', ?, ?)
+            ''', (run_id, task_id, scheduled_at, now, trigger_reason, now))
+            created = bool(cursor.rowcount)
+            row_cursor = await conn.execute(
+                'SELECT * FROM trigger_runs WHERE task_id = ? AND scheduled_at = ?',
+                (task_id, scheduled_at),
+            )
+            row = await row_cursor.fetchone()
+            if row is None:
+                raise RuntimeError(f'无法创建 trigger run: {task_id}')
+            return dict(row), created
 
     async def finish_trigger_run(self, run_id: str, **fields: Any):
         allowed = {
@@ -741,24 +768,24 @@ class BotMemoryDB:
         if not updates:
             return
         assignments = ', '.join(f'{key} = ?' for key in updates)
-        conn = await self._get_conn()
-        await conn.execute(
-            f'UPDATE trigger_runs SET {assignments} WHERE run_id = ?',
-            (*updates.values(), run_id),
-        )
+        async with self._write() as conn:
+            await conn.execute(
+                f'UPDATE trigger_runs SET {assignments} WHERE run_id = ?',
+                (*updates.values(), run_id),
+            )
 
     async def claim_trigger_run_delivery(self, run_id: str, claimed_at: float) -> bool:
         """Atomically claim one finished trigger run for exactly-once delivery."""
-        conn = await self._get_conn()
-        cursor = await conn.execute('''
-            UPDATE trigger_runs
-            SET delivery_started_at = ?
-            WHERE run_id = ?
-              AND finished_at IS NOT NULL
-              AND delivered_at IS NULL
-              AND delivery_started_at IS NULL
-        ''', (claimed_at, run_id))
-        return bool(cursor.rowcount)
+        async with self._write() as conn:
+            cursor = await conn.execute('''
+                UPDATE trigger_runs
+                SET delivery_started_at = ?
+                WHERE run_id = ?
+                  AND finished_at IS NOT NULL
+                  AND delivered_at IS NULL
+                  AND delivery_started_at IS NULL
+            ''', (claimed_at, run_id))
+            return bool(cursor.rowcount)
 
     async def get_trigger_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         conn = await self._get_conn()
@@ -781,21 +808,21 @@ class BotMemoryDB:
     async def suppress_trigger_runs(self, run_ids: List[str], reason: str) -> int:
         if not run_ids:
             return 0
-        conn = await self._get_conn()
-        placeholders = ', '.join('?' for _ in run_ids)
-        now = time.time()
-        cursor = await conn.execute(
-            f'''
-            UPDATE trigger_runs
-            SET delivered_at = COALESCE(delivered_at, ?),
-                status = 'suppressed',
-                trigger_reason = 'backlog_suppressed',
-                error = CASE WHEN error IS NULL OR error = '' THEN ? ELSE error END
-            WHERE run_id IN ({placeholders}) AND delivered_at IS NULL
-            ''',
-            (now, reason, *run_ids),
-        )
-        return max(0, int(cursor.rowcount or 0))
+        async with self._write() as conn:
+            placeholders = ', '.join('?' for _ in run_ids)
+            now = time.time()
+            cursor = await conn.execute(
+                f'''
+                UPDATE trigger_runs
+                SET delivered_at = COALESCE(delivered_at, ?),
+                    status = 'suppressed',
+                    trigger_reason = 'backlog_suppressed',
+                    error = CASE WHEN error IS NULL OR error = '' THEN ? ELSE error END
+                WHERE run_id IN ({placeholders}) AND delivered_at IS NULL
+                ''',
+                (now, reason, *run_ids),
+            )
+            return max(0, int(cursor.rowcount or 0))
 
     async def list_undelivered_trigger_runs(self) -> List[Dict[str, Any]]:
         conn = await self._get_conn()
@@ -814,61 +841,71 @@ class BotMemoryDB:
         return [dict(row) for row in rows]
 
     async def finalize_interrupted_trigger_deliveries(self) -> List[Dict[str, Any]]:
-        conn = await self._get_conn()
-        cursor = await conn.execute('''
-            SELECT r.*
-            FROM trigger_runs r
-            JOIN trigger_tasks t ON t.id = r.task_id
-            WHERE r.finished_at IS NOT NULL
-              AND r.delivered_at IS NULL
-              AND r.delivery_started_at IS NOT NULL
-              AND t.status != 'cancelled'
-            ORDER BY r.delivery_started_at ASC
-        ''')
-        rows = [dict(row) for row in await cursor.fetchall()]
-        if not rows:
-            return []
-        run_ids = [row['run_id'] for row in rows]
-        placeholders = ', '.join('?' for _ in run_ids)
-        await conn.execute(
-            f'''
-            UPDATE trigger_runs
-            SET delivered_at = ?
-            WHERE run_id IN ({placeholders}) AND delivered_at IS NULL
-            ''',
-            (time.time(), *run_ids),
-        )
-        return rows
+        # SELECT 出来的 run_id 紧接着被 UPDATE，必须同事务，
+        # 否则中途崩溃会让这批 run 既被返回投递、又没标记 delivered_at。
+        async with self._transaction() as conn:
+            cursor = await conn.execute('''
+                SELECT r.*
+                FROM trigger_runs r
+                JOIN trigger_tasks t ON t.id = r.task_id
+                WHERE r.finished_at IS NOT NULL
+                  AND r.delivered_at IS NULL
+                  AND r.delivery_started_at IS NOT NULL
+                  AND t.status != 'cancelled'
+                ORDER BY r.delivery_started_at ASC
+            ''')
+            rows = [dict(row) for row in await cursor.fetchall()]
+            if not rows:
+                return []
+            run_ids = [row['run_id'] for row in rows]
+            placeholders = ', '.join('?' for _ in run_ids)
+            await conn.execute(
+                f'''
+                UPDATE trigger_runs
+                SET delivered_at = ?
+                WHERE run_id IN ({placeholders}) AND delivered_at IS NULL
+                ''',
+                (time.time(), *run_ids),
+            )
+            return rows
 
     async def interrupt_running_trigger_runs(self) -> int:
-        conn = await self._get_conn()
         now = time.time()
-        cursor = await conn.execute('''
-            UPDATE trigger_runs
-            SET status = 'interrupted', finished_at = ?,
-                delivered_at = ?,
-                error = COALESCE(error, 'Bot 进程退出，操作系统子进程不可恢复')
-            WHERE status = 'running' AND finished_at IS NULL
-        ''', (now, now))
-        await conn.execute('''
-            UPDATE trigger_tasks
-            SET status = 'recovering', recovery_count = recovery_count + 1,
-                updated_at = ?, last_error = 'Bot 重启后重新执行任务'
-            WHERE status = 'running'
-              AND EXISTS (
-                  SELECT 1 FROM trigger_runs r
-                  WHERE r.task_id = trigger_tasks.id
-                    AND r.status = 'interrupted'
-                    AND r.delivered_at = ?
-              )
-        ''', (now, now))
-        return max(0, int(cursor.rowcount or 0))
+        # 两条 UPDATE 必须同事务：第二条靠 delivered_at = now 关联第一条改过的行，
+        # 中途崩溃会让 run 标成 interrupted 而 task 仍停在 running，之后
+        # scheduled_at 撞 UNIQUE 约束、INSERT OR IGNORE 静默失败，任务永久不再执行。
+        async with self._transaction() as conn:
+            cursor = await conn.execute('''
+                UPDATE trigger_runs
+                SET status = 'interrupted', finished_at = ?,
+                    delivered_at = ?,
+                    error = COALESCE(error, 'Bot 进程退出，操作系统子进程不可恢复')
+                WHERE status = 'running' AND finished_at IS NULL
+            ''', (now, now))
+            await conn.execute('''
+                UPDATE trigger_tasks
+                SET status = 'recovering', recovery_count = recovery_count + 1,
+                    updated_at = ?, last_error = 'Bot 重启后重新执行任务'
+                WHERE status = 'running'
+                  AND EXISTS (
+                      SELECT 1 FROM trigger_runs r
+                      WHERE r.task_id = trigger_tasks.id
+                        AND r.status = 'interrupted'
+                        AND r.delivered_at = ?
+                  )
+            ''', (now, now))
+            return max(0, int(cursor.rowcount or 0))
 
     async def close(self):
         """关闭连接"""
         async with self._connection_lock:
             connection = self._connection
             self._connection = None
+            # 复位初始化标记：否则关闭后任何迟到的调用都会静默新建一条
+            # 永远不会被关闭的连接。
+            self._initialized = False
+            self._config_cache = {}
+            self._providers_cache = None
             if connection is not None:
                 await connection.close()
 
@@ -954,8 +991,9 @@ class UserDataManager:
     @classmethod
     async def save_config(cls, key: str, value: Any):
         """保存配置到数据库"""
-        cls._data[key] = value
+        # 先落库再更新内存缓存，写库失败时不留下与 DB 不一致的缓存值。
         await cls._require_db().set_config(key, value)
+        cls._data[key] = value
     
     @classmethod
     async def reload_providers(cls):

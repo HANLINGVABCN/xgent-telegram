@@ -20,7 +20,14 @@ class ModelClient:
             client = cls._http_client
             if client is None or client.is_closed:
                 cls._http_client = httpx.AsyncClient(
-                    timeout=None,  # 各请求显式传入原有 timeout，避免改变语义
+                    # 各请求会显式传入自己的 timeout；这里的默认值只是兜底，
+                    # 避免任何漏传 timeout 的调用点变成永不超时的静默挂起。
+                    timeout=httpx.Timeout(
+                        connect=20.0,
+                        read=DEFAULT_HTTP_READ_TIMEOUT_SECONDS,
+                        write=60.0,
+                        pool=60.0,
+                    ),
                     follow_redirects=True,
                     limits=httpx.Limits(
                         max_connections=32,
@@ -803,7 +810,7 @@ class ModelClient:
                 return models, None
 
             client = PortalManager.get_portal(prov_name, selected_key, base_url)
-            response = await client.models.list()
+            response = await client.models.list(timeout=MODEL_LIST_TIMEOUT_SECONDS)
             model_ids = []
             for m in response.data:
                 if hasattr(m, 'id'):
@@ -967,12 +974,15 @@ class ModelClient:
                 logger.info(f"Provider {prov_name} does not support stream usage metadata; retrying without it")
                 stream = await ModelClient._chat_completions_api(client).create(**request_kwargs)
             
-            async for chunk in stream:
-                record_token_usage(usage_sink, _value_from_obj(chunk, 'usage'))
-                if chunk.choices and chunk.choices[0].delta.content:
-                    chunk_text = ModelClient._model_content_to_text(chunk.choices[0].delta.content)
-                    if chunk_text:
-                        yield chunk_text
+            # 用 async with 持有 stream：async for 中途抛错或生成器被提前关闭时，
+            # 底层响应也能确定性释放，不依赖 GC。
+            async with stream:
+                async for chunk in stream:
+                    record_token_usage(usage_sink, _value_from_obj(chunk, 'usage'))
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        chunk_text = ModelClient._model_content_to_text(chunk.choices[0].delta.content)
+                        if chunk_text:
+                            yield chunk_text
                     
         except Exception as e:
             err_msg = str(e)

@@ -33,6 +33,7 @@ import subprocess
 import re
 import threading
 import contextlib
+import copy
 import shutil
 import tempfile
 import fnmatch
@@ -196,6 +197,27 @@ MIN_IDLE_MESSAGE_INTERVAL = 60
 # AI 回复超时设为“不限”时，非流式请求的兜底上限。非流式没有增量输出，
 # 连接静默挂起会让界面永远停在“非流式输出中...”，必须有个硬上限。
 NONSTREAM_FALLBACK_TIMEOUT_SECONDS = 600.0
+# 流式请求的“两个分片之间”最长静默时间。流式已经产出的增量可以保留，
+# 所以这里限制的是单次等待而不是整轮总时长——长回复只要持续出字就不会被打断，
+# 但提供商建连后不发数据时不会永久挂住全局对话锁。
+STREAM_CHUNK_IDLE_TIMEOUT_SECONDS = 180.0
+# typing 状态任务的防泄漏兜底。调用方异常退出而没有 set stop_event 时，
+# typing 任务会每 4 秒发一次状态直到进程结束，这里给一个远大于正常回复
+# 时长的上限，只用于兜底，不作为功能限制。
+TYPING_MAX_DURATION_SECONDS = 1800.0
+# 共享 HTTP 客户端的默认读超时。调用方通常会显式传入自己的 timeout，
+# 这个值只用于兜底，避免漏传的调用点变成永不超时。
+DEFAULT_HTTP_READ_TIMEOUT_SECONDS = 300.0
+# 拉取模型列表是交互式操作，用户在等结果，超时要短。
+MODEL_LIST_TIMEOUT_SECONDS = 20.0
+# 空闲提醒是后台任务，没人盯着，必须有硬上限，否则提供商挂起会让它永久卡住。
+IDLE_MESSAGE_TIMEOUT_SECONDS = 300.0
+# 命令被黑名单拦截时回给模型的统一文案。刻意不包含命中的具体规则——
+# 把匹配到哪一条告诉模型，等于直接指导它改写命令绕过。规则详情只写日志。
+BLACKLIST_BLOCKED_NOTICE = (
+    '⛔ 命令被安全策略拦截，未执行。'
+    '如果确认这条命令是必要的，请让用户在「Agent 命令黑名单」菜单里调整规则。'
+)
 PROVIDER_HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -949,9 +971,12 @@ class AgentCommandBlacklist:
     def init(cls):
         os.makedirs(os.path.dirname(cls.FILE_PATH), exist_ok=True)
         if not os.path.exists(cls.FILE_PATH):
+            # 首次创建就写入推荐名单。以前这里只写注释头，等于开箱即用状态下
+            # 黑名单是空的、任何命令都放行，而推荐名单要用户自己去菜单里点
+            # “追加推荐名单”才生效——没人点就等于没有防护。
             with open(cls.FILE_PATH, 'w', encoding='utf-8') as f:
-                f.write(cls.HEADER)
-            logger.info("已创建 Agent 命令黑名单文件")
+                f.write(cls.HEADER + "\n" + "\n".join(cls.RECOMMENDED_PATTERNS) + "\n")
+            logger.info(f"已创建 Agent 命令黑名单文件，写入 {len(cls.RECOMMENDED_PATTERNS)} 条推荐规则")
         cls.reload()
 
     @classmethod
@@ -984,8 +1009,11 @@ class AgentCommandBlacklist:
                 cls._patterns = cls.parse(f.read())
             logger.info(f"加载 Agent 命令黑名单: {len(cls._patterns)} 条")
         except Exception as e:
-            logger.error(f"加载 Agent 命令黑名单失败: {e}")
-            cls._patterns = []
+            # 保留上一次成功加载的规则。以前这里会清空成 []，等于读文件一失败
+            # 就把所有命令全部放行——安全控制失效时必须保守，不能 fail-open。
+            logger.error(
+                f"加载 Agent 命令黑名单失败，继续沿用已加载的 {len(cls._patterns)} 条规则: {e}"
+            )
         return cls._patterns
 
     @classmethod
@@ -1017,13 +1045,75 @@ class AgentCommandBlacklist:
     def get_display_path(cls) -> str:
         return os.path.abspath(cls.FILE_PATH).replace('\\', '/')
 
+    # shell 里能把同一条命令写成很多形态：多个空格、制表符、${IFS}、
+    # 反斜杠转义（\rm）、把命令名拆开的引号（'r'm）。朴素的子串匹配
+    # 只要碰上任意一种就失效，所以比较前先把两边都规范化。
+    _IFS_RE = re.compile(r'\$\{IFS\}|\$IFS', re.IGNORECASE)
+    _ESCAPE_RE = re.compile(r'\\(?=[A-Za-z0-9])')
+    _QUOTE_RE = re.compile(r'[\'"`]')
+    _WHITESPACE_RE = re.compile(r'\s+')
+
+    @classmethod
+    def normalize_for_match(cls, text: str) -> str:
+        """把命令/规则压成可比较的规范形态。"""
+        normalized = cls._IFS_RE.sub(' ', text or '')
+        normalized = cls._ESCAPE_RE.sub('', normalized)
+        normalized = cls._QUOTE_RE.sub('', normalized)
+        normalized = cls._WHITESPACE_RE.sub(' ', normalized)
+        return normalized.strip().lower()
+
     @classmethod
     def check(cls, command: str) -> Tuple[bool, str]:
-        cmd_lower = command.lower().strip()
+        normalized_cmd = cls.normalize_for_match(command)
+        # 再准备一份去掉全部空白的形态，用来识别 `curl|sh` 这种
+        # 把规则里的空格直接删掉的写法。
+        squeezed_cmd = normalized_cmd.replace(' ', '')
         for pattern in cls._patterns:
-            if pattern.lower() in cmd_lower:
+            normalized_pattern = cls.normalize_for_match(pattern)
+            if not normalized_pattern:
+                continue
+            if normalized_pattern in normalized_cmd:
+                return True, pattern
+            squeezed_pattern = normalized_pattern.replace(' ', '')
+            if squeezed_pattern and squeezed_pattern in squeezed_cmd:
+                return True, pattern
+            if cls._matches_piped_pattern(normalized_pattern, normalized_cmd):
                 return True, pattern
         return False, ""
+
+    @classmethod
+    def _matches_piped_pattern(cls, normalized_pattern: str, normalized_cmd: str) -> bool:
+        """处理 `curl | sh` 这类跨管道的规则。
+
+        规则里两段之间通常什么都没有，而真实命令中间还有 URL、参数等内容
+        （`curl -fsSL https://x | bash`）。所以对含管道的规则改为按顺序匹配
+        各段，而不是要求整串连续出现。
+        """
+        if '|' not in normalized_pattern:
+            return False
+        segments = [seg.strip() for seg in normalized_pattern.split('|')]
+        if not all(segments):
+            return False
+        cmd_segments = [seg.strip() for seg in normalized_cmd.split('|')]
+        if len(cmd_segments) < len(segments):
+            return False
+        # 在命令的管道分段里按顺序找齐规则的每一段。
+        search_from = 0
+        for index, segment in enumerate(segments):
+            for cmd_index in range(search_from, len(cmd_segments)):
+                cmd_segment = cmd_segments[cmd_index]
+                # 规则的第一段允许作为前缀出现（curl 后面可以跟参数和 URL），
+                # 后续段要求整段就是它，避免 `| shasum` 命中 `| sh`。
+                if index == 0:
+                    hit = cmd_segment == segment or cmd_segment.startswith(segment + ' ')
+                else:
+                    hit = cmd_segment == segment
+                if hit:
+                    search_from = cmd_index + 1
+                    break
+            else:
+                return False
+        return True
 
 
 AgentCommandBlacklist.init()

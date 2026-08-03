@@ -1,4 +1,5 @@
 import hashlib
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,6 +7,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SECTION_DIR = ROOT / "xgent_app" / "sections"
+sys.path.insert(0, str(ROOT))
+
+from tools.check_split_integrity import section_body
 
 
 def read_manifest():
@@ -28,11 +32,19 @@ class SplitIntegrityTests(unittest.TestCase):
             self.assertTrue(path.is_file(), filename)
             source = path.read_text(encoding="utf-8")
             compile(source, str(path), "exec")
-            chunks.append(source.split("\n\n", 1)[1])
+            chunks.append(section_body(source))
 
         digest = hashlib.sha256("".join(chunks).encode("utf-8")).hexdigest()
         expected = (SECTION_DIR / "SOURCE_BASELINE.sha256").read_text(encoding="utf-8").strip()
-        self.assertEqual(expected, digest)
+        self.assertEqual(
+            expected,
+            digest,
+            "section 源码与基线不一致；改动属预期时运行 python tools/check_split_integrity.py --write",
+        )
+
+    def test_section_body_tolerates_missing_blank_line(self):
+        self.assertEqual("", section_body("X = 1\n"))
+        self.assertEqual("body\n", section_body("header\n\nbody\n"))
 
     def test_entrypoint_is_small(self):
         source = (ROOT / "xgent_server.py").read_text(encoding="utf-8")

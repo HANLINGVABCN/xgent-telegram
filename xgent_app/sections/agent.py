@@ -1502,9 +1502,12 @@ class AgentExecutor:
 
         blocked, pattern = AgentCommandBlacklist.check(command)
         if blocked:
+            # 命中的规则只写日志，不回灌给模型：告诉它具体匹配了哪一条，
+            # 等于直接指导它改写命令来绕过。
+            logger.warning(f"run 命令被黑名单拦截，命中规则: {pattern} | 命令: {command[:200]}")
             return {
                 'success': False,
-                'output': f'⛔ 命令被安全系统拦截: 命令匹配用户黑名单: {pattern}',
+                'output': BLACKLIST_BLOCKED_NOTICE,
                 'return_code': -1,
             }
 

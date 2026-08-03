@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/HANLINGVABCN/xgent-telegram/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/HANLINGVABCN/xgent-telegram/actions/workflows/tests.yml/badge.svg"></a>
   <a href="https://github.com/HANLINGVABCN/xgent-telegram/blob/main/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
-  <img alt="Python 3.8+" src="https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white">
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white">
   <img alt="Self-hosted" src="https://img.shields.io/badge/Self--hosted-private-24A1DE?logo=telegram&logoColor=white">
 </p>
 
@@ -96,7 +96,7 @@ flowchart LR
 
 ### 准备
 
-- Linux 服务器与可用的 Python 3.8+
+- Linux 服务器与可用的 Python 3.10+
 - 从 [BotFather](https://t.me/BotFather) 获取的 Telegram Bot Token
 - 你的 Telegram 用户 ID
 - 至少一个可用的模型 API Key

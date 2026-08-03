@@ -912,6 +912,22 @@ class TelegramStreamRenderer:
             self.live_edit_enabled = False
             logger.warning(f"流式消息刷新失败，改为结束后一次性发送: {e}")
 
+def _stream_chunk_idle_timeout_seconds() -> float:
+    """流式请求两个分片之间的最长静默时间（秒）。
+
+    用户把 AI 回复超时设为“不限”（0）时，底层 HTTP 读超时也是 None，提供商
+    建连后不发任何分片就会永久阻塞在 asyncio.wait 上，而这段代码持有全局
+    对话锁，结果是整个 bot 对所有消息只回“仍在处理”。
+
+    流式与非流式的区别在于：已经产出的增量值得保留，所以限制的是单次等待
+    而不是整轮总时长——持续出字的长回复不会被误伤。
+    """
+    configured = normalize_stream_timeout(UserDataManager.get('stream_timeout', 0))
+    if configured <= 0:
+        return STREAM_CHUNK_IDLE_TIMEOUT_SECONDS
+    return configured + 30.0
+
+
 async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                    prov_name: str, prov_data: Dict, model: str,
                                    system_prompt: str, history: List[Dict],
@@ -951,7 +967,10 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
         renderer.start()
         typing_stop = asyncio.Event()
         typing_task = asyncio.create_task(
-            keep_typing_while_waiting(context, chat_id, typing_stop)
+            keep_typing_while_waiting(
+                context, chat_id, typing_stop,
+                max_duration=TYPING_MAX_DURATION_SECONDS
+            )
         )
 
         stream_iter = ModelClient.think_and_reply_stream(
@@ -962,13 +981,23 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             trace_id=trace_id
         ).__aiter__()
         stop_task = asyncio.create_task(stop_event.wait())
+        stream_timed_out = False
         try:
             while True:
                 next_chunk_task = asyncio.create_task(stream_iter.__anext__())
+                # 这个 wait 必须有超时：提供商建连后不发分片时 next_chunk_task 和
+                # stop_task 都不会完成，没有 timeout 就永久阻塞，而此处持有全局
+                # 对话锁，整个 bot 会对所有消息只回“仍在处理”。
                 done, _pending = await asyncio.wait(
                     {next_chunk_task, stop_task},
-                    return_when=asyncio.FIRST_COMPLETED
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=_stream_chunk_idle_timeout_seconds()
                 )
+
+                if not done:
+                    stream_timed_out = True
+                    await cancel_task_quietly(next_chunk_task, timeout=1.0)
+                    break
 
                 if stop_task in done and stop_event.is_set():
                     stopped_by_user = True
@@ -1028,6 +1057,42 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             if stopped_partial_sink is not None:
                 stopped_partial_sink.append(''.join(raw_response_parts).strip())
             return None
+
+        if stream_timed_out:
+            waited = int(_stream_chunk_idle_timeout_seconds())
+            partial = ''.join(raw_response_parts).strip()
+            write_model_trace("model_error", {
+                "trace_id": trace_id,
+                "provider": prov_name,
+                "provider_format": prov_data.get('api_format', 'openai'),
+                "model": model,
+                "stream": True,
+                "error": "stream chunk idle timeout",
+                "partial_response": partial,
+                "usage": usage_sink[0] if usage_sink else None,
+                "elapsed_seconds": time.monotonic() - generation_started_at,
+            })
+            timeout_notice = (
+                f"\n\n⏱️ 已超过 {waited} 秒没有收到新内容，本次流式回复被中断。"
+                "上面是已经收到的部分；可以直接重发这条消息重试。"
+            )
+            if renderer and not native_media_detected:
+                try:
+                    await renderer.append(timeout_notice)
+                except Exception as e:
+                    logger.warning(f"流式超时提示追加失败: {e}")
+                partial = (await renderer.finish()) or partial
+            elif msg:
+                try:
+                    await safe_edit_text(msg, (partial + timeout_notice).strip(), reply_markup=None)
+                except Exception as e:
+                    logger.warning(f"流式超时提示发送失败: {e}")
+            await send_token_usage_message(
+                context, chat_id,
+                usage_sink[0] if usage_sink else None,
+                time.monotonic() - generation_started_at
+            )
+            return partial or timeout_notice.strip()
 
         if not native_media_detected and renderer and has_media_artifacts(extra_media_artifacts):
             notice_text = build_media_autosave_notice_text(
@@ -1186,7 +1251,10 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
         )
         typing_stop = asyncio.Event()
         typing_task = asyncio.create_task(
-            keep_typing_while_waiting(context, chat_id, typing_stop)
+            keep_typing_while_waiting(
+                context, chat_id, typing_stop,
+                max_duration=TYPING_MAX_DURATION_SECONDS
+            )
         )
 
         response_task = asyncio.create_task(ModelClient.think_and_reply(

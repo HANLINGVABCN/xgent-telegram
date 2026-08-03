@@ -37,8 +37,10 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
         model = UserDataManager.get('default_model')
         if not model:
             return
-        assert prov_name is not None
-        
+        if prov_name is None:
+            logger.warning("空闲提醒跳过：当前 provider 名称为空")
+            return
+
         # 获取全局对话记忆
         global_depth = max(1, int(UserDataManager.get('global_depth', 30)))
         global_history = await db.get_conversation_messages(global_depth)
@@ -48,13 +50,24 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
             build_conversation_system_prompt(agent_mode) +
             format_prompt_template('idle_message_prompt', hours_passed=int(hours_passed))
         )
-        
-        # 生成提醒消息
-        response, error = await ModelClient.think_and_reply(
-            prov_name, get_next_api_key(prov_name, prov_data['api_key']), prov_data['base_url'],
-            model, idle_prompt, global_history,
-            api_format=prov_data.get('api_format', 'openai')
-        )
+
+        # 生成提醒消息。必须有硬上限：AI 回复超时设为“不限”时底层 HTTP 也不会
+        # 超时，提供商静默挂起会让这个后台任务永远卡住，之后的空闲提醒全部停摆。
+        try:
+            response, error = await asyncio.wait_for(
+                ModelClient.think_and_reply(
+                    prov_name, get_next_api_key(prov_name, prov_data['api_key']), prov_data['base_url'],
+                    model, idle_prompt, global_history,
+                    api_format=prov_data.get('api_format', 'openai')
+                ),
+                timeout=IDLE_MESSAGE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"空闲提醒生成超时（>{int(IDLE_MESSAGE_TIMEOUT_SECONDS)}s）: "
+                f"provider={prov_name}, model={model}"
+            )
+            return
 
         response_text = (response or "").strip()
         if not response_text:
