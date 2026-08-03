@@ -44,6 +44,9 @@ def _load_db_class():
         'VALID_PROVIDER_API_FORMATS': {'openai'},
         # 只在读取路径用到的过滤器，这里不参与被测逻辑。
         'is_redundant_agent_command_record': lambda *a, **kw: False,
+        # 脱敏名单登记，真实运行时由 core section 提供。
+        'register_runtime_secret': lambda *a, **kw: None,
+        'register_provider_secrets': lambda *a, **kw: None,
     }
 
     class _Cfg:

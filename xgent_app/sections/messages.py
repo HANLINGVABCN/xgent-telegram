@@ -1014,9 +1014,13 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     if state == BotState.ADD_PROV_URL:
-        if not text.startswith("http"):
-            await update.message.reply_text("⚠️ 必须是 http 开头。")
+        try:
+            text, url_warning = validate_provider_base_url(text)
+        except ValueError as exc:
+            await update.message.reply_text(f"⚠️ {exc}")
             return
+        if url_warning:
+            await update.message.reply_text(url_warning)
         UserDataManager.set('temp_prov_url', text)
         UserDataManager.set('state', BotState.ADD_PROV_KEY)
         api_format = UserDataManager.get('temp_prov_format', 'openai_compatible')
@@ -1131,6 +1135,13 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if state == BotState.EDIT_PROV_URL:
         p = UserDataManager.get('editing_provider')
         providers = UserDataManager.get('providers', {})
+        try:
+            text, url_warning = validate_provider_base_url(text)
+        except ValueError as exc:
+            await update.message.reply_text(f"⚠️ {exc}")
+            return
+        if url_warning:
+            await update.message.reply_text(url_warning)
         if p and p in providers:
             providers[p]['base_url'] = text
             prov = providers[p]

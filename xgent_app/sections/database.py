@@ -531,6 +531,8 @@ class BotMemoryDB:
                 'api_format': row['api_format'] if 'api_format' in row.keys() else 'openai'
             }
         self._providers_cache = result
+        # 登记 api_key 供日志/错误脱敏使用
+        register_provider_secrets(result)
         return copy.deepcopy(result)
     
     async def save_provider(self, name: str, base_url: str, api_key: str,
@@ -545,6 +547,7 @@ class BotMemoryDB:
             ''', (name, base_url, api_key, json.dumps(models or []), api_format))
             # 清除缓存
             self._providers_cache = None
+        register_runtime_secret(api_key)
     
     async def import_providers(self, providers: Dict[str, Dict[str, Any]], replace: bool = False):
         """在单个事务中批量导入 Provider；可合并或先清空后覆盖。"""
@@ -563,6 +566,7 @@ class BotMemoryDB:
                     provider.get('api_format', 'openai')
                 ))
         self._providers_cache = None
+        register_provider_secrets(providers)
 
     async def rename_provider(self, old_name: str, new_name: str):
         """原子重命名 Provider，并同步关联的默认模型提供商配置。"""

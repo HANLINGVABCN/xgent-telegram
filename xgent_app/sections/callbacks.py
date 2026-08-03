@@ -976,6 +976,9 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif data == "export_provider_config":
             await send_provider_config_export(update, context)
 
+        elif data == "export_provider_config_secrets":
+            await send_provider_config_export(update, context, include_secrets=True)
+
         elif data == "import_provider_config":
             UserDataManager.set('state', BotState.IDLE)
             UserDataManager.set('provider_import_mode', None)
@@ -1195,7 +1198,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"🧭 说明: {safe_text(platform_hint)}\n"
                 f"🔗 Base URL: <code>{safe_text(prov['base_url'])}</code>\n"
                 f"📨 请求形式: <code>{safe_text(request_hint)}</code>\n"
-                f"🔑 API Key: {masked_key}"
+                f"🔑 API Key: {safe_text(masked_key)}"
             )
             await query.message.edit_text(
                 info,

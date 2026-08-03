@@ -218,6 +218,36 @@ BLACKLIST_BLOCKED_NOTICE = (
     '⛔ 命令被安全策略拦截，未执行。'
     '如果确认这条命令是必要的，请让用户在「Agent 命令黑名单」菜单里调整规则。'
 )
+def validate_provider_base_url(url: str) -> Tuple[str, Optional[str]]:
+    """校验 provider 的 base_url。
+
+    返回 (清理后的 url, 警告文案或 None)；不合法时抛 ValueError。
+
+    之前有三个入口三套规则：JSON 导入严格校验、交互式添加只判 startswith("http")
+    （`httpevil.com` 都能过），编辑 URL 完全不校验。这里统一。
+    """
+    cleaned = str(url or '').strip()
+    if not cleaned:
+        raise ValueError('URL 不能为空')
+    lowered = cleaned.lower()
+    if not lowered.startswith(('http://', 'https://')):
+        raise ValueError('URL 必须以 http:// 或 https:// 开头')
+    parsed = urllib.parse.urlparse(cleaned)
+    if not parsed.netloc:
+        raise ValueError('URL 缺少主机名')
+
+    warning = None
+    if lowered.startswith('http://'):
+        host = (parsed.hostname or '').lower()
+        is_local = host in ('localhost', '127.0.0.1', '::1') or host.endswith('.localhost')
+        if not is_local:
+            warning = (
+                '⚠️ 这个地址用的是 http:// 明文传输，API Key 会以明文经过网络。'
+                '除非是内网自建服务，建议改用 https://。'
+            )
+    return cleaned, warning
+
+
 PROVIDER_HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -240,7 +270,37 @@ def redact_sensitive_text(text: str) -> str:
     for secret, replacement in secrets.items():
         if secret:
             text = text.replace(secret, replacement)
+    # provider 的 api_key 存在数据库里，不是环境变量常量，但它同样会出现在
+    # 错误响应体、trace 日志里，必须一起脱敏。
+    for secret in _runtime_secrets():
+        text = text.replace(secret, "[REDACTED_API_KEY]")
     return text
+
+
+# provider 的 api_key 在运行时才知道，这里维护一份供脱敏使用的快照。
+# 用 set 而不是每次去查数据库：脱敏在错误处理和日志热路径上，不能是 async。
+_RUNTIME_SECRETS: set = set()
+
+
+def _runtime_secrets() -> set:
+    return _RUNTIME_SECRETS
+
+
+def register_runtime_secret(value: Any) -> None:
+    """登记一个需要脱敏的运行时密钥（provider api_key 等）。"""
+    for key in parse_api_keys(str(value or '')):
+        # 太短的值容易在正常文本里误伤，跳过。
+        if len(key) >= 8:
+            _RUNTIME_SECRETS.add(key)
+
+
+def register_provider_secrets(providers: Optional[Dict[str, Any]]) -> None:
+    """把所有 provider 的 api_key 登记进脱敏名单。"""
+    if not providers:
+        return
+    for provider in providers.values():
+        if isinstance(provider, dict):
+            register_runtime_secret(provider.get('api_key'))
 
 def format_provider_exception(e: Exception) -> str:
     response = getattr(e, "response", None)
@@ -463,6 +523,9 @@ def write_model_trace(event: str, payload: Dict[str, Any]):
             **trace_json_safe(payload),
         }
         line = json.dumps(record, ensure_ascii=False, default=repr)
+        # 落盘前脱敏：trace 里包含完整 prompt 和响应体，provider 的 api_key
+        # 会随请求头/错误体一起被记进去。
+        line = redact_sensitive_text(line)
         with FULL_TRACE_LOCK:
             with open(FULL_TRACE_LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(line + "\n")

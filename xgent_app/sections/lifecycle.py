@@ -3,24 +3,26 @@
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("全局错误处理捕获异常", exc_info=context.error)
-    
-    # 尝试记录错误
+
+    # 尝试记录错误。必须脱敏：SYSTEM_OP 记录会被重新注入模型上下文
+    # （见 get_conversation_messages），异常串里的密钥会被持续外发给
+    # 第三方 provider。
     try:
         await GlobalRecorder.record_system_op(
-            f"错误: {str(context.error)[:200]}",
-            {"traceback": traceback.format_exc()[:500]}
+            redact_sensitive_text(f"错误: {str(context.error)[:200]}"),
+            {"traceback": redact_sensitive_text(traceback.format_exc()[:500])}
         )
     except Exception as record_err:
         logger.warning(f"记录错误信息失败: {record_err}")
-    
-    # 尝试通知用户
+
+    # 尝试通知用户。异常原文可能带文件路径、provider 名、URL 里的密钥，
+    # 这里只给固定文案，详情去日志看。
     try:
         if update and hasattr(update, 'effective_chat') and update.effective_chat:
             await safe_send_message(
                 context,
                 update.effective_chat.id,
-                f"系统处理时出现异常，请稍后重试。\n<i>({safe_text(str(context.error)[:80])}</i>",
-                parse_mode=constants.ParseMode.HTML
+                "系统处理时出现异常，请稍后重试。详细错误已写入日志。",
             )
     except Exception:
         pass
