@@ -5,7 +5,7 @@ Send Mailu 发信工具。
 子命令：
   send    发信（默认，可省略子命令直接 send-mailu.py --to ... --body ...）
   get     按绝对路径读取本地 EML，输出邮件信息和正文预览
-  check   检查配置是否可用（格式 + 每账号 SMTP/IMAP 实连测试），失败时提示是否开始配置
+  check   检查配置是否可用；开始前自动扫描 Mailu 对缺失域名逐个提示添加，再逐账号 SMTP/IMAP 实连测试，失败时提示是否开始全量配置
 """
 import argparse
 import base64
@@ -16,6 +16,7 @@ import os
 import sqlite3
 import sys
 import imaplib
+import ipaddress
 import smtplib
 import ssl
 from datetime import datetime, timezone
@@ -118,12 +119,34 @@ def resolve_security(config, smtp_port):
     return "starttls"
 
 
+def _is_ip_literal(host):
+    """host 是否是 IP 字面量（而不是域名）。"""
+    try:
+        ipaddress.ip_address(str(host or "").strip().strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
+def _tls_context(host):
+    """构造 TLS 上下文。
+
+    只有连 IP 时才关闭主机名校验（证书 CN 通常不含 IP）；连域名时保留校验。
+    以前是无条件全局关闭，等于对域名连接也放弃了主机名绑定，
+    任何持有其它受信任证书的中间人都能截获发信凭证。
+    证书链校验（verify_mode=CERT_REQUIRED）始终保持开启。
+    """
+    ctx = ssl.create_default_context()
+    if _is_ip_literal(host):
+        ctx.check_hostname = False
+    return ctx
+
+
 def smtp_connect(host, port, security, username, password):
     """
     按指定安全模式建立 SMTP 连接并登录。返回已登录的 server，失败抛异常。
     """
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False  # 允许 IP 地址连接（证书 CN 通常不含 IP）
+    ctx = _tls_context(host)
     if security == "ssl":
         server = smtplib.SMTP_SSL(host, port, timeout=10, context=ctx)
     else:
@@ -236,14 +259,12 @@ def archive_to_sent(imap_settings, raw_message):
     imap = None
     try:
         if security == "ssl":
-            imap_ctx = ssl.create_default_context()
-            imap_ctx.check_hostname = False  # 允许 IP 地址连接
+            imap_ctx = _tls_context(host)
             imap = imaplib.IMAP4_SSL(host, port, timeout=10, ssl_context=imap_ctx)
         else:
             imap = imaplib.IMAP4(host, port, timeout=10)
             if security == "starttls":
-                imap_ctx = ssl.create_default_context()
-                imap_ctx.check_hostname = False
+                imap_ctx = _tls_context(host)
                 imap.starttls(imap_ctx)
         imap.login(username, password)
 
@@ -507,7 +528,7 @@ def _run_check(do_connect):
     if err:
         results.append((False, f"读取配置: {err}"))
         _emit_check_results(results, [], do_connect)
-        return False
+        return False, []
     results.append((True, f"读取配置: {CONFIG_PATH}"))
 
     # 2) 必填字段
@@ -526,7 +547,8 @@ def _run_check(do_connect):
     if field_ok:
         results.append((True, "必填字段齐全"))
 
-    # 3) 凭证非空
+    # 3) 凭证：username 必须非空；password 可空（空密码会在 SMTP 实连时失败，
+    #    由 cmd_check 的失败菜单逐个补密码），因此 password 空不影响格式判定。
     cred_ok = True
     if isinstance(domains_cfg, dict) and domains_cfg:
         for dom, cred in domains_cfg.items():
@@ -534,11 +556,15 @@ def _run_check(do_connect):
                 results.append((False, f"domains.{dom} 结构不正确（应为对象）"))
                 cred_ok = False
                 continue
-            if not cred.get("username") or not cred.get("password"):
-                results.append((False, f"domains.{dom} 的 username/password 为空"))
+            if not cred.get("username"):
+                results.append((False, f"domains.{dom} 的 username 为空"))
                 cred_ok = False
         if cred_ok:
-            results.append((True, f"凭证完整（{len(domains_cfg)} 个域名）"))
+            missing_pw = [d for d, c in domains_cfg.items() if isinstance(c, dict) and not c.get("password")]
+            if missing_pw:
+                results.append((True, f"凭证格式齐全（{len(domains_cfg)} 个域名，其中 {len(missing_pw)} 个密码待设）"))
+            else:
+                results.append((True, f"凭证完整（{len(domains_cfg)} 个域名）"))
 
     # 4) 安全模式解析（顺带验证取值合法）
     try:
@@ -550,6 +576,7 @@ def _run_check(do_connect):
 
     # 5) SMTP 实连测试：每个配置账号都实际登录一次，不能只测代表账号。
     smtp_results = []
+    smtp_failures = []  # [(dom, uname, reason), ...] 供失败菜单使用
     if do_connect and field_ok and cred_ok and security:
         for dom, cred in domains_cfg.items():
             uname = cred.get("username")
@@ -559,9 +586,13 @@ def _run_check(do_connect):
                 close_smtp(srv)
                 smtp_results.append((True, f"{uname}：登录成功"))
             except smtplib.SMTPAuthenticationError as e:
-                smtp_results.append((False, f"{uname}：认证失败 — {e}"))
+                reason = f"认证失败 — {e}"
+                smtp_results.append((False, f"{uname}：{reason}"))
+                smtp_failures.append((dom, uname, reason))
             except Exception as e:
-                smtp_results.append((False, f"{uname}：连接失败 — {e}"))
+                reason = f"连接失败 — {e}"
+                smtp_results.append((False, f"{uname}：{reason}"))
+                smtp_failures.append((dom, uname, reason))
 
     _emit_check_results(results, smtp_results, do_connect)
 
@@ -588,7 +619,8 @@ def _run_check(do_connect):
         print("\n--- IMAP Sent 逐邮箱测试 ---")
         print("  [·] 基础配置未通过，未测试")
 
-    return all(ok for ok, _ in (results + smtp_results))
+    all_ok = all(ok for ok, _ in (results + smtp_results))
+    return all_ok, smtp_failures
 
 
 def _probe_imap_once(imap_settings, uname, upass):
@@ -711,35 +743,264 @@ def _probe_imap_all_accounts(config, domains_cfg, security):
 
 
 
-def cmd_check(args):
+def _auto_init_from_mailu():
+    """config 不存在时，用 detect_defaults 从 Mailu 自动建基础 config
+    （smtp_host/port/security + default_domain + 扫到的账户密码留空）。扫不到
+    Mailu（source 为空）或没域名时返回 False，交给 y/n 全量配置。返回是否已建。
     """
-    检查 config.json：格式 + 字段 +（可选）逐账号 SMTP/IMAP 实连测试。
-    失败时提示用户是否开始交互配置。
+    defaults = detect_defaults()
+    if not defaults.get("source"):
+        return False
+    smtp_host = defaults.get("smtp_host") or "127.0.0.1"
+    smtp_port = defaults.get("smtp_port") or 587
+    security = defaults.get("security") or "starttls"
+    domains = defaults.get("domains") or []
+    accounts = defaults.get("accounts") or []
+    if not domains:
+        return False
+    domain_to_accounts = {}
+    for em in accounts:
+        if "@" in em:
+            domain_to_accounts.setdefault(em.split("@", 1)[1], []).append(em)
+    domains_cfg = {}
+    for dom in domains:
+        accs = domain_to_accounts.get(dom, [])
+        if accs:
+            uname = next((a for a in accs if a.split("@", 1)[0] == DEFAULT_POSTMASTER), accs[0])
+        else:
+            uname = f"{DEFAULT_POSTMASTER}@{dom}"
+        domains_cfg[dom] = {"username": uname, "password": ""}
+    arch = {"enabled": True, "folder": _DEFAULT_SENT_FOLDER}
+    imap_detected = detect_imap_settings(smtp_host)
+    if imap_detected:
+        arch.update(imap_detected)
+    config = {
+        "smtp_host": smtp_host,
+        "smtp_port": smtp_port,
+        "smtp_security": security,
+        "default_domain": domains[0],
+        "domains": domains_cfg,
+        "sent_archive": arch,
+    }
+    try:
+        _write_config(config, force=True)
+    except SystemExit:
+        print("Error: 自动写入 config 失败，转全量配置。", file=sys.stderr)
+        return False
+    print("\n--- 自动从 Mailu 建立配置 ---")
+    print(f"✓ 已从 Mailu 自动建立 config: {CONFIG_PATH}")
+    print(f"  SMTP {smtp_host}:{smtp_port} ({security})，{len(domains_cfg)} 个域名，账户已加、密码留空待补")
+    return True
+
+
+def _auto_add_missing_accounts():
+    """扫描 Mailu，把 config 中缺失的域名自动加进去（只加账户，密码留空），不询问。
+
+    每个域名只存一个登录账号（与现有 config 结构一致）。无 config、探测不到任何
+    域名、或全部已添加时静默跳过。密码留空，留给 SMTP 实连测试暴露失败、由失败
+    菜单逐个补。返回本次自动添加的域名数。
     """
-    do_connect = not args.no_connect
-    all_ok = _run_check(do_connect)
+    config, err = load_config()
+    if err:
+        return 0  # 无 config，交给 check 失败流程走全量配置
 
-    if all_ok:
-        return
+    existing = set((config.get("domains") or {}).keys())
+    defaults = detect_defaults()
+    accounts = defaults.get("accounts") or []
+    known_domains = defaults.get("domains") or []
 
-    # 检查失败：提示是否开始配置
-    if sys.stdin.isatty():
+    # 优先用 user 表里的真实账户推域名；没有则退到 domain 表/.env 的域名
+    domain_to_accounts = {}
+    if accounts:
+        for em in accounts:
+            if "@" in em:
+                dom = em.split("@", 1)[1]
+                domain_to_accounts.setdefault(dom, []).append(em)
+        candidate_domains = sorted(domain_to_accounts.keys())
+    elif known_domains:
+        candidate_domains = list(known_domains)
+    else:
+        return 0
+
+    print("\n--- 账户自动扫描 ---")
+    print(f"Mailu 检测到 {len(candidate_domains)} 个域名账户，config 已有 {len(existing)} 个")
+    missing = [d for d in candidate_domains if d not in existing]
+    if not missing:
+        print("✓ 全部已在 config 中，无需添加")
+        return 0
+
+    print(f"检测到 {len(missing)} 个域名尚未配置: {', '.join(missing)}")
+    print("自动添加账户（密码留空，稍后由 SMTP 失败菜单逐个补密码）。\n")
+
+    updates = {}
+    added_users = []
+    for dom in missing:
+        accs = domain_to_accounts.get(dom, [])
+        if accs:
+            default_user = next(
+                (a for a in accs if a.split("@", 1)[0] == DEFAULT_POSTMASTER),
+                accs[0],
+            )
+        else:
+            default_user = f"{DEFAULT_POSTMASTER}@{dom}"
+        updates[dom] = {"username": default_user, "password": ""}
+        added_users.append(default_user)
+
+    if merge_domain_credentials(updates):
+        print(f"✓ 已自动添加 {len(updates)} 个账户: {', '.join(added_users)}")
+        print("  （密码留空；下面 SMTP 测试会逐个标记登录失败，到时按菜单补密码。）")
+        return len(updates)
+    print(f"Error: 写入配置失败，本次 {len(updates)} 个域名未保存。", file=sys.stderr)
+    return 0
+
+
+def _retest_one(dom, do_connect):
+    """单测一个域名的 SMTP 登录，返回 (ok, msg)。"""
+    config, err = load_config()
+    if err:
+        return (False, "读取配置失败")
+    cred = (config.get("domains") or {}).get(dom) or {}
+    uname = cred.get("username")
+    upass = cred.get("password")
+    if not uname or not upass:
+        return (False, "账号或密码为空")
+    if not do_connect:
+        return (True, "未实连（--no-connect），格式通过")
+    smtp_host = config.get("smtp_host", "127.0.0.1")
+    smtp_port = config.get("smtp_port", 587)
+    try:
+        security = resolve_security(config, smtp_port)
+    except Exception as e:
+        return (False, f"解析安全模式失败 — {e}")
+    try:
+        srv = smtp_connect(smtp_host, smtp_port, security, uname, upass)
+        close_smtp(srv)
+        return (True, "登录成功")
+    except smtplib.SMTPAuthenticationError as e:
+        return (False, f"认证失败 — {e}")
+    except Exception as e:
+        return (False, f"连接失败 — {e}")
+
+
+def _main_menu(args, do_connect, failures, all_ok=True):
+    """check 后主菜单：无论通过与否都显示交互选项。
+    failures 非空 → 按1 为失败账户输密码重测；
+    failures 空   → 按1 列出所有账户、选一个输密码重测。
+    按2 手动添加账户+密码；按0 退出（有失败/未通过时 exit 1）。
+    """
+    while True:
+        print("\n--- 操作菜单 ---")
+        if failures:
+            print(f"登录失败账号（{len(failures)} 个）:")
+            for i, (dom, uname, reason) in enumerate(failures, 1):
+                print(f"  {i}. {uname}@{dom}  ({reason})")
+            print("按1: 为失败账户输入密码并重新测试")
+        elif all_ok:
+            print("✓ 所有账户 SMTP/IMAP 全部通过")
+            print("按1: 为某账户输入密码并重新测试")
+        else:
+            print("✗ 基础配置未通过（详见上方）")
+            print("按1: 为某账户输入密码并重新测试")
+        print("按2: 手动添加账户+密码")
+        print("按0: 退出")
         try:
-            answer = input("\n检查未通过，是否开始配置？(y/n): ").strip().lower()
+            choice = input("选择: ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             sys.exit(EXIT_ERROR)
-        if answer in ('y', 'yes'):
-            args.force = True  # 用户确认重新配置，允许覆盖
-            cmd_init(args)
-            # 配置完成后重新检查
-            print("\n--- 重新检查配置 ---")
-            recheck_ok = _run_check(do_connect)
-            if not recheck_ok:
+
+        if choice == "0":
+            if failures or not all_ok:
                 sys.exit(EXIT_ERROR)
             return
 
-    sys.exit(EXIT_ERROR)
+        if choice == "1":
+            if failures:
+                if len(failures) == 1:
+                    pick = 0
+                else:
+                    try:
+                        pick = int(input(f"选哪个（1-{len(failures)}）: ").strip()) - 1
+                    except (EOFError, KeyboardInterrupt):
+                        print(); sys.exit(EXIT_ERROR)
+                    except ValueError:
+                        print("  输入无效，跳过。"); continue
+                    if pick < 0 or pick >= len(failures):
+                        print("  编号超出范围，跳过。"); continue
+                dom, uname, _reason = failures[pick]
+            else:
+                config, _ = load_config()
+                domains_cfg = config.get("domains") or {}
+                doms = sorted(domains_cfg.keys())
+                if not doms:
+                    print("  没有已配置的域名"); continue
+                for i, d in enumerate(doms, 1):
+                    u = (domains_cfg[d].get("username") or "admin")
+                    print(f"  {i}. {u}@{d}")
+                try:
+                    pick = int(input(f"选哪个（1-{len(doms)}）: ").strip()) - 1
+                except (EOFError, KeyboardInterrupt):
+                    print(); sys.exit(EXIT_ERROR)
+                except ValueError:
+                    print("  输入无效，跳过。"); continue
+                if pick < 0 or pick >= len(doms):
+                    print("  编号超出范围，跳过。"); continue
+                dom = doms[pick]
+                uname = (domains_cfg[dom].get("username") or "admin")
+            pw = _ask_password_for(uname)
+            if not pw:
+                print(f"  密码为空，{uname} 未更新。"); continue
+            if not merge_domain_credentials({dom: {"username": uname, "password": pw}}):
+                print(f"  Error: 写入失败，{uname} 未保存。", file=sys.stderr); continue
+            ok, msg = _retest_one(dom, do_connect)
+            if ok:
+                print(f"  ✓ {uname}@{dom}：登录成功")
+                failures = [f for f in failures if f[0] != dom]
+                if not failures:
+                    all_ok = True
+            else:
+                print(f"  ✗ {uname}@{dom}：{msg}")
+                failures = [f for f in failures if f[0] != dom] + [(dom, uname, msg)]
+                all_ok = False
+
+        elif choice == "2":
+            uname = _ask("手动添加的登录账号（完整邮箱）", "")
+            if "@" not in uname:
+                print("  账号必须是完整邮箱，跳过。"); continue
+            dom = uname.split("@", 1)[1]
+            pw = _ask_password_for(uname)
+            if not pw:
+                print("  密码为空，跳过。"); continue
+            if not merge_domain_credentials({dom: {"username": uname, "password": pw}}):
+                print(f"  Error: 写入失败，{uname} 未保存。", file=sys.stderr); continue
+            ok, msg = _retest_one(dom, do_connect)
+            if ok:
+                print(f"  ✓ {uname}@{dom}：登录成功")
+                failures = [f for f in failures if f[0] != dom]
+            else:
+                print(f"  ✗ {uname}@{dom}：{msg}")
+                failures = [f for f in failures if f[0] != dom] + [(dom, uname, msg)]
+
+        else:
+            print("  输入无效，请输 0/1/2。")
+
+
+def cmd_check(args):
+    """
+    检查 config.json：先自动扫描 Mailu、把缺失账户自动加进 config（密码留空），
+    再跑基础配置 + 逐账号 SMTP/IMAP 实连测试。无论通过与否都弹操作菜单：
+    按1 为账户输密码并重测 / 按2 手动添加账户+密码 / 按0 退出。
+    """
+    do_connect = not args.no_connect
+    config, _err = load_config()
+    if _err:
+        # config 不存在：先尝试用 Mailu 自动建基础 config（smtp + 扫到的账户密码空）
+        _auto_init_from_mailu()  # 扫不到 Mailu 返回 False，下面 _run_check 显示 err → 走 y/n 全量
+    else:
+        _auto_add_missing_accounts()
+    all_ok, failures = _run_check(do_connect)
+    # 无论通过与否，都显示操作菜单（输密码重测 / 手动加账户 / 退出）
+    _main_menu(args, do_connect, failures, all_ok)
 
 
 def _emit_check_results(results, smtp_results, do_connect):
@@ -971,9 +1232,7 @@ def detect_imap_settings(smtp_host):
 
 
 def _ask(prompt, default=""):
-    """交互式提问，支持默认值（直接回车采用）。非 TTY 时返回 default。"""
-    if not sys.stdin.isatty():
-        return default
+    """交互式提问，支持默认值（直接回车采用）。"""
     suffix = f" [{default}]" if default != "" else ""
     try:
         raw = input(f"{prompt}{suffix}: ").strip()
@@ -984,9 +1243,7 @@ def _ask(prompt, default=""):
 
 
 def _ask_password_for(label, default=""):
-    """带账号标签的密码询问，不回显。非 TTY 时用 default。"""
-    if not sys.stdin.isatty():
-        return default
+    """带账号标签的密码询问，不回显。"""
     try:
         pw = getpass.getpass(f"  {label} 的密码: ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -996,64 +1253,46 @@ def _ask_password_for(label, default=""):
 
 
 def cmd_init(args):
-    """交互式或批量生成 config.json（多域名）。"""
+    """交互式生成 config.json（多域名）。纯交互一条路：逐项询问、逐个输密码。"""
     defaults = detect_defaults()
 
-    # ---------- 批量模式：--domains + --passwords 齐全则跳过交互 ----------
-    batch_ready = bool(args.domains and args.passwords)
-    if batch_ready:
-        domain_list = split_addresses(args.domains)
-        passwords = split_addresses(args.passwords)
-        if len(passwords) == 1:
-            passwords = passwords * len(domain_list)  # 单密码广播
-        if len(passwords) != len(domain_list):
-            print(f"Error: --domains 有 {len(domain_list)} 个域名，--passwords 有 {len(passwords)} 个密码，数量不匹配。", file=sys.stderr)
-            sys.exit(EXIT_ERROR)
-        username_prefix = args.username_prefix or DEFAULT_POSTMASTER
-        smtp_host = args.smtp_host or "127.0.0.1"
-        smtp_port = args.smtp_port or 587
-        security = args.security or "starttls"
-        accounts = [f"{username_prefix}@{dom}" for dom in domain_list]
-        if defaults["source"]:
-            print(f"（检测到 Mailu 环境: {defaults['source']}，但使用了命令行批量参数）")
+    # ---------- 交互模式 ----------
+    if defaults["source"]:
+        kind = "数据库" if defaults["accounts"] or (defaults["domains"] and not defaults["source"].endswith(".env")) else ".env"
+        print(f"已检测到 Mailu {kind}: {defaults['source']}")
+        if defaults["domains"]:
+            print(f"发现域名 ({len(defaults['domains'])}): {', '.join(defaults['domains'])}")
+        if defaults["accounts"]:
+            print(f"发现账号 ({len(defaults['accounts'])}): {', '.join(defaults['accounts'])}")
+        print("密码在数据库里是 hash，需逐个输入明文。直接回车采用方括号内默认值。\n")
     else:
-        # ---------- 交互模式 ----------
-        if defaults["source"]:
-            kind = "数据库" if defaults["accounts"] or (defaults["domains"] and not defaults["source"].endswith(".env")) else ".env"
-            print(f"已检测到 Mailu {kind}: {defaults['source']}")
-            if defaults["domains"]:
-                print(f"发现域名 ({len(defaults['domains'])}): {', '.join(defaults['domains'])}")
-            if defaults["accounts"]:
-                print(f"发现账号 ({len(defaults['accounts'])}): {', '.join(defaults['accounts'])}")
-            print("密码在数据库里是 hash，需逐个输入明文。直接回车采用方括号内默认值。\n")
-        else:
-            print("未检测到 Mailu 环境，将逐项询问。直接回车采用方括号内默认值。\n")
+        print("未检测到 Mailu 环境，将逐项询问。直接回车采用方括号内默认值。\n")
 
-        smtp_host = _ask("[1/5] SMTP 服务器地址", args.smtp_host or defaults["smtp_host"])
-        smtp_port = _ask("[2/5] SMTP 端口 (587=STARTTLS / 465=SSL / 25=无加密)", str(args.smtp_port or defaults["smtp_port"]))
-        security = _ask("[3/5] 安全模式 (starttls/ssl/none)", args.security or defaults["security"])
+    smtp_host = _ask("[1/5] SMTP 服务器地址", args.smtp_host or defaults["smtp_host"])
+    smtp_port = _ask("[2/5] SMTP 端口 (587=STARTTLS / 465=SSL / 25=无加密)", str(args.smtp_port or defaults["smtp_port"]))
+    security = _ask("[3/5] 安全模式 (starttls/ssl/none)", args.security or defaults["security"])
 
-        # 域名列表：默认用探测到的，可手动改
-        default_domains_str = ",".join(defaults["domains"]) if defaults["domains"] else ""
-        domains_input = _ask("[4/5] 所有域名 (逗号分隔)", args.domains or default_domains_str)
-        domain_list = split_addresses(domains_input)
-        if not domain_list:
-            print("Error: 至少需要一个域名。", file=sys.stderr)
+    # 域名列表：默认用探测到的，可手动改
+    default_domains_str = ",".join(defaults["domains"]) if defaults["domains"] else ""
+    domains_input = _ask("[4/5] 所有域名 (逗号分隔)", args.domains or default_domains_str)
+    domain_list = split_addresses(domains_input)
+    if not domain_list:
+        print("Error: 至少需要一个域名。", file=sys.stderr)
+        sys.exit(EXIT_ERROR)
+
+    username_prefix = _ask("      用户名前缀 (每域一个账号)", args.username_prefix or DEFAULT_POSTMASTER)
+    accounts = [f"{username_prefix}@{dom}" for dom in domain_list]
+
+    # 5) 逐个询问密码（不可回显）
+    print(f"\n[5/5] 逐个输入密码（{len(domain_list)} 个域名，输入不可见）:")
+    passwords = []
+    for dom, acc in zip(domain_list, accounts):
+        pw = _ask_password_for(acc)
+        if not pw:
+            print(f"Error: {acc} 的密码不能为空。", file=sys.stderr)
             sys.exit(EXIT_ERROR)
-
-        username_prefix = _ask("      用户名前缀 (每域一个账号)", args.username_prefix or DEFAULT_POSTMASTER)
-        accounts = [f"{username_prefix}@{dom}" for dom in domain_list]
-
-        # 5) 逐个询问密码（不可回显）
-        print(f"\n[5/5] 逐个输入密码（{len(domain_list)} 个域名，输入不可见）:")
-        passwords = []
-        for dom, acc in zip(domain_list, accounts):
-            pw = _ask_password_for(acc)
-            if not pw:
-                print(f"Error: {acc} 的密码不能为空。", file=sys.stderr)
-                sys.exit(EXIT_ERROR)
-            passwords.append(pw)
-        print()
+        passwords.append(pw)
+    print()
 
     # ---------- 校验 ----------
     try:
@@ -1128,6 +1367,46 @@ def patch_sent_archive(updates):
         arch = {}
     arch.update(updates)
     config["sent_archive"] = arch
+
+    payload = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+    tmp = CONFIG_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(payload)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, CONFIG_PATH)
+        return True
+    except OSError:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return False
+
+
+def merge_domain_credentials(updates):
+    """原子地把新域名凭证合并进 config['domains']，保留其余字段与已有域名。权限 0600。
+
+    用于 check 自动扫描时把用户确认添加的缺失域名并入现有 config，而不重写整份配置。
+    updates: {domain: {"username": str, "password": str}}；同名域名会被覆盖（调用方应只传缺失项）。
+    成功返回 True；文件不存在或读写失败返回 False。
+    """
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    domains = config.get("domains")
+    if not isinstance(domains, dict):
+        domains = {}
+    for dom, cred in updates.items():
+        domains[dom] = cred
+    config["domains"] = domains
 
     payload = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
     tmp = CONFIG_PATH + ".tmp"
@@ -1270,16 +1549,15 @@ def build_parser():
     p_get = sub.add_parser("get", help="按绝对路径读取 EML 信息和正文预览")
     p_get.add_argument("path", help="邮件 EML 绝对路径，例如 /mailu/mail/admin@example.com/new/文件名")
 
-    # check 子命令（含配置生成功能，失败时可交互配置）
-    p_check = sub.add_parser("check", help="检查配置是否可用，失败时可交互配置")
+    # check 子命令：自动扫描补齐账户 + 逐账号 SMTP/IMAP 实连测试；失败时弹菜单或全量配置
+    p_check = sub.add_parser("check", help="检查配置；自动扫描补齐账户，SMTP 失败可逐个补密码，或全量配置")
     p_check.add_argument("--no-connect", action="store_true", help="跳过全部 SMTP/IMAP 实连测试，仅做格式检查")
-    # 以下参数用于批量配置模式（合并原 init 功能）
-    p_check.add_argument("--domains", help="所有域名，逗号/分号/空格分隔（批量配置模式）")
-    p_check.add_argument("--username-prefix", help="每域账号前缀（默认 admin，批量配置模式可用）")
-    p_check.add_argument("--passwords", help="各域密码，逗号/分号分隔；或单个密码广播到所有域（批量配置模式）")
-    p_check.add_argument("--smtp-host", help="SMTP 服务器地址")
-    p_check.add_argument("--smtp-port", help="SMTP 端口")
-    p_check.add_argument("--security", choices=["starttls", "ssl", "none"], help="安全模式")
+    # 以下参数在交互配置时作为各项默认值（直接回车采用），不再有跳过交互的批量模式
+    p_check.add_argument("--domains", help="所有域名，逗号/分号/空格分隔（交互配置时的默认值）")
+    p_check.add_argument("--username-prefix", help="每域账号前缀（默认 admin，交互配置时的默认值）")
+    p_check.add_argument("--smtp-host", help="SMTP 服务器地址（交互配置时的默认值）")
+    p_check.add_argument("--smtp-port", help="SMTP 端口（交互配置时的默认值）")
+    p_check.add_argument("--security", choices=["starttls", "ssl", "none"], help="安全模式（交互配置时的默认值）")
     p_check.add_argument("--force", action="store_true", help="覆盖已存在的配置")
 
     return parser

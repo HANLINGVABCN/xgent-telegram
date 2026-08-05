@@ -274,5 +274,41 @@ print(json.dumps({
         self.assertIn("张三", data["combined"])
 
 
+    def test_album_message_merges_photos_into_one_multimodal_payload(self):
+        output = self.run_probe(r'''
+import json
+import xgent_server as bot
+
+photos = [
+    {"image_b64": "IMG1", "saved_notice": "第1张已保存到 a/1.jpg", "index_text": "[图片] telegram_photo.jpg，已保存到 a/1.jpg。说明：看这个"},
+    {"image_b64": "IMG2", "saved_notice": "第2张已保存到 a/2.jpg", "index_text": "[图片] telegram_photo.jpg，已保存到 a/2.jpg"},
+    {"image_b64": "IMG3", "saved_notice": "第3张已保存到 a/3.jpg", "index_text": "[图片] telegram_photo.jpg，已保存到 a/3.jpg"},
+]
+memory_text, multimodal = bot.build_album_message(photos, "看这个", "[转发] 老王")
+
+types = [part["type"] for part in multimodal]
+images = [part["data"] for part in multimodal if part["type"] == "image"]
+texts = [part["text"] for part in multimodal if part["type"] == "text"]
+
+print(json.dumps({
+    "photo_count": len(photos),
+    "memory_text": memory_text,
+    "image_count": len(images),
+    "image_order": images,
+    "has_caption": any("用户附言：看这个" == t for t in texts),
+    "has_context_prefix": any(t == "[转发] 老王" for t in texts),
+    "saved_notice_count": sum(1 for t in texts if "已保存到" in t),
+}, ensure_ascii=False))
+''')
+        data = json.loads(output.strip().splitlines()[-1])
+        self.assertEqual(3, data["photo_count"])
+        self.assertIn("共3张", data["memory_text"])
+        self.assertEqual(3, data["image_count"])
+        self.assertEqual(["IMG1", "IMG2", "IMG3"], data["image_order"])
+        self.assertTrue(data["has_caption"])
+        self.assertTrue(data["has_context_prefix"])
+        self.assertEqual(3, data["saved_notice_count"])
+
+
 if __name__ == "__main__":
     unittest.main()

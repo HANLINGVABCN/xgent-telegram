@@ -286,7 +286,12 @@ async def perform_update_system(update: Update, context: ContextTypes.DEFAULT_TY
     await restart_current_process(update.effective_chat.id, context.bot)
 
 def build_provider_config_export() -> Dict[str, Any]:
-    """构建可移植的 Provider 配置；API Key 会原样包含在导出文件中。"""
+    """构建可移植的 Provider 配置；API Key 会原样包含在导出文件中。
+
+    刻意不做掩码：导出的唯一用途就是迁移/恢复，掩码后的文件无法导入，
+    默认给一份不可用的文件只会把主流程弄坏。接收方是已授权的用户本人，
+    发送时会附带明确的保管提示。
+    """
     providers = UserDataManager.get('providers', {}) or {}
     exported_providers: Dict[str, Dict[str, Any]] = {}
     for name, provider in providers.items():
@@ -474,7 +479,8 @@ async def send_provider_config_export(update: Update, context: ContextTypes.DEFA
         document=InputFile(buffer, filename),
         caption=(
             f'✅ 已导出 {len(providers)} 个提供商。\n'
-            '⚠️ 文件包含完整 API Key，请妥善保管，不要转发给他人。'
+            '⚠️ 文件包含完整 API Key，请妥善保管，不要转发给他人。\n'
+            'ℹ️ Telegram 聊天默认不是端到端加密；用完建议删除这条消息。'
         )
     )
     await GlobalRecorder.record_system_op('导出提供商配置', {'count': len(providers)})

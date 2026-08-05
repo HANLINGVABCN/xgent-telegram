@@ -839,6 +839,11 @@ class AgentExecutor:
     def strip_protocol_blocks(cls, ai_response: str) -> str:
         """兼容入口：只移除协议块，不参与执行或消息发送。"""
         return ProtocolParser.strip_protocol_blocks(ai_response)
+
+    @classmethod
+    def has_unclosed_protocol_block(cls, ai_response: str) -> bool:
+        """兼容入口：是否存在开始行有效但未闭合的协议块。"""
+        return ProtocolParser.has_unclosed_block(ai_response)
     @classmethod
     def resolve_file_path(cls, requested_path: str) -> str:
         """将文件路径解析为服务器上的实际路径。仅接受绝对路径。"""
@@ -1502,9 +1507,12 @@ class AgentExecutor:
 
         blocked, pattern = AgentCommandBlacklist.check(command)
         if blocked:
+            # 命中的规则只写日志，不回灌给模型：告诉它具体匹配了哪一条，
+            # 等于直接指导它改写命令来绕过。
+            logger.warning(f"run 命令被黑名单拦截，命中规则: {pattern} | 命令: {command[:200]}")
             return {
                 'success': False,
-                'output': f'⛔ 命令被安全系统拦截: 命令匹配用户黑名单: {pattern}',
+                'output': BLACKLIST_BLOCKED_NOTICE,
                 'return_code': -1,
             }
 
@@ -1576,7 +1584,7 @@ class AgentExecutor:
             output = output or '(无输出)'
 
             elapsed_seconds = round(max(0.0, time.monotonic() - started_at), 2)
-            saved = save_command_output(command, output)
+            saved = await save_command_output_async(command, output)
             rc = process.returncode if process else -1
             return {
                 'success': bool(not stopped and not timed_out and rc == 0),
@@ -1596,7 +1604,7 @@ class AgentExecutor:
             logger.error(f"run 命令执行异常: {e}")
             output = f"执行异常: {str(e)[:200]}"
             elapsed_seconds = round(max(0.0, time.monotonic() - started_at), 2)
-            saved = save_command_output(command, output)
+            saved = await save_command_output_async(command, output)
             return {
                 'success': False,
                 'command': command,

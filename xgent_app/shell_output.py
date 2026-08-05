@@ -119,7 +119,7 @@ def build_run_notice(run_result: Dict[str, Any]) -> str:
         f"超时: {run_result.get('timed_out')}\n"
         f"停止: {run_result.get('stopped')}\n"
         f"耗时: {run_result.get('elapsed_seconds')} 秒\n"
-        f"完整输出文件: {run_result.get('output_path')}\n"
+        f"完整输出文件: {run_result.get('output_path') or '(存档失败)'}\n"
         f"完整输出大小: {run_result.get('output_bytes')} bytes\n"
         f"上下文输出:\n{stored_output}"
     )

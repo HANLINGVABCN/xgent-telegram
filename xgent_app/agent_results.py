@@ -13,9 +13,11 @@ from typing import Any, Dict, Mapping, Optional, TypedDict
 from xgent_app.agent_context import (
     AgentMessage,
     build_edit_context_message,
+    build_fetch_context_message,
     build_grep_context_message,
     build_read_context_message,
     build_run_context_message,
+    build_search_context_message,
 )
 from xgent_app.shell_output import build_run_notice
 
@@ -112,25 +114,45 @@ def normalize_run_result(raw: Mapping[str, Any]) -> AgentOperationResult:
     )
 
 
+def normalize_search_result(raw: Mapping[str, Any]) -> AgentOperationResult:
+    """Normalize a web search result."""
+    notice = str(raw.get("output") or raw.get("notice") or "")
+    return _normalize(
+        raw,
+        kind="search",
+        notice=notice,
+        output=notice,
+        context_message=build_search_context_message(notice),
+    )
+
+
+def normalize_fetch_result(raw: Mapping[str, Any]) -> AgentOperationResult:
+    """Normalize a web page fetch result."""
+    notice = str(raw.get("output") or raw.get("notice") or "")
+    return _normalize(
+        raw,
+        kind="fetch",
+        notice=notice,
+        output=notice,
+        context_message=build_fetch_context_message(notice),
+    )
+
+
 def failed_result(kind: str, message: str) -> AgentOperationResult:
     """Create the same shape used for executor exceptions."""
     notice = str(message)
+    builders = {
+        "read": lambda text: build_read_context_message({"notice": text}),
+        "edit": build_edit_context_message,
+        "grep": build_grep_context_message,
+        "search": build_search_context_message,
+        "fetch": build_fetch_context_message,
+    }
+    build = builders.get(kind, build_run_context_message)
     return _normalize(
         {"success": False, "output": notice, "notice": notice},
         kind=kind,
         notice=notice,
         output=notice,
-        context_message=(
-            build_read_context_message({"notice": notice})
-            if kind == "read"
-            else (
-                build_edit_context_message(notice)
-                if kind == "edit"
-                else (
-                    build_grep_context_message(notice)
-                    if kind == "grep"
-                    else build_run_context_message(notice)
-                )
-            )
-        ),
+        context_message=build(notice),
     )

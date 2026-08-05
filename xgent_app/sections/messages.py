@@ -551,6 +551,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         BotState.SEARCH_FETCHED,
         BotState.SEARCH_SAVED,
         BotState.IMPORT_PROVIDER_CONFIG,
+        # GitHub Token 含大量下划线，转义后写进 .env 会导致更新下载 401。
+        BotState.SET_UPDATE_TOKEN,
+        # 黑名单是命令匹配模式，转义 * 和 _ 会让通配符规则失效。
+        BotState.SET_COMMAND_BLACKLIST,
+        # 搜索 Key 同样含下划线和连字符，必须保持原样。
+        BotState.SET_SEARCH_KEY,
     }
     text = ""
     if update.message.text:
@@ -617,16 +623,16 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if state == BotState.IMPORT_PROVIDER_CONFIG and update.message.text:
         text = update.message.text.strip()
 
-    # 转发消息添加来源信息
-    context_prefix = build_incoming_context_prefix(update.message)
-    if context_prefix:
-        text = f"{context_prefix}\n{text}"
+    # 转发/引用来源前缀只加在正常对话上（见文件末尾的正常对话分支）。
+    # 配置状态下必须保持原样：前缀会被当成 Token、API Key 或黑名单规则本身存进配置。
 
     # 普通聊天按拼接模式决定：直接发送，或累计到“完成”按钮后再写入记忆。
     if state != BotState.IDLE:
         recorded_text = (
             "[已填入 UPDATE_GITHUB_TOKEN，内容已隐藏]"
             if state == BotState.SET_UPDATE_TOKEN
+            else "[已填入搜索 API Key，内容已隐藏]"
+            if state == BotState.SET_SEARCH_KEY
             else "[已提交提供商配置 JSON，内容已隐藏]"
             if state == BotState.IMPORT_PROVIDER_CONFIG
             else "[已填入 API Key，内容已隐藏]"
@@ -721,15 +727,79 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         UserDataManager.set('state', BotState.IDLE)
         UserDataManager.set('pending_update_zip_url', "")
         await GlobalRecorder.record_system_op(
-            "保存 UPDATE_GITHUB_TOKEN 并继续更新确认",
+            "保存 UPDATE_GITHUB_TOKEN",
             {"update_source": BotConfig.UPDATE_ZIP_URL},
             update.effective_chat.id
         )
         status_msg = await update.message.reply_text(
-            "✅ Token 已保存，信息已加密",
+            f"✅ 已保存 <code>{safe_text(mask_update_github_token(token))}</code>，正在验证...",
+            parse_mode=constants.ParseMode.HTML
+        )
+        # 立即验证，避免坏 Token 一路存进去、直到点更新才 401。
+        verification = await asyncio.to_thread(
+            verify_update_github_token, token, BotConfig.UPDATE_ZIP_URL
+        )
+        if not verification['ok']:
+            await status_msg.edit_text(
+                f"❌ <b>Token 验证未通过</b>\n\n{verification['message']}\n\n"
+                "<i>修正后重新发送，或点下方按钮管理。</i>",
+                reply_markup=get_github_token_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+            return
+
+        await status_msg.edit_text(
+            f"✅ Token 已保存并验证通过。\n{verification['message']}",
             parse_mode=constants.ParseMode.HTML
         )
         await send_update_confirmation_message(status_msg)
+        return
+
+    if state == BotState.SET_SEARCH_KEY:
+        api_key = text.strip()
+        if not api_key:
+            await update.message.reply_text("⚠️ API Key 不能为空。请重新发送，或发送 cancel 取消。")
+            return
+        try:
+            await asyncio.to_thread(persist_search_api_key, api_key)
+        except Exception as e:
+            logger.exception("保存搜索 API Key 失败")
+            await update.message.reply_text(
+                f"❌ 保存失败：<code>{safe_text(format_provider_exception(e))}</code>",
+                parse_mode=constants.ParseMode.HTML
+            )
+            return
+
+        UserDataManager.set('state', BotState.IDLE)
+        await GlobalRecorder.record_system_op(
+            "保存搜索 API Key",
+            {"masked": mask_search_api_key(api_key)},
+            update.effective_chat.id
+        )
+        status_msg = await update.message.reply_text(
+            f"✅ 已保存 <code>{safe_text(mask_search_api_key(api_key))}</code>，正在验证...",
+            parse_mode=constants.ParseMode.HTML
+        )
+        # 立即验证一次，避免 Key 填错但用户以为已生效。
+        try:
+            result = await run_search("hello world\nmax: 1", BotConfig.TAVILY_API_KEY)
+        except Exception as e:
+            logger.exception("搜索 Key 验证失败")
+            result = {"success": False, "output": format_provider_exception(e)}
+        if result.get('success'):
+            await status_msg.edit_text(
+                "✅ 搜索 API Key 已保存并验证通过。\n"
+                "Agent 现在可以使用 search-x 联网搜索、fetch-x 抓取网页正文了。",
+                reply_markup=get_search_settings_menu()
+            )
+        else:
+            await status_msg.edit_text(
+                "⚠️ Key 已保存，但验证未通过：\n"
+                f"<code>{safe_text(str(result.get('output') or '')[:600])}</code>\n\n"
+                "请检查 Key 是否正确，或稍后用“测试搜索”重试。",
+                reply_markup=get_search_settings_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
         return
 
     if state == BotState.SET_PROMPT:
@@ -944,9 +1014,13 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     if state == BotState.ADD_PROV_URL:
-        if not text.startswith("http"):
-            await update.message.reply_text("⚠️ 必须是 http 开头。")
+        try:
+            text, url_warning = validate_provider_base_url(text)
+        except ValueError as exc:
+            await update.message.reply_text(f"⚠️ {exc}")
             return
+        if url_warning:
+            await update.message.reply_text(url_warning)
         UserDataManager.set('temp_prov_url', text)
         UserDataManager.set('state', BotState.ADD_PROV_KEY)
         api_format = UserDataManager.get('temp_prov_format', 'openai_compatible')
@@ -1061,6 +1135,13 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if state == BotState.EDIT_PROV_URL:
         p = UserDataManager.get('editing_provider')
         providers = UserDataManager.get('providers', {})
+        try:
+            text, url_warning = validate_provider_base_url(text)
+        except ValueError as exc:
+            await update.message.reply_text(f"⚠️ {exc}")
+            return
+        if url_warning:
+            await update.message.reply_text(url_warning)
         if p and p in providers:
             providers[p]['base_url'] = text
             prov = providers[p]
@@ -1364,6 +1445,17 @@ async def _send_agent_iteration_limit_notice(
     await safe_send_message(context, chat_id, message)
 
 
+async def _record_user_stopped_reply(db, cid, chat_id, partial_text: str) -> str:
+    """用户在接收 AI 回复期间手动停止：把已生成的部分文本 + 停止标记写入
+    全局记录与模型可见历史，返回写入内容。与正常回复保存路径一致。"""
+    marker = "⏹️ 当前回复已被用户手动停止"
+    partial = (partial_text or "").strip()
+    content = f"{partial}\n\n{marker}" if partial else marker
+    await GlobalRecorder.record_ai_reply(content, chat_id)
+    await db.add_chat_message(cid, 'assistant', content)
+    return content
+
+
 async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
                                content_override: Optional[Any] = None,
                                lock_acquired_event: Optional[asyncio.Event] = None,
@@ -1445,7 +1537,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             reply_markup=get_main_menu()
         )
         return
-    assert prov_name is not None
+    if prov_name is None:
+        raise RuntimeError("provider 校验通过但名称为空，状态不一致")
 
     if reset_agent_iterations:
         await db.add_chat_message(cid, 'user', text)
@@ -1468,20 +1561,42 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     )
 
     # 根据流式/非流式开关选择回复方式
+    stop_partial: List[str] = []
     if stream_mode:
         response = await send_streaming_response(
             update, context,
             prov_name, prov_data, model,
-            system_prompt, history
+            system_prompt, history,
+            stopped_partial_sink=stop_partial
         )
     else:
         response = await send_non_streaming_response(
             update, context,
             prov_name, prov_data, model,
-            system_prompt, history
+            system_prompt, history,
+            stopped_partial_sink=stop_partial
         )
     
     if not response:
+        if is_stop_requested():
+            # 用户在接收 AI 回复期间手动停止：保留用户消息与已生成的部分，
+            # 记录“当前回复已被用户手动停止”，并跳过后续 Agent 协议执行。
+            if trigger_status_msg is not None and trigger_status_iteration is not None:
+                with contextlib.suppress(Exception):
+                    await safe_edit_text(
+                        trigger_status_msg,
+                        build_agent_round_status(
+                            trigger_status_iteration,
+                            "stopped",
+                            origin=agent_origin,
+                        ),
+                        reply_markup=None,
+                    )
+            await _record_user_stopped_reply(
+                db, cid, update.effective_chat.id,
+                stop_partial[0] if stop_partial else "",
+            )
+            return
         if trigger_status_msg is not None and trigger_status_iteration is not None:
             with contextlib.suppress(Exception):
                 await safe_edit_text(
@@ -1538,6 +1653,15 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 pending_round_status_msg = None
                 pending_round_iteration = None
             if not protocol_blocks:
+                if AgentExecutor.has_unclosed_protocol_block(response):
+                    # 有开始行但没闭合：解析器会停止扫描，后面的协议全部不执行。
+                    # 以前这是完全静默的，用户只看到 AI 说要做事却什么也没发生。
+                    await safe_send_message(
+                        context,
+                        update.effective_chat.id,
+                        "⚠️ 检测到未闭合的协议块（缺少结束标记或收尾的三反引号），"
+                        "本轮没有执行任何操作。可以让 AI 重新输出一次。",
+                    )
                 break  # AI 没有请求任何操作
 
             operation_iteration = agent_iteration + 1
@@ -1563,302 +1687,307 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 )
             )
 
-            for block in protocol_blocks:
-                if is_stop_requested():
-                    round_state.should_continue = False
-                    break
-                block_type = block['type']
-
-                standard_operation = await dispatch_standard_protocol(
-                    block,
-                    executor=AgentExecutor,
-                    provider_api_format=provider_api_format,
-                    stop_event_factory=get_or_create_stop_event,
-                    logger=logger,
-                )
-                if standard_operation is not None:
-                    operation_notice = standard_operation['notice']
-                    operation_presentation = build_standard_operation_presentation(
-                        standard_operation
-                    )
-                    if operation_presentation is not None:
-                        await safe_send_message(
-                            context,
-                            update.effective_chat.id,
-                            operation_presentation,
-                            parse_mode=constants.ParseMode.HTML,
-                        )
-                    await persist_standard_operation_result(
-                        recorder=GlobalRecorder,
-                        message_type=MessageType.AGENT_RESULT,
-                        database=db,
-                        conversation_id=cid,
-                        chat_id=update.effective_chat.id,
-                        operation=standard_operation,
-                    )
-                    round_state.add_context(standard_operation['context_message'])
-                    round_state.should_continue = True
-                    continue
-
-                if block_type == 'sendfile':
-                    sendfile_notice = await execute_sendfile_protocol(
-                        block['body'],
-                        executor=AgentExecutor,
-                        context=context,
-                        chat_id=update.effective_chat.id,
-                        api_base_url=BotConfig.API_BASE_URL,
-                        local_api_host_data_dir=_LOCAL_API_HOST_DATA_DIR,
-                        local_api_container_data_dir=_LOCAL_API_CONTAINER_DATA_DIR,
-                        max_file_size=AgentExecutor.MAX_FILE_SIZE,
-                        safe_send_message=safe_send_message,
-                        safe_text=safe_text,
-                        logger=logger,
-                        cancel_task_quietly=cancel_task_quietly,
-                    )
-                    if sendfile_notice:
-                        await persist_agent_result(
-                            recorder=GlobalRecorder,
-                            message_type=MessageType.AGENT_RESULT,
-                            database=db,
-                            conversation_id=cid,
-                            chat_id=update.effective_chat.id,
-                            notice=sendfile_notice,
-                        )
-                        round_state.add_context(
-                            build_sendfile_context_message(sendfile_notice)
-                        )
-                        round_state.should_continue = True
-                    continue
-
-                if block_type == 'file':
-                    filename = block['path']
-                    file_notice = ""
-                    try:
-                        written_file = await write_text_protocol_file(
-                            block, executor=AgentExecutor
-                        )
-                        file_notice = await send_written_agent_file(
-                            written_file,
-                            protocol="file",
-                            context=context,
-                            chat_id=update.effective_chat.id,
-                            max_file_size=AgentExecutor.MAX_FILE_SIZE,
-                            safe_send_message=safe_send_message,
-                            safe_text=safe_text,
-                            html_parse_mode=constants.ParseMode.HTML,
-                        )
-                    except Exception as e:
-                        logger.error(f"Agent写入文件失败: {e}")
-                        file_notice = f"[file结果] 写入失败: {filename}。错误: {str(e)[:200]}"
-                        await safe_send_message(
-                            context,
-                            update.effective_chat.id,
-                            f"❌ 文件写入失败: {safe_text(str(e)[:200])}"
-                        )
-
-                    if file_notice:
-                        await persist_agent_result(
-                            recorder=GlobalRecorder,
-                            message_type=MessageType.AGENT_RESULT,
-                            database=db,
-                            conversation_id=cid,
-                            chat_id=update.effective_chat.id,
-                            notice=file_notice,
-                        )
-                        round_state.add_context(
-                            build_file_context_message(file_notice)
-                        )
-                        round_state.should_continue = True
-                    continue
-
-                if block_type == 'file_base64':
-                    filename = block['path']
-                    file_notice = ""
-                    try:
-                        written_file = await write_base64_protocol_file(
-                            block, executor=AgentExecutor
-                        )
-                        file_notice = await send_written_agent_file(
-                            written_file,
-                            protocol="file:base64",
-                            context=context,
-                            chat_id=update.effective_chat.id,
-                            max_file_size=AgentExecutor.MAX_FILE_SIZE,
-                            safe_send_message=safe_send_message,
-                            safe_text=safe_text,
-                            html_parse_mode=constants.ParseMode.HTML,
-                        )
-                    except Exception as e:
-                        logger.error(f"Agent base64 写入文件失败: {e}")
-                        file_notice = f"[file:base64结果] 写入失败: {filename}。错误: {str(e)[:200]}"
-                        await safe_send_message(
-                            context,
-                            update.effective_chat.id,
-                            f"❌ base64 文件写入失败: {safe_text(str(e)[:200])}"
-                        )
-
-                    if file_notice:
-                        await persist_agent_result(
-                            recorder=GlobalRecorder,
-                            message_type=MessageType.AGENT_RESULT,
-                            database=db,
-                            conversation_id=cid,
-                            chat_id=update.effective_chat.id,
-                            notice=file_notice,
-                        )
-                        round_state.add_context(
-                            build_file_context_message(file_notice, protocol="file:base64")
-                        )
-                        round_state.should_continue = True
-                    continue
-
-                if block_type == 'trigger':
-                    trigger_notice = await execute_trigger_protocol(
-                        block,
-                        trigger_manager=SelfTriggerManager,
-                        bot=context.bot,
-                        chat_id=update.effective_chat.id,
-                        conversation_id=cid,
-                        original_text=text,
-                        response=response,
-                    )
-                    await persist_agent_result(
-                        recorder=GlobalRecorder,
-                        message_type=MessageType.AGENT_RESULT,
-                        database=db,
-                        conversation_id=cid,
-                        chat_id=update.effective_chat.id,
-                        notice=trigger_notice,
-                    )
-                    round_state.add_context(
-                        build_trigger_context_message(trigger_notice)
-                    )
-                    round_state.should_continue = True
-                    continue
-
-                if block_type in {'shell', 'stdin', 'shellread', 'shellkill'}:
-                    shell_execution = await execute_shell_protocol(
-                        block,
-                        shell_manager=AgentShellSessionManager,
-                        executor=AgentExecutor,
-                        stop_event_factory=get_or_create_stop_event,
-                        stop_requested=is_stop_requested,
-                    )
-                    shell_result = shell_execution['result']
-                    session_id = shell_execution['session_id']
-                    command = shell_execution['command']
-                    output = shell_execution['output']
-                    display_output = format_shell_display_output(
-                        output, bool(shell_result.get('running'))
-                    )
-
-                    action_label = {
-                        'shell': '启动会话',
-                        'stdin': '输入会话',
-                        'shellread': '读取会话',
-                        'shellkill': '关闭会话',
-                    }[block_type]
-                    pause_note = ""
-                    pause_display_text, round_state.pause_message = get_shell_pause_messages(
-                        str(shell_result.get('pause_reason') or '')
-                    )
-                    if shell_result.get('running'):
-                        pause_note = "\n" + pause_display_text
-
-                    await safe_send_message(
-                        context,
-                        update.effective_chat.id,
-                        build_shell_presentation(
-                            action_label=action_label,
-                            shell_result=shell_result,
-                            session_id=session_id,
-                            display_output=display_output,
-                            pause_note=pause_note,
-                        ),
-                        parse_mode=constants.ParseMode.HTML
-                    )
-
-                    shell_notice = build_shell_notice(
-                        action_label,
-                        shell_result,
-                        session_id,
-                        command,
-                        output
-                    )
-                    await persist_agent_result(
-                        recorder=GlobalRecorder,
-                        message_type=MessageType.AGENT_RESULT,
-                        database=db,
-                        conversation_id=cid,
-                        chat_id=update.effective_chat.id,
-                        notice=shell_notice,
-                    )
-                    if shell_result.get('running'):
-                        round_state.add_context(
-                            build_shell_context_message(shell_notice, running=True)
-                        )
-                        round_state.should_continue = True
-                        # 会话仍在运行不代表本次回复的后续协议无效；继续按原顺序处理，
-                        # 这样同一回复中的 shellread/stdin/shellkill 不会被静默跳过。
-                        continue
-                    round_state.add_context(
-                        build_shell_context_message(shell_notice, running=False)
-                    )
-                    round_state.should_continue = True
-                    continue
-
-                if block_type == 'media':
-                    media_prompt = block['body']
-                    await GlobalRecorder.record(
-                        msg_type=MessageType.AGENT_CMD,
-                        role='system',
-                        content=f"[Agent媒体生成] {media_prompt}",
-                        chat_id=update.effective_chat.id
-                    )
-
-                    media_execution = await execute_media_generation(
-                        media_prompt,
-                        context=context,
-                        chat_id=update.effective_chat.id,
-                        generate_media=run_default_media_generation,
-                        keep_typing=keep_typing_while_waiting,
-                        stop_event_factory=get_or_create_stop_event,
-                        stop_requested=is_stop_requested,
-                        build_stop_keyboard=build_stop_keyboard,
-                        safe_edit_text=safe_edit_text,
-                        cancel_task_quietly=cancel_task_quietly,
-                    )
-                    if media_execution['stopped']:
+            try:
+                for block in protocol_blocks:
+                    if is_stop_requested():
                         round_state.should_continue = False
                         break
-                    media_result = media_execution['result']
+                    block_type = block['type']
 
-                    media_notice, media_artifacts = build_external_media_output(media_result, media_prompt)
-
-                    await send_media_generation_result(
-                        media_result,
-                        media_artifacts,
-                        media_notice,
-                        context=context,
-                        chat_id=update.effective_chat.id,
-                        send_artifacts=send_generated_media_artifacts,
-                        safe_send_message=safe_send_message,
-                        safe_text=safe_text,
+                    standard_operation = await dispatch_standard_protocol(
+                        block,
+                        executor=AgentExecutor,
+                        provider_api_format=provider_api_format,
+                        stop_event_factory=get_or_create_stop_event,
                         logger=logger,
+                        search_api_key=BotConfig.TAVILY_API_KEY,
                     )
+                    if standard_operation is not None:
+                        operation_notice = standard_operation['notice']
+                        operation_presentation = build_standard_operation_presentation(
+                            standard_operation
+                        )
+                        if operation_presentation is not None:
+                            await safe_send_message(
+                                context,
+                                update.effective_chat.id,
+                                operation_presentation,
+                                parse_mode=constants.ParseMode.HTML,
+                            )
+                        await persist_standard_operation_result(
+                            recorder=GlobalRecorder,
+                            message_type=MessageType.AGENT_RESULT,
+                            database=db,
+                            conversation_id=cid,
+                            chat_id=update.effective_chat.id,
+                            operation=standard_operation,
+                        )
+                        round_state.add_context(standard_operation['context_message'])
+                        round_state.should_continue = True
+                        continue
 
-                    await persist_media_result(
-                        recorder=GlobalRecorder,
-                        database=db,
-                        conversation_id=cid,
-                        chat_id=update.effective_chat.id,
-                        notice=media_notice,
-                    )
-                    round_state.add_context(build_media_continuation_message(media_result, media_prompt))
-                    round_state.should_continue = True
+                    if block_type == 'sendfile':
+                        sendfile_notice = await execute_sendfile_protocol(
+                            block['body'],
+                            executor=AgentExecutor,
+                            context=context,
+                            chat_id=update.effective_chat.id,
+                            api_base_url=BotConfig.API_BASE_URL,
+                            local_api_host_data_dir=_LOCAL_API_HOST_DATA_DIR,
+                            local_api_container_data_dir=_LOCAL_API_CONTAINER_DATA_DIR,
+                            max_file_size=AgentExecutor.MAX_FILE_SIZE,
+                            safe_send_message=safe_send_message,
+                            safe_text=safe_text,
+                            logger=logger,
+                            cancel_task_quietly=cancel_task_quietly,
+                        )
+                        if sendfile_notice:
+                            await persist_agent_result(
+                                recorder=GlobalRecorder,
+                                message_type=MessageType.AGENT_RESULT,
+                                database=db,
+                                conversation_id=cid,
+                                chat_id=update.effective_chat.id,
+                                notice=sendfile_notice,
+                            )
+                            round_state.add_context(
+                                build_sendfile_context_message(sendfile_notice)
+                            )
+                            round_state.should_continue = True
+                        continue
+
+                    if block_type == 'file':
+                        filename = block['path']
+                        file_notice = ""
+                        try:
+                            written_file = await write_text_protocol_file(
+                                block, executor=AgentExecutor
+                            )
+                            file_notice = await send_written_agent_file(
+                                written_file,
+                                protocol="file",
+                                context=context,
+                                chat_id=update.effective_chat.id,
+                                max_file_size=AgentExecutor.MAX_FILE_SIZE,
+                                safe_send_message=safe_send_message,
+                                safe_text=safe_text,
+                                html_parse_mode=constants.ParseMode.HTML,
+                            )
+                        except Exception as e:
+                            logger.error(f"Agent写入文件失败: {e}")
+                            file_notice = f"[file结果] 写入失败: {filename}。错误: {str(e)[:200]}"
+                            await safe_send_message(
+                                context,
+                                update.effective_chat.id,
+                                f"❌ 文件写入失败: {safe_text(str(e)[:200])}"
+                            )
+
+                        if file_notice:
+                            await persist_agent_result(
+                                recorder=GlobalRecorder,
+                                message_type=MessageType.AGENT_RESULT,
+                                database=db,
+                                conversation_id=cid,
+                                chat_id=update.effective_chat.id,
+                                notice=file_notice,
+                            )
+                            round_state.add_context(
+                                build_file_context_message(file_notice)
+                            )
+                            round_state.should_continue = True
+                        continue
+
+                    if block_type == 'file_base64':
+                        filename = block['path']
+                        file_notice = ""
+                        try:
+                            written_file = await write_base64_protocol_file(
+                                block, executor=AgentExecutor
+                            )
+                            file_notice = await send_written_agent_file(
+                                written_file,
+                                protocol="file:base64",
+                                context=context,
+                                chat_id=update.effective_chat.id,
+                                max_file_size=AgentExecutor.MAX_FILE_SIZE,
+                                safe_send_message=safe_send_message,
+                                safe_text=safe_text,
+                                html_parse_mode=constants.ParseMode.HTML,
+                            )
+                        except Exception as e:
+                            logger.error(f"Agent base64 写入文件失败: {e}")
+                            file_notice = f"[file:base64结果] 写入失败: {filename}。错误: {str(e)[:200]}"
+                            await safe_send_message(
+                                context,
+                                update.effective_chat.id,
+                                f"❌ base64 文件写入失败: {safe_text(str(e)[:200])}"
+                            )
+
+                        if file_notice:
+                            await persist_agent_result(
+                                recorder=GlobalRecorder,
+                                message_type=MessageType.AGENT_RESULT,
+                                database=db,
+                                conversation_id=cid,
+                                chat_id=update.effective_chat.id,
+                                notice=file_notice,
+                            )
+                            round_state.add_context(
+                                build_file_context_message(file_notice, protocol="file:base64")
+                            )
+                            round_state.should_continue = True
+                        continue
+
+                    if block_type == 'trigger':
+                        trigger_notice = await execute_trigger_protocol(
+                            block,
+                            trigger_manager=SelfTriggerManager,
+                            bot=context.bot,
+                            chat_id=update.effective_chat.id,
+                            conversation_id=cid,
+                            original_text=text,
+                            response=response,
+                        )
+                        await persist_agent_result(
+                            recorder=GlobalRecorder,
+                            message_type=MessageType.AGENT_RESULT,
+                            database=db,
+                            conversation_id=cid,
+                            chat_id=update.effective_chat.id,
+                            notice=trigger_notice,
+                        )
+                        round_state.add_context(
+                            build_trigger_context_message(trigger_notice)
+                        )
+                        round_state.should_continue = True
+                        continue
+
+                    if block_type in {'shell', 'stdin', 'shellread', 'shellkill'}:
+                        shell_execution = await execute_shell_protocol(
+                            block,
+                            shell_manager=AgentShellSessionManager,
+                            executor=AgentExecutor,
+                            stop_event_factory=get_or_create_stop_event,
+                            stop_requested=is_stop_requested,
+                        )
+                        shell_result = shell_execution['result']
+                        session_id = shell_execution['session_id']
+                        command = shell_execution['command']
+                        output = shell_execution['output']
+                        display_output = format_shell_display_output(
+                            output, bool(shell_result.get('running'))
+                        )
+
+                        action_label = {
+                            'shell': '启动会话',
+                            'stdin': '输入会话',
+                            'shellread': '读取会话',
+                            'shellkill': '关闭会话',
+                        }[block_type]
+                        pause_note = ""
+                        pause_display_text, round_state.pause_message = get_shell_pause_messages(
+                            str(shell_result.get('pause_reason') or '')
+                        )
+                        if shell_result.get('running'):
+                            pause_note = "\n" + pause_display_text
+
+                        await safe_send_message(
+                            context,
+                            update.effective_chat.id,
+                            build_shell_presentation(
+                                action_label=action_label,
+                                shell_result=shell_result,
+                                session_id=session_id,
+                                display_output=display_output,
+                                pause_note=pause_note,
+                            ),
+                            parse_mode=constants.ParseMode.HTML
+                        )
+
+                        shell_notice = build_shell_notice(
+                            action_label,
+                            shell_result,
+                            session_id,
+                            command,
+                            output
+                        )
+                        await persist_agent_result(
+                            recorder=GlobalRecorder,
+                            message_type=MessageType.AGENT_RESULT,
+                            database=db,
+                            conversation_id=cid,
+                            chat_id=update.effective_chat.id,
+                            notice=shell_notice,
+                        )
+                        if shell_result.get('running'):
+                            round_state.add_context(
+                                build_shell_context_message(shell_notice, running=True)
+                            )
+                            round_state.should_continue = True
+                            # 会话仍在运行不代表本次回复的后续协议无效；继续按原顺序处理，
+                            # 这样同一回复中的 shellread/stdin/shellkill 不会被静默跳过。
+                            continue
+                        round_state.add_context(
+                            build_shell_context_message(shell_notice, running=False)
+                        )
+                        round_state.should_continue = True
+                        continue
+
+                    if block_type == 'media':
+                        media_prompt = block['body']
+                        await GlobalRecorder.record(
+                            msg_type=MessageType.AGENT_CMD,
+                            role='system',
+                            content=f"[Agent媒体生成] {media_prompt}",
+                            chat_id=update.effective_chat.id
+                        )
+
+                        media_execution = await execute_media_generation(
+                            media_prompt,
+                            context=context,
+                            chat_id=update.effective_chat.id,
+                            generate_media=run_default_media_generation,
+                            keep_typing=keep_typing_while_waiting,
+                            stop_event_factory=get_or_create_stop_event,
+                            stop_requested=is_stop_requested,
+                            build_stop_keyboard=build_stop_keyboard,
+                            safe_edit_text=safe_edit_text,
+                            cancel_task_quietly=cancel_task_quietly,
+                        )
+                        if media_execution['stopped']:
+                            round_state.should_continue = False
+                            break
+                        media_result = media_execution['result']
+
+                        media_notice, media_artifacts = build_external_media_output(media_result, media_prompt)
+
+                        await send_media_generation_result(
+                            media_result,
+                            media_artifacts,
+                            media_notice,
+                            context=context,
+                            chat_id=update.effective_chat.id,
+                            send_artifacts=send_generated_media_artifacts,
+                            safe_send_message=safe_send_message,
+                            safe_text=safe_text,
+                            logger=logger,
+                        )
+
+                        await persist_media_result(
+                            recorder=GlobalRecorder,
+                            database=db,
+                            conversation_id=cid,
+                            chat_id=update.effective_chat.id,
+                            notice=media_notice,
+                        )
+                        round_state.add_context(await build_media_continuation_message(media_result, media_prompt))
+                        round_state.should_continue = True
             
-            typing_stop.set()
-            await cancel_task_quietly(typing_task)
+            finally:
+                # 放进 finally：run 分支抛错时（磁盘满等）如果不清理，
+                # typing 状态会空转到 max_duration 才停。
+                typing_stop.set()
+                await cancel_task_quietly(typing_task)
 
             round_decision = plan_agent_round_transition(
                 round_state,
@@ -1934,20 +2063,43 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             pending_round_status_msg = None
             pending_round_iteration = None
 
+            stop_partial = []
             if stream_mode:
                 response = await send_streaming_response(
                     update, context,
                     prov_name, prov_data, model,
-                    system_prompt, next_history
+                    system_prompt, next_history,
+                    stopped_partial_sink=stop_partial
                 )
             else:
                 response = await send_non_streaming_response(
                     update, context,
                     prov_name, prov_data, model,
-                    system_prompt, next_history
+                    system_prompt, next_history,
+                    stopped_partial_sink=stop_partial
                 )
             
             if not response:
+                if is_stop_requested():
+                    # Agent 后续回复期间被用户手动停止：记录“当前回复已被用户手动停止”后结束本轮。
+                    if pending_round_status_msg is not None and pending_round_iteration is not None:
+                        with contextlib.suppress(Exception):
+                            await safe_edit_text(
+                                pending_round_status_msg,
+                                build_agent_round_status(
+                                    pending_round_iteration,
+                                    "stopped",
+                                    origin=agent_origin,
+                                ),
+                                reply_markup=None,
+                            )
+                        pending_round_status_msg = None
+                        pending_round_iteration = None
+                    await _record_user_stopped_reply(
+                        db, cid, update.effective_chat.id,
+                        stop_partial[0] if stop_partial else "",
+                    )
+                    break
                 if pending_round_status_msg is not None and pending_round_iteration is not None:
                     with contextlib.suppress(Exception):
                         await safe_edit_text(

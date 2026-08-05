@@ -1,0 +1,32 @@
+{
+  "_comment": "send-mailu 配置样例。实际文件默认位于 /etc/send-mailu/config.json（可用 SEND_MAILU_CONFIG 环境变量覆盖），权限应为 0600。通常不需要手写：运行 send-mailu.py check 会自动扫描 Mailu 并生成。",
+
+  "smtp_host": "127.0.0.1",
+  "smtp_port": 587,
+  "smtp_security": "starttls",
+
+  "_comment_security": "smtp_security 可选 ssl / starttls / none",
+
+  "default_domain": "example.com",
+
+  "_comment_domains": "每个域名一组发信凭证；username 通常是该域下的 postmaster 账号",
+  "domains": {
+    "example.com": {
+      "username": "postmaster@example.com",
+      "password": "在此填写该账号的密码"
+    },
+    "another.example.org": {
+      "username": "postmaster@another.example.org",
+      "password": "在此填写该账号的密码"
+    }
+  },
+
+  "_comment_archive": "发信后把副本 IMAP 归档到已发送文件夹。enabled 为 false 或整段缺失时不归档。host/port/security 缺省时沿用上面的 SMTP 设置（port 按 security 推断：ssl→993，其余→143）",
+  "sent_archive": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 143,
+    "security": "starttls",
+    "folder": "Sent"
+  }
+}

@@ -1,5 +1,12 @@
-python-telegram-bot[job-queue]>=20.0
-openai>=1.0.0
-python-dotenv>=1.0.0
-aiosqlite>=0.19.0
-httpx[socks]>=0.27.0
+# Upper bounds guard against breaking major releases: CI installs the newest
+# version every run, and a jump like python-telegram-bot 23.x or openai 3.x
+# would break both the runtime and CI without warning.
+# Widen these deliberately, and run the full test suite when you do.
+python-telegram-bot[job-queue]>=20.0,<23.0
+openai>=1.0.0,<3.0
+python-dotenv>=1.0.0,<2.0
+aiosqlite>=0.19.0,<1.0
+httpx[socks]>=0.27.0,<1.0
+# apscheduler is imported directly in core.py (CronTrigger). It used to arrive
+# only as a transitive dependency of python-telegram-bot[job-queue]; declare it.
+apscheduler>=3.10,<4.0

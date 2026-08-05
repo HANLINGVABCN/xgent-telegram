@@ -31,8 +31,10 @@ import random
 import uuid
 import subprocess
 import re
+import queue
 import threading
 import contextlib
+import copy
 import shutil
 import tempfile
 import fnmatch
@@ -113,6 +115,8 @@ class BotConfig:
         or os.getenv("GITHUB_TOKEN")
         or ""
     ).strip()
+    # 联网搜索（search-x / fetch-x）。未配置时协议返回配置指引而不是报错。
+    TAVILY_API_KEY = (os.getenv("TAVILY_API_KEY") or "").strip()
 
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -191,6 +195,60 @@ MAX_AGENT_MAX_ITERATIONS = 50
 AGENT_TURN_ITERATION_CONFIG_KEY = 'agent_turn_iteration'
 DEFAULT_IDLE_MESSAGE_INTERVAL = 24 * 3600
 MIN_IDLE_MESSAGE_INTERVAL = 60
+# AI 回复超时设为“不限”时，非流式请求的兜底上限。非流式没有增量输出，
+# 连接静默挂起会让界面永远停在“非流式输出中...”，必须有个硬上限。
+NONSTREAM_FALLBACK_TIMEOUT_SECONDS = 600.0
+# 流式请求的“两个分片之间”最长静默时间。流式已经产出的增量可以保留，
+# 所以这里限制的是单次等待而不是整轮总时长——长回复只要持续出字就不会被打断，
+# 但提供商建连后不发数据时不会永久挂住全局对话锁。
+STREAM_CHUNK_IDLE_TIMEOUT_SECONDS = 180.0
+# typing 状态任务的防泄漏兜底。调用方异常退出而没有 set stop_event 时，
+# typing 任务会每 4 秒发一次状态直到进程结束，这里给一个远大于正常回复
+# 时长的上限，只用于兜底，不作为功能限制。
+TYPING_MAX_DURATION_SECONDS = 1800.0
+# 共享 HTTP 客户端的默认读超时。调用方通常会显式传入自己的 timeout，
+# 这个值只用于兜底，避免漏传的调用点变成永不超时。
+DEFAULT_HTTP_READ_TIMEOUT_SECONDS = 300.0
+# 拉取模型列表是交互式操作，用户在等结果，超时要短。
+MODEL_LIST_TIMEOUT_SECONDS = 20.0
+# 空闲提醒是后台任务，没人盯着，必须有硬上限，否则提供商挂起会让它永久卡住。
+IDLE_MESSAGE_TIMEOUT_SECONDS = 300.0
+# 命令被黑名单拦截时回给模型的统一文案。刻意不包含命中的具体规则——
+# 把匹配到哪一条告诉模型，等于直接指导它改写命令绕过。规则详情只写日志。
+BLACKLIST_BLOCKED_NOTICE = (
+    '⛔ 命令被安全策略拦截，未执行。'
+    '如果确认这条命令是必要的，请让用户在「Agent 命令黑名单」菜单里调整规则。'
+)
+def validate_provider_base_url(url: str) -> Tuple[str, Optional[str]]:
+    """校验 provider 的 base_url。
+
+    返回 (清理后的 url, 警告文案或 None)；不合法时抛 ValueError。
+
+    之前有三个入口三套规则：JSON 导入严格校验、交互式添加只判 startswith("http")
+    （`httpevil.com` 都能过），编辑 URL 完全不校验。这里统一。
+    """
+    cleaned = str(url or '').strip()
+    if not cleaned:
+        raise ValueError('URL 不能为空')
+    lowered = cleaned.lower()
+    if not lowered.startswith(('http://', 'https://')):
+        raise ValueError('URL 必须以 http:// 或 https:// 开头')
+    parsed = urllib.parse.urlparse(cleaned)
+    if not parsed.netloc:
+        raise ValueError('URL 缺少主机名')
+
+    warning = None
+    if lowered.startswith('http://'):
+        host = (parsed.hostname or '').lower()
+        is_local = host in ('localhost', '127.0.0.1', '::1') or host.endswith('.localhost')
+        if not is_local:
+            warning = (
+                '⚠️ 这个地址用的是 http:// 明文传输，API Key 会以明文经过网络。'
+                '除非是内网自建服务，建议改用 https://。'
+            )
+    return cleaned, warning
+
+
 PROVIDER_HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -208,11 +266,42 @@ def redact_sensitive_text(text: str) -> str:
     secrets = {
         BotConfig.TOKEN: "[REDACTED_BOT_TOKEN]",
         BotConfig.UPDATE_GITHUB_TOKEN: "[REDACTED_UPDATE_GITHUB_TOKEN]",
+        BotConfig.TAVILY_API_KEY: "[REDACTED_TAVILY_API_KEY]",
     }
     for secret, replacement in secrets.items():
         if secret:
             text = text.replace(secret, replacement)
+    # provider 的 api_key 存在数据库里，不是环境变量常量，但它同样会出现在
+    # 错误响应体、trace 日志里，必须一起脱敏。
+    for secret in _runtime_secrets():
+        text = text.replace(secret, "[REDACTED_API_KEY]")
     return text
+
+
+# provider 的 api_key 在运行时才知道，这里维护一份供脱敏使用的快照。
+# 用 set 而不是每次去查数据库：脱敏在错误处理和日志热路径上，不能是 async。
+_RUNTIME_SECRETS: set = set()
+
+
+def _runtime_secrets() -> set:
+    return _RUNTIME_SECRETS
+
+
+def register_runtime_secret(value: Any) -> None:
+    """登记一个需要脱敏的运行时密钥（provider api_key 等）。"""
+    for key in parse_api_keys(str(value or '')):
+        # 太短的值容易在正常文本里误伤，跳过。
+        if len(key) >= 8:
+            _RUNTIME_SECRETS.add(key)
+
+
+def register_provider_secrets(providers: Optional[Dict[str, Any]]) -> None:
+    """把所有 provider 的 api_key 登记进脱敏名单。"""
+    if not providers:
+        return
+    for provider in providers.values():
+        if isinstance(provider, dict):
+            register_runtime_secret(provider.get('api_key'))
 
 def format_provider_exception(e: Exception) -> str:
     response = getattr(e, "response", None)
@@ -426,8 +515,52 @@ def trace_json_safe(value: Any) -> Any:
     return repr(value)
 
 
+_TRACE_QUEUE: "queue.Queue[Optional[str]]" = queue.Queue(maxsize=2000)
+_TRACE_WRITER_THREAD: Optional[threading.Thread] = None
+_TRACE_WRITER_LOCK = threading.Lock()
+_TRACE_DROPPED = 0
+
+
+def _trace_writer_loop():
+    """后台线程：串行地把 trace 行落盘。"""
+    while True:
+        line = _TRACE_QUEUE.get()
+        try:
+            if line is None:
+                return
+            with FULL_TRACE_LOCK:
+                with open(FULL_TRACE_LOG_FILE, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+        except Exception as e:
+            logger.debug(f"模型全量日志写入失败: {e}")
+        finally:
+            _TRACE_QUEUE.task_done()
+
+
+def _ensure_trace_writer():
+    global _TRACE_WRITER_THREAD
+    thread = _TRACE_WRITER_THREAD
+    if thread is not None and thread.is_alive():
+        return
+    with _TRACE_WRITER_LOCK:
+        thread = _TRACE_WRITER_THREAD
+        if thread is not None and thread.is_alive():
+            return
+        thread = threading.Thread(
+            target=_trace_writer_loop, name="model-trace-writer", daemon=True
+        )
+        thread.start()
+        _TRACE_WRITER_THREAD = thread
+
+
 def write_model_trace(event: str, payload: Dict[str, Any]):
-    """Append every full-fidelity action/model event to one chronological JSONL log."""
+    """Append every full-fidelity action/model event to one chronological JSONL log.
+
+    序列化在调用线程做，落盘丢给后台线程：这个函数在对话热路径上被同步调用，
+    而 FULL_TRACE_LOCK 是 threading.Lock——直接在事件循环里持锁写文件会把
+    整个 bot 卡住。队列满时丢弃并计数，日志不能反过来拖垮主流程。
+    """
+    global _TRACE_DROPPED
     try:
         record = {
             "ts": datetime.now().isoformat(timespec="milliseconds"),
@@ -435,11 +568,28 @@ def write_model_trace(event: str, payload: Dict[str, Any]):
             **trace_json_safe(payload),
         }
         line = json.dumps(record, ensure_ascii=False, default=repr)
-        with FULL_TRACE_LOCK:
-            with open(FULL_TRACE_LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+        # 落盘前脱敏：trace 里包含完整 prompt 和响应体，provider 的 api_key
+        # 会随请求头/错误体一起被记进去。
+        line = redact_sensitive_text(line)
+        _ensure_trace_writer()
+        try:
+            _TRACE_QUEUE.put_nowait(line)
+        except queue.Full:
+            _TRACE_DROPPED += 1
+            if _TRACE_DROPPED % 100 == 1:
+                logger.warning(f"trace 队列已满，累计丢弃 {_TRACE_DROPPED} 条")
     except Exception as e:
         logger.debug(f"模型全量日志写入失败: {e}")
+
+
+def flush_model_trace(timeout: float = 3.0) -> None:
+    """等待后台 trace 线程把队列写完（关闭时调用）。"""
+    thread = _TRACE_WRITER_THREAD
+    if thread is None or not thread.is_alive():
+        return
+    deadline = time.monotonic() + timeout
+    while not _TRACE_QUEUE.empty() and time.monotonic() < deadline:
+        time.sleep(0.05)
 
 
 def extract_token_usage(raw_usage: Any) -> Optional[Dict[str, int]]:
@@ -643,6 +793,7 @@ class BotState:
     SET_IDLE_MESSAGE_INTERVAL = 'set_idle_message_interval'
     SET_COMMAND_BLACKLIST = 'set_command_blacklist'
     SET_UPDATE_TOKEN = 'set_update_token'
+    SET_SEARCH_KEY = 'set_search_key'
     SET_MEMORY = 'set_memory'
     IMPORT_PROVIDER_CONFIG = 'import_provider_config'
 
@@ -767,6 +918,48 @@ def has_pending_text_conversation(update: Update) -> bool:
     key = get_text_conversation_buffer_key(update)
     with _pending_text_conversations_lock:
         return key in _pending_text_conversations
+
+
+# ---------------------------------------------------------------------------
+# Album (media_group) photo buffering
+#
+# Telegram delivers each photo of an album as a separate update that all
+# share the same ``media_group_id``. Buffer them per ``(chat_id, media_group_id)``
+# and flush once the quiet window elapses so the whole album reaches the AI as
+# a single multimodal message instead of one conversation per photo.
+# ---------------------------------------------------------------------------
+
+ALBUM_FLUSH_QUIET_SECONDS = 3.0
+ALBUM_MAX_PHOTOS = 10  # Telegram album hard cap; defensive truncation.
+
+
+class PendingAlbumConversation:
+    """Collect photos sharing one Telegram ``media_group_id`` until the quiet window elapses."""
+
+    def __init__(self, update: Update, context: ContextTypes.DEFAULT_TYPE, media_group_id: str):
+        self.update = update  # representative update (caption-bearing, falls back to first)
+        self.context = context
+        self.media_group_id = media_group_id
+        self.photos: List[Dict[str, str]] = []  # each: {image_b64, saved_notice, index_text}
+        self.caption: str = ""
+        self.flush_task: Optional[Any] = None
+        self.closed: bool = False
+
+    def add_photo(self, image_b64: str, saved_notice: str, index_text: str,
+                  caption: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.photos.append({
+            "image_b64": image_b64,
+            "saved_notice": saved_notice,
+            "index_text": index_text,
+        })
+        if caption and not self.caption:
+            self.caption = caption
+            self.update = update
+            self.context = context
+
+
+_pending_album_conversations: Dict[Tuple[int, str], "PendingAlbumConversation"] = {}
+_pending_album_conversations_lock = threading.RLock()
 
 
 REDUNDANT_AGENT_COMMAND_PREFIXES: Tuple[str, ...] = ()
@@ -900,9 +1093,13 @@ class AgentCommandBlacklist:
     def init(cls):
         os.makedirs(os.path.dirname(cls.FILE_PATH), exist_ok=True)
         if not os.path.exists(cls.FILE_PATH):
+            # 只写注释头，不预填规则：拦哪些命令由用户自己决定。
+            # 运维场景下 shutdown / killall / systemctl disable 都是正常操作，
+            # 默认拦下来会挡住真实用途。推荐名单放在 RECOMMENDED_PATTERNS，
+            # 用户可在菜单「⭐ 查看推荐名单」/「➕ 追加推荐名单」按需启用。
             with open(cls.FILE_PATH, 'w', encoding='utf-8') as f:
                 f.write(cls.HEADER)
-            logger.info("已创建 Agent 命令黑名单文件")
+            logger.info("已创建 Agent 命令黑名单文件（默认为空，可在菜单里追加推荐名单）")
         cls.reload()
 
     @classmethod
@@ -935,8 +1132,11 @@ class AgentCommandBlacklist:
                 cls._patterns = cls.parse(f.read())
             logger.info(f"加载 Agent 命令黑名单: {len(cls._patterns)} 条")
         except Exception as e:
-            logger.error(f"加载 Agent 命令黑名单失败: {e}")
-            cls._patterns = []
+            # 保留上一次成功加载的规则。以前这里会清空成 []，等于读文件一失败
+            # 就把所有命令全部放行——安全控制失效时必须保守，不能 fail-open。
+            logger.error(
+                f"加载 Agent 命令黑名单失败，继续沿用已加载的 {len(cls._patterns)} 条规则: {e}"
+            )
         return cls._patterns
 
     @classmethod
@@ -968,13 +1168,75 @@ class AgentCommandBlacklist:
     def get_display_path(cls) -> str:
         return os.path.abspath(cls.FILE_PATH).replace('\\', '/')
 
+    # shell 里能把同一条命令写成很多形态：多个空格、制表符、${IFS}、
+    # 反斜杠转义（\rm）、把命令名拆开的引号（'r'm）。朴素的子串匹配
+    # 只要碰上任意一种就失效，所以比较前先把两边都规范化。
+    _IFS_RE = re.compile(r'\$\{IFS\}|\$IFS', re.IGNORECASE)
+    _ESCAPE_RE = re.compile(r'\\(?=[A-Za-z0-9])')
+    _QUOTE_RE = re.compile(r'[\'"`]')
+    _WHITESPACE_RE = re.compile(r'\s+')
+
+    @classmethod
+    def normalize_for_match(cls, text: str) -> str:
+        """把命令/规则压成可比较的规范形态。"""
+        normalized = cls._IFS_RE.sub(' ', text or '')
+        normalized = cls._ESCAPE_RE.sub('', normalized)
+        normalized = cls._QUOTE_RE.sub('', normalized)
+        normalized = cls._WHITESPACE_RE.sub(' ', normalized)
+        return normalized.strip().lower()
+
     @classmethod
     def check(cls, command: str) -> Tuple[bool, str]:
-        cmd_lower = command.lower().strip()
+        normalized_cmd = cls.normalize_for_match(command)
+        # 再准备一份去掉全部空白的形态，用来识别 `curl|sh` 这种
+        # 把规则里的空格直接删掉的写法。
+        squeezed_cmd = normalized_cmd.replace(' ', '')
         for pattern in cls._patterns:
-            if pattern.lower() in cmd_lower:
+            normalized_pattern = cls.normalize_for_match(pattern)
+            if not normalized_pattern:
+                continue
+            if normalized_pattern in normalized_cmd:
+                return True, pattern
+            squeezed_pattern = normalized_pattern.replace(' ', '')
+            if squeezed_pattern and squeezed_pattern in squeezed_cmd:
+                return True, pattern
+            if cls._matches_piped_pattern(normalized_pattern, normalized_cmd):
                 return True, pattern
         return False, ""
+
+    @classmethod
+    def _matches_piped_pattern(cls, normalized_pattern: str, normalized_cmd: str) -> bool:
+        """处理 `curl | sh` 这类跨管道的规则。
+
+        规则里两段之间通常什么都没有，而真实命令中间还有 URL、参数等内容
+        （`curl -fsSL https://x | bash`）。所以对含管道的规则改为按顺序匹配
+        各段，而不是要求整串连续出现。
+        """
+        if '|' not in normalized_pattern:
+            return False
+        segments = [seg.strip() for seg in normalized_pattern.split('|')]
+        if not all(segments):
+            return False
+        cmd_segments = [seg.strip() for seg in normalized_cmd.split('|')]
+        if len(cmd_segments) < len(segments):
+            return False
+        # 在命令的管道分段里按顺序找齐规则的每一段。
+        search_from = 0
+        for index, segment in enumerate(segments):
+            for cmd_index in range(search_from, len(cmd_segments)):
+                cmd_segment = cmd_segments[cmd_index]
+                # 规则的第一段允许作为前缀出现（curl 后面可以跟参数和 URL），
+                # 后续段要求整段就是它，避免 `| shasum` 命中 `| sh`。
+                if index == 0:
+                    hit = cmd_segment == segment or cmd_segment.startswith(segment + ' ')
+                else:
+                    hit = cmd_segment == segment
+                if hit:
+                    search_from = cmd_index + 1
+                    break
+            else:
+                return False
+        return True
 
 
 AgentCommandBlacklist.init()

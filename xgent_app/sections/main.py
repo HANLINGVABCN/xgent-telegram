@@ -37,7 +37,10 @@ if __name__ == '__main__':
         
         # 添加任务调度器 - 每小时检查一次是否需要发送提醒消息
         job_queue = app.job_queue
-        assert job_queue is not None
+        if job_queue is None:
+            raise RuntimeError(
+                "JobQueue 不可用：请确认安装了 python-telegram-bot[job-queue]"
+            )
         job_queue.run_repeating(check_and_send_idle_message, interval=3600, first=60)
         # 注意：不再注册 send_startup_menu 兜底任务。
         # post_init 已保证启动菜单发送且 flag 不回滚，兜底任务只会制造重复发送风险。

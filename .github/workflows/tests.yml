@@ -9,6 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
+        # 代码使用 zoneinfo 和 str.removesuffix（3.9+），install.sh 的门槛是 3.10。
         python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
@@ -20,5 +21,34 @@ jobs:
       - run: python -m pip install -r requirements.txt
       - run: python tools/check_split_integrity.py
       - run: python -m compileall -q xgent_server.py xgent_app
+      # skill/script 下的脚本也要过编译检查，此前完全没被覆盖
+      - run: python -m compileall -q tools tests skill/script
       - run: python -m unittest discover -s tests -v
       - run: bash -n install.sh skill/script/mailu-helper/mailu-helper.sh skill/script/notes/install.sh skill/script/proxy-setup/proxy_setup.sh skill/script/webdav-filemanager/install.sh
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install ruff
+      # 只查真正的错误类（未定义名、语法错、明显 bug），不做风格强制。
+      # sections/ 通过共享命名空间加载，跨文件符号必然「未定义」，故排除。
+      - run: ruff check --select E9,F63,F7,F82 --exclude xgent_app/sections .
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install pip-audit
+      # 依赖有已知漏洞时失败；仅作提示不阻塞时可加 || true
+      - run: pip-audit -r requirements.txt

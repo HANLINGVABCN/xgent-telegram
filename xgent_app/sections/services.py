@@ -1,3 +1,7 @@
+
+
+
+
 # This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
@@ -8,7 +12,11 @@ from xgent_app.shell_output import (
     format_shell_display_output,
     get_shell_pause_messages,
 )
-from xgent_app.agent_context import build_media_context_message
+from xgent_app.agent_context import (
+    build_media_context_message,
+    build_media_context_message_async,
+)
+from xgent_app.agent_search import run_search
 class GlobalRecorder:
     """始终记录所有操作（无论什么模式）"""
     
@@ -16,28 +24,39 @@ class GlobalRecorder:
     async def record(msg_type: str, role: str, content: str,
                      chat_id: Optional[int] = None, user_id: Optional[int] = None,
                      session_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None):
-        """记录消息到全局表 - 始终记录"""
-        db = await BotMemoryDB.get_instance()
-        await db.record_global_message(
-            chat_id=chat_id or BotConfig.AUTHORIZED_USER_ID,
-            user_id=user_id or 0,
-            msg_type=msg_type,
-            role=role,
-            content=content,
-            session_id=session_id or UserDataManager.get('current_chat_id'),
-            metadata=metadata
-        )
+        """记录消息到全局表 - 始终记录。
+
+        记录是旁路：数据库抖动、磁盘满不应该中断用户正在进行的对话。
+        这里的 91 处调用点全是主流程里的裸 await，异常会直接冒到用户面前。
+        """
+        try:
+            db = await BotMemoryDB.get_instance()
+            await db.record_global_message(
+                chat_id=chat_id or BotConfig.AUTHORIZED_USER_ID,
+                user_id=user_id or 0,
+                msg_type=msg_type,
+                role=role,
+                content=content,
+                session_id=session_id or UserDataManager.get('current_chat_id'),
+                metadata=metadata
+            )
+        except Exception as e:
+            logger.error(f"全局消息记录失败（已忽略，不中断主流程）: {e}")
+
         if msg_type == MessageType.AI_REPLY:
             return
-        write_model_trace("operation", {
-            "msg_type": msg_type,
-            "role": role,
-            "chat_id": chat_id or BotConfig.AUTHORIZED_USER_ID,
-            "user_id": user_id or 0,
-            "session_id": session_id or UserDataManager.get('current_chat_id'),
-            "content": content,
-            "metadata": metadata,
-        })
+        try:
+            write_model_trace("operation", {
+                "msg_type": msg_type,
+                "role": role,
+                "chat_id": chat_id or BotConfig.AUTHORIZED_USER_ID,
+                "user_id": user_id or 0,
+                "session_id": session_id or UserDataManager.get('current_chat_id'),
+                "content": content,
+                "metadata": metadata,
+            })
+        except Exception as e:
+            logger.error(f"trace 记录失败（已忽略，不中断主流程）: {e}")
     
     @staticmethod
     async def record_user_message(content: str, msg_type: str = MessageType.USER_TEXT,
@@ -195,6 +214,160 @@ def persist_update_github_token(token: str, update_url: Optional[str] = None):
         "UPDATE_GITHUB_TOKEN": token,
     })
 
+def persist_search_api_key(api_key: str):
+    """把 Tavily Key 写入 .env 并立即生效，无需重启。"""
+    api_key = str(api_key or "").replace("\r", "").replace("\n", "").strip()
+    if not api_key:
+        raise ValueError("搜索 API Key 不能为空")
+    BotConfig.TAVILY_API_KEY = api_key
+    os.environ["TAVILY_API_KEY"] = api_key
+    update_env_values({"TAVILY_API_KEY": api_key})
+
+
+def clear_search_api_key():
+    """清除已保存的搜索 Key，search-x 会回到未配置提示。"""
+    BotConfig.TAVILY_API_KEY = ""
+    os.environ.pop("TAVILY_API_KEY", None)
+    update_env_values({"TAVILY_API_KEY": ""})
+
+
+def mask_search_api_key(api_key: str) -> str:
+    """只显示尾部 4 位，避免完整 Key 出现在聊天记录里。"""
+    api_key = str(api_key or "").strip()
+    if not api_key:
+        return "未配置"
+    if len(api_key) <= 8:
+        return "*" * len(api_key)
+    return f"{api_key[:6]}...{api_key[-4:]}"
+
+
+def clear_update_github_token():
+    """清除已保存的 GitHub Token。"""
+    BotConfig.UPDATE_GITHUB_TOKEN = ""
+    os.environ.pop("UPDATE_GITHUB_TOKEN", None)
+    update_env_values({"UPDATE_GITHUB_TOKEN": ""})
+
+
+def mask_update_github_token(token: str) -> str:
+    """只显示首尾，避免完整 Token 出现在聊天记录里。"""
+    token = str(token or "").strip()
+    if not token:
+        return "未配置"
+    if len(token) <= 12:
+        return "*" * len(token)
+    return f"{token[:10]}...{token[-4:]}"
+
+
+def _github_api_status(url: str, token: str) -> int:
+    """对 GitHub API 发一次 GET，只返回状态码。"""
+    request = urllib.request.Request(url, headers={
+        "User-Agent": "xgent-telegram-updater",
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return int(response.status)
+    except urllib.error.HTTPError as e:
+        return int(e.code)
+
+
+def verify_update_github_token(token: str, update_url: str) -> Dict[str, Any]:
+    """分两步验证 Token，区分「Token 本身无效」和「没授权这个仓库」。
+
+    GitHub 对无权限的私有仓库返回 404 而不是 403（避免泄露仓库存在），
+    所以必须先验证身份再验证仓库，否则无法给出可操作的提示。
+    """
+    token = str(token or "").strip()
+    if not token:
+        return {"ok": False, "reason": "empty", "message": "Token 为空。"}
+
+    if "\\" in token:
+        return {
+            "ok": False,
+            "reason": "escaped",
+            "message": (
+                "Token 里含有反斜杠 <code>\\</code>，说明被转义过。\n"
+                "请重新发送一次原始 Token。"
+            ),
+        }
+
+    try:
+        user_status = _github_api_status("https://api.github.com/user", token)
+    except Exception as e:
+        return {
+            "ok": False,
+            "reason": "network",
+            "message": f"无法连接 GitHub：{str(e)[:150]}",
+        }
+
+    if user_status == 401:
+        return {
+            "ok": False,
+            "reason": "invalid_token",
+            "message": (
+                "Token 无效或已过期（GitHub 返回 401）。\n\n"
+                "请到 GitHub → Settings → Developer settings → "
+                "Personal access tokens 重新生成，注意复制完整、不要漏字符。"
+            ),
+        }
+    if user_status != 200:
+        return {
+            "ok": False,
+            "reason": "unexpected",
+            "message": f"验证身份时 GitHub 返回 HTTP {user_status}。",
+        }
+
+    repo_api = github_repo_api_url(update_url)
+    if not repo_api:
+        return {"ok": True, "reason": "user_only", "message": "Token 有效。"}
+
+    try:
+        repo_status = _github_api_status(repo_api, token)
+    except Exception as e:
+        return {
+            "ok": False,
+            "reason": "network",
+            "message": f"无法连接 GitHub：{str(e)[:150]}",
+        }
+
+    if repo_status == 200:
+        return {"ok": True, "reason": "ok", "message": "Token 有效，且可以访问该仓库。"}
+
+    if repo_status in (403, 404):
+        return {
+            "ok": False,
+            "reason": "no_repo_access",
+            "message": (
+                "Token 本身有效，但<b>访问不到这个仓库</b>。\n\n"
+                "生成 Fine-grained Token 时必须同时满足：\n"
+                "1️⃣ <b>Repository access</b> → 选 <code>Only select repositories</code> "
+                "→ 勾上目标仓库\n"
+                "2️⃣ <b>Permissions</b> → <code>Repository permissions</code> → "
+                "<code>Contents</code> → 设为 <b>Read-only</b>\n\n"
+                "第 2 条默认是 No access，最容易漏掉。"
+            ),
+        }
+
+    return {
+        "ok": False,
+        "reason": "unexpected",
+        "message": f"访问仓库时 GitHub 返回 HTTP {repo_status}。",
+    }
+
+
+def github_repo_api_url(update_url: str) -> str:
+    """从 zipball 地址推出仓库 API 地址，用于权限校验。"""
+    match = re.match(
+        r"https://api\.github\.com/repos/([^/]+)/([^/]+)/zipball",
+        str(update_url or "").strip(),
+    )
+    if not match:
+        return ""
+    return f"https://api.github.com/repos/{match.group(1)}/{match.group(2)}"
+
+
 def should_send_github_update_token(update_url: str) -> bool:
     host = (urllib.parse.urlparse(update_url).hostname or "").lower()
     return host == "github.com" or host == "api.github.com" or host.endswith(".github.com")
@@ -212,9 +385,12 @@ def build_update_download_request() -> urllib.request.Request:
 def format_update_download_error(e: urllib.error.HTTPError) -> str:
     if e.code in {401, 403, 404}:
         auth_hint = (
-            "已读取 UPDATE_GITHUB_TOKEN，但访问仍被拒绝，请确认 token 对该仓库有 Contents 只读权限。"
+            "已读取 UPDATE_GITHUB_TOKEN，但访问被拒绝。"
+            "多半是 Token 没授权这个仓库：生成 Fine-grained Token 时要选 "
+            "Only select repositories 勾上目标仓库，并把 Contents 设为 Read-only。"
+            "可在「更多设置 → 凭据配置 → GitHub Token → 验证 Token」查看具体原因。"
             if BotConfig.UPDATE_GITHUB_TOKEN
-            else "如果仓库是私有仓库，请在 .env 设置 UPDATE_GITHUB_TOKEN。"
+            else "如果仓库是私有仓库，请在「更多设置 → 凭据配置 → GitHub Token」设置 Token。"
         )
         return f"更新源访问失败（HTTP {e.code}）。{auth_hint}"
     return f"下载更新包失败（HTTP {e.code}）。"
@@ -1172,10 +1348,14 @@ def build_media_result_notice(result: Dict[str, Any], prompt: str) -> str:
     return text
 
 
-def build_media_continuation_message(result: Dict[str, Any], prompt: str) -> Dict[str, Any]:
-    """Compatibility wrapper; media context construction lives in agent_context."""
+async def build_media_continuation_message(result: Dict[str, Any], prompt: str) -> Dict[str, Any]:
+    """Compatibility wrapper; media context construction lives in agent_context.
+
+    异步版本：读取并 base64 编码最多 8MB 的媒体本体会阻塞事件循环，
+    而这条路径持有全局对话锁。
+    """
     notice = build_media_result_notice(result, prompt)
-    return build_media_context_message(
+    return await build_media_context_message_async(
         result,
         notice,
         max_inline_bytes=MEDIA_CONTEXT_MAX_BYTES,

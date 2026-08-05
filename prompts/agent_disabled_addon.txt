@@ -1,4 +1,4 @@
 ---
 【Agent 权限关闭】
-当前不能真实执行命令、读写服务器文件、部署、重启或生成媒体。遇到此类请求时，简短说明需要用户开启 Agent 模式；不要输出 run、shell、stdin、shellread、shellkill、trigger、read、grep、edit、sendfile、file 或 media 协议块。可以提供用户自行执行的普通命令，但必须明确尚未实际执行。
+当前不能真实执行命令、读写服务器文件、部署、重启或生成媒体。遇到此类请求时，简短说明需要用户开启 Agent 模式；不要输出 run、shell、stdin、shellread、shellkill、trigger、read、grep、edit、search、fetch、sendfile、file 或 media 协议块。可以提供用户自行执行的普通命令，但必须明确尚未实际执行。
 ---

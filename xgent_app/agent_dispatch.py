@@ -12,13 +12,16 @@ from xgent_app.agent_results import (
     AgentOperationResult,
     failed_result,
     normalize_edit_result,
+    normalize_fetch_result,
     normalize_grep_result,
     normalize_read_result,
     normalize_run_result,
+    normalize_search_result,
 )
+from xgent_app.agent_search import run_fetch, run_search
 
 
-STANDARD_PROTOCOL_TYPES = frozenset({"read", "edit", "grep", "run"})
+STANDARD_PROTOCOL_TYPES = frozenset({"read", "edit", "grep", "run", "search", "fetch"})
 
 
 async def dispatch_standard_protocol(
@@ -28,6 +31,7 @@ async def dispatch_standard_protocol(
     provider_api_format: str,
     stop_event_factory: Callable[[], Any],
     logger: Any,
+    search_api_key: Optional[str] = None,
 ) -> Optional[AgentOperationResult]:
     """Execute one standard protocol or return ``None`` when unsupported."""
     block_type = str(block.get("type") or "")
@@ -85,5 +89,31 @@ async def dispatch_standard_protocol(
             )
         return normalize_grep_result(raw_result)
 
-    raw_result = await executor.run_command(block["body"], stop_event_factory())
+    if block_type == "search":
+        try:
+            raw_result = await run_search(block["body"], search_api_key)
+        except Exception as exc:
+            logger.error(f"Agent search 执行异常: {exc}")
+            raw_result = failed_result(
+                "search", f"[search结果] 执行异常: {str(exc)[:200]}"
+            )
+        return normalize_search_result(raw_result)
+
+    if block_type == "fetch":
+        try:
+            raw_result = await run_fetch(block["body"], search_api_key)
+        except Exception as exc:
+            logger.error(f"Agent fetch 执行异常: {exc}")
+            raw_result = failed_result(
+                "fetch", f"[fetch结果] 执行异常: {str(exc)[:200]}"
+            )
+        return normalize_fetch_result(raw_result)
+
+    try:
+        raw_result = await executor.run_command(block["body"], stop_event_factory())
+    except Exception as exc:
+        logger.error(f"Agent run 执行异常: {exc}")
+        raw_result = failed_result(
+            "run", f"[run结果] 执行异常: {str(exc)[:200]}"
+        )
     return normalize_run_result(raw_result)

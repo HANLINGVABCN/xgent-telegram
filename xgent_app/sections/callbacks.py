@@ -219,6 +219,149 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode=constants.ParseMode.HTML
             )
 
+        # --- 凭据配置 ---
+        elif data == "menu_credentials":
+            UserDataManager.set('state', BotState.IDLE)
+            await query.message.edit_text(
+                build_credentials_text(),
+                reply_markup=get_credentials_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "menu_github_token":
+            UserDataManager.set('state', BotState.IDLE)
+            await query.message.edit_text(
+                build_github_token_text(),
+                reply_markup=get_github_token_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "act_set_github_token":
+            UserDataManager.set('state', BotState.SET_UPDATE_TOKEN)
+            UserDataManager.set('pending_update_zip_url', BotConfig.UPDATE_ZIP_URL)
+            await query.message.reply_text(
+                "🔑 <b>设置 GitHub Token</b>\n"
+                "━━━━━━━━━━━━━━\n"
+                "请发送 Fine-grained GitHub Token（<code>github_pat_</code> 开头）。\n\n"
+                "生成时必须同时满足：\n"
+                "1️⃣ <b>Repository access</b> → <code>Only select repositories</code> "
+                "→ 勾上目标仓库\n"
+                "2️⃣ <b>Permissions</b> → <code>Repository permissions</code> → "
+                "<code>Contents</code> → <b>Read-only</b>\n\n"
+                "<i>第 2 条默认是 No access，最容易漏。</i>\n"
+                "━━━━━━━━━━━━━━\n"
+                "保存时会自动验证，聊天记录里只保留掩码形式。\n"
+                "<i>发送 cancel 取消。</i>",
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "act_test_github_token":
+            status_msg = await query.message.reply_text("🔍 正在验证 Token...")
+            result = await asyncio.to_thread(
+                verify_update_github_token,
+                BotConfig.UPDATE_GITHUB_TOKEN,
+                BotConfig.UPDATE_ZIP_URL,
+            )
+            icon = "✅" if result['ok'] else "❌"
+            await status_msg.edit_text(
+                f"{icon} {result['message']}",
+                reply_markup=get_github_token_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "confirm_clear_github_token":
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ 确认清除", callback_data="do_clear_github_token")],
+                [InlineKeyboardButton("🔙 返回", callback_data="menu_github_token")]
+            ])
+            await query.message.edit_text(
+                "⚠️ <b>确认清除 GitHub Token？</b>\n\n"
+                "清除后无法从私有仓库拉取更新（会返回 404）。\n"
+                "正常更新源不受影响。",
+                reply_markup=kb,
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "do_clear_github_token":
+            await asyncio.to_thread(clear_update_github_token)
+            await GlobalRecorder.record_system_op("清除 GitHub Token")
+            await query.message.edit_text(
+                build_github_token_text(),
+                reply_markup=get_github_token_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        # --- 联网搜索设置 ---
+        elif data == "menu_search_settings":
+            UserDataManager.set('state', BotState.IDLE)
+            await query.message.edit_text(
+                build_search_settings_text(),
+                reply_markup=get_search_settings_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "act_set_search_key":
+            UserDataManager.set('state', BotState.SET_SEARCH_KEY)
+            await query.message.reply_text(
+                "🔑 <b>设置搜索 API Key</b>\n"
+                "━━━━━━━━━━━━━━\n"
+                "请发送 Tavily API Key（通常以 <code>tvly-</code> 开头）。\n\n"
+                "获取方式：访问 <code>tavily.com</code> 注册账号，"
+                "在 Dashboard 复制 API Key，免费额度 1000 次/月。\n\n"
+                "Key 会写入 <code>.env</code>，保存后立即生效，无需重启。\n"
+                "为安全起见，收到后聊天记录里只会保留掩码形式。\n"
+                "━━━━━━━━━━━━━━\n"
+                "<i>发送 cancel 取消。</i>",
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "act_test_search":
+            status_msg = await query.message.reply_text("🔍 正在测试搜索...")
+            try:
+                result = await run_search("hello world\nmax: 2", BotConfig.TAVILY_API_KEY)
+            except Exception as e:
+                logger.exception("搜索测试失败")
+                await status_msg.edit_text(
+                    f"❌ 测试失败：<code>{safe_text(format_provider_exception(e))}</code>",
+                    parse_mode=constants.ParseMode.HTML
+                )
+                return
+            if result.get('success'):
+                hits = len(result.get('results') or [])
+                await status_msg.edit_text(
+                    f"✅ 搜索可用，返回 {hits} 条结果。\n"
+                    "Agent 现在可以使用 search-x 和 fetch-x 了。",
+                    reply_markup=get_search_settings_menu()
+                )
+            else:
+                await status_msg.edit_text(
+                    f"⚠️ 搜索不可用：\n<code>{safe_text(str(result.get('output') or '')[:600])}</code>",
+                    reply_markup=get_search_settings_menu(),
+                    parse_mode=constants.ParseMode.HTML
+                )
+
+        elif data == "confirm_clear_search_key":
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ 确认清除", callback_data="do_clear_search_key")],
+                [InlineKeyboardButton("🔙 返回", callback_data="menu_search_settings")]
+            ])
+            await query.message.edit_text(
+                "⚠️ <b>确认清除搜索 API Key？</b>\n\n"
+                "清除后 Agent 无法联网搜索，search-x 会返回未配置提示。\n"
+                "其他功能不受影响。",
+                reply_markup=kb,
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "do_clear_search_key":
+            await asyncio.to_thread(clear_search_api_key)
+            await GlobalRecorder.record_system_op("清除搜索 API Key")
+            await query.message.edit_text(
+                build_search_settings_text(),
+                reply_markup=get_search_settings_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
         # --- 记忆管理 ---
         elif data == "menu_memory":
             UserDataManager.set('state', BotState.IDLE)
@@ -1052,7 +1195,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"🧭 说明: {safe_text(platform_hint)}\n"
                 f"🔗 Base URL: <code>{safe_text(prov['base_url'])}</code>\n"
                 f"📨 请求形式: <code>{safe_text(request_hint)}</code>\n"
-                f"🔑 API Key: {masked_key}"
+                f"🔑 API Key: {safe_text(masked_key)}"
             )
             await query.message.edit_text(
                 info,
@@ -1523,7 +1666,17 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await cmd_delete_chat(update, context)
         elif data in {"cmd_new_chat", "cmd_save", "cmd_list_chats", "cmd_rename_chat"} or data.startswith("load_chat_"):
             await query.answer("现在只有一份全局记忆，不再支持分段管理。", show_alert=True)
-    
+        else:
+            # 没有任何分支命中。最常见的原因是重启后旧按钮里的短 ID 已经从
+            # 内存映射表里消失（CallbackDataStore 是纯内存的）。以前这里
+            # 直接静默结束：转圈已经被 query.answer() 清掉了，用户看到的是
+            # 一个"点了但什么都没发生"的按钮。
+            logger.warning(f"未识别的 callback data: {data!r}")
+            await query.answer(
+                "这个按钮已失效（可能是重启前的旧消息）。请重新打开菜单。",
+                show_alert=True,
+            )
+
     except Exception as e:
         logger.error(f"Callback Error: {e}\n{traceback.format_exc()}")
         await query.message.reply_text("操作失败，请稍后重试。")

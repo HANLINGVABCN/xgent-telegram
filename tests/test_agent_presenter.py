@@ -76,11 +76,26 @@ class AgentPresenterTests(unittest.TestCase):
             ),
             (
                 "⌨️ <b>Agent Run</b>\n"
-                "✅ 返回码: <code></code>\n"
+                # 返回码 0 必须显示成 "0"。以前 escape_html 用 falsy 判断，
+                # 成功命令的返回码会渲染成空的 <code></code>，
+                # 而喂给模型的上下文里却是 "0"，两边对不上。
+                "✅ 返回码: <code>0</code>\n"
                 "完整输出: <code>/tmp/a&amp;b.log</code>\n"
                 "<pre>&lt;done&gt;</pre>"
             ),
         )
+
+    def test_run_presentation_reports_archive_failure(self):
+        """存档失败时 output_path 是 None，不能显示成空白。"""
+        rendered = build_run_presentation(
+            {
+                "success": True,
+                "output": "ok",
+                "return_code": 0,
+                "output_path": None,
+            }
+        )
+        self.assertIn("存档失败", rendered)
 
 
 if __name__ == "__main__":
