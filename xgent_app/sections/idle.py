@@ -106,6 +106,7 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
 _web_chat_server: Optional[Any] = None
 # 真实 PTB bot 引用。网页发起对话时，MirrorBot 用它把消息同时投递到 Telegram。
 _web_real_bot: Optional[Any] = None
+_web_application: Optional[Any] = None
 
 # 网页可改的参数白名单。刻意不含提供商增删改和 API Key——那些留在 Telegram 里。
 WEB_EDITABLE_SETTINGS = {
@@ -220,6 +221,25 @@ async def _web_run_conversation(text: str, outbox: Any) -> None:
     update, context, _bot = build_web_mirror_objects(
         BotConfig.AUTHORIZED_USER_ID, outbox, _web_real_bot,
     )
+    # 配置状态（设置密码/端口/地址/提示词/Key 等）：走 Telegram 同款状态机，
+    # 不要当 AI 对话。否则网页输入 cancel 或配置值会被发给 AI（既有 bug）。
+    state = UserDataManager.get('state')
+    if state != BotState.IDLE:
+        try:
+            update.message.text = text
+        except Exception:
+            pass
+        # 状态处理器（设密码/端口）会调 restart_web_chat(context.application)，
+        # mirror context 默认无该属性，这里补上真实 application。
+        context.application = _web_application
+        try:
+            await handle_text_message(update, context)
+        except Exception as e:
+            logger.exception("Web 状态处理失败")
+            outbox.put({"type": "turn_error", "text": redact_sensitive_text(str(e))[:300]})
+        else:
+            outbox.put({"type": "turn_end"})
+        return
     try:
         # 先把用户消息镜像到 Telegram，再记录到记忆、跑对话。
         if _web_real_bot is not None:
@@ -376,7 +396,7 @@ def _web_is_busy() -> bool:
 
 async def start_web_chat_if_enabled(app: Any) -> None:
     """按开关启动 Web 服务。失败只记日志，绝不影响 bot 主流程。"""
-    global _web_chat_server, _web_real_bot
+    global _web_chat_server, _web_real_bot, _web_application
     if _web_chat_server is not None:
         return
     if not normalize_bool(UserDataManager.get('web_enabled', False), False):
@@ -384,6 +404,9 @@ async def start_web_chat_if_enabled(app: Any) -> None:
 
     # 记下真实 bot，网页发起对话时 MirrorBot 用它把消息同步到 Telegram。
     _web_real_bot = getattr(app, "bot", None)
+    # 记下 application：网页触发配置状态（设密码/端口需 restart_web_chat）时，
+    # 状态处理器会取 context.application，mirror context 默认没有该属性。
+    _web_application = app
 
     password_hash = await read_web_password_hash()
     if not password_hash:
