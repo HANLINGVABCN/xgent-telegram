@@ -27,6 +27,7 @@
     border-radius: 8px; padding: 6px 12px; cursor: pointer; font-size: 13px;
   }
   #bar button:hover { background: #243341; }
+  #bar button.back-btn { border: none; padding: 6px 8px; font-size: 18px; line-height: 1; }
   #term-wrap { position: absolute; top: 44px; left: 0; right: 0; bottom: 0; padding: 6px; }
   #term { width: 100%; height: 100%; }
   .overlay {
@@ -56,6 +57,7 @@
 </head>
 <body>
 <div id="bar">
+  <button class="back-btn" id="backBtn" title="返回聊天">←</button>
   <span class="title">🖥 终端</span>
   <button id="closeBtn">关闭会话</button>
 </div>
@@ -76,6 +78,7 @@
   <div class="card">
     <h2>会话已结束</h2>
     <button id="renewBtn">新建会话</button>
+    <button id="endedBackBtn" style="margin-top:8px;background:transparent;border:none;color:#5288c1;font:inherit;cursor:pointer;">← 返回聊天</button>
     <div class="muted" id="endReason"></div>
   </div>
 </div>
@@ -186,7 +189,13 @@ function initTerm() {
       updateStatus();
       openStream();
     })
-    .catch(function (e) { showEnded(e.message || '无法创建终端'); });
+    .catch(function (e) {
+      var msg = e.message || '无法创建终端';
+      if (msg.indexOf('终端功能未开启') >= 0) {
+        msg = '终端功能未开启。请在 Telegram /start → 🌐 Web → 🖥 终端 里开启后重试。';
+      }
+      showEnded(msg);
+    });
 
   term.onData(function (data) {
     if (!sessionId) return;
@@ -216,6 +225,8 @@ $('closeBtn').onclick = function () {
   }
   showEnded('已手动关闭');
 };
+$('backBtn').onclick = function () { location.href = '/'; };
+$('endedBackBtn').onclick = function () { location.href = '/'; };
 $('renewBtn').onclick = function () {
   $('endedOverlay').style.display = 'none';
   if (term) { term.dispose(); term = null; }

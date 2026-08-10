@@ -68,6 +68,7 @@ class WebChatConfig:
         submit_callback: Optional[Callable[[str, int, WebOutbox], Any]] = None,
         submit_command: Optional[Callable[[str, WebOutbox], Any]] = None,
         is_terminal_enabled: Optional[Callable[[], bool]] = None,
+        is_web_enabled: Optional[Callable[[], bool]] = None,
     ):
         self.host = host
         self.port = port
@@ -81,6 +82,7 @@ class WebChatConfig:
         self.submit_command = submit_command or (lambda *a: None)
         # 终端开关。默认关闭——终端是任意命令执行，必须显式开启。
         self.is_terminal_enabled = is_terminal_enabled or (lambda: False)
+        self.is_web_enabled = is_web_enabled or (lambda: True)
         self.read_history = read_history
         self.read_settings = read_settings
         self.write_setting = write_setting
@@ -250,6 +252,20 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     # --- 处理器 ---
 
     def _serve_index(self) -> None:
+        if not self.config.is_web_enabled():
+            self._send_html(
+                b'<!DOCTYPE html><html><head><meta charset="utf-8">'
+                b'<meta name="viewport" content="width=device-width,initial-scale=1">'
+                b'<title>XGent</title>'
+                b'<style>body{margin:0;height:100%;display:flex;align-items:center;'
+                b'justify-content:center;background:#17212b;color:#e9edf0;'
+                b'font-family:sans-serif;text-align:center}'
+                b'a{color:#5288c1;text-decoration:none}</style></head>'
+                b'<body><div><h2>Web Chat \u672a\u5f00\u542f</h2>'
+                b'<p>\u8bf7\u5728 Telegram /start \u2192 \U0001f310 Web \u91cc\u5f00\u542f\u3002</p>'
+                b'<p><a href="/terminal">\U0001f5a5 \u6253\u5f00\u7ec8\u7aef</a></p>'
+                b'</div></body></html>')
+            return
         index_path = os.path.join(STATIC_DIR, "index.html")
         try:
             with open(index_path, "rb") as handle:
@@ -311,6 +327,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _handle_history(self) -> None:
         if not self._require_auth():
             return
+        if not self._require_web_enabled():
+            return
         query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         try:
             limit = int((query.get("limit") or ["50"])[0])
@@ -345,6 +363,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _handle_chat(self) -> None:
         if not self._require_auth():
             return
+        if not self._require_web_enabled():
+            return
         data = self._read_json()
         if data is None:
             return
@@ -367,12 +387,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _handle_stop(self) -> None:
         if not self._require_auth():
             return
+        if not self._require_web_enabled():
+            return
         self.config.request_stop()
         self._send_json({"ok": True})
 
     def _handle_callback(self) -> None:
         """网页内联按钮点击。复用 Telegram 的回调路由，结果经 SSE 推回。"""
         if not self._require_auth():
+            return
+        if not self._require_web_enabled():
             return
         data = self._read_json()
         if data is None:
@@ -394,6 +418,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         """网页 /命令。复用 Telegram 的 cmd_* 处理函数，结果经 SSE 推回。"""
         if not self._require_auth():
             return
+        if not self._require_web_enabled():
+            return
         data = self._read_json()
         if data is None:
             return
@@ -410,6 +436,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def _handle_stream(self) -> None:
         if not self._require_auth():
+            return
+        if not self._require_web_enabled():
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -454,6 +482,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if self.config.is_terminal_enabled():
             return True
         self._send_json({"error": "终端功能未开启"}, status=403)
+        return False
+
+    def _require_web_enabled(self) -> bool:
+        if self.config.is_web_enabled():
+            return True
+        self._send_json({"error": "Web Chat 未开启"}, status=403)
         return False
 
     def _handle_term_open(self) -> None:

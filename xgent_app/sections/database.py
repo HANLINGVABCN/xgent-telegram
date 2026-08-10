@@ -920,6 +920,7 @@ class UserDataManager:
     _data: Dict[str, Any] = {}
     _db: Optional[BotMemoryDB] = None
     _initialized = False
+    _init_lock: Optional[asyncio.Lock] = None
 
     @classmethod
     def _require_db(cls) -> BotMemoryDB:
@@ -929,12 +930,21 @@ class UserDataManager:
         return db
     
     @classmethod
+    def _get_init_lock(cls):
+        if cls._init_lock is None:
+            cls._init_lock = asyncio.Lock()
+        return cls._init_lock
+
+    @classmethod
     async def init(cls):
         if cls._initialized:
             return
-        cls._db = await BotMemoryDB.get_instance()
-        await cls._load_from_db()
-        cls._initialized = True
+        async with cls._get_init_lock():
+            if cls._initialized:
+                return
+            cls._db = await BotMemoryDB.get_instance()
+            await cls._load_from_db()
+            cls._initialized = True
     
     @classmethod
     async def _load_from_db(cls):

@@ -533,7 +533,10 @@ def to_display_path(path: str) -> str:
     return os.path.abspath(path).replace('\\', '/')
 
 def get_runtime_prompt(key: str) -> str:
-    return UserDataManager.get(key, PromptFileManager.get(key))
+    value = UserDataManager.get(key)
+    if value:
+        return value
+    return PromptFileManager.get(key)
 
 def format_prompt_template(key: str, **values: Any) -> str:
     content = PromptFileManager.get(key)

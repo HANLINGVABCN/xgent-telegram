@@ -3,7 +3,8 @@
 
 async def keep_typing_while_waiting(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
                                     stop_event: asyncio.Event, interval: float = 4.0,
-                                    max_duration: Optional[float] = None):
+                                    max_duration: Optional[float] = None,
+                                    watch_task: Optional[asyncio.Task] = None):
     """Keep Telegram typing status alive while the model is still working.
 
     ``max_duration`` 是防泄漏兜底：调用方异常退出而未设置 stop_event 时，
@@ -11,6 +12,8 @@ async def keep_typing_while_waiting(context: ContextTypes.DEFAULT_TYPE, chat_id:
     """
     started_at = time.monotonic()
     while not stop_event.is_set():
+        if watch_task is not None and watch_task.done():
+            return
         if max_duration is not None and time.monotonic() - started_at >= max_duration:
             return
         try:

@@ -1758,9 +1758,11 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             # 命令执行期间保持聊天顶栏 typing 状态；max_duration 仅作异常防泄漏兜底，
             # 正常路径在操作循环结束后立即停止。
             typing_stop = asyncio.Event()
+            main_task = asyncio.current_task()
             typing_task = asyncio.create_task(
                 keep_typing_while_waiting(
-                    context, update.effective_chat.id, typing_stop, max_duration=1800.0
+                    context, update.effective_chat.id, typing_stop, max_duration=1800.0,
+                    watch_task=main_task
                 )
             )
 

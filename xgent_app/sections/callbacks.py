@@ -559,7 +559,15 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return
             UserDataManager.set('web_enabled', enabled)
             await UserDataManager.save_config('web_enabled', enabled)
-            await restart_web_chat(context.application)
+            # 解耦: 只在服务器运行状态需要改变时才 start/stop, 不无谓 restart
+            running = is_web_chat_running()
+            term_still_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
+            if enabled or term_still_on:
+                if not running:
+                    await start_web_chat_if_enabled(context.application)
+            else:
+                if running:
+                    await stop_web_chat()
             await GlobalRecorder.record_system_op(
                 f"Web Chat {'开启' if enabled else '关闭'}",
                 {"web_enabled": enabled}
@@ -641,14 +649,21 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
         elif data == "toggle_terminal_enabled":
-            # 终端依赖 Web 服务（同端口同认证），Web 未开时拒绝开启终端。
-            web_on = normalize_bool(UserDataManager.get('web_enabled', False), False)
-            if not web_on:
-                await query.answer("请先开启 Web 服务", show_alert=True)
-                return
             term_on = not normalize_bool(UserDataManager.get('terminal_enabled', False), False)
+            if term_on and not UserDataManager.get('_web_has_password', False):
+                await query.answer("请先设置访问密码", show_alert=True)
+                return
             UserDataManager.set('terminal_enabled', term_on)
             await UserDataManager.save_config('terminal_enabled', term_on)
+            # 解耦: 终端与 Web 共享服务器但独立开关
+            running = is_web_chat_running()
+            web_still_on = normalize_bool(UserDataManager.get('web_enabled', False), False)
+            if term_on or web_still_on:
+                if not running:
+                    await start_web_chat_if_enabled(context.application)
+            else:
+                if running:
+                    await stop_web_chat()
             await GlobalRecorder.record_system_op(
                 f"终端{'开启' if term_on else '关闭'}",
                 {"terminal_enabled": term_on}

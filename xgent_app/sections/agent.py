@@ -894,7 +894,7 @@ class AgentExecutor:
         }
 
     @classmethod
-    async def edit_file(cls, edit_body: str) -> Dict[str, Any]:
+    async def edit_file(cls, edit_body: str, explicit_path: str = "") -> Dict[str, Any]:
         """字符串级原地替换：把文件中唯一存在的 old_str 换成 new_str。
 
         body 格式（标记行必须顶格独占一行，内容区可含任意字符）：
@@ -912,7 +912,7 @@ class AgentExecutor:
             ...
         返回 dict 含 success/path/backed_up/matches/line_range 等。
         """
-        old_str, new_str, requested_path, parse_err = cls._parse_edit_body(edit_body)
+        old_str, new_str, requested_path, parse_err = cls._parse_edit_body(edit_body, explicit_path)
         if parse_err:
             return {'success': False, 'error': parse_err, 'output': parse_err}
 
@@ -1013,7 +1013,7 @@ class AgentExecutor:
         }
 
     @classmethod
-    def _parse_edit_body(cls, body: str) -> Tuple[str, str, str, str]:
+    def _parse_edit_body(cls, body: str, explicit_path: str = "") -> Tuple[str, str, str, str]:
         """解析 edit 块 body，返回 (old_str, new_str, path, err)。
 
         格式（固定分隔标记，标记行必须顶格独占一行）：
@@ -1027,10 +1027,14 @@ class AgentExecutor:
         """
         body = body.replace('\r\n', '\n')
         lines = body.split('\n')
-        if not lines or not lines[0].strip():
-            return '', '', '', "edit 块第一行必须是文件路径。"
-        path_line = lines[0].strip()
-        rest_lines = lines[1:]
+        if explicit_path:
+            path_line = explicit_path.strip()
+            rest_lines = lines
+        else:
+            if not lines or not lines[0].strip():
+                return '', '', '', "edit 块第一行必须是文件路径。"
+            path_line = lines[0].strip()
+            rest_lines = lines[1:]
 
         if cls._EDIT_OLD_MARK not in rest_lines:
             return '', '', '', (

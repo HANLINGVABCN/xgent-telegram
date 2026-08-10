@@ -399,7 +399,9 @@ async def start_web_chat_if_enabled(app: Any) -> None:
     global _web_chat_server, _web_real_bot, _web_application
     if _web_chat_server is not None:
         return
-    if not normalize_bool(UserDataManager.get('web_enabled', False), False):
+    web_on = normalize_bool(UserDataManager.get('web_enabled', False), False)
+    term_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
+    if not (web_on or term_on):
         return
 
     # 记下真实 bot，网页发起对话时 MirrorBot 用它把消息同步到 Telegram。
@@ -414,7 +416,7 @@ async def start_web_chat_if_enabled(app: Any) -> None:
         with contextlib.suppress(Exception):
             await app.bot.send_message(
                 chat_id=BotConfig.AUTHORIZED_USER_ID,
-                text="⚠️ Web Chat 已开启但没有设置密码，未启动。请在 /start → 🌐 Web 里设置密码。",
+                text="⚠️ Web/终端服务已开启但没有设置密码，未启动。请在 /start → 🌐 Web 里设置密码。",
             )
         return
 
@@ -434,6 +436,7 @@ async def start_web_chat_if_enabled(app: Any) -> None:
         request_stop=_web_request_stop,
         is_busy=_web_is_busy,
         is_terminal_enabled=lambda: normalize_bool(UserDataManager.get('terminal_enabled', False), False),
+        is_web_enabled=lambda: normalize_bool(UserDataManager.get('web_enabled', False), False),
     )
     server = WebChatServer(config)
     try:
