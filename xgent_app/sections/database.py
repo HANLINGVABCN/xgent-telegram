@@ -964,6 +964,7 @@ class UserDataManager:
             'web_port': normalize_web_port(await cls._require_db().get_config('web_port', DEFAULT_WEB_PORT)),
             'web_public_url': str(await cls._require_db().get_config('web_public_url', '') or ''),
             'terminal_enabled': normalize_bool(await cls._require_db().get_config('terminal_enabled', False), False),
+            'silent_unauthorized': normalize_bool(await cls._require_db().get_config('silent_unauthorized', False), False),
             # 只缓存"有没有设密码"这个布尔，哈希本身按需读库，不进内存快照。
             '_web_has_password': bool(
                 await cls._require_db().get_config(WEB_PASSWORD_CONFIG_KEY, '')

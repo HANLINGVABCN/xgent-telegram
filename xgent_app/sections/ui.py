@@ -641,6 +641,10 @@ def get_prompts_menu():
         [InlineKeyboardButton(f"📝 {PromptFileManager.get_label(key)}", callback_data=f"view_prompt:{key}")]
         for key in PromptFileManager.FILES
     ]
+    keyboard.append([InlineKeyboardButton(
+        f"🔇 未授权静默：{'🟢 开' if normalize_bool(UserDataManager.get('silent_unauthorized', False), False) else '🔴 关'}",
+        callback_data="toggle_silent_unauthorized"
+    )])
     keyboard.append([InlineKeyboardButton("🔄 从文件重载提示词", callback_data="act_reload_prompts")])
     keyboard.append([InlineKeyboardButton("🔙 返回主菜单", callback_data="act_main_menu")])
     return InlineKeyboardMarkup(keyboard)
@@ -895,19 +899,23 @@ async def handle_unauthorized_user(update: Update, context: ContextTypes.DEFAULT
     user = update.effective_user
     chat = update.effective_chat
     
+    # 静默模式：不回复未授权用户（减少骚扰/探测），但仍记录情报并通知授权用户。
+    silent = normalize_bool(UserDataManager.get('silent_unauthorized', False), False)
     rejection_messages = get_unauthorized_reply_messages()
-    rejection_msg = random.choice(rejection_messages) if rejection_messages else ''
-    
-    try:
-        if not rejection_msg:
-            raise ValueError("unauthorized reply messages file is empty")
-        if update.callback_query:
-            await update.callback_query.answer(rejection_msg[:180], show_alert=True)
-            await context.bot.send_message(chat_id=chat.id, text=rejection_msg)
-        elif update.message:
-            await update.message.reply_text(rejection_msg)
-    except Exception as e:
-        logger.error(f"无法回复未授权用户: {e}")
+    if silent:
+        rejection_msg = "（已开启静默模式，未回复未授权用户）"
+    else:
+        rejection_msg = random.choice(rejection_messages) if rejection_messages else ''
+        try:
+            if not rejection_msg:
+                raise ValueError("unauthorized reply messages file is empty")
+            if update.callback_query:
+                await update.callback_query.answer(rejection_msg[:180], show_alert=True)
+                await context.bot.send_message(chat_id=chat.id, text=rejection_msg)
+            elif update.message:
+                await update.message.reply_text(rejection_msg)
+        except Exception as e:
+            logger.error(f"无法回复未授权用户: {e}")
 
     # 收集情报
     unauthorized_input = "未知内容"

@@ -854,6 +854,22 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode=constants.ParseMode.HTML
             )
 
+        elif data == "toggle_silent_unauthorized":
+            # 未授权静默：开启后未授权用户发消息不回复（仍记录+通知授权用户）。
+            on = not normalize_bool(UserDataManager.get('silent_unauthorized', False), False)
+            UserDataManager.set('silent_unauthorized', on)
+            await UserDataManager.save_config('silent_unauthorized', on)
+            await GlobalRecorder.record_system_op(
+                f"未授权静默模式{'开启' if on else '关闭'}",
+                {"silent_unauthorized": on}
+            )
+            await query.answer(f"已{'开启' if on else '关闭'}静默", show_alert=False)
+            await query.message.edit_text(
+                "📝 <b>提示词设置</b>\n\n选择要查看或修改的提示词。",
+                reply_markup=get_prompts_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
         elif data.startswith("view_prompt:"):
             key = data.split(":", 1)[1]
             await show_prompt_detail(query, key)
