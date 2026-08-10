@@ -410,6 +410,7 @@ async def start_web_chat_if_enabled(app: Any) -> None:
         write_setting=_web_write_setting,
         request_stop=_web_request_stop,
         is_busy=_web_is_busy,
+        is_terminal_enabled=lambda: normalize_bool(UserDataManager.get('terminal_enabled', False), False),
     )
     server = WebChatServer(config)
     try:

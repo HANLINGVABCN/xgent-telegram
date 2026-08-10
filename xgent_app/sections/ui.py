@@ -144,6 +144,29 @@ def _build_web_open_button():
     return InlineKeyboardButton("🌐 浏览器打开", url=f"http://{DEFAULT_WEB_HOST}:{port}")
 
 
+def _build_terminal_open_button():
+    """终端开启时的「打开终端」按钮。复用 Web 的公开地址 + /terminal 路径。
+
+    终端依赖 Web 服务（同一端口、同一认证），所以只在 web_enabled 且
+    terminal_enabled 时返回按钮，否则 None。终端是任意命令执行，默认关闭，
+    必须显式开启。
+    """
+    web_on = normalize_bool(UserDataManager.get('web_enabled', False), False)
+    term_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
+    if not (web_on and term_on):
+        return None
+
+    public_url = str(UserDataManager.get('web_public_url', '') or '')
+    if public_url.startswith("https://"):
+        return InlineKeyboardButton(
+            "🖥 打开终端", web_app=WebAppInfo(url=public_url.rstrip("/") + "/terminal")
+        )
+    port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
+    return InlineKeyboardButton(
+        "🖥 浏览器打开终端", url=f"http://{DEFAULT_WEB_HOST}:{port}/terminal"
+    )
+
+
 def get_web_menu():
     enabled = normalize_bool(UserDataManager.get('web_enabled', False), False)
     port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
@@ -174,6 +197,15 @@ def get_web_menu():
         rows.append([InlineKeyboardButton("🗑️ 清除密码", callback_data="confirm_clear_web_password")])
     if public_url:
         rows.append([InlineKeyboardButton("🧹 清除公开地址", callback_data="do_clear_web_public_url")])
+    # 终端开关 + 打开按钮。终端依赖 Web，Web 关时终端按钮不显示。
+    term_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
+    term_button = _build_terminal_open_button()
+    if term_button is not None:
+        rows.append([term_button])
+    rows.append([InlineKeyboardButton(
+        f"🖥 终端：{'🟢 开' if term_on else '🔴 关'}　点击{'关闭' if term_on else '开启'}",
+        callback_data="toggle_terminal_enabled"
+    )])
     rows.append([InlineKeyboardButton("🔙 返回", callback_data="act_main_menu")])
     return InlineKeyboardMarkup(rows)
 
@@ -184,12 +216,16 @@ def build_web_text() -> str:
     public_url = str(UserDataManager.get('web_public_url', '') or '')
     has_password = bool(UserDataManager.get('_web_has_password', False))
     running = is_web_chat_running()
+    term_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
 
     status = "🟢 运行中" if running else ("🟡 已开启但未运行" if enabled else "🔴 已关闭")
     password_line = "✅ 已设置" if has_password else "⚠️ 未设置（未设置时拒绝启动）"
     public_line = (
         f"✅ <code>{safe_text(public_url)}</code>"
         if public_url else "未配置（按钮将用外部浏览器打开本地地址）"
+    )
+    term_line = (
+        f"🖥 终端：{'🟢 已开启（任意命令执行，注意安全）' if term_on else '🔴 已关闭'}"
     )
 
     return (
@@ -198,7 +234,8 @@ def build_web_text() -> str:
         f"状态：{status}\n"
         f"监听：<code>{DEFAULT_WEB_HOST}:{port}</code>\n"
         f"密码：{password_line}\n"
-        f"公开地址：{public_line}\n\n"
+        f"公开地址：{public_line}\n"
+        f"{term_line}\n\n"
         "网页版复用同一套对话核心，Agent 模式、协议执行、记忆与 Telegram 完全共享。\n"
         "可在网页里聊天并调整常用参数；提供商与 API Key 仍只在 Telegram 里管理。\n\n"
         f"⚠️ 服务只监听 <code>{DEFAULT_WEB_HOST}</code>，不会直接暴露到公网。"

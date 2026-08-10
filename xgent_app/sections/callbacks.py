@@ -640,6 +640,25 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode=constants.ParseMode.HTML
             )
 
+        elif data == "toggle_terminal_enabled":
+            # 终端依赖 Web 服务（同端口同认证），Web 未开时拒绝开启终端。
+            web_on = normalize_bool(UserDataManager.get('web_enabled', False), False)
+            if not web_on:
+                await query.answer("请先开启 Web 服务", show_alert=True)
+                return
+            term_on = not normalize_bool(UserDataManager.get('terminal_enabled', False), False)
+            UserDataManager.set('terminal_enabled', term_on)
+            await UserDataManager.save_config('terminal_enabled', term_on)
+            await GlobalRecorder.record_system_op(
+                f"终端{'开启' if term_on else '关闭'}",
+                {"terminal_enabled": term_on}
+            )
+            await query.message.edit_text(
+                build_web_text(),
+                reply_markup=get_web_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
         # --- 思考深度 ---
         elif data == "menu_thinking_level":
             await query.message.edit_text(

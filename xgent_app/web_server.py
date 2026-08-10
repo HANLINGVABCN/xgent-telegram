@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import http.server
 import json
@@ -28,6 +29,7 @@ import urllib.parse
 from typing import Any, Callable, Dict, List, Optional
 
 from xgent_app import web_auth
+from xgent_app import web_terminal
 from xgent_app.web_bridge import WebOutbox, build_web_conversation_objects
 
 logger = logging.getLogger(__name__)
@@ -65,6 +67,7 @@ class WebChatConfig:
         is_busy: Callable[[], bool],
         submit_callback: Optional[Callable[[str, int, WebOutbox], Any]] = None,
         submit_command: Optional[Callable[[str, WebOutbox], Any]] = None,
+        is_terminal_enabled: Optional[Callable[[], bool]] = None,
     ):
         self.host = host
         self.port = port
@@ -76,6 +79,8 @@ class WebChatConfig:
         # 网页按钮 / 命令路由。可选，保留向后兼容（旧测试构造 WebChatConfig 时不传）。
         self.submit_callback = submit_callback or (lambda *a: None)
         self.submit_command = submit_command or (lambda *a: None)
+        # 终端开关。默认关闭——终端是任意命令执行，必须显式开启。
+        self.is_terminal_enabled = is_terminal_enabled or (lambda: False)
         self.read_history = read_history
         self.read_settings = read_settings
         self.write_setting = write_setting
@@ -185,6 +190,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         try:
             if path == "/":
                 self._serve_index()
+            elif path == "/terminal":
+                self._serve_terminal()
             elif path == "/api/session":
                 self._send_json({"authenticated": self._is_authenticated()})
             elif path == "/api/history":
@@ -193,6 +200,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._handle_read_config()
             elif path == "/api/stream":
                 self._handle_stream()
+            elif path == "/api/term/output":
+                self._handle_term_output()
             else:
                 self._send_json({"error": "not found"}, status=404)
         except (BrokenPipeError, ConnectionResetError):
@@ -221,6 +230,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._handle_stop()
             elif path == "/api/config":
                 self._handle_write_config()
+            elif path == "/api/term/open":
+                self._handle_term_open()
+            elif path == "/api/term/input":
+                self._handle_term_input()
+            elif path == "/api/term/resize":
+                self._handle_term_resize()
+            elif path == "/api/term/close":
+                self._handle_term_close()
             else:
                 self._send_json({"error": "not found"}, status=404)
         except (BrokenPipeError, ConnectionResetError):
@@ -419,6 +436,139 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # 浏览器关页面就是这条路径，属正常。
             pass
 
+    # --- 终端 ---
+
+    def _serve_terminal(self) -> None:
+        # 页面本身不要求认证，与 / (index) 一致：前端 terminal.html 自己走登录
+        # 流程（initData 免密或密码）。终端 API 层强制认证 + 开关校验。
+        term_path = os.path.join(STATIC_DIR, "terminal.html")
+        try:
+            with open(term_path, "rb") as handle:
+                body = handle.read()
+        except OSError:
+            self._send_html(b"<h1>terminal.html missing</h1>", status=500)
+            return
+        self._send_html(body)
+
+    def _require_terminal_enabled(self) -> bool:
+        if self.config.is_terminal_enabled():
+            return True
+        self._send_json({"error": "终端功能未开启"}, status=403)
+        return False
+
+    def _handle_term_open(self) -> None:
+        """创建一个独立终端会话。"""
+        if not self._require_auth():
+            return
+        if not self._require_terminal_enabled():
+            return
+        if not web_terminal.is_terminal_supported():
+            self._send_json({"error": "服务器平台不支持终端"}, status=503)
+            return
+        data = self._read_json() or {}
+        try:
+            cols = int(data.get("cols", 80) or 80)
+            rows = int(data.get("rows", 24) or 24)
+        except (TypeError, ValueError):
+            cols, rows = 80, 24
+        try:
+            session = web_terminal.get_terminal_manager().open(cols=cols, rows=rows)
+        except RuntimeError as exc:
+            self._send_json({"error": str(exc)}, status=409)
+            return
+        self._send_json({"session_id": session.id, "pid": session.pid})
+
+    def _handle_term_input(self) -> None:
+        """写入终端输入。data 是 base64 编码的字节。"""
+        if not self._require_auth():
+            return
+        if not self._require_terminal_enabled():
+            return
+        data = self._read_json() or {}
+        session_id = str(data.get("session_id") or "")
+        if not session_id:
+            self._send_json({"error": "缺少 session_id"}, status=400)
+            return
+        try:
+            payload = base64.b64decode(str(data.get("data") or ""))
+        except (ValueError, TypeError):
+            self._send_json({"error": "bad data"}, status=400)
+            return
+        if not web_terminal.get_terminal_manager().write(session_id, payload):
+            self._send_json({"error": "会话不存在或已关闭"}, status=404)
+            return
+        self._send_json({"ok": True})
+
+    def _handle_term_resize(self) -> None:
+        if not self._require_auth():
+            return
+        if not self._require_terminal_enabled():
+            return
+        data = self._read_json() or {}
+        session_id = str(data.get("session_id") or "")
+        try:
+            cols = int(data.get("cols", 80) or 80)
+            rows = int(data.get("rows", 24) or 24)
+        except (TypeError, ValueError):
+            cols, rows = 80, 24
+        web_terminal.get_terminal_manager().resize(session_id, cols, rows)
+        self._send_json({"ok": True})
+
+    def _handle_term_close(self) -> None:
+        if not self._require_auth():
+            return
+        if not self._require_terminal_enabled():
+            return
+        data = self._read_json() or {}
+        session_id = str(data.get("session_id") or "")
+        web_terminal.get_terminal_manager().close(session_id)
+        self._send_json({"ok": True})
+
+    def _handle_term_output(self) -> None:
+        """终端输出 SSE。每个连接独占一个会话的读取。"""
+        if not self._require_auth():
+            return
+        if not self._require_terminal_enabled():
+            return
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        session_id = (query.get("session_id") or [""])[0]
+        manager = web_terminal.get_terminal_manager()
+        if not session_id or manager.get(session_id) is None:
+            self._send_json({"error": "会话不存在"}, status=404)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        stop_event = self.server.shutdown_event  # type: ignore[attr-defined]
+        try:
+            while not stop_event.is_set():
+                chunk = manager.read(session_id, timeout=SSE_HEARTBEAT_SECONDS)
+                if chunk is None:
+                    # 会话结束（子进程退出 / EOF）。发 close 事件并回收。
+                    self.wfile.write(b"event: close\ndata: \n\n")
+                    self.wfile.flush()
+                    manager.close(session_id)
+                    break
+                if chunk == b"":
+                    # select 超时，发注释行保活并探测连接。
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    continue
+                payload = json.dumps(
+                    {"data": base64.b64encode(chunk).decode("ascii")},
+                    ensure_ascii=False,
+                )
+                self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ValueError):
+            # 浏览器关页面属正常。
+            pass
+
 
 class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
@@ -475,6 +625,9 @@ class WebChatServer:
     def stop(self) -> None:
         self.shutdown_event.set()
         self.outbox.close()
+        # 停服时回收所有终端会话，避免 pty + 子进程残留。
+        with contextlib.suppress(Exception):
+            web_terminal.get_terminal_manager().close_all()
         if self._httpd is not None:
             with contextlib.suppress(Exception):
                 self._httpd.shutdown()
