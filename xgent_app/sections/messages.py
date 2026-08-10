@@ -1532,13 +1532,16 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
     # bot 的发送方法包成双通道，让网页同步看到这轮对话的 AI 输出；同时把用户消息
     # 推一帧给网页。Web 发起的对话走 MirrorBot（Web->TG），这里会因标记位跳过。
     restore_mirror = lambda: None
-    if is_web_chat_running() and not getattr(context.bot, "_is_xgent_web_bot", False):
-        _web_outbox = get_web_outbox()
-        if _web_outbox is not None:
-            restore_mirror = install_tg_to_web_mirror(get_web_real_bot(), _web_outbox)
-            _web_outbox.put({"type": "user_message", "text": str(text or ""), "ts": time.time()})
-
     try:
+        # install 与 put 必须都在 try 内：若 put 抛异常，finally 仍能 restore，
+        # 否则补丁会残留，下次 install 把残留 wrapper 当“原方法”再次包裹，
+        # real_bot 被注入成 chat_id → “got multiple values for argument 'chat_id'”。
+        # 详见 web_bridge._ACTIVE_MIRRORS 的重入引用计数保护。
+        if is_web_chat_running() and not getattr(context.bot, "_is_xgent_web_bot", False):
+            _web_outbox = get_web_outbox()
+            if _web_outbox is not None:
+                restore_mirror = install_tg_to_web_mirror(get_web_real_bot(), _web_outbox)
+                _web_outbox.put({"type": "user_message", "text": str(text or ""), "ts": time.time()})
         async with _conversation_processing_lock:
             if lock_acquired_event is not None:
                 lock_acquired_event.set()

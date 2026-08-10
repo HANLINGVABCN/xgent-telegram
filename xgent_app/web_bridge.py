@@ -37,6 +37,17 @@ def _allocate_web_message_id() -> int:
         return mid
 
 
+# TG->Web 镜像补丁的重入保护。key = id(ExtBot 类)，value = [depth, restore_fn]。
+# 补丁是类级全局的：一旦某次 install 后 restore 没按预期成对执行（重入交错、
+# install 与 try 之间抛异常），残留的 wrapper 会在下次 install 时被 getattr(cls)
+# 当作“原方法”再次包裹——新 wrapper 转发 saved(real_bot, chat_id=..., text=...)，
+# 而旧 wrapper 形参是 (*args, **kwargs)，会把 real_bot 收进 args[0]，再转发时
+# real_bot 就落进原方法签名的 chat_id 位置，与关键字 chat_id 冲突，报
+# “got multiple values for argument 'chat_id'”。用引用计数保证：已打补丁时只
+# 增计数不重裹，最后一个 release 才真正还原类，从根上杜绝双层包裹。
+_ACTIVE_MIRRORS: Dict[int, List[Any]] = {}
+
+
 class WebOutbox:
     """asyncio 侧生产、HTTP 处理线程侧消费的帧队列。
 
@@ -525,6 +536,15 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
         return lambda: None
 
     cls = type(real_bot)
+    key = id(cls)
+
+    # 重入保护：已有活跃补丁时复用，仅增计数、不再包裹，防止双层 wrapper 把
+    # real_bot 注入成 chat_id（见模块顶部 _ACTIVE_MIRRORS 注释）。
+    state = _ACTIVE_MIRRORS.get(key)
+    if state is not None:
+        state[0] += 1
+        return _make_mirror_release(key)
+
     saved: Dict[str, Any] = {}
 
     def _patch(name: str, wrapper: Any) -> None:
@@ -650,7 +670,29 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
             except Exception:  # noqa: BLE001
                 pass
 
-    return restore
+    _ACTIVE_MIRRORS[key] = [1, restore]
+    return _make_mirror_release(key)
+
+
+def _make_mirror_release(key: int) -> Any:
+    """引用计数 release：只有最后一个释放者才真正还原类属性。
+
+    这样即使两个 process_conversation 交错（A 先 release、B 后 release），
+    也不会在 A release 时就把类还原、再被 B 当作“原方法”重新包裹——只要还有
+    任何一轮对话在用，补丁就保持原样；全都没了才一次性还原到真正的原始方法。
+    """
+    def release() -> None:
+        state = _ACTIVE_MIRRORS.get(key)
+        if state is None:
+            return
+        state[0] -= 1
+        if state[0] <= 0:
+            _ACTIVE_MIRRORS.pop(key, None)
+            try:
+                state[1]()
+            except Exception:  # noqa: BLE001
+                pass
+    return release
 
 
 __all__ = [
