@@ -100,6 +100,9 @@ def _fmt_idle_message_interval(val):
         return f"{minutes}分钟"
     return f"{seconds}s"
 
+def _fmt_thinking_level(val=None):
+    return get_thinking_level_label(val)
+
 def get_main_menu():
     agent_on = UserDataManager.get('agent_mode', False)
     stream_on = normalize_bool(UserDataManager.get('stream_mode', True), True)
@@ -161,19 +164,64 @@ def build_text_stitch_pending_text(pending: PendingTextConversation) -> str:
 
 def get_more_settings_menu():
     global_depth = UserDataManager.get('global_depth', 30)
-    
+
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"📊 深度:{global_depth}", callback_data="cmd_set_global_depth"),
          InlineKeyboardButton("⏱️ 超时", callback_data="menu_timeout_settings")],
-        [InlineKeyboardButton("🚫 Agent黑名单", callback_data="menu_command_blacklist"),
-         InlineKeyboardButton("🧹 清空上下文", callback_data="cmd_delete")],
-        [InlineKeyboardButton(f"🔐 凭据配置{_credentials_badge()}", callback_data="menu_credentials"),
+        [InlineKeyboardButton(f"🧠 思考:{_fmt_thinking_level()}", callback_data="menu_thinking_level"),
+         InlineKeyboardButton("🚫 Agent黑名单", callback_data="menu_command_blacklist")],
+        [InlineKeyboardButton("🧹 清空上下文", callback_data="cmd_delete"),
          InlineKeyboardButton("ℹ️ 状态", callback_data="cmd_info")],
-        [InlineKeyboardButton("📤 导出", callback_data="cmd_export_all"),
-         InlineKeyboardButton("⬆️ 更新", callback_data="cmd_update")],
-        [InlineKeyboardButton("🔄 重启", callback_data="cmd_restart")],
+        [InlineKeyboardButton(f"🔐 凭据配置{_credentials_badge()}", callback_data="menu_credentials"),
+         InlineKeyboardButton("📤 导出", callback_data="cmd_export_all")],
+        [InlineKeyboardButton("⬆️ 更新", callback_data="cmd_update"),
+         InlineKeyboardButton("🔄 重启", callback_data="cmd_restart")],
         [InlineKeyboardButton("🔙 返回", callback_data="act_main_menu")]
     ])
+
+
+def get_thinking_level_menu():
+    """思考深度：8 档单选。"""
+    current = normalize_thinking_level(UserDataManager.get('thinking_level'))
+
+    def button(level: str) -> InlineKeyboardButton:
+        label = THINKING_LEVEL_LABELS[level]
+        text = f"✅ {label}" if level == current else label
+        return InlineKeyboardButton(text, callback_data=f"set_thinking_level:{level}")
+
+    return InlineKeyboardMarkup([
+        [button(THINKING_LEVEL_OFF), button(THINKING_LEVEL_AUTO)],
+        [button(THINKING_LEVEL_LOW), button(THINKING_LEVEL_MEDIUM), button(THINKING_LEVEL_HIGH)],
+        [button(THINKING_LEVEL_XHIGH), button(THINKING_LEVEL_ULTRA), button(THINKING_LEVEL_MAX)],
+        [InlineKeyboardButton("🔙 返回", callback_data="menu_more_settings")]
+    ])
+
+
+def build_thinking_level_text() -> str:
+    current = normalize_thinking_level(UserDataManager.get('thinking_level'))
+    spec = THINKING_LEVEL_SPECS.get(current)
+    if current == THINKING_LEVEL_AUTO:
+        detail = "不发送任何思考参数，完全交给提供商的默认行为。"
+    elif current == THINKING_LEVEL_OFF:
+        detail = "显式关闭思考。Gemini 走预算 0，OpenRouter 走 reasoning.enabled=false；其余格式不发字段即为关闭。"
+    else:
+        budget = spec["budget"]
+        budget_text = "动态（由模型决定）" if budget < 0 else f"{budget} tokens"
+        detail = f"思考预算：<b>{budget_text}</b>　推理档位：<b>{spec['effort']}</b>"
+
+    return (
+        "🧠 <b>思考深度</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"当前档位: <b>{safe_text(THINKING_LEVEL_LABELS[current])}</b>\n"
+        f"{detail}\n\n"
+        "会按提供商自动翻译成对应字段：\n"
+        "• Claude → <code>thinking.budget_tokens</code>（并同步抬高 max_tokens）\n"
+        "• Gemini/Vertex → <code>thinkingConfig.thinkingBudget</code>\n"
+        "• OpenAI 及兼容接口 → <code>reasoning_effort</code>\n"
+        "• OpenRouter → <code>reasoning.effort</code>\n\n"
+        "思考内容不会显示在对话里，也不写入记忆；思考消耗的 token 会计入用量行。\n"
+        "模型不支持时会自动去掉参数重发一次，并记住该模型不再重试。"
+    )
 
 
 def _credentials_badge() -> str:
@@ -289,7 +337,7 @@ def build_settings_menu_text() -> str:
     return (
         "⚙️ <b>更多设置</b>\n"
         "━━━━━━━━━━━━━━\n"
-        "调整记忆深度、超时、Agent 黑名单、联网搜索、更新与重启。"
+        "调整记忆深度、超时、思考深度、Agent 黑名单、联网搜索、更新与重启。"
     )
 
 def get_timeout_settings_menu():

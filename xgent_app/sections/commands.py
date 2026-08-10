@@ -9,6 +9,7 @@ def build_start_menu_text() -> str:
     global_depth = UserDataManager.get('global_depth', 30)
     agent_mode = "开启 🟢" if UserDataManager.get('agent_mode', False) else "关闭 🔴"
     stitch_mode = get_text_stitch_mode_label()
+    thinking_level = get_thinking_level_label()
 
     welcome_msg = (
         f"<b>XGent for Telegram 已就绪</b>\n"
@@ -19,6 +20,7 @@ def build_start_menu_text() -> str:
         f"🖼️ 媒体模型: <b>{safe_text(media_model)}</b>\n"
         f"🌐 全局模式: <b>常驻开启</b>\n"
         f"🤖 Agent模式: <b>{agent_mode}</b>\n"
+        f"🧠 思考深度: <b>{safe_text(thinking_level)}</b>\n"
         f"🧩 文字拼接: <b>{safe_text(stitch_mode)}</b>\n"
         f"📊 全局记忆深度: <b>{global_depth}条</b>\n"
         f"💾 记忆系统: <b>异步SQLite + 内存缓存</b>\n"

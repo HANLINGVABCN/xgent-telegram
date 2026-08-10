@@ -957,6 +957,9 @@ class UserDataManager:
                 await cls._require_db().get_config('text_stitch_mode', DEFAULT_TEXT_STITCH_MODE)
             ),
             'stream_timeout': normalize_stream_timeout(await cls._require_db().get_config('stream_timeout', 0)),
+            'thinking_level': normalize_thinking_level(
+                await cls._require_db().get_config('thinking_level', DEFAULT_THINKING_LEVEL)
+            ),
             'agent_command_timeout': normalize_command_timeout(
                 await cls._require_db().get_config('agent_command_timeout', DEFAULT_AGENT_COMMAND_TIMEOUT)
             ),

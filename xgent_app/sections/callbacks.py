@@ -543,6 +543,30 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode=constants.ParseMode.HTML
             )
         
+        # --- 思考深度 ---
+        elif data == "menu_thinking_level":
+            await query.message.edit_text(
+                build_thinking_level_text(),
+                reply_markup=get_thinking_level_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data.startswith("set_thinking_level:"):
+            level = normalize_thinking_level(data.split(":", 1)[1])
+            UserDataManager.set('thinking_level', level)
+            await UserDataManager.save_config('thinking_level', level)
+            # 换档位后允许重新试探：之前被记为"不支持"的模型可能只是不支持旧档位。
+            ModelClient._thinking_unsupported.clear()
+            await GlobalRecorder.record_system_op(
+                f"设置思考深度: {get_thinking_level_label(level)}",
+                {"thinking_level": level}
+            )
+            await query.message.edit_text(
+                build_thinking_level_text(),
+                reply_markup=get_thinking_level_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
         # --- 超时设置 ---
         elif data == "menu_timeout_settings":
             await query.message.edit_text(
