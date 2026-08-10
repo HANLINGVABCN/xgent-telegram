@@ -508,10 +508,15 @@ def build_web_command_objects(chat_id: int, outbox: WebOutbox, command_text: str
 def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
     """TG -> Web 镜像：临时把真实 bot 的发送方法包成「发 TG + 推网页帧」。
 
-    PTB 的 ``context.bot`` 是只读 property（返回 application.bot），没法替换，
-    所以直接在真实 ExtBot 实例上临时替换方法。全局对话锁保证同一时刻只有一轮
-    对话在跑；并发按钮点击即使顺带被镜像，也只是让网页多看到一些菜单更新，可
-    接受。返回的 restore() 必须在 finally 里调用，否则真实 bot 会一直带着包装。
+    PTB 的 ExtBot 用 __slots__ 且实例无 __dict__，无法在实例上覆盖方法；
+    TelegramObject 的 __setattr__ 也禁止实例属性赋值（连 object.__setattr__
+    都被拒——send_message 是 read-only descriptor）。因此改为在**类**上用
+    staticmethod 临时覆盖方法：staticmethod 不绑 self，wrapper 收到的 args
+    不含 self，转发时显式把 real_bot 作为第一个参数传给原 function。
+
+    类级覆盖是全局的，但全局对话锁保证同一时刻只有一轮对话在跑；并发按钮
+    点击即使顺带被镜像，也只是让网页多看到一些菜单更新，可接受。返回的
+    restore() 必须在 finally 里调用，否则真实 bot 会一直带着包装。
 
     与 MirrorBot（Web->TG）的区别：这里用的是真实 message_id，因为 Telegram 侧
     全程直接用真实 id；网页前端按帧里的 message_id 跟踪气泡，两套 id 互不冲突。
@@ -519,7 +524,15 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
     if real_bot is None or outbox is None:
         return lambda: None
 
+    cls = type(real_bot)
     saved: Dict[str, Any] = {}
+
+    def _patch(name: str, wrapper: Any) -> None:
+        # 存类上的原 function（未绑定），用 staticmethod 覆盖类属性。
+        # staticmethod 不绑 self，wrapper 的 args 不含 self，与原实例覆盖
+        # 方案一致；转发时显式传 real_bot 给原 function。
+        saved[name] = getattr(cls, name)
+        setattr(cls, name, staticmethod(wrapper))
 
     def emit(frame_type: str, **fields: Any) -> None:
         frame: Dict[str, Any] = {"type": frame_type, "ts": time.time()}
@@ -537,9 +550,8 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
         return ""
 
     # send_message
-    saved["send_message"] = real_bot.send_message
     async def send_message(*args: Any, **kwargs: Any) -> Any:
-        result = await saved["send_message"](*args, **kwargs)
+        result = await saved["send_message"](real_bot, *args, **kwargs)
         try:
             emit("message", message_id=getattr(result, "message_id", 0),
                  text=_kw_text(kwargs, args, send=True),
@@ -548,12 +560,11 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
         except Exception:  # noqa: BLE001
             pass
         return result
-    real_bot.send_message = send_message  # type: ignore[method-assign]
+    _patch("send_message", send_message)
 
     # edit_message_text(text, chat_id=None, message_id=None, ...)
-    saved["edit_message_text"] = real_bot.edit_message_text
     async def edit_message_text(*args: Any, **kwargs: Any) -> Any:
-        result = await saved["edit_message_text"](*args, **kwargs)
+        result = await saved["edit_message_text"](real_bot, *args, **kwargs)
         try:
             mid = kwargs.get("message_id")
             if mid is None and len(args) >= 3:
@@ -564,12 +575,11 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
         except Exception:  # noqa: BLE001
             pass
         return result
-    real_bot.edit_message_text = edit_message_text  # type: ignore[method-assign]
+    _patch("edit_message_text", edit_message_text)
 
     # edit_message_reply_markup
-    saved["edit_message_reply_markup"] = real_bot.edit_message_reply_markup
     async def edit_message_reply_markup(*args: Any, **kwargs: Any) -> Any:
-        result = await saved["edit_message_reply_markup"](*args, **kwargs)
+        result = await saved["edit_message_reply_markup"](real_bot, *args, **kwargs)
         try:
             mid = kwargs.get("message_id")
             if mid is None and len(args) >= 2:
@@ -579,12 +589,11 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
         except Exception:  # noqa: BLE001
             pass
         return result
-    real_bot.edit_message_reply_markup = edit_message_reply_markup  # type: ignore[method-assign]
+    _patch("edit_message_reply_markup", edit_message_reply_markup)
 
     # delete_message
-    saved["delete_message"] = real_bot.delete_message
     async def delete_message(*args: Any, **kwargs: Any) -> Any:
-        result = await saved["delete_message"](*args, **kwargs)
+        result = await saved["delete_message"](real_bot, *args, **kwargs)
         try:
             mid = kwargs.get("message_id")
             if mid is None and len(args) >= 2:
@@ -593,23 +602,21 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
         except Exception:  # noqa: BLE001
             pass
         return result
-    real_bot.delete_message = delete_message  # type: ignore[method-assign]
+    _patch("delete_message", delete_message)
 
     # send_chat_action
-    saved["send_chat_action"] = real_bot.send_chat_action
     async def send_chat_action(*args: Any, **kwargs: Any) -> Any:
-        result = await saved["send_chat_action"](*args, **kwargs)
+        result = await saved["send_chat_action"](real_bot, *args, **kwargs)
         try:
             emit("chat_action", action=str(kwargs.get("action") or "typing"))
         except Exception:  # noqa: BLE001
             pass
         return result
-    real_bot.send_chat_action = send_chat_action  # type: ignore[method-assign]
+    _patch("send_chat_action", send_chat_action)
 
     # send_document
-    saved["send_document"] = real_bot.send_document
     async def send_document(*args: Any, **kwargs: Any) -> Any:
-        result = await saved["send_document"](*args, **kwargs)
+        result = await saved["send_document"](real_bot, *args, **kwargs)
         try:
             doc = kwargs.get("document")
             name = (kwargs.get("filename")
@@ -622,24 +629,24 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
         except Exception:  # noqa: BLE001
             pass
         return result
-    real_bot.send_document = send_document  # type: ignore[method-assign]
+    _patch("send_document", send_document)
 
     # send_photo
-    saved["send_photo"] = real_bot.send_photo
     async def send_photo(*args: Any, **kwargs: Any) -> Any:
-        result = await saved["send_photo"](*args, **kwargs)
+        result = await saved["send_photo"](real_bot, *args, **kwargs)
         try:
             emit("photo", message_id=getattr(result, "message_id", 0),
                  caption=str(kwargs.get("caption")) if kwargs.get("caption") else None)
         except Exception:  # noqa: BLE001
             pass
         return result
-    real_bot.send_photo = send_photo  # type: ignore[method-assign]
+    _patch("send_photo", send_photo)
 
     def restore() -> None:
+        # 类属性设回原 function（non-data descriptor，访问实例时自动绑 self）。
         for name, fn in saved.items():
             try:
-                setattr(real_bot, name, fn)
+                setattr(cls, name, fn)
             except Exception:  # noqa: BLE001
                 pass
 
