@@ -35,6 +35,8 @@ async def setup_bot_commands(app):
     await UserDataManager.init()
     await BotMemoryDB.get_instance()
     await SelfTriggerManager.startup(app)
+    # Web 服务按开关启动；失败只记日志并通知用户，不影响 bot 主流程。
+    await start_web_chat_if_enabled(app)
 
     if not _startup_commands_synced:
         try:
@@ -51,6 +53,8 @@ async def setup_bot_commands(app):
                 BotCommand("clear_memory", "清空上下文"),
                 BotCommand("depth", "设置记忆深度"),
                 BotCommand("timeout", "设置超时"),
+                BotCommand("thinking", "设置思考深度"),
+                BotCommand("web", "配置网页版聊天"),
                 BotCommand("agent", "开关 Agent 模式"),
                 BotCommand("blacklist", "管理 Agent 命令黑名单"),
                 BotCommand("stream", "开关流式输出"),
@@ -168,6 +172,10 @@ async def on_shutdown(app):
         logger.info("✅ 后台触发任务已关闭")
     except Exception as e:
         logger.error(f"关闭后台触发任务失败: {e}")
+    try:
+        await stop_web_chat()
+    except Exception as e:
+        logger.error(f"关闭 Web Chat 失败: {e}")
     try:
         AgentShellSessionManager.kill_all()
         logger.info("✅ Agent shell 会话已关闭")

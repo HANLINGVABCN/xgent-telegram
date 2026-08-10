@@ -56,7 +56,7 @@ from apscheduler.triggers.date import DateTrigger
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from telegram import BotCommand, BotCommandScopeAllPrivateChats, Update, constants, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import BotCommand, BotCommandScopeAllPrivateChats, Update, constants, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, WebAppInfo
 from telegram.error import BadRequest, InvalidToken, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
@@ -795,6 +795,9 @@ class BotState:
     SET_UPDATE_TOKEN = 'set_update_token'
     SET_SEARCH_KEY = 'set_search_key'
     SET_MEMORY = 'set_memory'
+    SET_WEB_PASSWORD = 'set_web_password'
+    SET_WEB_PORT = 'set_web_port'
+    SET_WEB_PUBLIC_URL = 'set_web_public_url'
     IMPORT_PROVIDER_CONFIG = 'import_provider_config'
 
 PROVIDER_CONFIG_FORMAT = 'xgent-telegram-provider-config'
@@ -995,6 +998,55 @@ def get_thinking_level_label(level: Optional[str] = None) -> str:
         level if level is not None else UserDataManager.get('thinking_level')
     )
     return THINKING_LEVEL_LABELS.get(level, THINKING_LEVEL_LABELS[DEFAULT_THINKING_LEVEL])
+
+
+# ---------------------------------------------------------------------------
+# Web Chat
+#
+# 默认只绑 127.0.0.1：这个界面能驱动 Agent 在服务器上执行真实命令，直接
+# 对公网监听等于把控制台暴露出去。要远程访问就自己配反向代理。
+#
+# Telegram 的 WebApp 按钮只接受 HTTPS 地址，所以公开地址单独配一项；没配
+# 时按钮降级成普通链接，用外部浏览器打开 127.0.0.1。
+# ---------------------------------------------------------------------------
+
+DEFAULT_WEB_HOST = "127.0.0.1"
+DEFAULT_WEB_PORT = 8790
+MIN_WEB_PORT = 1024
+MAX_WEB_PORT = 65535
+WEB_PASSWORD_CONFIG_KEY = 'web_password_hash'
+
+
+def normalize_web_port(value: Any, default: int = DEFAULT_WEB_PORT) -> int:
+    try:
+        port = int(float(value))
+    except (TypeError, ValueError):
+        return int(default)
+    if port < MIN_WEB_PORT or port > MAX_WEB_PORT:
+        return int(default)
+    return port
+
+
+def parse_web_port(text: str) -> int:
+    """解析用户输入的端口，越界抛 ValueError 交给调用方提示。"""
+    cleaned = str(text or "").strip()
+    try:
+        port = int(cleaned)
+    except (TypeError, ValueError):
+        raise ValueError("port must be a number")
+    if port < MIN_WEB_PORT or port > MAX_WEB_PORT:
+        raise ValueError(f"port must be between {MIN_WEB_PORT} and {MAX_WEB_PORT}")
+    return port
+
+
+def normalize_web_public_url(value: Any) -> str:
+    """公开地址必须是 HTTPS——Telegram 服务器会拒绝非 HTTPS 的 web_app URL。"""
+    url = str(value or "").strip().rstrip('/')
+    if not url:
+        return ""
+    if not url.startswith("https://"):
+        raise ValueError("public url must start with https://")
+    return url
 
 
 def has_pending_text_conversation(update: Update) -> bool:

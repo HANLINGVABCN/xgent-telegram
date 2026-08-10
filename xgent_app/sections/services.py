@@ -17,6 +17,9 @@ from xgent_app.agent_context import (
     build_media_context_message_async,
 )
 from xgent_app.agent_search import run_search
+from xgent_app import web_auth
+from xgent_app.web_bridge import WebOutbox, build_web_conversation_objects
+from xgent_app.web_server import WebChatConfig, WebChatServer
 class GlobalRecorder:
     """始终记录所有操作（无论什么模式）"""
     
@@ -246,6 +249,38 @@ def clear_update_github_token():
     BotConfig.UPDATE_GITHUB_TOKEN = ""
     os.environ.pop("UPDATE_GITHUB_TOKEN", None)
     update_env_values({"UPDATE_GITHUB_TOKEN": ""})
+
+
+# --- ☆ Web Chat 密码 ☆ ---
+# 存 PBKDF2 哈希进 SQLite config，不存 .env 明文：
+# xgent_memory.db 在 UPDATE_SKIP_NAMES 里，/update 不会覆盖它。
+
+async def persist_web_password(password: str) -> str:
+    """哈希后落库，返回哈希串。"""
+    password = str(password or "").strip()
+    if not password:
+        raise ValueError("密码不能为空")
+    if len(password) < 6:
+        raise ValueError("密码至少 6 位")
+    digest = web_auth.hash_password(password)
+    await UserDataManager.save_config(WEB_PASSWORD_CONFIG_KEY, digest)
+    UserDataManager.set('_web_has_password', True)
+    return digest
+
+
+async def read_web_password_hash() -> str:
+    """按需读库。哈希不进 UserDataManager 内存快照，避免被顺手打进日志。"""
+    db = await BotMemoryDB.get_instance()
+    return str(await db.get_config(WEB_PASSWORD_CONFIG_KEY, '') or '')
+
+
+async def clear_web_password() -> None:
+    await UserDataManager.save_config(WEB_PASSWORD_CONFIG_KEY, '')
+    UserDataManager.set('_web_has_password', False)
+
+
+def mask_web_password(password_hash: str) -> str:
+    return web_auth.mask_password_hash(password_hash)
 
 
 def mask_update_github_token(token: str) -> str:

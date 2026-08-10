@@ -60,6 +60,8 @@ if __name__ == '__main__':
             ("clear_memory", cmd_delete_chat),
             ("depth", cmd_depth_menu),
             ("timeout", cmd_timeout_menu),
+            ("thinking", cmd_thinking_menu),
+            ("web", cmd_web_menu),
             ("agent", cmd_toggle_agent),
             ("blacklist", cmd_blacklist_menu),
             ("stream", cmd_toggle_stream),

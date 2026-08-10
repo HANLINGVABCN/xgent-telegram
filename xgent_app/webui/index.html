@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>XGent Web Chat</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1e222b;
+    --line: #2a2f3a;
+    --text: #e6e9ef;
+    --muted: #9aa3b2;
+    --accent: #4c8dff;
+    --user: #2b4d8f;
+    --danger: #e05260;
+    --radius: 12px;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f5f7; --panel: #ffffff; --panel-2: #f0f2f5; --line: #dfe3e8;
+      --text: #1a1d23; --muted: #6b7280; --user: #d6e4ff;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px; background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    padding-top: max(10px, env(safe-area-inset-top));
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; flex: 1; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.on { background: #34c759; }
+  button {
+    font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 7px 12px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+
+  main { flex: 1; overflow-y: auto; padding: 14px; }
+  .msg { max-width: min(720px, 92%); margin: 0 0 12px; }
+  .msg .who { font-size: 11px; color: var(--muted); margin-bottom: 3px; }
+  .msg .body {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 9px 12px;
+    white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
+  }
+  .msg.user { margin-left: auto; }
+  .msg.user .body { background: var(--user); }
+  .msg.user .who { text-align: right; }
+  .msg.sys .body { background: transparent; border-style: dashed; color: var(--muted); font-size: 13px; }
+  .msg .body pre { background: var(--panel-2); padding: 8px; border-radius: 8px; overflow-x: auto; margin: 6px 0; }
+  .msg .body code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
+
+  footer {
+    border-top: 1px solid var(--line); background: var(--panel);
+    padding: 10px 14px; padding-bottom: max(10px, env(safe-area-inset-bottom));
+  }
+  .composer { display: flex; gap: 8px; align-items: flex-end; }
+  textarea {
+    flex: 1; resize: none; min-height: 42px; max-height: 180px;
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+    font: inherit;
+  }
+  textarea:focus { outline: none; border-color: var(--accent); }
+
+  dialog {
+    border: 1px solid var(--line); border-radius: var(--radius);
+    background: var(--panel); color: var(--text);
+    padding: 20px; max-width: 90vw; width: 340px;
+  }
+  dialog::backdrop { background: rgba(0,0,0,.55); }
+  dialog h2 { margin: 0 0 12px; font-size: 16px; }
+  dialog input {
+    width: 100%; padding: 9px 11px; margin-bottom: 12px;
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px; font: inherit;
+  }
+  .err { color: var(--danger); font-size: 13px; min-height: 18px; margin-bottom: 8px; }
+
+  #settings { position: fixed; inset: 0; background: var(--bg); z-index: 5; overflow-y: auto;
+              padding: 14px; padding-top: max(14px, env(safe-area-inset-top)); display: none; }
+  #settings.open { display: block; }
+  .row {
+    display: flex; align-items: center; gap: 10px; justify-content: space-between;
+    padding: 11px 12px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px; margin-bottom: 8px;
+  }
+  .row label { color: var(--muted); font-size: 13px; }
+  .row select, .row input[type=number] {
+    background: var(--panel-2); color: var(--text); font: inherit;
+    border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; min-width: 130px;
+  }
+  .hint { color: var(--muted); font-size: 12px; margin: 4px 2px 14px; }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>XGent Web Chat</h1>
+  <button id="btn-settings">⚙️</button>
+  <button id="btn-stop" class="danger" style="display:none">停止</button>
+</header>
+
+<main id="log"></main>
+
+<footer>
+  <div class="composer">
+    <textarea id="input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+    <button id="btn-send" class="primary">发送</button>
+  </div>
+</footer>
+
+<div id="settings">
+  <div class="row" style="background:transparent;border:none;padding-left:0">
+    <strong>系统参数</strong>
+    <button id="btn-close-settings">返回</button>
+  </div>
+  <div id="settings-rows"></div>
+  <div class="hint">改动即时保存，与 Telegram 菜单共用同一份配置。提供商与 API Key 请在 Telegram 里管理。</div>
+  <div class="row" style="background:transparent;border:none;padding-left:0">
+    <button id="btn-logout">退出登录</button>
+  </div>
+</div>
+
+<dialog id="login">
+  <h2>需要登录</h2>
+  <div class="err" id="login-err"></div>
+  <input type="password" id="password" placeholder="访问密码" autocomplete="current-password">
+  <button class="primary" id="btn-login" style="width:100%">登录</button>
+</dialog>
+
+<script>
+(function () {
+  "use strict";
+
+  var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+  if (tg) { try { tg.ready(); tg.expand(); } catch (e) {} }
+
+  var log = document.getElementById("log");
+  var input = document.getElementById("input");
+  var btnSend = document.getElementById("btn-send");
+  var btnStop = document.getElementById("btn-stop");
+  var dot = document.getElementById("dot");
+  var loginDlg = document.getElementById("login");
+  var loginErr = document.getElementById("login-err");
+  var settings = document.getElementById("settings");
+  var settingsRows = document.getElementById("settings-rows");
+
+  var streaming = null;   // 当前正在流式渲染的气泡
+  var byMessageId = {};   // message_id -> 气泡元素，供 edit 帧定位
+  var evtSource = null;
+
+  function api(path, options) {
+    options = options || {};
+    options.credentials = "same-origin";
+    options.headers = Object.assign({ "Content-Type": "application/json" }, options.headers || {});
+    return fetch(path, options).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (body) {
+        if (!r.ok) { throw new Error(body.error || ("HTTP " + r.status)); }
+        return body;
+      });
+    });
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  // 只做最小渲染：转义之后还原代码块和行内代码。服务端返回的是 Telegram
+  // HTML，直接 innerHTML 等于把模型输出当 HTML 执行。
+  function render(text) {
+    var out = escapeHtml(text);
+    out = out.replace(/```([\s\S]*?)```/g, function (_, code) {
+      return "<pre>" + code.replace(/^\n/, "") + "</pre>";
+    });
+    out = out.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+    return out;
+  }
+
+  function bubble(role, text, messageId) {
+    var wrap = document.createElement("div");
+    wrap.className = "msg " + role;
+    var who = document.createElement("div");
+    who.className = "who";
+    who.textContent = role === "user" ? "我" : (role === "sys" ? "系统" : "AI");
+    var body = document.createElement("div");
+    body.className = "body";
+    body.innerHTML = render(text || "");
+    wrap.appendChild(who);
+    wrap.appendChild(body);
+    log.appendChild(wrap);
+    log.scrollTop = log.scrollHeight;
+    if (messageId != null) { byMessageId[messageId] = body; }
+    return body;
+  }
+
+  function setBusy(busy) {
+    btnSend.disabled = busy;
+    btnStop.style.display = busy ? "" : "none";
+    dot.className = busy ? "dot on" : "dot";
+  }
+
+  function handleFrame(frame) {
+    if (frame.type === "message") {
+      streaming = bubble("ai", frame.text, frame.message_id);
+      setBusy(true);
+    } else if (frame.type === "edit") {
+      var target = byMessageId[frame.message_id] || streaming;
+      if (target) { target.innerHTML = render(frame.text); }
+      else { streaming = bubble("ai", frame.text, frame.message_id); }
+      log.scrollTop = log.scrollHeight;
+    } else if (frame.type === "delete") {
+      var el = byMessageId[frame.message_id];
+      if (el && el.parentNode) { el.parentNode.remove(); }
+      delete byMessageId[frame.message_id];
+    } else if (frame.type === "document" || frame.type === "photo") {
+      bubble("sys", (frame.filename ? "📎 " + frame.filename : "🖼️ 图片") +
+                    (frame.caption ? "\n" + frame.caption : ""), frame.message_id);
+    } else if (frame.type === "turn_end") {
+      setBusy(false);
+      streaming = null;
+    } else if (frame.type === "turn_error") {
+      bubble("sys", "⚠️ " + (frame.text || "处理失败"));
+      setBusy(false);
+      streaming = null;
+    }
+  }
+
+  function connectStream() {
+    if (evtSource) { evtSource.close(); }
+    evtSource = new EventSource("/api/stream");
+    evtSource.onmessage = function (e) {
+      try { handleFrame(JSON.parse(e.data)); } catch (err) {}
+    };
+    evtSource.onerror = function () {
+      // EventSource 会自己重连，这里不干预，只是把忙状态清掉避免卡住按钮。
+      setBusy(false);
+    };
+  }
+
+  function loadHistory() {
+    return api("/api/history?limit=50").then(function (data) {
+      log.innerHTML = "";
+      byMessageId = {};
+      (data.messages || []).forEach(function (m) {
+        bubble(m.role === "user" ? "user" : (m.role === "assistant" ? "ai" : "sys"), m.content);
+      });
+      log.scrollTop = log.scrollHeight;
+    });
+  }
+
+  var SETTING_FIELDS = [
+    { key: "thinking_level", label: "思考深度", type: "select" },
+    { key: "stream_mode", label: "流式输出", type: "bool" },
+    { key: "agent_mode", label: "Agent 模式", type: "bool" },
+    { key: "text_stitch_mode", label: "文字拼接", type: "select" },
+    { key: "global_depth", label: "记忆深度", type: "number", min: 1, max: 500 },
+    { key: "agent_max_iterations", label: "Agent 最大轮数", type: "number", min: 1, max: 50 },
+    { key: "stream_timeout", label: "AI 回复超时(秒, 0=不限)", type: "number", min: 0, max: 3600 },
+    { key: "chat_model", label: "对话模型", type: "select" }
+  ];
+
+  function loadSettings() {
+    return api("/api/config").then(function (data) {
+      settingsRows.innerHTML = "";
+      SETTING_FIELDS.forEach(function (field) {
+        if (!(field.key in data.values)) { return; }
+        var row = document.createElement("div");
+        row.className = "row";
+        var label = document.createElement("label");
+        label.textContent = field.label;
+        row.appendChild(label);
+
+        var control;
+        if (field.type === "bool") {
+          control = document.createElement("select");
+          [["true", "开"], ["false", "关"]].forEach(function (pair) {
+            var opt = document.createElement("option");
+            opt.value = pair[0]; opt.textContent = pair[1];
+            control.appendChild(opt);
+          });
+          control.value = data.values[field.key] ? "true" : "false";
+        } else if (field.type === "select") {
+          control = document.createElement("select");
+          (data.options[field.key] || []).forEach(function (opt) {
+            var o = document.createElement("option");
+            o.value = opt.value; o.textContent = opt.label;
+            control.appendChild(o);
+          });
+          control.value = String(data.values[field.key]);
+        } else {
+          control = document.createElement("input");
+          control.type = "number";
+          if (field.min != null) { control.min = field.min; }
+          if (field.max != null) { control.max = field.max; }
+          control.value = data.values[field.key];
+        }
+
+        control.addEventListener("change", function () {
+          var value = control.value;
+          if (field.type === "bool") { value = control.value === "true"; }
+          else if (field.type === "number") { value = Number(control.value); }
+          api("/api/config", { method: "POST", body: JSON.stringify({ key: field.key, value: value }) })
+            .catch(function (err) { alert("保存失败：" + err.message); loadSettings(); });
+        });
+        row.appendChild(control);
+        settingsRows.appendChild(row);
+      });
+    });
+  }
+
+  function send() {
+    var text = input.value.trim();
+    if (!text) { return; }
+    bubble("user", text);
+    input.value = "";
+    input.style.height = "auto";
+    setBusy(true);
+    api("/api/chat", { method: "POST", body: JSON.stringify({ text: text }) })
+      .catch(function (err) {
+        bubble("sys", "⚠️ " + err.message);
+        setBusy(false);
+      });
+  }
+
+  function boot() {
+    loginDlg.close();
+    connectStream();
+    loadHistory().catch(function () {});
+  }
+
+  function tryLogin(payload) {
+    return api("/api/login", { method: "POST", body: JSON.stringify(payload) });
+  }
+
+  // 启动：先看有没有现成会话；没有就试 Telegram initData 免密登录；再不行才弹密码框。
+  api("/api/session").then(function (data) {
+    if (data.authenticated) { boot(); return; }
+    var initData = tg && tg.initData ? tg.initData : "";
+    if (initData) {
+      return tryLogin({ init_data: initData }).then(boot).catch(function () { loginDlg.showModal(); });
+    }
+    loginDlg.showModal();
+  }).catch(function () { loginDlg.showModal(); });
+
+  document.getElementById("btn-login").addEventListener("click", function () {
+    loginErr.textContent = "";
+    tryLogin({ password: document.getElementById("password").value })
+      .then(boot)
+      .catch(function (err) { loginErr.textContent = err.message; });
+  });
+  document.getElementById("password").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") { document.getElementById("btn-login").click(); }
+  });
+
+  btnSend.addEventListener("click", send);
+  input.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+  input.addEventListener("input", function () {
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 180) + "px";
+  });
+
+  btnStop.addEventListener("click", function () {
+    api("/api/stop", { method: "POST" }).catch(function () {});
+  });
+
+  document.getElementById("btn-settings").addEventListener("click", function () {
+    settings.classList.add("open");
+    loadSettings().catch(function (err) { alert("读取配置失败：" + err.message); });
+  });
+  document.getElementById("btn-close-settings").addEventListener("click", function () {
+    settings.classList.remove("open");
+  });
+  document.getElementById("btn-logout").addEventListener("click", function () {
+    api("/api/logout", { method: "POST" }).then(function () { location.reload(); });
+  });
+})();
+</script>
+</body>
+</html>

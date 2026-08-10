@@ -543,6 +543,103 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode=constants.ParseMode.HTML
             )
         
+        # --- Web Chat ---
+        elif data == "menu_web":
+            UserDataManager.set('state', BotState.IDLE)
+            await query.message.edit_text(
+                build_web_text(),
+                reply_markup=get_web_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "toggle_web_enabled":
+            enabled = not normalize_bool(UserDataManager.get('web_enabled', False), False)
+            if enabled and not UserDataManager.get('_web_has_password', False):
+                await query.answer("请先设置访问密码", show_alert=True)
+                return
+            UserDataManager.set('web_enabled', enabled)
+            await UserDataManager.save_config('web_enabled', enabled)
+            await restart_web_chat(context.application)
+            await GlobalRecorder.record_system_op(
+                f"Web Chat {'开启' if enabled else '关闭'}",
+                {"web_enabled": enabled}
+            )
+            await query.message.edit_text(
+                build_web_text(),
+                reply_markup=get_web_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "act_set_web_password":
+            UserDataManager.set('state', BotState.SET_WEB_PASSWORD)
+            await query.message.reply_text(
+                "🔑 <b>设置 Web 访问密码</b>\n"
+                "━━━━━━━━━━━━━━\n"
+                "请发送新密码（至少 6 位）。\n\n"
+                "密码只以 PBKDF2 哈希形式存进数据库，聊天记录里不会保留原文。\n"
+                "保存后会自动重启 Web 服务使其生效。\n"
+                "━━━━━━━━━━━━━━\n"
+                "<i>发送 cancel 取消。</i>",
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "act_set_web_port":
+            UserDataManager.set('state', BotState.SET_WEB_PORT)
+            await query.message.reply_text(
+                f"🔌 请输入监听端口（{MIN_WEB_PORT}-{MAX_WEB_PORT}）。\n"
+                f"当前：{normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))}。\n"
+                "发送 cancel 取消。"
+            )
+
+        elif data == "act_set_web_public_url":
+            UserDataManager.set('state', BotState.SET_WEB_PUBLIC_URL)
+            await query.message.reply_text(
+                "🌐 <b>设置公开访问地址</b>\n"
+                "━━━━━━━━━━━━━━\n"
+                "请发送反向代理的完整地址，必须以 <code>https://</code> 开头。\n"
+                "例如：<code>https://chat.example.com</code>\n\n"
+                "Telegram 的内嵌网页按钮只接受 HTTPS 地址；配置后 /start 里的 Web 按钮"
+                "就能直接在 Telegram 内弹出页面。\n"
+                "━━━━━━━━━━━━━━\n"
+                "<i>发送 cancel 取消。</i>",
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "confirm_clear_web_password":
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ 确认清除", callback_data="do_clear_web_password")],
+                [InlineKeyboardButton("🔙 返回", callback_data="menu_web")]
+            ])
+            await query.message.edit_text(
+                "⚠️ <b>确认清除 Web 访问密码？</b>\n\n"
+                "清除后 Web 服务会立即停止，直到重新设置密码。",
+                reply_markup=kb,
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "do_clear_web_password":
+            await clear_web_password()
+            # 没有密码就不能继续对外服务，连同开关一起关掉。
+            UserDataManager.set('web_enabled', False)
+            await UserDataManager.save_config('web_enabled', False)
+            await stop_web_chat()
+            await GlobalRecorder.record_system_op("清除 Web 访问密码并停止服务")
+            await query.message.edit_text(
+                build_web_text(),
+                reply_markup=get_web_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "do_clear_web_public_url":
+            UserDataManager.set('web_public_url', '')
+            await UserDataManager.save_config('web_public_url', '')
+            await GlobalRecorder.record_system_op("清除 Web 公开地址")
+            await query.message.edit_text(
+                build_web_text(),
+                reply_markup=get_web_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
         # --- 思考深度 ---
         elif data == "menu_thinking_level":
             await query.message.edit_text(

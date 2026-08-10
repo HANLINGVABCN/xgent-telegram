@@ -107,7 +107,7 @@ def get_main_menu():
     agent_on = UserDataManager.get('agent_mode', False)
     stream_on = normalize_bool(UserDataManager.get('stream_mode', True), True)
     stitch_label = get_text_stitch_mode_label()
-    
+
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔌 提供商", callback_data="menu_providers"),
          InlineKeyboardButton("🎯 模型", callback_data="menu_default_models")],
@@ -115,9 +115,86 @@ def get_main_menu():
          InlineKeyboardButton(f"🌊 流式:{'开' if stream_on else '关'}", callback_data="toggle_stream_mode")],
         [InlineKeyboardButton(f"🧩{stitch_label}", callback_data="menu_text_stitch_mode"),
          InlineKeyboardButton("🧠记忆", callback_data="menu_memory")],
-        [InlineKeyboardButton("📝 提示词", callback_data="menu_prompts"),
-         InlineKeyboardButton("⚙️ 更多", callback_data="menu_more_settings")]
+        [_build_web_entry_button(),
+         InlineKeyboardButton("📝 提示词", callback_data="menu_prompts")],
+        [InlineKeyboardButton("⚙️ 更多", callback_data="menu_more_settings")]
     ])
+
+
+def _build_web_entry_button() -> InlineKeyboardButton:
+    """Web 入口按钮三态。
+
+    Telegram 服务器拒绝非 HTTPS 的 web_app URL，所以只有配了公开 HTTPS
+    地址才能内嵌打开；否则退化成普通链接用外部浏览器开 127.0.0.1。
+    """
+    enabled = normalize_bool(UserDataManager.get('web_enabled', False), False)
+    if not enabled:
+        return InlineKeyboardButton("🌐 Web:关", callback_data="menu_web")
+
+    public_url = str(UserDataManager.get('web_public_url', '') or '')
+    if public_url.startswith("https://"):
+        return InlineKeyboardButton("🌐 打开网页", web_app=WebAppInfo(url=public_url))
+
+    port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
+    return InlineKeyboardButton("🌐 浏览器打开", url=f"http://{DEFAULT_WEB_HOST}:{port}")
+
+
+def get_web_menu():
+    enabled = normalize_bool(UserDataManager.get('web_enabled', False), False)
+    port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
+    public_url = str(UserDataManager.get('web_public_url', '') or '')
+    has_password = bool(UserDataManager.get('_web_has_password', False))
+
+    rows = [
+        [InlineKeyboardButton(
+            f"{'🟢 已开启' if enabled else '🔴 已关闭'}　点击{'关闭' if enabled else '开启'}",
+            callback_data="toggle_web_enabled"
+        )],
+        [InlineKeyboardButton(
+            f"🔑 密码：{'已设置' if has_password else '未设置'}",
+            callback_data="act_set_web_password"
+        )],
+        [InlineKeyboardButton(f"🔌 端口：{port}", callback_data="act_set_web_port")],
+        [InlineKeyboardButton(
+            f"🌐 公开地址：{'已配置' if public_url else '未配置'}",
+            callback_data="act_set_web_public_url"
+        )],
+    ]
+    if has_password:
+        rows.append([InlineKeyboardButton("🗑️ 清除密码", callback_data="confirm_clear_web_password")])
+    if public_url:
+        rows.append([InlineKeyboardButton("🧹 清除公开地址", callback_data="do_clear_web_public_url")])
+    rows.append([InlineKeyboardButton("🔙 返回", callback_data="act_main_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_web_text() -> str:
+    enabled = normalize_bool(UserDataManager.get('web_enabled', False), False)
+    port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
+    public_url = str(UserDataManager.get('web_public_url', '') or '')
+    has_password = bool(UserDataManager.get('_web_has_password', False))
+    running = is_web_chat_running()
+
+    status = "🟢 运行中" if running else ("🟡 已开启但未运行" if enabled else "🔴 已关闭")
+    password_line = "✅ 已设置" if has_password else "⚠️ 未设置（未设置时拒绝启动）"
+    public_line = (
+        f"✅ <code>{safe_text(public_url)}</code>"
+        if public_url else "未配置（按钮将用外部浏览器打开本地地址）"
+    )
+
+    return (
+        "🌐 <b>Web Chat</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"状态：{status}\n"
+        f"监听：<code>{DEFAULT_WEB_HOST}:{port}</code>\n"
+        f"密码：{password_line}\n"
+        f"公开地址：{public_line}\n\n"
+        "网页版复用同一套对话核心，Agent 模式、协议执行、记忆与 Telegram 完全共享。\n"
+        "可在网页里聊天并调整常用参数；提供商与 API Key 仍只在 Telegram 里管理。\n\n"
+        f"⚠️ 服务只监听 <code>{DEFAULT_WEB_HOST}</code>，不会直接暴露到公网。"
+        "要远程访问请自行配置反向代理，并在上面填入反代的 HTTPS 地址。\n"
+        "Telegram 的内嵌网页按钮只接受 HTTPS 地址，这也是公开地址单独配置的原因。"
+    )
 
 
 def get_text_stitch_mode_menu():

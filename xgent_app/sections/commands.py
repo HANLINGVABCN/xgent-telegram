@@ -589,6 +589,26 @@ async def cmd_blacklist_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parse_mode=constants.ParseMode.HTML
     )
 
+async def cmd_web_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_authorized_user_middleware(update, context):
+        return
+    await UserDataManager.init()
+    await update.message.reply_text(
+        build_web_text(),
+        reply_markup=get_web_menu(),
+        parse_mode=constants.ParseMode.HTML
+    )
+
+async def cmd_thinking_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_authorized_user_middleware(update, context):
+        return
+    await UserDataManager.init()
+    await update.message.reply_text(
+        build_thinking_level_text(),
+        reply_markup=get_thinking_level_menu(),
+        parse_mode=constants.ParseMode.HTML
+    )
+
 async def cmd_depth_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
         return

@@ -960,6 +960,13 @@ class UserDataManager:
             'thinking_level': normalize_thinking_level(
                 await cls._require_db().get_config('thinking_level', DEFAULT_THINKING_LEVEL)
             ),
+            'web_enabled': normalize_bool(await cls._require_db().get_config('web_enabled', False), False),
+            'web_port': normalize_web_port(await cls._require_db().get_config('web_port', DEFAULT_WEB_PORT)),
+            'web_public_url': str(await cls._require_db().get_config('web_public_url', '') or ''),
+            # 只缓存"有没有设密码"这个布尔，哈希本身按需读库，不进内存快照。
+            '_web_has_password': bool(
+                await cls._require_db().get_config(WEB_PASSWORD_CONFIG_KEY, '')
+            ),
             'agent_command_timeout': normalize_command_timeout(
                 await cls._require_db().get_config('agent_command_timeout', DEFAULT_AGENT_COMMAND_TIMEOUT)
             ),

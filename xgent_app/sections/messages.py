@@ -557,6 +557,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         BotState.SET_COMMAND_BLACKLIST,
         # 搜索 Key 同样含下划线和连字符，必须保持原样。
         BotState.SET_SEARCH_KEY,
+        # 密码里的 _ - ` 被转义后会存成另一个字符串，用户永远登录不上。
+        BotState.SET_WEB_PASSWORD,
+        # URL 含下划线和连字符，转义会写出无法访问的地址。
+        BotState.SET_WEB_PUBLIC_URL,
     }
     text = ""
     if update.message.text:
@@ -633,6 +637,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             if state == BotState.SET_UPDATE_TOKEN
             else "[已填入搜索 API Key，内容已隐藏]"
             if state == BotState.SET_SEARCH_KEY
+            else "[已设置 Web 访问密码，内容已隐藏]"
+            if state == BotState.SET_WEB_PASSWORD
             else "[已提交提供商配置 JSON，内容已隐藏]"
             if state == BotState.IMPORT_PROVIDER_CONFIG
             else "[已填入 API Key，内容已隐藏]"
@@ -800,6 +806,63 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=get_search_settings_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
+        return
+
+    if state == BotState.SET_WEB_PASSWORD:
+        try:
+            await persist_web_password(text.strip())
+        except ValueError as e:
+            await update.message.reply_text(f"⚠️ {e}。请重新发送，或发送 cancel 取消。")
+            return
+        UserDataManager.set('state', BotState.IDLE)
+        await GlobalRecorder.record_system_op("设置 Web 访问密码")
+        # 密码变了要重启服务，否则旧进程还在用旧哈希校验。
+        await restart_web_chat(context.application)
+        await update.message.reply_text(
+            build_web_text(),
+            reply_markup=get_web_menu(),
+            parse_mode=constants.ParseMode.HTML
+        )
+        return
+
+    if state == BotState.SET_WEB_PORT:
+        try:
+            port = parse_web_port(text)
+        except ValueError:
+            await update.message.reply_text(
+                f"⚠️ 请输入 {MIN_WEB_PORT}-{MAX_WEB_PORT} 之间的端口号。"
+            )
+            return
+        UserDataManager.set('web_port', port)
+        UserDataManager.set('state', BotState.IDLE)
+        await UserDataManager.save_config('web_port', port)
+        await GlobalRecorder.record_system_op(f"设置 Web 端口: {port}")
+        await restart_web_chat(context.application)
+        await update.message.reply_text(
+            build_web_text(),
+            reply_markup=get_web_menu(),
+            parse_mode=constants.ParseMode.HTML
+        )
+        return
+
+    if state == BotState.SET_WEB_PUBLIC_URL:
+        try:
+            url = normalize_web_public_url(text)
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ 地址必须以 https:// 开头。\n"
+                "Telegram 的内嵌网页按钮只接受 HTTPS 地址。"
+            )
+            return
+        UserDataManager.set('web_public_url', url)
+        UserDataManager.set('state', BotState.IDLE)
+        await UserDataManager.save_config('web_public_url', url)
+        await GlobalRecorder.record_system_op("设置 Web 公开地址", {"url": url})
+        await update.message.reply_text(
+            build_web_text(),
+            reply_markup=get_web_menu(),
+            parse_mode=constants.ParseMode.HTML
+        )
         return
 
     if state == BotState.SET_PROMPT:
