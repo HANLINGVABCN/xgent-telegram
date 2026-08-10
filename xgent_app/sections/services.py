@@ -18,7 +18,16 @@ from xgent_app.agent_context import (
 )
 from xgent_app.agent_search import run_search
 from xgent_app import web_auth
-from xgent_app.web_bridge import WebOutbox, build_web_conversation_objects
+from xgent_app.web_bridge import (
+    WebOutbox,
+    build_web_conversation_objects,
+    build_web_mirror_objects,
+    build_web_callback_objects,
+    build_web_command_objects,
+    MirrorBot,
+    MirrorMessage,
+    install_tg_to_web_mirror,
+)
 from xgent_app.web_server import WebChatConfig, WebChatServer
 class GlobalRecorder:
     """始终记录所有操作（无论什么模式）"""

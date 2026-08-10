@@ -107,6 +107,7 @@ def get_main_menu():
     agent_on = UserDataManager.get('agent_mode', False)
     stream_on = normalize_bool(UserDataManager.get('stream_mode', True), True)
     stitch_label = get_text_stitch_mode_label()
+    web_on = normalize_bool(UserDataManager.get('web_enabled', False), False)
 
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔌 提供商", callback_data="menu_providers"),
@@ -115,25 +116,29 @@ def get_main_menu():
          InlineKeyboardButton(f"🌊 流式:{'开' if stream_on else '关'}", callback_data="toggle_stream_mode")],
         [InlineKeyboardButton(f"🧩{stitch_label}", callback_data="menu_text_stitch_mode"),
          InlineKeyboardButton("🧠记忆", callback_data="menu_memory")],
-        [_build_web_entry_button(),
+        [InlineKeyboardButton(f"🌐 Web:{'开' if web_on else '关'}", callback_data="menu_web"),
          InlineKeyboardButton("📝 提示词", callback_data="menu_prompts")],
         [InlineKeyboardButton("⚙️ 更多", callback_data="menu_more_settings")]
     ])
 
 
-def _build_web_entry_button() -> InlineKeyboardButton:
-    """Web 入口按钮三态。
+def _build_web_open_button():
+    """Web 配置菜单里用的「打开网页版」按钮。
 
-    Telegram 服务器拒绝非 HTTPS 的 web_app URL，所以只有配了公开 HTTPS
-    地址才能内嵌打开；否则退化成普通链接用外部浏览器开 127.0.0.1。
+    主菜单的 Web 按钮现在是恒定的回调入口（menu_web），不再承担"打开"职责，
+    所以无论是否配置公开地址，配置菜单都能进得来、改得了。
+    这里只负责在已开启时给出一个打开动作：
+      - 配了 HTTPS 公开地址 → WebApp 内嵌打开；
+      - 否则 → 外部浏览器打开本地地址。
+    未开启时返回 None，调用方据此决定是否显示该行。
     """
     enabled = normalize_bool(UserDataManager.get('web_enabled', False), False)
     if not enabled:
-        return InlineKeyboardButton("🌐 Web:关", callback_data="menu_web")
+        return None
 
     public_url = str(UserDataManager.get('web_public_url', '') or '')
     if public_url.startswith("https://"):
-        return InlineKeyboardButton("🌐 打开网页", web_app=WebAppInfo(url=public_url))
+        return InlineKeyboardButton("🌐 打开网页版", web_app=WebAppInfo(url=public_url))
 
     port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
     return InlineKeyboardButton("🌐 浏览器打开", url=f"http://{DEFAULT_WEB_HOST}:{port}")
@@ -145,7 +150,12 @@ def get_web_menu():
     public_url = str(UserDataManager.get('web_public_url', '') or '')
     has_password = bool(UserDataManager.get('_web_has_password', False))
 
-    rows = [
+    rows: List[List[InlineKeyboardButton]] = []
+    # 已开启时，第一行就是「打开网页版」，和开关/端口/密码等配置项分开。
+    open_button = _build_web_open_button()
+    if open_button is not None:
+        rows.append([open_button])
+    rows.extend([
         [InlineKeyboardButton(
             f"{'🟢 已开启' if enabled else '🔴 已关闭'}　点击{'关闭' if enabled else '开启'}",
             callback_data="toggle_web_enabled"
@@ -159,7 +169,7 @@ def get_web_menu():
             f"🌐 公开地址：{'已配置' if public_url else '未配置'}",
             callback_data="act_set_web_public_url"
         )],
-    ]
+    ])
     if has_password:
         rows.append([InlineKeyboardButton("🗑️ 清除密码", callback_data="confirm_clear_web_password")])
     if public_url:

@@ -63,6 +63,8 @@ class WebChatConfig:
         write_setting: Callable[[str, Any], Any],
         request_stop: Callable[[], None],
         is_busy: Callable[[], bool],
+        submit_callback: Optional[Callable[[str, int, WebOutbox], Any]] = None,
+        submit_command: Optional[Callable[[str, WebOutbox], Any]] = None,
     ):
         self.host = host
         self.port = port
@@ -71,6 +73,9 @@ class WebChatConfig:
         self.authorized_user_id = authorized_user_id
         self.loop = loop
         self.submit_message = submit_message
+        # 网页按钮 / 命令路由。可选，保留向后兼容（旧测试构造 WebChatConfig 时不传）。
+        self.submit_callback = submit_callback or (lambda *a: None)
+        self.submit_command = submit_command or (lambda *a: None)
         self.read_history = read_history
         self.read_settings = read_settings
         self.write_setting = write_setting
@@ -208,6 +213,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._handle_logout()
             elif path == "/api/chat":
                 self._handle_chat()
+            elif path == "/api/callback":
+                self._handle_callback()
+            elif path == "/api/command":
+                self._handle_command()
             elif path == "/api/stop":
                 self._handle_stop()
             elif path == "/api/config":
@@ -342,6 +351,44 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if not self._require_auth():
             return
         self.config.request_stop()
+        self._send_json({"ok": True})
+
+    def _handle_callback(self) -> None:
+        """网页内联按钮点击。复用 Telegram 的回调路由，结果经 SSE 推回。"""
+        if not self._require_auth():
+            return
+        data = self._read_json()
+        if data is None:
+            return
+        callback_data = str(data.get("callback_data") or "")
+        if not callback_data:
+            self._send_json({"error": "缺少 callback_data"}, status=400)
+            return
+        try:
+            message_id = int(data.get("message_id") or 0)
+        except (TypeError, ValueError):
+            message_id = 0
+
+        outbox = self.server.outbox  # type: ignore[attr-defined]
+        self.config.submit_callback(callback_data, message_id, outbox)
+        self._send_json({"ok": True})
+
+    def _handle_command(self) -> None:
+        """网页 /命令。复用 Telegram 的 cmd_* 处理函数，结果经 SSE 推回。"""
+        if not self._require_auth():
+            return
+        data = self._read_json()
+        if data is None:
+            return
+        command = str(data.get("command") or "").strip()
+        if not command:
+            self._send_json({"error": "命令不能为空"}, status=400)
+            return
+        if not command.startswith("/"):
+            command = "/" + command
+
+        outbox = self.server.outbox  # type: ignore[attr-defined]
+        self.config.submit_command(command, outbox)
         self._send_json({"ok": True})
 
     def _handle_stream(self) -> None:

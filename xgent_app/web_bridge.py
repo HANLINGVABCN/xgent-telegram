@@ -13,10 +13,28 @@ shell_triggers.py 里的 _SelfTriggerUpdate / _SelfTriggerContext 已经用同�
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# 网页侧假 message_id 全局计数器。起始放到 1,000,000 以上，刻意避开真实
+# Telegram message_id（通常是小整数），让前端 byMessageId 不会把 TG->Web 镜像
+# 帧和网页原生帧搞混。WebBot / MirrorBot 共用这一个计数器，保证命令、按钮、
+# 对话各自新建实例时 id 仍然唯一。
+_WEB_MESSAGE_ID_LOCK = threading.Lock()
+_web_message_id_counter = 1_000_000
+
+
+def _allocate_web_message_id() -> int:
+    global _web_message_id_counter
+    with _WEB_MESSAGE_ID_LOCK:
+        mid = _web_message_id_counter
+        _web_message_id_counter += 1
+        return mid
 
 
 class WebOutbox:
@@ -119,6 +137,9 @@ class WebBot:
     以为消息发出去了。
     """
 
+    # 标记位：process_conversation 据此识别"本轮来自网页"，跳过 TG->Web 镜像安装。
+    _is_xgent_web_bot = True
+
     def __init__(self, outbox: WebOutbox, chat_id: int):
         self.outbox = outbox
         self.chat_id = chat_id
@@ -126,10 +147,8 @@ class WebBot:
         self._id_lock = threading.Lock()
 
     def _allocate_message_id(self) -> int:
-        with self._id_lock:
-            message_id = self._next_message_id
-            self._next_message_id += 1
-            return message_id
+        # 用全局计数器，避免不同 WebBot 实例（每次命令/回调都新建一个）id 重复。
+        return _allocate_web_message_id()
 
     def _emit(self, frame_type: str, **fields: Any) -> None:
         frame: Dict[str, Any] = {"type": frame_type, "ts": time.time()}
@@ -219,10 +238,412 @@ class WebContext:
         self.bot = bot
 
 
+class MirrorBot:
+    """双通道输出 Bot：每次发送既推帧给网页（SSE），又发给真实 Telegram bot。
+
+    网页版和 Telegram 共用同一套对话核心，但默认各走各的输出通道——网页发的
+    Telegram 看不到，反之亦然。MirrorBot 把两条通道并起来：对话核心调用
+    send_message / edit_message_text 等方法时，这里同时：
+
+      1. 调真实 PTB bot 对应方法（消息进 Telegram 聊天）；
+      2. 推一帧到 WebOutbox（消息进网页 SSE）。
+
+    real_bot 为 None 时退化为纯网页输出，行为等价于 WebBot。维护 fake_id ->
+    real_id 映射，让后续 edit/delete 能定位到 Telegram 里的真实消息。
+
+    Telegram 侧调用失败（消息超长、HTML 解析失败等）只记日志，不抛出——网页
+    那一帧照发，避免一边坏了把整轮对话拖崩。这会让两端偶尔不一致，但比直接
+    中断对话可控。
+    """
+
+    # 标记位：process_conversation 据此识别"本轮来自网页"，跳过 TG->Web 镜像安装。
+    _is_xgent_web_bot = True
+
+    def __init__(self, outbox: WebOutbox, chat_id: int, real_bot: Any = None):
+        self.outbox = outbox
+        self.chat_id = chat_id
+        self.real_bot = real_bot
+        self._next_message_id = 1
+        self._id_lock = threading.Lock()
+        self._id_map: Dict[int, int] = {}  # fake_id -> real Telegram message_id
+
+    def _allocate_message_id(self) -> int:
+        return _allocate_web_message_id()
+
+    def _emit(self, frame_type: str, **fields: Any) -> None:
+        frame: Dict[str, Any] = {"type": frame_type, "ts": time.time()}
+        frame.update(fields)
+        self.outbox.put(frame)
+
+    def _resolve_real_id(self, message_id: Optional[int]) -> Optional[int]:
+        """fake_id -> real_id。没映射就当它本身就是真实 id（部分代码会直接传 real id）。"""
+        if message_id is None:
+            return None
+        try:
+            mid = int(message_id)
+        except (TypeError, ValueError):
+            return None
+        return self._id_map.get(mid, mid)
+
+    async def _tg_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        if self.real_bot is None:
+            return None
+        try:
+            return await getattr(self.real_bot, method)(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 —— 刻意宽，TG 失败不能拖垮网页
+            logger.warning("MirrorBot Telegram %s 失败: %s", method, exc)
+            return None
+
+    async def send_message(self, chat_id: Optional[int] = None, text: str = "",
+                           reply_markup: Any = None, parse_mode: Any = None,
+                           **kwargs: Any) -> WebMessage:
+        target = int(chat_id) if chat_id is not None else self.chat_id
+        message_id = self._allocate_message_id()
+        real = await self._tg_call(
+            "send_message", chat_id=target, text=str(text),
+            reply_markup=reply_markup, parse_mode=parse_mode, **kwargs,
+        )
+        if real is not None and getattr(real, "message_id", None) is not None:
+            self._id_map[message_id] = real.message_id
+        self._emit(
+            "message", message_id=message_id, text=str(text),
+            parse_mode=str(parse_mode) if parse_mode else None,
+            reply_markup=_markup_to_frame(reply_markup),
+        )
+        return WebMessage(self, message_id, target, str(text))
+
+    async def edit_message_text(self, text: str, chat_id: Optional[int] = None,
+                                message_id: Optional[int] = None, reply_markup: Any = None,
+                                parse_mode: Any = None, **kwargs: Any) -> WebMessage:
+        target = int(chat_id) if chat_id is not None else self.chat_id
+        real_id = self._resolve_real_id(message_id)
+        if real_id is not None:
+            await self._tg_call(
+                "edit_message_text", chat_id=target, message_id=real_id,
+                text=str(text), reply_markup=reply_markup, parse_mode=parse_mode, **kwargs,
+            )
+        self._emit(
+            "edit", message_id=message_id, text=str(text),
+            parse_mode=str(parse_mode) if parse_mode else None,
+            reply_markup=_markup_to_frame(reply_markup),
+        )
+        return WebMessage(self, int(message_id or 0), target, str(text))
+
+    async def edit_message_reply_markup(self, chat_id: Optional[int] = None,
+                                        message_id: Optional[int] = None,
+                                        reply_markup: Any = None, **kwargs: Any) -> bool:
+        target = int(chat_id) if chat_id is not None else self.chat_id
+        real_id = self._resolve_real_id(message_id)
+        if real_id is not None:
+            await self._tg_call(
+                "edit_message_reply_markup", chat_id=target, message_id=real_id,
+                reply_markup=reply_markup, **kwargs,
+            )
+        self._emit("edit_markup", message_id=message_id,
+                   reply_markup=_markup_to_frame(reply_markup))
+        return True
+
+    async def delete_message(self, chat_id: Optional[int] = None,
+                             message_id: Optional[int] = None, **kwargs: Any) -> bool:
+        target = int(chat_id) if chat_id is not None else self.chat_id
+        real_id = self._resolve_real_id(message_id)
+        if real_id is not None:
+            await self._tg_call("delete_message", chat_id=target, message_id=real_id, **kwargs)
+        self._emit("delete", message_id=message_id)
+        return True
+
+    async def send_chat_action(self, chat_id: Optional[int] = None,
+                               action: Any = None, **kwargs: Any) -> bool:
+        if self.real_bot is not None:
+            await self._tg_call(
+                "send_chat_action", chat_id=int(chat_id) if chat_id is not None else self.chat_id,
+                action=action or "typing", **kwargs,
+            )
+        self._emit("chat_action", action=str(action) if action else "typing")
+        return True
+
+    async def send_document(self, chat_id: Optional[int] = None, document: Any = None,
+                            caption: Optional[str] = None, filename: Optional[str] = None,
+                            **kwargs: Any) -> WebMessage:
+        target = int(chat_id) if chat_id is not None else self.chat_id
+        name = filename or getattr(document, "filename", None) or getattr(document, "name", None)
+        message_id = self._allocate_message_id()
+        real = await self._tg_call(
+            "send_document", chat_id=target, document=document,
+            caption=caption, filename=filename, **kwargs,
+        )
+        if real is not None and getattr(real, "message_id", None) is not None:
+            self._id_map[message_id] = real.message_id
+        self._emit("document", message_id=message_id,
+                   filename=str(name) if name else "file",
+                   caption=str(caption) if caption else None)
+        return WebMessage(self, message_id, target, str(caption or ""))
+
+    async def send_photo(self, chat_id: Optional[int] = None, photo: Any = None,
+                         caption: Optional[str] = None, **kwargs: Any) -> WebMessage:
+        target = int(chat_id) if chat_id is not None else self.chat_id
+        message_id = self._allocate_message_id()
+        real = await self._tg_call(
+            "send_photo", chat_id=target, photo=photo, caption=caption, **kwargs,
+        )
+        if real is not None and getattr(real, "message_id", None) is not None:
+            self._id_map[message_id] = real.message_id
+        self._emit("photo", message_id=message_id,
+                   caption=str(caption) if caption else None)
+        return WebMessage(self, message_id, target, str(caption or ""))
+
+    async def get_file(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError("Web 端不支持下载 Telegram 文件")
+
+
+class MirrorMessage:
+    """代理真实 PTB Message：数据属性透传，发送/编辑方法走 MirrorBot 以镜像到网页。
+
+    Telegram 侧对话核心大量使用 ``update.message.reply_text`` / ``status_msg.edit_text``
+    这类方法。直接把这些调用喂给真实 Message 只会进 Telegram，网页看不到。本类把
+    这几个写方法改路由到 MirrorBot，其余属性（text / from_user / chat / message_id /
+    photo / document 等）原样透传给真实对象，保证读取语义不变。
+    """
+
+    def __init__(self, real_message: Any, bot: MirrorBot):
+        object.__setattr__(self, "_real", real_message)
+        object.__setattr__(self, "_bot", bot)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+    @property
+    def chat_id(self) -> Any:
+        return getattr(self._real, "chat_id", None)
+
+    async def reply_text(self, text: str, **kwargs: Any) -> WebMessage:
+        return await self._bot.send_message(chat_id=self.chat_id, text=text, **kwargs)
+
+    async def reply_markdown(self, text: str, **kwargs: Any) -> WebMessage:
+        return await self._bot.send_message(chat_id=self.chat_id, text=text, **kwargs)
+
+    async def reply_document(self, document: Any = None, **kwargs: Any) -> WebMessage:
+        return await self._bot.send_document(chat_id=self.chat_id, document=document, **kwargs)
+
+    async def reply_photo(self, photo: Any = None, **kwargs: Any) -> WebMessage:
+        return await self._bot.send_photo(chat_id=self.chat_id, photo=photo, **kwargs)
+
+    async def edit_text(self, text: str, **kwargs: Any) -> WebMessage:
+        return await self._bot.edit_message_text(
+            chat_id=self.chat_id, message_id=self._real.message_id, text=text, **kwargs,
+        )
+
+    async def edit_reply_markup(self, reply_markup: Any = None, **kwargs: Any) -> bool:
+        return await self._bot.edit_message_reply_markup(
+            chat_id=self.chat_id, message_id=self._real.message_id, reply_markup=reply_markup, **kwargs,
+        )
+
+    async def delete(self) -> bool:
+        return await self._bot.delete_message(
+            chat_id=self.chat_id, message_id=self._real.message_id,
+        )
+
+
+class WebCallbackQuery:
+    """对照 PTB CallbackQuery：只实现对话核心/回调路由用到的部分。
+
+    answer() 把提示文本作为 callback_answer 帧推给网页，由前端弹 toast/弹窗。
+    message 用 WebMessage（绑定 WebBot），edit_text/reply_text 走网页帧。
+    """
+
+    def __init__(self, bot: WebBot, message: WebMessage, data: str, user_id: int):
+        self.bot = bot
+        self.message = message
+        self.data = data
+        self.from_user = type("WebUser", (), {
+            "id": user_id, "full_name": "Web", "username": None,
+        })()
+        self.id = "web-callback"
+
+    async def answer(self, text: Optional[str] = None, show_alert: bool = False,
+                     **kwargs: Any) -> bool:
+        if text:
+            self.bot._emit("callback_answer", text=str(text), show_alert=bool(show_alert))
+        return True
+
+
 def build_web_conversation_objects(chat_id: int, outbox: WebOutbox):
     """一次造好三件套，调用方直接喂给 process_conversation。"""
     bot = WebBot(outbox, chat_id)
     return WebUpdate(bot, chat_id), WebContext(bot), bot
+
+
+def build_web_mirror_objects(chat_id: int, outbox: WebOutbox, real_bot: Any):
+    """带 Telegram 镜像的对话三件套：网页消息同时进 Telegram。
+
+    用于网页发起的普通对话（非 /命令、非按钮）。/命令和按钮走
+    build_web_command_objects / build_web_callback_objects（纯网页，不回灌 TG），
+    避免在网页点菜单时往 Telegram 刷一堆菜单消息。
+    """
+    bot = MirrorBot(outbox, chat_id, real_bot)
+    update = WebUpdate(bot, chat_id)
+    return update, WebContext(bot), bot
+
+
+def build_web_callback_objects(chat_id: int, outbox: WebOutbox,
+                               callback_data: str, message_id: int):
+    """网页按钮点击三件套：复用 Telegram 的 handle_button_click 回调路由。"""
+    bot = WebBot(outbox, chat_id)
+    msg = WebMessage(bot, int(message_id or 0), chat_id)
+    query = WebCallbackQuery(bot, msg, str(callback_data or ""), chat_id)
+    update = WebUpdate(bot, chat_id)
+    update.callback_query = query
+    update.message = None
+    return update, WebContext(bot), bot
+
+
+def build_web_command_objects(chat_id: int, outbox: WebOutbox, command_text: str):
+    """网页 /命令三件套：复用 Telegram 的 cmd_* 命令处理函数。"""
+    bot = WebBot(outbox, chat_id)
+    update = WebUpdate(bot, chat_id)
+    update.message.text = str(command_text or "")
+    return update, WebContext(bot), bot
+
+
+def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
+    """TG -> Web 镜像：临时把真实 bot 的发送方法包成「发 TG + 推网页帧」。
+
+    PTB 的 ``context.bot`` 是只读 property（返回 application.bot），没法替换，
+    所以直接在真实 ExtBot 实例上临时替换方法。全局对话锁保证同一时刻只有一轮
+    对话在跑；并发按钮点击即使顺带被镜像，也只是让网页多看到一些菜单更新，可
+    接受。返回的 restore() 必须在 finally 里调用，否则真实 bot 会一直带着包装。
+
+    与 MirrorBot（Web->TG）的区别：这里用的是真实 message_id，因为 Telegram 侧
+    全程直接用真实 id；网页前端按帧里的 message_id 跟踪气泡，两套 id 互不冲突。
+    """
+    if real_bot is None or outbox is None:
+        return lambda: None
+
+    saved: Dict[str, Any] = {}
+
+    def emit(frame_type: str, **fields: Any) -> None:
+        frame: Dict[str, Any] = {"type": frame_type, "ts": time.time()}
+        frame.update(fields)
+        outbox.put(frame)
+
+    def _kw_text(kwargs: Dict[str, Any], args: tuple, send: bool = False) -> str:
+        text = kwargs.get("text")
+        if text is not None:
+            return str(text)
+        if send and len(args) >= 2:  # send_message(chat_id, text, ...)
+            return str(args[1])
+        if args:  # edit_message_text(text, ...)
+            return str(args[0])
+        return ""
+
+    # send_message
+    saved["send_message"] = real_bot.send_message
+    async def send_message(*args: Any, **kwargs: Any) -> Any:
+        result = await saved["send_message"](*args, **kwargs)
+        try:
+            emit("message", message_id=getattr(result, "message_id", 0),
+                 text=_kw_text(kwargs, args, send=True),
+                 parse_mode=str(kwargs.get("parse_mode")) if kwargs.get("parse_mode") else None,
+                 reply_markup=_markup_to_frame(kwargs.get("reply_markup")))
+        except Exception:  # noqa: BLE001
+            pass
+        return result
+    real_bot.send_message = send_message  # type: ignore[method-assign]
+
+    # edit_message_text(text, chat_id=None, message_id=None, ...)
+    saved["edit_message_text"] = real_bot.edit_message_text
+    async def edit_message_text(*args: Any, **kwargs: Any) -> Any:
+        result = await saved["edit_message_text"](*args, **kwargs)
+        try:
+            mid = kwargs.get("message_id")
+            if mid is None and len(args) >= 3:
+                mid = args[2]
+            emit("edit", message_id=mid, text=_kw_text(kwargs, args),
+                 parse_mode=str(kwargs.get("parse_mode")) if kwargs.get("parse_mode") else None,
+                 reply_markup=_markup_to_frame(kwargs.get("reply_markup")))
+        except Exception:  # noqa: BLE001
+            pass
+        return result
+    real_bot.edit_message_text = edit_message_text  # type: ignore[method-assign]
+
+    # edit_message_reply_markup
+    saved["edit_message_reply_markup"] = real_bot.edit_message_reply_markup
+    async def edit_message_reply_markup(*args: Any, **kwargs: Any) -> Any:
+        result = await saved["edit_message_reply_markup"](*args, **kwargs)
+        try:
+            mid = kwargs.get("message_id")
+            if mid is None and len(args) >= 2:
+                mid = args[1]
+            emit("edit_markup", message_id=mid,
+                 reply_markup=_markup_to_frame(kwargs.get("reply_markup")))
+        except Exception:  # noqa: BLE001
+            pass
+        return result
+    real_bot.edit_message_reply_markup = edit_message_reply_markup  # type: ignore[method-assign]
+
+    # delete_message
+    saved["delete_message"] = real_bot.delete_message
+    async def delete_message(*args: Any, **kwargs: Any) -> Any:
+        result = await saved["delete_message"](*args, **kwargs)
+        try:
+            mid = kwargs.get("message_id")
+            if mid is None and len(args) >= 2:
+                mid = args[1]
+            emit("delete", message_id=mid)
+        except Exception:  # noqa: BLE001
+            pass
+        return result
+    real_bot.delete_message = delete_message  # type: ignore[method-assign]
+
+    # send_chat_action
+    saved["send_chat_action"] = real_bot.send_chat_action
+    async def send_chat_action(*args: Any, **kwargs: Any) -> Any:
+        result = await saved["send_chat_action"](*args, **kwargs)
+        try:
+            emit("chat_action", action=str(kwargs.get("action") or "typing"))
+        except Exception:  # noqa: BLE001
+            pass
+        return result
+    real_bot.send_chat_action = send_chat_action  # type: ignore[method-assign]
+
+    # send_document
+    saved["send_document"] = real_bot.send_document
+    async def send_document(*args: Any, **kwargs: Any) -> Any:
+        result = await saved["send_document"](*args, **kwargs)
+        try:
+            doc = kwargs.get("document")
+            name = (kwargs.get("filename")
+                    or getattr(doc, "filename", None)
+                    or getattr(doc, "name", None)
+                    or "file")
+            emit("document", message_id=getattr(result, "message_id", 0),
+                 filename=str(name),
+                 caption=str(kwargs.get("caption")) if kwargs.get("caption") else None)
+        except Exception:  # noqa: BLE001
+            pass
+        return result
+    real_bot.send_document = send_document  # type: ignore[method-assign]
+
+    # send_photo
+    saved["send_photo"] = real_bot.send_photo
+    async def send_photo(*args: Any, **kwargs: Any) -> Any:
+        result = await saved["send_photo"](*args, **kwargs)
+        try:
+            emit("photo", message_id=getattr(result, "message_id", 0),
+                 caption=str(kwargs.get("caption")) if kwargs.get("caption") else None)
+        except Exception:  # noqa: BLE001
+            pass
+        return result
+    real_bot.send_photo = send_photo  # type: ignore[method-assign]
+
+    def restore() -> None:
+        for name, fn in saved.items():
+            try:
+                setattr(real_bot, name, fn)
+            except Exception:  # noqa: BLE001
+                pass
+
+    return restore
 
 
 __all__ = [
@@ -231,5 +652,12 @@ __all__ = [
     "WebBot",
     "WebUpdate",
     "WebContext",
+    "WebCallbackQuery",
+    "MirrorBot",
+    "MirrorMessage",
+    "install_tg_to_web_mirror",
     "build_web_conversation_objects",
+    "build_web_mirror_objects",
+    "build_web_callback_objects",
+    "build_web_command_objects",
 ]

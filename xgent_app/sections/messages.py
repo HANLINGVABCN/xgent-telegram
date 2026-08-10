@@ -1527,25 +1527,39 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
                                agent_origin: Optional[AgentTurnOrigin] = None):
     """处理对话（全局模式 + Agent 协议执行：命令 / 读文件 / 发文件 / 写文件 / 媒体）"""
     global _is_processing, _stop_generation_event
-    async with _conversation_processing_lock:
-        if lock_acquired_event is not None:
-            lock_acquired_event.set()
-        _is_processing = True
-        _stop_generation_event = asyncio.Event()
 
-        try:
-            await _process_conversation_inner(
-                update,
-                context,
-                text,
-                content_override,
-                force_agent_mode,
-                reset_agent_iterations,
-                agent_origin,
-            )
-        finally:
-            _stop_generation_event = None
-            _is_processing = False
+    # TG -> Web 镜像：Web 运行中且本轮来自 Telegram（非网页 bot）时，临时把真实
+    # bot 的发送方法包成双通道，让网页同步看到这轮对话的 AI 输出；同时把用户消息
+    # 推一帧给网页。Web 发起的对话走 MirrorBot（Web->TG），这里会因标记位跳过。
+    restore_mirror = lambda: None
+    if is_web_chat_running() and not getattr(context.bot, "_is_xgent_web_bot", False):
+        _web_outbox = get_web_outbox()
+        if _web_outbox is not None:
+            restore_mirror = install_tg_to_web_mirror(get_web_real_bot(), _web_outbox)
+            _web_outbox.put({"type": "user_message", "text": str(text or ""), "ts": time.time()})
+
+    try:
+        async with _conversation_processing_lock:
+            if lock_acquired_event is not None:
+                lock_acquired_event.set()
+            _is_processing = True
+            _stop_generation_event = asyncio.Event()
+
+            try:
+                await _process_conversation_inner(
+                    update,
+                    context,
+                    text,
+                    content_override,
+                    force_agent_mode,
+                    reset_agent_iterations,
+                    agent_origin,
+                )
+            finally:
+                _stop_generation_event = None
+                _is_processing = False
+    finally:
+        restore_mirror()
 
 
 async def _process_conversation_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
