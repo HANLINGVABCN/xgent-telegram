@@ -194,12 +194,15 @@ class SameOriginTests(unittest.TestCase):
 class WebBridgeTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.outbox = WebOutbox()
+        # 广播总线只投给「已经订阅」的消费者，所以订阅要在 put 之前建立。
+        self.stream = self.outbox.subscribe()
+        self.addCleanup(self.stream.close)
         self.bot = WebBot(self.outbox, chat_id=7)
 
     def drain(self):
         frames = []
         while True:
-            frame = self.outbox.get(timeout=0.01)
+            frame = self.stream.get(timeout=0.01)
             if frame is None:
                 break
             frames.append(frame)
@@ -264,16 +267,21 @@ class WebBridgeTests(unittest.IsolatedAsyncioTestCase):
 
 class WebOutboxTests(unittest.TestCase):
     def test_get_timeout_returns_none(self):
-        self.assertIsNone(WebOutbox().get(timeout=0.01))
+        outbox = WebOutbox()
+        stream = outbox.subscribe()
+        self.addCleanup(stream.close)
+        self.assertIsNone(stream.get(timeout=0.01))
 
     def test_full_queue_drops_oldest_and_never_blocks(self):
         """队列满时绝不能阻塞——对话核心持有全局锁，卡住等于整个 bot 挂掉。"""
         outbox = WebOutbox(maxsize=2)
+        stream = outbox.subscribe()
+        self.addCleanup(stream.close)
         for index in range(5):
             outbox.put({"type": "message", "n": index})
         frames = []
         while True:
-            frame = outbox.get(timeout=0.01)
+            frame = stream.get(timeout=0.01)
             if frame is None:
                 break
             frames.append(frame)
@@ -282,9 +290,56 @@ class WebOutboxTests(unittest.TestCase):
 
     def test_close_wakes_consumer(self):
         outbox = WebOutbox()
+        stream = outbox.subscribe()
         outbox.close()
-        self.assertIsNone(outbox.get(timeout=1.0))
+        self.assertIsNone(stream.get(timeout=1.0))
         self.assertTrue(outbox.closed)
+
+    def test_every_subscriber_gets_every_frame(self):
+        """两个 SSE 连接必须各收到全量帧。
+
+        回归：早期实现是所有连接共用一个 queue.Queue，get() 取走而非广播，
+        于是每帧只落到其中一个连接——多标签页互抢消息，断线重连时旧连接的
+        线程还会把帧吞进死 socket，表现为网页消息缺失、错乱、要刷新才恢复。
+        """
+        outbox = WebOutbox()
+        a = outbox.subscribe()
+        b = outbox.subscribe()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        for index in range(6):
+            outbox.put({"type": "message", "n": index})
+
+        def drain(stream):
+            out = []
+            while True:
+                frame = stream.get(timeout=0.01)
+                if frame is None:
+                    return out
+                out.append(frame["n"])
+
+        expected = list(range(6))
+        self.assertEqual(expected, drain(a))
+        self.assertEqual(expected, drain(b))
+
+    def test_unsubscribed_consumer_stops_stealing_frames(self):
+        """退订后不再占广播位——否则死连接会一直分走帧。"""
+        outbox = WebOutbox()
+        gone = outbox.subscribe()
+        alive = outbox.subscribe()
+        self.addCleanup(alive.close)
+        gone.close()
+        self.assertEqual(1, outbox.subscriber_count)
+        outbox.put({"type": "message", "n": 1})
+        self.assertEqual(1, alive.get(timeout=0.5)["n"])
+
+    def test_put_without_subscribers_is_dropped(self):
+        """没人在线就不该攒帧：攒下的旧帧会盖在新拉的 history 上造成错乱。"""
+        outbox = WebOutbox()
+        outbox.put({"type": "message", "n": 1})
+        late = outbox.subscribe()
+        self.addCleanup(late.close)
+        self.assertIsNone(late.get(timeout=0.05))
 
 
 class WebServerHttpTests(unittest.TestCase):

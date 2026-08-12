@@ -13,6 +13,7 @@ shell_triggers.py 里的 _SelfTriggerUpdate / _SelfTriggerContext 已经用同�
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import queue
 import threading
@@ -48,31 +49,101 @@ def _allocate_web_message_id() -> int:
 _ACTIVE_MIRRORS: Dict[int, List[Any]] = {}
 
 
+def _offer(q: "queue.Queue[Optional[Dict[str, Any]]]", item: Optional[Dict[str, Any]]) -> None:
+    """向单条队列投递；满了就丢它自己最旧的一帧腾位置。绝不阻塞。"""
+    try:
+        q.put_nowait(item)
+    except queue.Full:
+        # 这个消费端跟不上（浏览器关了但连接还没断干净）。丢最旧的一帧，
+        # 宁可让那个页面少显示一段，也不能把持有全局对话锁的协程卡住。
+        try:
+            q.get_nowait()
+            q.put_nowait(item)
+        except (queue.Empty, queue.Full):
+            pass
+
+
 class WebOutbox:
-    """asyncio 侧生产、HTTP 处理线程侧消费的帧队列。
+    """帧广播总线：asyncio 侧生产，N 个 SSE 线程各自消费一份**完整**的帧流。
 
     对话核心跑在 PTB 的事件循环里，SSE 响应写在 http.server 的工作线程里，
     两边跨线程，所以用线程安全的 queue.Queue 而不是 asyncio.Queue。
+
+    早期实现是**单个** queue.Queue、所有 SSE 连接共用，这是个严重的错误：
+    queue.get() 是「取走」而不是「广播」，于是每一帧只会落到其中一个连接上。
+    后果是——
+      - 开两个标签页（或 Telegram 内嵌 WebApp + 桌面浏览器）会互相抢消息，
+        谁都收不全；
+      - 前端断线重连后，旧连接的服务端线程还阻塞在 get(timeout=25) 里，最长
+        25 秒内它会继续抢帧、再写进已经死掉的 socket，这些帧就此**永久丢失**。
+    表现就是网页消息缺失、错乱、不即时，必须手动刷新（重新拉 history）才恢复。
+
+    现在每个订阅者持有一条独立队列，put() 向所有订阅者各投一份，订阅者退出时
+    自行摘除。没有订阅者时 put() 直接丢弃：没人在线就不该攒帧，前端连上后会
+    重新拉一次 history 作为真相源，攒下来的旧帧反而会盖在新历史上造成错乱。
+
+    只提供 subscribe() 而不提供 outbox 级的 get()：广播总线上「先 put 再 get」
+    本来就收不到，留一个看起来能用的 get() 只会把这类 bug 引回来。
     """
 
     def __init__(self, maxsize: int = 1000):
-        self._queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=maxsize)
+        self._maxsize = max(1, int(maxsize))
+        self._lock = threading.Lock()
+        self._queues: List["queue.Queue[Optional[Dict[str, Any]]]"] = []
         self._closed = threading.Event()
 
+    def subscribe(self) -> "WebSubscription":
+        """注册一个订阅者，返回它的私有帧视图。
+
+        用 with 语句，或手动 close()，否则队列会留在广播列表里被一直投递。
+        """
+        q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=self._maxsize)
+        with self._lock:
+            self._queues.append(q)
+        if self._closed.is_set():
+            # 在 close() 之后才订阅：立刻塞 None 唤醒，别让消费者干等一个 timeout。
+            _offer(q, None)
+        return WebSubscription(self, q)
+
+    def _drop(self, q: "queue.Queue[Optional[Dict[str, Any]]]") -> None:
+        with self._lock:
+            with contextlib.suppress(ValueError):
+                self._queues.remove(q)
+
     def put(self, frame: Dict[str, Any]) -> None:
-        """非阻塞投递。队列满时丢弃最旧的一帧，绝不阻塞对话核心。"""
+        """非阻塞广播给当前所有订阅者。"""
         if self._closed.is_set():
             return
-        try:
-            self._queue.put_nowait(frame)
-        except queue.Full:
-            # 消费端跟不上（浏览器关了但连接没断干净）。丢最旧的一帧腾位置，
-            # 宁可让页面少显示一段，也不能把持有全局对话锁的协程卡住。
-            try:
-                self._queue.get_nowait()
-                self._queue.put_nowait(frame)
-            except (queue.Empty, queue.Full):
-                pass
+        with self._lock:
+            targets = list(self._queues)
+        for q in targets:
+            _offer(q, frame)
+
+    def close(self) -> None:
+        self._closed.set()
+        # 给每个订阅者塞一个 None，唤醒可能正在阻塞的消费者
+        with self._lock:
+            targets = list(self._queues)
+        for q in targets:
+            _offer(q, None)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed.is_set()
+
+    @property
+    def subscriber_count(self) -> int:
+        """当前在线的 SSE 连接数，供测试与排查用。"""
+        with self._lock:
+            return len(self._queues)
+
+
+class WebSubscription:
+    """单个 SSE 连接的私有帧视图。每个订阅者都能看到全量帧流。"""
+
+    def __init__(self, outbox: "WebOutbox", q: "queue.Queue[Optional[Dict[str, Any]]]"):
+        self._outbox = outbox
+        self._queue = q
 
     def get(self, timeout: float = 25.0) -> Optional[Dict[str, Any]]:
         """取一帧；超时返回 None，供调用方发 SSE 心跳保活。"""
@@ -82,16 +153,14 @@ class WebOutbox:
             return None
 
     def close(self) -> None:
-        self._closed.set()
-        # 塞一个 None 唤醒可能正在阻塞的消费者
-        try:
-            self._queue.put_nowait(None)
-        except queue.Full:
-            pass
+        self._outbox._drop(self._queue)
 
-    @property
-    def closed(self) -> bool:
-        return self._closed.is_set()
+    def __enter__(self) -> "WebSubscription":
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        self.close()
+        return False
 
 
 class WebMessage:
@@ -697,6 +766,7 @@ def _make_mirror_release(key: int) -> Any:
 
 __all__ = [
     "WebOutbox",
+    "WebSubscription",
     "WebMessage",
     "WebBot",
     "WebUpdate",

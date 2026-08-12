@@ -2,91 +2,271 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1">
 <title>XGent Terminal</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
 <style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
+  :root {
+    color-scheme: dark;
+    --bg:        #08090C;
+    --surface:   #101218;
+    --surface-2: #171A21;
+    --surface-3: #20242D;
+    --line:      rgba(255, 255, 255, .075);
+    --line-2:    rgba(255, 255, 255, .15);
+    --text:      #ECEEF3;
+    --text-2:    #9BA3B2;
+    --text-3:    #6A7383;
+    --accent:      #8189FF;
+    --accent-soft: rgba(129, 137, 255, .13);
+    --accent-ring: rgba(129, 137, 255, .26);
+    --grad:        linear-gradient(135deg, #5D67F5 0%, #9B62F0 100%);
+    --danger:    #FF6B7E;
+    --ok:        #3ECF8E;
+    --warn:      #F0B429;
+    --r-xs: 7px;  --r-sm: 10px; --r-md: 13px; --r-lg: 17px; --r-xl: 22px; --r-full: 999px;
+    --header-h: 52px;
+    --ease: cubic-bezier(.2, .8, .2, 1);
+    --t: .16s var(--ease);
+    --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text",
+            "Segoe UI", Inter, "PingFang SC", "HarmonyOS Sans SC", "MiSans",
+            "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo,
+            Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body {
-    margin: 0; height: 100%;
-    background: #17212b; color: #e9edf0;
-    font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    margin: 0; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--text);
+    font-family: var(--font); font-size: 15px; letter-spacing: -.006em;
+    -webkit-font-smoothing: antialiased;
   }
+  ::selection { background: var(--accent-ring); }
+
+  /* 描边属性写在 <svg> 上：stroke / fill 可继承，能穿进 <use> 的影子树，
+     而 `.icon path {…}` 这类后代选择器选不到影子树里的节点。 */
+  .icon {
+    width: 19px; height: 19px; display: block; flex-shrink: 0;
+    fill: none; stroke: currentColor; stroke-width: 1.7;
+    stroke-linecap: round; stroke-linejoin: round;
+  }
+
+  /* ---- 顶栏 ---- */
   #bar {
-    height: 44px; display: flex; align-items: center; padding: 0 12px;
-    background: #1c2733; border-bottom: 1px solid #0e1621;
-    position: relative; z-index: 2;
+    position: absolute; top: 0; left: 0; right: 0; z-index: 4;
+    height: calc(var(--header-h) + env(safe-area-inset-top));
+    padding: env(safe-area-inset-top) 8px 0 6px;
+    display: flex; align-items: center; gap: 3px;
+    background: var(--surface); border-bottom: 1px solid var(--line);
   }
-  #bar .title { font-weight: 600; font-size: 15px; flex: 1; }
-  #bar button {
-    background: transparent; color: #e9edf0; border: 1px solid #2b3a47;
-    border-radius: 8px; padding: 6px 12px; cursor: pointer; font-size: 13px;
+  #bar .brand {
+    display: flex; align-items: center; gap: 9px; flex: 1; min-width: 0; margin-left: 2px;
   }
-  #bar button:hover { background: #243341; }
-  #bar button.back-btn { border: none; padding: 6px 8px; font-size: 18px; line-height: 1; }
-  #term-wrap { position: absolute; top: 44px; left: 0; right: 0; bottom: 0; padding: 6px; }
+  #bar .dot-mark {
+    width: 27px; height: 27px; border-radius: 9px; flex-shrink: 0;
+    background: var(--grad); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .16);
+  }
+  #bar .dot-mark .icon { width: 15px; height: 15px; }
+  #bar .title {
+    font-size: 14.5px; font-weight: 620; letter-spacing: -.012em;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .icon-btn {
+    width: 34px; height: 34px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    border: none; background: transparent; color: var(--text-2);
+    border-radius: var(--r-sm); cursor: pointer;
+    transition: background var(--t), color var(--t), transform .1s var(--ease);
+  }
+  .icon-btn:hover { background: var(--surface-2); color: var(--text); }
+  .icon-btn:active { transform: scale(.92); }
+  .icon-btn.danger:hover { background: rgba(255, 107, 126, .12); color: var(--danger); }
+  .icon-btn.done { color: var(--ok); }
+
+  /* ---- 终端 ---- */
+  #term-wrap {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    top: calc(var(--header-h) + env(safe-area-inset-top));
+    padding: 10px 6px 6px 10px;
+    background: var(--bg);
+  }
   #term { width: 100%; height: 100%; }
-  .overlay {
-    position: absolute; inset: 0; background: rgba(14, 22, 33, 0.96);
-    display: flex; align-items: center; justify-content: center; z-index: 10;
+  .xterm .xterm-viewport { background: transparent !important; }
+  .xterm-viewport::-webkit-scrollbar { width: 10px; }
+  .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
+  .xterm-viewport::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, .14); border-radius: var(--r-full);
+    border: 3px solid transparent; background-clip: content-box;
   }
-  .card {
-    background: #1c2733; border: 1px solid #2b3a47; border-radius: 12px;
-    padding: 24px; width: min(360px, 90vw);
-  }
-  .card h2 { margin: 0 0 12px; font-size: 16px; }
-  .card input {
-    width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #2b3a47;
-    background: #17212b; color: #e9edf0; font-size: 14px; margin-bottom: 12px;
-  }
-  .card button {
-    width: 100%; padding: 10px; border: none; border-radius: 8px;
-    background: #5288c1; color: #fff; font-size: 14px; cursor: pointer;
-  }
-  .muted { color: #7d8e9e; font-size: 12px; margin-top: 8px; line-height: 1.5; }
-  #err { color: #e57676; font-size: 13px; margin-top: 8px; min-height: 18px; }
+  .xterm-viewport::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, .26); background-clip: content-box; }
+
+  /* ---- 状态条 ---- */
   #status {
-    position: absolute; bottom: 6px; right: 10px; font-size: 11px;
-    color: #7d8e9e; z-index: 3; pointer-events: none;
+    position: absolute; bottom: 9px; right: 12px; z-index: 3;
+    display: flex; align-items: center; gap: 7px;
+    padding: 4px 10px; border-radius: var(--r-full);
+    background: rgba(16, 18, 24, .82); border: 1px solid var(--line);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    font-size: 11px; font-weight: 500; color: var(--text-3);
+    font-variant-numeric: tabular-nums; letter-spacing: 0;
+    pointer-events: none; transition: color var(--t);
   }
+  #status.flash { color: var(--ok); }
+  #status .sep { color: var(--line-2); }
   .conn-dot {
-    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
-    margin-right: 4px; vertical-align: middle; background: #4caf50;
+    width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
+    background: var(--ok); box-shadow: 0 0 0 3px rgba(62, 207, 142, .18);
   }
-  .conn-dot.disconnected { background: #e57676; }
-  .conn-dot.connecting { background: #ff9800; animation: pulse 1s infinite; }
-  @keyframes pulse { 50% { opacity: .4; } }
+  .conn-dot.disconnected { background: var(--danger); box-shadow: 0 0 0 3px rgba(255, 107, 126, .18); }
+  .conn-dot.connecting { background: var(--warn); box-shadow: 0 0 0 3px rgba(240, 180, 41, .2); animation: pulse 1.4s var(--ease) infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+
+  /* ---- 浮层 ---- */
+  .overlay {
+    position: absolute; inset: 0; z-index: 10;
+    display: flex; align-items: center; justify-content: center; padding: 20px;
+    background: rgba(4, 5, 8, .72);
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    animation: fade .2s var(--ease);
+  }
+  @keyframes fade { from { opacity: 0; } }
+  .card {
+    width: min(372px, 100%); padding: 30px 26px 26px;
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--r-xl);
+    box-shadow: 0 28px 70px rgba(0, 0, 0, .5);
+    animation: rise .26s var(--ease);
+  }
+  @keyframes rise { from { opacity: 0; transform: translateY(12px) scale(.97); } }
+  .card .mark {
+    width: 52px; height: 52px; border-radius: 16px; margin: 0 auto 18px;
+    background: var(--grad); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 8px 26px var(--accent-ring), inset 0 0 0 1px rgba(255, 255, 255, .18);
+  }
+  .card .mark .icon { width: 25px; height: 25px; }
+  .card h2 { margin: 0 0 6px; font-size: 18px; font-weight: 640; letter-spacing: -.022em; text-align: center; }
+  .card .sub { margin: 0 0 20px; font-size: 13.5px; line-height: 1.55; color: var(--text-3); text-align: center; }
+  .card input, .card textarea {
+    width: 100%; padding: 12px 14px; margin-bottom: 12px;
+    background: var(--surface-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: var(--r-sm);
+    font-family: var(--font); font-size: 15px; resize: none;
+    transition: border-color var(--t), box-shadow var(--t), background var(--t);
+  }
+  .card textarea { font-family: var(--mono); font-size: 13px; min-height: 108px; letter-spacing: 0; }
+  .card input::placeholder, .card textarea::placeholder { color: var(--text-3); }
+  .card input:focus, .card textarea:focus {
+    outline: none; background: var(--bg);
+    border-color: var(--accent-ring); box-shadow: 0 0 0 3.5px var(--accent-ring);
+  }
+  .btn-primary {
+    width: 100%; padding: 12px 14px; border: none; border-radius: var(--r-sm);
+    background: var(--grad); color: #fff;
+    font-family: var(--font); font-size: 15px; font-weight: 560; cursor: pointer;
+    box-shadow: 0 4px 16px var(--accent-ring);
+    transition: opacity var(--t), transform .1s var(--ease);
+  }
+  .btn-primary:hover { opacity: .93; }
+  .btn-primary:active { transform: scale(.985); }
+  .btn-ghost {
+    width: 100%; margin-top: 9px; padding: 11px 14px;
+    background: transparent; color: var(--text-2);
+    border: 1px solid var(--line); border-radius: var(--r-sm);
+    font-family: var(--font); font-size: 14px; font-weight: 500; cursor: pointer;
+    transition: background var(--t), color var(--t);
+  }
+  .btn-ghost:hover { background: var(--surface-2); color: var(--text); }
+  .muted { color: var(--text-3); font-size: 12.5px; line-height: 1.6; margin-top: 14px; text-align: center; }
+  .muted kbd {
+    display: inline-block; padding: 1px 5px; margin: 0 1px;
+    background: var(--surface-2); border: 1px solid var(--line); border-bottom-width: 2px;
+    border-radius: 5px; font: 500 11px var(--mono); color: var(--text-2); letter-spacing: 0;
+  }
+  #err { color: var(--danger); font-size: 13px; min-height: 19px; margin-bottom: 6px; line-height: 1.45; }
+
+  /* ---- toast ---- */
+  #toast {
+    position: absolute; left: 50%; bottom: 46px; z-index: 20;
+    transform: translate(-50%, 10px); max-width: 88vw;
+    background: rgba(236, 238, 243, .95); color: #0B0D12;
+    padding: 9px 16px; border-radius: var(--r-full);
+    font-size: 13px; font-weight: 500;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, .4);
+    opacity: 0; pointer-events: none;
+    transition: opacity .2s var(--ease), transform .2s var(--ease);
+  }
+  #toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+  @media (max-width: 420px) {
+    #bar .title { display: none; }
+  }
 </style>
 </head>
 <body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <g id="i-back"><path d="M19.2 12H4.8M10.8 18 4.8 12l6-6"/></g>
+    <g id="i-terminal"><rect x="2.7" y="4.2" width="18.6" height="15.6" rx="4"/><path d="m7.2 10 2.6 2.6-2.6 2.6M13.2 15.2h3.8"/></g>
+    <g id="i-copy"><rect x="9.2" y="9.2" width="11.3" height="11.3" rx="2.8"/><path d="M5.6 14.8H5a2.5 2.5 0 0 1-2.5-2.5V5a2.5 2.5 0 0 1 2.5-2.5h7.3A2.5 2.5 0 0 1 14.8 5v.6"/></g>
+    <g id="i-paste"><rect x="4.8" y="4.2" width="14.4" height="16.6" rx="3.4"/><path d="M9.2 4.2a2 2 0 0 1 2-2h1.6a2 2 0 0 1 2 2v1.2H9.2V4.2Z"/><path d="M9 12h6M9 15.6h4"/></g>
+    <g id="i-check"><path d="m5 12.6 4.6 4.6L19 6.6"/></g>
+    <g id="i-power"><path d="M12 3.4v8.2"/><path d="M17.6 6.6a7.4 7.4 0 1 1-11.2 0"/></g>
+    <g id="i-lock"><rect x="4.4" y="10.2" width="15.2" height="10.4" rx="3.2"/><path d="M8 10.2V7.6a4 4 0 0 1 8 0v2.6"/></g>
+    <g id="i-plug"><path d="M12 3.6v6.8M8.4 10.4h7.2v3.2a3.6 3.6 0 0 1-3.6 3.6 3.6 3.6 0 0 1-3.6-3.6v-3.2ZM12 17.2v3.2"/></g>
+  </defs>
+</svg>
+
 <div id="bar">
-  <button class="back-btn" id="backBtn" title="返回聊天">←</button>
-  <span class="title">🖥 终端</span>
-  <button id="closeBtn">关闭会话</button>
+  <button class="icon-btn" id="backBtn" title="返回聊天" aria-label="返回聊天"><svg class="icon" viewBox="0 0 24 24"><use href="#i-back"/></svg></button>
+  <div class="brand">
+    <div class="dot-mark"><svg class="icon" viewBox="0 0 24 24"><use href="#i-terminal"/></svg></div>
+    <span class="title">终端</span>
+  </div>
+  <button class="icon-btn" id="copyBtn" title="复制（有选区复制选区，否则复制全部输出）" aria-label="复制"><svg class="icon" viewBox="0 0 24 24"><use href="#i-copy"/></svg></button>
+  <button class="icon-btn" id="pasteBtn" title="粘贴" aria-label="粘贴"><svg class="icon" viewBox="0 0 24 24"><use href="#i-paste"/></svg></button>
+  <button class="icon-btn danger" id="closeBtn" title="关闭会话" aria-label="关闭会话"><svg class="icon" viewBox="0 0 24 24"><use href="#i-power"/></svg></button>
 </div>
+
 <div id="term-wrap"><div id="term"></div></div>
 <div id="status"></div>
+<div id="toast"></div>
 
 <div class="overlay" id="loginOverlay">
   <div class="card">
-    <h2>🔐 终端登录</h2>
-    <input id="pw" type="password" placeholder="访问密码">
-    <button id="loginBtn">登录</button>
+    <div class="mark"><svg class="icon" viewBox="0 0 24 24"><use href="#i-lock"/></svg></div>
+    <h2>终端登录</h2>
+    <p class="sub">终端可执行任意命令，仅授权用户可用。</p>
     <div id="err"></div>
-    <div class="muted">终端仅授权用户可用。在 Telegram 内打开时自动免密。</div>
+    <input id="pw" type="password" placeholder="访问密码" autocomplete="current-password">
+    <button class="btn-primary" id="loginBtn">登录</button>
+    <div class="muted">在 Telegram 内打开时自动免密。</div>
   </div>
 </div>
 
 <div class="overlay" id="endedOverlay" style="display:none">
   <div class="card">
+    <div class="mark"><svg class="icon" viewBox="0 0 24 24"><use href="#i-plug"/></svg></div>
     <h2>会话已结束</h2>
-    <button id="renewBtn">新建会话</button>
-    <button id="endedBackBtn" style="margin-top:8px;background:transparent;border:none;color:#5288c1;font:inherit;cursor:pointer;">← 返回聊天</button>
-    <div class="muted" id="endReason"></div>
+    <p class="sub" id="endReason"></p>
+    <button class="btn-primary" id="renewBtn">新建会话</button>
+    <button class="btn-ghost" id="endedBackBtn">返回聊天</button>
+  </div>
+</div>
+
+<div class="overlay" id="pasteOverlay" style="display:none">
+  <div class="card">
+    <h2>粘贴到终端</h2>
+    <p class="sub">当前环境不允许直接读取剪贴板，请在下方粘贴内容。</p>
+    <textarea id="pasteBox" placeholder="在此长按粘贴，或按 Ctrl/⌘ + V"></textarea>
+    <button class="btn-primary" id="pasteSendBtn">发送到终端</button>
+    <button class="btn-ghost" id="pasteCancelBtn">取消</button>
   </div>
 </div>
 
@@ -119,14 +299,131 @@ function bytesToB64(bytes) {
   return btoa(s);
 }
 
+function toast(msg) {
+  var el = $('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(el._t);
+  el._t = setTimeout(function () { el.classList.remove('show'); }, 1700);
+}
+
+// ---- 剪贴板 ----
+// navigator.clipboard 只在安全上下文（https / localhost）存在。本服务常以
+// http://ip:port 直连，此时必须回退到 execCommand('copy')，否则复制全线失效
+// ——这正是「终端不能复制」的根因。
+function copyText(text) {
+  text = String(text == null ? '' : text);
+  return new Promise(function (resolve, reject) {
+    function legacy() {
+      try {
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;padding:0;border:0;opacity:0;';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        ta.setSelectionRange(0, ta.value.length);   // iOS 需要显式 range
+        var ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        ok ? resolve() : reject(new Error('execCommand copy failed'));
+      } catch (e) { reject(e); }
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(resolve, legacy);
+    } else {
+      legacy();
+    }
+  });
+}
+
+// 整屏（含回滚缓冲）文本，用于「无选区时复制全部」。
+function bufferText() {
+  if (!term) return '';
+  var buf = term.buffer.active, lines = [], i, line;
+  for (i = 0; i < buf.length; i++) {
+    line = buf.getLine(i);
+    lines.push(line ? line.translateToString(true) : '');
+  }
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  return lines.join('\n');
+}
+
+function flashStatus(msg) {
+  var el = $('status');
+  el.classList.add('flash');
+  el._msg = msg;
+  updateStatus();
+  clearTimeout(el._t);
+  el._t = setTimeout(function () { el.classList.remove('flash'); el._msg = null; updateStatus(); }, 1600);
+}
+
+function doCopy(text, quiet) {
+  if (!text) { if (!quiet) toast('没有可复制的内容'); return; }
+  copyText(text).then(function () {
+    flashStatus('已复制 ' + text.length + ' 字符');
+    if (!quiet) {
+      var b = $('copyBtn');
+      b.classList.add('done');
+      b.innerHTML = '<svg class="icon" viewBox="0 0 24 24"><use href="#i-check"/></svg>';
+      clearTimeout(b._t);
+      b._t = setTimeout(function () {
+        b.classList.remove('done');
+        b.innerHTML = '<svg class="icon" viewBox="0 0 24 24"><use href="#i-copy"/></svg>';
+      }, 1400);
+    }
+  }).catch(function () {
+    if (!quiet) toast('复制失败，请长按选中后手动复制');
+  });
+}
+
+function sendToTerm(text) {
+  if (!text || !sessionId || !term) return;
+  term.paste(text);          // 走 onData → POST /api/term/input
+  term.focus();
+}
+
+function doPaste() {
+  if (navigator.clipboard && navigator.clipboard.readText && window.isSecureContext) {
+    navigator.clipboard.readText().then(function (t) {
+      if (t) { sendToTerm(t); flashStatus('已粘贴 ' + t.length + ' 字符'); }
+      else toast('剪贴板为空');
+    }).catch(openPasteSheet);
+  } else {
+    openPasteSheet();
+  }
+}
+
+function openPasteSheet() {
+  $('pasteOverlay').style.display = 'flex';
+  var box = $('pasteBox');
+  box.value = '';
+  setTimeout(function () { box.focus(); }, 60);
+}
+function closePasteSheet() { $('pasteOverlay').style.display = 'none'; if (term) term.focus(); }
+
+$('pasteSendBtn').onclick = function () {
+  var v = $('pasteBox').value;
+  closePasteSheet();
+  if (v) { sendToTerm(v); flashStatus('已粘贴 ' + v.length + ' 字符'); }
+};
+$('pasteCancelBtn').onclick = closePasteSheet;
+
+// ---- 状态条 ----
 var connState = '';
 
 function updateStatus() {
-  var parts = [];
-  parts.push('<span class="conn-dot' + (connState ? ' ' + connState : '') + '"></span>');
-  if (currentPid) parts.push('pid ' + currentPid);
-  if (term) parts.push(term.cols + '×' + term.rows);
-  $('status').innerHTML = parts.join(' · ');
+  var el = $('status');
+  var html = '<span class="conn-dot' + (connState ? ' ' + connState : '') + '"></span>';
+  if (el._msg) {
+    html += '<span>' + el._msg + '</span>';
+  } else {
+    var parts = [];
+    if (currentPid) parts.push('pid ' + currentPid);
+    if (term) parts.push(term.cols + '×' + term.rows);
+    if (parts.length) html += '<span>' + parts.join('</span><span class="sep">·</span><span>') + '</span>';
+  }
+  el.innerHTML = html;
 }
 
 function setConnState(state) {
@@ -134,6 +431,7 @@ function setConnState(state) {
   updateStatus();
 }
 
+// ---- 登录 ----
 function login() {
   return api('/api/session').then(function (d) {
     if (d.authenticated) return true;
@@ -165,6 +463,7 @@ $('loginBtn').onclick = function () {
 };
 $('pw').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('loginBtn').click(); });
 
+// ---- 输出流 ----
 function openStream() {
   if (es) es.close();
   setConnState('connecting');
@@ -184,22 +483,56 @@ function openStream() {
   };
 }
 
+// ---- 终端 ----
+var THEME = {
+  background: '#08090C', foreground: '#DDE1E9',
+  cursor: '#8189FF', cursorAccent: '#08090C',
+  selectionBackground: 'rgba(129,137,255,.34)',
+  black: '#1C1F27',   red: '#FF6B7E',     green: '#3ECF8E',  yellow: '#F0B429',
+  blue: '#8189FF',    magenta: '#C08BFF', cyan: '#4CD6DE',   white: '#C6CBD6',
+  brightBlack: '#5A6273', brightRed: '#FF8D9C', brightGreen: '#67E0AA', brightYellow: '#FFC94D',
+  brightBlue: '#A0A6FF',  brightMagenta: '#D3A8FF', brightCyan: '#77E4EA', brightWhite: '#F2F4F8'
+};
+
 function initTerm() {
   if (term) { term.dispose(); term = null; }
   currentPid = null;
   term = new Terminal({
-    fontFamily: 'Menlo, Consolas, "Courier New", monospace',
-    fontSize: 14, cursorBlink: true, scrollback: 5000,
-    theme: {
-      background: '#17212b', foreground: '#e9edf0', cursor: '#e9edf0',
-      selectionBackground: 'rgba(82,136,193,0.4)'
-    }
+    fontFamily: '"SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, "Liberation Mono", monospace',
+    fontSize: window.innerWidth < 520 ? 12 : 13.5,
+    lineHeight: 1.25,
+    letterSpacing: 0,
+    cursorBlink: true,
+    cursorStyle: 'bar',
+    scrollback: 8000,
+    rightClickSelectsWord: true,
+    macOptionIsMeta: true,
+    theme: THEME
   });
   fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open($('term'));
   try { fit.fit(); } catch (e) {}
   updateStatus();
+
+  // 复制/粘贴键位：
+  // - Ctrl/⌘+C 有选区时复制（无选区仍然发 SIGINT，保留中断能力）
+  // - Ctrl/⌘+Shift+C 始终复制选区
+  // - Ctrl/⌘+Shift+A 全选
+  // Ctrl/⌘+V 不拦截：浏览器原生 paste 事件会落到 xterm 自己的 textarea 上，
+  // 那条路径不需要安全上下文，比 clipboard.readText() 可靠。
+  term.attachCustomKeyEventHandler(function (e) {
+    if (e.type !== 'keydown') return true;
+    var mod = e.ctrlKey || e.metaKey;
+    if (!mod) return true;
+    if (e.code === 'KeyC' && (e.shiftKey || term.hasSelection())) {
+      var sel = term.getSelection();
+      if (sel) { doCopy(sel); e.preventDefault(); return false; }
+      if (e.shiftKey) { e.preventDefault(); return false; }
+    }
+    if (e.code === 'KeyA' && e.shiftKey) { term.selectAll(); e.preventDefault(); return false; }
+    return true;
+  });
 
   var cols = term.cols, rows = term.rows;
   api('/api/term/open', { method: 'POST', body: JSON.stringify({ cols: cols, rows: rows }) })
@@ -208,6 +541,7 @@ function initTerm() {
       currentPid = d.pid;
       updateStatus();
       openStream();
+      term.focus();
     })
     .catch(function (e) {
       var msg = e.message || '无法创建终端';
@@ -229,8 +563,17 @@ function initTerm() {
       .catch(function () {});
     updateStatus();
   });
-  window.addEventListener('resize', function () { if (fit) { try { fit.fit(); } catch (e) {} } });
 }
+
+// 下面两个监听只在页面加载时挂一次：initTerm() 会因「新建会话」重复调用，
+// 挂在里面会越积越多（划一次选区触发 N 次复制）。
+// 鼠标划选即复制——终端里最常用的复制方式。
+$('term').addEventListener('mouseup', function () {
+  if (!term || !term.hasSelection()) return;
+  var sel = term.getSelection();
+  if (sel && sel.trim()) doCopy(sel, true);
+});
+window.addEventListener('resize', function () { if (fit) { try { fit.fit(); } catch (e) {} } });
 
 function showEnded(reason) {
   if (es) { es.close(); es = null; }
@@ -255,6 +598,12 @@ function goBackToChat() {
     location.href = '/';
   }
 }
+
+$('copyBtn').onclick = function () {
+  var sel = term && term.hasSelection() ? term.getSelection() : '';
+  doCopy(sel && sel.trim() ? sel : bufferText());
+};
+$('pasteBtn').onclick = doPaste;
 $('closeBtn').onclick = function () {
   if (sessionId) {
     api('/api/term/close', { method: 'POST', body: JSON.stringify({ session_id: sessionId }) }).catch(function () {});

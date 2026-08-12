@@ -487,16 +487,19 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         outbox = self.server.outbox  # type: ignore[attr-defined]
         stop_event = self.server.shutdown_event  # type: ignore[attr-defined]
         try:
-            while not stop_event.is_set():
-                frame = outbox.get(timeout=SSE_HEARTBEAT_SECONDS)
-                if frame is None:
-                    # 超时或队列关闭：发注释行保活，顺便探测连接是否还在。
-                    self.wfile.write(b": ping\n\n")
+            # 每条连接一个独立订阅：帧是广播给所有连接的，不是被谁抢走一份。
+            # 退出 with 时自动摘除，死连接不会继续占着广播位。
+            with outbox.subscribe() as stream:
+                while not stop_event.is_set():
+                    frame = stream.get(timeout=SSE_HEARTBEAT_SECONDS)
+                    if frame is None:
+                        # 超时或队列关闭：发注释行保活，顺便探测连接是否还在。
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                        continue
+                    payload = json.dumps(frame, ensure_ascii=False)
+                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                     self.wfile.flush()
-                    continue
-                payload = json.dumps(frame, ensure_ascii=False)
-                self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-                self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, ValueError):
             # 浏览器关页面就是这条路径，属正常。
             pass
