@@ -103,6 +103,14 @@ class TelegramRichAPI:
 async def rich_finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
                                        msg: Any, response: str, limit: int = RICH_MESSAGE_CHAR_LIMIT):
     """使用 Rich Message 发送最终回复。失败时 fallback 到旧 HTML 编辑模式。"""
+    # sendRichMessage 直连 Telegram Bot API，绕过 context.bot。网页会话用的是
+    # WebBot / MirrorBot（_is_xgent_web_bot），直连既不会往网页 outbox 推帧，又
+    # 会对纯网页会话误发到 Telegram。网页端改走 finalize_text_response：经
+    # context.bot 发 edit/message 帧，网页看得到回复，MirrorBot 也能正常镜像到
+    # TG（表格等仍以 <pre> 等宽块呈现，仅失去原生 RichBlock 排版）。
+    if getattr(context.bot, "_is_xgent_web_bot", False):
+        await finalize_text_response(context, chat_id, msg, response, min(limit, 4000))
+        return
     try:
         await TelegramRichAPI.send_rich_message(
             chat_id=chat_id,
@@ -726,6 +734,13 @@ class TelegramStreamRenderer:
         # draft_id 由 bot 自行生成（API 要求非零整数），相同 draft_id 的调用会动画过渡更新
         self._draft_id: int = int(time.time() * 1000) % 0x7FFFFFFF + 1
         self._rich_draft_enabled = True  # 尝试使用 Rich Draft，失败则降级
+        # sendRichMessage(Draft) 直连 Telegram Bot API，绕过 context.bot；网页会话
+        # 走 WebBot/MirrorBot，直连既不往网页 outbox 推帧，又会把 draft 发到 TG。
+        # 网页端禁用 Rich Draft，流式刷新与收尾都走 HTML edit（经 context.bot，
+        # 网页收 edit 帧，MirrorBot 也正常镜像到 TG）。
+        self._is_web_bot = bool(getattr(context.bot, "_is_xgent_web_bot", False))
+        if self._is_web_bot:
+            self._rich_draft_enabled = False
 
     def start(self):
         self._task = asyncio.create_task(self._render_loop())
@@ -762,17 +777,18 @@ class TelegramStreamRenderer:
         partial = ''.join(self.response_parts).strip()
         visible_text = self.current_text.strip() or partial
         if visible_text:
-            # 用 Rich Message 固化已生成内容
-            try:
-                await TelegramRichAPI.send_rich_message(chat_id=self.chat_id, text=visible_text + "\n\n⏹️ 已停止，保留以上已生成内容。")
+            # 用 Rich Message 固化已生成内容（网页会话绕过：见 __init__ 注释）
+            if not self._is_web_bot:
                 try:
-                    await self.current_msg.delete()
+                    await TelegramRichAPI.send_rich_message(chat_id=self.chat_id, text=visible_text + "\n\n⏹️ 已停止，保留以上已生成内容。")
+                    try:
+                        await self.current_msg.delete()
+                    except Exception:
+                        pass
+                    return partial
                 except Exception:
                     pass
-                return partial
-            except Exception:
-                pass
-            # 降级为 HTML 编辑
+            # 网页会话或 Rich 固化失败：降级为 HTML 编辑（经 context.bot）
             html_visible = markdown_to_telegram_html(visible_text)
             stopped_text = html_visible + "\n\n\u23f9\ufe0f 已停止，保留以上已生成内容。"
         else:
@@ -789,8 +805,8 @@ class TelegramStreamRenderer:
         """流式完成后：用 Rich Message 发送最终内容，删除旧占位消息。"""
         if not self.current_text.strip():
             return
-        if self.live_edit_enabled:
-            # 优先尝试 Rich Message 固化
+        if self.live_edit_enabled and not self._is_web_bot:
+            # 优先尝试 Rich Message 固化（网页会话绕过：见 __init__ 注释）
             try:
                 await TelegramRichAPI.send_rich_message(chat_id=self.chat_id, text=self.current_text)
                 try:
@@ -800,7 +816,8 @@ class TelegramStreamRenderer:
                 return
             except Exception as e:
                 logger.debug(f"Rich Message 固化失败，降级为 HTML: {e}")
-            # 降级为 HTML 编辑
+        # 网页会话或 Rich 固化失败：降级为 HTML 编辑（经 context.bot，网页收 edit 帧）
+        if self.live_edit_enabled:
             try:
                 html_text = markdown_to_telegram_html(self.current_text)
                 await safe_edit_text(self.current_msg, html_text, reply_markup=None,
