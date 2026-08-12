@@ -1,10 +1,8 @@
----
-name: trigger-x
-description: trigger-x 后台任务调度协议，支持延迟/定时/条件触发，YAML 格式，1 小时超时限制
-tags: [protocol, scheduling, yaml, automation]
----
+```!
+trigger-x 后台任务调度协议完整文档。支持延迟执行（after: 30s）、定时任务（at: 2024-12-31 23:59）、周期任务（cron: 0 * * * *）、条件触发（when: READY）和持续监控。使用 YAML 格式，1 小时硬性超时。路径: skill/trigger-x-protocol.md
+```
 
-# trigger-x 协议技术文档
+# trigger-x 后台任务调度协议
 
 trigger-x 是后台任务调度协议，支持延迟执行、定时任务、条件触发和持续监控。使用 YAML 结构化格式，专为 AI 理解和生成优化。
 
