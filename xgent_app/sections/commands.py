@@ -487,6 +487,12 @@ async def send_provider_config_export(update: Update, context: ContextTypes.DEFA
     )
     await GlobalRecorder.record_system_op('导出提供商配置', {'count': len(providers)})
 
+    # 记录导出成功到上下文
+    await GlobalRecorder.record_system_message(
+        f"✅ 已成功导出 {len(providers)} 个提供商配置到 JSON 文件。文件包含完整 API Key。",
+        update.effective_chat.id
+    )
+
 
 async def cmd_provider_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):

@@ -162,6 +162,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=get_command_blacklist_menu()
             )
 
+            # 记录到上下文，让 AI 知道用户添加了黑名单
+            await GlobalRecorder.record_system_message(
+                f"✅ 已成功添加 {added} 条 Agent 命令黑名单（当前共 {len(AgentCommandBlacklist.get_patterns())} 条），已立即生效。",
+                query.message.chat.id
+            )
+
         elif data == "view_recommended_blacklist":
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ 追加推荐名单", callback_data="act_add_recommended_blacklist")],
@@ -184,6 +190,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 + build_command_blacklist_text("Agent 命令黑名单（已更新）"),
                 reply_markup=get_command_blacklist_menu(),
                 parse_mode=constants.ParseMode.HTML
+            )
+
+            # 记录到上下文
+            await GlobalRecorder.record_system_message(
+                f"✅ 已成功追加推荐 Agent 命令黑名单，新增 {added} 条。",
+                query.message.chat.id
             )
 
         elif data == "act_reload_command_blacklist":
@@ -217,6 +229,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 build_command_blacklist_text("Agent 命令黑名单（已清空）"),
                 reply_markup=get_command_blacklist_menu(),
                 parse_mode=constants.ParseMode.HTML
+            )
+
+            # 记录到上下文
+            await GlobalRecorder.record_system_message(
+                "✅ 已成功清空 Agent 命令黑名单。",
+                query.message.chat.id
             )
 
         # --- 凭据配置 ---
@@ -410,6 +428,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=get_memory_menu()
             )
 
+            # 记录到上下文，让 AI 知道用户添加了记忆
+            await GlobalRecorder.record_system_message(
+                f"✅ 已成功添加 1 条用户记忆（{len(buffer)} 字）到 system prompt。",
+                query.message.chat.id
+            )
+
         elif data == "act_list_memory":
             files = list_memory_files()
             if not files:
@@ -461,6 +485,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                     {"filename": filename}
                 )
                 await query.answer(f"已删除: {filename}", show_alert=False)
+
+                # 记录到上下文
+                await GlobalRecorder.record_system_message(
+                    f"✅ 已成功删除 1 条用户记忆（文件：{filename}）。",
+                    query.message.chat.id
+                )
             else:
                 await query.answer("删除失败：文件不存在", show_alert=True)
             # 回到删除菜单或记忆主页
@@ -504,6 +534,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 build_memory_menu_text(f"记忆管理（已清空 {count} 条）"),
                 reply_markup=get_memory_menu(),
                 parse_mode=constants.ParseMode.HTML
+            )
+
+            # 记录到上下文
+            await GlobalRecorder.record_system_message(
+                f"✅ 已成功清空全部 {count} 条用户记忆。",
+                query.message.chat.id
             )
 
 
@@ -1177,9 +1213,11 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             await query.message.edit_text(
                 f"📥 <b>{mode_label}</b>\n\n"
-                "请发送由本 Bot 导出的 <code>提供商配置-*.json</code> 文件，"
-                "也可以直接粘贴完整 JSON。\n\n"
+                "💡 <b>支持两种导入方式</b>：\n"
+                "1️⃣ <b>发送文件</b>：直接发送导出的 .json 文件\n"
+                "2️⃣ <b>粘贴文本</b>：复制 JSON 内容，直接发送为文本消息\n\n"
                 f"{mode_note}"
+                "✅ <b>优势</b>：文本方式不受 Telegram 文件大小限制，适合大型配置。\n\n"
                 "只有有效的默认模型选择才会恢复。\n"
                 "配置内含 API Key，请仅在私聊中操作。\n\n"
                 "发送 <code>cancel</code> 可取消。",

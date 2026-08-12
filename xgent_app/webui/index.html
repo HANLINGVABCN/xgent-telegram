@@ -740,7 +740,10 @@
   document.getElementById("btn-close-menu").addEventListener("click", closeMenu);
   overlay.addEventListener("click", closeMenu);
 
-  document.getElementById("btn-terminal").addEventListener("click", function () { location.href = "/terminal"; });
+  document.getElementById("btn-terminal").addEventListener("click", function () {
+    // 在新标签页打开终端，避免丢失聊天页面状态
+    window.open("/terminal", "_blank");
+  });
 
   document.getElementById("btn-settings").addEventListener("click", function () {
     settings.classList.add("open");

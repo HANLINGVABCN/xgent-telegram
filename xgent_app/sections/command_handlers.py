@@ -156,4 +156,10 @@ async def cmd_export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await status_msg.delete()
 
+    # 记录导出成功到上下文
+    await GlobalRecorder.record_system_message(
+        "✅ 已成功导出全部数据（包括提示词、全局记忆、陌生人拦截记录）到压缩文件。",
+        update.effective_chat.id
+    )
+
 # --- ☆ 空闲提醒系统（仅全局模式下工作）☆ ---

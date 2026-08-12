@@ -115,6 +115,12 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
                 reply_markup=get_providers_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
+
+            # 记录导入成功到上下文，让 AI 知道用户已完成导入
+            await GlobalRecorder.record_system_message(
+                f"✅ 已成功通过文件导入 {result['count']} 个提供商配置（方式：{mode_label}，新增 {result['added']} 个，更新 {result['overwritten']} 个）。",
+                update.effective_chat.id
+            )
         except ValueError as e:
             await status_msg.edit_text(
                 f"❌ 导入失败：{safe_text(str(e))}\n\n请修正文件后重试，或发送 cancel 取消。",
@@ -700,6 +706,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"默认项：{safe_text(restored)}{safe_text(skipped)}",
                 reply_markup=get_providers_menu(),
                 parse_mode=constants.ParseMode.HTML
+            )
+
+            # 记录导入成功到上下文，让 AI 知道用户已完成导入
+            await GlobalRecorder.record_system_message(
+                f"✅ 已成功通过文本导入 {result['count']} 个提供商配置（方式：{mode_label}，新增 {result['added']} 个，更新 {result['overwritten']} 个）。",
+                update.effective_chat.id
             )
         except ValueError as e:
             await status_msg.edit_text(

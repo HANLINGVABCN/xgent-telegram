@@ -80,7 +80,11 @@ async def execute_sendfile_protocol(
         filename = os.path.basename(resolved_path)
 
         if file_size > max_file_size and api_base_url:
-            unique_name = f"{filename}.sendfile_{uuid.uuid4().hex[:8]}"
+            name_parts = filename.rsplit('.', 1)
+            if len(name_parts) == 2:
+                unique_name = f"{name_parts[0]}_sendfile_{uuid.uuid4().hex[:8]}.{name_parts[1]}"
+            else:
+                unique_name = f"{filename}_sendfile_{uuid.uuid4().hex[:8]}"
             temp_host_path = os.path.join(local_api_host_data_dir, unique_name)
             try:
                 await _prepare_local_api_file(
