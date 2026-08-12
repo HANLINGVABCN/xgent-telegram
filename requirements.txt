@@ -10,3 +10,5 @@ httpx[socks]>=0.27.0,<1.0
 # apscheduler is imported directly in core.py (CronTrigger). It used to arrive
 # only as a transitive dependency of python-telegram-bot[job-queue]; declare it.
 apscheduler>=3.10,<4.0
+# pyyaml is imported in sections/shell_triggers.py for YAML parsing.
+pyyaml>=6.0,<7.0
