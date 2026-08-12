@@ -239,8 +239,15 @@ function showEnded(reason) {
   $('endedOverlay').style.display = 'flex';
 }
 
-// 返回聊天：如果是 window.open 打开的新标签页，直接关闭；否则跳转首页
+// 返回聊天：
+// 1. 被 iframe 嵌入时（index.html 的终端模态层），postMessage 通知父窗口关闭模态层
+// 2. window.open 打开的新标签页，直接关闭
+// 3. 兜底跳转首页
 function goBackToChat() {
+  if (window.parent && window.parent !== window) {
+    window.parent.postMessage({ type: 'xgent-close-terminal' }, '*');
+    return;
+  }
   if (window.opener && !window.opener.closed) {
     window.opener.focus();
     window.close();

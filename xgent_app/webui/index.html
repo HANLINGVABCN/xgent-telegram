@@ -238,6 +238,22 @@
   .hint { color: var(--muted); font-size: 12px; margin: 12px 14px; }
   .btn-text { background: transparent; border: none; color: var(--accent); font: inherit; cursor: pointer; padding: 12px 14px; }
 
+  /* ---- 终端模态层（内嵌 iframe，避免跳转外部浏览器） ---- */
+  #terminal-modal { position: fixed; inset: 0; background: var(--bg); z-index: 30; display: none;
+                    flex-direction: column; }
+  #terminal-modal.open { display: flex; }
+  #terminal-modal .term-head {
+    display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+    padding-top: max(8px, env(safe-area-inset-top)); background: var(--panel);
+    border-bottom: 1px solid var(--line); flex-shrink: 0;
+  }
+  #terminal-modal .term-head strong { flex: 1; font-size: 15px; }
+  #terminal-modal .term-head button { width: 36px; height: 36px; border: none; background: transparent;
+    color: var(--muted); font-size: 20px; cursor: pointer; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center; }
+  #terminal-modal .term-head button:hover { background: var(--panel-2); color: var(--accent); }
+  #terminal-iframe { flex: 1; width: 100%; border: none; background: #000; }
+
   /* ---- 登录 / toast ---- */
   dialog {
     border: 1px solid var(--line); border-radius: 14px;
@@ -336,6 +352,15 @@
   <div class="cmd-list" id="cmd-list"></div>
 </aside>
 <div id="overlay" class="hidden"></div>
+
+<!-- 终端模态层：内嵌 iframe，避免在 Telegram webview 中跳转外部浏览器 -->
+<div id="terminal-modal">
+  <div class="term-head">
+    <strong>终端</strong>
+    <button id="btn-close-terminal" title="返回聊天">✕</button>
+  </div>
+  <iframe id="terminal-iframe" src="about:blank"></iframe>
+</div>
 
 <!-- 设置面板 -->
 <div id="settings">
@@ -896,8 +921,24 @@
   overlay.addEventListener("click", closeMenu);
 
   document.getElementById("btn-terminal").addEventListener("click", function () {
-    // 在新标签页打开终端，避免丢失聊天页面状态
-    window.open("/terminal", "_blank");
+    // 在当前页面内嵌 iframe 打开终端，避免 Telegram webview 跳转外部浏览器，
+    // 同时保留聊天页面状态。关闭即回到聊天。
+    var modal = document.getElementById("terminal-modal");
+    var iframe = document.getElementById("terminal-iframe");
+    if (iframe.dataset.loaded !== "1") {
+      iframe.src = "/terminal";
+      iframe.dataset.loaded = "1";
+    }
+    modal.classList.add("open");
+  });
+  document.getElementById("btn-close-terminal").addEventListener("click", function () {
+    document.getElementById("terminal-modal").classList.remove("open");
+  });
+  // iframe 内的 terminal.html 点"返回聊天"时，postMessage 通知关闭模态层
+  window.addEventListener("message", function (event) {
+    if (event.data && event.data.type === "xgent-close-terminal") {
+      document.getElementById("terminal-modal").classList.remove("open");
+    }
   });
 
   document.getElementById("btn-settings").addEventListener("click", function () {
