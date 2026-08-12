@@ -100,11 +100,15 @@ def _fmt_idle_message_interval(val):
         return f"{minutes}分钟"
     return f"{seconds}s"
 
+def _fmt_thinking_level(val=None):
+    return get_thinking_level_label(val)
+
 def get_main_menu():
     agent_on = UserDataManager.get('agent_mode', False)
     stream_on = normalize_bool(UserDataManager.get('stream_mode', True), True)
     stitch_label = get_text_stitch_mode_label()
-    
+    web_on = normalize_bool(UserDataManager.get('web_enabled', False), False)
+
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔌 提供商", callback_data="menu_providers"),
          InlineKeyboardButton("🎯 模型", callback_data="menu_default_models")],
@@ -112,9 +116,130 @@ def get_main_menu():
          InlineKeyboardButton(f"🌊 流式:{'开' if stream_on else '关'}", callback_data="toggle_stream_mode")],
         [InlineKeyboardButton(f"🧩{stitch_label}", callback_data="menu_text_stitch_mode"),
          InlineKeyboardButton("🧠记忆", callback_data="menu_memory")],
-        [InlineKeyboardButton("📝 提示词", callback_data="menu_prompts"),
-         InlineKeyboardButton("⚙️ 更多", callback_data="menu_more_settings")]
+        [InlineKeyboardButton(f"🌐 Web:{'开' if web_on else '关'}", callback_data="menu_web"),
+         InlineKeyboardButton("📝 提示词", callback_data="menu_prompts")],
+        [InlineKeyboardButton("⚙️ 更多", callback_data="menu_more_settings")]
     ])
+
+
+def _build_web_open_button():
+    """Web 配置菜单里用的「打开网页版」按钮。
+
+    主菜单的 Web 按钮现在是恒定的回调入口（menu_web），不再承担"打开"职责，
+    所以无论是否配置公开地址，配置菜单都能进得来、改得了。
+    这里只负责在已开启时给出一个打开动作：
+      - 配了 HTTPS 公开地址 → WebApp 内嵌打开；
+      - 否则 → 外部浏览器打开本地地址。
+    未开启时返回 None，调用方据此决定是否显示该行。
+    """
+    enabled = normalize_bool(UserDataManager.get('web_enabled', False), False)
+    if not enabled:
+        return None
+
+    public_url = str(UserDataManager.get('web_public_url', '') or '')
+    if public_url.startswith("https://"):
+        return InlineKeyboardButton("🌐 打开网页版", web_app=WebAppInfo(url=public_url))
+
+    port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
+    return InlineKeyboardButton("🌐 浏览器打开", url=f"http://{DEFAULT_WEB_HOST}:{port}")
+
+
+def _build_terminal_open_button():
+    """终端开启时的「打开终端」按钮。复用 Web 的公开地址 + /terminal 路径。
+
+    终端与 Web 共享同一端口和认证，但开关独立。只要 terminal_enabled
+    即返回按钮。终端是任意命令执行，默认关闭，必须显式开启。
+    """
+    term_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
+    if not term_on:
+        return None
+
+    public_url = str(UserDataManager.get('web_public_url', '') or '')
+    if public_url.startswith("https://"):
+        return InlineKeyboardButton(
+            "🖥 打开终端", web_app=WebAppInfo(url=public_url.rstrip("/") + "/terminal")
+        )
+    port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
+    return InlineKeyboardButton(
+        "🖥 浏览器打开终端", url=f"http://{DEFAULT_WEB_HOST}:{port}/terminal"
+    )
+
+
+def get_web_menu():
+    enabled = normalize_bool(UserDataManager.get('web_enabled', False), False)
+    port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
+    public_url = str(UserDataManager.get('web_public_url', '') or '')
+    has_password = bool(UserDataManager.get('_web_has_password', False))
+
+    rows: List[List[InlineKeyboardButton]] = []
+    # 已开启时，第一行就是「打开网页版」，和开关/端口/密码等配置项分开。
+    open_button = _build_web_open_button()
+    if open_button is not None:
+        rows.append([open_button])
+    rows.extend([
+        [InlineKeyboardButton(
+            f"{'🟢 已开启' if enabled else '🔴 已关闭'}　点击{'关闭' if enabled else '开启'}",
+            callback_data="toggle_web_enabled"
+        )],
+        [InlineKeyboardButton(
+            f"🔑 密码：{'已设置' if has_password else '未设置'}",
+            callback_data="act_set_web_password"
+        )],
+        [InlineKeyboardButton(f"🔌 端口：{port}", callback_data="act_set_web_port")],
+        [InlineKeyboardButton(
+            f"🌐 公开地址：{'已配置' if public_url else '未配置'}",
+            callback_data="act_set_web_public_url"
+        )],
+    ])
+    if has_password:
+        rows.append([InlineKeyboardButton("🗑️ 清除密码", callback_data="confirm_clear_web_password")])
+    if public_url:
+        rows.append([InlineKeyboardButton("🧹 清除公开地址", callback_data="do_clear_web_public_url")])
+    # 终端开关 + 打开按钮。终端与 Web 独立开关，共享同一服务器。
+    term_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
+    term_button = _build_terminal_open_button()
+    if term_button is not None:
+        rows.append([term_button])
+    rows.append([InlineKeyboardButton(
+        f"🖥 终端：{'🟢 开' if term_on else '🔴 关'}　点击{'关闭' if term_on else '开启'}",
+        callback_data="toggle_terminal_enabled"
+    )])
+    rows.append([InlineKeyboardButton("🔙 返回", callback_data="act_main_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_web_text() -> str:
+    enabled = normalize_bool(UserDataManager.get('web_enabled', False), False)
+    port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
+    public_url = str(UserDataManager.get('web_public_url', '') or '')
+    has_password = bool(UserDataManager.get('_web_has_password', False))
+    running = is_web_chat_running()
+    term_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
+
+    status = "🟢 运行中" if running else ("🟡 已开启但未运行" if enabled else "🔴 已关闭")
+    password_line = "✅ 已设置" if has_password else "⚠️ 未设置（未设置时拒绝启动）"
+    public_line = (
+        f"✅ <code>{safe_text(public_url)}</code>"
+        if public_url else "未配置（按钮将用外部浏览器打开本地地址）"
+    )
+    term_line = (
+        f"🖥 终端：{'🟢 已开启（任意命令执行，注意安全）' if term_on else '🔴 已关闭'}"
+    )
+
+    return (
+        "🌐 <b>Web Chat</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"状态：{status}\n"
+        f"监听：<code>{DEFAULT_WEB_HOST}:{port}</code>\n"
+        f"密码：{password_line}\n"
+        f"公开地址：{public_line}\n"
+        f"{term_line}\n\n"
+        "网页版复用同一套对话核心，Agent 模式、协议执行、记忆与 Telegram 完全共享。\n"
+        "可在网页里聊天并调整常用参数；提供商与 API Key 仍只在 Telegram 里管理。\n\n"
+        f"⚠️ 服务只监听 <code>{DEFAULT_WEB_HOST}</code>，不会直接暴露到公网。"
+        "要远程访问请自行配置反向代理，并在上面填入反代的 HTTPS 地址。\n"
+        "Telegram 的内嵌网页按钮只接受 HTTPS 地址，这也是公开地址单独配置的原因。"
+    )
 
 
 def get_text_stitch_mode_menu():
@@ -161,19 +286,64 @@ def build_text_stitch_pending_text(pending: PendingTextConversation) -> str:
 
 def get_more_settings_menu():
     global_depth = UserDataManager.get('global_depth', 30)
-    
+
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"📊 深度:{global_depth}", callback_data="cmd_set_global_depth"),
          InlineKeyboardButton("⏱️ 超时", callback_data="menu_timeout_settings")],
-        [InlineKeyboardButton("🚫 Agent黑名单", callback_data="menu_command_blacklist"),
-         InlineKeyboardButton("🧹 清空上下文", callback_data="cmd_delete")],
-        [InlineKeyboardButton(f"🔐 凭据配置{_credentials_badge()}", callback_data="menu_credentials"),
+        [InlineKeyboardButton(f"🧠 思考:{_fmt_thinking_level()}", callback_data="menu_thinking_level"),
+         InlineKeyboardButton("🚫 Agent黑名单", callback_data="menu_command_blacklist")],
+        [InlineKeyboardButton("🧹 清空上下文", callback_data="cmd_delete"),
          InlineKeyboardButton("ℹ️ 状态", callback_data="cmd_info")],
-        [InlineKeyboardButton("📤 导出", callback_data="cmd_export_all"),
-         InlineKeyboardButton("⬆️ 更新", callback_data="cmd_update")],
-        [InlineKeyboardButton("🔄 重启", callback_data="cmd_restart")],
+        [InlineKeyboardButton(f"🔐 凭据配置{_credentials_badge()}", callback_data="menu_credentials"),
+         InlineKeyboardButton("📤 导出", callback_data="cmd_export_all")],
+        [InlineKeyboardButton("⬆️ 更新", callback_data="cmd_update"),
+         InlineKeyboardButton("🔄 重启", callback_data="cmd_restart")],
         [InlineKeyboardButton("🔙 返回", callback_data="act_main_menu")]
     ])
+
+
+def get_thinking_level_menu():
+    """思考深度：8 档单选。"""
+    current = normalize_thinking_level(UserDataManager.get('thinking_level'))
+
+    def button(level: str) -> InlineKeyboardButton:
+        label = THINKING_LEVEL_LABELS[level]
+        text = f"✅ {label}" if level == current else label
+        return InlineKeyboardButton(text, callback_data=f"set_thinking_level:{level}")
+
+    return InlineKeyboardMarkup([
+        [button(THINKING_LEVEL_OFF), button(THINKING_LEVEL_AUTO)],
+        [button(THINKING_LEVEL_LOW), button(THINKING_LEVEL_MEDIUM), button(THINKING_LEVEL_HIGH)],
+        [button(THINKING_LEVEL_XHIGH), button(THINKING_LEVEL_ULTRA), button(THINKING_LEVEL_MAX)],
+        [InlineKeyboardButton("🔙 返回", callback_data="menu_more_settings")]
+    ])
+
+
+def build_thinking_level_text() -> str:
+    current = normalize_thinking_level(UserDataManager.get('thinking_level'))
+    spec = THINKING_LEVEL_SPECS.get(current)
+    if current == THINKING_LEVEL_AUTO:
+        detail = "不发送任何思考参数，完全交给提供商的默认行为。"
+    elif current == THINKING_LEVEL_OFF:
+        detail = "显式关闭思考。Gemini 走预算 0，OpenRouter 走 reasoning.enabled=false；其余格式不发字段即为关闭。"
+    else:
+        budget = spec["budget"]
+        budget_text = "动态（由模型决定）" if budget < 0 else f"{budget} tokens"
+        detail = f"思考预算：<b>{budget_text}</b>　推理档位：<b>{spec['effort']}</b>"
+
+    return (
+        "🧠 <b>思考深度</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"当前档位: <b>{safe_text(THINKING_LEVEL_LABELS[current])}</b>\n"
+        f"{detail}\n\n"
+        "会按提供商自动翻译成对应字段：\n"
+        "• Claude → <code>thinking.budget_tokens</code>（并同步抬高 max_tokens）\n"
+        "• Gemini/Vertex → <code>thinkingConfig.thinkingBudget</code>\n"
+        "• OpenAI 及兼容接口 → <code>reasoning_effort</code>\n"
+        "• OpenRouter → <code>reasoning.effort</code>\n\n"
+        "思考内容不会显示在对话里，也不写入记忆；思考消耗的 token 会计入用量行。\n"
+        "模型不支持时会自动去掉参数重发一次，并记住该模型不再重试。"
+    )
 
 
 def _credentials_badge() -> str:
@@ -289,7 +459,7 @@ def build_settings_menu_text() -> str:
     return (
         "⚙️ <b>更多设置</b>\n"
         "━━━━━━━━━━━━━━\n"
-        "调整记忆深度、超时、Agent 黑名单、联网搜索、更新与重启。"
+        "调整记忆深度、超时、思考深度、Agent 黑名单、联网搜索、更新与重启。"
     )
 
 def get_timeout_settings_menu():
@@ -469,6 +639,10 @@ def get_prompts_menu():
         [InlineKeyboardButton(f"📝 {PromptFileManager.get_label(key)}", callback_data=f"view_prompt:{key}")]
         for key in PromptFileManager.FILES
     ]
+    keyboard.append([InlineKeyboardButton(
+        f"🔇 未授权静默：{'🟢 开' if normalize_bool(UserDataManager.get('silent_unauthorized', False), False) else '🔴 关'}",
+        callback_data="toggle_silent_unauthorized"
+    )])
     keyboard.append([InlineKeyboardButton("🔄 从文件重载提示词", callback_data="act_reload_prompts")])
     keyboard.append([InlineKeyboardButton("🔙 返回主菜单", callback_data="act_main_menu")])
     return InlineKeyboardMarkup(keyboard)
@@ -723,19 +897,23 @@ async def handle_unauthorized_user(update: Update, context: ContextTypes.DEFAULT
     user = update.effective_user
     chat = update.effective_chat
     
+    # 静默模式：不回复未授权用户（减少骚扰/探测），但仍记录情报并通知授权用户。
+    silent = normalize_bool(UserDataManager.get('silent_unauthorized', False), False)
     rejection_messages = get_unauthorized_reply_messages()
-    rejection_msg = random.choice(rejection_messages) if rejection_messages else ''
-    
-    try:
-        if not rejection_msg:
-            raise ValueError("unauthorized reply messages file is empty")
-        if update.callback_query:
-            await update.callback_query.answer(rejection_msg[:180], show_alert=True)
-            await context.bot.send_message(chat_id=chat.id, text=rejection_msg)
-        elif update.message:
-            await update.message.reply_text(rejection_msg)
-    except Exception as e:
-        logger.error(f"无法回复未授权用户: {e}")
+    if silent:
+        rejection_msg = "（已开启静默模式，未回复未授权用户）"
+    else:
+        rejection_msg = random.choice(rejection_messages) if rejection_messages else ''
+        try:
+            if not rejection_msg:
+                raise ValueError("unauthorized reply messages file is empty")
+            if update.callback_query:
+                await update.callback_query.answer(rejection_msg[:180], show_alert=True)
+                await context.bot.send_message(chat_id=chat.id, text=rejection_msg)
+            elif update.message:
+                await update.message.reply_text(rejection_msg)
+        except Exception as e:
+            logger.error(f"无法回复未授权用户: {e}")
 
     # 收集情报
     unauthorized_input = "未知内容"

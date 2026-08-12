@@ -29,6 +29,9 @@ components. The first extracted components are:
 | `xgent_app/agent_coordinator.py` | Plan stop/end/continue transitions and build the next in-memory transcript without I/O |
 | `xgent_app/agent_media.py` | Manage media generation waiting, stop cancellation, typing state, and progress-message cleanup |
 | `xgent_app/agent_media_delivery.py` | Deliver generated media or the existing failure warning without persistence/context concerns |
+| `xgent_app/web_auth.py` | Web Chat password hashing, signed session cookies, login rate limiting, and Telegram `initData` verification; no HTTP or Telegram concerns |
+| `xgent_app/web_bridge.py` | Duck-typed `Update`/`Context`/`Bot` shims that let the Web UI drive `process_conversation` unchanged, plus the thread-safe outbound frame queue |
+| `xgent_app/web_server.py` | Zero-dependency threaded HTTP/SSE server for the Web Chat UI; receives all application behavior through injected callbacks |
 
 Legacy names remain available through thin imports/wrappers in the sections so
 existing handlers keep working while the internal boundaries become explicit.

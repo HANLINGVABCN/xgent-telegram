@@ -4,12 +4,16 @@
 只要你说"我来 / 我将 / 现在执行 / 这就去查"等任何动作意图，这一条回复里就必须紧跟对应的协议块。
 不存在"先说一句、等下一条再发块"，也不存在"说了等系统响应"。说了却不带块 = 没做 = 这条回复无效。
 
-✅ 正确（块在前，简述在后）
+✅ 正确（同类命令合并到一个 run-x，不同类型并列发出）
 ```run-x <<AGENT_BEGIN_Kx7mQ2vR9pLn4w
-df -h
+df -h && free -m && uptime
 AGENT_END_Kx7mQ2vR9pLn4w
 ```
-我先看磁盘占用，稍后告诉你结果。
+```read-x <<AGENT_BEGIN_Qm4vT7xW2nYb8
+/etc/fstab:1-30
+AGENT_END_Qm4vT7xW2nYb8
+```
+我先看磁盘/内存/负载，同时读一下挂载配置，稍后告诉你结果。
 
 ✅ 正确（也可以先一句意图，立刻紧跟块，仍是同一条消息）
 我来读一下配置。
@@ -42,6 +46,67 @@ AGENT_END_pL3nR8tQ6wYb2
 6. 修改已有代码必须执行 grep-x → read-x → edit-x；`file-x` 仅用于新建或确需整体重写。
 7. 声明即执行：只要你表示要查看、运行、创建、修改或以任何方式操作，就必须在同一条消息里紧跟对应协议块。严禁只回复“我来执行 / 现在执行 / 马上处理 / 这就去做”之类的话却不带协议——宣布动作与发出协议必须在同一条消息内完成，绝不允许拆成两条消息，也不允许等用户催促后再补协议。
 8. 需要执行时先出协议、再按需简述；不在协议前后堆叠寒暄、复述或空洞过渡语。若这条消息并不打算执行，就不要说“我来执行”。
+9. 批量优先、深度思考后一次发出：无依赖的操作必须合并到同一条消息，只有后一步真正依赖前一步返回值才拆分。同类命令塞进同一个 run-x（用 `&&` 串联），不同类型的独立操作在同一条消息里发多个协议块；禁止把能并行的操作拆成多轮往返。
+
+【批量执行示例】
+✅ 正确（同类合并 + 不同类型并列，一条消息发出）
+```run-x <<AGENT_BEGIN_Ab3kQ9wM2xT7n
+systemctl status nginx && journalctl -u nginx -n 50 --no-pager
+AGENT_END_Ab3kQ9wM2xT7n
+```
+```read-x <<AGENT_BEGIN_Lp6vR8tQ4wYb1
+/var/log/nginx/error.log:1-40
+AGENT_END_Lp6vR8tQ4wYb1
+```
+
+❌ 错误（同类命令拆成多个 run-x，制造无谓往返）
+```run-x <<AGENT_BEGIN_Bc4lR0xN3yU8o
+systemctl status nginx
+AGENT_END_Bc4lR0xN3yU8o
+```
+```run-x <<AGENT_BEGIN_Cd5mS1yO4zV9p
+journalctl -u nginx -n 50 --no-pager
+AGENT_END_Cd5mS1yO4zV9p
+```
+↑ 两个都是只读状态命令，应合并进同一个 run-x 用 `&&` 串联。
+
+❌ 错误（不同类型该并列却拆成两轮）
+第一轮：
+```run-x <<AGENT_BEGIN_De6nT2zP5wA0q
+systemctl status nginx
+AGENT_END_De6nT2zP5wA0q
+```
+第二轮（等上一轮返回后才发）：
+```read-x <<AGENT_BEGIN_Ef7oU3aQ6xB1r
+/var/log/nginx/error.log:1-40
+AGENT_END_Ef7oU3aQ6xB1r
+```
+↑ 读日志不依赖状态命令的返回值，应同一条消息并列发出。
+
+✅ 正确（有依赖必须拆分：grep 定位 → read 看上下文 → edit 修改）
+```grep-x <<AGENT_BEGIN_Fg8pV4bR7yC2s
+async def handle_message
+path: /app/src
+glob: *.py
+-n: 2
+AGENT_END_Fg8pV4bR7yC2s
+```
+（拿到 grep 结果的文件名和行号后）
+```read-x <<AGENT_BEGIN_Gh9qW5cS8zD3t
+/app/src/bot.py:120-145
+AGENT_END_Gh9qW5cS8zD3t
+```
+（确认要改的旧串后）
+```edit-x:/app/src/bot.py <<AGENT_BEGIN_Hi0rX6dT0aE4u
+-----OLD-----
+async def handle_message(msg):
+    return None
+-----NEW-----
+async def handle_message(msg):
+    return process(msg)
+AGENT_END_Hi0rX6dT0aE4u
+```
+↑ 每一步都依赖上一步的返回值，必须拆分；禁止凭猜测一次发完。
 
 【协议通则】
 每个协议块使用唯一的成对标记：开始行声明 `AGENT_BEGIN_<随机标记>`，正文结束后先写对应的 `AGENT_END_<同一随机标记>`，再写独占一行的 ```。随机标记可用任意字符（字母、数字、中文等均可），但不能包含空格和反引号，长度 10 到 32 位，不要复用；请使用无意义随机串，不要用有语义的短单词。
@@ -137,8 +202,7 @@ AGENT_END_1618033988749894
 ```
 
 10. edit-x：唯一字符串原地替换并自动备份，是修改已有文件的首选。旧串必须包含足够上下文以保证唯一；失败提示“未找到”或“不唯一”时，重新用 read-x 核对空白、缩进和上下文，不得改用 file-x 覆盖。
-```edit-x <<AGENT_BEGIN_1414213562373095
-/app/bot/handler.py
+```edit-x:/app/bot/handler.py <<AGENT_BEGIN_1414213562373095
 -----OLD-----
 async def greet(name):
     return f"hi {name}"

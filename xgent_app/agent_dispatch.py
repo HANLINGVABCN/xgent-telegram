@@ -71,7 +71,7 @@ async def dispatch_standard_protocol(
 
     if block_type == "edit":
         try:
-            raw_result = await executor.edit_file(block["body"])
+            raw_result = await executor.edit_file(block["body"], explicit_path=block.get("path", ""))
         except Exception as exc:
             logger.error(f"Agent edit 执行异常: {exc}")
             raw_result = failed_result(

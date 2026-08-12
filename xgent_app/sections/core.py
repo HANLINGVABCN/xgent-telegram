@@ -56,7 +56,7 @@ from apscheduler.triggers.date import DateTrigger
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from telegram import BotCommand, BotCommandScopeAllPrivateChats, Update, constants, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import BotCommand, BotCommandScopeAllPrivateChats, Update, constants, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, WebAppInfo
 from telegram.error import BadRequest, InvalidToken, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
@@ -795,6 +795,9 @@ class BotState:
     SET_UPDATE_TOKEN = 'set_update_token'
     SET_SEARCH_KEY = 'set_search_key'
     SET_MEMORY = 'set_memory'
+    SET_WEB_PASSWORD = 'set_web_password'
+    SET_WEB_PORT = 'set_web_port'
+    SET_WEB_PUBLIC_URL = 'set_web_public_url'
     IMPORT_PROVIDER_CONFIG = 'import_provider_config'
 
 PROVIDER_CONFIG_FORMAT = 'xgent-telegram-provider-config'
@@ -912,6 +915,138 @@ def get_text_conversation_buffer_key(update: Update) -> Tuple[int, int]:
     chat_id = update.effective_chat.id if update.effective_chat else BotConfig.AUTHORIZED_USER_ID
     user_id = update.effective_user.id if update.effective_user else BotConfig.AUTHORIZED_USER_ID
     return chat_id, user_id
+
+
+# ---------------------------------------------------------------------------
+# 思考深度（reasoning / extended thinking）
+#
+# 各家的字段名和取值完全不同，这里统一成一组档位，发请求时再翻译：
+#   Claude  -> thinking.budget_tokens（且 max_tokens 必须大于它）
+#   Gemini  -> generationConfig.thinkingConfig.thinkingBudget
+#   OpenAI  -> reasoning_effort
+#   OpenRouter -> reasoning.effort
+#
+# AUTO 表示「一个思考字段都不发」，让提供商用自己的默认值。这是默认档位，
+# 因为不支持思考的模型（gpt-4o、claude-3-5-haiku 等）收到未知字段会直接 400。
+# ---------------------------------------------------------------------------
+
+THINKING_LEVEL_OFF = "off"
+THINKING_LEVEL_AUTO = "auto"
+THINKING_LEVEL_LOW = "low"
+THINKING_LEVEL_MEDIUM = "medium"
+THINKING_LEVEL_HIGH = "high"
+THINKING_LEVEL_XHIGH = "xhigh"
+THINKING_LEVEL_ULTRA = "ultra"
+THINKING_LEVEL_MAX = "max"
+
+# 有序，菜单按这个顺序渲染
+THINKING_LEVEL_ORDER = (
+    THINKING_LEVEL_OFF,
+    THINKING_LEVEL_AUTO,
+    THINKING_LEVEL_LOW,
+    THINKING_LEVEL_MEDIUM,
+    THINKING_LEVEL_HIGH,
+    THINKING_LEVEL_XHIGH,
+    THINKING_LEVEL_ULTRA,
+    THINKING_LEVEL_MAX,
+)
+THINKING_LEVELS = set(THINKING_LEVEL_ORDER)
+DEFAULT_THINKING_LEVEL = THINKING_LEVEL_AUTO
+
+THINKING_LEVEL_LABELS = {
+    THINKING_LEVEL_OFF: "关闭",
+    THINKING_LEVEL_AUTO: "自动",
+    THINKING_LEVEL_LOW: "低",
+    THINKING_LEVEL_MEDIUM: "中",
+    THINKING_LEVEL_HIGH: "高",
+    THINKING_LEVEL_XHIGH: "很高",
+    THINKING_LEVEL_ULTRA: "超高",
+    THINKING_LEVEL_MAX: "最高",
+}
+
+# budget: Claude / Gemini 的思考 token 预算；-1 表示交给模型动态决定（Gemini 语义）。
+# effort: OpenAI 系的档位名。两家档位数量不一样，高档位会重复映射。
+THINKING_LEVEL_SPECS: Dict[str, Dict[str, Any]] = {
+    THINKING_LEVEL_LOW: {"budget": 2048, "effort": "low"},
+    THINKING_LEVEL_MEDIUM: {"budget": 8192, "effort": "medium"},
+    THINKING_LEVEL_HIGH: {"budget": 16384, "effort": "high"},
+    THINKING_LEVEL_XHIGH: {"budget": 24576, "effort": "high"},
+    THINKING_LEVEL_ULTRA: {"budget": 32768, "effort": "xhigh"},
+    THINKING_LEVEL_MAX: {"budget": -1, "effort": "max"},
+}
+
+# Claude 要求 max_tokens > budget_tokens，否则直接 400。budget 为 -1（动态）时
+# 没有具体数值可参照，用这个上限兜底。
+CLAUDE_THINKING_DYNAMIC_BUDGET = 32768
+CLAUDE_THINKING_ANSWER_HEADROOM = 4096
+CLAUDE_DEFAULT_MAX_TOKENS = 4096
+
+
+def normalize_thinking_level(value: Any, default: str = DEFAULT_THINKING_LEVEL) -> str:
+    level = str(value if value is not None else default).strip().lower()
+    if level in {"none", "false", "0", "disabled", "close", "closed", "关闭", "关"}:
+        return THINKING_LEVEL_OFF
+    if level in {"default", "auto", "自动"}:
+        return THINKING_LEVEL_AUTO
+    if level not in THINKING_LEVELS:
+        return default
+    return level
+
+
+def get_thinking_level_label(level: Optional[str] = None) -> str:
+    level = normalize_thinking_level(
+        level if level is not None else UserDataManager.get('thinking_level')
+    )
+    return THINKING_LEVEL_LABELS.get(level, THINKING_LEVEL_LABELS[DEFAULT_THINKING_LEVEL])
+
+
+# ---------------------------------------------------------------------------
+# Web Chat
+#
+# 默认只绑 127.0.0.1：这个界面能驱动 Agent 在服务器上执行真实命令，直接
+# 对公网监听等于把控制台暴露出去。要远程访问就自己配反向代理。
+#
+# Telegram 的 WebApp 按钮只接受 HTTPS 地址，所以公开地址单独配一项；没配
+# 时按钮降级成普通链接，用外部浏览器打开 127.0.0.1。
+# ---------------------------------------------------------------------------
+
+DEFAULT_WEB_HOST = "127.0.0.1"
+DEFAULT_WEB_PORT = 8790
+MIN_WEB_PORT = 1024
+MAX_WEB_PORT = 65535
+WEB_PASSWORD_CONFIG_KEY = 'web_password_hash'
+
+
+def normalize_web_port(value: Any, default: int = DEFAULT_WEB_PORT) -> int:
+    try:
+        port = int(float(value))
+    except (TypeError, ValueError):
+        return int(default)
+    if port < MIN_WEB_PORT or port > MAX_WEB_PORT:
+        return int(default)
+    return port
+
+
+def parse_web_port(text: str) -> int:
+    """解析用户输入的端口，越界抛 ValueError 交给调用方提示。"""
+    cleaned = str(text or "").strip()
+    try:
+        port = int(cleaned)
+    except (TypeError, ValueError):
+        raise ValueError("port must be a number")
+    if port < MIN_WEB_PORT or port > MAX_WEB_PORT:
+        raise ValueError(f"port must be between {MIN_WEB_PORT} and {MAX_WEB_PORT}")
+    return port
+
+
+def normalize_web_public_url(value: Any) -> str:
+    """公开地址必须是 HTTPS——Telegram 服务器会拒绝非 HTTPS 的 web_app URL。"""
+    url = str(value or "").strip().rstrip('/')
+    if not url:
+        return ""
+    if not url.startswith("https://"):
+        raise ValueError("public url must start with https://")
+    return url
 
 
 def has_pending_text_conversation(update: Update) -> bool:

@@ -24,9 +24,9 @@ class ProtocolParser:
     # 等于静默丢掉一次操作，用户和模型都收不到任何提示。
     _NONCE_PATTERN = r"[^\s`]{6,32}"
     _OPEN_RE = re.compile(
-        r"^```(?P<tag>"
+        r"^[^\n]*?```(?P<tag>"
         r"run-x|shell-x|stdin-x:[^\n<]+|shellread-x:[^\n<]+|shellkill-x:[^\n<]+|"
-        r"trigger-x(?::[^\n<]+)?|sendfile-x|read-x:[^\n<]+|read-x|edit-x|grep-x|"
+        r"trigger-x(?::[^\n<]+)?|sendfile-x|read-x:[^\n<]+|read-x|edit-x(?::[^\n<]+)?|grep-x|"
         r"search-x|fetch-x|"
         r"media-x|file-x(?::[^\n<]*?)?"
         r")\s+<<AGENT_BEGIN_(?P<nonce>" + _NONCE_PATTERN + r")\s*$"
@@ -118,7 +118,14 @@ class ProtocolParser:
                 **common,
             }
 
-        if normalized_tag in {"edit", "grep"}:
+        if normalized_tag in {"edit", "grep"} or normalized_tag.startswith("edit:"):
+            if normalized_tag.startswith("edit:"):
+                return {
+                    "type": "edit",
+                    "path": normalized_tag[5:].strip(),
+                    "body": raw_body.strip("\n"),
+                    **common,
+                }
             return {
                 "type": normalized_tag,
                 "path": "",

@@ -98,4 +98,376 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"发送提醒消息失败: {e}")
 
+
+# --- ☆ Web Chat 运行时接线 ☆ ---
+# 放在这里是因为要同时用到 messages.py 的 process_conversation（更早加载）
+# 和被 lifecycle.py 调用（更晚加载）。
+
+_web_chat_server: Optional[Any] = None
+# 真实 PTB bot 引用。网页发起对话时，MirrorBot 用它把消息同时投递到 Telegram。
+_web_real_bot: Optional[Any] = None
+_web_application: Optional[Any] = None
+
+# 网页可改的参数白名单。刻意不含提供商增删改和 API Key——那些留在 Telegram 里。
+WEB_EDITABLE_SETTINGS = {
+    'thinking_level', 'stream_mode', 'agent_mode', 'text_stitch_mode',
+    'global_depth', 'agent_max_iterations', 'stream_timeout', 'chat_model',
+}
+
+
+async def _web_read_history(limit: int) -> List[Dict[str, Any]]:
+    db = await BotMemoryDB.get_instance()
+    rows = await db.get_conversation_messages(limit)
+    return [
+        {'role': str(row.get('role') or 'user'), 'content': str(row.get('content') or '')}
+        for row in rows
+    ]
+
+
+async def _web_read_settings() -> Dict[str, Any]:
+    """返回当前值 + 下拉框选项，供网页渲染设置面板。"""
+    await UserDataManager.init()
+    providers = UserDataManager.get('providers', {}) or {}
+    prov_name = get_model_target_provider_name('chat')
+    model_options = []
+    for name, data in providers.items():
+        for model in (data.get('models') or []):
+            model_options.append({'value': f"{name}|{model}", 'label': f"{name} / {model}"})
+
+    current_model = UserDataManager.get('default_model') or ''
+    return {
+        'values': {
+            'thinking_level': normalize_thinking_level(UserDataManager.get('thinking_level')),
+            'stream_mode': normalize_bool(UserDataManager.get('stream_mode', True), True),
+            'agent_mode': bool(UserDataManager.get('agent_mode', False)),
+            'text_stitch_mode': normalize_text_stitch_mode(UserDataManager.get('text_stitch_mode')),
+            'global_depth': int(UserDataManager.get('global_depth', 30) or 30),
+            'agent_max_iterations': normalize_agent_max_iterations(
+                UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
+            ),
+            'stream_timeout': int(normalize_stream_timeout(UserDataManager.get('stream_timeout', 0))),
+            'chat_model': f"{prov_name}|{current_model}" if prov_name and current_model else '',
+        },
+        'options': {
+            'thinking_level': [
+                {'value': level, 'label': THINKING_LEVEL_LABELS[level]}
+                for level in THINKING_LEVEL_ORDER
+            ],
+            'text_stitch_mode': [
+                {'value': TEXT_STITCH_MODE_AUTO, 'label': '自动判断'},
+                {'value': TEXT_STITCH_MODE_FORCE, 'label': '强制拼接'},
+                {'value': TEXT_STITCH_MODE_OFF, 'label': '不拼接'},
+            ],
+            'chat_model': model_options,
+        },
+    }
+
+
+async def _web_write_setting(key: str, value: Any) -> Dict[str, Any]:
+    """写入前一律过 normalize_*，与 Telegram 菜单走同一套校验。"""
+    if key not in WEB_EDITABLE_SETTINGS:
+        raise ValueError(f"不可修改的配置项: {key}")
+
+    if key == 'chat_model':
+        raw = str(value or '')
+        prov_name, _, model = raw.partition('|')
+        providers = UserDataManager.get('providers', {}) or {}
+        if prov_name not in providers or model not in (providers[prov_name].get('models') or []):
+            raise ValueError("提供商或模型不存在")
+        await save_model_target_selection('chat', prov_name, model)
+    elif key == 'thinking_level':
+        level = normalize_thinking_level(value)
+        UserDataManager.set(key, level)
+        await UserDataManager.save_config(key, level)
+        ModelClient._thinking_unsupported.clear()
+    elif key in {'stream_mode', 'agent_mode'}:
+        flag = normalize_bool(value, False)
+        UserDataManager.set(key, flag)
+        await UserDataManager.save_config(key, flag)
+    elif key == 'text_stitch_mode':
+        mode = normalize_text_stitch_mode(value)
+        UserDataManager.set(key, mode)
+        await UserDataManager.save_config(key, mode)
+    elif key == 'global_depth':
+        try:
+            depth = int(value)
+        except (TypeError, ValueError):
+            raise ValueError("记忆深度必须是数字")
+        if not (1 <= depth <= 500):
+            raise ValueError("记忆深度需在 1-500 之间")
+        UserDataManager.set(key, depth)
+        await UserDataManager.save_config(key, depth)
+    elif key == 'agent_max_iterations':
+        iterations = normalize_agent_max_iterations(value)
+        UserDataManager.set(key, iterations)
+        await UserDataManager.save_config(key, iterations)
+    elif key == 'stream_timeout':
+        timeout = normalize_stream_timeout(value)
+        UserDataManager.set(key, timeout)
+        await UserDataManager.save_config(key, timeout)
+        PortalManager._portals.clear()
+
+    await GlobalRecorder.record_system_op(f"[Web] 修改配置 {key}", {"key": key})
+    return await _web_read_settings()
+
+
+async def _web_run_conversation(text: str, outbox: Any) -> None:
+    """跑一轮完整对话，结束后给网页发一帧收尾信号。
+
+    用 MirrorBot 而不是纯 WebBot：网页发的对话会同时投递到 Telegram，让两端
+    保持同步。用户消息本身也单独发一条到 Telegram（标记来自网页），这样 TG
+    那边能看到"网页问了什么"，而不只是 AI 的回复。
+    """
+    update, context, _bot = build_web_mirror_objects(
+        BotConfig.AUTHORIZED_USER_ID, outbox, _web_real_bot,
+    )
+    # 配置状态（设置密码/端口/地址/提示词/Key 等）：走 Telegram 同款状态机，
+    # 不要当 AI 对话。否则网页输入 cancel 或配置值会被发给 AI（既有 bug）。
+    state = UserDataManager.get('state')
+    if state != BotState.IDLE:
+        try:
+            update.message.text = text
+        except Exception:
+            pass
+        # 状态处理器（设密码/端口）会调 restart_web_chat(context.application)，
+        # mirror context 默认无该属性，这里补上真实 application。
+        context.application = _web_application
+        try:
+            await handle_text_message(update, context)
+        except Exception as e:
+            logger.exception("Web 状态处理失败")
+            outbox.put({"type": "turn_error", "text": redact_sensitive_text(str(e))[:300]})
+        else:
+            outbox.put({"type": "turn_end"})
+        return
+    try:
+        # 先把用户消息镜像到 Telegram，再记录到记忆、跑对话。
+        if _web_real_bot is not None:
+            with contextlib.suppress(Exception):
+                await _web_real_bot.send_message(
+                    chat_id=BotConfig.AUTHORIZED_USER_ID,
+                    text=f"💬 [网页]\n{text}",
+                )
+        await GlobalRecorder.record_user_message(
+            text, MessageType.USER_TEXT, BotConfig.AUTHORIZED_USER_ID
+        )
+        await process_conversation(update, context, text)
+        outbox.put({"type": "turn_end"})
+    except Exception as e:
+        logger.exception("Web 对话失败")
+        outbox.put({"type": "turn_error", "text": redact_sensitive_text(str(e))[:300]})
+
+
+async def _web_handle_callback(callback_data: str, message_id: int, outbox: Any) -> None:
+    """网页按钮点击：复用 Telegram 的 handle_button_click 回调路由（纯网页，不回灌 TG）。"""
+    update, context, _bot = build_web_callback_objects(
+        BotConfig.AUTHORIZED_USER_ID, outbox, callback_data, message_id,
+    )
+    try:
+        await handle_button_click(update, context)
+        outbox.put({"type": "callback_done"})
+    except Exception as e:
+        logger.exception("Web 回调失败")
+        outbox.put({"type": "turn_error", "text": redact_sensitive_text(str(e))[:300]})
+
+
+async def _web_handle_command(command: str, outbox: Any) -> None:
+    """网页 /命令：路由到对应的 cmd_* 处理函数（纯网页，不回灌 TG）。
+
+    命令和按钮属于 UI 交互，不需要镜像到 Telegram；真正影响同步的是普通对话，
+    那条路走 _web_run_conversation 的 MirrorBot。
+    """
+    name = command.strip().split(" ", 1)[0].lstrip("/").split("@", 1)[0].lower()
+    handler = _WEB_COMMAND_MAP.get(name)
+    update, context, _bot = build_web_command_objects(
+        BotConfig.AUTHORIZED_USER_ID, outbox, command,
+    )
+    try:
+        if handler is None:
+            # 未知命令当成普通对话发出去，避免网页端 /xxx 没反应。
+            await GlobalRecorder.record_user_message(
+                command, MessageType.USER_TEXT, BotConfig.AUTHORIZED_USER_ID,
+            )
+            await process_conversation(update, context, command)
+        else:
+            await handler(update, context)
+        outbox.put({"type": "turn_end"})
+    except Exception as e:
+        logger.exception("Web 命令失败: %s", command)
+        outbox.put({"type": "turn_error", "text": redact_sensitive_text(str(e))[:300]})
+
+
+# 网页可用的 /命令 -> cmd_* 处理函数映射，与 main.py 的 CommandHandler 注册一致。
+# 在模块加载完成前这些名字可能还没就绪，所以延迟到首次使用时构建。
+_WEB_COMMAND_MAP: Dict[str, Any] = {}
+
+
+def _ensure_web_command_map() -> None:
+    if _WEB_COMMAND_MAP:
+        return
+    pairs = [
+        ("start", "cmd_start"),
+        ("config", "cmd_settings_menu"),
+        ("update", "cmd_update_system"),
+        ("restart", "cmd_restart_system"),
+        ("providers", "cmd_providers_menu"),
+        ("provider_config", "cmd_provider_config"),
+        ("models", "cmd_models_menu"),
+        ("chat_model", "cmd_chat_model_menu"),
+        ("media_model", "cmd_media_model_menu"),
+        ("prompts", "cmd_prompts_menu"),
+        ("clear_memory", "cmd_delete_chat"),
+        ("depth", "cmd_depth_menu"),
+        ("timeout", "cmd_timeout_menu"),
+        ("thinking", "cmd_thinking_menu"),
+        ("web", "cmd_web_menu"),
+        ("agent", "cmd_toggle_agent"),
+        ("blacklist", "cmd_blacklist_menu"),
+        ("stream", "cmd_toggle_stream"),
+        ("status", "cmd_show_info"),
+        ("export", "cmd_export_all"),
+        ("show_chat_info", "cmd_show_info"),
+    ]
+    g = globals()
+    for cmd_name, fn_name in pairs:
+        fn = g.get(fn_name)
+        if fn is not None:
+            _WEB_COMMAND_MAP[cmd_name] = fn
+
+
+def _web_submit_message(text: str, outbox: Any) -> None:
+    """HTTP 线程调用：把对话丢进事件循环，不等它跑完。
+
+    一轮 Agent 对话可能跑几分钟，HTTP 请求不能挂在那里等。
+    """
+    loop = _web_chat_server.config.loop if _web_chat_server else None
+    if loop is None:
+        outbox.put({"type": "turn_error", "text": "服务未就绪"})
+        return
+    asyncio.run_coroutine_threadsafe(_web_run_conversation(text, outbox), loop)
+
+
+def _web_submit_callback(callback_data: str, message_id: int, outbox: Any) -> None:
+    """HTTP 线程调用：把网页按钮点击丢进事件循环。"""
+    loop = _web_chat_server.config.loop if _web_chat_server else None
+    if loop is None:
+        outbox.put({"type": "turn_error", "text": "服务未就绪"})
+        return
+    asyncio.run_coroutine_threadsafe(
+        _web_handle_callback(callback_data, message_id, outbox), loop,
+    )
+
+
+def _web_submit_command(command: str, outbox: Any) -> None:
+    """HTTP 线程调用：把网页 /命令丢进事件循环。"""
+    _ensure_web_command_map()
+    loop = _web_chat_server.config.loop if _web_chat_server else None
+    if loop is None:
+        outbox.put({"type": "turn_error", "text": "服务未就绪"})
+        return
+    asyncio.run_coroutine_threadsafe(_web_handle_command(command, outbox), loop)
+
+
+def get_web_outbox() -> Optional[Any]:
+    """返回当前网页 SSE 队列；Web 未运行时返回 None。
+
+    Telegram 侧对话用它把消息镜像到网页（TG -> Web 方向）。
+    """
+    if _web_chat_server is None:
+        return None
+    return _web_chat_server.outbox
+
+
+def get_web_real_bot() -> Optional[Any]:
+    """返回真实 PTB bot 引用，供 TG 侧构建 MirrorBot 镜像到网页。"""
+    return _web_real_bot
+
+
+def _web_request_stop() -> None:
+    """复用 Telegram 侧的停止语义——全局只有一个停止事件。"""
+    event = _stop_generation_event
+    if event is not None and not event.is_set():
+        event.set()
+
+
+def _web_is_busy() -> bool:
+    return _conversation_processing_lock.locked()
+
+
+async def start_web_chat_if_enabled(app: Any) -> None:
+    """按开关启动 Web 服务。失败只记日志，绝不影响 bot 主流程。"""
+    global _web_chat_server, _web_real_bot, _web_application
+    if _web_chat_server is not None:
+        return
+    web_on = normalize_bool(UserDataManager.get('web_enabled', False), False)
+    term_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
+    if not (web_on or term_on):
+        return
+
+    # 记下真实 bot，网页发起对话时 MirrorBot 用它把消息同步到 Telegram。
+    _web_real_bot = getattr(app, "bot", None)
+    # 记下 application：网页触发配置状态（设密码/端口需 restart_web_chat）时，
+    # 状态处理器会取 context.application，mirror context 默认没有该属性。
+    _web_application = app
+
+    password_hash = await read_web_password_hash()
+    if not password_hash:
+        logger.warning("Web Chat 已开启但未设置密码，跳过启动")
+        with contextlib.suppress(Exception):
+            await app.bot.send_message(
+                chat_id=BotConfig.AUTHORIZED_USER_ID,
+                text="⚠️ Web/终端服务已开启但没有设置密码，未启动。请在 /start → 🌐 Web 里设置密码。",
+            )
+        return
+
+    config = WebChatConfig(
+        host=DEFAULT_WEB_HOST,
+        port=normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT)),
+        password_hash=password_hash,
+        bot_token=BotConfig.TOKEN,
+        authorized_user_id=BotConfig.AUTHORIZED_USER_ID,
+        loop=asyncio.get_running_loop(),
+        submit_message=_web_submit_message,
+        submit_callback=_web_submit_callback,
+        submit_command=_web_submit_command,
+        read_history=_web_read_history,
+        read_settings=_web_read_settings,
+        write_setting=_web_write_setting,
+        request_stop=_web_request_stop,
+        is_busy=_web_is_busy,
+        is_terminal_enabled=lambda: normalize_bool(UserDataManager.get('terminal_enabled', False), False),
+        is_web_enabled=lambda: normalize_bool(UserDataManager.get('web_enabled', False), False),
+    )
+    server = WebChatServer(config)
+    try:
+        await asyncio.to_thread(server.start)
+    except Exception as e:
+        logger.error(f"Web Chat 启动失败: {e}")
+        with contextlib.suppress(Exception):
+            await app.bot.send_message(
+                chat_id=BotConfig.AUTHORIZED_USER_ID,
+                text=f"⚠️ Web Chat 启动失败：{safe_text(str(e)[:200])}",
+            )
+        return
+    _web_chat_server = server
+
+
+async def stop_web_chat() -> None:
+    global _web_chat_server
+    if _web_chat_server is None:
+        return
+    server, _web_chat_server = _web_chat_server, None
+    with contextlib.suppress(Exception):
+        await asyncio.to_thread(server.stop)
+
+
+async def restart_web_chat(app: Any) -> None:
+    """改端口/密码后重启，让新配置立即生效。"""
+    await stop_web_chat()
+    await start_web_chat_if_enabled(app)
+
+
+def is_web_chat_running() -> bool:
+    return _web_chat_server is not None and _web_chat_server.running
+
 # --- ☆ 其他类型消息处理 ☆ ---

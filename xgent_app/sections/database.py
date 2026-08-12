@@ -920,6 +920,7 @@ class UserDataManager:
     _data: Dict[str, Any] = {}
     _db: Optional[BotMemoryDB] = None
     _initialized = False
+    _init_lock: Optional[asyncio.Lock] = None
 
     @classmethod
     def _require_db(cls) -> BotMemoryDB:
@@ -929,12 +930,21 @@ class UserDataManager:
         return db
     
     @classmethod
+    def _get_init_lock(cls):
+        if cls._init_lock is None:
+            cls._init_lock = asyncio.Lock()
+        return cls._init_lock
+
+    @classmethod
     async def init(cls):
         if cls._initialized:
             return
-        cls._db = await BotMemoryDB.get_instance()
-        await cls._load_from_db()
-        cls._initialized = True
+        async with cls._get_init_lock():
+            if cls._initialized:
+                return
+            cls._db = await BotMemoryDB.get_instance()
+            await cls._load_from_db()
+            cls._initialized = True
     
     @classmethod
     async def _load_from_db(cls):
@@ -957,6 +967,18 @@ class UserDataManager:
                 await cls._require_db().get_config('text_stitch_mode', DEFAULT_TEXT_STITCH_MODE)
             ),
             'stream_timeout': normalize_stream_timeout(await cls._require_db().get_config('stream_timeout', 0)),
+            'thinking_level': normalize_thinking_level(
+                await cls._require_db().get_config('thinking_level', DEFAULT_THINKING_LEVEL)
+            ),
+            'web_enabled': normalize_bool(await cls._require_db().get_config('web_enabled', False), False),
+            'web_port': normalize_web_port(await cls._require_db().get_config('web_port', DEFAULT_WEB_PORT)),
+            'web_public_url': str(await cls._require_db().get_config('web_public_url', '') or ''),
+            'terminal_enabled': normalize_bool(await cls._require_db().get_config('terminal_enabled', False), False),
+            'silent_unauthorized': normalize_bool(await cls._require_db().get_config('silent_unauthorized', False), False),
+            # 只缓存"有没有设密码"这个布尔，哈希本身按需读库，不进内存快照。
+            '_web_has_password': bool(
+                await cls._require_db().get_config(WEB_PASSWORD_CONFIG_KEY, '')
+            ),
             'agent_command_timeout': normalize_command_timeout(
                 await cls._require_db().get_config('agent_command_timeout', DEFAULT_AGENT_COMMAND_TIMEOUT)
             ),

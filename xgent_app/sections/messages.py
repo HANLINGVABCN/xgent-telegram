@@ -115,6 +115,12 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
                 reply_markup=get_providers_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
+
+            # 记录导入成功到上下文，让 AI 知道用户已完成导入
+            await GlobalRecorder.record_system_message(
+                f"✅ 已成功通过文件导入 {result['count']} 个提供商配置（方式：{mode_label}，新增 {result['added']} 个，更新 {result['overwritten']} 个）。",
+                update.effective_chat.id
+            )
         except ValueError as e:
             await status_msg.edit_text(
                 f"❌ 导入失败：{safe_text(str(e))}\n\n请修正文件后重试，或发送 cancel 取消。",
@@ -557,6 +563,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         BotState.SET_COMMAND_BLACKLIST,
         # 搜索 Key 同样含下划线和连字符，必须保持原样。
         BotState.SET_SEARCH_KEY,
+        # 密码里的 _ - ` 被转义后会存成另一个字符串，用户永远登录不上。
+        BotState.SET_WEB_PASSWORD,
+        # URL 含下划线和连字符，转义会写出无法访问的地址。
+        BotState.SET_WEB_PUBLIC_URL,
     }
     text = ""
     if update.message.text:
@@ -633,6 +643,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             if state == BotState.SET_UPDATE_TOKEN
             else "[已填入搜索 API Key，内容已隐藏]"
             if state == BotState.SET_SEARCH_KEY
+            else "[已设置 Web 访问密码，内容已隐藏]"
+            if state == BotState.SET_WEB_PASSWORD
             else "[已提交提供商配置 JSON，内容已隐藏]"
             if state == BotState.IMPORT_PROVIDER_CONFIG
             else "[已填入 API Key，内容已隐藏]"
@@ -694,6 +706,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"默认项：{safe_text(restored)}{safe_text(skipped)}",
                 reply_markup=get_providers_menu(),
                 parse_mode=constants.ParseMode.HTML
+            )
+
+            # 记录导入成功到上下文，让 AI 知道用户已完成导入
+            await GlobalRecorder.record_system_message(
+                f"✅ 已成功通过文本导入 {result['count']} 个提供商配置（方式：{mode_label}，新增 {result['added']} 个，更新 {result['overwritten']} 个）。",
+                update.effective_chat.id
             )
         except ValueError as e:
             await status_msg.edit_text(
@@ -800,6 +818,63 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=get_search_settings_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
+        return
+
+    if state == BotState.SET_WEB_PASSWORD:
+        try:
+            await persist_web_password(text.strip())
+        except ValueError as e:
+            await update.message.reply_text(f"⚠️ {e}。请重新发送，或发送 cancel 取消。")
+            return
+        UserDataManager.set('state', BotState.IDLE)
+        await GlobalRecorder.record_system_op("设置 Web 访问密码")
+        # 密码变了要重启服务，否则旧进程还在用旧哈希校验。
+        await restart_web_chat(context.application)
+        await update.message.reply_text(
+            build_web_text(),
+            reply_markup=get_web_menu(),
+            parse_mode=constants.ParseMode.HTML
+        )
+        return
+
+    if state == BotState.SET_WEB_PORT:
+        try:
+            port = parse_web_port(text)
+        except ValueError:
+            await update.message.reply_text(
+                f"⚠️ 请输入 {MIN_WEB_PORT}-{MAX_WEB_PORT} 之间的端口号。"
+            )
+            return
+        UserDataManager.set('web_port', port)
+        UserDataManager.set('state', BotState.IDLE)
+        await UserDataManager.save_config('web_port', port)
+        await GlobalRecorder.record_system_op(f"设置 Web 端口: {port}")
+        await restart_web_chat(context.application)
+        await update.message.reply_text(
+            build_web_text(),
+            reply_markup=get_web_menu(),
+            parse_mode=constants.ParseMode.HTML
+        )
+        return
+
+    if state == BotState.SET_WEB_PUBLIC_URL:
+        try:
+            url = normalize_web_public_url(text)
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ 地址必须以 https:// 开头。\n"
+                "Telegram 的内嵌网页按钮只接受 HTTPS 地址。"
+            )
+            return
+        UserDataManager.set('web_public_url', url)
+        UserDataManager.set('state', BotState.IDLE)
+        await UserDataManager.save_config('web_public_url', url)
+        await GlobalRecorder.record_system_op("设置 Web 公开地址", {"url": url})
+        await update.message.reply_text(
+            build_web_text(),
+            reply_markup=get_web_menu(),
+            parse_mode=constants.ParseMode.HTML
+        )
         return
 
     if state == BotState.SET_PROMPT:
@@ -1464,25 +1539,42 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
                                agent_origin: Optional[AgentTurnOrigin] = None):
     """处理对话（全局模式 + Agent 协议执行：命令 / 读文件 / 发文件 / 写文件 / 媒体）"""
     global _is_processing, _stop_generation_event
-    async with _conversation_processing_lock:
-        if lock_acquired_event is not None:
-            lock_acquired_event.set()
-        _is_processing = True
-        _stop_generation_event = asyncio.Event()
 
-        try:
-            await _process_conversation_inner(
-                update,
-                context,
-                text,
-                content_override,
-                force_agent_mode,
-                reset_agent_iterations,
-                agent_origin,
-            )
-        finally:
-            _stop_generation_event = None
-            _is_processing = False
+    # TG -> Web 镜像：Web 运行中且本轮来自 Telegram（非网页 bot）时，临时把真实
+    # bot 的发送方法包成双通道，让网页同步看到这轮对话的 AI 输出；同时把用户消息
+    # 推一帧给网页。Web 发起的对话走 MirrorBot（Web->TG），这里会因标记位跳过。
+    restore_mirror = lambda: None
+    try:
+        # install 与 put 必须都在 try 内：若 put 抛异常，finally 仍能 restore，
+        # 否则补丁会残留，下次 install 把残留 wrapper 当“原方法”再次包裹，
+        # real_bot 被注入成 chat_id → “got multiple values for argument 'chat_id'”。
+        # 详见 web_bridge._ACTIVE_MIRRORS 的重入引用计数保护。
+        if is_web_chat_running() and not getattr(context.bot, "_is_xgent_web_bot", False):
+            _web_outbox = get_web_outbox()
+            if _web_outbox is not None:
+                restore_mirror = install_tg_to_web_mirror(get_web_real_bot(), _web_outbox)
+                _web_outbox.put({"type": "user_message", "text": str(text or ""), "ts": time.time()})
+        async with _conversation_processing_lock:
+            if lock_acquired_event is not None:
+                lock_acquired_event.set()
+            _is_processing = True
+            _stop_generation_event = asyncio.Event()
+
+            try:
+                await _process_conversation_inner(
+                    update,
+                    context,
+                    text,
+                    content_override,
+                    force_agent_mode,
+                    reset_agent_iterations,
+                    agent_origin,
+                )
+            finally:
+                _stop_generation_event = None
+                _is_processing = False
+    finally:
+        restore_mirror()
 
 
 async def _process_conversation_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
@@ -1681,9 +1773,11 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             # 命令执行期间保持聊天顶栏 typing 状态；max_duration 仅作异常防泄漏兜底，
             # 正常路径在操作循环结束后立即停止。
             typing_stop = asyncio.Event()
+            main_task = asyncio.current_task()
             typing_task = asyncio.create_task(
                 keep_typing_while_waiting(
-                    context, update.effective_chat.id, typing_stop, max_duration=1800.0
+                    context, update.effective_chat.id, typing_stop, max_duration=1800.0,
+                    watch_task=main_task
                 )
             )
 

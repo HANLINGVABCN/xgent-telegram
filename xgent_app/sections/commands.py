@@ -9,6 +9,7 @@ def build_start_menu_text() -> str:
     global_depth = UserDataManager.get('global_depth', 30)
     agent_mode = "开启 🟢" if UserDataManager.get('agent_mode', False) else "关闭 🔴"
     stitch_mode = get_text_stitch_mode_label()
+    thinking_level = get_thinking_level_label()
 
     welcome_msg = (
         f"<b>XGent for Telegram 已就绪</b>\n"
@@ -19,6 +20,7 @@ def build_start_menu_text() -> str:
         f"🖼️ 媒体模型: <b>{safe_text(media_model)}</b>\n"
         f"🌐 全局模式: <b>常驻开启</b>\n"
         f"🤖 Agent模式: <b>{agent_mode}</b>\n"
+        f"🧠 思考深度: <b>{safe_text(thinking_level)}</b>\n"
         f"🧩 文字拼接: <b>{safe_text(stitch_mode)}</b>\n"
         f"📊 全局记忆深度: <b>{global_depth}条</b>\n"
         f"💾 记忆系统: <b>异步SQLite + 内存缓存</b>\n"
@@ -485,6 +487,12 @@ async def send_provider_config_export(update: Update, context: ContextTypes.DEFA
     )
     await GlobalRecorder.record_system_op('导出提供商配置', {'count': len(providers)})
 
+    # 记录导出成功到上下文
+    await GlobalRecorder.record_system_message(
+        f"✅ 已成功导出 {len(providers)} 个提供商配置到 JSON 文件。文件包含完整 API Key。",
+        update.effective_chat.id
+    )
+
 
 async def cmd_provider_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
@@ -584,6 +592,26 @@ async def cmd_blacklist_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(
         build_command_blacklist_text(),
         reply_markup=get_command_blacklist_menu(),
+        parse_mode=constants.ParseMode.HTML
+    )
+
+async def cmd_web_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_authorized_user_middleware(update, context):
+        return
+    await UserDataManager.init()
+    await update.message.reply_text(
+        build_web_text(),
+        reply_markup=get_web_menu(),
+        parse_mode=constants.ParseMode.HTML
+    )
+
+async def cmd_thinking_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_authorized_user_middleware(update, context):
+        return
+    await UserDataManager.init()
+    await update.message.reply_text(
+        build_thinking_level_text(),
+        reply_markup=get_thinking_level_menu(),
         parse_mode=constants.ParseMode.HTML
     )
 

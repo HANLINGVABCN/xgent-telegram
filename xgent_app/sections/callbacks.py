@@ -162,6 +162,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=get_command_blacklist_menu()
             )
 
+            # 记录到上下文，让 AI 知道用户添加了黑名单
+            await GlobalRecorder.record_system_message(
+                f"✅ 已成功添加 {added} 条 Agent 命令黑名单（当前共 {len(AgentCommandBlacklist.get_patterns())} 条），已立即生效。",
+                query.message.chat.id
+            )
+
         elif data == "view_recommended_blacklist":
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ 追加推荐名单", callback_data="act_add_recommended_blacklist")],
@@ -184,6 +190,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 + build_command_blacklist_text("Agent 命令黑名单（已更新）"),
                 reply_markup=get_command_blacklist_menu(),
                 parse_mode=constants.ParseMode.HTML
+            )
+
+            # 记录到上下文
+            await GlobalRecorder.record_system_message(
+                f"✅ 已成功追加推荐 Agent 命令黑名单，新增 {added} 条。",
+                query.message.chat.id
             )
 
         elif data == "act_reload_command_blacklist":
@@ -217,6 +229,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 build_command_blacklist_text("Agent 命令黑名单（已清空）"),
                 reply_markup=get_command_blacklist_menu(),
                 parse_mode=constants.ParseMode.HTML
+            )
+
+            # 记录到上下文
+            await GlobalRecorder.record_system_message(
+                "✅ 已成功清空 Agent 命令黑名单。",
+                query.message.chat.id
             )
 
         # --- 凭据配置 ---
@@ -410,6 +428,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=get_memory_menu()
             )
 
+            # 记录到上下文，让 AI 知道用户添加了记忆
+            await GlobalRecorder.record_system_message(
+                f"✅ 已成功添加 1 条用户记忆（{len(buffer)} 字）到 system prompt。",
+                query.message.chat.id
+            )
+
         elif data == "act_list_memory":
             files = list_memory_files()
             if not files:
@@ -461,6 +485,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                     {"filename": filename}
                 )
                 await query.answer(f"已删除: {filename}", show_alert=False)
+
+                # 记录到上下文
+                await GlobalRecorder.record_system_message(
+                    f"✅ 已成功删除 1 条用户记忆（文件：{filename}）。",
+                    query.message.chat.id
+                )
             else:
                 await query.answer("删除失败：文件不存在", show_alert=True)
             # 回到删除菜单或记忆主页
@@ -506,6 +536,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode=constants.ParseMode.HTML
             )
 
+            # 记录到上下文
+            await GlobalRecorder.record_system_message(
+                f"✅ 已成功清空全部 {count} 条用户记忆。",
+                query.message.chat.id
+            )
+
 
         # --- Agent模式切换 ---
         elif data == "toggle_agent_mode":
@@ -543,6 +579,161 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode=constants.ParseMode.HTML
             )
         
+        # --- Web Chat ---
+        elif data == "menu_web":
+            UserDataManager.set('state', BotState.IDLE)
+            await query.message.edit_text(
+                build_web_text(),
+                reply_markup=get_web_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "toggle_web_enabled":
+            enabled = not normalize_bool(UserDataManager.get('web_enabled', False), False)
+            if enabled and not UserDataManager.get('_web_has_password', False):
+                await query.answer("请先设置访问密码", show_alert=True)
+                return
+            UserDataManager.set('web_enabled', enabled)
+            await UserDataManager.save_config('web_enabled', enabled)
+            # 解耦: 只在服务器运行状态需要改变时才 start/stop, 不无谓 restart
+            running = is_web_chat_running()
+            term_still_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
+            if enabled or term_still_on:
+                if not running:
+                    await start_web_chat_if_enabled(context.application)
+            else:
+                if running:
+                    await stop_web_chat()
+            await GlobalRecorder.record_system_op(
+                f"Web Chat {'开启' if enabled else '关闭'}",
+                {"web_enabled": enabled}
+            )
+            await query.message.edit_text(
+                build_web_text(),
+                reply_markup=get_web_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "act_set_web_password":
+            UserDataManager.set('state', BotState.SET_WEB_PASSWORD)
+            await query.message.reply_text(
+                "🔑 <b>设置 Web 访问密码</b>\n"
+                "━━━━━━━━━━━━━━\n"
+                "请发送新密码（至少 6 位）。\n\n"
+                "密码只以 PBKDF2 哈希形式存进数据库，聊天记录里不会保留原文。\n"
+                "保存后会自动重启 Web 服务使其生效。\n"
+                "━━━━━━━━━━━━━━\n"
+                "<i>发送 cancel 取消。</i>",
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "act_set_web_port":
+            UserDataManager.set('state', BotState.SET_WEB_PORT)
+            await query.message.reply_text(
+                f"🔌 请输入监听端口（{MIN_WEB_PORT}-{MAX_WEB_PORT}）。\n"
+                f"当前：{normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))}。\n"
+                "发送 cancel 取消。"
+            )
+
+        elif data == "act_set_web_public_url":
+            UserDataManager.set('state', BotState.SET_WEB_PUBLIC_URL)
+            await query.message.reply_text(
+                "🌐 <b>设置公开访问地址</b>\n"
+                "━━━━━━━━━━━━━━\n"
+                "请发送反向代理的完整地址，必须以 <code>https://</code> 开头。\n"
+                "例如：<code>https://chat.example.com</code>\n\n"
+                "Telegram 的内嵌网页按钮只接受 HTTPS 地址；配置后 /start 里的 Web 按钮"
+                "就能直接在 Telegram 内弹出页面。\n"
+                "━━━━━━━━━━━━━━\n"
+                "<i>发送 cancel 取消。</i>",
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "confirm_clear_web_password":
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ 确认清除", callback_data="do_clear_web_password")],
+                [InlineKeyboardButton("🔙 返回", callback_data="menu_web")]
+            ])
+            await query.message.edit_text(
+                "⚠️ <b>确认清除 Web 访问密码？</b>\n\n"
+                "清除后 Web 服务会立即停止，直到重新设置密码。",
+                reply_markup=kb,
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "do_clear_web_password":
+            await clear_web_password()
+            # 没有密码就不能继续对外服务，连同开关一起关掉。
+            UserDataManager.set('web_enabled', False)
+            await UserDataManager.save_config('web_enabled', False)
+            await stop_web_chat()
+            await GlobalRecorder.record_system_op("清除 Web 访问密码并停止服务")
+            await query.message.edit_text(
+                build_web_text(),
+                reply_markup=get_web_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "do_clear_web_public_url":
+            UserDataManager.set('web_public_url', '')
+            await UserDataManager.save_config('web_public_url', '')
+            await GlobalRecorder.record_system_op("清除 Web 公开地址")
+            await query.message.edit_text(
+                build_web_text(),
+                reply_markup=get_web_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "toggle_terminal_enabled":
+            term_on = not normalize_bool(UserDataManager.get('terminal_enabled', False), False)
+            if term_on and not UserDataManager.get('_web_has_password', False):
+                await query.answer("请先设置访问密码", show_alert=True)
+                return
+            UserDataManager.set('terminal_enabled', term_on)
+            await UserDataManager.save_config('terminal_enabled', term_on)
+            # 解耦: 终端与 Web 共享服务器但独立开关
+            running = is_web_chat_running()
+            web_still_on = normalize_bool(UserDataManager.get('web_enabled', False), False)
+            if term_on or web_still_on:
+                if not running:
+                    await start_web_chat_if_enabled(context.application)
+            else:
+                if running:
+                    await stop_web_chat()
+            await GlobalRecorder.record_system_op(
+                f"终端{'开启' if term_on else '关闭'}",
+                {"terminal_enabled": term_on}
+            )
+            await query.message.edit_text(
+                build_web_text(),
+                reply_markup=get_web_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        # --- 思考深度 ---
+        elif data == "menu_thinking_level":
+            await query.message.edit_text(
+                build_thinking_level_text(),
+                reply_markup=get_thinking_level_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data.startswith("set_thinking_level:"):
+            level = normalize_thinking_level(data.split(":", 1)[1])
+            UserDataManager.set('thinking_level', level)
+            await UserDataManager.save_config('thinking_level', level)
+            # 换档位后允许重新试探：之前被记为"不支持"的模型可能只是不支持旧档位。
+            ModelClient._thinking_unsupported.clear()
+            await GlobalRecorder.record_system_op(
+                f"设置思考深度: {get_thinking_level_label(level)}",
+                {"thinking_level": level}
+            )
+            await query.message.edit_text(
+                build_thinking_level_text(),
+                reply_markup=get_thinking_level_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
         # --- 超时设置 ---
         elif data == "menu_timeout_settings":
             await query.message.edit_text(
@@ -708,6 +899,22 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         # --- 提示词菜单 ---
         elif data == "menu_prompts":
+            await query.message.edit_text(
+                "📝 <b>提示词设置</b>\n\n选择要查看或修改的提示词。",
+                reply_markup=get_prompts_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "toggle_silent_unauthorized":
+            # 未授权静默：开启后未授权用户发消息不回复（仍记录+通知授权用户）。
+            on = not normalize_bool(UserDataManager.get('silent_unauthorized', False), False)
+            UserDataManager.set('silent_unauthorized', on)
+            await UserDataManager.save_config('silent_unauthorized', on)
+            await GlobalRecorder.record_system_op(
+                f"未授权静默模式{'开启' if on else '关闭'}",
+                {"silent_unauthorized": on}
+            )
+            await query.answer(f"已{'开启' if on else '关闭'}静默", show_alert=False)
             await query.message.edit_text(
                 "📝 <b>提示词设置</b>\n\n选择要查看或修改的提示词。",
                 reply_markup=get_prompts_menu(),
@@ -1006,9 +1213,11 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             await query.message.edit_text(
                 f"📥 <b>{mode_label}</b>\n\n"
-                "请发送由本 Bot 导出的 <code>提供商配置-*.json</code> 文件，"
-                "也可以直接粘贴完整 JSON。\n\n"
+                "💡 <b>支持两种导入方式</b>：\n"
+                "1️⃣ <b>发送文件</b>：直接发送导出的 .json 文件\n"
+                "2️⃣ <b>粘贴文本</b>：复制 JSON 内容，直接发送为文本消息\n\n"
                 f"{mode_note}"
+                "✅ <b>优势</b>：文本方式不受 Telegram 文件大小限制，适合大型配置。\n\n"
                 "只有有效的默认模型选择才会恢复。\n"
                 "配置内含 API Key，请仅在私聊中操作。\n\n"
                 "发送 <code>cancel</code> 可取消。",

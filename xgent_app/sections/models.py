@@ -242,6 +242,10 @@ class ModelClient:
             pieces = [ModelClient._model_content_to_text(part) for part in content]
             return "\n".join(piece for piece in pieces if piece)
         if isinstance(content, dict):
+            # Gemini 的思考分片长得跟正文分片一模一样，只差一个 thought: true。
+            # 不过滤就会把思考内容混进回复正文、写进记忆、下一轮再发回给模型。
+            if content.get('thought') is True:
+                return ""
             pieces: List[str] = []
             text = content.get('text') or content.get('output_text')
             if text:
@@ -306,6 +310,112 @@ class ModelClient:
             configured_timeout = normalize_stream_timeout(UserDataManager.get('stream_timeout', 0))
             read_timeout = None if configured_timeout <= 0 else configured_timeout
         return httpx.Timeout(connect=20.0, read=read_timeout, write=60.0, pool=60.0)
+
+    # --- ☆ 思考深度参数 ☆ ---
+    # 提供商拒绝过思考参数的 (provider_key, model) 组合。降级重试成功后记进来，
+    # 后续同组合直接跳过，不再每轮白试一次。
+    _thinking_unsupported: set = set()
+
+    @staticmethod
+    def _thinking_reject_key(prov_name: str, model: str) -> str:
+        return f"{prov_name}\x00{model}"
+
+    @staticmethod
+    def _is_thinking_rejection(error_text: str) -> bool:
+        """判断报错是否由思考参数引起，用于决定要不要去掉参数重试。"""
+        lowered = str(error_text or "").lower()
+        markers = (
+            "thinking", "budget_tokens", "thinkingbudget", "thinking_config",
+            "reasoning_effort", "reasoning", "thinkingconfig",
+        )
+        return any(marker in lowered for marker in markers)
+
+    @staticmethod
+    def _build_thinking_params(api_format: str, model: str, base_url: str = "",
+                               prov_name: str = "") -> Dict[str, Any]:
+        """把全局思考档位翻译成当前提供商格式的请求字段。
+
+        返回值直接合并进请求体。返回空字典表示「什么都不发」——AUTO 档位、
+        已知不支持的 provider+model 组合，以及无法映射的格式都走这条路。
+
+        Claude 的返回值里会带 max_tokens：Anthropic 要求 max_tokens > budget_tokens，
+        沿用调用点硬编码的 4096 会直接 400。
+        """
+        level = normalize_thinking_level(UserDataManager.get('thinking_level'))
+        if level == THINKING_LEVEL_AUTO:
+            return {}
+
+        if prov_name and ModelClient._thinking_reject_key(prov_name, model) in ModelClient._thinking_unsupported:
+            return {}
+
+        profile = classify_provider_mode(api_format, base_url)
+
+        if profile in {'gemini', 'vertex'}:
+            # Gemini 是唯一能显式关闭思考的格式（预算 0）。
+            if level == THINKING_LEVEL_OFF:
+                return {"generationConfig": {"thinkingConfig": {"thinkingBudget": 0}}}
+            budget = THINKING_LEVEL_SPECS[level]["budget"]
+            # includeThoughts 保持关闭：思考内容不展示，只统计 token。
+            return {"generationConfig": {"thinkingConfig": {"thinkingBudget": budget}}}
+
+        if profile == 'claude':
+            # Anthropic 没有「显式关闭」，不发字段就是关闭。
+            if level == THINKING_LEVEL_OFF:
+                return {}
+            budget = THINKING_LEVEL_SPECS[level]["budget"]
+            if budget < 0:
+                budget = CLAUDE_THINKING_DYNAMIC_BUDGET
+            return {
+                "thinking": {"type": "enabled", "budget_tokens": budget},
+                "max_tokens": max(budget + CLAUDE_THINKING_ANSWER_HEADROOM, CLAUDE_DEFAULT_MAX_TOKENS),
+            }
+
+        # 以下都是 OpenAI 兼容形状。
+        if level == THINKING_LEVEL_OFF:
+            # 只有 OpenRouter 能显式关闭；其余格式没有对应字段，不发即可。
+            if 'openrouter.ai' in (base_url or '').lower():
+                return {"reasoning": {"enabled": False}}
+            return {}
+
+        effort = THINKING_LEVEL_SPECS[level]["effort"]
+        if 'openrouter.ai' in (base_url or '').lower():
+            # OpenRouter 的 reasoning.effort 只认 low/medium/high。
+            return {"reasoning": {"effort": "high" if effort in {"xhigh", "max"} else effort}}
+        return {"reasoning_effort": effort}
+
+    @staticmethod
+    def _merge_thinking_params(body: Dict[str, Any], thinking: Dict[str, Any]) -> None:
+        """把思考参数并进请求体；generationConfig 走深合并，别覆盖 temperature。"""
+        for key, value in thinking.items():
+            if key == "generationConfig" and isinstance(body.get(key), dict):
+                for sub_key, sub_value in value.items():
+                    body[key][sub_key] = sub_value
+                continue
+            body[key] = value
+
+    @staticmethod
+    def _strip_thinking_params(body: Dict[str, Any], thinking: Dict[str, Any],
+                               prov_name: str, model: str) -> bool:
+        """降级：从请求体里去掉思考参数，并记住这个组合不支持。
+
+        返回 False 表示本来就没加过思考参数，调用方不该重试。
+        """
+        if not thinking:
+            return False
+        for key, value in thinking.items():
+            if key == "generationConfig" and isinstance(body.get(key), dict):
+                for sub_key in value:
+                    body[key].pop(sub_key, None)
+                continue
+            if key == "max_tokens":
+                # Claude 的 max_tokens 是伴随思考抬上去的，回落到原默认值。
+                body[key] = CLAUDE_DEFAULT_MAX_TOKENS
+                continue
+            body.pop(key, None)
+        if prov_name:
+            ModelClient._thinking_unsupported.add(ModelClient._thinking_reject_key(prov_name, model))
+        logger.info(f"Provider {prov_name or '?'} / {model} 不支持思考参数，已降级重试并记住该组合")
+        return True
 
     @staticmethod
     def _openai_compatible_headers(api_key: str, accept: str = "application/json") -> Dict[str, str]:
@@ -408,6 +518,10 @@ class ModelClient:
         }
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
+        thinking_params = ModelClient._build_thinking_params(
+            'openai_compatible', model, base_url, prov_name
+        )
+        ModelClient._merge_thinking_params(body, thinking_params)
 
         write_model_trace("model_request", {
             "trace_id": trace_id,
@@ -426,6 +540,15 @@ class ModelClient:
                     headers=ModelClient._openai_compatible_headers(api_key),
                     timeout=ModelClient._build_stream_timeout(),
                 )
+                # 提供商拒绝思考参数时去掉重发一次，避免整轮对话失败。
+                if resp.status_code >= 400 and ModelClient._is_thinking_rejection(resp.text or ''):
+                    if ModelClient._strip_thinking_params(body, thinking_params, prov_name, model):
+                        resp = await client.post(
+                            url,
+                            json=body,
+                            headers=ModelClient._openai_compatible_headers(api_key),
+                            timeout=ModelClient._build_stream_timeout(),
+                        )
             if resp.status_code >= 400:
                 error_text = redact_sensitive_text(resp.text or '')
                 write_model_trace("model_error", {
@@ -500,6 +623,10 @@ class ModelClient:
         }
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
+        thinking_params = ModelClient._build_thinking_params(
+            'openai_compatible', model, base_url, prov_name
+        )
+        ModelClient._merge_thinking_params(body, thinking_params)
 
         write_model_trace("model_request", {
             "trace_id": trace_id,
@@ -513,41 +640,51 @@ class ModelClient:
         yielded_any_text = False
         try:
             async with ModelClient._http_client_context() as client:
-                async with client.stream(
-                    "POST",
-                    url,
-                    json=body,
-                    headers=ModelClient._openai_compatible_headers(api_key, "text/event-stream"),
-                    timeout=ModelClient._build_stream_timeout(),
-                ) as resp:
-                    if resp.status_code >= 400:
-                        error_body = await resp.aread()
-                        error_text = redact_sensitive_text(error_body.decode(errors='replace'))
-                        write_model_trace("model_error", {
-                            "trace_id": trace_id,
-                            "provider": prov_name,
-                            "provider_format": "openai_compatible_http",
-                            "model": model,
-                            "stream": True,
-                            "status_code": resp.status_code,
-                            "error": error_text,
-                        })
-                        yield f"OpenAI compatible API error ({resp.status_code}): {error_text}"
-                        return
+                # 最多两轮：第一轮带思考参数，被拒时去掉参数重开一次流。
+                for attempt in range(2):
+                    async with client.stream(
+                        "POST",
+                        url,
+                        json=body,
+                        headers=ModelClient._openai_compatible_headers(api_key, "text/event-stream"),
+                        timeout=ModelClient._build_stream_timeout(),
+                    ) as resp:
+                        if resp.status_code >= 400:
+                            error_body = await resp.aread()
+                            error_text = redact_sensitive_text(error_body.decode(errors='replace'))
+                            if (
+                                attempt == 0
+                                and ModelClient._is_thinking_rejection(error_text)
+                                and ModelClient._strip_thinking_params(body, thinking_params, prov_name, model)
+                            ):
+                                continue
+                            write_model_trace("model_error", {
+                                "trace_id": trace_id,
+                                "provider": prov_name,
+                                "provider_format": "openai_compatible_http",
+                                "model": model,
+                                "stream": True,
+                                "status_code": resp.status_code,
+                                "error": error_text,
+                            })
+                            yield f"OpenAI compatible API error ({resp.status_code}): {error_text}"
+                            return
 
-                    async for payload in ModelClient._iter_sse_payloads(resp):
-                        if payload == '[DONE]':
-                            break
-                        try:
-                            data = json.loads(payload)
-                        except json.JSONDecodeError:
-                            logger.debug(f"OpenAI compatible SSE parse failed: {payload[:200]}")
-                            continue
-                        record_token_usage(usage_sink, data.get("usage"))
-                        text = ModelClient._extract_openai_compatible_text(data)
-                        if text:
-                            yielded_any_text = True
-                            yield text
+                        async for payload in ModelClient._iter_sse_payloads(resp):
+                            if payload == '[DONE]':
+                                break
+                            try:
+                                data = json.loads(payload)
+                            except json.JSONDecodeError:
+                                logger.debug(f"OpenAI compatible SSE parse failed: {payload[:200]}")
+                                continue
+                            record_token_usage(usage_sink, data.get("usage"))
+                            text = ModelClient._extract_openai_compatible_text(data)
+                            if text:
+                                yielded_any_text = True
+                                yield text
+                    # 流正常跑完，不要进入第二轮重试。
+                    break
 
             if not yielded_any_text:
                 text, error = await ModelClient._complete_openai_compatible_http(
@@ -605,7 +742,8 @@ class ModelClient:
                                system_prompt: str, history: list,
                                max_tokens: Optional[int] = None,
                                usage_sink: Optional[List[Dict[str, int]]] = None,
-                               trace_id: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+                               trace_id: Optional[str] = None,
+                               prov_name: str = "") -> Tuple[Optional[str], Optional[str]]:
         import httpx
 
         url = f"{base_url.rstrip('/')}/models/{model}:generateContent"
@@ -627,6 +765,10 @@ class ModelClient:
                 }
                 if system_prompt:
                     body["systemInstruction"] = {"parts": [{"text": system_prompt}]}
+                thinking_params = ModelClient._build_thinking_params(
+                    'gemini', model, base_url, prov_name
+                )
+                ModelClient._merge_thinking_params(body, thinking_params)
                 write_model_trace("model_request", {
                     "trace_id": trace_id,
                     "provider_format": "gemini",
@@ -640,6 +782,14 @@ class ModelClient:
                     headers=headers,
                     timeout=ModelClient._build_stream_timeout(),
                 )
+                if resp.status_code != 200 and ModelClient._is_thinking_rejection(resp.text or ''):
+                    if ModelClient._strip_thinking_params(body, thinking_params, prov_name, model):
+                        resp = await client.post(
+                            url,
+                            json=body,
+                            headers=headers,
+                            timeout=ModelClient._build_stream_timeout(),
+                        )
 
                 if resp.status_code != 200:
                     error_text = redact_sensitive_text(resp.text or '')
@@ -699,7 +849,8 @@ class ModelClient:
                                system_prompt: str, history: list,
                                max_tokens: Optional[int] = None,
                                usage_sink: Optional[List[Dict[str, int]]] = None,
-                               trace_id: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+                               trace_id: Optional[str] = None,
+                               prov_name: str = "") -> Tuple[Optional[str], Optional[str]]:
         import httpx
 
         url = f"{base_url.rstrip('/')}/messages"
@@ -716,8 +867,17 @@ class ModelClient:
                     "model": model,
                     "system": system_prompt,
                     "messages": ModelClient._build_claude_messages(history),
-                    "max_tokens": max_tokens if max_tokens is not None else 4096,
+                    "max_tokens": max_tokens if max_tokens is not None else CLAUDE_DEFAULT_MAX_TOKENS,
                 }
+                # Claude 的思考参数会连带把 max_tokens 抬到 budget 之上（API 硬性要求）。
+                thinking_params = ModelClient._build_thinking_params(
+                    'claude', model, base_url, prov_name
+                )
+                if thinking_params and max_tokens is not None:
+                    # 调用方显式给了上限时以调用方为准，但仍要保证大于 budget。
+                    budget = thinking_params["thinking"]["budget_tokens"]
+                    thinking_params["max_tokens"] = max(max_tokens, budget + CLAUDE_THINKING_ANSWER_HEADROOM)
+                ModelClient._merge_thinking_params(body, thinking_params)
                 write_model_trace("model_request", {
                     "trace_id": trace_id,
                     "provider_format": "claude",
@@ -731,6 +891,16 @@ class ModelClient:
                     headers=headers,
                     timeout=ModelClient._build_stream_timeout(),
                 )
+                if resp.status_code != 200 and ModelClient._is_thinking_rejection(resp.text or ''):
+                    if ModelClient._strip_thinking_params(body, thinking_params, prov_name, model):
+                        if max_tokens is not None:
+                            body["max_tokens"] = max_tokens
+                        resp = await client.post(
+                            url,
+                            json=body,
+                            headers=headers,
+                            timeout=ModelClient._build_stream_timeout(),
+                        )
 
                 if resp.status_code != 200:
                     error_text = redact_sensitive_text(resp.text or '')
@@ -923,18 +1093,18 @@ class ModelClient:
                                       trace_id: Optional[str] = None):
         """流式回复生成器 - 支持多种 API 格式"""
         if api_format in {'gemini', 'vertex'}:
-            async for chunk in ModelClient._stream_gemini(api_key, base_url, model, system_prompt, history, max_tokens, usage_sink, trace_id):
+            async for chunk in ModelClient._stream_gemini(api_key, base_url, model, system_prompt, history, max_tokens, usage_sink, trace_id, prov_name):
                 yield chunk
             return
         elif api_format == 'claude':
-            async for chunk in ModelClient._stream_claude(api_key, base_url, model, system_prompt, history, max_tokens, usage_sink, trace_id):
+            async for chunk in ModelClient._stream_claude(api_key, base_url, model, system_prompt, history, max_tokens, usage_sink, trace_id, prov_name):
                 yield chunk
             return
         elif api_format == 'openai_compatible':
             async for chunk in ModelClient._stream_openai_compatible_http(api_key, base_url, model, system_prompt, history, max_tokens, usage_sink, trace_id, prov_name):
                 yield chunk
             return
-        
+
         # OpenAI 兼容格式
         client = PortalManager.get_portal(prov_name, api_key, base_url)
         messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
@@ -943,7 +1113,7 @@ class ModelClient:
                 "role": msg['role'],
                 "content": ModelClient._to_openai_content(msg['content'])
             })
-        
+
         try:
             request_kwargs = {
                 "model": model,
@@ -953,6 +1123,10 @@ class ModelClient:
             }
             if max_tokens is not None:
                 request_kwargs["max_tokens"] = max_tokens
+            thinking_params = ModelClient._build_thinking_params(
+                api_format, model, base_url, prov_name
+            )
+            ModelClient._merge_thinking_params(request_kwargs, thinking_params)
             write_model_trace("model_request", {
                 "trace_id": trace_id,
                 "provider": prov_name,
@@ -969,10 +1143,21 @@ class ModelClient:
                 )
             except Exception as e:
                 err_text = str(e).lower()
-                if "stream_options" not in err_text and "include_usage" not in err_text:
+                # 思考参数被拒：去掉后重试一次，避免整轮对话失败。
+                if ModelClient._is_thinking_rejection(err_text) and ModelClient._strip_thinking_params(
+                    request_kwargs, thinking_params, prov_name, model
+                ):
+                    if max_tokens is None:
+                        request_kwargs.pop("max_tokens", None)
+                    stream = await ModelClient._chat_completions_api(client).create(
+                        **request_kwargs,
+                        stream_options={"include_usage": True}
+                    )
+                elif "stream_options" not in err_text and "include_usage" not in err_text:
                     raise
-                logger.info(f"Provider {prov_name} does not support stream usage metadata; retrying without it")
-                stream = await ModelClient._chat_completions_api(client).create(**request_kwargs)
+                else:
+                    logger.info(f"Provider {prov_name} does not support stream usage metadata; retrying without it")
+                    stream = await ModelClient._chat_completions_api(client).create(**request_kwargs)
             
             # 用 async with 持有 stream：async for 中途抛错或生成器被提前关闭时，
             # 底层响应也能确定性释放，不依赖 GC。
@@ -1001,10 +1186,11 @@ class ModelClient:
     async def _stream_gemini(api_key: str, base_url: str, model: str,
                               system_prompt: str, history: list, max_tokens: Optional[int] = None,
                               usage_sink: Optional[List[Dict[str, int]]] = None,
-                              trace_id: Optional[str] = None):
+                              trace_id: Optional[str] = None,
+                              prov_name: str = ""):
         """Google 原生 Gemini 流式回复（Gemini / Vertex 通用）"""
         import httpx
-        
+
         # 构建 Gemini 格式消息
         contents = []
         for msg in ModelClient.clean_memories(history):
@@ -1012,7 +1198,7 @@ class ModelClient:
             parts = ModelClient._to_gemini_parts(msg['content'])
             if parts:
                 contents.append({"role": role, "parts": parts})
-        
+
         url = f"{base_url.rstrip('/')}/models/{model}:streamGenerateContent?alt=sse"
         headers = {**PROVIDER_HTTP_HEADERS, "Accept": "text/event-stream", "x-goog-api-key": api_key}
         body = {
@@ -1031,6 +1217,10 @@ class ModelClient:
             body["systemInstruction"] = {"parts": [{"text": system_prompt}]}
         if max_tokens is not None:
             body["generationConfig"]["maxOutputTokens"] = max_tokens
+        thinking_params = ModelClient._build_thinking_params(
+            'gemini', model, base_url, prov_name
+        )
+        ModelClient._merge_thinking_params(body, thinking_params)
         write_model_trace("model_request", {
             "trace_id": trace_id,
             "provider_format": "gemini",
@@ -1038,12 +1228,14 @@ class ModelClient:
             "stream": True,
             "request_body": body,
         })
-        
+
         try:
             event_count = 0
             text_event_count = 0
             last_payload_time = time.monotonic()
             async with ModelClient._http_client_context() as client:
+              # 最多两轮：第一轮带思考参数，被拒时去掉参数重开一次流。
+              for attempt in range(2):
                 async with client.stream(
                     'POST',
                     url,
@@ -1054,6 +1246,12 @@ class ModelClient:
                     if resp.status_code != 200:
                         error_body = await resp.aread()
                         error_text = redact_sensitive_text(error_body.decode(errors='replace'))
+                        if (
+                            attempt == 0
+                            and ModelClient._is_thinking_rejection(error_text)
+                            and ModelClient._strip_thinking_params(body, thinking_params, prov_name, model)
+                        ):
+                            continue
                         write_model_trace("model_error", {
                             "trace_id": trace_id,
                             "provider_format": "gemini",
@@ -1103,6 +1301,8 @@ class ModelClient:
                                 )
                         else:
                             logger.warning(f"Gemini event #{event_count} had no candidates: {payload[:200]}")
+                # 流正常跑完，不要进入第二轮重试。
+                break
         except httpx.ReadTimeout as e:
             logger.error(f"Gemini Stream Read Timeout: {e}")
             yield "📖 Gemini 流式连接超时，像是线路在回复途中被中断了，请稍后再试试"
@@ -1121,10 +1321,11 @@ class ModelClient:
     async def _stream_claude(api_key: str, base_url: str, model: str,
                               system_prompt: str, history: list, max_tokens: Optional[int] = None,
                               usage_sink: Optional[List[Dict[str, int]]] = None,
-                              trace_id: Optional[str] = None):
+                              trace_id: Optional[str] = None,
+                              prov_name: str = ""):
         """Claude (Anthropic) 流式回复"""
         import httpx
-        
+
         messages = []
         for msg in ModelClient.clean_memories(history):
             # Claude 消息仅支持 user/assistant；系统旁白（[系统操作] 前缀）降级为 user 保留内容
@@ -1146,10 +1347,18 @@ class ModelClient:
             "model": model,
             "messages": messages,
             "stream": True,
-            "max_tokens": max_tokens if max_tokens is not None else 4096,
+            "max_tokens": max_tokens if max_tokens is not None else CLAUDE_DEFAULT_MAX_TOKENS,
         }
         if system_prompt:
             body["system"] = system_prompt
+        # Claude 的思考参数会连带把 max_tokens 抬到 budget 之上（API 硬性要求）。
+        thinking_params = ModelClient._build_thinking_params(
+            'claude', model, base_url, prov_name
+        )
+        if thinking_params and max_tokens is not None:
+            budget = thinking_params["thinking"]["budget_tokens"]
+            thinking_params["max_tokens"] = max(max_tokens, budget + CLAUDE_THINKING_ANSWER_HEADROOM)
+        ModelClient._merge_thinking_params(body, thinking_params)
         write_model_trace("model_request", {
             "trace_id": trace_id,
             "provider_format": "claude",
@@ -1157,9 +1366,11 @@ class ModelClient:
             "stream": True,
             "request_body": body,
         })
-        
+
         try:
             async with ModelClient._http_client_context() as client:
+              # 最多两轮：第一轮带思考参数，被拒时去掉参数重开一次流。
+              for attempt in range(2):
                 async with client.stream(
                     'POST',
                     url,
@@ -1170,6 +1381,14 @@ class ModelClient:
                     if resp.status_code != 200:
                         error_body = await resp.aread()
                         error_text = redact_sensitive_text(error_body.decode(errors='replace'))
+                        if (
+                            attempt == 0
+                            and ModelClient._is_thinking_rejection(error_text)
+                            and ModelClient._strip_thinking_params(body, thinking_params, prov_name, model)
+                        ):
+                            if max_tokens is not None:
+                                body["max_tokens"] = max_tokens
+                            continue
                         write_model_trace("model_error", {
                             "trace_id": trace_id,
                             "provider_format": "claude",
@@ -1197,9 +1416,17 @@ class ModelClient:
                         record_token_usage(usage_sink, data.get('usage'))
 
                         if data.get('type') == 'content_block_delta':
-                            text = data.get('delta', {}).get('text', '')
+                            delta = data.get('delta') or {}
+                            # thinking_delta 的文本在 delta.thinking 里，不是 delta.text。
+                            # 思考内容不展示也不写入记忆，这里显式跳过，避免以后被"顺手"
+                            # 改成读整个 delta 而把思考混进正文。
+                            if delta.get('type') in {'thinking_delta', 'signature_delta'}:
+                                continue
+                            text = delta.get('text', '')
                             if text:
                                 yield text
+                # 流正常跑完，不要进入第二轮重试。
+                break
         except httpx.ReadTimeout as e:
             logger.error(f"Claude Stream Read Timeout: {e}")
             yield "📖 Claude 流式连接超时，线路可能在回复途中被打断了，请稍后再试试"
@@ -1224,11 +1451,11 @@ class ModelClient:
         """非流式回复（备用）"""
         if api_format in {'gemini', 'vertex'}:
             return await ModelClient._complete_gemini(
-                api_key, base_url, model, system_prompt, history, max_tokens, usage_sink, trace_id
+                api_key, base_url, model, system_prompt, history, max_tokens, usage_sink, trace_id, prov_name
             )
         if api_format == 'claude':
             return await ModelClient._complete_claude(
-                api_key, base_url, model, system_prompt, history, max_tokens, usage_sink, trace_id
+                api_key, base_url, model, system_prompt, history, max_tokens, usage_sink, trace_id, prov_name
             )
         if api_format == 'openai_compatible':
             return await ModelClient._complete_openai_compatible_http(
@@ -1242,7 +1469,7 @@ class ModelClient:
                 "role": msg['role'],
                 "content": ModelClient._to_openai_content(msg['content'])
             })
-        
+
         try:
             started_at = time.monotonic()
             request_kwargs = {
@@ -1252,6 +1479,10 @@ class ModelClient:
             }
             if max_tokens is not None:
                 request_kwargs["max_tokens"] = max_tokens
+            thinking_params = ModelClient._build_thinking_params(
+                api_format, model, base_url, prov_name
+            )
+            ModelClient._merge_thinking_params(request_kwargs, thinking_params)
             write_model_trace("model_request", {
                 "trace_id": trace_id,
                 "provider": prov_name,
@@ -1262,10 +1493,24 @@ class ModelClient:
             })
             # 必须显式设超时：连接静默中断（TCP 半开、代理丢包）时 SDK 默认会
             # 一直挂着，非流式又没有增量输出，界面会永远停在“非流式输出中...”。
-            completion = await ModelClient._chat_completions_api(client).create(
-                **request_kwargs,
-                timeout=ModelClient._build_stream_timeout(),
-            )
+            try:
+                completion = await ModelClient._chat_completions_api(client).create(
+                    **request_kwargs,
+                    timeout=ModelClient._build_stream_timeout(),
+                )
+            except Exception as e:
+                # 思考参数被拒：去掉后重试一次，避免整轮对话失败。
+                if not (
+                    ModelClient._is_thinking_rejection(str(e))
+                    and ModelClient._strip_thinking_params(request_kwargs, thinking_params, prov_name, model)
+                ):
+                    raise
+                if max_tokens is None:
+                    request_kwargs.pop("max_tokens", None)
+                completion = await ModelClient._chat_completions_api(client).create(
+                    **request_kwargs,
+                    timeout=ModelClient._build_stream_timeout(),
+                )
             if not completion or not completion.choices:
                 return None, "对方暂时没反应，用户稍后再试试？"
             record_token_usage(usage_sink, _value_from_obj(completion, 'usage'))
@@ -1273,11 +1518,14 @@ class ModelClient:
             choice = completion.choices[0]
             content = ModelClient._model_content_to_text(choice.message.content)
             if not content:
+                # 兜底只看 dump 的 content 字段：整份 dump 里还有 reasoning_content
+                # 之类的思考字段，直接喂给 _model_content_to_text 会把思考当成答案返回。
                 try:
                     message_dump = choice.message.model_dump()
                 except Exception:
                     message_dump = {}
-                content = ModelClient._model_content_to_text(message_dump)
+                if isinstance(message_dump, dict):
+                    content = ModelClient._model_content_to_text(message_dump.get('content'))
             if not content:
                 return None, "对方暂时没反应，用户稍后再试试？"
 

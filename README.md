@@ -56,6 +56,8 @@ AI：当前主要问题是 /var/log 占用增长过快……
 - **真实 Agent 执行**：运行一次性命令，管理交互式或持续输出的 Shell 会话。
 - **服务器文件操作**：读取、创建、覆盖和发送服务器文件，命令完整输出自动归档。
 - **多模型提供商**：支持 OpenAI、OpenAI 兼容接口、Gemini、Vertex 和 Claude。
+- **思考深度控制**：8 档全局思考深度，按提供商自动翻译成 `thinking.budget_tokens`、`thinkingConfig.thinkingBudget`、`reasoning_effort` 或 `reasoning.effort`。
+- **网页版聊天**：可选的本地 Web 界面，与 Telegram 共享同一套对话核心、记忆与 Agent 能力，可作为 Telegram Web App 内嵌打开。
 - **对话与媒体模型分离**：可分别设置默认聊天模型和默认媒体模型。
 - **全局记忆**：使用 SQLite 保存对话、系统操作、按钮操作和 Agent 结果。
 - **多模态上下文**：接收文件、图片和贴纸，并按路径索引保存上下文。
@@ -176,6 +178,8 @@ UPDATE_ZIP_URL=https://api.github.com/repos/HANLINGVABCN/xgent-telegram/zipball/
 | `/clear_memory` | 清空上下文 |
 | `/depth` | 设置记忆深度 |
 | `/timeout` | 设置请求超时 |
+| `/thinking` | 设置思考深度 |
+| `/web` | 配置网页版聊天 |
 | `/agent` | 开关 Agent 模式 |
 | `/blacklist` | 管理 Agent 命令黑名单 |
 | `/stream` | 开关流式输出 |
@@ -261,6 +265,48 @@ prompts/extras/agent_command_blacklist.txt
 
 每行填写一个禁止片段；待执行命令包含该片段时会被拦截。黑名单只能降低风险，不能替代操作系统权限隔离。
 
+## 思考深度
+
+`/thinking` 或「更多设置 → 🧠 思考」可设置全局思考深度，共 8 档：关闭、自动、低、中、高、很高、超高、最高。
+
+发请求时会按当前提供商自动翻译成对应字段：
+
+| 提供商 | 字段 |
+| --- | --- |
+| Claude | `thinking.budget_tokens`（同时抬高 `max_tokens`，Anthropic 要求前者小于后者） |
+| Gemini / Vertex | `generationConfig.thinkingConfig.thinkingBudget` |
+| OpenAI 及兼容接口 | `reasoning_effort` |
+| OpenRouter | `reasoning.effort` |
+
+默认档位是**自动**，即一个思考字段都不发，完全沿用提供商的默认行为。这是有意的：不支持思考的模型收到未知字段会直接返回 400。
+
+模型拒绝思考参数时，系统会自动去掉参数重发一次，并记住该「提供商 + 模型」组合不再重试；切换档位会清空这份记录。
+
+思考内容不会显示在对话里，也不会写入记忆；思考消耗的 token 仍会计入用量统计行。
+
+## 网页版聊天
+
+`/web` 或 `/start` 里的「🌐 Web」按钮可配置网页版界面。它复用同一套对话核心，Agent 模式、协议执行、记忆与停止按钮的行为和 Telegram 完全一致，两端共享同一份 SQLite 记忆。
+
+网页里可以聊天，并调整思考深度、流式开关、Agent 模式、文字拼接、记忆深度、Agent 轮数、回复超时和对话模型。提供商与 API Key 仍只在 Telegram 中管理。
+
+配置项：
+
+- **开关**：未设置密码时拒绝开启。
+- **密码**：以 PBKDF2 哈希存入数据库，聊天记录中只保留占位提示。
+- **端口**：默认 `8790`。
+- **公开地址**：反向代理的 HTTPS 地址，可选。
+
+> [!IMPORTANT]
+> 服务只监听 `127.0.0.1`，不会自行暴露到公网。这个界面能驱动 Agent 在服务器上执行真实命令，请勿直接绑定公网地址；需要远程访问时自行配置反向代理并启用 HTTPS。
+
+Telegram 的内嵌网页按钮只接受 HTTPS 地址，因此：
+
+- 已填公开地址时，按钮为 Web App，在 Telegram 内直接弹出页面；
+- 未填时，按钮降级为普通链接，用外部浏览器打开本地地址。
+
+在 Telegram 内打开时会通过 `initData` 签名自动登录，无需输入密码；用浏览器直接访问则需要密码。
+
 ## 安全说明
 
 Agent 模式拥有真实服务器权限。建议至少执行以下措施：
@@ -272,6 +318,7 @@ Agent 模式拥有真实服务器权限。建议至少执行以下措施：
 5. **不要提交敏感文件**：`.env`、数据库、日志和 `xgent_storage/`。
 6. **谨慎处理外部内容**：网页、文件和转发消息可能包含提示词注入内容。
 7. Token 或 API Key 泄露后，应立即在对应平台撤销并重新生成。
+8. **网页版只监听 `127.0.0.1`**：需要远程访问时，用反向代理并启用 HTTPS，设置足够强的密码，不要把服务直接绑到公网地址。
 
 项目当前不是强隔离执行环境。如果你的威胁模型包含恶意用户、不可信模型或高价值服务器，请在容器、虚拟机或专用主机中进一步隔离。
 
@@ -293,6 +340,10 @@ xgent-telegram/
 ├─ requirements.txt
 ├─ xgent_app/
 │  ├─ bootstrap.py            # 模块加载与完整性检查
+│  ├─ web_auth.py             # 网页版认证：密码哈希、会话签名、登录限速
+│  ├─ web_bridge.py           # 网页版与对话核心之间的垫片
+│  ├─ web_server.py           # 网页版 HTTP / SSE 服务
+│  ├─ webui/                  # 网页版前端（单文件，无构建步骤）
 │  └─ sections/               # Bot 功能模块
 ├─ prompts/                   # 系统与 Agent 提示词
 ├─ skill/                     # Skill 说明及配套脚本
