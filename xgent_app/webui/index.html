@@ -256,20 +256,36 @@
 
   /* ---- 登录 / toast ---- */
   dialog {
-    border: 1px solid var(--line); border-radius: 14px;
+    border: none; border-radius: 18px;
     background: var(--panel); color: var(--text);
-    padding: 22px; max-width: 90vw; width: 340px;
+    padding: 0; max-width: 92vw; width: 360px;
+    box-shadow: 0 12px 48px rgba(0,0,0,.22);
+    overflow: hidden;
   }
-  dialog::backdrop { background: rgba(0,0,0,.5); }
-  dialog h2 { margin: 0 0 14px; font-size: 17px; }
+  dialog::backdrop { background: rgba(0,0,0,.55); backdrop-filter: blur(4px); }
+  .login-card { padding: 28px 24px 24px; }
+  .login-icon {
+    width: 52px; height: 52px; border-radius: 50%; margin: 0 auto 16px;
+    background: linear-gradient(135deg, #5ca3f5, #3390ec);
+    color: #fff; display: flex; align-items: center; justify-content: center;
+    font-size: 24px; font-weight: 600;
+  }
+  dialog h2 { margin: 0 0 6px; font-size: 18px; text-align: center; }
+  .login-sub { color: var(--muted); font-size: 13px; text-align: center; margin: 0 0 20px; line-height: 1.5; }
   dialog input {
-    width: 100%; padding: 10px 12px; margin-bottom: 12px;
+    width: 100%; padding: 12px 14px; margin-bottom: 14px;
     background: var(--panel-2); color: var(--text);
-    border: 1px solid var(--line); border-radius: 9px; font: inherit;
+    border: 1px solid var(--line); border-radius: 11px; font: inherit; font-size: 15px;
+    transition: border-color .15s, box-shadow .15s;
   }
-  .err { color: var(--danger); font-size: 13px; min-height: 18px; margin-bottom: 8px; }
-  .btn-primary { background: var(--accent); color: #fff; border: none; border-radius: 9px;
-    padding: 10px 14px; font: inherit; cursor: pointer; width: 100%; }
+  dialog input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .err { color: var(--danger); font-size: 13px; min-height: 20px; margin-bottom: 10px; line-height: 1.4; }
+  .btn-primary { background: var(--accent); color: #fff; border: none; border-radius: 11px;
+    padding: 12px 14px; font: inherit; font-size: 15px; font-weight: 500; cursor: pointer; width: 100%;
+    transition: opacity .15s, transform .1s; }
+  .btn-primary:active { transform: scale(.98); }
+  .login-foot { padding: 14px 24px; background: var(--panel-2); border-top: 1px solid var(--line);
+    text-align: center; font-size: 12px; color: var(--muted); line-height: 1.5; }
   #toast {
     position: fixed; left: 50%; bottom: 80px; transform: translateX(-50%);
     background: rgba(0,0,0,.82); color: #fff; padding: 9px 16px; border-radius: 18px;
@@ -375,10 +391,15 @@
 
 <!-- 登录 -->
 <dialog id="login">
-  <h2>需要登录</h2>
-  <div class="err" id="login-err"></div>
-  <input type="password" id="password" placeholder="访问密码" autocomplete="current-password">
-  <button class="btn-primary" id="btn-login">登录</button>
+  <div class="login-card">
+    <div class="login-icon">X</div>
+    <h2>XGent Web Chat</h2>
+    <p class="login-sub" id="login-sub">请输入访问密码以继续</p>
+    <div class="err" id="login-err"></div>
+    <input type="password" id="password" placeholder="访问密码" autocomplete="current-password">
+    <button class="btn-primary" id="btn-login">登录</button>
+  </div>
+  <div class="login-foot" id="login-foot">在 Telegram 中通过菜单按钮打开可免密登录</div>
 </dialog>
 
 <div id="toast"></div>
@@ -400,6 +421,7 @@
   var connDot = document.getElementById("conn-dot");
   var loginDlg = document.getElementById("login");
   var loginErr = document.getElementById("login-err");
+  var loginSub = document.getElementById("login-sub");
   var settings = document.getElementById("settings");
   var settingsRows = document.getElementById("settings-rows");
   var menuPanel = document.getElementById("menu-panel");
@@ -865,8 +887,15 @@
     if (data.authenticated) { boot(); return; }
     var initData = tg && tg.initData ? tg.initData : "";
     if (initData) {
-      return tryLogin({ init_data: initData }).then(boot).catch(function () { loginDlg.showModal(); });
+      // 有 initData：Telegram WebApp 内打开，尝试免密登录
+      return tryLogin({ init_data: initData }).then(boot).catch(function () {
+        // 免密失败——可能是 bot_token 不匹配 / auth_date 过期 / user_id 不匹配
+        loginErr.textContent = "Telegram 免密登录失败，请输入密码继续";
+        loginDlg.showModal();
+      });
     }
+    // 无 initData：不是在 Telegram WebApp 内打开（普通浏览器 / Telegram 内置浏览器直接访问 URL）
+    loginSub.textContent = "未检测到 Telegram 身份，请输入访问密码";
     loginDlg.showModal();
   }).catch(function () { loginDlg.showModal(); });
 
