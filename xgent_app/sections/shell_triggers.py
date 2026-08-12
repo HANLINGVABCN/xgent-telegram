@@ -1,8 +1,37 @@
 # This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
+import asyncio
+import codecs
+import contextlib
+import hashlib
+import json
+import logging
+import os
+import re
+import subprocess
+import threading
+import time
+import uuid
+from collections import deque
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import yaml
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+from telegram.ext import Application
+
 from xgent_app.text_utils import clip_middle_text
 from xgent_app.agent_status import AgentTurnOrigin
+
+# 以下这些符号需要从共享命名空间获取（由 xgent_server.py 注入）
+# logger, BotMemoryDB, AgentExecutor, AgentCommandBlacklist, COMMAND_OUTPUT_DIR,
+# to_display_path, BLACKLIST_BLOCKED_NOTICE, GlobalRecorder, MessageType,
+# process_conversation
+
+logger = logging.getLogger(__name__)
 def strip_terminal_control_sequences(text: str) -> str:
     cleaned = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text or '')
     cleaned = re.sub(r'\x1b\][^\x07]*(?:\x07|\x1b\\)', '', cleaned)
@@ -970,17 +999,25 @@ class AgentShellSessionManager:
 
 
 class TriggerConditionExpression:
-    """解析并增量计算由字符串字面量、AND/OR 和括号组成的条件表达式。"""
+    """智能解析条件表达式：默认字面量匹配，支持正则和逻辑运算。
+
+    语法示例：
+        READY                    → 字面量匹配 "READY"
+        READY AND SUCCESS        → 逻辑组合
+        "error.*timeout"         → 正则匹配
+        /error.*/i               → 正则 + 忽略大小写
+        (READY OR STARTED) AND SUCCESS  → 括号分组
+    """
 
     def __init__(self, expression: str):
         self.expression = (expression or '').strip()
         if not self.expression:
-            raise ValueError('when 条件不能为空')
+            raise ValueError('condition.when 不能为空')
         self.tokens = self._tokenize(self.expression)
         self.index = 0
         self.ast = self._parse_or()
         if self.index != len(self.tokens):
-            raise ValueError(f"when 条件存在多余内容: {self.tokens[self.index][1]}")
+            raise ValueError(f"condition.when 存在多余内容: {self.tokens[self.index][1]}")
         self.literals = list(dict.fromkeys(self._collect_literals(self.ast)))
         self.matched: set = set()
         self.carry = ''
@@ -988,6 +1025,7 @@ class TriggerConditionExpression:
 
     @staticmethod
     def _tokenize(expression: str) -> List[Tuple[str, str]]:
+        """智能分词：裸词视为字面量，引号和斜杠包裹的特殊处理。"""
         tokens: List[Tuple[str, str]] = []
         index = 0
         while index < len(expression):
@@ -999,6 +1037,37 @@ class TriggerConditionExpression:
                 tokens.append((char, char))
                 index += 1
                 continue
+
+            # 正则表达式：/pattern/flags
+            if char == '/':
+                index += 1
+                pattern_chars: List[str] = []
+                while index < len(expression):
+                    if expression[index] == '\\' and index + 1 < len(expression):
+                        pattern_chars.append(expression[index])
+                        pattern_chars.append(expression[index + 1])
+                        index += 2
+                        continue
+                    if expression[index] == '/':
+                        break
+                    pattern_chars.append(expression[index])
+                    index += 1
+                if index >= len(expression):
+                    raise ValueError('condition.when 中的正则表达式没有闭合（缺少结束 /）')
+                index += 1  # 跳过结束 /
+                # 收集 flags（i, m, s 等）
+                flags = []
+                while index < len(expression) and expression[index].isalpha():
+                    flags.append(expression[index])
+                    index += 1
+                pattern = ''.join(pattern_chars)
+                if not pattern:
+                    raise ValueError('condition.when 正则表达式不能为空')
+                # 正则表达式作为特殊 LITERAL 存储，运行时匹配
+                tokens.append(('REGEX', (pattern, ''.join(flags))))
+                continue
+
+            # 引号字符串
             if char in {'"', "'"}:
                 quote = char
                 index += 1
@@ -1014,25 +1083,28 @@ class TriggerConditionExpression:
                     value.append(char)
                     index += 1
                 if index >= len(expression) or expression[index] != quote:
-                    raise ValueError('when 条件中的字符串没有闭合')
+                    raise ValueError(f'condition.when 中的字符串没有闭合（缺少结束 {quote}）')
                 literal = ''.join(value)
                 if not literal:
-                    raise ValueError('when 条件不允许空字符串')
+                    raise ValueError('condition.when 不允许空字符串')
                 tokens.append(('LITERAL', literal))
                 index += 1
                 continue
+
+            # 裸词：AND/OR 关键字或字面量
             end = index
-            while end < len(expression) and not expression[end].isspace() and expression[end] not in '()':
+            while end < len(expression) and not expression[end].isspace() and expression[end] not in '()/':
                 end += 1
             word = expression[index:end]
             upper_word = word.upper()
             if upper_word in {'AND', 'OR'}:
                 tokens.append((upper_word, upper_word))
             else:
+                # 裸词自动视为字面量
                 tokens.append(('LITERAL', word))
             index = end
         if not tokens:
-            raise ValueError('when 条件不能为空')
+            raise ValueError('condition.when 不能为空')
         return tokens
 
     def _accept(self, token_type: str) -> Optional[Tuple[str, str]]:
@@ -1058,40 +1130,95 @@ class TriggerConditionExpression:
         literal = self._accept('LITERAL')
         if literal:
             return ('LITERAL', literal[1])
+        regex = self._accept('REGEX')
+        if regex:
+            return ('REGEX', regex[1])
         if self._accept('('):
             node = self._parse_or()
             if not self._accept(')'):
-                raise ValueError('when 条件缺少右括号')
+                raise ValueError('condition.when 缺少右括号')
             return node
         found = self.tokens[self.index][1] if self.index < len(self.tokens) else '表达式末尾'
-        raise ValueError(f'when 条件语法错误，意外内容: {found}')
+        raise ValueError(f'condition.when 语法错误，意外内容: {found}')
 
     @classmethod
     def _collect_literals(cls, node) -> List[str]:
+        """收集所有字面量和正则表达式（用于确定最大长度）。"""
         if node[0] == 'LITERAL':
             return [node[1]]
+        if node[0] == 'REGEX':
+            # 正则表达式：返回模式字符串用于估算carry长度
+            pattern, _ = node[1]
+            # 使用合理的最大匹配长度估算（正则可能匹配任意长度）
+            return [pattern[:100] if len(pattern) < 100 else 'X' * 100]
         return cls._collect_literals(node[1]) + cls._collect_literals(node[2])
 
     def feed(self, output: str) -> bool:
+        """增量喂入输出，检查条件是否满足。"""
         combined = self.carry + (output or '')
         for literal in self.literals:
             if literal not in self.matched and literal in combined:
                 self.matched.add(literal)
+
+        # 检查正则表达式匹配
+        self._check_regex_matches(combined)
+
         carry_length = max(0, self.max_literal_length - 1)
         self.carry = combined[-carry_length:] if carry_length else ''
         return self.is_satisfied()
 
+    def _check_regex_matches(self, text: str):
+        """检查AST中的正则表达式是否匹配。"""
+        def check_node(node):
+            if node[0] == 'REGEX':
+                pattern, flags = node[1]
+                regex_key = f"REGEX:{pattern}:{flags}"
+                if regex_key not in self.matched:
+                    regex_flags = 0
+                    if 'i' in flags:
+                        regex_flags |= re.IGNORECASE
+                    if 'm' in flags:
+                        regex_flags |= re.MULTILINE
+                    if 's' in flags:
+                        regex_flags |= re.DOTALL
+                    try:
+                        if re.search(pattern, text, regex_flags):
+                            self.matched.add(regex_key)
+                    except re.error:
+                        pass  # 忽略正则表达式错误
+            elif node[0] in ('AND', 'OR'):
+                check_node(node[1])
+                check_node(node[2])
+
+        check_node(self.ast)
+
     def is_satisfied(self) -> bool:
+        """检查条件是否完全满足。"""
         def evaluate(node) -> bool:
             if node[0] == 'LITERAL':
                 return node[1] in self.matched
+            if node[0] == 'REGEX':
+                pattern, flags = node[1]
+                regex_key = f"REGEX:{pattern}:{flags}"
+                return regex_key in self.matched
             if node[0] == 'AND':
                 return evaluate(node[1]) and evaluate(node[2])
             return evaluate(node[1]) or evaluate(node[2])
         return evaluate(self.ast)
 
     def matched_literals(self) -> List[str]:
-        return [literal for literal in self.literals if literal in self.matched]
+        """返回已匹配的字面量（不包括正则的内部键）。"""
+        result = []
+        for item in self.literals:
+            if item in self.matched:
+                result.append(item)
+        # 添加正则匹配的描述
+        for key in self.matched:
+            if key.startswith('REGEX:'):
+                parts = key.split(':', 2)
+                if len(parts) >= 2:
+                    result.append(f"/{parts[1]}/{parts[2] if len(parts) > 2 else ''}")
+        return result
 
 
 class _SelfTriggerMessage:
@@ -1209,102 +1336,144 @@ class SelfTriggerManager:
 
     @classmethod
     def _parse_definition(cls, body: str) -> Dict[str, Any]:
-        allowed = {'summary', 'after', 'at', 'cron', 'tz', 'when', 'repeat'}
-        lines = (body or '').splitlines()
-        while lines and not lines[0].strip():
-            lines.pop(0)
-        directives: Dict[str, str] = {}
-        command_start = 0
-        for index, raw_line in enumerate(lines):
-            match = re.match(r'^\s*#@([A-Za-z_]+)(?:\s+(.*?))?\s*$', raw_line)
-            if not match:
-                command_start = index
-                break
-            key = match.group(1).lower()
-            value = (match.group(2) or '').strip()
-            if key not in allowed:
-                raise ValueError(f"不支持的 trigger 指令: #@{key}")
-            if key in directives:
-                raise ValueError(f"trigger 指令不能重复: #@{key}")
-            if not value:
-                raise ValueError(f"trigger 指令缺少参数: #@{key}")
-            directives[key] = value
-            command_start = index + 1
+        """解析 YAML 格式的 trigger 定义。
 
-        command = '\n'.join(lines[command_start:]).strip()
+        YAML 格式示例：
+            task: 监控日志错误
+            schedule:
+              after: 30s
+              timezone: Asia/Shanghai
+            condition:
+              when: READY
+              repeat: true
+            command: |
+              tail -f /var/log/app.log
+        """
+        body = (body or '').strip()
+        if not body:
+            raise ValueError('trigger 定义不能为空')
+
+        # 解析 YAML
+        try:
+            config = yaml.safe_load(body)
+        except yaml.YAMLError as e:
+            raise ValueError(f'trigger 定义 YAML 格式错误: {str(e)}') from e
+
+        if not isinstance(config, dict):
+            raise ValueError('trigger 定义必须是 YAML 对象（键值对），不能是列表或纯文本')
+
+        # 必填字段：task 和 command
+        task_summary = config.get('task', '').strip()
+        if not task_summary:
+            raise ValueError('trigger 定义缺少必填字段 "task"（任务概述）')
+        if len(task_summary) > 600:
+            raise ValueError(f'task 字段不能超过 600 字符，当前 {len(task_summary)} 字符')
+
+        command = config.get('command', '').strip()
         if not command:
-            raise ValueError('trigger 命令不能为空')
+            raise ValueError('trigger 定义缺少必填字段 "command"（要执行的 Shell 命令）')
 
-        summary_source = re.sub(r'\s+', ' ', str(directives.get('summary') or '')).strip()
-        if len(summary_source) > 600:
-            raise ValueError('#@summary 不能超过 600 个字符')
-        summary = cls._compact_task_summary(summary_source)
-        if not summary:
-            raise ValueError('trigger 必须在顶部提供 #@summary 任务概述')
+        # 解析 schedule（可选）
+        schedule = config.get('schedule', {})
+        if schedule and not isinstance(schedule, dict):
+            raise ValueError('schedule 字段必须是对象，例如 {after: 30s}')
 
-        timezone_name = directives.get('tz', cls.DEFAULT_TIMEZONE)
+        timezone_name = schedule.get('timezone', cls.DEFAULT_TIMEZONE) if schedule else cls.DEFAULT_TIMEZONE
         try:
             timezone_value = ZoneInfo(timezone_name)
         except ZoneInfoNotFoundError as exc:
             raise ValueError(f'未知时区: {timezone_name}') from exc
 
-        schedule_directives = [key for key in ('after', 'at', 'cron') if key in directives]
-        if len(schedule_directives) > 1:
-            raise ValueError('#@after、#@at、#@cron 只能使用一个')
-
         now = datetime.now(timezone_value)
         schedule_type = 'immediate'
         schedule_expr: Optional[str] = None
         next_run_at = now.timestamp()
-        if 'after' in directives:
-            duration_match = re.fullmatch(r'(\d+(?:\.\d+)?)\s*([smhdw])', directives['after'], re.I)
-            if not duration_match:
-                raise ValueError('#@after 格式应为 30s、15m、2h、1d 或 1w')
-            duration_value = float(duration_match.group(1))
-            unit = duration_match.group(2).lower()
-            seconds = duration_value * {'s': 1, 'm': 60, 'h': 3600, 'd': 86400, 'w': 604800}[unit]
-            if seconds <= 0:
-                raise ValueError('#@after 必须大于 0')
-            schedule_type = 'once'
-            schedule_expr = directives['after']
-            next_run_at = (now + timedelta(seconds=seconds)).timestamp()
-        elif 'at' in directives:
-            try:
-                run_at = datetime.fromisoformat(directives['at'])
-            except ValueError as exc:
-                raise ValueError('#@at 格式应为 YYYY-MM-DD HH:MM[:SS]') from exc
-            if run_at.tzinfo is None:
-                run_at = run_at.replace(tzinfo=timezone_value)
-            else:
-                run_at = run_at.astimezone(timezone_value)
-            schedule_type = 'once'
-            schedule_expr = directives['at']
-            next_run_at = run_at.timestamp()
-        elif 'cron' in directives:
-            try:
-                cron_trigger = CronTrigger.from_crontab(directives['cron'], timezone=timezone_value)
-                next_fire = cron_trigger.get_next_fire_time(None, now)
-            except Exception as exc:
-                raise ValueError(f"无效的 cron 表达式: {directives['cron']}") from exc
-            if next_fire is None:
-                raise ValueError('cron 表达式没有可执行的未来时间')
-            schedule_type = 'cron'
-            schedule_expr = directives['cron']
-            next_run_at = next_fire.timestamp()
 
-        condition_expr = directives.get('when')
-        if condition_expr:
-            TriggerConditionExpression(condition_expr)
+        if schedule:
+            schedule_keys = [k for k in ('after', 'at', 'cron') if k in schedule]
+            if len(schedule_keys) > 1:
+                raise ValueError(f'schedule 中只能使用一个时间字段（after/at/cron），当前有: {", ".join(schedule_keys)}')
 
-        repeat_text = directives.get('repeat', 'false').lower()
-        if repeat_text not in {'true', 'false'}:
-            raise ValueError('#@repeat 只能是 true 或 false')
-        repeat = repeat_text == 'true'
+            if 'after' in schedule:
+                after_value = str(schedule['after']).strip()
+                duration_match = re.fullmatch(r'(\d+(?:\.\d+)?)\s*([smhdw])', after_value, re.I)
+                if not duration_match:
+                    raise ValueError(f'schedule.after 格式错误，应为 30s/15m/2h/1d/1w，当前: {after_value}')
+                duration_value = float(duration_match.group(1))
+                unit = duration_match.group(2).lower()
+                seconds = duration_value * {'s': 1, 'm': 60, 'h': 3600, 'd': 86400, 'w': 604800}[unit]
+                if seconds <= 0:
+                    raise ValueError('schedule.after 必须大于 0')
+                schedule_type = 'once'
+                schedule_expr = after_value
+                next_run_at = (now + timedelta(seconds=seconds)).timestamp()
+
+            elif 'at' in schedule:
+                at_value = str(schedule['at']).strip()
+                try:
+                    run_at = datetime.fromisoformat(at_value)
+                except ValueError as exc:
+                    raise ValueError(f'schedule.at 格式错误，应为 YYYY-MM-DD HH:MM[:SS]，当前: {at_value}') from exc
+                if run_at.tzinfo is None:
+                    run_at = run_at.replace(tzinfo=timezone_value)
+                else:
+                    run_at = run_at.astimezone(timezone_value)
+                schedule_type = 'once'
+                schedule_expr = at_value
+                next_run_at = run_at.timestamp()
+
+            elif 'cron' in schedule:
+                cron_value = str(schedule['cron']).strip()
+                try:
+                    cron_trigger = CronTrigger.from_crontab(cron_value, timezone=timezone_value)
+                    next_fire = cron_trigger.get_next_fire_time(None, now)
+                except Exception as exc:
+                    raise ValueError(f'schedule.cron 格式错误: {cron_value}') from exc
+                if next_fire is None:
+                    raise ValueError(f'cron 表达式没有可执行的未来时间: {cron_value}')
+                schedule_type = 'cron'
+                schedule_expr = cron_value
+                next_run_at = next_fire.timestamp()
+
+        # 解析 condition（可选）
+        condition_config = config.get('condition', {})
+        if condition_config and not isinstance(condition_config, dict):
+            raise ValueError('condition 字段必须是对象，例如 {when: "READY", repeat: true}')
+
+        condition_expr = None
+        repeat = False
+        if condition_config:
+            when_value = condition_config.get('when')
+            if when_value:
+                condition_expr = str(when_value).strip()
+                if not condition_expr:
+                    raise ValueError('condition.when 不能为空字符串')
+                # 验证条件表达式语法
+                try:
+                    TriggerConditionExpression(condition_expr)
+                except Exception as e:
+                    raise ValueError(f'condition.when 语法错误: {e}') from e
+
+            repeat_value = condition_config.get('repeat')
+            if repeat_value is not None:
+                if isinstance(repeat_value, bool):
+                    repeat = repeat_value
+                elif isinstance(repeat_value, str):
+                    repeat_lower = repeat_value.lower()
+                    if repeat_lower in {'true', 'yes', '1'}:
+                        repeat = True
+                    elif repeat_lower in {'false', 'no', '0'}:
+                        repeat = False
+                    else:
+                        raise ValueError(f'condition.repeat 只能是 true/false，当前: {repeat_value}')
+                else:
+                    raise ValueError(f'condition.repeat 只能是布尔值（true/false），当前类型: {type(repeat_value).__name__}')
+
+        # 验证组合约束
         if repeat and not condition_expr:
-            raise ValueError('#@repeat true 只能与 #@when 一起使用')
-        if repeat and schedule_type == 'cron':
-            raise ValueError('#@repeat true 不能与 #@cron 同时使用')
+            raise ValueError('condition.repeat 为 true 时必须同时设置 condition.when')
 
+        # 检查命令黑名单
         blocked, pattern = AgentCommandBlacklist.check(command)
         if blocked:
             logger.warning(f"trigger 命令被黑名单拦截，命中规则: {pattern} | 命令: {command[:200]}")
@@ -1312,7 +1481,7 @@ class SelfTriggerManager:
 
         return {
             'command': command,
-            'summary': summary,
+            'summary': task_summary,
             'schedule_type': schedule_type,
             'schedule_expr': schedule_expr,
             'timezone': timezone_name,
@@ -1325,19 +1494,44 @@ class SelfTriggerManager:
     async def handle_protocol(cls, target: str, body: str, bot: Any, chat_id: int,
                               conversation_id: str, origin_user_text: str,
                               origin_assistant_text: str) -> str:
+        """处理 trigger-x 协议。
+
+        支持三种形式：
+        1. trigger-x <<AGENT_BEGIN...   → 创建新任务
+        2. trigger-x:show <<AGENT_BEGIN... → 查看活跃任务
+        3. trigger-x:kill:<任务ID> <<AGENT_BEGIN... → 取消任务
+        4. trigger-x:kill:all <<AGENT_BEGIN... → 取消所有任务
+        """
         normalized_target = (target or '').strip()
+
+        # 查看活跃任务
         if normalized_target == 'show':
             return await cls.format_active_tasks()
+
+        # 取消所有任务
+        if normalized_target == 'kill:all':
+            count = await cls.cancel_all()
+            return f"✅ 已取消全部触发任务，共 {count} 个"
+
+        # 取消指定任务
         if normalized_target.startswith('kill:'):
             task_id = normalized_target[5:].strip()
-            if task_id == 'all':
-                count = await cls.cancel_all()
-                return f"[trigger:kill 结果] 已取消全部触发任务，共 {count} 个。"
+            if not task_id:
+                raise ValueError("trigger-x:kill: 后必须指定任务 ID，例如 trigger-x:kill:trg_abc123")
             return await cls.cancel(task_id)
-        if normalized_target == 'kill':
-            raise ValueError("请使用 trigger-x:kill:<任务ID> 或 trigger-x:kill:all 协议")
+
+        # 不支持的目标
         if normalized_target:
-            raise ValueError('创建任务请使用 trigger-x 协议块')
+            raise ValueError(
+                f'trigger-x 不支持的目标: {normalized_target}\n'
+                '支持的操作：\n'
+                '  - trigger-x          → 创建新任务\n'
+                '  - trigger-x:show     → 查看活跃任务\n'
+                '  - trigger-x:kill:<ID> → 取消指定任务\n'
+                '  - trigger-x:kill:all → 取消所有任务'
+            )
+
+        # 创建新任务
         return await cls.register(
             body, bot, chat_id, conversation_id,
             origin_user_text, origin_assistant_text,
@@ -1346,6 +1540,7 @@ class SelfTriggerManager:
     @classmethod
     async def register(cls, body: str, bot: Any, chat_id: int, conversation_id: str,
                        origin_user_text: str, origin_assistant_text: str) -> str:
+        """注册一个新的 trigger 任务。"""
         definition = cls._parse_definition(body)
         task_id = await cls._new_task_id()
         now = time.time()
@@ -1368,18 +1563,20 @@ class SelfTriggerManager:
 
         schedule_text = cls._format_schedule(task)
         condition_text = f"，条件: {definition['condition_expr']}" if definition.get('condition_expr') else ''
-        repeat_text = '，命中后自动重新启动' if definition.get('repeat') else ''
+        repeat_text = '，条件命中后自动重启监控' if definition.get('repeat') else ''
         return (
-            f"[trigger结果] 已创建持久化任务 {task_id}，概述: {definition['summary']}，"
-            f"{schedule_text}{condition_text}{repeat_text}"
+            f"✅ 已创建触发任务 {task_id}\n"
+            f"📝 任务: {definition['summary']}\n"
+            f"⏰ 计划: {schedule_text}{condition_text}{repeat_text}"
         )
 
     @classmethod
     async def cancel(cls, task_id: str) -> str:
+        """取消一个触发任务。"""
         db = await BotMemoryDB.get_instance()
         task = await db.get_trigger_task(task_id)
         if task is None or task['status'] in {'completed', 'cancelled', 'failed'}:
-            return f"[trigger:kill 结果] 未找到触发任务: {task_id}"
+            return f"❌ 未找到活跃的触发任务: {task_id}"
         await db.cancel_trigger_tasks(task_id)
         cls._remove_scheduler_job(task_id)
         runtime_task = cls._runtime_tasks.get(task_id)
@@ -1391,7 +1588,7 @@ class SelfTriggerManager:
         process = cls._processes.get(task_id)
         if process is not None:
             await terminate_async_process(process)
-        return f"[trigger:kill 结果] 已取消触发任务: {task_id}"
+        return f"✅ 已取消触发任务: {task_id}"
 
     @classmethod
     async def cancel_all(cls) -> int:
@@ -1433,16 +1630,18 @@ class SelfTriggerManager:
 
     @classmethod
     async def format_active_tasks(cls) -> str:
+        """格式化输出所有活跃任务。"""
         db = await BotMemoryDB.get_instance()
         tasks = await db.list_trigger_tasks(active_only=True)
         if not tasks:
-            return "[trigger:show 结果] 当前没有活跃触发任务。"
-        lines = [f"[trigger:show 结果] 当前活跃触发任务: {len(tasks)} 个"]
+            return "📋 当前没有活跃的触发任务"
+
+        lines = [f"📋 活跃触发任务: {len(tasks)} 个\n"]
         now = time.time()
         for index, task in enumerate(tasks, start=1):
             elapsed = cls._format_elapsed(now - float(task['created_at']))
             repeat_text = '是' if task['repeat'] else '否'
-            condition_text = task.get('condition_expr') or '(进程退出时触发)'
+            condition_text = task.get('condition_expr') or '(命令退出即触发)'
             duplicate_count = int(task.get('duplicate_count') or 0)
             backoff_until = float(task.get('backoff_until') or 0)
             backoff_text = (
@@ -1450,13 +1649,18 @@ class SelfTriggerManager:
                 if backoff_until > now else '无'
             )
             lines.append(
-                f"\n#{index} ID: {task['id']}\n"
-                f"概述: {cls._build_task_summary(task)}\n"
-                f"状态: {task['status']}\n计划: {cls._format_schedule(task)}\n"
-                f"条件: {condition_text}\n命令: {task['command']}\n"
-                f"已存在: {elapsed}\n重复监控: {repeat_text}\n"
-                f"已触发: {task['fire_count']} 次，恢复: {task['recovery_count']} 次\n"
-                f"连续静默去重: {duplicate_count} 次，当前退避: {backoff_text}"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"#{index} 【{task['id']}】\n"
+                f"📝 任务: {cls._build_task_summary(task)}\n"
+                f"📊 状态: {task['status']}\n"
+                f"⏰ 计划: {cls._format_schedule(task)}\n"
+                f"🎯 条件: {condition_text}\n"
+                f"💻 命令: {task['command']}\n"
+                f"⏱️  已存在: {elapsed}\n"
+                f"🔄 重复监控: {repeat_text}\n"
+                f"📈 已触发: {task['fire_count']} 次，恢复: {task['recovery_count']} 次\n"
+                f"🔕 连续静默去重: {duplicate_count} 次\n"
+                f"⏳ 当前退避: {backoff_text}"
             )
         return "\n".join(lines)
 

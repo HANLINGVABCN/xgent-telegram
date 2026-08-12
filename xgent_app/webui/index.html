@@ -20,8 +20,27 @@
     --user-2: #d6f3c0;
     --ai: #ffffff;
     --danger: #e53935;
+    --code-bg: #1e1f22;
+    --code-fg: #e6e9ef;
     --radius: 16px;
     --header-h: 52px;
+  }
+  body.dark {
+    --bg: #0e1621;
+    --wallpaper: #17212b;
+    --panel: #1c2733;
+    --panel-2: #243341;
+    --line: #2b3a47;
+    --text: #e9edf0;
+    --muted: #7d8e9e;
+    --accent: #5288c1;
+    --accent-soft: #1e3a5f;
+    --user: #2b5278;
+    --user-2: #1e3a5f;
+    --ai: #1c2733;
+    --danger: #e57676;
+    --code-bg: #0e1621;
+    --code-fg: #e9edf0;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body { height: 100%; margin: 0; }
@@ -43,12 +62,12 @@
     border-bottom: 1px solid var(--line);
     flex-shrink: 0; z-index: 4;
   }
-  #btn-menu, #btn-settings, #btn-terminal {
+  #btn-menu, #btn-settings, #btn-terminal, #btn-theme {
     width: 36px; height: 36px; border: none; background: transparent;
     color: var(--muted); font-size: 20px; cursor: pointer; border-radius: 50%;
     display: flex; align-items: center; justify-content: center;
   }
-  #btn-menu:hover, #btn-settings:hover, #btn-terminal:hover { background: var(--panel-2); color: var(--accent); }
+  #btn-menu:hover, #btn-settings:hover, #btn-terminal:hover, #btn-theme:hover { background: var(--panel-2); color: var(--accent); }
   .header-info { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
   .bot-avatar {
     width: 38px; height: 38px; border-radius: 50%; flex-shrink: 0;
@@ -88,14 +107,23 @@
   }
   .bubble.user .ts { color: #5fb84b; }
   .bubble pre {
-    background: #1e1f22; color: #e6e9ef; padding: 9px 11px; border-radius: 10px;
+    background: var(--code-bg); color: var(--code-fg); padding: 9px 11px; border-radius: 10px;
     overflow-x: auto; margin: 6px 0; font: 13px/1.5 ui-monospace, "SF Mono", Consolas, monospace;
+    position: relative;
   }
   .bubble code { background: rgba(0,0,0,.07); padding: 1px 5px; border-radius: 5px;
     font: 13px ui-monospace, "SF Mono", Consolas, monospace; }
+  body.dark .bubble code { background: rgba(255,255,255,.08); }
   .bubble pre code { background: transparent; padding: 0; }
   .bubble a { color: var(--accent); }
   .bubble blockquote { margin: 4px 0; padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
+  .copy-code-btn {
+    position: absolute; top: 4px; right: 4px; opacity: 0; transition: opacity .15s;
+    background: rgba(255,255,255,.12); color: var(--code-fg); border: none; border-radius: 6px;
+    padding: 3px 8px; font-size: 11px; cursor: pointer; line-height: 1;
+  }
+  .bubble pre:hover .copy-code-btn { opacity: 1; }
+  .copy-code-btn:hover { background: rgba(255,255,255,.22); }
 
   .sys-pill {
     background: rgba(0,0,0,.12); color: #fff; text-shadow: 0 1px 1px rgba(0,0,0,.2);
@@ -232,6 +260,37 @@
     font-size: 13px; z-index: 50; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 88vw;
   }
   #toast.show { opacity: 1; }
+
+  /* ---- 滚动到底部按钮 ---- */
+  #scroll-bottom {
+    position: fixed; right: 16px; bottom: 72px; width: 40px; height: 40px;
+    border-radius: 50%; border: 1px solid var(--line); background: var(--panel);
+    color: var(--accent); font-size: 18px; cursor: pointer; z-index: 10;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 2px 8px rgba(0,0,0,.15); opacity: 0; pointer-events: none;
+    transition: opacity .2s, transform .2s; transform: translateY(8px);
+  }
+  #scroll-bottom.show { opacity: 1; pointer-events: auto; transform: translateY(0); }
+  #scroll-bottom:hover { background: var(--panel-2); }
+
+  /* ---- 空状态 ---- */
+  #empty-state {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    height: 100%; color: var(--muted); text-align: center; gap: 8px; padding: 20px;
+  }
+  #empty-state .emoji { font-size: 42px; opacity: .7; }
+  #empty-state .title { font-size: 16px; font-weight: 600; color: var(--text); }
+  #empty-state .desc { font-size: 13px; max-width: 260px; line-height: 1.5; }
+
+  /* ---- 连接状态指示 ---- */
+  .conn-dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    margin-right: 4px; vertical-align: middle;
+    background: #4caf50; transition: background .2s;
+  }
+  .conn-dot.connecting { background: #ff9800; animation: pulse 1s infinite; }
+  .conn-dot.disconnected { background: var(--danger); }
+  @keyframes pulse { 50% { opacity: .4; } }
 </style>
 </head>
 <body>
@@ -242,15 +301,22 @@
     <div class="bot-avatar">X</div>
     <div>
       <div class="bot-name">XGent</div>
-      <div class="bot-status" id="status-text">在线</div>
+      <div class="bot-status" id="status-text"><span class="conn-dot" id="conn-dot"></span> 在线</div>
     </div>
   </div>
+  <button id="btn-theme" title="切换深色模式">🌙</button>
   <button id="btn-terminal" title="终端">🖥</button>
   <button id="btn-settings" title="设置">⚙️</button>
 </div>
 
 <main id="log"></main>
+<div id="empty-state" class="hidden">
+  <div class="emoji">💬</div>
+  <div class="title">开始对话</div>
+  <div class="desc">在下方输入消息，或点击左上角 ≡ 查看可用命令。</div>
+</div>
 <div id="typing" class="hidden"><span></span><span></span><span></span></div>
+<button id="scroll-bottom" title="滚动到底部">↓</button>
 
 <footer>
   <div class="composer">
@@ -306,6 +372,7 @@
   var btnAttach = document.getElementById("btn-attach");
   var typing = document.getElementById("typing");
   var statusText = document.getElementById("status-text");
+  var connDot = document.getElementById("conn-dot");
   var loginDlg = document.getElementById("login");
   var loginErr = document.getElementById("login-err");
   var settings = document.getElementById("settings");
@@ -314,10 +381,27 @@
   var overlay = document.getElementById("overlay");
   var suggest = document.getElementById("cmd-suggest");
   var toastEl = document.getElementById("toast");
+  var scrollBtn = document.getElementById("scroll-bottom");
+  var emptyState = document.getElementById("empty-state");
+  var btnTheme = document.getElementById("btn-theme");
 
   var byMessageId = {};   // message_id -> { wrap, body, btns }
   var evtSource = null;
   var suggestIndex = -1;
+  var reconnectTimer = null;
+  var reconnectDelay = 1000;
+  var msgCount = 0;
+
+  // ---- 深色模式 ----
+  if (localStorage.getItem("xgent-theme") === "dark") {
+    document.body.classList.add("dark");
+    btnTheme.textContent = "☀️";
+  }
+  btnTheme.addEventListener("click", function () {
+    var isDark = document.body.classList.toggle("dark");
+    btnTheme.textContent = isDark ? "☀️" : "🌙";
+    localStorage.setItem("xgent-theme", isDark ? "dark" : "light");
+  });
 
   // 与 Telegram 注册的命令一致（lifecycle.py setup_bot_commands）。
   var COMMANDS = [
@@ -419,10 +503,43 @@
     setTimeout(function () { toastEl.classList.remove("show"); }, alert ? 2600 : 1800);
   }
 
-  function scrollDown() { log.scrollTop = log.scrollHeight; }
+  function scrollDown() { log.scrollTop = log.scrollHeight; hideScrollBtn(); }
+
+  function isNearBottom() { return log.scrollHeight - log.scrollTop - log.clientHeight < 80; }
+  function hideScrollBtn() { scrollBtn.classList.remove("show"); }
+  function showScrollBtn() { scrollBtn.classList.add("show"); }
+
+  function updateEmptyState() {
+    if (msgCount === 0) { emptyState.classList.remove("hidden"); }
+    else { emptyState.classList.add("hidden"); }
+  }
+
+  // 给 pre 块注入复制按钮
+  function injectCopyButtons(container) {
+    var pres = container.querySelectorAll("pre");
+    pres.forEach(function (pre) {
+      if (pre.querySelector(".copy-code-btn")) return;
+      var btn = document.createElement("button");
+      btn.className = "copy-code-btn";
+      btn.textContent = "复制";
+      btn.addEventListener("click", function () {
+        var code = pre.querySelector("code");
+        var text = code ? code.textContent : pre.textContent;
+        navigator.clipboard.writeText(text).then(function () {
+          btn.textContent = "已复制";
+          setTimeout(function () { btn.textContent = "复制"; }, 1500);
+        }).catch(function () {
+          toast("复制失败");
+        });
+      });
+      pre.appendChild(btn);
+    });
+  }
 
   // ---- 气泡渲染 ----
   function makeBubble(role, text, messageId, parseMode, markup) {
+    msgCount++;
+    updateEmptyState();
     var row = document.createElement("div");
     row.className = "msg-row " + role;
     if (role === "sys") {
@@ -439,6 +556,7 @@
     var body = document.createElement("div");
     body.className = "body";
     body.innerHTML = renderText(text, parseMode);
+    injectCopyButtons(body);
     var ts = document.createElement("span");
     ts.className = "ts";
     ts.textContent = nowTime();
@@ -493,7 +611,11 @@
     btnSend.disabled = busy;
     btnSend.classList.toggle("hidden", busy);
     btnStop.classList.toggle("hidden", !busy);
-    statusText.textContent = busy ? "正在输入…" : "在线";
+    if (busy) {
+      statusText.innerHTML = '<span class="conn-dot"></span> 正在输入…';
+    } else {
+      setConnState(currentConnState);
+    }
     statusText.classList.toggle("busy", busy);
     if (busy) showTyping(); else hideTyping();
   }
@@ -509,6 +631,7 @@
       var e = byMessageId[frame.message_id];
       if (e) {
         e.body.innerHTML = renderText(frame.text, frame.parse_mode);
+        injectCopyButtons(e.body);
         if (frame.reply_markup !== undefined) setButtons(e, frame.reply_markup, frame.message_id);
       } else {
         makeBubble("ai", frame.text, frame.message_id, frame.parse_mode, frame.reply_markup);
@@ -521,6 +644,8 @@
       var d = byMessageId[frame.message_id];
       if (d && d.row && d.row.parentNode) d.row.parentNode.removeChild(d.row);
       delete byMessageId[frame.message_id];
+      msgCount = Math.max(0, msgCount - 1);
+      updateEmptyState();
     } else if (frame.type === "user_message") {
       // Telegram 侧发来的用户消息，镜像到网页
       makeBubble("user", frame.text, null, null, null);
@@ -541,23 +666,47 @@
     }
   }
 
+  var currentConnState = "";
+
+  function setConnState(state) {
+    currentConnState = state || "";
+    connDot.className = "conn-dot" + (state ? " " + state : "");
+    if (state === "connecting") statusText.innerHTML = '<span class="conn-dot connecting"></span> 连接中…';
+    else if (state === "disconnected") statusText.innerHTML = '<span class="conn-dot disconnected"></span> 已断开，重连中…';
+    else statusText.innerHTML = '<span class="conn-dot"></span> 在线';
+  }
+
   function connectStream() {
     if (evtSource) evtSource.close();
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    setConnState("connecting");
     evtSource = new EventSource("/api/stream");
+    evtSource.onopen = function () { setConnState(); reconnectDelay = 1000; };
     evtSource.onmessage = function (e) {
       try { handleFrame(JSON.parse(e.data)); } catch (err) {}
     };
-    evtSource.onerror = function () { setBusy(false); };
+    evtSource.onerror = function () {
+      setBusy(false);
+      setConnState("disconnected");
+      evtSource.close();
+      // 指数退避重连，上限 30 秒
+      reconnectTimer = setTimeout(function () {
+        reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
+        connectStream();
+      }, reconnectDelay);
+    };
   }
 
   function loadHistory() {
     return api("/api/history?limit=50").then(function (data) {
       log.innerHTML = "";
       byMessageId = {};
+      msgCount = 0;
       (data.messages || []).forEach(function (m) {
         var role = m.role === "user" ? "user" : (m.role === "assistant" ? "ai" : "sys");
         makeBubble(role, m.content);
       });
+      if (msgCount === 0) updateEmptyState();
       scrollDown();
     });
   }
@@ -735,6 +884,12 @@
 
   btnStop.addEventListener("click", function () { api("/api/stop", { method: "POST" }).catch(function () {}); });
   btnAttach.addEventListener("click", function () { toast("附件上传请在 Telegram 中发送文件"); });
+
+  // 滚动检测 & 滚动到底部按钮
+  log.addEventListener("scroll", function () {
+    if (isNearBottom()) hideScrollBtn(); else showScrollBtn();
+  });
+  scrollBtn.addEventListener("click", function () { scrollDown(); });
 
   document.getElementById("btn-menu").addEventListener("click", openMenu);
   document.getElementById("btn-close-menu").addEventListener("click", closeMenu);

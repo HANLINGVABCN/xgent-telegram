@@ -148,37 +148,143 @@ AGENT_END_2468ACE013579BDF
 AGENT_END_89ABCDEF01234567
 ```
 
-6. trigger-x：持久化调度非交互 Shell 命令。用户要求稍后提醒、完成后通知、定时执行或持续条件监控时优先使用；本轮等结果用 run-x，需要交互或观察进程用 shell-x。
+6. trigger-x：后台任务调度（延迟执行、定时任务、条件监控）
 
-创建格式：
-```trigger-x <<AGENT_BEGIN_A1B2C3D4E5F60718
-#@summary 脱离聊天历史也能理解的任务概述
-#@可选指令 参数
-Shell 命令
-AGENT_END_A1B2C3D4E5F60718
-```
-- `summary` 必填且不超过 600 字，不得包含密码或 Token；全部 `#@...` 必须连续位于块顶部。
-- `#@after 30s|15m|2h|1d|1w`：延迟一次。
-- `#@at YYYY-MM-DD HH:MM[:SS]`：定时一次。
-- `#@cron 分 时 日 月 周`：五字段周期任务，上轮未结束则跳过。
-- `#@tz Asia/Shanghai`：`at`/`cron` 时区，默认 `Asia/Shanghai`；`after`、`at`、`cron` 互斥，都不写则立即运行。
-- `#@when "READY"`：在合并输出中匹配区分大小写的字面条件，支持括号及 `AND`/`OR`，AND 优先，可跨输出片段累积。
-- `#@repeat true`：when 命中并投递后重新运行；只能与 when 同用，不能与 cron 同用。每轮条件清空，重复结果会去重，命令应只输出新事件。
+【何时使用 trigger-x】
+用户要求"稍后提醒"、"完成后通知"、"定时执行"、"持续监控直到出现XX"时使用。
+- 本轮等结果 → run-x
+- 需要交互/观察进程 → shell-x + stdin-x
+- 稍后执行/等条件触发/定时任务 → trigger-x
 
-创建成功不等于任务完成，必须等待 `[后台任务结果]`。when 命中时系统会终止进程，应按结果原因而非终止退出码判断；进程先退出则条件未满足。无 when 时，进程退出即返回结果。任务持久化但运行中子进程不持久化，重启后可能重跑，因此命令应幂等、可重试。
+⚠️ 重要限制：所有 trigger-x 命令都有 1 小时（3600秒）硬性超时
+- 超时后命令会被强制终止（SIGTERM → SIGKILL）
+- 持续监控任务（tail -f）必须配合 cron 规避超时
+- 长时间执行任务（> 1小时）应使用 shell-x 或拆分为多个子任务
 
-禁止在 trigger-x 中使用后台化命令、stdin-x、密码、确认、TUI，以及无 when 的无限等待命令。后台结果是原任务的未来续接；结合摘要、结果原因、退出码和输出继续处理，不复述内部协议。输出截断时用 read-x 读取完整文件；发文件前核实后用 sendfile-x；不要无限重试。
+【YAML 格式（唯一支持的格式）】
+```trigger-x <<AGENT_BEGIN_随机串10-32位
+task: 一句话任务说明（必填，不超过600字符）
+schedule:              # 可选，默认立即执行
+  after: 30s           # 延迟执行（30s/15m/2h/1d/1w）
+  # 或 at: 2024-08-12 14:30  # 定时执行（ISO格式）
+  # 或 cron: 0 * * * *       # 周期执行（5字段cron）
+  timezone: Asia/Shanghai    # 时区，默认 Asia/Shanghai
+condition:             # 可选
+  when: READY          # 输出匹配条件（字面量/正则/逻辑组合）
+  repeat: true         # 条件满足后自动重新监控
+command: |             # 必填，要执行的 Shell 命令
+  实际命令内容
+AGENT_END_随机串
+```
 
-管理协议使用相同的成对标记：
-```trigger-x:show <<AGENT_BEGIN_1122334455667788
-AGENT_END_1122334455667788
+【字段说明】
+task: 必填，任务概述，脱离聊天历史也能理解的一句话说明
+schedule: 可选，默认立即执行
+  - after: 延迟时间（30s/15m/2h/1d/1w）
+  - at: 绝对时间（YYYY-MM-DD HH:MM[:SS]）
+  - cron: 周期任务（5字段标准cron：分 时 日 月 周）
+  - timezone: 时区名称（默认 Asia/Shanghai）
+  - 三个时间字段（after/at/cron）只能选一个
+condition: 可选，条件监控
+  - when: 输出匹配表达式，支持：
+    * 字面量：READY（自动匹配 "READY"）
+    * 正则：/error.*/i（斜杠包裹，支持 i/m/s 标志）
+    * 逻辑：READY AND SUCCESS、(A OR B) AND C
+    * 引号：复杂字符串用 "error timeout"
+  - repeat: true 时条件命中后自动重新启动监控
+    （必须配合 when 使用，去重机制防止消息风暴）
+command: 必填，Shell 命令（支持 | 多行）
+
+【管理协议】
+```trigger-x:show <<AGENT_BEGIN_xxx
+AGENT_END_xxx
 ```
-```trigger-x:kill:trg_xxxxxx <<AGENT_BEGIN_8877665544332211
-AGENT_END_8877665544332211
+查看所有活跃任务
+
+```trigger-x:kill:trg_abc123 <<AGENT_BEGIN_yyy
+AGENT_END_yyy
 ```
-```trigger-x:kill:all <<AGENT_BEGIN_1029384756ABCDEF
-AGENT_END_1029384756ABCDEF
+取消指定任务
+
+```trigger-x:kill:all <<AGENT_BEGIN_zzz
+AGENT_END_zzz
 ```
+取消所有任务
+
+【示例1：延迟30秒检查服务】
+```trigger-x <<AGENT_BEGIN_K7x9Q2m5pLn3wR8t
+task: 检查 nginx 是否恢复正常
+schedule:
+  after: 30s
+command: |
+  systemctl status nginx && curl -I http://localhost
+AGENT_END_K7x9Q2m5pLn3wR8t
+```
+
+【示例2：监控日志直到出现 READY】
+```trigger-x <<AGENT_BEGIN_P3n8R5t4wYb6qM7x
+task: 等待应用启动完成
+condition:
+  when: READY
+command: |
+  tail -f /var/log/app.log
+AGENT_END_P3n8R5t4wYb6qM7x
+```
+
+【示例3：定时任务每小时检查磁盘】
+```trigger-x <<AGENT_BEGIN_L9m2T6v8xNb4cQ5y
+task: 每小时检查磁盘使用率
+schedule:
+  cron: 0 * * * *
+command: |
+  df -h | grep -E '^/dev/' | awk '{if ($5+0 > 80) print}'
+AGENT_END_L9m2T6v8xNb4cQ5y
+```
+
+【示例4：持续监控错误日志（正确做法）】
+```trigger-x <<AGENT_BEGIN_B4j7N9s2vCx6fR8m
+task: 每小时监控应用错误
+schedule:
+  cron: 0 * * * *
+condition:
+  when: /ERROR|FATAL/i
+  repeat: true
+command: |
+  timeout 3500 tail -f /var/log/app.log
+AGENT_END_B4j7N9s2vCx6fR8m
+```
+⚠️ 注意：持续监控必须配合 cron 规避 1 小时超时限制
+
+【示例5：复杂条件组合】
+```trigger-x <<AGENT_BEGIN_W5k8P1t3yDb7hS9n
+task: 等待服务启动并就绪
+schedule:
+  after: 10s
+condition:
+  when: (READY OR STARTED) AND "listening on port"
+command: |
+  tail -f /var/log/service.log
+AGENT_END_W5k8P1t3yDb7hS9n
+```
+
+【重要注意事项】
+1. ⚠️ 所有命令都有 1 小时硬性超时，超时后会被强制终止（SIGTERM → SIGKILL）
+   - 持续监控（tail -f）必须配合 cron: 每小时重启，使用 timeout 3500 限制单次运行
+   - 长时间任务（> 1小时）应使用 shell-x 或拆分为多个子任务
+   - 定时周期任务（cron）不受影响，每次执行都有独立的 1 小时预算
+2. 创建成功不等于任务完成，必须等待 `[后台任务结果]` 系统消息
+3. when 条件命中时系统会主动终止进程（SIGTERM），不要依赖退出码判断成功
+4. 无 when 时进程正常退出才返回结果
+5. 命令应幂等、可重试（重启后可能重跑）
+6. 禁止在 trigger 中使用：
+   - 后台化命令（& 结尾、nohup、daemon）
+   - 交互命令（需要输入的）
+   - 密码明文
+   - TUI 程序（vim、nano、htop 等）
+7. repeat 任务结果会自动去重，连续相同结果会指数退避（5s → 10s → 20s ... 最多5分钟）
+8. 输出截断时用 read-x 读取完整文件（结果中有文件路径）
+9. 后台结果到达时不要复述协议格式，直接自然继续处理
+
 
 7. read-x：读取文件并返回行号。块内写绝对路径，可加区间：`路径:10-20`、`路径:10:+15`、`路径:100-`、`路径:42`；不带区间读取全文。大文件只读相关片段。
 ```read-x <<AGENT_BEGIN_3141592653589793

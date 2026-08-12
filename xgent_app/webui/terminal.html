@@ -53,6 +53,13 @@
     position: absolute; bottom: 6px; right: 10px; font-size: 11px;
     color: #7d8e9e; z-index: 3; pointer-events: none;
   }
+  .conn-dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    margin-right: 4px; vertical-align: middle; background: #4caf50;
+  }
+  .conn-dot.disconnected { background: #e57676; }
+  .conn-dot.connecting { background: #ff9800; animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .4; } }
 </style>
 </head>
 <body>
@@ -112,9 +119,19 @@ function bytesToB64(bytes) {
   return btoa(s);
 }
 
+var connState = '';
+
 function updateStatus() {
-  $('status').textContent = (currentPid ? ('pid ' + currentPid + ' · ') : '') +
-    (term ? (term.cols + '×' + term.rows) : '');
+  var parts = [];
+  parts.push('<span class="conn-dot' + (connState ? ' ' + connState : '') + '"></span>');
+  if (currentPid) parts.push('pid ' + currentPid);
+  if (term) parts.push(term.cols + '×' + term.rows);
+  $('status').innerHTML = parts.join(' · ');
+}
+
+function setConnState(state) {
+  connState = state || '';
+  updateStatus();
 }
 
 function login() {
@@ -150,7 +167,9 @@ $('pw').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('log
 
 function openStream() {
   if (es) es.close();
+  setConnState('connecting');
   es = new EventSource('/api/term/output?session_id=' + encodeURIComponent(sessionId));
+  es.onopen = function () { setConnState(''); };
   es.onmessage = function (ev) {
     try {
       var j = JSON.parse(ev.data);
@@ -159,6 +178,7 @@ function openStream() {
   };
   es.addEventListener('close', function () { showEnded('终端会话已退出'); });
   es.onerror = function () {
+    setConnState('disconnected');
     // EventSource 默认自动重连，但终端会话一旦断了重连也拿不到旧输出，
     // 关掉由 close 事件 / 主动检测处理。
   };
@@ -219,14 +239,23 @@ function showEnded(reason) {
   $('endedOverlay').style.display = 'flex';
 }
 
+// 返回聊天：如果是 window.open 打开的新标签页，直接关闭；否则跳转首页
+function goBackToChat() {
+  if (window.opener && !window.opener.closed) {
+    window.opener.focus();
+    window.close();
+  } else {
+    location.href = '/';
+  }
+}
 $('closeBtn').onclick = function () {
   if (sessionId) {
     api('/api/term/close', { method: 'POST', body: JSON.stringify({ session_id: sessionId }) }).catch(function () {});
   }
   showEnded('已手动关闭');
 };
-$('backBtn').onclick = function () { location.href = '/'; };
-$('endedBackBtn').onclick = function () { location.href = '/'; };
+$('backBtn').onclick = goBackToChat;
+$('endedBackBtn').onclick = goBackToChat;
 $('renewBtn').onclick = function () {
   $('endedOverlay').style.display = 'none';
   if (term) { term.dispose(); term = null; }

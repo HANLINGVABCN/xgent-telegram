@@ -253,18 +253,55 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def _serve_index(self) -> None:
         if not self.config.is_web_enabled():
-            self._send_html(
-                b'<!DOCTYPE html><html><head><meta charset="utf-8">'
-                b'<meta name="viewport" content="width=device-width,initial-scale=1">'
-                b'<title>XGent</title>'
-                b'<style>body{margin:0;height:100%;display:flex;align-items:center;'
-                b'justify-content:center;background:#17212b;color:#e9edf0;'
-                b'font-family:sans-serif;text-align:center}'
-                b'a{color:#5288c1;text-decoration:none}</style></head>'
-                b'<body><div><h2>Web Chat \u672a\u5f00\u542f</h2>'
-                b'<p>\u8bf7\u5728 Telegram /start \u2192 \U0001f310 Web \u91cc\u5f00\u542f\u3002</p>'
-                b'<p><a href="/terminal">\U0001f5a5 \u6253\u5f00\u7ec8\u7aef</a></p>'
-                b'</div></body></html>')
+            term_on = self.config.is_terminal_enabled()
+            if term_on:
+                body = (
+                    '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
+                    '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
+                    '<title>XGent</title><style>'
+                    ':root{color-scheme:dark}'
+                    '*{box-sizing:border-box;margin:0;padding:0}'
+                    'body{height:100%;display:flex;align-items:center;justify-content:center;'
+                    'background:#17212b;color:#e9edf0;font-family:-apple-system,"Segoe UI",'
+                    '"PingFang SC","Microsoft YaHei",sans-serif;padding:20px}'
+                    '.card{background:#1c2733;border:1px solid #2b3a47;border-radius:16px;'
+                    'padding:40px 32px;width:min(380px,92vw);text-align:center}'
+                    '.icon{font-size:48px;margin-bottom:16px}'
+                    '.card h1{font-size:20px;font-weight:600;margin-bottom:8px}'
+                    '.card .sub{color:#7d8e9e;font-size:13px;line-height:1.6;margin-bottom:24px}'
+                    '.btn{display:block;width:100%;padding:14px;border:none;border-radius:10px;'
+                    'background:#5288c1;color:#fff;font-size:15px;font-weight:600;'
+                    'cursor:pointer;text-decoration:none;transition:background .15s}'
+                    '.btn:hover{background:#3a6a9e}'
+                    '</style></head><body><div class="card">'
+                    '<div class="icon">\U0001f5a5\ufe0f</div>'
+                    '<h1>XGent 终端</h1>'
+                    '<p class="sub">Web Chat 未开启。<br>终端已就绪。</p>'
+                    '<a class="btn" href="/terminal">打开终端</a>'
+                    '</div></body></html>'
+                )
+            else:
+                body = (
+                    '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
+                    '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
+                    '<title>XGent</title><style>'
+                    ':root{color-scheme:dark}'
+                    '*{box-sizing:border-box;margin:0;padding:0}'
+                    'body{height:100%;display:flex;align-items:center;justify-content:center;'
+                    'background:#17212b;color:#e9edf0;font-family:-apple-system,"Segoe UI",'
+                    '"PingFang SC","Microsoft YaHei",sans-serif;padding:20px}'
+                    '.card{background:#1c2733;border:1px solid #2b3a47;border-radius:16px;'
+                    'padding:40px 32px;width:min(380px,92vw);text-align:center}'
+                    '.icon{font-size:48px;margin-bottom:16px}'
+                    '.card h1{font-size:20px;font-weight:600;margin-bottom:8px}'
+                    '.card .sub{color:#7d8e9e;font-size:13px;line-height:1.6;margin-bottom:24px}'
+                    '</style></head><body><div class="card">'
+                    '<div class="icon">\U0001f510</div>'
+                    '<h1>Web 服务未开启</h1>'
+                    '<p class="sub">请在 Telegram /start \u2192 \U0001f310 Web 里开启 Web Chat 或终端。</p>'
+                    '</div></body></html>'
+                )
+            self._send_html(body.encode('utf-8'))
             return
         index_path = os.path.join(STATIC_DIR, "index.html")
         try:

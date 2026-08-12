@@ -112,6 +112,21 @@ class GlobalRecorder:
             chat_id=chat_id,
             metadata=details
         )
+
+    @staticmethod
+    async def record_system_message(content: str, chat_id: Optional[int] = None):
+        """记录系统消息到 AI 可见的上下文（操作结果/确认信息）。
+
+        与 record_system_op 的区别：record_system_op 记录操作本身（如"导出全部数据"），
+        record_system_message 记录操作结果（如"✅ 已成功导出..."），让 AI 能看到用户已完成
+        的操作结果，避免重复询问。
+        """
+        await GlobalRecorder.record(
+            msg_type=MessageType.SYSTEM_OP,
+            role='system',
+            content=content,
+            chat_id=chat_id,
+        )
     
     @staticmethod
     async def record_button_click(button_data: str, chat_id: Optional[int] = None):
