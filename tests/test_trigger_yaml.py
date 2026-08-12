@@ -1,79 +1,73 @@
 """trigger-x YAML 格式解析测试"""
-import sys
-from unittest.mock import MagicMock, patch
+import unittest
+from unittest.mock import MagicMock
 
-import pytest
-
-# Mock 共享命名空间中的依赖
+# AgentCommandBlacklist 定义在 core.py 的共享命名空间里，shell_triggers 作为独立
+# 模块导入时该裸名不存在。直接给模块对象注入 mock：注意不能用 patch.dict 包裹
+# import——退出时会把 with 块内 import 的模块对象移除，导致后续重新 import 拿到第
+# 二个模块对象，而 SelfTriggerManager 方法的 __globals__ 仍指向已被移除的第一个，
+# mock 赋值给错对象 → NameError。
+import xgent_app.sections.shell_triggers as _shell_triggers_module
 mock_blacklist = MagicMock()
 mock_blacklist.check = MagicMock(return_value=(False, None))
-
-# 在导入之前设置 mock
-with patch.dict('sys.modules', {
-    'xgent_app.sections.shell_triggers.AgentCommandBlacklist': mock_blacklist
-}):
-    from xgent_app.sections.shell_triggers import TriggerConditionExpression, SelfTriggerManager
-
-# 确保 AgentCommandBlacklist 被 mock
-import xgent_app.sections.shell_triggers as shell_triggers_module
-if not hasattr(shell_triggers_module, 'AgentCommandBlacklist'):
-    shell_triggers_module.AgentCommandBlacklist = mock_blacklist
+_shell_triggers_module.AgentCommandBlacklist = mock_blacklist
+from xgent_app.sections.shell_triggers import TriggerConditionExpression, SelfTriggerManager
 
 
-class TestConditionExpression:
+class TestConditionExpression(unittest.TestCase):
     """测试智能条件表达式解析"""
 
     def test_literal_bare_word(self):
         """裸词自动视为字面量"""
         expr = TriggerConditionExpression("READY")
-        assert not expr.is_satisfied()
+        self.assertFalse(expr.is_satisfied())
         expr.feed("Server is READY")
-        assert expr.is_satisfied()
-        assert "READY" in expr.matched_literals()
+        self.assertTrue(expr.is_satisfied())
+        self.assertIn("READY", expr.matched_literals())
 
     def test_literal_quoted(self):
         """引号字符串"""
         expr = TriggerConditionExpression('"error timeout"')
         expr.feed("Got error timeout message")
-        assert expr.is_satisfied()
+        self.assertTrue(expr.is_satisfied())
 
     def test_regex_pattern(self):
         """正则表达式匹配"""
         expr = TriggerConditionExpression("/error.*/i")
-        assert not expr.is_satisfied()
+        self.assertFalse(expr.is_satisfied())
         expr.feed("ERROR: connection failed")
-        assert expr.is_satisfied()
+        self.assertTrue(expr.is_satisfied())
 
     def test_logic_and(self):
         """AND 逻辑"""
         expr = TriggerConditionExpression("READY AND SUCCESS")
         expr.feed("READY")
-        assert not expr.is_satisfied()
+        self.assertFalse(expr.is_satisfied())
         expr.feed("SUCCESS")
-        assert expr.is_satisfied()
+        self.assertTrue(expr.is_satisfied())
 
     def test_logic_or(self):
         """OR 逻辑"""
         expr = TriggerConditionExpression("READY OR STARTED")
         expr.feed("STARTED")
-        assert expr.is_satisfied()
+        self.assertTrue(expr.is_satisfied())
 
     def test_parentheses(self):
         """括号分组"""
         expr = TriggerConditionExpression("(READY OR STARTED) AND SUCCESS")
         expr.feed("STARTED")
-        assert not expr.is_satisfied()
+        self.assertFalse(expr.is_satisfied())
         expr.feed("SUCCESS")
-        assert expr.is_satisfied()
+        self.assertTrue(expr.is_satisfied())
 
     def test_complex_regex(self):
         """复杂正则"""
         expr = TriggerConditionExpression("/ERROR|FATAL/i")
         expr.feed("fatal error occurred")
-        assert expr.is_satisfied()
+        self.assertTrue(expr.is_satisfied())
 
 
-class TestYAMLParsing:
+class TestYAMLParsing(unittest.TestCase):
     """测试 YAML 格式解析"""
 
     def test_minimal_task(self):
@@ -83,11 +77,11 @@ task: 检查服务状态
 command: systemctl status nginx
 """
         result = SelfTriggerManager._parse_definition(yaml_body)
-        assert result['summary'] == '检查服务状态'
-        assert result['command'] == 'systemctl status nginx'
-        assert result['schedule_type'] == 'immediate'
-        assert result['condition_expr'] is None
-        assert result['repeat'] is False
+        self.assertEqual(result['summary'], '检查服务状态')
+        self.assertEqual(result['command'], 'systemctl status nginx')
+        self.assertEqual(result['schedule_type'], 'immediate')
+        self.assertIsNone(result['condition_expr'])
+        self.assertFalse(result['repeat'])
 
     def test_schedule_after(self):
         """延迟执行"""
@@ -98,8 +92,8 @@ schedule:
 command: echo test
 """
         result = SelfTriggerManager._parse_definition(yaml_body)
-        assert result['schedule_type'] == 'once'
-        assert result['schedule_expr'] == '30s'
+        self.assertEqual(result['schedule_type'], 'once')
+        self.assertEqual(result['schedule_expr'], '30s')
 
     def test_schedule_at(self):
         """定时执行"""
@@ -110,8 +104,8 @@ schedule:
 command: echo happy new year
 """
         result = SelfTriggerManager._parse_definition(yaml_body)
-        assert result['schedule_type'] == 'once'
-        assert result['schedule_expr'] == '2024-12-31 23:59:59'
+        self.assertEqual(result['schedule_type'], 'once')
+        self.assertEqual(result['schedule_expr'], '2024-12-31 23:59:59')
 
     def test_schedule_cron(self):
         """周期执行"""
@@ -122,8 +116,8 @@ schedule:
 command: df -h
 """
         result = SelfTriggerManager._parse_definition(yaml_body)
-        assert result['schedule_type'] == 'cron'
-        assert result['schedule_expr'] == '0 * * * *'
+        self.assertEqual(result['schedule_type'], 'cron')
+        self.assertEqual(result['schedule_expr'], '0 * * * *')
 
     def test_condition_when(self):
         """条件监控"""
@@ -134,8 +128,8 @@ condition:
 command: tail -f app.log
 """
         result = SelfTriggerManager._parse_definition(yaml_body)
-        assert result['condition_expr'] == 'READY'
-        assert result['repeat'] is False
+        self.assertEqual(result['condition_expr'], 'READY')
+        self.assertFalse(result['repeat'])
 
     def test_condition_repeat(self):
         """重复监控"""
@@ -147,8 +141,8 @@ condition:
 command: tail -f error.log
 """
         result = SelfTriggerManager._parse_definition(yaml_body)
-        assert result['condition_expr'] == 'ERROR'
-        assert result['repeat'] is True
+        self.assertEqual(result['condition_expr'], 'ERROR')
+        self.assertTrue(result['repeat'])
 
     def test_multiline_command(self):
         """多行命令"""
@@ -160,8 +154,8 @@ command: |
   echo "Done"
 """
         result = SelfTriggerManager._parse_definition(yaml_body)
-        assert 'Starting' in result['command']
-        assert 'Done' in result['command']
+        self.assertIn('Starting', result['command'])
+        self.assertIn('Done', result['command'])
 
     def test_full_featured(self):
         """完整功能"""
@@ -177,31 +171,31 @@ command: |
   tail -f /var/log/app.log | grep -E 'READY|STARTED|SUCCESS'
 """
         result = SelfTriggerManager._parse_definition(yaml_body)
-        assert result['summary'] == '完整示例任务'
-        assert result['schedule_type'] == 'once'
-        assert result['schedule_expr'] == '1h'
-        assert result['timezone'] == 'Asia/Shanghai'
-        assert result['condition_expr'] == '(READY OR STARTED) AND SUCCESS'
-        assert result['repeat'] is True
-        assert 'tail -f' in result['command']
+        self.assertEqual(result['summary'], '完整示例任务')
+        self.assertEqual(result['schedule_type'], 'once')
+        self.assertEqual(result['schedule_expr'], '1h')
+        self.assertEqual(result['timezone'], 'Asia/Shanghai')
+        self.assertEqual(result['condition_expr'], '(READY OR STARTED) AND SUCCESS')
+        self.assertTrue(result['repeat'])
+        self.assertIn('tail -f', result['command'])
 
 
-class TestErrorHandling:
+class TestErrorHandling(unittest.TestCase):
     """测试错误处理"""
 
     def test_missing_task(self):
         """缺少 task 字段"""
-        with pytest.raises(ValueError, match='缺少必填字段 "task"'):
+        with self.assertRaisesRegex(ValueError, '缺少必填字段 "task"'):
             SelfTriggerManager._parse_definition("command: echo test")
 
     def test_missing_command(self):
         """缺少 command 字段"""
-        with pytest.raises(ValueError, match='缺少必填字段 "command"'):
+        with self.assertRaisesRegex(ValueError, '缺少必填字段 "command"'):
             SelfTriggerManager._parse_definition("task: test task")
 
     def test_invalid_yaml(self):
         """无效的 YAML"""
-        with pytest.raises(ValueError, match='YAML 格式错误'):
+        with self.assertRaisesRegex(ValueError, 'YAML 格式错误'):
             SelfTriggerManager._parse_definition("task: test\n  invalid: : :")
 
     def test_conflicting_schedule(self):
@@ -213,7 +207,7 @@ schedule:
   cron: 0 * * * *
 command: echo test
 """
-        with pytest.raises(ValueError, match='只能使用一个时间字段'):
+        with self.assertRaisesRegex(ValueError, '只能使用一个时间字段'):
             SelfTriggerManager._parse_definition(yaml_body)
 
     def test_repeat_without_when(self):
@@ -224,7 +218,7 @@ condition:
   repeat: true
 command: echo test
 """
-        with pytest.raises(ValueError, match='repeat 为 true 时必须同时设置'):
+        with self.assertRaisesRegex(ValueError, 'repeat 为 true 时必须同时设置'):
             SelfTriggerManager._parse_definition(yaml_body)
 
     def test_invalid_timezone(self):
@@ -236,7 +230,7 @@ schedule:
   timezone: Invalid/Timezone
 command: echo test
 """
-        with pytest.raises(ValueError, match='未知时区'):
+        with self.assertRaisesRegex(ValueError, '未知时区'):
             SelfTriggerManager._parse_definition(yaml_body)
 
     def test_invalid_condition_syntax(self):
@@ -247,7 +241,7 @@ condition:
   when: READY AND
 command: echo test
 """
-        with pytest.raises(ValueError, match='condition.when 语法错误'):
+        with self.assertRaisesRegex(ValueError, 'condition.when 语法错误'):
             SelfTriggerManager._parse_definition(yaml_body)
 
     def test_task_too_long(self):
@@ -257,9 +251,9 @@ command: echo test
 task: {long_task}
 command: echo test
 """
-        with pytest.raises(ValueError, match='不能超过 600 字符'):
+        with self.assertRaisesRegex(ValueError, '不能超过 600 字符'):
             SelfTriggerManager._parse_definition(yaml_body)
 
 
 if __name__ == '__main__':
-    pytest.main([__file__, '-v'])
+    unittest.main()
