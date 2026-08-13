@@ -46,7 +46,8 @@ if __name__ == '__main__':
         # post_init 已保证启动菜单发送且 flag 不回滚，兜底任务只会制造重复发送风险。
         
         # 注册命令。CommandHandler 必须放在兜底 MessageHandler 前面，否则命令会被普通消息处理器吃掉。
-        app.add_handler(CommandHandler("start", cmd_start))
+        # mirror_to_web 让 TG 端命令/按钮的输出（菜单切换、按钮变化）同步到 web 端。
+        app.add_handler(CommandHandler("start", mirror_to_web(cmd_start)))
         commands = [
             ("config", cmd_settings_menu),
             ("update", cmd_update_system),
@@ -70,12 +71,12 @@ if __name__ == '__main__':
             ("show_chat_info", cmd_show_info),
         ]
         for cmd, handler in commands:
-            app.add_handler(CommandHandler(cmd, handler))
+            app.add_handler(CommandHandler(cmd, mirror_to_web(handler)))
 
-        app.add_handler(CallbackQueryHandler(handle_button_click))
+        app.add_handler(CallbackQueryHandler(mirror_to_web(handle_button_click)))
         app.add_handler(MessageHandler(
             filters.Regex(r"^/(?:黑名单|blacklist)(?:@\w+)?(?:\s|$)"),
-            cmd_blacklist_menu
+            mirror_to_web(cmd_blacklist_menu)
         ))
         
         # 文件处理器

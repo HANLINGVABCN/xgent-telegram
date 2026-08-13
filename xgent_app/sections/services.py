@@ -93,6 +93,17 @@ class GlobalRecorder:
         )
 
     @staticmethod
+    async def record_token_usage(content: str, chat_id: Optional[int] = None):
+        """记录 token 用量提示。须在 record_ai_reply 之后调用，保证 timestamp 晚于正文，
+        刷新后顺序为「输出 + tokens」而非反序。"""
+        await GlobalRecorder.record(
+            msg_type=MessageType.TOKEN_USAGE,
+            role='assistant',
+            content=content,
+            chat_id=chat_id
+        )
+
+    @staticmethod
     async def record_media_reply(content: str, chat_id: Optional[int] = None):
         """记录外部媒体模块回复，避免和聊天AI混成同一个说话人。"""
         await GlobalRecorder.record(

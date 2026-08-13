@@ -929,11 +929,14 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
                                    prov_name: str, prov_data: Dict, model: str,
                                    system_prompt: str, history: List[Dict],
                                    extra_media_artifacts: Optional[List[Dict[str, Any]]] = None,
-                                   stopped_partial_sink: Optional[List[str]] = None) -> Optional[str]:
+                                   stopped_partial_sink: Optional[List[str]] = None,
+                                   token_text_sink: Optional[List[str]] = None) -> Optional[str]:
     """流式回复：上游边生成，Telegram 边按字符刷新显示。
 
     stopped_partial_sink：可选出参。用户中途手动停止时，把已经生成的部分文本
-    append 进去（可能为空串），供调用方记录“当前回复已被用户手动停止”。"""
+    append 进去（可能为空串），供调用方记录“当前回复已被用户手动停止”。
+    token_text_sink：可选出参。token 用量文本 append 进去，供调用方在正文落库
+    之后再落库，避免 token 记录 timestamp 早于正文导致刷新后顺序反序。"""
     global _stop_generation_event
     chat_id = update.effective_chat.id
     TELEGRAM_MSG_LIMIT = RICH_MESSAGE_CHAR_LIMIT
@@ -1087,7 +1090,8 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             await send_token_usage_message(
                 context, chat_id,
                 usage_sink[0] if usage_sink else None,
-                time.monotonic() - generation_started_at
+                time.monotonic() - generation_started_at,
+                token_text_sink=token_text_sink
             )
             return partial or timeout_notice.strip()
 
@@ -1143,7 +1147,8 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
                     await send_token_usage_message(
                         context, chat_id,
                         usage_sink[0] if usage_sink else None,
-                        time.monotonic() - generation_started_at
+                        time.monotonic() - generation_started_at,
+                        token_text_sink=token_text_sink
                     )
                     return full_response
                 except Exception as e:
@@ -1156,7 +1161,8 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             await send_token_usage_message(
                 context, chat_id,
                 usage_sink[0] if usage_sink else None,
-                time.monotonic() - generation_started_at
+                time.monotonic() - generation_started_at,
+                token_text_sink=token_text_sink
             )
             return full_response
 
@@ -1223,10 +1229,12 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
                                        prov_name: str, prov_data: Dict, model: str,
                                        system_prompt: str, history: List[Dict],
                                        extra_media_artifacts: Optional[List[Dict[str, Any]]] = None,
-                                       stopped_partial_sink: Optional[List[str]] = None) -> Optional[str]:
+                                       stopped_partial_sink: Optional[List[str]] = None,
+                                       token_text_sink: Optional[List[str]] = None) -> Optional[str]:
     """非流式回复：等待完整回复后一次性发送。
 
-    stopped_partial_sink：可选出参，语义同流式版本。"""
+    stopped_partial_sink：可选出参，语义同流式版本。
+    token_text_sink：可选出参，语义同流式版本。"""
     global _stop_generation_event
     chat_id = update.effective_chat.id
     TELEGRAM_MSG_LIMIT = RICH_MESSAGE_CHAR_LIMIT
@@ -1375,7 +1383,8 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
                     await send_token_usage_message(
                         context, chat_id,
                         usage_sink[0] if usage_sink else None,
-                        time.monotonic() - generation_started_at
+                        time.monotonic() - generation_started_at,
+                        token_text_sink=token_text_sink
                     )
                     return response
                 except Exception as e:
@@ -1387,7 +1396,8 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
             await send_token_usage_message(
                 context, chat_id,
                 usage_sink[0] if usage_sink else None,
-                time.monotonic() - generation_started_at
+                time.monotonic() - generation_started_at,
+                token_text_sink=token_text_sink
             )
             return response
 

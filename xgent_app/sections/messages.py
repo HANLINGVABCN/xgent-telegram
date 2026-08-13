@@ -1654,19 +1654,22 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
 
     # 根据流式/非流式开关选择回复方式
     stop_partial: List[str] = []
+    token_text: List[str] = []   # token 用量文本出参，正文落库后再落库，保证顺序
     if stream_mode:
         response = await send_streaming_response(
             update, context,
             prov_name, prov_data, model,
             system_prompt, history,
-            stopped_partial_sink=stop_partial
+            stopped_partial_sink=stop_partial,
+            token_text_sink=token_text
         )
     else:
         response = await send_non_streaming_response(
             update, context,
             prov_name, prov_data, model,
             system_prompt, history,
-            stopped_partial_sink=stop_partial
+            stopped_partial_sink=stop_partial,
+            token_text_sink=token_text
         )
     
     if not response:
@@ -1706,6 +1709,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     # 保存 AI 回复
     await GlobalRecorder.record_ai_reply(response, update.effective_chat.id)
     await db.add_chat_message(cid, 'assistant', response)
+    # token 用量在正文落库之后落库，保证 timestamp 晚于正文，刷新后顺序为「输出 + tokens」。
+    if token_text:
+        await GlobalRecorder.record_token_usage(token_text[0], update.effective_chat.id)
     agent_turn_history: List[Dict[str, Any]] = list(history)
     agent_turn_history.append({'role': 'assistant', 'content': response})
     
@@ -2158,19 +2164,22 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             pending_round_iteration = None
 
             stop_partial = []
+            token_text = []
             if stream_mode:
                 response = await send_streaming_response(
                     update, context,
                     prov_name, prov_data, model,
                     system_prompt, next_history,
-                    stopped_partial_sink=stop_partial
+                    stopped_partial_sink=stop_partial,
+                    token_text_sink=token_text
                 )
             else:
                 response = await send_non_streaming_response(
                     update, context,
                     prov_name, prov_data, model,
                     system_prompt, next_history,
-                    stopped_partial_sink=stop_partial
+                    stopped_partial_sink=stop_partial,
+                    token_text_sink=token_text
                 )
             
             if not response:
@@ -2211,6 +2220,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
 
             await GlobalRecorder.record_ai_reply(response, update.effective_chat.id)
             await db.add_chat_message(cid, 'assistant', response)
+            if token_text:
+                await GlobalRecorder.record_token_usage(token_text[0], update.effective_chat.id)
             agent_turn_history = next_history
             agent_turn_history.append({'role': 'assistant', 'content': response})
 

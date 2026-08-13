@@ -361,6 +361,9 @@ async def _web_deliver_file_to_tg(abs_path: str, filename: str, caption: str) ->
         return  # 纯网页模式，无 TG 可同步
 
     chat_id = BotConfig.AUTHORIZED_USER_ID
+    # 发到 TG 的 caption 带 [网页] 标记，与网页文本消息的镜像标记一致，
+    # 让 TG 端知道这文件来自网页。仅用于 TG 发送，不影响喂给模型的附言。
+    tg_caption = f"💬 [网页]\n{caption}" if caption else "💬 [网页]"
     try:
         file_size = os.path.getsize(abs_path)
         # AgentExecutor.MAX_FILE_SIZE 与发送侧同源（50MB），通过共享命名空间可见。
@@ -396,7 +399,7 @@ async def _web_deliver_file_to_tg(abs_path: str, filename: str, caption: str) ->
                     chat_id=chat_id,
                     document=container_path,
                     filename=filename,
-                    caption=caption or None,
+                    caption=tg_caption,
                     read_timeout=read_timeout,
                     write_timeout=read_timeout,
                     connect_timeout=30,
@@ -567,6 +570,32 @@ def get_web_outbox() -> Optional[Any]:
 def get_web_real_bot() -> Optional[Any]:
     """返回真实 PTB bot 引用，供 TG 侧构建 MirrorBot 镜像到网页。"""
     return _web_real_bot
+
+
+def mirror_to_web(handler):
+    """装饰器：让 TG 端命令/按钮 handler 的输出同步镜像到 web。
+
+    process_conversation 内部已装 install_tg_to_web_mirror，但命令和按钮回调不走
+    process_conversation，所以 web 端看不到 TG 端的菜单切换/按钮变化。本装饰器在
+    handler 入口装镜像（web 在线时），finally restore，让 handler 里的
+    send_message / edit_text / edit_reply_markup 等也推网页 SSE 帧。
+
+    web 未运行时零开销——直接调原 handler。重入安全由 install_tg_to_web_mirror
+    内部的 _ACTIVE_MIRRORS 计数保证。
+    """
+    async def wrapped(update, context):
+        if not is_web_chat_running():
+            return await handler(update, context)
+        from xgent_app.web_bridge import install_tg_to_web_mirror
+        outbox = get_web_outbox()
+        real_bot = get_web_real_bot()
+        restore = install_tg_to_web_mirror(real_bot, outbox)
+        try:
+            return await handler(update, context)
+        finally:
+            restore()
+    wrapped.__name__ = getattr(handler, "__name__", "wrapped")
+    return wrapped
 
 
 def _web_request_stop() -> None:

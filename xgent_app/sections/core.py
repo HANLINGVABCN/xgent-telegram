@@ -711,23 +711,19 @@ def build_token_usage_message(usage: Optional[Dict[str, int]], elapsed_seconds: 
 
 
 async def send_token_usage_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
-                                   usage: Optional[Dict[str, int]], elapsed_seconds: float):
+                                   usage: Optional[Dict[str, int]], elapsed_seconds: float,
+                                   token_text_sink: Optional[List[str]] = None) -> None:
+    """发送 token 用量提示消息。
+
+    落库不在本函数做——本函数在正文落库之前被调用，此时落库会让 token 记录的
+    timestamp 早于正文，刷新后顺序反成「tokens + 输出」。改为把 token 文本写进
+    token_text_sink，由调用方在正文落库之后再落库，保证顺序为「输出 + tokens」。
+    """
     text = build_token_usage_message(usage, elapsed_seconds)
     if not text:
         return
-    # 落库：用独立的 TOKEN_USAGE 类型常驻历史，刷新后仍可见。role=assistant 让它在
-    # web 历史显示在 AI 侧（与实时 SSE message 帧一致）。模型上下文查询里这个类型
-    # 走 else 分支按 assistant 原样带入，不会伪装成 user 破坏对话轮换。
-    try:
-        await GlobalRecorder.record(
-            msg_type=MessageType.TOKEN_USAGE,
-            role='assistant',
-            content=text,
-            chat_id=chat_id,
-            metadata={'usage': usage, 'elapsed_seconds': elapsed_seconds} if usage else None,
-        )
-    except Exception:
-        logger.debug("token 用量落库失败", exc_info=True)
+    if token_text_sink is not None:
+        token_text_sink.append(text)
     try:
         await context.bot.send_message(
             chat_id=chat_id,
