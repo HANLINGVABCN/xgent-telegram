@@ -323,6 +323,10 @@ class BotMemoryDB:
             msg_type = msg.get('msg_type')
             if is_redundant_agent_command_record(msg_type, msg.get('content')):
                 continue
+            # token 用量提示是给用户看的 UI 信息，不喂给模型，否则「↑ N tokens」这类
+            # 文本会混进上下文污染对话。
+            if msg_type == MessageType.TOKEN_USAGE:
+                continue
             
             # 系统操作以 system 角色注入（OpenAI 格式原样支持；Gemini/Claude 在各自构建器里降级为 user），
             # 避免系统旁白伪装成用户消息、破坏对话轮换结构
@@ -358,7 +362,36 @@ class BotMemoryDB:
                 })
         
         return result
-    
+
+    async def get_display_history(self, limit: int = 50) -> List[Dict]:
+        """供 web 前端显示用的历史。与 get_conversation_messages（给模型上下文）解耦：
+
+        模型上下文里执行结果要当 user 喂给 AI；但前端显示时这些是「AI/系统侧产出的结果」，
+        应显示在 AI 一侧。这里把 AGENT_RESULT/AGENT_CMD/MEDIA_REPLY 映射成 assistant，
+        其余按真实 role。冗余记录过滤与 get_conversation_messages 保持一致。
+        """
+        conn = await self._get_conn()
+        cursor = await conn.execute('''
+            SELECT role, content, timestamp, msg_type FROM global_messages
+            ORDER BY timestamp DESC LIMIT ?
+        ''', (limit,))
+        rows = await cursor.fetchall()
+
+        result = []
+        for row in reversed(rows):
+            msg = dict(row)
+            msg_type = msg.get('msg_type')
+            if is_redundant_agent_command_record(msg_type, msg.get('content')):
+                continue
+            # 执行结果 / 媒体回复：AI 侧产出 → 显示到对面（assistant）。
+            # 去掉模型上下文里加的 [系统结果]/[Agent执行] 前缀，前端直接看原文。
+            if msg_type in (MessageType.AGENT_RESULT, MessageType.AGENT_CMD,
+                            MessageType.MEDIA_REPLY):
+                result.append({'role': 'assistant', 'content': msg['content']})
+            else:
+                result.append({'role': msg['role'], 'content': msg['content']})
+        return result
+
     async def get_last_user_message_time(self) -> Optional[float]:
         """获取用户最后一次发消息的时间"""
         conn = await self._get_conn()

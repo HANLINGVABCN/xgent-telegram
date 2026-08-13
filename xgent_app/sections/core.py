@@ -715,6 +715,19 @@ async def send_token_usage_message(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     text = build_token_usage_message(usage, elapsed_seconds)
     if not text:
         return
+    # 落库：用独立的 TOKEN_USAGE 类型常驻历史，刷新后仍可见。role=assistant 让它在
+    # web 历史显示在 AI 侧（与实时 SSE message 帧一致）。模型上下文查询里这个类型
+    # 走 else 分支按 assistant 原样带入，不会伪装成 user 破坏对话轮换。
+    try:
+        await GlobalRecorder.record(
+            msg_type=MessageType.TOKEN_USAGE,
+            role='assistant',
+            content=text,
+            chat_id=chat_id,
+            metadata={'usage': usage, 'elapsed_seconds': elapsed_seconds} if usage else None,
+        )
+    except Exception:
+        logger.debug("token 用量落库失败", exc_info=True)
     try:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -820,6 +833,7 @@ class MessageType:
     COMMAND = 'command'
     AGENT_CMD = 'agent_cmd'           # Agent 请求的工具动作
     AGENT_RESULT = 'agent_result'     # Agent 工具结果
+    TOKEN_USAGE = 'token_usage'       # 每轮回复末尾的 token 用量提示（独立消息，常驻历史）
 
 def _read_int_env(name: str, default: int, minimum: int = 1) -> int:
     try:

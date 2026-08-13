@@ -127,3 +127,6 @@ site/
 $RECYCLE_BIN/
 ehthumbs.db
 ehthumbs_vista.db
+
+# 本地工具会话目录（非项目内容）
+.zcode/

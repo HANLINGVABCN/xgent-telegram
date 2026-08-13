@@ -38,6 +38,14 @@ logger = logging.getLogger(__name__)
 # 不限大小的话一个未授权请求就能让工作线程吃满内存。
 MAX_REQUEST_BODY = 1 * 1024 * 1024
 
+# 文件上传请求体上限的两档基线，对齐 agent_sendfile.py 的发送侧阈值：
+#   官方 api.telegram.org —— send_document 上限 50MB
+#   本地 Bot API server  —— send_document 上限 2GB
+# 实际生效值由 WebChatConfig.upload_body_limit 携带（idle.py 据 API_BASE_URL 选档），
+# 这里只是默认值。读体前先校验，避免大文件把工作线程内存打爆。
+MAX_UPLOAD_BODY_OFFICIAL = 50 * 1024 * 1024
+MAX_UPLOAD_BODY_LOCAL_API = 2 * 1024 * 1024 * 1024
+
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui")
 
 # SSE 心跳间隔。低于常见反代的 60s 空闲超时。
@@ -67,6 +75,8 @@ class WebChatConfig:
         is_busy: Callable[[], bool],
         submit_callback: Optional[Callable[[str, int, WebOutbox], Any]] = None,
         submit_command: Optional[Callable[[str, WebOutbox], Any]] = None,
+        submit_upload: Optional[Callable[[str, bytes, str, WebOutbox], Any]] = None,
+        upload_body_limit: int = MAX_UPLOAD_BODY_OFFICIAL,
         is_terminal_enabled: Optional[Callable[[], bool]] = None,
         is_web_enabled: Optional[Callable[[], bool]] = None,
     ):
@@ -80,6 +90,12 @@ class WebChatConfig:
         # 网页按钮 / 命令路由。可选，保留向后兼容（旧测试构造 WebChatConfig 时不传）。
         self.submit_callback = submit_callback or (lambda *a: None)
         self.submit_command = submit_command or (lambda *a: None)
+        # 网页文件上传。可选：旧构造路径不传时回退为占位（没人会调到，因为
+        # /api/upload 路由只在 idle 注入了真实回放时才注册语义）。
+        self.submit_upload = submit_upload or (lambda *a: None)
+        # 上传请求体上限。由 idle.py 按 API_BASE_URL 选档传入，web_server 本身
+        # 不 import sections，避免破坏「可独立 import」约定。
+        self.upload_body_limit = int(upload_body_limit)
         # 终端开关。默认关闭——终端是任意命令执行，必须显式开启。
         self.is_terminal_enabled = is_terminal_enabled or (lambda: False)
         self.is_web_enabled = is_web_enabled or (lambda: True)
@@ -156,6 +172,103 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return None
         return data if isinstance(data, dict) else {}
 
+    def _parse_multipart_boundary(self) -> Optional[bytes]:
+        """从 Content-Type 头里取 multipart/form-data 的 boundary。
+
+        格式：multipart/form-data; boundary=----xxx。boundary 在帧里会前后各
+        多两个横杠（--boundary），头里给的是不含那两个横杠的原始值。
+        """
+        ctype = self.headers.get("Content-Type", "") or ""
+        if "multipart/form-data" not in ctype:
+            return None
+        # 直接 split 而不用 cgi/email（cgi 在 3.13 已移除，且本项目零依赖）。
+        for part in ctype.split(";"):
+            part = part.strip()
+            if part.lower().startswith("boundary="):
+                # 头里的 boundary 可能带引号。
+                value = part[len("boundary="):].strip().strip('"')
+                if value:
+                    return value.encode("utf-8")
+        return None
+
+    def _read_multipart(self) -> Optional[Dict[str, Any]]:
+        """读 multipart/form-data 上传体。返回 {file, filename, text} 或 None。
+
+        只认两个字段：名为 file 的二进制部分（提 filename/字节），名为 text
+        的附言（可空）。超限或格式错直接回错误响应。
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            self._send_json({"error": "bad content-length"}, status=400)
+            return None
+        if length <= 0:
+            self._send_json({"error": "空请求体"}, status=400)
+            return None
+        if length > self.config.upload_body_limit:
+            self._send_json({"error": "文件过大"}, status=413)
+            return None
+
+        boundary = self._parse_multipart_boundary()
+        if not boundary:
+            self._send_json({"error": "缺少 boundary"}, status=400)
+            return None
+
+        # 一次性读完整请求体（上限 50MB，工作线程内存可控）。流式解析也能写，
+        # 但 stdlib BaseHTTPRequestHandler 拿不到可靠的可读流式接口，且 50MB
+        # 一次性读对本服务的并发量足够。
+        body = self.rfile.read(length)
+
+        result: Dict[str, Any] = {"file": None, "filename": None, "text": ""}
+        delimiter = b"--" + boundary
+        # 按 --boundary 切块。第一个块是前置 CRLF（空），最后两个是 -- 和 结束。
+        segments = body.split(delimiter)
+        for seg in segments:
+            # 结束边界之后的内容是尾部 "--\r\n"，跳过。
+            if seg in (b"", b"--", b"--\r\n", b"\r\n"):
+                continue
+            # 每块前面有 \r\n，后面也有 \r\n。剥掉。
+            if seg.startswith(b"\r\n"):
+                seg = seg[2:]
+            if seg.endswith(b"\r\n"):
+                seg = seg[:-2]
+            # 块 = 头部CRLF +正文。头与正文用空行 CRLF CRLF 分隔。
+            header_end = seg.find(b"\r\n\r\n")
+            if header_end < 0:
+                continue
+            header_bytes = seg[:header_end].decode("utf-8", errors="replace")
+            content = seg[header_end + 4:]
+
+            # 解析 Content-Disposition：name="file"; filename="xxx.txt"
+            name = None
+            filename = None
+            for line in header_bytes.split("\r\n"):
+                low = line.lower()
+                if low.startswith("content-disposition:"):
+                    for field in line.split(";"):
+                        field = field.strip()
+                        if field.startswith("name="):
+                            name = field[len("name="):].strip().strip('"')
+                        elif field.startswith("filename="):
+                            filename = field[len("filename="):].strip().strip('"')
+                elif low.startswith("content-type:"):
+                    # 不用，文件类型靠 ArtifactManager 的 mimetypes 推断。
+                    pass
+
+            if name == "file":
+                if not content:
+                    self._send_json({"error": "空文件"}, status=400)
+                    return None
+                result["file"] = content
+                result["filename"] = filename or "upload"
+            elif name == "text":
+                result["text"] = content.decode("utf-8", errors="replace").strip()
+
+        if result["file"] is None:
+            self._send_json({"error": "缺少文件"}, status=400)
+            return None
+        return result
+
     # --- 认证 ---
 
     def _is_authenticated(self) -> bool:
@@ -224,6 +337,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._handle_logout()
             elif path == "/api/chat":
                 self._handle_chat()
+            elif path == "/api/upload":
+                self._handle_upload()
             elif path == "/api/callback":
                 self._handle_callback()
             elif path == "/api/command":
@@ -419,6 +534,32 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # submit_message 只负责把任务丢进事件循环，不等对话跑完——一轮 Agent
         # 对话可能跑好几分钟，HTTP 请求不能挂在那里。
         self.config.submit_message(text, outbox)
+        self._send_json({"ok": True})
+
+    def _handle_upload(self) -> None:
+        """网页文件上传。校验与 /api/chat 一致，只是改读 multipart。
+
+        结果同样经 SSE 推回：文件存盘→同步到 Telegram→进对话核心，HTTP 请求
+        本身立即返回 ok，不等对话跑完。
+        """
+        if not self._require_auth():
+            return
+        if not self._require_web_enabled():
+            return
+        data = self._read_multipart()
+        if data is None:
+            return
+
+        # 全局对话锁被占用时直接拒绝，语义与 /api/chat 的「仍在处理」一致。
+        if self.config.is_busy():
+            self._send_json({"error": "系统仍在处理上一个请求，请稍后再发送"}, status=409)
+            return
+
+        outbox = self.server.outbox  # type: ignore[attr-defined]
+        filename = str(data.get("filename") or "upload")
+        content = data["file"]   # _read_multipart 已保证非 None
+        caption = str(data.get("text") or "")
+        self.config.submit_upload(filename, content, caption, outbox)
         self._send_json({"ok": True})
 
     def _handle_stop(self) -> None:

@@ -366,17 +366,41 @@
     background: var(--surface); border-top: 1px solid var(--line);
     padding: 10px 14px; padding-bottom: max(10px, env(safe-area-inset-bottom));
   }
-  .composer {
+  #composer {
     position: relative; max-width: 980px; margin: 0 auto;
+  }
+  .composer-row {
+    position: relative;
     display: flex; align-items: flex-end; gap: 4px;
     background: var(--surface-2); border: 1px solid var(--line);
     border-radius: var(--r-xl); padding: 4px 4px 4px 5px;
     transition: border-color var(--t), box-shadow var(--t), background var(--t);
   }
-  .composer:focus-within {
+  .composer-row:focus-within {
     border-color: var(--accent-ring); background: var(--surface);
     box-shadow: 0 0 0 3.5px var(--accent-ring);
   }
+  #pending-files {
+    background: var(--surface-2); border: 1px solid var(--line);
+    border-radius: var(--r-lg); padding: 6px 8px; margin-bottom: 6px;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  #pending-files.hidden { display: none; }
+  .pending-file {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 13px; color: var(--text-2);
+    background: var(--surface-3); border-radius: var(--r-md);
+    padding: 4px 6px 4px 8px;
+  }
+  .pending-file .pf-name {
+    flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .pending-file .pf-del {
+    flex-shrink: 0; width: 20px; height: 20px; border: none; background: transparent;
+    color: var(--text-3); cursor: pointer; border-radius: var(--r-full);
+    display: flex; align-items: center; justify-content: center; font-size: 14px;
+  }
+  .pending-file .pf-del:hover { background: var(--surface); color: var(--text); }
   .input-wrap { flex: 1; min-width: 0; position: static; }
   #btn-attach { width: 36px; height: 36px; border-radius: var(--r-full); color: var(--text-3); }
   #btn-attach:hover { background: var(--surface-3); color: var(--text-2); }
@@ -685,14 +709,18 @@
 <button id="scroll-bottom" title="滚动到底部" aria-label="滚动到底部"><svg class="icon" viewBox="0 0 24 24"><use href="#i-down"/></svg></button>
 
 <footer>
-  <div class="composer">
-    <button id="btn-attach" class="icon-btn" title="附件" aria-label="附件"><svg class="icon" viewBox="0 0 24 24"><use href="#i-attach"/></svg></button>
-    <div class="input-wrap">
-      <textarea id="input" rows="1" placeholder="消息 XGent…"></textarea>
+  <div id="composer">
+    <div id="pending-files" class="pending-files hidden"></div>
+    <div class="composer-row">
+      <input type="file" id="file-input" class="hidden" multiple>
+      <button id="btn-attach" class="icon-btn" title="附件" aria-label="附件"><svg class="icon" viewBox="0 0 24 24"><use href="#i-attach"/></svg></button>
+      <div class="input-wrap">
+        <textarea id="input" rows="1" placeholder="消息 XGent…"></textarea>
+      </div>
+      <button id="btn-send" class="send-btn" title="发送" aria-label="发送"><svg class="icon" viewBox="0 0 24 24"><use href="#i-send"/></svg></button>
+      <button id="btn-stop" class="stop-btn hidden" title="停止" aria-label="停止"><svg class="icon" viewBox="0 0 24 24"><use href="#i-stop"/></svg></button>
+      <div id="cmd-suggest" class="cmd-suggest hidden"></div>
     </div>
-    <button id="btn-send" class="send-btn" title="发送" aria-label="发送"><svg class="icon" viewBox="0 0 24 24"><use href="#i-send"/></svg></button>
-    <button id="btn-stop" class="stop-btn hidden" title="停止" aria-label="停止"><svg class="icon" viewBox="0 0 24 24"><use href="#i-stop"/></svg></button>
-    <div id="cmd-suggest" class="cmd-suggest hidden"></div>
   </div>
 </footer>
 
@@ -756,6 +784,8 @@
   var btnSend = document.getElementById("btn-send");
   var btnStop = document.getElementById("btn-stop");
   var btnAttach = document.getElementById("btn-attach");
+  var fileInput = document.getElementById("file-input");
+  var pendingFilesEl = document.getElementById("pending-files");
   var typing = document.getElementById("typing");
   var statusText = document.getElementById("status-text");
   var loginDlg = document.getElementById("login");
@@ -777,6 +807,7 @@
   var reconnectTimer = null;
   var reconnectDelay = 1000;
   var msgCount = 0;
+  var pendingFiles = [];  // 待上传文件 File[]，选完先回显，跟文本一起发送
 
   function svgIcon(name, cls) {
     return '<svg class="icon' + (cls ? " " + cls : "") + '" viewBox="0 0 24 24"><use href="#i-' + name + '"/></svg>';
@@ -1219,18 +1250,35 @@
 
   // ---- 发送 ----
   function syncSendState() {
-    btnSend.classList.toggle("ready", input.value.trim().length > 0);
+    btnSend.classList.toggle("ready", input.value.trim().length > 0 || pendingFiles.length > 0);
   }
 
   function send() {
     var text = input.value.trim();
-    if (!text || btnSend.disabled) return;
-    makeBubble("user", text);            // 本地先显示用户气泡
+    var hasFiles = pendingFiles.length > 0;
+    // 没文本又没文件，或正在忙，直接拦下。纯文件（无附言）允许发送。
+    if ((!text && !hasFiles) || btnSend.disabled) return;
+
+    // 本地先显示用户气泡：有文件时把文件名列进去，方便用户看到自己发了什么。
+    var preview = text;
+    if (hasFiles) {
+      var names = pendingFiles.map(function (f) { return "📎 " + f.name; }).join("\n");
+      preview = text ? (names + "\n" + text) : names;
+    }
+    makeBubble("user", preview);
     input.value = "";
     input.style.height = "auto";
     syncSendState();
     hideSuggest();
     setBusy(true);
+
+    // 有文件走 multipart 上传：绕开 api() 强制的 JSON 头，让浏览器自带 boundary。
+    // 文件与附言一起发；多个文件逐个上传（后端 /api/upload 单次单文件）。
+    if (hasFiles) {
+      sendFiles(text);
+      return;
+    }
+
     var isCmd = text.charAt(0) === "/";
     var path = isCmd ? "/api/command" : "/api/chat";
     var body = isCmd ? { command: text } : { text: text };
@@ -1238,6 +1286,37 @@
       makeBubble("sys", "⚠️ " + err.message);
       setBusy(false);
     });
+  }
+
+  // 逐个上传待发送文件。附言只跟在第一个文件一起发，其余文件附言为空，
+  // 避免同一段文本被重复喂给模型。全部完成才认为这一轮发起成功。
+  function sendFiles(text) {
+    var files = pendingFiles.slice();
+    clearPendingFiles();
+    var i = 0;
+    function next() {
+      if (i >= files.length) return;
+      var f = files[i];
+      var caption = (i === 0 ? text : "");
+      i += 1;
+      var fd = new FormData();
+      fd.append("file", f, f.name);
+      fd.append("text", caption);
+      fetch("/api/upload", {
+        method: "POST", credentials: "same-origin", body: fd,
+      }).then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (body) {
+          if (!r.ok) { throw new Error(body.error || ("HTTP " + r.status)); }
+          return body;
+        });
+      }).then(function () {
+        if (i < files.length) { next(); }
+      }).catch(function (err) {
+        makeBubble("sys", "⚠️ " + f.name + " 上传失败：" + err.message);
+        setBusy(false);
+      });
+    }
+    next();
   }
 
   // ---- / 命令补全 ----
@@ -1421,7 +1500,46 @@
   syncSendState();
 
   btnStop.addEventListener("click", function () { api("/api/stop", { method: "POST" }).catch(function () {}); });
-  btnAttach.addEventListener("click", function () { toast("附件上传请在 Telegram 中发送文件"); });
+  btnAttach.addEventListener("click", function () { fileInput.click(); });
+
+  // 文件选择：加入待发送队列并回显徽标。选完不立即上传，等点发送时跟附言一起发。
+  fileInput.addEventListener("change", function () {
+    for (var i = 0; i < fileInput.files.length; i++) {
+      pendingFiles.push(fileInput.files[i]);
+    }
+    fileInput.value = "";   // 清空，否则选同一个文件不触发 change
+    renderPendingFiles();
+  });
+
+  function renderPendingFiles() {
+    pendingFilesEl.innerHTML = "";
+    pendingFiles.forEach(function (f, idx) {
+      var chip = document.createElement("div");
+      chip.className = "pending-file";
+      var name = document.createElement("span");
+      name.className = "pf-name";
+      name.textContent = "📎 " + f.name;
+      var del = document.createElement("button");
+      del.className = "pf-del";
+      del.type = "button";
+      del.setAttribute("aria-label", "移除");
+      del.textContent = "×";
+      del.addEventListener("click", function () {
+        pendingFiles.splice(idx, 1);
+        renderPendingFiles();
+      });
+      chip.appendChild(name);
+      chip.appendChild(del);
+      pendingFilesEl.appendChild(chip);
+    });
+    pendingFilesEl.classList.toggle("hidden", pendingFiles.length === 0);
+    syncSendState();
+  }
+
+  function clearPendingFiles() {
+    pendingFiles = [];
+    renderPendingFiles();
+  }
 
   // 滚动检测 & 滚动到底部按钮
   log.addEventListener("scroll", function () {

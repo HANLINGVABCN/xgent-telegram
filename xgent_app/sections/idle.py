@@ -117,7 +117,8 @@ WEB_EDITABLE_SETTINGS = {
 
 async def _web_read_history(limit: int) -> List[Dict[str, Any]]:
     db = await BotMemoryDB.get_instance()
-    rows = await db.get_conversation_messages(limit)
+    # 用显示专用查询：执行结果/媒体回复显示在 AI 侧，不沿用模型上下文的 user 映射。
+    rows = await db.get_display_history(limit)
     return [
         {'role': str(row.get('role') or 'user'), 'content': str(row.get('content') or '')}
         for row in rows
@@ -347,6 +348,191 @@ def _web_submit_message(text: str, outbox: Any) -> None:
     asyncio.run_coroutine_threadsafe(_web_run_conversation(text, outbox), loop)
 
 
+async def _web_deliver_file_to_tg(abs_path: str, filename: str, caption: str) -> None:
+    """把网页上传的文件同步发到 Telegram。三段分流对齐 agent_sendfile.py:79-174：
+
+      ≤ MAX_FILE_SIZE              → 原生 send_document 上传
+      > MAX_FILE_SIZE + 本地 server → 硬链到 .local-api-data/，用 file:// 容器路径直发
+      > MAX_FILE_SIZE 无 server     → 只在网页告警，不发（对话照常进行）
+
+    本函数刻意不抛异常：TG 同步失败用 outbox 推一条 sys 提示，网页对话不被拖崩。
+    """
+    if _web_real_bot is None:
+        return  # 纯网页模式，无 TG 可同步
+
+    chat_id = BotConfig.AUTHORIZED_USER_ID
+    try:
+        file_size = os.path.getsize(abs_path)
+        # AgentExecutor.MAX_FILE_SIZE 与发送侧同源（50MB），通过共享命名空间可见。
+        max_file_size = AgentExecutor.MAX_FILE_SIZE
+        api_base_url = BotConfig.API_BASE_URL
+
+        if file_size > max_file_size and api_base_url:
+            # 大文件 + 本地 server：硬链到宿主机数据目录，用容器内 file:// 路径直发。
+            # _LOCAL_API_HOST_DATA_DIR / _LOCAL_API_CONTAINER_DATA_DIR 来自 core.py。
+            import uuid as _uuid
+            name_parts = filename.rsplit('.', 1)
+            unique_name = (
+                f"{name_parts[0]}_web_{_uuid.uuid4().hex[:8]}.{name_parts[1]}"
+                if len(name_parts) == 2
+                else f"{filename}_web_{_uuid.uuid4().hex[:8]}"
+            )
+            temp_host_path = os.path.join(_LOCAL_API_HOST_DATA_DIR, unique_name)
+
+            def _prepare() -> None:
+                os.makedirs(_LOCAL_API_HOST_DATA_DIR, exist_ok=True)
+                try:
+                    if os.path.exists(temp_host_path):
+                        os.remove(temp_host_path)
+                    os.link(abs_path, temp_host_path)
+                except OSError:
+                    shutil.copy2(abs_path, temp_host_path)
+
+            await asyncio.to_thread(_prepare)
+            try:
+                container_path = f"file://{_LOCAL_API_CONTAINER_DATA_DIR}/{unique_name}"
+                read_timeout = max(120, min(1800, int(file_size / (50 * 1024 * 1024) * 60)))
+                await _web_real_bot.send_document(
+                    chat_id=chat_id,
+                    document=container_path,
+                    filename=filename,
+                    caption=caption or None,
+                    read_timeout=read_timeout,
+                    write_timeout=read_timeout,
+                    connect_timeout=30,
+                    pool_timeout=30,
+                )
+            finally:
+                try:
+                    await asyncio.to_thread(
+                        lambda: os.path.exists(temp_host_path) and os.remove(temp_host_path)
+                    )
+                except OSError:
+                    logger.warning("清理 web 上传临时文件失败: %s", temp_host_path)
+            return
+
+        if file_size > max_file_size:
+            # 大文件但没配本地 server：发不了。用 message 帧推一条 AI 侧提示——
+            # 不能用 turn_error（会让前端 setBusy(false) 中断本轮）；message 帧只
+            # hideTyping + 显示气泡，不动 busy，正好。显示在 AI 侧而非用户侧。
+            server_obj = _web_chat_server
+            if server_obj is not None:
+                server_obj.outbox.put({
+                    "type": "message",
+                    "text": (
+                        f"⚠️ 文件 {filename} 超过 50MB({file_size} bytes)，未启用本地 API，"
+                        "无法同步到 Telegram（仅网页处理）。如需同步大文件，请在 install.sh 菜单"
+                        "选项 8 启用本地 API 容器。"
+                    ),
+                    "ts": time.time(),
+                })
+            return
+
+        # 小文件：原生上传。
+        with open(abs_path, "rb") as f:
+            await _web_real_bot.send_document(
+                chat_id=chat_id,
+                document=f,
+                filename=filename,
+                caption=caption or None,
+                read_timeout=120,
+                write_timeout=120,
+            )
+    except Exception as exc:
+        # TG 同步失败不阻断网页对话，与 MirrorBot._tg_call 容错策略一致。
+        # 用 message 帧显示在 AI 侧（系统告警），不用 user_message 误显示在用户侧。
+        logger.warning("Web 文件同步到 Telegram 失败: %s", exc)
+        server_obj = _web_chat_server
+        if server_obj is not None:
+            server_obj.outbox.put({
+                "type": "message",
+                "text": f"⚠️ 文件 {filename} 同步到 Telegram 失败：{str(exc)[:120]}",
+                "ts": time.time(),
+            })
+
+
+async def _web_run_file_conversation(filename: str, content: bytes,
+                                     caption: str, outbox: Any) -> None:
+    """网页上传文件后跑一轮对话。镜像 Telegram 端 handle_document_message 的普通分支
+    （messages.py:245-297）：存盘→记记忆→以路径+内联文本作 content_override 进对话核心。
+
+    与 TG 端唯一的差别在「文件来源」：TG 端用 get_file 下载，这里直接拿上传字节。
+    文件本体也同步发到 Telegram——走与 agent_sendfile.py 同款的三段分流：
+    ≤MAX_FILE_SIZE 原生 send_document 直发；超限且配了本地 Bot API server 则硬链到
+    .local-api-data/ 用 file:// 容器路径直发；超限且没配 server 则只告警不发（对话照跑）。
+    TG 失败不阻断网页对话，与 MirrorBot._tg_call 同样的容错策略。
+    """
+    try:
+        update, context, _bot = build_web_mirror_objects(
+            BotConfig.AUTHORIZED_USER_ID, outbox, _web_real_bot,
+        )
+
+        saved_file = ArtifactManager.save_binary_upload(filename, content)
+        note = ArtifactManager.shorten_text(caption, 80) if caption else ""
+        memory_text = ArtifactManager.build_index_message(
+            "文件", filename, saved_file['rel_path'], note
+        )
+
+        # 文件本体同步到 Telegram。三段分流对齐 agent_sendfile.py:79-174，
+        # 阈值用同源的 AgentExecutor.MAX_FILE_SIZE，保证两端「能发多大」一致。
+        await _web_deliver_file_to_tg(saved_file['abs_path'], filename, caption)
+
+        await GlobalRecorder.record_user_message(
+            memory_text, MessageType.USER_FILE, BotConfig.AUTHORIZED_USER_ID
+        )
+
+        # 构造本轮临时上下文：附言 + 保存通知 + 内联文本（小文件）/ 路径提示（大文件）。
+        # 复刻 messages.py:257-286，保证网页上传与 TG 上传对模型完全一致。
+        turn_parts: List[Dict[str, str]] = []
+        if caption:
+            turn_parts.append({"type": "text", "text": f"用户附言：{caption}"})
+        turn_parts.append({
+            "type": "text",
+            "text": ArtifactManager.build_saved_notice(
+                "文件", saved_file['rel_path'], f"原文件名：{filename}"
+            )
+        })
+        inline_text = ArtifactManager.try_decode_text(content)
+        if inline_text is not None:
+            clipped_text, was_clipped = ArtifactManager.clip_inline_text(inline_text)
+            clip_note = (
+                "\n[系统提示] 文件内容过长，本轮只内联了前半部分，完整内容仍可通过保存路径重新读取。"
+                if was_clipped else ""
+            )
+            turn_parts.append({
+                "type": "text",
+                "text": (
+                    f"[文件内容开始]\n{clipped_text}{clip_note}\n[文件内容结束]\n"
+                    "请直接基于文件内容回答，并说明文件保存路径。"
+                )
+            })
+        else:
+            turn_parts.append({
+                "type": "text",
+                "text": (
+                    "这份文件已经保存到路径里了，但不会把全文长期塞在上下文里。"
+                    "如果后面还要继续分析，请优先按保存路径重新读取。"
+                )
+            })
+
+        await process_conversation(update, context, memory_text, content_override=turn_parts)
+        outbox.put({"type": "turn_end"})
+    except Exception as e:
+        logger.exception("Web 文件对话失败")
+        outbox.put({"type": "turn_error", "text": redact_sensitive_text(str(e))[:300]})
+
+
+def _web_submit_upload(filename: str, content: bytes, caption: str, outbox: Any) -> None:
+    """HTTP 线程调用：把网页上传文件的对话丢进事件循环，不等它跑完。"""
+    loop = _web_chat_server.config.loop if _web_chat_server else None
+    if loop is None:
+        outbox.put({"type": "turn_error", "text": "服务未就绪"})
+        return
+    asyncio.run_coroutine_threadsafe(
+        _web_run_file_conversation(filename, content, caption, outbox), loop,
+    )
+
+
 def _web_submit_callback(callback_data: str, message_id: int, outbox: Any) -> None:
     """HTTP 线程调用：把网页按钮点击丢进事件循环。"""
     loop = _web_chat_server.config.loop if _web_chat_server else None
@@ -430,6 +616,14 @@ async def start_web_chat_if_enabled(app: Any) -> None:
         submit_message=_web_submit_message,
         submit_callback=_web_submit_callback,
         submit_command=_web_submit_command,
+        submit_upload=_web_submit_upload,
+        # 上传上限按 API_BASE_URL 选档，与 agent_sendfile.py 发送侧阈值同源：
+        # 官方 API 50MB、本地 Bot API server 2GB。保证「web 放进来 → bot 发出去」
+        # 两端阈值一致，不会出现 web 放行却在 send_document 被 TG 拒。
+        upload_body_limit=(
+            2 * 1024 * 1024 * 1024 if BotConfig.API_BASE_URL
+            else 50 * 1024 * 1024
+        ),
         read_history=_web_read_history,
         read_settings=_web_read_settings,
         write_setting=_web_write_setting,
