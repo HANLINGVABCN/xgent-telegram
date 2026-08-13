@@ -1026,6 +1026,10 @@ class UserDataManager:
             'idle_message_interval': normalize_idle_message_interval(
                 await cls._require_db().get_config('idle_message_interval', DEFAULT_IDLE_MESSAGE_INTERVAL)
             ),
+            'disabled_skills': [
+                str(s) for s in (await cls._require_db().get_config('disabled_skills', [])) or []
+                if isinstance(s, str)
+            ],
             # 临时数据（不需要持久化）
             'temp_viewing_prov': None,
             'temp_list_type': None,
