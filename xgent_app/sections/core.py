@@ -174,7 +174,7 @@ UPDATE_SKIP_SUFFIXES = (
     ".pid",
     ".pyc",
 )
-UPDATE_LOCAL_CUSTOM_DIRS = ("prompts", "skill")
+UPDATE_LOCAL_CUSTOM_DIRS = ("prompts", "skill-public", "skill")
 UPDATE_BACKUP_DIR = os.path.join(PROJECT_ROOT, "xgent_storage", "update_backups")
 COMMAND_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "xgent_storage", "command_outputs")
 _TRACE_LOG_OVERRIDE = (

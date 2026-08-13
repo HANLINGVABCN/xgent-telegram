@@ -33,7 +33,7 @@
 | 长驻任务 | “启动这个服务，持续观察日志，遇到异常时告诉我。” |
 | 私人助理 | “结合之前的对话和这份文件，整理一份执行清单。” |
 | 媒体生成 | “用默认媒体模型生成一张封面图并发给我。” |
-| 自定义能力 | 通过 `skill/` 增加工作流；私有 skill 放 `skill/private/`，每个可单独启用/禁用。 |
+| 自定义能力 | 通过 `skill-public/` 增加工作流；私有 skill 放 `skill-private/`，每个可单独启用/禁用。 |
 
 ### 典型交互（示意）
 
@@ -216,10 +216,10 @@ UPDATE_ZIP_URL=https://api.github.com/repos/HANLINGVABCN/xgent-telegram/zipball/
 2. 全局附加提示词；
 3. Agent 提示词；
 4. 当前运行目录、上传目录、命令输出目录等路径信息；
-5. `skill/` 文件索引（被禁用的 skill 不计入）；
+5. `skill-public/` 和 `skill-private/` 文件索引（被禁用的 skill 不计入）；
 6. Agent 关闭时的限制说明。
 
-`skill/` 只以索引形式进入提示词，模型需要时才读取具体文件。Skill 文件简介使用 `!` 围栏协议块；同一文件中的多个 `!` 块会按出现顺序合并：
+`skill-public/`、`skill-private/` 只以索引形式进入提示词，模型需要时才读取具体文件。Skill 文件简介使用 `!` 围栏协议块；同一文件中的多个 `!` 块会按出现顺序合并：
 
 ````text
 ```!
@@ -229,10 +229,10 @@ UPDATE_ZIP_URL=https://api.github.com/repos/HANLINGVABCN/xgent-telegram/zipball/
 ````
 
 **Skill 目录与按需启停**：
-- 仓库公共 skill 放 `skill/` 根目录；仅本部署实例使用的私有 skill 放 `skill/private/`（被 git 忽略，更新不覆盖）。
+- 公有 skill 放 `skill-public/`；仅本部署实例使用的私有 skill 放 `skill-private/`（被 git 忽略，更新不覆盖）。
 - 每个 skill 默认启用。不需要的可在 TG 的 `/skills` 菜单或 web 设置面板「Skill 管理」中关闭，关掉的不进 Prompt。
 
-执行 `/update` 时，可选择保留或覆盖 `prompts/` 提示词。skill 文件随仓库更新，`skill/private/` 私有 skill 永不被覆盖。覆盖前，当前内容会备份到：
+执行 `/update` 时，可选择保留或覆盖 `prompts/` 提示词。skill 文件随仓库更新，`skill-private/` 私有 skill 永不被覆盖。覆盖前，当前内容会备份到：
 
 ```text
 xgent_storage/update_backups/custom_时间戳/
@@ -350,7 +350,8 @@ xgent-telegram/
 │  ├─ webui/                  # 网页版前端（单文件，无构建步骤）
 │  └─ sections/               # Bot 功能模块
 ├─ prompts/                   # 系统与 Agent 提示词
-├─ skill/                     # Skill 说明及配套脚本（skill/private/ 为私有，不进仓库）
+├─ skill-public/             # 公有 Skill 说明及配套脚本
+├─ skill-private/            # 私有 Skill（不进仓库、不被更新覆盖）
 ├─ tests/                     # 单元测试
 ├─ tools/                     # 开发检查工具
 └─ docs/

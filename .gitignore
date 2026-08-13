@@ -30,7 +30,7 @@ bot.pid
 memory/
 
 # 用户私有 skill（每个部署实例自定义，不进仓库、不被更新覆盖）
-skill/private/
+skill-private/
 
 # Logs
 xgent_output.log

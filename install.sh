@@ -527,7 +527,7 @@ confirm_uninstall() {
 
     warn "即将卸载本安装脚本创建的运行环境和服务记录。"
     echo "   会清理: venv、本项目 nohup/PM2 进程、xgent.pid、脚本记录的 apt 下载包。"
-    echo "   会保留: 项目文件、.env、数据库、日志、skill/ 下脚本服务、PM2 程序本体。"
+    echo "   会保留: 项目文件、.env、数据库、日志、skill-public/ 下脚本服务、PM2 程序本体。"
     echo ""
     read -r -p "确认继续？输入 y 继续: " answer
     if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
@@ -713,7 +713,7 @@ uninstall_app() {
     echo ""
     echo -e "${CYAN}========================================================${NC}"
     echo -e "${CYAN} XGent for Telegram 主安装内容已卸载。${NC}"
-    echo -e "${CYAN} 已保留项目文件、配置、数据库、日志、skill 服务和 PM2 本体。${NC}"
+    echo -e "${CYAN} 已保留项目文件、配置、数据库、日志、skill-public 服务和 PM2 本体。${NC}"
     echo -e "${CYAN}========================================================${NC}"
 }
 

@@ -162,9 +162,9 @@ def should_apply_update_file(rel_path: str, overwrite_local_custom_files: bool =
     parts = [part for part in rel_path.split("/") if part]
     if not parts:
         return False
-    # 私有 skill 永不覆盖：无论保留/覆盖模式，skill/private/ 下的文件都跳过。
+    # 私有 skill 永不覆盖：无论保留/覆盖模式，skill-private/ 下的文件都跳过。
     # 这些是每个部署实例的自定义 skill，更新里也不会含它们，但显式跳过更安全。
-    if parts[:2] == ["skill", "private"]:
+    if parts[0] == "skill-private":
         return False
     if not overwrite_local_custom_files and parts[0] in UPDATE_LOCAL_CUSTOM_DIRS:
         return False
@@ -760,11 +760,28 @@ def get_provider_usage_badges(provider_name: str) -> str:
         badges.append('🖼️')
     return ''.join(badges) or '⚪'
 
-SKILL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'skill')
+SKILL_PUBLIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'skill-public')
+SKILL_PRIVATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'skill-private')
+# 兼容：旧部署可能还有 skill/ 目录，一并扫描避免 skill 丢失。
+SKILL_LEGACY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'skill')
 SKILL_FILE_EXTENSIONS = {'.md', '.markdown', '.txt'}
 SKILL_SUMMARY_BLOCK_TAG = '!'
 SINGLE_MEMORY_SESSION_ID = "global_memory"
 SINGLE_MEMORY_SESSION_NAME = "全局记忆"
+
+def _skill_dirs() -> list:
+    """返回所有要扫描的 skill 目录：(目录路径, 前缀) 对。
+
+    公有目录前缀为空（路径如 bot-system.md），私有目录前缀为 'private/'
+    （路径如 private/my-skill.md），旧 skill/ 目录前缀为空（兼容历史部署）。
+    """
+    dirs = []
+    for d in (SKILL_PUBLIC_DIR, SKILL_LEGACY_DIR):
+        if os.path.isdir(d):
+            dirs.append((d, ''))
+    if os.path.isdir(SKILL_PRIVATE_DIR):
+        dirs.append((SKILL_PRIVATE_DIR, 'private/'))
+    return dirs
 
 MEMORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'memory')
 MEMORY_FILE_PREFIX = 'memory_'
@@ -772,21 +789,19 @@ MEMORY_FILE_SUFFIX = '.txt'
 
 def list_skill_files() -> List[str]:
     skill_files = []
-    if not os.path.isdir(SKILL_DIR):
-        return skill_files
+    for skill_dir, prefix in _skill_dirs():
+        for root, _, filenames in os.walk(skill_dir):
+            for filename in filenames:
+                if filename.startswith('.'):
+                    continue
 
-    for root, _, filenames in os.walk(SKILL_DIR):
-        for filename in filenames:
-            if filename.startswith('.'):
-                continue
+                ext = os.path.splitext(filename)[1].lower()
+                if ext not in SKILL_FILE_EXTENSIONS:
+                    continue
 
-            ext = os.path.splitext(filename)[1].lower()
-            if ext not in SKILL_FILE_EXTENSIONS:
-                continue
-
-            full_path = os.path.join(root, filename)
-            rel_path = os.path.relpath(full_path, SKILL_DIR).replace('\\', '/')
-            skill_files.append(rel_path)
+                full_path = os.path.join(root, filename)
+                rel_path = os.path.relpath(full_path, skill_dir).replace('\\', '/')
+                skill_files.append(prefix + rel_path)
 
     return sorted(skill_files, key=str.lower)
 
@@ -834,8 +849,24 @@ def extract_skill_summary_blocks(text: str) -> str:
 
     return ' '.join('\n\n'.join(blocks).split())
 
+def resolve_skill_abs_path(rel_path: str) -> str:
+    """把带前缀的相对路径解析为绝对路径。
+
+    rel_path 带前缀：private/xxx.md → skill-private/xxx.md，
+    其余 → skill-public/（或旧 skill/）。
+    """
+    if rel_path.startswith("private/"):
+        real_rel = rel_path[len("private/"):]
+        return os.path.join(SKILL_PRIVATE_DIR, real_rel.replace('/', os.sep))
+    for d in (SKILL_PUBLIC_DIR, SKILL_LEGACY_DIR):
+        candidate = os.path.join(d, rel_path.replace('/', os.sep))
+        if os.path.exists(candidate):
+            return candidate
+    # 文件不存在时仍返回公有目录拼出来的路径（保持旧行为，read_skill_text 会返回空）
+    return os.path.join(SKILL_PUBLIC_DIR, rel_path.replace('/', os.sep))
+
 def extract_skill_summary(rel_path: str) -> str:
-    full_path = os.path.join(SKILL_DIR, rel_path.replace('/', os.sep))
+    full_path = resolve_skill_abs_path(rel_path)
     raw_text = read_skill_text(full_path)
     if not raw_text:
         return "无简介"
@@ -860,7 +891,7 @@ def build_skill_prompt_section() -> str:
         return ''
     disabled = get_disabled_skills()
     skill_entries = ''.join(
-        f"- {skill_file}: {extract_skill_summary(skill_file)} (路径: {to_display_path(os.path.join(SKILL_DIR, skill_file.replace('/', os.sep)))})\n"
+        f"- {skill_file}: {extract_skill_summary(skill_file)} (路径: {to_display_path(resolve_skill_abs_path(skill_file))})\n"
         for skill_file in skill_files
         if skill_file not in disabled
     )
@@ -870,13 +901,15 @@ def build_skill_prompt_section() -> str:
 
 def build_absolute_path_prompt_section() -> str:
     project_root = to_display_path(os.path.dirname(os.path.abspath(__file__)))
-    skill_dir = to_display_path(SKILL_DIR)
+    skill_public_dir = to_display_path(SKILL_PUBLIC_DIR)
+    skill_private_dir = to_display_path(SKILL_PRIVATE_DIR)
     upload_dir = to_display_path(os.path.join(project_root, 'xgent_storage', 'uploads'))
     return (
         "\n\n---\n"
         "【当前运行目录绝对路径】\n"
         f"- 项目根目录: {project_root}\n"
-        f"- skill 目录: {skill_dir}\n"
+        f"- skill 公有目录: {skill_public_dir}\n"
+        f"- skill 私有目录: {skill_private_dir}\n"
         f"- 上传目录: {upload_dir}\n"
         "所有协议的路径参数（read、edit、file、grep 的 path:、sendfile 等）必须使用上述绝对路径，禁止使用相对路径。需要新建文件时，在项目根目录下选择合适的子路径。\n"
         "---\n"

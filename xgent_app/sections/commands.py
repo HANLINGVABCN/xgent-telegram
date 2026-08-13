@@ -198,7 +198,7 @@ async def send_update_confirmation_message(message: Any):
         f"更新会从 <b>{safe_text(source_label)}</b> 下载最新代码并覆盖当前项目文件，然后自动重启。\n"
         f"更新源：<code>{safe_text(BotConfig.UPDATE_ZIP_URL)}</code>\n"
         "运行数据、数据库、日志、存储目录、虚拟环境和 Git 目录会保留。\n"
-        "skill 文件随仓库更新（<code>skill/private/</code> 私有 skill 永不覆盖）。\n\n"
+        "skill 文件随仓库更新（<code>skill-private/</code> 私有 skill 永不覆盖）。\n\n"
         f"{auth_text}"
         "请选择是否覆盖 <code>prompts/</code> 提示词：\n"
         "• 保留：继续使用服务器当前提示词。\n"
