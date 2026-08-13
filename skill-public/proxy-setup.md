@@ -1,15 +1,15 @@
 ```!
-代理节点部署技能：支持 sing-box、Reality、Hysteria2、WARP 等。执行命令：sudo bash skill/script/proxy-setup/proxy_setup.sh。支持自由全协议组合安装。脚本会自动开放本机防火墙，云安全组需用户手动放行。如遇 WARP 异常或高级需求，请先 read 本文档全文。
+代理节点部署技能：支持 sing-box、Reality、Hysteria2、WARP 等。执行命令：sudo bash skill-public/script/proxy-setup/proxy_setup.sh。支持自由全协议组合安装。脚本会自动开放本机防火墙，云安全组需用户手动放行。如遇 WARP 异常或高级需求，请先 read 本文档全文。
 ```
 
 # proxy_setup.sh 使用说明
 
-本文是 XGent for Telegram 项目内置 skill 文档，用于指导 Agent 模式在服务器上使用 `skill/script/proxy-setup/proxy_setup.sh` 部署代理节点。
+本文是 XGent for Telegram 项目内置 skill 文档，用于指导 Agent 模式在服务器上使用 `skill-public/script/proxy-setup/proxy_setup.sh` 部署代理节点。
 
 ## 脚本位置
 
 ```text
-skill/script/proxy-setup/proxy_setup.sh
+skill-public/script/proxy-setup/proxy_setup.sh
 ```
 
 脚本用途：
@@ -29,14 +29,14 @@ skill/script/proxy-setup/proxy_setup.sh
 在项目根目录执行：
 
 ```bash
-chmod +x skill/script/proxy-setup/proxy_setup.sh
-sudo bash skill/script/proxy-setup/proxy_setup.sh
+chmod +x skill-public/script/proxy-setup/proxy_setup.sh
+sudo bash skill-public/script/proxy-setup/proxy_setup.sh
 ```
 
 也可以直接在脚本目录执行：
 
 ```bash
-cd skill/script/proxy-setup
+cd skill-public/script/proxy-setup
 chmod +x proxy_setup.sh
 sudo bash proxy_setup.sh
 ```
@@ -223,7 +223,7 @@ endpoint/wireguard[out-warp]: outbound connection to ...
 
 ```bash
 rm -f /etc/sing-box/warp_wg.json
-sudo bash skill/script/proxy-setup/proxy_setup.sh
+sudo bash skill-public/script/proxy-setup/proxy_setup.sh
 ```
 
 然后选择：
@@ -264,7 +264,7 @@ ca-certificates wget tar curl openssl jq qrencode
 
 ## Agent 使用注意
 
-当用户要求部署代理、安装 WARP、生成 Reality 节点、配置 sing-box、查看 Clash/Mihomo 配置时，应优先读取本文，再运行 `skill/script/proxy-setup/proxy_setup.sh`。
+当用户要求部署代理、安装 WARP、生成 Reality 节点、配置 sing-box、查看 Clash/Mihomo 配置时，应优先读取本文，再运行 `skill-public/script/proxy-setup/proxy_setup.sh`。
 
 执行前先确认：
 

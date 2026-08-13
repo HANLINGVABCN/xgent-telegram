@@ -1,18 +1,18 @@
 ```!
-WebDAV网盘技能：一键部署网页网盘及WebDAV服务。安装: sudo bash skill/script/webdav-filemanager/install.sh install。日常更新: sudo bash skill/script/webdav-filemanager/install.sh update (注意：日常更新严禁用install，否则会覆盖账号)。卸载: 传参数 uninstall。默认端口 8989。同名文件严格不覆盖。详细功能、常见故障排查请先 read 本文档全文。
+WebDAV网盘技能：一键部署网页网盘及WebDAV服务。安装: sudo bash skill-public/script/webdav-filemanager/install.sh install。日常更新: sudo bash skill-public/script/webdav-filemanager/install.sh update (注意：日常更新严禁用install，否则会覆盖账号)。卸载: 传参数 uninstall。默认端口 8989。同名文件严格不覆盖。详细功能、常见故障排查请先 read 本文档全文。
 ```
 
 # 服务器网盘 + WebDAV + HTTP 测速文件管理器
 
-本文是 XGent for Telegram 项目内置 skill 文档，用于指导 Agent 模式在服务器上使用 `skill/script/webdav-filemanager/install.sh` 搭建一个带网页文件管理界面、WebDAV 协议支持和 HTTP 测速能力的私有网盘。
+本文是 XGent for Telegram 项目内置 skill 文档，用于指导 Agent 模式在服务器上使用 `skill-public/script/webdav-filemanager/install.sh` 搭建一个带网页文件管理界面、WebDAV 协议支持和 HTTP 测速能力的私有网盘。
 
 ## 1. 文件位置
 
 ```text
 skill/webdav-filemanager.md
-skill/script/webdav-filemanager/install.sh
-skill/script/webdav-filemanager/server.py
-skill/script/webdav-filemanager/index.html
+skill-public/script/webdav-filemanager/install.sh
+skill-public/script/webdav-filemanager/server.py
+skill-public/script/webdav-filemanager/index.html
 ```
 
 其中：
@@ -60,14 +60,14 @@ skill/script/webdav-filemanager/index.html
 在项目根目录执行：
 
 ```bash
-chmod +x skill/script/webdav-filemanager/install.sh
-sudo bash skill/script/webdav-filemanager/install.sh install
+chmod +x skill-public/script/webdav-filemanager/install.sh
+sudo bash skill-public/script/webdav-filemanager/install.sh install
 ```
 
 如果当前已经是 `root` 用户，可以去掉 `sudo`：
 
 ```bash
-bash skill/script/webdav-filemanager/install.sh install
+bash skill-public/script/webdav-filemanager/install.sh install
 ```
 
 脚本会交互式询问：
@@ -106,7 +106,7 @@ WebDAV：    http://服务器IP:8989/dav/
 不带参数运行脚本会进入菜单：
 
 ```bash
-sudo bash skill/script/webdav-filemanager/install.sh
+sudo bash skill-public/script/webdav-filemanager/install.sh
 ```
 
 菜单选项：
@@ -128,7 +128,7 @@ sudo bash skill/script/webdav-filemanager/install.sh
 **Agent 执行建议**：
 
 - 首次部署：选择选项 1（安装）。
-- 程序更新：选择选项 2（更新），或直接使用命令 `sudo bash skill/script/webdav-filemanager/install.sh update`。
+- 程序更新：选择选项 2（更新），或直接使用命令 `sudo bash skill-public/script/webdav-filemanager/install.sh update`。
 - 用户明确要求卸载：选择选项 3（卸载）。
 - 用户要求"重新配置端口/账号/目录"：选择选项 1（重新安装）。
 
@@ -137,13 +137,13 @@ sudo bash skill/script/webdav-filemanager/install.sh
 当项目里的 `server.py` 或 `index.html` 有新版本时，**不需要重新走安装问答，不需要重新输入端口、账号、密码**。直接执行：
 
 ```bash
-sudo bash skill/script/webdav-filemanager/install.sh update
+sudo bash skill-public/script/webdav-filemanager/install.sh update
 ```
 
 或者通过菜单模式选择选项 2：
 
 ```bash
-sudo bash skill/script/webdav-filemanager/install.sh
+sudo bash skill-public/script/webdav-filemanager/install.sh
 # 然后输入 2 选择"更新程序"
 ```
 
@@ -244,7 +244,7 @@ sudo bash skill/script/webdav-filemanager/install.sh
 卸载命令：
 
 ```bash
-sudo bash skill/script/webdav-filemanager/install.sh uninstall
+sudo bash skill-public/script/webdav-filemanager/install.sh uninstall
 ```
 
 卸载脚本会全面清理程序侧内容，并保留网盘文件根目录。会删除：
@@ -330,7 +330,7 @@ cat /etc/systemd/system/webdav-filemanager.service
 如果不想安装任何服务，也可以直接运行：
 
 ```bash
-python3 skill/script/webdav-filemanager/server.py -H 0.0.0.0 -p 8989 -r /data/files -a admin:你的密码
+python3 skill-public/script/webdav-filemanager/server.py -H 0.0.0.0 -p 8989 -r /data/files -a admin:你的密码
 ```
 
 参数说明：
@@ -346,7 +346,7 @@ python3 skill/script/webdav-filemanager/server.py -H 0.0.0.0 -p 8989 -r /data/fi
 
 ```bash
 mkdir -p /data/files
-python3 skill/script/webdav-filemanager/server.py \
+python3 skill-public/script/webdav-filemanager/server.py \
   -H 0.0.0.0 \
   -p 8989 \
   -r /data/files \
@@ -463,7 +463,7 @@ http://服务器IP:端口/dav/
 
 1. 确认当前环境是 Linux VPS / 服务器。
 2. 确认有 root 或 sudo 权限。
-3. 确认 `skill/script/webdav-filemanager/` 下存在 `install.sh`、`server.py`、`index.html`。
+3. 确认 `skill-public/script/webdav-filemanager/` 下存在 `install.sh`、`server.py`、`index.html`。
 4. 运行安装命令。
 5. 按用户要求填写进程管理方式、端口、账号、密码、文件根目录。
 6. 安装完成后检查服务状态。
@@ -473,9 +473,9 @@ http://服务器IP:端口/dav/
 推荐命令：
 
 ```bash
-ls -lah skill/script/webdav-filemanager
-chmod +x skill/script/webdav-filemanager/install.sh
-sudo bash skill/script/webdav-filemanager/install.sh install
+ls -lah skill-public/script/webdav-filemanager
+chmod +x skill-public/script/webdav-filemanager/install.sh
+sudo bash skill-public/script/webdav-filemanager/install.sh install
 pm2 show webdav-filemanager
 # 或者 systemctl status webdav-filemanager --no-pager
 ```
@@ -493,7 +493,7 @@ pm2 show webdav-filemanager
 ```bash
 cd "<项目根目录绝对路径>"
 git pull  # 如果需要从 git 仓库拉取最新代码
-sudo bash skill/script/webdav-filemanager/install.sh update
+sudo bash skill-public/script/webdav-filemanager/install.sh update
 pm2 show webdav-filemanager
 # 或者 systemctl status webdav-filemanager --no-pager
 ```
@@ -515,7 +515,7 @@ pm2 show webdav-filemanager
 当用户要求”更改端口”、”修改账号”、”换个目录”、”重新配置”时，使用 `install` 命令：
 
 ```bash
-sudo bash skill/script/webdav-filemanager/install.sh install
+sudo bash skill-public/script/webdav-filemanager/install.sh install
 ```
 
 这会重新询问所有配置项，但**不会删除网盘文件根目录**（例如 `/data/files`）。
@@ -525,7 +525,7 @@ sudo bash skill/script/webdav-filemanager/install.sh install
 当用户明确要求”卸载网盘”、”删除 WebDAV”、”移除程序”时，使用 `uninstall` 命令：
 
 ```bash
-sudo bash skill/script/webdav-filemanager/install.sh uninstall
+sudo bash skill-public/script/webdav-filemanager/install.sh uninstall
 ```
 
 卸载会删除程序和服务，但**不会删除网盘文件根目录**。如果用户要求”连文件一起删除”，需要额外确认后再执行：
@@ -568,7 +568,7 @@ hostname -I
 检查：
 
 ```bash
-ls -lah skill/script/webdav-filemanager
+ls -lah skill-public/script/webdav-filemanager
 ```
 
 正确目录里应该有：
@@ -632,7 +632,7 @@ systemctl restart webdav-filemanager
 也可以重新运行安装脚本重新配置：
 
 ```bash
-sudo bash skill/script/webdav-filemanager/install.sh install
+sudo bash skill-public/script/webdav-filemanager/install.sh install
 ```
 
 ### 12.5 WebDAV 客户端无法连接

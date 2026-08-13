@@ -1,5 +1,5 @@
 ```!
-便签技能：一键部署一个轻量私有网页便签。功能包括账号密码登录、便签列表、新建/编辑/删除、标题与正文搜索。安装: sudo bash skill/script/notes/install.sh install。更新: sudo bash skill/script/notes/install.sh update。卸载: sudo bash skill/script/notes/install.sh uninstall。默认端口 8899，部署时交互填写端口、账号、密码。
+便签技能：一键部署一个轻量私有网页便签。功能包括账号密码登录、便签列表、新建/编辑/删除、标题与正文搜索。安装: sudo bash skill-public/script/notes/install.sh install。更新: sudo bash skill-public/script/notes/install.sh update。卸载: sudo bash skill-public/script/notes/install.sh uninstall。默认端口 8899，部署时交互填写端口、账号、密码。
 ```
 
 # 私有网页便签
@@ -10,8 +10,8 @@
 
 ```text
 skill/notes.md
-skill/script/notes/install.sh
-skill/script/notes/server.py
+skill-public/script/notes/install.sh
+skill-public/script/notes/server.py
 ```
 
 ## 功能
@@ -29,8 +29,8 @@ skill/script/notes/server.py
 在项目根目录执行：
 
 ```bash
-chmod +x skill/script/notes/install.sh
-sudo bash skill/script/notes/install.sh install
+chmod +x skill-public/script/notes/install.sh
+sudo bash skill-public/script/notes/install.sh install
 ```
 
 脚本会询问：
@@ -56,7 +56,7 @@ http://服务器IP:端口/
 更新程序但保留端口、账号密码和便签数据：
 
 ```bash
-sudo bash skill/script/notes/install.sh update
+sudo bash skill-public/script/notes/install.sh update
 ```
 
 日常修复或升级时使用 `update`，不要重新 `install`，避免覆盖账号密码配置。
@@ -64,7 +64,7 @@ sudo bash skill/script/notes/install.sh update
 ## 卸载
 
 ```bash
-sudo bash skill/script/notes/install.sh uninstall
+sudo bash skill-public/script/notes/install.sh uninstall
 ```
 
 卸载会删除服务和程序目录。默认不删除已配置的数据目录，避免误删便签数据。
