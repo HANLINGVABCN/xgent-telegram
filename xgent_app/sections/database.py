@@ -385,11 +385,16 @@ class BotMemoryDB:
                 continue
             # 执行结果 / 媒体回复：AI 侧产出 → 显示到对面（assistant）。
             # 去掉模型上下文里加的 [系统结果]/[Agent执行] 前缀，前端直接看原文。
-            if msg_type in (MessageType.AGENT_RESULT, MessageType.AGENT_CMD,
-                            MessageType.MEDIA_REPLY):
-                result.append({'role': 'assistant', 'content': msg['content']})
-            else:
-                result.append({'role': msg['role'], 'content': msg['content']})
+            # msg_type 一并返回，供 _web_read_history 决定哪些消息需 Markdown→HTML 转换
+            # （AI_REPLY 存的是 Markdown 原文，TOKEN_USAGE/AGENT_RESULT 已是 HTML）。
+            display_role = 'assistant' if msg_type in (
+                MessageType.AGENT_RESULT, MessageType.AGENT_CMD, MessageType.MEDIA_REPLY,
+            ) else msg['role']
+            result.append({
+                'role': display_role,
+                'content': msg['content'],
+                'msg_type': msg_type,
+            })
         return result
 
     async def get_last_user_message_time(self) -> Optional[float]:

@@ -1241,7 +1241,7 @@
       msgCount = 0;
       (data.messages || []).forEach(function (m) {
         var role = m.role === "user" ? "user" : (m.role === "assistant" ? "ai" : "sys");
-        makeBubble(role, m.content);
+        makeBubble(role, m.content, null, m.parse_mode);
       });
       updateEmptyState();
       scrollDown();

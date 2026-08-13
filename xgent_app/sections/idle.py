@@ -119,10 +119,25 @@ async def _web_read_history(limit: int) -> List[Dict[str, Any]]:
     db = await BotMemoryDB.get_instance()
     # 用显示专用查询：执行结果/媒体回复显示在 AI 侧，不沿用模型上下文的 user 映射。
     rows = await db.get_display_history(limit)
-    return [
-        {'role': str(row.get('role') or 'user'), 'content': str(row.get('content') or '')}
-        for row in rows
-    ]
+    result = []
+    for row in rows:
+        msg_type = row.get('msg_type')
+        content = str(row.get('content') or '')
+        # AI_REPLY 存的是 Markdown 原文：转成 Telegram HTML 再返回，前端 sanitizeHtml
+        # 即可正常渲染粗体/标题/列表/引用/代码等。刷新后格式不再丢失。
+        # TOKEN_USAGE/AGENT_RESULT/MEDIA_REPLY 已是 HTML，不再二次转换。
+        if msg_type == MessageType.AI_REPLY:
+            try:
+                content = markdown_to_telegram_html(content)
+            except Exception:
+                pass  # 转换失败退回原文，总比报错好
+            result.append({'role': 'assistant', 'content': content, 'parse_mode': 'HTML'})
+        else:
+            result.append({
+                'role': str(row.get('role') or 'user'),
+                'content': content,
+            })
+    return result
 
 
 async def _web_read_settings() -> Dict[str, Any]:
