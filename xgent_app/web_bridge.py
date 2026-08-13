@@ -577,9 +577,16 @@ def build_web_callback_objects(chat_id: int, outbox: WebOutbox,
     return update, WebContext(bot), bot
 
 
-def build_web_command_objects(chat_id: int, outbox: WebOutbox, command_text: str):
-    """网页 /命令三件套：复用 Telegram 的 cmd_* 命令处理函数。"""
-    bot = WebBot(outbox, chat_id)
+def build_web_command_objects(chat_id: int, outbox: WebOutbox, command_text: str,
+                              real_bot: Any = None):
+    """网页 /命令三件套：复用 Telegram 的 cmd_* 命令处理函数。
+
+    用 MirrorBot（传 real_bot 时）让命令输出既推网页帧又发 Telegram，实现
+    web→TG 同步。命令以 reply_text 新发消息为主，MirrorBot 的 _id_map 能把
+    web 假 id 映射到 TG 真实 id，后续 edit_text 也能正确更新 TG 端消息。
+    real_bot 为 None 时退化为纯网页输出（等价 WebBot）。
+    """
+    bot = MirrorBot(outbox, chat_id, real_bot)
     update = WebUpdate(bot, chat_id)
     update.message.text = str(command_text or "")
     return update, WebContext(bot), bot

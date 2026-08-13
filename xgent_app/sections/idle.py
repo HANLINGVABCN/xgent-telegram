@@ -273,16 +273,19 @@ async def _web_handle_callback(callback_data: str, message_id: int, outbox: Any)
 
 
 async def _web_handle_command(command: str, outbox: Any) -> None:
-    """网页 /命令：路由到对应的 cmd_* 处理函数（纯网页，不回灌 TG）。
+    """网页 /命令：路由到对应的 cmd_* 处理函数，输出同步到 Telegram。
 
-    命令和按钮属于 UI 交互，不需要镜像到 Telegram；真正影响同步的是普通对话，
-    那条路走 _web_run_conversation 的 MirrorBot。
+    用 MirrorBot（带 real_bot）让命令的 send_message/edit_text 既推网页帧又发 TG。
+    命令以 reply_text 新发消息为主，MirrorBot 的 _id_map 保证后续 edit_text 能
+    通过假 id 找到 TG 真实 id 并更新，不像按钮点击那样编辑「别人发的旧消息」。
     """
     name = command.strip().split(" ", 1)[0].lstrip("/").split("@", 1)[0].lower()
     handler = _WEB_COMMAND_MAP.get(name)
     update, context, _bot = build_web_command_objects(
-        BotConfig.AUTHORIZED_USER_ID, outbox, command,
+        BotConfig.AUTHORIZED_USER_ID, outbox, command, _web_real_bot,
     )
+    # 命令可能触发 restart_web_chat（设端口/密码），状态处理器会取 context.application。
+    context.application = _web_application
     try:
         if handler is None:
             # 未知命令当成普通对话发出去，避免网页端 /xxx 没反应。
