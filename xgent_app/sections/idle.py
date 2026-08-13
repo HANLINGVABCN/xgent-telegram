@@ -125,13 +125,24 @@ async def _web_read_history(limit: int) -> List[Dict[str, Any]]:
         content = str(row.get('content') or '')
         # AI_REPLY 存的是 Markdown 原文：转成 Telegram HTML 再返回，前端 sanitizeHtml
         # 即可正常渲染粗体/标题/列表/引用/代码等。刷新后格式不再丢失。
-        # TOKEN_USAGE/AGENT_RESULT/MEDIA_REPLY 已是 HTML，不再二次转换。
+        # TOKEN_USAGE/AGENT_RESULT/AGENT_CMD/MEDIA_REPLY 已是 HTML，不再二次转换，
+        # 但要带 parse_mode=HTML 让前端走 sanitizeHtml 而非纯文本分支（否则 <i>/<pre>
+        # 等标签被 escapeHtml 转义成字面文本）。
         if msg_type == MessageType.AI_REPLY:
             try:
                 content = markdown_to_telegram_html(content)
             except Exception:
                 pass  # 转换失败退回原文，总比报错好
             result.append({'role': 'assistant', 'content': content, 'parse_mode': 'HTML'})
+        elif msg_type in (MessageType.TOKEN_USAGE, MessageType.AGENT_RESULT,
+                          MessageType.AGENT_CMD, MessageType.MEDIA_REPLY,
+                          MessageType.SYSTEM_OP):
+            # 这些类型存库时已是 Telegram HTML，直接带 parse_mode 让前端渲染。
+            result.append({
+                'role': str(row.get('role') or 'user'),
+                'content': content,
+                'parse_mode': 'HTML',
+            })
         else:
             result.append({
                 'role': str(row.get('role') or 'user'),
