@@ -166,7 +166,11 @@ async def _web_read_settings() -> Dict[str, Any]:
     # skill 列表供前端渲染勾选项：每个 skill 的相对路径 + 显示名（stem）
     skill_files = list_skill_files()
     skill_list = [
-        {'path': rp, 'label': os.path.splitext(os.path.basename(rp))[0]}
+        {
+            'path': rp,
+            'label': os.path.splitext(os.path.basename(rp))[0],
+            'source': 'private' if rp.startswith('private/') else 'public',
+        }
         for rp in skill_files
     ]
     disabled_raw = UserDataManager.get('disabled_skills', [])

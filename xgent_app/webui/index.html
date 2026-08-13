@@ -1424,7 +1424,8 @@
             sw.setAttribute("aria-checked", on ? "true" : "false");
             var name = document.createElement("span");
             name.className = "skill-name";
-            name.textContent = sk.label;
+            var srcIcon = sk.source === "private" ? "🔒 " : "📦 ";
+            name.textContent = srcIcon + sk.label;
             sw.addEventListener("click", function () {
               var next = !sw.classList.contains("on");
               sw.classList.toggle("on", next);

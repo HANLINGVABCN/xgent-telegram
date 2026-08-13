@@ -316,11 +316,13 @@ def get_skills_menu():
     for rel_path in skill_files:
         label = os.path.splitext(os.path.basename(rel_path))[0]
         is_off = rel_path in disabled
-        icon = "🔴" if is_off else "🟢"
+        is_private = rel_path.startswith("private/")
+        status_icon = "🔴" if is_off else "🟢"
+        source_icon = "🔒" if is_private else "📦"
         # 路径里的 / 换成 |，避免 callback_data 解析时被 : 切分搞乱
         safe_key = rel_path.replace("/", "|")
         rows.append([InlineKeyboardButton(
-            f"{icon} {label}",
+            f"{status_icon}{source_icon} {label}",
             callback_data=f"toggle_skill:{safe_key}",
         )])
     rows.append([InlineKeyboardButton("🔙 返回", callback_data="menu_more_settings")])

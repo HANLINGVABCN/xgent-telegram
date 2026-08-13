@@ -692,9 +692,10 @@ async def cmd_skills_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["🧩 <b>Skill 管理</b>\n"]
     for rel_path in skill_files:
         label = os.path.splitext(os.path.basename(rel_path))[0]
-        icon = "🔴" if rel_path in disabled else "🟢"
-        lines.append(f"{icon} {label}")
-    lines.append(f"\n共 {len(skill_files)} 个 skill，{len(disabled)} 个已禁用。")
+        status = "🔴" if rel_path in disabled else "🟢"
+        source = "🔒" if rel_path.startswith("private/") else "📦"
+        lines.append(f"{status}{source} {label}")
+    lines.append(f"\n📦=公有 🔒=私有  共 {len(skill_files)} 个 skill，{len(disabled)} 个已禁用。")
     await update.message.reply_text(
         "\n".join(lines),
         reply_markup=get_skills_menu(),

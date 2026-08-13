@@ -60,9 +60,10 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 lines = ["🧩 <b>Skill 管理</b>\n"]
                 for rel_path in skill_files:
                     label = os.path.splitext(os.path.basename(rel_path))[0]
-                    icon = "🔴" if rel_path in disabled else "🟢"
-                    lines.append(f"{icon} {label}")
-                lines.append(f"\n共 {len(skill_files)} 个，{len(disabled)} 个已禁用。")
+                    status = "🔴" if rel_path in disabled else "🟢"
+                    source = "🔒" if rel_path.startswith("private/") else "📦"
+                    lines.append(f"{status}{source} {label}")
+                lines.append(f"\n📦=公有 🔒=私有  共 {len(skill_files)} 个，{len(disabled)} 个已禁用。")
                 await query.message.edit_text(
                     "\n".join(lines),
                     reply_markup=get_skills_menu(),
@@ -91,9 +92,10 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             lines = ["🧩 <b>Skill 管理</b>\n"]
             for rp in skill_files:
                 lbl = os.path.splitext(os.path.basename(rp))[0]
-                icon = "🔴" if rp in disabled else "🟢"
-                lines.append(f"{icon} {lbl}")
-            lines.append(f"\n共 {len(skill_files)} 个，{len(disabled)} 个已禁用。")
+                status = "🔴" if rp in disabled else "🟢"
+                source = "🔒" if rp.startswith("private/") else "📦"
+                lines.append(f"{status}{source} {lbl}")
+            lines.append(f"\n📦=公有 🔒=私有  共 {len(skill_files)} 个，{len(disabled)} 个已禁用。")
             with contextlib.suppress(Exception):
                 await query.message.edit_text(
                     "\n".join(lines),
