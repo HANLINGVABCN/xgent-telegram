@@ -232,7 +232,7 @@ UPDATE_ZIP_URL=https://api.github.com/repos/HANLINGVABCN/xgent-telegram/zipball/
 - 仓库公共 skill 放 `skill/` 根目录；仅本部署实例使用的私有 skill 放 `skill/private/`（被 git 忽略，更新不覆盖）。
 - 每个 skill 默认启用。不需要的可在 TG 的 `/skills` 菜单或 web 设置面板「Skill 管理」中关闭，关掉的不进 Prompt。
 
-执行 `/update` 时，可选择保留或覆盖 `prompts/` 与 `skill/`。无论哪种模式，`skill/private/` 永不被覆盖。覆盖前，当前内容会备份到：
+执行 `/update` 时，可选择保留或覆盖 `prompts/` 提示词。skill 文件随仓库更新，`skill/private/` 私有 skill 永不被覆盖。覆盖前，当前内容会备份到：
 
 ```text
 xgent_storage/update_backups/custom_时间戳/

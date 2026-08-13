@@ -197,16 +197,17 @@ async def send_update_confirmation_message(message: Any):
         "⬆️ <b>更新确认</b>\n\n"
         f"更新会从 <b>{safe_text(source_label)}</b> 下载最新代码并覆盖当前项目文件，然后自动重启。\n"
         f"更新源：<code>{safe_text(BotConfig.UPDATE_ZIP_URL)}</code>\n"
-        "运行数据、数据库、日志、存储目录、虚拟环境和 Git 目录会保留。\n\n"
+        "运行数据、数据库、日志、存储目录、虚拟环境和 Git 目录会保留。\n"
+        "skill 文件随仓库更新（<code>skill/private/</code> 私有 skill 永不覆盖）。\n\n"
         f"{auth_text}"
-        "请选择是否覆盖 <code>prompts/</code> 提示词与 <code>skill/</code> 技能文件：\n"
-        "• 保留：继续使用服务器当前提示词和 skill 文件。\n"
-        "• 覆盖：使用 GitHub 最新版本，覆盖前会把 prompts/ 与 skill/ 一起备份到新文件夹。\n\n"
-        "建议：如果你在机器人里手动改过提示词或 skill，优先选“保留当前提示词和 skill”。",
+        "请选择是否覆盖 <code>prompts/</code> 提示词：\n"
+        "• 保留：继续使用服务器当前提示词。\n"
+        "• 覆盖：使用 GitHub 最新版本，覆盖前会把 prompts/ 备份到新文件夹。\n\n"
+        "建议：如果你在机器人里手动改过提示词，优先选“保留当前提示词”。",
         parse_mode=constants.ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("保留当前提示词和 skill", callback_data="do_update_keep_custom_files")],
-            [InlineKeyboardButton("覆盖并备份提示词和 skill", callback_data="do_update_overwrite_custom_files")],
+            [InlineKeyboardButton("保留当前提示词", callback_data="do_update_keep_custom_files")],
+            [InlineKeyboardButton("覆盖并备份提示词", callback_data="do_update_overwrite_custom_files")],
             [InlineKeyboardButton("取消", callback_data="menu_more_settings")]
         ])
     )
@@ -216,7 +217,7 @@ async def perform_update_system(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     message = update.message or update.callback_query.message
-    custom_files_mode = "覆盖并自动备份 prompts/ 与 skill/" if overwrite_local_custom_files else "保留当前 prompts/ 与 skill/"
+    custom_files_mode = "覆盖并自动备份 prompts/" if overwrite_local_custom_files else "保留当前 prompts/"
     status_msg = await message.reply_text(
         "⬇️ 正在从更新源下载最新代码并覆盖当前目录...\n"
         f"本地文件策略：{custom_files_mode}\n"
@@ -263,10 +264,10 @@ async def perform_update_system(update: Update, context: ContextTypes.DEFAULT_TY
 
     backup_line = ""
     if result.get("backup_path"):
-        backup_line = f"\nprompts/ 与 skill/ 备份: {result.get('backup_path')}"
+        backup_line = f"\nprompts/ 备份: {result.get('backup_path')}"
     skipped_line = ""
     if result.get("skipped_local_custom_files"):
-        skipped_line = f"\n已保留 prompts/ 与 skill/，跳过 {int(result.get('skipped_local_custom_files') or 0)} 个文件。"
+        skipped_line = f"\n已保留 prompts/，跳过 {int(result.get('skipped_local_custom_files') or 0)} 个自定义文件。"
     reload_line = ""
     if reload_result:
         reload_line = (
