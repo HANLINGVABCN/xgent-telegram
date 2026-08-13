@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SERVER = ROOT / 'skill' / 'script' / 'webdav-filemanager' / 'server.py'
+SERVER = ROOT / 'skill-public' / 'script' / 'webdav-filemanager' / 'server.py'
 
 
 def _load_ssrf_helpers(allow_private=False):
