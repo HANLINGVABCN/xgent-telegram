@@ -112,6 +112,7 @@ _web_application: Optional[Any] = None
 WEB_EDITABLE_SETTINGS = {
     'thinking_level', 'stream_mode', 'agent_mode', 'text_stitch_mode',
     'global_depth', 'agent_max_iterations', 'stream_timeout', 'chat_model',
+    'disabled_skills',
 }
 
 
@@ -162,6 +163,14 @@ async def _web_read_settings() -> Dict[str, Any]:
             model_options.append({'value': f"{name}|{model}", 'label': f"{name} / {model}"})
 
     current_model = UserDataManager.get('default_model') or ''
+    # skill 列表供前端渲染勾选项：每个 skill 的相对路径 + 显示名（stem）
+    skill_files = list_skill_files()
+    skill_list = [
+        {'path': rp, 'label': os.path.splitext(os.path.basename(rp))[0]}
+        for rp in skill_files
+    ]
+    disabled_raw = UserDataManager.get('disabled_skills', [])
+    disabled_skills = disabled_raw if isinstance(disabled_raw, list) else []
     return {
         'values': {
             'thinking_level': normalize_thinking_level(UserDataManager.get('thinking_level')),
@@ -174,6 +183,7 @@ async def _web_read_settings() -> Dict[str, Any]:
             ),
             'stream_timeout': int(normalize_stream_timeout(UserDataManager.get('stream_timeout', 0))),
             'chat_model': f"{prov_name}|{current_model}" if prov_name and current_model else '',
+            'disabled_skills': disabled_skills,
         },
         'options': {
             'thinking_level': [
@@ -186,6 +196,7 @@ async def _web_read_settings() -> Dict[str, Any]:
                 {'value': TEXT_STITCH_MODE_OFF, 'label': '不拼接'},
             ],
             'chat_model': model_options,
+            'skill_list': skill_list,
         },
     }
 
@@ -233,6 +244,12 @@ async def _web_write_setting(key: str, value: Any) -> Dict[str, Any]:
         UserDataManager.set(key, timeout)
         await UserDataManager.save_config(key, timeout)
         PortalManager._portals.clear()
+    elif key == 'disabled_skills':
+        # 前端传一个被禁用 skill 的相对路径列表。normalize 成 list[str]，去重。
+        raw = value if isinstance(value, list) else []
+        cleaned = sorted({str(item) for item in raw if item})
+        UserDataManager.set(key, cleaned)
+        await UserDataManager.save_config(key, cleaned)
 
     await GlobalRecorder.record_system_op(f"[Web] 修改配置 {key}", {"key": key})
     return await _web_read_settings()
@@ -354,6 +371,7 @@ def _ensure_web_command_map() -> None:
         ("agent", "cmd_toggle_agent"),
         ("blacklist", "cmd_blacklist_menu"),
         ("stream", "cmd_toggle_stream"),
+        ("skills", "cmd_skills_menu"),
         ("status", "cmd_show_info"),
         ("export", "cmd_export_all"),
         ("show_chat_info", "cmd_show_info"),

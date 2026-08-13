@@ -66,6 +66,7 @@ if __name__ == '__main__':
             ("agent", cmd_toggle_agent),
             ("blacklist", cmd_blacklist_menu),
             ("stream", cmd_toggle_stream),
+            ("skills", cmd_skills_menu),
             ("status", cmd_show_info),
             ("export", cmd_export_all),
             ("show_chat_info", cmd_show_info),

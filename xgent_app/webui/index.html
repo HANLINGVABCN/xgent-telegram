@@ -567,6 +567,9 @@
   .switch.on { background: var(--accent); }
   .switch.on .knob { transform: translateX(18px); }
   .switch:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-ring); }
+  .skill-list { display: flex; flex-direction: column; gap: 6px; flex: 1; }
+  .skill-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 10px; background: var(--surface-3); border-radius: var(--r-md); }
+  .skill-name { font-size: 13.5px; color: var(--text-2); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   .hint { color: var(--text-3); font-size: 12.5px; line-height: 1.65; margin: 12px 4px 0; }
   .btn-text {
@@ -1353,7 +1356,8 @@
     { key: "global_depth", label: "记忆深度", type: "number", min: 1, max: 500 },
     { key: "agent_max_iterations", label: "Agent 最大轮数", type: "number", min: 1, max: 50 },
     { key: "stream_timeout", label: "回复超时(秒, 0=不限)", type: "number", min: 0, max: 3600 },
-    { key: "chat_model", label: "对话模型", type: "select" }
+    { key: "chat_model", label: "对话模型", type: "select" },
+    { key: "disabled_skills", label: "Skill 管理", type: "skills" }
   ];
   function saveSetting(key, value) {
     return api("/api/config", { method: "POST", body: JSON.stringify({ key: key, value: value }) })
@@ -1398,8 +1402,52 @@
           wrap.appendChild(sel);
           wrap.insertAdjacentHTML("beforeend", svgIcon("chev"));
           row.appendChild(wrap);
+        } else if (field.type === "skills") {
+          // Skill 管理：每个 skill 一个开关。on=启用，off=禁用。
+          // 变动时把所有关掉的 skill 路径收集成 disabled_skills 列表 POST。
+          var skills = data.options.skill_list || [];
+          var disabled = data.values.disabled_skills || [];
+          var disabledSet = {};
+          disabled.forEach(function (p) { disabledSet[p] = true; });
+          var skillBox = document.createElement("div");
+          skillBox.className = "skill-list";
+          skills.forEach(function (sk) {
+            var item = document.createElement("div");
+            item.className = "skill-item";
+            var sw = document.createElement("button");
+            sw.type = "button";
+            sw.className = "switch";
+            sw.setAttribute("role", "switch");
+            sw.innerHTML = '<span class="knob"></span>';
+            var on = !disabledSet[sk.path];
+            sw.classList.toggle("on", on);
+            sw.setAttribute("aria-checked", on ? "true" : "false");
+            var name = document.createElement("span");
+            name.className = "skill-name";
+            name.textContent = sk.label;
+            sw.addEventListener("click", function () {
+              var next = !sw.classList.contains("on");
+              sw.classList.toggle("on", next);
+              sw.setAttribute("aria-checked", next ? "true" : "false");
+              // 重算禁用列表：所有 switch 里关掉的
+              var newDisabled = [];
+              skillBox.querySelectorAll(".skill-item").forEach(function (it) {
+                var s = it.querySelector(".switch");
+                var p = it.dataset.path;
+                if (!s.classList.contains("on")) newDisabled.push(p);
+              });
+              saveSetting("disabled_skills", newDisabled);
+            });
+            item.dataset.path = sk.path;
+            item.appendChild(name);
+            item.appendChild(sw);
+            skillBox.appendChild(item);
+          });
+          if (!skills.length) {
+            skillBox.textContent = "暂无 skill 文件";
+          }
+          row.appendChild(skillBox);
         } else {
-          var num = document.createElement("input");
           num.type = "number";
           if (field.min != null) num.min = field.min;
           if (field.max != null) num.max = field.max;

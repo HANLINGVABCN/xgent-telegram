@@ -50,6 +50,57 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode=constants.ParseMode.HTML
             )
 
+        elif data == "menu_skills":
+            skill_files = list_skill_files()
+            disabled = get_disabled_skills()
+            if not skill_files:
+                await query.message.edit_text("📭 暂无 skill 文件。",
+                                              reply_markup=get_more_settings_menu())
+            else:
+                lines = ["🧩 <b>Skill 管理</b>\n"]
+                for rel_path in skill_files:
+                    label = os.path.splitext(os.path.basename(rel_path))[0]
+                    icon = "🔴" if rel_path in disabled else "🟢"
+                    lines.append(f"{icon} {label}")
+                lines.append(f"\n共 {len(skill_files)} 个，{len(disabled)} 个已禁用。")
+                await query.message.edit_text(
+                    "\n".join(lines),
+                    reply_markup=get_skills_menu(),
+                    parse_mode=constants.ParseMode.HTML,
+                )
+
+        elif data.startswith("toggle_skill:"):
+            # callback_data 里 / 被换成 | 避免解析干扰，这里还原
+            safe_key = data.split(":", 1)[1]
+            rel_path = safe_key.replace("|", "/")
+            disabled = get_disabled_skills()
+            if rel_path in disabled:
+                disabled.discard(rel_path)
+            else:
+                disabled.add(rel_path)
+            disabled_list = sorted(disabled)
+            UserDataManager.set('disabled_skills', disabled_list)
+            await UserDataManager.save_config('disabled_skills', disabled_list)
+            label = os.path.splitext(os.path.basename(rel_path))[0]
+            await GlobalRecorder.record_system_op(
+                f"Skill {label} 切换为: {'禁用' if rel_path in disabled else '启用'}",
+                {"skill": rel_path, "disabled": rel_path in disabled},
+            )
+            # 刷新菜单
+            skill_files = list_skill_files()
+            lines = ["🧩 <b>Skill 管理</b>\n"]
+            for rp in skill_files:
+                lbl = os.path.splitext(os.path.basename(rp))[0]
+                icon = "🔴" if rp in disabled else "🟢"
+                lines.append(f"{icon} {lbl}")
+            lines.append(f"\n共 {len(skill_files)} 个，{len(disabled)} 个已禁用。")
+            with contextlib.suppress(Exception):
+                await query.message.edit_text(
+                    "\n".join(lines),
+                    reply_markup=get_skills_menu(),
+                    parse_mode=constants.ParseMode.HTML,
+                )
+
         elif data == "menu_text_stitch_mode":
             await query.message.edit_text(
                 build_text_stitch_mode_text(),

@@ -678,4 +678,27 @@ async def cmd_toggle_stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_main_menu()
     )
 
+
+async def cmd_skills_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🧩 Skill 管理菜单：列出所有 skill 及其启用/禁用状态。"""
+    if not await check_authorized_user_middleware(update, context):
+        return
+    await UserDataManager.init()
+    skill_files = list_skill_files()
+    disabled = get_disabled_skills()
+    if not skill_files:
+        await update.message.reply_text("📭 暂无 skill 文件。")
+        return
+    lines = ["🧩 <b>Skill 管理</b>\n"]
+    for rel_path in skill_files:
+        label = os.path.splitext(os.path.basename(rel_path))[0]
+        icon = "🔴" if rel_path in disabled else "🟢"
+        lines.append(f"{icon} {label}")
+    lines.append(f"\n共 {len(skill_files)} 个 skill，{len(disabled)} 个已禁用。")
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=get_skills_menu(),
+        parse_mode=constants.ParseMode.HTML
+    )
+
 # --- ☆ 按钮回调处理 ☆ ---

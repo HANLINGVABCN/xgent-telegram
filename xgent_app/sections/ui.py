@@ -294,12 +294,37 @@ def get_more_settings_menu():
          InlineKeyboardButton("🚫 Agent黑名单", callback_data="menu_command_blacklist")],
         [InlineKeyboardButton("🧹 清空上下文", callback_data="cmd_delete"),
          InlineKeyboardButton("ℹ️ 状态", callback_data="cmd_info")],
-        [InlineKeyboardButton(f"🔐 凭据配置{_credentials_badge()}", callback_data="menu_credentials"),
+        [InlineKeyboardButton("🧩 Skill 管理", callback_data="menu_skills"),
          InlineKeyboardButton("📤 导出", callback_data="cmd_export_all")],
+        [InlineKeyboardButton("🔐 凭据配置" + _credentials_badge(), callback_data="menu_credentials")],
         [InlineKeyboardButton("⬆️ 更新", callback_data="cmd_update"),
          InlineKeyboardButton("🔄 重启", callback_data="cmd_restart")],
         [InlineKeyboardButton("🔙 返回", callback_data="act_main_menu")]
     ])
+
+
+def get_skills_menu():
+    """Skill 管理菜单：每个 skill 一个开关按钮（🟢启用/🔴禁用）。
+
+    callback_data 用 toggle_skill:<相对路径>，相对路径里的 / 会在 callbacks.py
+    里按 : 切分后取最后一段——为避免路径里的 / 干扰解析，这里用 | 代替 /。
+    """
+    skill_files = list_skill_files()
+    disabled = get_disabled_skills()
+
+    rows = []
+    for rel_path in skill_files:
+        label = os.path.splitext(os.path.basename(rel_path))[0]
+        is_off = rel_path in disabled
+        icon = "🔴" if is_off else "🟢"
+        # 路径里的 / 换成 |，避免 callback_data 解析时被 : 切分搞乱
+        safe_key = rel_path.replace("/", "|")
+        rows.append([InlineKeyboardButton(
+            f"{icon} {label}",
+            callback_data=f"toggle_skill:{safe_key}",
+        )])
+    rows.append([InlineKeyboardButton("🔙 返回", callback_data="menu_more_settings")])
+    return InlineKeyboardMarkup(rows)
 
 
 def get_thinking_level_menu():

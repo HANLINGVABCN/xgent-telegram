@@ -162,6 +162,10 @@ def should_apply_update_file(rel_path: str, overwrite_local_custom_files: bool =
     parts = [part for part in rel_path.split("/") if part]
     if not parts:
         return False
+    # 私有 skill 永不覆盖：无论保留/覆盖模式，skill/private/ 下的文件都跳过。
+    # 这些是每个部署实例的自定义 skill，更新里也不会含它们，但显式跳过更安全。
+    if parts[:2] == ["skill", "private"]:
+        return False
     if not overwrite_local_custom_files and parts[0] in UPDATE_LOCAL_CUSTOM_DIRS:
         return False
     if parts[0] in UPDATE_SKIP_NAMES:
@@ -838,14 +842,30 @@ def extract_skill_summary(rel_path: str) -> str:
 
     return extract_skill_summary_blocks(raw_text) or "无简介"
 
+def get_disabled_skills() -> set:
+    """返回被禁用的 skill 相对路径集合（黑名单语义）。
+
+    默认全部启用，用户关掉不要的。空集合=全开。配置存 UserDataManager 的
+    disabled_skills（JSON list），与 agent_mode/stream_mode 同路径。
+    """
+    raw = UserDataManager.get('disabled_skills', [])
+    if not isinstance(raw, list):
+        return set()
+    return {str(item) for item in raw}
+
+
 def build_skill_prompt_section() -> str:
     skill_files = list_skill_files()
     if not skill_files:
         return ''
+    disabled = get_disabled_skills()
     skill_entries = ''.join(
         f"- {skill_file}: {extract_skill_summary(skill_file)} (路径: {to_display_path(os.path.join(SKILL_DIR, skill_file.replace('/', os.sep)))})\n"
         for skill_file in skill_files
+        if skill_file not in disabled
     )
+    if not skill_entries:
+        return ''
     return f"\n\n{skill_entries}"
 
 def build_absolute_path_prompt_section() -> str:

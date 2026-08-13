@@ -29,6 +29,9 @@ bot.pid
 # 用户记忆（每条一个文件，含用户私密事实/偏好，绝不上传）
 memory/
 
+# 用户私有 skill（每个部署实例自定义，不进仓库、不被更新覆盖）
+skill/private/
+
 # Logs
 xgent_output.log
 xgent_server.log
