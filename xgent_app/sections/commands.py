@@ -688,7 +688,11 @@ async def cmd_skills_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     skill_files = list_skill_files()
     disabled = get_disabled_skills()
     if not skill_files:
-        await update.message.reply_text("📭 暂无 skill 文件。")
+        await update.message.reply_text(
+            "🧩 <b>Skill 管理</b>\n\n📭 暂无 skill 文件。",
+            reply_markup=get_skills_menu(),
+            parse_mode=constants.ParseMode.HTML
+        )
         return
     lines = ["🧩 <b>Skill 管理</b>\n"]
     for rel_path in skill_files:

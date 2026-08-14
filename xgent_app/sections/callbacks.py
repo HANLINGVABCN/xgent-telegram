@@ -54,8 +54,15 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             skill_files = list_skill_files()
             disabled = get_disabled_skills()
             if not skill_files:
-                await query.message.edit_text("📭 暂无 skill 文件。",
-                                              reply_markup=get_more_settings_menu())
+                # 进入 Skill 管理专属界面（只有“返回”按钮），而不是留在“更多设置”
+                # 菜单；否则用户重复点“Skill 管理”会因为文本和键盘都没变而触发
+                # Telegram 的 “Message is not modified” 错误，被顶层兜底报成
+                # “操作失败，请稍后重试”。
+                await query.message.edit_text(
+                    "🧩 <b>Skill 管理</b>\n\n📭 暂无 skill 文件。",
+                    reply_markup=get_skills_menu(),
+                    parse_mode=constants.ParseMode.HTML,
+                )
             else:
                 lines = ["🧩 <b>Skill 管理</b>\n"]
                 for rel_path in skill_files:
