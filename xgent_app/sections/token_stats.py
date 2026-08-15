@@ -335,7 +335,6 @@ def build_token_stats_html(
   th {{ background: #fafbfc; font-weight: 600; }}
   td.l, th.l {{ text-align: left; }}
   tr:hover {{ background: #fafbfc; }}
-  .opts {{ font-size: 12px; color: #666; background: #eef; padding: 8px 12px; border-radius: 8px; margin-bottom: 16px; }}
 </style>
 </head>
 <body>
@@ -350,8 +349,6 @@ def build_token_stats_html(
     <div class="card"><div class="k">总 token</div><div class="v">{_fmt_num(grand['total'])}</div></div>
     <div class="card"><div class="k">总费用</div><div class="v">{_fmt_cost(grand['cost'])}</div></div>
   </div>
-  <div class="opts">💡 选项：合并开关 / 时间段 / 指标(token或费用) 可在 Telegram 菜单或命令参数调整；手动合并与价格表在「参数设置 → 价格表」配置。图表需联网加载 Chart.js，离线时仅表格可用。</div>
-
   <div class="chart-box">
     <h2>📈 折线图 · {metric_label} 趋势（按天）</h2>
     <canvas id="line"></canvas>
