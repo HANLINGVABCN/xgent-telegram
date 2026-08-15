@@ -4,7 +4,7 @@
 import json
 import io
 import time
-import datetime
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -203,7 +203,7 @@ def _aggregate(records: List[Dict[str, Any]], auto_merge: bool):
         pm['total'] += r['total']
         pm['cost'] += cost
 
-        day = datetime.datetime.fromtimestamp(r['ts']).strftime('%Y-%m-%d')
+        day = datetime.fromtimestamp(r['ts']).strftime('%Y-%m-%d')
         pd = per_day.setdefault(day, {})
         pm_d = pd.setdefault(m, {
             'input': 0, 'output': 0, 'cached': 0, 'total': 0, 'cost': 0.0, 'count': 0
@@ -621,7 +621,7 @@ def build_token_stats_html(
     end = options.get('end')
     auto_merge = bool(options.get('auto_merge', True))
     metric = options.get('metric', 'token') or 'token'
-    gen_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    gen_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     records_json = json.dumps(records, ensure_ascii=False)
     price_json = json.dumps(price_table, ensure_ascii=False)
@@ -629,8 +629,8 @@ def build_token_stats_html(
 
     start_ms = 'null' if start is None else int(start * 1000)
     end_ms = 'null' if end is None else int(end * 1000)
-    start_iso = datetime.datetime.fromtimestamp(start).strftime('%Y-%m-%dT%H:%M') if start else ''
-    end_iso = datetime.datetime.fromtimestamp(end).strftime('%Y-%m-%dT%H:%M') if end else ''
+    start_iso = datetime.fromtimestamp(start).strftime('%Y-%m-%dT%H:%M') if start else ''
+    end_iso = datetime.fromtimestamp(end).strftime('%Y-%m-%dT%H:%M') if end else ''
 
     auto_merge_chk = 'checked' if auto_merge else ''
     auto_merge_js = 'true' if auto_merge else 'false'
@@ -665,7 +665,7 @@ def _ts_from_text(text: str) -> Optional[float]:
     text = (text or '').strip()
     for fmt in ('%Y-%m-%d %H:%M', '%Y-%m-%d', '%Y-%m-%dT%H:%M'):
         try:
-            return datetime.datetime.strptime(text, fmt).timestamp()
+            return datetime.strptime(text, fmt).timestamp()
         except ValueError:
             continue
     return None
@@ -723,10 +723,10 @@ async def cmd_token_stats(update, context):
             return
         period = ""
         if start and end:
-            period = f"_{datetime.datetime.fromtimestamp(start).strftime('%m%d')}-{datetime.datetime.fromtimestamp(end).strftime('%m%d')}"
+            period = f"_{datetime.fromtimestamp(start).strftime('%m%d')}-{datetime.fromtimestamp(end).strftime('%m%d')}"
         fname = f"token_stats{period}.html"
-        first = datetime.datetime.fromtimestamp(info['first']).strftime('%Y-%m-%d')
-        last = datetime.datetime.fromtimestamp(info['last']).strftime('%Y-%m-%d')
+        first = datetime.fromtimestamp(info['first']).strftime('%Y-%m-%d')
+        last = datetime.fromtimestamp(info['last']).strftime('%Y-%m-%d')
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
             document=io.BytesIO(data),
