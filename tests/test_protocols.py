@@ -242,8 +242,14 @@ class ProtocolParserTests(unittest.TestCase):
         response = protocol_block("run-x", "echo ok", nonce)
         self.assertEqual("echo ok", ProtocolParser.extract_protocol_blocks(response)[0]["body"])
 
-    def test_nonce_with_33_characters_is_rejected(self):
-        nonce = "A" * 33
+    def test_nonce_with_64_characters_is_accepted(self):
+        nonce = "A" + "1" * 61 + "_-"
+        self.assertEqual(64, len(nonce))
+        response = protocol_block("run-x", "echo ok", nonce)
+        self.assertEqual("echo ok", ProtocolParser.extract_protocol_blocks(response)[0]["body"])
+
+    def test_nonce_with_65_characters_is_rejected(self):
+        nonce = "A" * 65
         response = protocol_block("run-x", "echo unsafe", nonce)
         self.assertEqual([], ProtocolParser.extract_protocol_blocks(response))
 
