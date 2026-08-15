@@ -97,6 +97,12 @@ class TelegramRichAPI:
         resp = await client.post(cls._api_url("sendRichMessageDraft"), json=payload)
         result = resp.json()
         if not result.get("ok"):
+            # 429 限流：Telegram 返回 parameters.retry_after，抛 RetryAfter
+            # 让上层 append() 捕获后永久降级到 HTML edit，避免后续 chunk 反复撞 429
+            params = result.get("parameters") or {}
+            retry_after = params.get("retry_after")
+            if retry_after is not None:
+                raise RetryAfter(retry_after=retry_after)
             raise TelegramError(f"sendRichMessageDraft failed: {result.get('description', result)}")
         return result
 
@@ -632,12 +638,20 @@ def _retry_after_seconds(exc: RetryAfter) -> float:
         return 1.0
 
 async def safe_edit_text(msg: Any, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None,
-                         parse_mode: Optional[str] = None) -> bool:
-    """Edit a Telegram message while tolerating no-op edits, flood-wait pacing, and HTML parse failures."""
+                         parse_mode: Optional[str] = None,
+                         retry_on_retry_after: bool = True) -> bool:
+    """Edit a Telegram message while tolerating no-op edits, flood-wait pacing, and HTML parse failures.
+
+    ``retry_on_retry_after=False`` 时，第一次撞 RetryAfter 不 sleep + 重试，
+    而是直接抛 RetryAfter 给调用方处理。流式 append 用这个模式，配合冷却期
+    跳过限流期间的 edit 调用，避免 sleep 阻塞流式 loop。
+    """
     try:
         await msg.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
         return True
     except RetryAfter as e:
+        if not retry_on_retry_after:
+            raise  # 流式模式：直接抛给调用方设冷却期，不内部 sleep
         await asyncio.sleep(_retry_after_seconds(e) + 0.1)
         try:
             await msg.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
@@ -734,6 +748,10 @@ class TelegramStreamRenderer:
         # draft_id 由 bot 自行生成（API 要求非零整数），相同 draft_id 的调用会动画过渡更新
         self._draft_id: int = int(time.time() * 1000) % 0x7FFFFFFF + 1
         self._rich_draft_enabled = True  # 尝试使用 Rich Draft，失败则降级
+        # HTML edit 冷却期：撞 429 RetryAfter 后，retry_after 秒内跳过 edit 调用，
+        # 避免每个 chunk 都撞 429 浪费请求；冷却期过后再试，限流可能已解除。
+        # 不永久关闭 live_edit_enabled，让 UI 在冷却期后能恢复更新。
+        self._html_edit_cooldown_until: float = 0.0
         # sendRichMessage(Draft) 直连 Telegram Bot API，绕过 context.bot；网页会话
         # 走 WebBot/MirrorBot，直连既不往网页 outbox 推帧，又会把 draft 发到 TG。
         # 网页端禁用 Rich Draft，流式刷新与收尾都走 HTML edit（经 context.bot，
@@ -896,15 +914,69 @@ class TelegramStreamRenderer:
                     draft_id=self._draft_id,
                 )
                 return
+            except RetryAfter as e:
+                # Telegram 429 限流：永久降级到 HTML edit，避免后续 chunk 反复撞 429。
+                # sleep retry_after+0.1 后继续走 HTML edit 路径（不 return），让本
+                # 次 chunk 也能立刻可见。HTML edit 内部的 safe_edit_text 还会再
+                # 兜底一次 RetryAfter。
+                wait = _retry_after_seconds(e) + 0.1
+                logger.warning(f"Rich Draft 被 Telegram 限流 (retry_after={wait:.1f}s)，永久降级为 HTML edit")
+                self._rich_draft_enabled = False
+                # sleep 期间监听 stop_event，set 了立即返回（不继续走 HTML edit）。
+                # 这样流式 loop 不会被 sleep 阻塞，能立刻回到主循环响应停止。
+                _stop_event = get_or_create_stop_event()
+                sleep_task = asyncio.create_task(asyncio.sleep(wait))
+                stop_task = asyncio.create_task(_stop_event.wait())
+                done, _pending = await asyncio.wait({sleep_task, stop_task},
+                                                     return_when=asyncio.FIRST_COMPLETED)
+                if stop_task in done and _stop_event.is_set():
+                    sleep_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await sleep_task
+                    return
+                stop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stop_task
             except Exception as e:
                 logger.info(f"Rich Draft 推送失败，降级为 HTML edit: {e}")
                 self._rich_draft_enabled = False
 
         # 降级为旧的 edit_message_text HTML 模式
+        # 冷却期检查：撞 429 后 retry_after 秒内跳过 edit，避免每个 chunk 都撞 429
+        if time.monotonic() < self._html_edit_cooldown_until:
+            return  # 冷却期内，跳过这次 edit，下个 chunk 再试
+
+        # 用 asyncio.wait 把 edit 和 stop_event.wait() 并发等待，stop_event set
+        # 立即取消 edit_task 返回。safe_edit_text 用 retry_on_retry_after=False
+        # 模式，第一次撞 RetryAfter 直接抛（不内部 sleep），让这里能立即设冷却期。
         try:
             html_text = markdown_to_telegram_html(self.current_text)
-            await safe_edit_text(self.current_msg, html_text, reply_markup=self.reply_markup,
-                                 parse_mode=constants.ParseMode.HTML)
+            _stop_event = get_or_create_stop_event()
+            edit_task = asyncio.create_task(safe_edit_text(
+                self.current_msg, html_text, reply_markup=self.reply_markup,
+                parse_mode=constants.ParseMode.HTML,
+                retry_on_retry_after=False))
+            stop_task = asyncio.create_task(_stop_event.wait())
+            done, _pending = await asyncio.wait({edit_task, stop_task},
+                                                 return_when=asyncio.FIRST_COMPLETED)
+            if stop_task in done and _stop_event.is_set():
+                # 用户停止：取消 edit，让流式 loop 回到主循环响应停止
+                edit_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await edit_task
+                return
+            # edit 完成，取消 stop_task
+            stop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stop_task
+            # 重新 await edit_task 拿到异常（如果有）
+            await edit_task
+        except RetryAfter as e:
+            # HTML edit 撞 429：设冷却期，不永久关闭 live_edit_enabled
+            # 冷却期过后下个 chunk 会再试，限流可能已解除
+            wait = _retry_after_seconds(e) + 0.1
+            self._html_edit_cooldown_until = time.monotonic() + wait
+            logger.warning(f"HTML edit 被 Telegram 限流 (retry_after={wait:.1f}s)，进入冷却期，期间跳过 UI 更新")
         except Exception as e:
             self.live_edit_enabled = False
             logger.warning(f"流式消息刷新失败，改为结束后一次性发送: {e}")
@@ -955,6 +1027,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
     trace_id = make_trace_id("stream")
 
     stop_event = get_or_create_stop_event()
+    logger.info(f"[停止诊断] 流式开始: stop_event id={id(stop_event)}")
 
     try:
         stop_kb = build_stop_keyboard()
@@ -993,6 +1066,15 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
                     return_when=asyncio.FIRST_COMPLETED,
                     timeout=_stream_chunk_idle_timeout_seconds()
                 )
+                # 诊断日志：判断 asyncio.wait 是否响应了 stop_task 完成
+                _stop_set = stop_event.is_set()
+                _stop_in_done = stop_task in done
+                if _stop_set and not _stop_in_done and not done:
+                    logger.warning(f"[停止诊断] BUG 信号: stop_event 已 set 但 asyncio.wait 超时未返回 stop_task, done 为空")
+                elif _stop_set and not _stop_in_done:
+                    logger.warning(f"[停止诊断] 异常: stop_event 已 set 但 stop_task 不在 done 里, done={[type(t).__name__ for t in done]}")
+                else:
+                    logger.info(f"[停止诊断] wait 返回: stop_set={_stop_set}, stop_in_done={_stop_in_done}, done_count={len(done)}")
 
                 if not done:
                     stream_timed_out = True
@@ -1177,6 +1259,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         logger.error(f"流式响应错误: {e}")
         error_text = format_provider_exception(e)
+        partial = ''.join(raw_response_parts).strip()
         write_model_trace("model_error", {
             "trace_id": trace_id,
             "provider": prov_name,
@@ -1184,19 +1267,323 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             "model": model,
             "stream": True,
             "error": error_text,
-            "partial_response": ''.join(raw_response_parts).strip(),
+            "partial_response": partial,
             "usage": usage_sink[0] if usage_sink else None,
             "elapsed_seconds": time.monotonic() - generation_started_at,
         })
         if renderer:
             await renderer.cancel()
+        # 异常退出兜底：保证占位消息"流式输出中..."被替换。
+        # 优先发"已生成内容 + 错误提示"，让用户拿到 AI 已吐出的部分；
+        # 任何路径失败都退到 context.bot.send_message 强制发一条新消息，
+        # 绝不让 UI 卡在"流式输出中..."。
+        fallback_text = (partial + "\n\n" + error_text).strip() if partial else error_text
+        target_msg = renderer.current_msg if renderer else msg
+        try:
+            if target_msg:
+                try:
+                    await rich_finalize_text_response(context, chat_id, target_msg, fallback_text, TELEGRAM_MSG_LIMIT)
+                except Exception as e1:
+                    logger.warning(f"Rich 兜底发送失败，降级为 HTML edit: {e1}")
+                    await safe_edit_text(target_msg, fallback_text[:4000], reply_markup=None,
+                                         parse_mode=constants.ParseMode.HTML)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=fallback_text[:4000])
+        except Exception as edit_err:
+            logger.warning(f"兜底 edit 失败，最后退到 send_message: {edit_err}")
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=fallback_text[:4000])
+            except Exception as last_err:
+                logger.error(f"连 send_message 都失败了，UI 可能卡住: {last_err}")
+        return error_text
+    finally:
+        if typing_stop:
+            typing_stop.set()
+        if typing_task:
+            typing_task.cancel()
+            try:
+                await typing_task
+            except asyncio.CancelledError:
+                pass
+
+
+async def send_background_streaming_response(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                              prov_name: str, prov_data: Dict, model: str,
+                                              system_prompt: str, history: List[Dict],
+                                              extra_media_artifacts: Optional[List[Dict[str, Any]]] = None,
+                                              stopped_partial_sink: Optional[List[str]] = None,
+                                              token_text_sink: Optional[List[str]] = None) -> Optional[str]:
+    """后台流式：底层用流式 API 拿 token，但不实时推送到 Telegram。
+
+    只累积到字符串里，每隔几秒把占位消息更新为"已生成 N 字"（走 safe_edit_text
+    兜底限流）。流式结束（或被停止/超时/异常）后，一次性发送完整回复。
+
+    优点：完全避开 Rich Draft 实时推送的 429 限流问题；仍享受流式 API 的特性
+    （更早开始返回、可中途停止、某些模型只支持流式）。
+    签名与 send_streaming_response 完全一致，便于 messages.py 互换。
+    """
+    chat_id = update.effective_chat.id
+    TELEGRAM_MSG_LIMIT = RICH_MESSAGE_CHAR_LIMIT
+
+    msg = None
+    typing_stop = None
+    typing_task = None
+    stopped_by_user = False
+    stream_timed_out = False
+    raw_response_parts: List[str] = []
+    native_media_detected = False
+    usage_sink: List[Dict[str, int]] = []
+    generation_started_at = time.monotonic()
+    trace_id = make_trace_id("bgstream")
+
+    stop_event = get_or_create_stop_event()
+    logger.info(f"[停止诊断] 后台流式开始: stop_event id={id(stop_event)}")
+
+    # 进度更新周期（秒）。不实时推 = 不撞 draft 限流；周期性 edit 走 safe_edit_text
+    # 自带 RetryAfter 兜底，即使被限流也只会暂停几秒，不会崩。
+    progress_interval = 3.0
+    last_progress_at = generation_started_at
+
+    try:
+        stop_kb = build_stop_keyboard()
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text="后台流式输出中...",
+            reply_markup=stop_kb
+        )
+        typing_stop = asyncio.Event()
+        typing_task = asyncio.create_task(
+            keep_typing_while_waiting(
+                context, chat_id, typing_stop,
+                max_duration=TYPING_MAX_DURATION_SECONDS
+            )
+        )
+
+        stream_iter = ModelClient.think_and_reply_stream(
+            prov_name, get_next_api_key(prov_name, prov_data['api_key']), prov_data['base_url'],
+            model, system_prompt, history,
+            api_format=prov_data.get('api_format', 'openai'),
+            usage_sink=usage_sink,
+            trace_id=trace_id
+        ).__aiter__()
+        stop_task = asyncio.create_task(stop_event.wait())
+        try:
+            while True:
+                next_chunk_task = asyncio.create_task(stream_iter.__anext__())
+                # 复用流式的 idle 超时：两个分片间最长静默时间。
+                done, _pending = await asyncio.wait(
+                    {next_chunk_task, stop_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=_stream_chunk_idle_timeout_seconds()
+                )
+
+                if not done:
+                    stream_timed_out = True
+                    await cancel_task_quietly(next_chunk_task, timeout=1.0)
+                    break
+
+                if stop_task in done and stop_event.is_set():
+                    stopped_by_user = True
+                    await cancel_task_quietly(next_chunk_task, timeout=1.0)
+                    break
+
+                try:
+                    chunk = next_chunk_task.result()
+                except StopAsyncIteration:
+                    break
+
+                raw_response_parts.append(chunk)
+
+                # 周期性进度更新。safe_edit_text 内部对 RetryAfter 会 sleep+重试，
+                # 即使被限流也只会让进度暂停几秒，不影响主流程。
+                now = time.monotonic()
+                if now - last_progress_at >= progress_interval:
+                    last_progress_at = now
+                    partial_len = len(''.join(raw_response_parts))
+                    try:
+                        await safe_edit_text(
+                            msg,
+                            f"后台流式输出中... 已生成 {partial_len} 字",
+                            reply_markup=stop_kb
+                        )
+                    except Exception as e:
+                        logger.debug(f"进度更新失败（可忽略）: {e}")
+        finally:
+            await cancel_task_quietly(stop_task, timeout=0.2)
+            aclose = getattr(stream_iter, 'aclose', None)
+            if aclose is not None:
+                close_task = asyncio.ensure_future(aclose())
+                done, _pending = await asyncio.wait({close_task}, timeout=1.0)
+                if close_task in done:
+                    _drain_task_result(close_task)
+                else:
+                    await cancel_task_quietly(close_task, timeout=0.2)
+
+        partial = ''.join(raw_response_parts).strip()
+
+        if stopped_by_user:
+            stop_text = (partial + "\n\n⏹️ 已停止，保留以上已生成内容。").strip() if partial else "⏹️ 已停止，还没有生成可保留的内容。"
+            write_model_trace("model_stopped", {
+                "trace_id": trace_id,
+                "provider": prov_name,
+                "provider_format": prov_data.get('api_format', 'openai'),
+                "model": model,
+                "stream": True,
+                "partial_response": partial,
+                "usage": usage_sink[0] if usage_sink else None,
+                "elapsed_seconds": time.monotonic() - generation_started_at,
+            })
+            try:
+                await rich_finalize_text_response(context, chat_id, msg, stop_text, TELEGRAM_MSG_LIMIT)
+            except Exception as e:
+                logger.warning(f"后台流式停止消息发送失败: {e}")
+                try:
+                    await safe_edit_text(msg, stop_text[:4000], reply_markup=None,
+                                         parse_mode=constants.ParseMode.HTML)
+                except Exception as e2:
+                    logger.warning(f"safe_edit_text 也失败: {e2}")
+                    try:
+                        await context.bot.send_message(chat_id=chat_id, text=stop_text[:4000])
+                    except Exception:
+                        pass
+            if stopped_partial_sink is not None:
+                stopped_partial_sink.append(partial)
+            return None
+
+        if stream_timed_out:
+            waited = int(_stream_chunk_idle_timeout_seconds())
+            timeout_notice = (
+                f"\n\n⏱️ 已超过 {waited} 秒没有收到新内容，本次流式回复被中断。"
+                "上面是已经收到的部分；可以直接重发这条消息重试。"
+            )
+            timeout_text = (partial + timeout_notice).strip() if partial else timeout_notice.strip()
+            write_model_trace("model_error", {
+                "trace_id": trace_id,
+                "provider": prov_name,
+                "provider_format": prov_data.get('api_format', 'openai'),
+                "model": model,
+                "stream": True,
+                "error": "stream chunk idle timeout",
+                "partial_response": partial,
+                "usage": usage_sink[0] if usage_sink else None,
+                "elapsed_seconds": time.monotonic() - generation_started_at,
+            })
+            try:
+                await rich_finalize_text_response(context, chat_id, msg, timeout_text, TELEGRAM_MSG_LIMIT)
+            except Exception as e:
+                logger.warning(f"后台流式超时消息发送失败: {e}")
+                try:
+                    await safe_edit_text(msg, timeout_text[:4000], reply_markup=None,
+                                         parse_mode=constants.ParseMode.HTML)
+                except Exception as e2:
+                    logger.warning(f"safe_edit_text 也失败: {e2}")
+                    try:
+                        await context.bot.send_message(chat_id=chat_id, text=timeout_text[:4000])
+                    except Exception:
+                        pass
+            await send_token_usage_message(
+                context, chat_id,
+                usage_sink[0] if usage_sink else None,
+                time.monotonic() - generation_started_at,
+                token_text_sink=token_text_sink
+            )
+            return partial or timeout_notice.strip()
+
+        # 正常完成
+        if partial:
+            media_artifacts: List[Dict[str, Any]] = []
+            if contains_inline_generated_media(partial.lower()):
+                native_media_detected = True
+                partial, media_artifacts = extract_inline_generated_media(partial)
+            partial = append_external_media_notices_to_response(partial, extra_media_artifacts)
+            write_model_trace("model_response", {
+                "trace_id": trace_id,
+                "provider": prov_name,
+                "provider_format": prov_data.get('api_format', 'openai'),
+                "model": model,
+                "stream": True,
+                "response": partial,
+                "usage": usage_sink[0] if usage_sink else None,
+                "elapsed_seconds": time.monotonic() - generation_started_at,
+            })
+            if media_artifacts:
+                try:
+                    await send_generated_media_artifacts(context, chat_id, media_artifacts, caption=partial)
+                    if msg:
+                        try:
+                            await msg.delete()
+                        except Exception:
+                            pass
+                    await send_token_usage_message(
+                        context, chat_id,
+                        usage_sink[0] if usage_sink else None,
+                        time.monotonic() - generation_started_at,
+                        token_text_sink=token_text_sink
+                    )
+                    return partial
+                except Exception as e:
+                    logger.warning(f"发送模型原生媒体失败: {e}")
+            try:
+                await rich_finalize_text_response(context, chat_id, msg, partial, TELEGRAM_MSG_LIMIT)
+            except Exception as e:
+                logger.warning(f"后台流式最终消息发送失败: {e}")
+                try:
+                    await safe_edit_text(msg, partial[:4000], reply_markup=None,
+                                         parse_mode=constants.ParseMode.HTML)
+                except Exception as e2:
+                    logger.warning(f"safe_edit_text 也失败: {e2}")
+                    try:
+                        await context.bot.send_message(chat_id=chat_id, text=partial[:4000])
+                    except Exception:
+                        pass
+            await send_token_usage_message(
+                context, chat_id,
+                usage_sink[0] if usage_sink else None,
+                time.monotonic() - generation_started_at,
+                token_text_sink=token_text_sink
+            )
+            return partial
+
+        empty_text = "模型未返回有效内容。"
+        try:
+            await safe_edit_text(msg, empty_text, reply_markup=None)
+        except Exception as e:
+            logger.warning(f"空回复提示发送失败: {e}")
+            await context.bot.send_message(chat_id=chat_id, text=empty_text)
+        return empty_text
+
+    except Exception as e:
+        logger.error(f"后台流式响应错误: {e}")
+        error_text = format_provider_exception(e)
+        partial = ''.join(raw_response_parts).strip()
+        write_model_trace("model_error", {
+            "trace_id": trace_id,
+            "provider": prov_name,
+            "provider_format": prov_data.get('api_format', 'openai'),
+            "model": model,
+            "stream": True,
+            "error": error_text,
+            "partial_response": partial,
+            "usage": usage_sink[0] if usage_sink else None,
+            "elapsed_seconds": time.monotonic() - generation_started_at,
+        })
+        fallback_text = (partial + "\n\n" + error_text).strip() if partial else error_text
         try:
             if msg:
-                await rich_finalize_text_response(context, chat_id, renderer.current_msg if renderer else msg, error_text, TELEGRAM_MSG_LIMIT)
+                try:
+                    await rich_finalize_text_response(context, chat_id, msg, fallback_text, TELEGRAM_MSG_LIMIT)
+                except Exception as e1:
+                    logger.warning(f"Rich 兜底发送失败，降级为 HTML edit: {e1}")
+                    await safe_edit_text(msg, fallback_text[:4000], reply_markup=None,
+                                         parse_mode=constants.ParseMode.HTML)
             else:
-                await context.bot.send_message(chat_id=chat_id, text=error_text)
+                await context.bot.send_message(chat_id=chat_id, text=fallback_text[:4000])
         except Exception as edit_err:
-            logger.warning(f"发送错误消息也失败了: {edit_err}")
+            logger.warning(f"兜底 edit 失败，最后退到 send_message: {edit_err}")
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=fallback_text[:4000])
+            except Exception as last_err:
+                logger.error(f"连 send_message 都失败了，UI 可能卡住: {last_err}")
         return error_text
     finally:
         if typing_stop:
@@ -1246,6 +1633,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
     usage_sink: List[Dict[str, int]] = []
     generation_started_at = time.monotonic()
     trace_id = make_trace_id("nonstream")
+    logger.info(f"[停止诊断] 非流式开始: stop_event id={id(stop_event)}")
 
     try:
         stop_kb = build_stop_keyboard()
@@ -1278,6 +1666,15 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
             return_when=asyncio.FIRST_COMPLETED,
             timeout=_nonstream_hard_timeout_seconds(),
         )
+        # 诊断日志：判断 asyncio.wait 是否响应了 stop_task 完成
+        _stop_set = stop_event.is_set()
+        _stop_in_done = stop_task in done
+        if _stop_set and not _stop_in_done and not done:
+            logger.warning(f"[停止诊断] 非流式 BUG 信号: stop_event 已 set 但 asyncio.wait 超时未返回 stop_task, done 为空")
+        elif _stop_set and not _stop_in_done:
+            logger.warning(f"[停止诊断] 非流式 异常: stop_event 已 set 但 stop_task 不在 done 里, done={[type(t).__name__ for t in done]}")
+        else:
+            logger.info(f"[停止诊断] 非流式 wait 返回: stop_set={_stop_set}, stop_in_done={_stop_in_done}, done_count={len(done)}")
         if not done:
             await cancel_task_quietly(response_task, timeout=1.0)
             await cancel_task_quietly(stop_task, timeout=0.2)

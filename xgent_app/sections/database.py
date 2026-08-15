@@ -1001,6 +1001,11 @@ class UserDataManager:
             'agent_mode': await cls._require_db().get_config('agent_mode', False),
             'agent_confirm': await cls._require_db().get_config('agent_confirm', False),
             'stream_mode': normalize_bool(await cls._require_db().get_config('stream_mode', True), True),
+            # 流式风格：'foreground'（前台流式，实时推送）/ 'background'（后台流式，累积后一次发）
+            # 仅当 stream_mode=True 时有意义；默认 'foreground' 保持与旧版行为一致。
+            'stream_style': normalize_stream_style(
+                await cls._require_db().get_config('stream_style', 'foreground')
+            ),
             'text_stitch_mode': normalize_text_stitch_mode(
                 await cls._require_db().get_config('text_stitch_mode', DEFAULT_TEXT_STITCH_MODE)
             ),
