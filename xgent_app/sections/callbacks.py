@@ -870,7 +870,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif data == "set_command_timeout_custom":
             UserDataManager.set('state', BotState.SET_COMMAND_TIMEOUT)
             await query.message.reply_text(
-                f"⌨️ 请输入自定义命令等待窗口秒数 ({MIN_AGENT_COMMAND_TIMEOUT}-{MAX_AGENT_COMMAND_TIMEOUT})。\n"
+                f"⌨️ 请输入自定义命令等待窗口秒数（不小于 {MIN_AGENT_COMMAND_TIMEOUT}）。\n"
                 "例如: 90、300、600s。发送 cancel 取消。"
             )
 
@@ -899,7 +899,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif data == "set_agent_max_iterations_custom":
             UserDataManager.set('state', BotState.SET_AGENT_MAX_ITERATIONS)
             await query.message.reply_text(
-                f"🔁 请输入自定义 Agent 最大轮数 ({MIN_AGENT_MAX_ITERATIONS}-{MAX_AGENT_MAX_ITERATIONS})。\n"
+                f"🔁 请输入自定义 Agent 最大轮数（不小于 {MIN_AGENT_MAX_ITERATIONS}）。\n"
                 "例如: 8、15、25轮。发送 cancel 取消。"
             )
 
@@ -968,7 +968,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             depth_str = data.split("_")[2]
             if depth_str == "custom":
                 UserDataManager.set('state', BotState.SET_GLOBAL_DEPTH)
-                await query.message.reply_text("🔢 请输入自定义的记忆深度 (1-500)，或发送 'cancel' 取消:")
+                await query.message.reply_text("🔢 请输入自定义的记忆深度，或发送 'cancel' 取消:")
             else:
                 depth = int(depth_str)
                 UserDataManager.set('global_depth', depth)
@@ -993,7 +993,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             if pct_str == "custom":
                 UserDataManager.set('state', BotState.SET_SMART_MATCH)
                 await query.message.reply_text(
-                    "🎯 请输入自定义智能匹配阈值 (50-100)，例如: 88、92、100。\n"
+                    "🎯 请输入自定义智能匹配阈值（0-100 为有效百分比），例如: 88、92、100。\n"
                     "100 = 只精确匹配，不做容错。发送 cancel 取消。"
                 )
             else:

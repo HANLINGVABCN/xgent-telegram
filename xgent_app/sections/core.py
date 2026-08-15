@@ -354,8 +354,6 @@ def normalize_command_timeout(value: Any, default: int = DEFAULT_AGENT_COMMAND_T
         seconds = int(default)
     if seconds < MIN_AGENT_COMMAND_TIMEOUT:
         return MIN_AGENT_COMMAND_TIMEOUT
-    if seconds > MAX_AGENT_COMMAND_TIMEOUT:
-        return MAX_AGENT_COMMAND_TIMEOUT
     return seconds
 
 
@@ -368,8 +366,6 @@ def normalize_agent_max_iterations(value: Any, default: int = DEFAULT_AGENT_MAX_
         iterations = int(default)
     if iterations < MIN_AGENT_MAX_ITERATIONS:
         return MIN_AGENT_MAX_ITERATIONS
-    if iterations > MAX_AGENT_MAX_ITERATIONS:
-        return MAX_AGENT_MAX_ITERATIONS
     return iterations
 
 
@@ -399,8 +395,6 @@ def parse_agent_max_iterations(text: str) -> int:
         raise ValueError("iterations must be a number")
     if iterations < MIN_AGENT_MAX_ITERATIONS:
         raise ValueError(f"iterations must be at least {MIN_AGENT_MAX_ITERATIONS}")
-    if iterations > MAX_AGENT_MAX_ITERATIONS:
-        raise ValueError(f"iterations must be at most {MAX_AGENT_MAX_ITERATIONS}")
     return iterations
 
 

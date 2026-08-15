@@ -975,12 +975,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             timeout_val = parse_timeout_seconds(
                 text,
-                minimum=MIN_AGENT_COMMAND_TIMEOUT,
-                maximum=MAX_AGENT_COMMAND_TIMEOUT
+                minimum=MIN_AGENT_COMMAND_TIMEOUT
             )
         except ValueError:
             await update.message.reply_text(
-                f"⚠️ 请输入 {MIN_AGENT_COMMAND_TIMEOUT}-{MAX_AGENT_COMMAND_TIMEOUT} 之间的秒数，"
+                f"⚠️ 请输入不小于 {MIN_AGENT_COMMAND_TIMEOUT} 的秒数，"
                 "例如 90、300、600s。"
             )
             return
@@ -999,7 +998,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             iterations = parse_agent_max_iterations(text)
         except ValueError:
             await update.message.reply_text(
-                f"⚠️ 请输入 {MIN_AGENT_MAX_ITERATIONS}-{MAX_AGENT_MAX_ITERATIONS} 之间的轮数，"
+                f"⚠️ 请输入不小于 {MIN_AGENT_MAX_ITERATIONS} 的轮数，"
                 "例如 8、15、25轮。"
             )
             return
@@ -1032,7 +1031,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     if state == BotState.SET_GLOBAL_DEPTH:
-        if text.isdigit() and 1 <= int(text) <= 500:
+        if text.isdigit() and int(text) >= 1:
             depth = int(text)
             UserDataManager.set('global_depth', depth)
             UserDataManager.set('state', BotState.IDLE)
@@ -1043,11 +1042,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=get_timeout_settings_menu()
             )
         else:
-            await update.message.reply_text("⚠️ 请输入 1-500 之间的数字。")
+            await update.message.reply_text("⚠️ 请输入大于 0 的数字。")
         return
 
     if state == BotState.SET_SMART_MATCH:
-        if text.isdigit() and 50 <= int(text) <= 100:
+        if text.isdigit() and int(text) >= 0:
             pct = int(text)
             UserDataManager.set('smart_match_threshold', pct)
             UserDataManager.set('state', BotState.IDLE)
@@ -1058,7 +1057,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=get_timeout_settings_menu()
             )
         else:
-            await update.message.reply_text("⚠️ 请输入 50-100 之间的数字。")
+            await update.message.reply_text("⚠️ 请输入不小于 0 的数字。")
         return
     
     if state == BotState.ADD_PROV_NAME:

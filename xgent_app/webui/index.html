@@ -1353,12 +1353,12 @@
     { key: "stream_mode", label: "流式输出", type: "bool" },
     { key: "agent_mode", label: "Agent 模式", type: "bool" },
     { key: "text_stitch_mode", label: "文字拼接", type: "select" },
-    { key: "global_depth", label: "记忆深度", type: "number", min: 1, max: 500 },
-    { key: "agent_max_iterations", label: "Agent 最大轮数", type: "number", min: 1, max: 50 },
-    { key: "stream_timeout", label: "回复超时(秒, 0=不限)", type: "number", min: 0, max: 3600 },
-    { key: "agent_command_timeout", label: "命令等待(秒)", type: "number", min: 5, max: 600 },
-    { key: "idle_message_interval", label: "空闲提醒(秒, 0=关闭)", type: "number", min: 0, max: 86400 },
-    { key: "smart_match_threshold", label: "智能匹配阈值(%)", type: "number", min: 50, max: 100 },
+    { key: "global_depth", label: "记忆深度", type: "number", min: 1 },
+    { key: "agent_max_iterations", label: "Agent 最大轮数", type: "number", min: 1 },
+    { key: "stream_timeout", label: "回复超时(秒, 0=不限)", type: "number", min: 0 },
+    { key: "agent_command_timeout", label: "命令等待(秒)", type: "number", min: 5 },
+    { key: "idle_message_interval", label: "空闲提醒(秒, 0=关闭)", type: "number", min: 0 },
+    { key: "smart_match_threshold", label: "智能匹配阈值(%)", type: "number", min: 0 },
     { key: "chat_model", label: "对话模型", type: "select" },
     { key: "disabled_skills", label: "Skill 管理", type: "skills" }
   ];

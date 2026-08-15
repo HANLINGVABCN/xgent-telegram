@@ -243,8 +243,8 @@ async def _web_write_setting(key: str, value: Any) -> Dict[str, Any]:
             depth = int(value)
         except (TypeError, ValueError):
             raise ValueError("记忆深度必须是数字")
-        if not (1 <= depth <= 500):
-            raise ValueError("记忆深度需在 1-500 之间")
+        if depth < 1:
+            raise ValueError("记忆深度需大于 0")
         UserDataManager.set(key, depth)
         await UserDataManager.save_config(key, depth)
     elif key == 'agent_max_iterations':
@@ -269,8 +269,8 @@ async def _web_write_setting(key: str, value: Any) -> Dict[str, Any]:
             pct = int(value)
         except (TypeError, ValueError):
             raise ValueError("智能匹配阈值必须是数字")
-        if not (50 <= pct <= 100):
-            raise ValueError("智能匹配阈值需在 50-100 之间")
+        if pct < 0:
+            raise ValueError("智能匹配阈值需不小于 0")
         UserDataManager.set(key, pct)
         await UserDataManager.save_config(key, pct)
     elif key == 'disabled_skills':
