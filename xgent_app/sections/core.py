@@ -800,6 +800,7 @@ class BotState:
     SET_COMMAND_TIMEOUT = 'set_command_timeout'
     SET_AGENT_MAX_ITERATIONS = 'set_agent_max_iterations'
     SET_IDLE_MESSAGE_INTERVAL = 'set_idle_message_interval'
+    SET_SMART_MATCH = 'set_smart_match'
     SET_COMMAND_BLACKLIST = 'set_command_blacklist'
     SET_UPDATE_TOKEN = 'set_update_token'
     SET_SEARCH_KEY = 'set_search_key'
@@ -901,6 +902,32 @@ def normalize_text_stitch_mode(value: Any) -> str:
     if mode not in TEXT_STITCH_MODES:
         return DEFAULT_TEXT_STITCH_MODE
     return mode
+
+
+# 流式风格：仅当 stream_mode=True 时有意义
+STREAM_STYLE_FOREGROUND = "foreground"   # 前台流式：实时推送到 Telegram（draft / edit）
+STREAM_STYLE_BACKGROUND = "background"   # 后台流式：累积后一次性发送，避开限流
+STREAM_STYLES = {STREAM_STYLE_FOREGROUND, STREAM_STYLE_BACKGROUND}
+DEFAULT_STREAM_STYLE = STREAM_STYLE_FOREGROUND
+
+
+def normalize_stream_style(value: Any) -> str:
+    """归一化流式风格字段。任何无法识别的值都回退到默认（前台流式）。"""
+    style = str(value or DEFAULT_STREAM_STYLE).strip().lower()
+    if style in {"bg", "back", "后台", "后台流式"}:
+        return STREAM_STYLE_BACKGROUND
+    if style in {"fg", "front", "前台", "前台流式"}:
+        return STREAM_STYLE_FOREGROUND
+    if style not in STREAM_STYLES:
+        return DEFAULT_STREAM_STYLE
+    return style
+
+
+def get_stream_style_label(style: Optional[str] = None) -> str:
+    style = normalize_stream_style(style if style is not None else UserDataManager.get('stream_style'))
+    if style == STREAM_STYLE_BACKGROUND:
+        return "后台流式"
+    return "前台流式"
 
 
 def get_text_stitch_mode_label(mode: Optional[str] = None) -> str:

@@ -1040,10 +1040,25 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await GlobalRecorder.record_system_op(f"设置记忆深度: {depth}")
             await update.message.reply_text(
                 f"✅ 记忆深度已设为 {depth} 条。",
-                reply_markup=get_main_menu()
+                reply_markup=get_timeout_settings_menu()
             )
         else:
             await update.message.reply_text("⚠️ 请输入 1-500 之间的数字。")
+        return
+
+    if state == BotState.SET_SMART_MATCH:
+        if text.isdigit() and 50 <= int(text) <= 100:
+            pct = int(text)
+            UserDataManager.set('smart_match_threshold', pct)
+            UserDataManager.set('state', BotState.IDLE)
+            await UserDataManager.save_config('smart_match_threshold', pct)
+            await GlobalRecorder.record_system_op(f"设置智能匹配阈值: {pct}%")
+            await update.message.reply_text(
+                f"✅ 智能匹配阈值已设为 {pct}%。",
+                reply_markup=get_timeout_settings_menu()
+            )
+        else:
+            await update.message.reply_text("⚠️ 请输入 50-100 之间的数字。")
         return
     
     if state == BotState.ADD_PROV_NAME:
@@ -1656,13 +1671,24 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     stop_partial: List[str] = []
     token_text: List[str] = []   # token 用量文本出参，正文落库后再落库，保证顺序
     if stream_mode:
-        response = await send_streaming_response(
-            update, context,
-            prov_name, prov_data, model,
-            system_prompt, history,
-            stopped_partial_sink=stop_partial,
-            token_text_sink=token_text
-        )
+        # stream_style: 'foreground'（前台流式，实时推送）/ 'background'（后台流式，累积后一次发）
+        stream_style = normalize_stream_style(UserDataManager.get('stream_style', DEFAULT_STREAM_STYLE))
+        if stream_style == STREAM_STYLE_BACKGROUND:
+            response = await send_background_streaming_response(
+                update, context,
+                prov_name, prov_data, model,
+                system_prompt, history,
+                stopped_partial_sink=stop_partial,
+                token_text_sink=token_text
+            )
+        else:
+            response = await send_streaming_response(
+                update, context,
+                prov_name, prov_data, model,
+                system_prompt, history,
+                stopped_partial_sink=stop_partial,
+                token_text_sink=token_text
+            )
     else:
         response = await send_non_streaming_response(
             update, context,
@@ -1788,11 +1814,48 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             )
 
             try:
+                def _smart_match_notice(blk: Dict[str, Any]) -> str:
+                    """协议块 nonce 智能匹配时的提示文本（用户与 AI 共用）。"""
+                    if not blk.get("smart_matched"):
+                        return ""
+                    sim_pct = int(blk.get("similarity", 0) * 100)
+                    return (
+                        "⚠️ 协议块 nonce 不相同，已智能匹配"
+                        f"（相似度 {sim_pct}%），下次务必注意 "
+                        "AGENT_BEGIN 和 AGENT_END 的 nonce 保持完全一致。"
+                    )
+
+                def _ctx_with_notice(msg: Dict[str, Any], notice: str) -> Dict[str, Any]:
+                    """在上下文消息末尾追加智能匹配提示，原消息不被修改。"""
+                    if not notice:
+                        return msg
+                    out = dict(msg)
+                    out['content'] = str(out.get('content', '')) + "\n\n" + notice
+                    return out
+
                 for block in protocol_blocks:
                     if is_stop_requested():
                         round_state.should_continue = False
                         break
+                    smart_notice = _smart_match_notice(block)
                     block_type = block['type']
+
+                    # 智能匹配时，先把"系统提示"发到聊天，放在执行结果前面，让用户也能看到
+                    if smart_notice:
+                        sys_notice = f"系统提示：{smart_notice}"
+                        await safe_send_message(
+                            context,
+                            update.effective_chat.id,
+                            sys_notice,
+                        )
+                        await persist_agent_result(
+                            recorder=GlobalRecorder,
+                            message_type=MessageType.AGENT_RESULT,
+                            database=db,
+                            conversation_id=cid,
+                            chat_id=update.effective_chat.id,
+                            notice=sys_notice,
+                        )
 
                     standard_operation = await dispatch_standard_protocol(
                         block,
@@ -1822,7 +1885,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             chat_id=update.effective_chat.id,
                             operation=standard_operation,
                         )
-                        round_state.add_context(standard_operation['context_message'])
+                        round_state.add_context(
+                            _ctx_with_notice(standard_operation['context_message'], smart_notice)
+                        )
                         round_state.should_continue = True
                         continue
 
@@ -1851,7 +1916,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                 notice=sendfile_notice,
                             )
                             round_state.add_context(
-                                build_sendfile_context_message(sendfile_notice)
+                                _ctx_with_notice(build_sendfile_context_message(sendfile_notice), smart_notice)
                             )
                             round_state.should_continue = True
                         continue
@@ -1892,7 +1957,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                 notice=file_notice,
                             )
                             round_state.add_context(
-                                build_file_context_message(file_notice)
+                                _ctx_with_notice(build_file_context_message(file_notice), smart_notice)
                             )
                             round_state.should_continue = True
                         continue
@@ -1933,7 +1998,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                 notice=file_notice,
                             )
                             round_state.add_context(
-                                build_file_context_message(file_notice, protocol="file:base64")
+                                _ctx_with_notice(build_file_context_message(file_notice, protocol="file:base64"), smart_notice)
                             )
                             round_state.should_continue = True
                         continue
@@ -1957,7 +2022,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             notice=trigger_notice,
                         )
                         round_state.add_context(
-                            build_trigger_context_message(trigger_notice)
+                            _ctx_with_notice(build_trigger_context_message(trigger_notice), smart_notice)
                         )
                         round_state.should_continue = True
                         continue
@@ -2021,14 +2086,14 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         )
                         if shell_result.get('running'):
                             round_state.add_context(
-                                build_shell_context_message(shell_notice, running=True)
+                                _ctx_with_notice(build_shell_context_message(shell_notice, running=True), smart_notice)
                             )
                             round_state.should_continue = True
                             # 会话仍在运行不代表本次回复的后续协议无效；继续按原顺序处理，
                             # 这样同一回复中的 shellread/stdin/shellkill 不会被静默跳过。
                             continue
                         round_state.add_context(
-                            build_shell_context_message(shell_notice, running=False)
+                            _ctx_with_notice(build_shell_context_message(shell_notice, running=False), smart_notice)
                         )
                         round_state.should_continue = True
                         continue
@@ -2080,7 +2145,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             chat_id=update.effective_chat.id,
                             notice=media_notice,
                         )
-                        round_state.add_context(await build_media_continuation_message(media_result, media_prompt))
+                        round_state.add_context(
+                            _ctx_with_notice(await build_media_continuation_message(media_result, media_prompt), smart_notice)
+                        )
                         round_state.should_continue = True
             
             finally:
@@ -2166,13 +2233,23 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             stop_partial = []
             token_text = []
             if stream_mode:
-                response = await send_streaming_response(
-                    update, context,
-                    prov_name, prov_data, model,
-                    system_prompt, next_history,
-                    stopped_partial_sink=stop_partial,
-                    token_text_sink=token_text
-                )
+                stream_style = normalize_stream_style(UserDataManager.get('stream_style', DEFAULT_STREAM_STYLE))
+                if stream_style == STREAM_STYLE_BACKGROUND:
+                    response = await send_background_streaming_response(
+                        update, context,
+                        prov_name, prov_data, model,
+                        system_prompt, next_history,
+                        stopped_partial_sink=stop_partial,
+                        token_text_sink=token_text
+                    )
+                else:
+                    response = await send_streaming_response(
+                        update, context,
+                        prov_name, prov_data, model,
+                        system_prompt, next_history,
+                        stopped_partial_sink=stop_partial,
+                        token_text_sink=token_text
+                    )
             else:
                 response = await send_non_streaming_response(
                     update, context,

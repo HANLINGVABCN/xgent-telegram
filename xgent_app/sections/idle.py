@@ -112,7 +112,8 @@ _web_application: Optional[Any] = None
 WEB_EDITABLE_SETTINGS = {
     'thinking_level', 'stream_mode', 'agent_mode', 'text_stitch_mode',
     'global_depth', 'agent_max_iterations', 'stream_timeout', 'chat_model',
-    'disabled_skills',
+    'disabled_skills', 'agent_command_timeout', 'idle_message_interval',
+    'smart_match_threshold',
 }
 
 
@@ -186,6 +187,13 @@ async def _web_read_settings() -> Dict[str, Any]:
                 UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
             ),
             'stream_timeout': int(normalize_stream_timeout(UserDataManager.get('stream_timeout', 0))),
+            'agent_command_timeout': normalize_command_timeout(
+                UserDataManager.get('agent_command_timeout', DEFAULT_AGENT_COMMAND_TIMEOUT)
+            ),
+            'idle_message_interval': normalize_idle_message_interval(
+                UserDataManager.get('idle_message_interval', DEFAULT_IDLE_MESSAGE_INTERVAL)
+            ),
+            'smart_match_threshold': int(UserDataManager.get('smart_match_threshold', 90) or 90),
             'chat_model': f"{prov_name}|{current_model}" if prov_name and current_model else '',
             'disabled_skills': disabled_skills,
         },
@@ -248,6 +256,23 @@ async def _web_write_setting(key: str, value: Any) -> Dict[str, Any]:
         UserDataManager.set(key, timeout)
         await UserDataManager.save_config(key, timeout)
         PortalManager._portals.clear()
+    elif key == 'agent_command_timeout':
+        timeout = normalize_command_timeout(value)
+        UserDataManager.set(key, timeout)
+        await UserDataManager.save_config(key, timeout)
+    elif key == 'idle_message_interval':
+        interval = normalize_idle_message_interval(value)
+        UserDataManager.set(key, interval)
+        await UserDataManager.save_config(key, interval)
+    elif key == 'smart_match_threshold':
+        try:
+            pct = int(value)
+        except (TypeError, ValueError):
+            raise ValueError("智能匹配阈值必须是数字")
+        if not (50 <= pct <= 100):
+            raise ValueError("智能匹配阈值需在 50-100 之间")
+        UserDataManager.set(key, pct)
+        await UserDataManager.save_config(key, pct)
     elif key == 'disabled_skills':
         # 前端传一个被禁用 skill 的相对路径列表。normalize 成 list[str]，去重。
         raw = value if isinstance(value, list) else []

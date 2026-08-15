@@ -11,10 +11,15 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
     if data == "act_stop_generation":
         global _stop_generation_event
         if _stop_generation_event and not _stop_generation_event.is_set():
+            _event_id = id(_stop_generation_event)
             _stop_generation_event.set()
+            logger.info(f"[停止诊断] 点击停止: event id={_event_id}, 已 set")
             logger.info("用户手动停止了AI回答")
             await query.answer("已收到停止请求")
         else:
+            _event_id = id(_stop_generation_event) if _stop_generation_event else None
+            _is_set = _stop_generation_event.is_set() if _stop_generation_event else None
+            logger.info(f"[停止诊断] 点击停止但无活跃事件: event={_stop_generation_event}, is_set={_is_set}, id={_event_id}")
             await query.answer("当前没有正在生成的回答")
         return
 
@@ -627,15 +632,33 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             new_mode = not current
             UserDataManager.set('stream_mode', new_mode)
             await UserDataManager.save_config('stream_mode', new_mode)
-            
+
             await GlobalRecorder.record_system_op(
                 f"流式输出切换为: {'开启' if new_mode else '关闭'}",
                 {"stream_mode": new_mode}
             )
-            
+
             await query.message.edit_text(
                 build_start_menu_text(),
                 reply_markup=get_main_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        # --- 流式风格切换（前台流式 / 后台流式）---
+        elif data == "toggle_stream_style":
+            current = normalize_stream_style(UserDataManager.get('stream_style', DEFAULT_STREAM_STYLE))
+            new_style = STREAM_STYLE_BACKGROUND if current == STREAM_STYLE_FOREGROUND else STREAM_STYLE_FOREGROUND
+            UserDataManager.set('stream_style', new_style)
+            await UserDataManager.save_config('stream_style', new_style)
+
+            await GlobalRecorder.record_system_op(
+                f"流式风格切换为: {get_stream_style_label(new_style)}",
+                {"stream_style": new_style}
+            )
+
+            await query.message.edit_text(
+                build_settings_menu_text(),
+                reply_markup=get_more_settings_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
         
@@ -931,7 +954,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                  InlineKeyboardButton("100条", callback_data="set_depth_100"),
                  InlineKeyboardButton("200条", callback_data="set_depth_200")],
                 [InlineKeyboardButton("✍️ 自定义", callback_data="set_depth_custom")],
-                [InlineKeyboardButton("🔙 返回", callback_data="act_main_menu")]
+                [InlineKeyboardButton("🔙 返回", callback_data="menu_timeout_settings")]
             ])
             await query.message.edit_text(
                 f"📊 <b>全局记忆深度设置</b>\n\n"
@@ -940,7 +963,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=keyboard,
                 parse_mode=constants.ParseMode.HTML
             )
-        
+
         elif data.startswith("set_depth_"):
             depth_str = data.split("_")[2]
             if depth_str == "custom":
@@ -953,7 +976,34 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await GlobalRecorder.record_system_op(f"设置记忆深度: {depth}")
                 await query.message.edit_text(
                     f"✅ 记忆深度已设为 <b>{depth}条</b> 。",
-                    reply_markup=get_more_settings_menu(),
+                    reply_markup=get_timeout_settings_menu(),
+                    parse_mode=constants.ParseMode.HTML
+                )
+
+        # --- 智能匹配阈值设置 ---
+        elif data == "cmd_set_smart_match":
+            await query.message.edit_text(
+                build_smart_match_text(),
+                reply_markup=get_smart_match_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data.startswith("set_smart_match_"):
+            pct_str = data.rsplit("_", 1)[1]
+            if pct_str == "custom":
+                UserDataManager.set('state', BotState.SET_SMART_MATCH)
+                await query.message.reply_text(
+                    "🎯 请输入自定义智能匹配阈值 (50-100)，例如: 88、92、100。\n"
+                    "100 = 只精确匹配，不做容错。发送 cancel 取消。"
+                )
+            else:
+                pct = max(50, min(100, int(pct_str)))
+                UserDataManager.set('smart_match_threshold', pct)
+                await UserDataManager.save_config('smart_match_threshold', pct)
+                await GlobalRecorder.record_system_op(f"设置智能匹配阈值: {pct}%")
+                await query.message.edit_text(
+                    f"✅ 智能匹配阈值已设为 <b>{pct}%</b>。",
+                    reply_markup=get_timeout_settings_menu(),
                     parse_mode=constants.ParseMode.HTML
                 )
         
