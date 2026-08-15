@@ -186,6 +186,71 @@ asyncio.run(main())
         self.assertEqual(1, data["claim_count"])
         self.assertTrue(data["claimed"])
 
+    def test_rich_finalize_does_not_bypass_web_outbox(self):
+        """网页会话的最终回复必须投到 web outbox，不能直连 Telegram rich API。
+
+        回归：rich_finalize_text_response 原本无差别调 TelegramRichAPI.send_rich_message
+        （直连 TG Bot API，绕过 context.bot）。网页会话用 WebBot/MirrorBot，于是网页
+        outbox 收不到回复帧——占位气泡被删后只剩 token 信息，必须刷新拉 history 才
+        正常。修复后网页 bot 走 finalize_text_response，发 edit 帧到 outbox。
+        """
+        output = self.run_probe(r'''
+import asyncio
+import json
+from types import SimpleNamespace as NS
+import xgent_server as bot
+from xgent_app.web_bridge import WebOutbox
+
+async def main():
+    # ---- 网页 bot：必须走 finalize_text_response，不直连 TG rich API ----
+    outbox = WebOutbox()
+    stream = outbox.subscribe()
+    _update, context, webbot = bot.build_web_conversation_objects(7, outbox)
+    msg = await webbot.send_message(chat_id=7, text="…")  # 占位气泡
+    stream.get(timeout=0.5)  # 丢掉占位 message 帧
+
+    web_rich_calls = []
+    async def fake_web_rich(*a, **kw):
+        web_rich_calls.append(kw.get("text"))
+        return {"ok": True}
+    bot.TelegramRichAPI.send_rich_message = fake_web_rich
+
+    await bot.rich_finalize_text_response(context, 7, msg, "真实回复正文", limit=4000)
+    frames = []
+    while True:
+        f = stream.get(timeout=0.1)
+        if f is None:
+            break
+        frames.append(f)
+    stream.close()
+
+    # ---- 非 web bot：原生 Telegram 仍走直连 rich API ----
+    tg_rich_calls = []
+    async def fake_tg_rich(*a, **kw):
+        tg_rich_calls.append(kw.get("text"))
+        return {"ok": True}
+    bot.TelegramRichAPI.send_rich_message = fake_tg_rich
+
+    class FakeMsg:
+        async def delete(self):
+            return True
+    await bot.rich_finalize_text_response(
+        NS(bot=NS(_is_xgent_web_bot=False)), 7, FakeMsg(), "tg回复", limit=4000)
+
+    print(json.dumps({
+        "web_rich_called": bool(web_rich_calls),
+        "web_frame_types": [f["type"] for f in frames],
+        "web_has_reply_text": any("真实回复正文" in (f.get("text") or "") for f in frames),
+        "tg_rich_called": bool(tg_rich_calls),
+    }, ensure_ascii=False))
+
+asyncio.run(main())
+''')
+        data = json.loads(output.strip().splitlines()[-1])
+        self.assertFalse(data["web_rich_called"], "网页会话不应直连 Telegram rich API")
+        self.assertTrue(data["web_has_reply_text"], "网页 outbox 必须收到含回复正文的帧")
+        self.assertTrue(data["tg_rich_called"], "原生 Telegram 仍应走 rich API")
+
     def test_protocol_and_normalization_behavior(self):
         output = self.run_probe(r'''
 import json

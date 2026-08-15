@@ -79,7 +79,10 @@ class AgentSendfileTests(unittest.IsolatedAsyncioTestCase):
         notice = await self._call(path, api_base_url="http://local", max_file_size=1)
         self.assertIn("本地API直发", notice)
         kwargs = self.context.bot.send_document.await_args.kwargs
-        self.assertTrue(kwargs["document"].startswith("file:///var/lib/telegram-bot-api/large.bin.sendfile_"))
+        # 目录级隔离：file://.../sendfile_<hex>/large.bin，文件名保持原样不再被篡改
+        self.assertTrue(kwargs["document"].startswith("file:///var/lib/telegram-bot-api/sendfile_"))
+        self.assertTrue(kwargs["document"].endswith("/large.bin"))
+        self.assertEqual(kwargs["filename"], "large.bin")
         self.assertFalse(list((self.root / "api").glob("*")))
         self.cancel_task.assert_awaited_once()
 

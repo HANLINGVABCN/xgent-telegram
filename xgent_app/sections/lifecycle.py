@@ -52,7 +52,7 @@ async def setup_bot_commands(app):
                 BotCommand("prompts", "管理提示词"),
                 BotCommand("clear_memory", "清空上下文"),
                 BotCommand("depth", "设置记忆深度"),
-                BotCommand("timeout", "设置超时"),
+                BotCommand("params", "参数设置"),
                 BotCommand("thinking", "设置思考深度"),
                 BotCommand("web", "配置网页版聊天"),
                 BotCommand("agent", "开关 Agent 模式"),
@@ -60,6 +60,7 @@ async def setup_bot_commands(app):
                 BotCommand("stream", "开关流式输出"),
                 BotCommand("status", "查看状态"),
                 BotCommand("export", "导出全部记忆"),
+                BotCommand("stats", "Token统计报表"),
                 BotCommand("restart", "重启 Bot"),
                 BotCommand("show_chat_info", "查看状态与记忆统计"),
             ]

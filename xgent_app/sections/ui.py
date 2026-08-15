@@ -285,21 +285,48 @@ def build_text_stitch_pending_text(pending: PendingTextConversation) -> str:
     )
 
 def get_more_settings_menu():
-    global_depth = UserDataManager.get('global_depth', 30)
+    stream_style_label = get_stream_style_label()
 
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"📊 深度:{global_depth}", callback_data="cmd_set_global_depth"),
-         InlineKeyboardButton("⏱️ 超时", callback_data="menu_timeout_settings")],
-        [InlineKeyboardButton(f"🧠 思考:{_fmt_thinking_level()}", callback_data="menu_thinking_level"),
+        [InlineKeyboardButton("🎚️ 参数", callback_data="menu_timeout_settings"),
+         InlineKeyboardButton(f"🧠 思考:{_fmt_thinking_level()}", callback_data="menu_thinking_level")],
+        [InlineKeyboardButton(f"🌊 流式:{stream_style_label}", callback_data="toggle_stream_style"),
          InlineKeyboardButton("🚫 Agent黑名单", callback_data="menu_command_blacklist")],
-        [InlineKeyboardButton("🧹 清空上下文", callback_data="cmd_delete"),
-         InlineKeyboardButton("ℹ️ 状态", callback_data="cmd_info")],
-        [InlineKeyboardButton(f"🔐 凭据配置{_credentials_badge()}", callback_data="menu_credentials"),
-         InlineKeyboardButton("📤 导出", callback_data="cmd_export_all")],
-        [InlineKeyboardButton("⬆️ 更新", callback_data="cmd_update"),
-         InlineKeyboardButton("🔄 重启", callback_data="cmd_restart")],
-        [InlineKeyboardButton("🔙 返回", callback_data="act_main_menu")]
+        [InlineKeyboardButton("🔐 凭据" + _credentials_badge(), callback_data="menu_credentials"),
+         InlineKeyboardButton("🧹 清空上下文", callback_data="cmd_delete")],
+        [InlineKeyboardButton("ℹ️ 状态", callback_data="cmd_info"),
+         InlineKeyboardButton("🧩 Skill 管理", callback_data="menu_skills")],
+        [InlineKeyboardButton("📤 导出", callback_data="cmd_export_all"),
+         InlineKeyboardButton("⬆️ 更新", callback_data="cmd_update")],
+        [InlineKeyboardButton("🔄 重启", callback_data="cmd_restart"),
+         InlineKeyboardButton("🔙 返回", callback_data="act_main_menu")]
     ])
+
+
+def get_skills_menu():
+    """Skill 管理菜单：每个 skill 一个开关按钮（🟢启用/🔴禁用）。
+
+    callback_data 用 toggle_skill:<相对路径>，相对路径里的 / 会在 callbacks.py
+    里按 : 切分后取最后一段——为避免路径里的 / 干扰解析，这里用 | 代替 /。
+    """
+    skill_files = list_skill_files()
+    disabled = get_disabled_skills()
+
+    rows = []
+    for rel_path in skill_files:
+        label = os.path.splitext(os.path.basename(rel_path))[0]
+        is_off = rel_path in disabled
+        is_private = rel_path.startswith("private/")
+        status_icon = "🔴" if is_off else "🟢"
+        source_icon = "🔒" if is_private else "📦"
+        # 路径里的 / 换成 |，避免 callback_data 解析时被 : 切分搞乱
+        safe_key = rel_path.replace("/", "|")
+        rows.append([InlineKeyboardButton(
+            f"{status_icon}{source_icon} {label}",
+            callback_data=f"toggle_skill:{safe_key}",
+        )])
+    rows.append([InlineKeyboardButton("🔙 返回", callback_data="menu_more_settings")])
+    return InlineKeyboardMarkup(rows)
 
 
 def get_thinking_level_menu():
@@ -467,11 +494,16 @@ def get_timeout_settings_menu():
     command_timeout = UserDataManager.get('agent_command_timeout', DEFAULT_AGENT_COMMAND_TIMEOUT)
     agent_max_iterations = UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
     idle_interval = UserDataManager.get('idle_message_interval', DEFAULT_IDLE_MESSAGE_INTERVAL)
+    global_depth = UserDataManager.get('global_depth', 30)
+    smart_match = UserDataManager.get('smart_match_threshold', 90)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"💬 AI回复超时：{_fmt_timeout(ai_timeout)}", callback_data="cmd_set_ai_timeout")],
-        [InlineKeyboardButton(f"⌨️ 命令等待：{_fmt_command_timeout(command_timeout)}", callback_data="cmd_set_command_timeout")],
-        [InlineKeyboardButton(f"🔁 Agent轮数：{_fmt_agent_max_iterations(agent_max_iterations)}", callback_data="cmd_set_agent_max_iterations")],
-        [InlineKeyboardButton(f"💭 空闲提醒：{_fmt_idle_message_interval(idle_interval)}", callback_data="cmd_set_idle_message_interval")],
+        [InlineKeyboardButton(f"📊 深度：{global_depth}条", callback_data="cmd_set_global_depth"),
+         InlineKeyboardButton(f"🎯 智能匹配：{smart_match}%", callback_data="cmd_set_smart_match")],
+        [InlineKeyboardButton(f"💬 AI回复超时：{_fmt_timeout(ai_timeout)}", callback_data="cmd_set_ai_timeout"),
+         InlineKeyboardButton(f"⌨️ 命令等待：{_fmt_command_timeout(command_timeout)}", callback_data="cmd_set_command_timeout")],
+        [InlineKeyboardButton(f"🔁 Agent轮数：{_fmt_agent_max_iterations(agent_max_iterations)}", callback_data="cmd_set_agent_max_iterations"),
+         InlineKeyboardButton(f"💭 空闲提醒：{_fmt_idle_message_interval(idle_interval)}", callback_data="cmd_set_idle_message_interval")],
+        [InlineKeyboardButton("💵 模型价格表", callback_data="menu_price_table")],
         [InlineKeyboardButton("🔙 返回", callback_data="menu_more_settings")]
     ])
 
@@ -480,16 +512,47 @@ def build_timeout_settings_text() -> str:
     command_timeout = UserDataManager.get('agent_command_timeout', DEFAULT_AGENT_COMMAND_TIMEOUT)
     agent_max_iterations = UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
     idle_interval = UserDataManager.get('idle_message_interval', DEFAULT_IDLE_MESSAGE_INTERVAL)
+    global_depth = UserDataManager.get('global_depth', 30)
+    smart_match = UserDataManager.get('smart_match_threshold', 90)
     return (
-        "⏱️ <b>超时设置</b>\n"
+        "🎚️ <b>参数设置</b>\n"
         "━━━━━━━━━━━━━━\n"
+        f"📊 记忆深度：<b>{global_depth}条</b>\n"
+        f"🎯 智能匹配阈值：<b>{smart_match}%</b>\n"
         f"💬 AI回复超时：<b>{_fmt_timeout(ai_timeout)}</b>\n"
         f"⌨️ 命令等待窗口：<b>{_fmt_command_timeout(command_timeout)}</b>\n"
         f"🔁 Agent最大轮数：<b>{_fmt_agent_max_iterations(agent_max_iterations)}</b>\n"
         f"💭 空闲提醒间隔：<b>{_fmt_idle_message_interval(idle_interval)}</b>\n\n"
+        "记忆深度控制系统能回顾多少条历史；智能匹配阈值控制协议块 nonce 相似度达到多少时容错执行（100% = 只精确匹配）；"
         "AI回复超时控制等待模型响应的时间；命令等待窗口控制 run 的最长等待，也是 shell 状态判断的硬上限；"
         "Agent最大轮数控制从最近一条真实用户消息开始，系统结果继续调用 AI 的累计次数；"
         "空闲提醒间隔控制用户多久没发消息后自动生成一条提醒回复。"
+    )
+
+def get_smart_match_menu():
+    current = UserDataManager.get('smart_match_threshold', 90)
+    def btn(pct: int) -> InlineKeyboardButton:
+        label = f"{pct}%"
+        if pct == 100:
+            label = "100% 精确"
+        text = f"✅ {label}" if pct == current else label
+        return InlineKeyboardButton(text, callback_data=f"set_smart_match_{pct}")
+    return InlineKeyboardMarkup([
+        [btn(80), btn(85), btn(90)],
+        [btn(95), btn(100), InlineKeyboardButton("✍️ 自定义", callback_data="set_smart_match_custom")],
+        [InlineKeyboardButton("🔙 返回", callback_data="menu_timeout_settings")]
+    ])
+
+def build_smart_match_text() -> str:
+    current = UserDataManager.get('smart_match_threshold', 90)
+    return (
+        "🎯 <b>智能匹配阈值</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"当前: <b>{current}%</b>\n\n"
+        "协议块用 AGENT_BEGIN_ 和 AGENT_END_ 携带同一个 nonce 成对标记。\n"
+        "nonce 完全一致时直接执行；相似度达到此阈值时容错执行，"
+        "但会在回灌给 AI 的结果和聊天里标注系统提示，提醒下次保持 nonce 一致。\n"
+        "设为 100% 表示只精确匹配，不做容错。"
     )
 
 def get_ai_timeout_menu():

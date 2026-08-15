@@ -39,6 +39,9 @@ class TgToWebMirrorTests(unittest.TestCase):
         ExtBot.send_message = fake_send
         bot = ExtBot("1:2")
         outbox = WebOutbox()
+        # 广播总线只投给已订阅的消费者，订阅必须早于 put。
+        stream = outbox.subscribe()
+        self.addCleanup(stream.close)
         restore = install_tg_to_web_mirror(bot, outbox)
 
         # 类方法已被 staticmethod 覆盖：实例访问不绑 self，args 不含 self。
@@ -57,7 +60,7 @@ class TgToWebMirrorTests(unittest.TestCase):
         # fake_send(self=bot, 123, "hi") -> a=(123, "hi")
         self.assertEqual(called[0][0][0], 123)
         # wrapper 推了一帧到 outbox
-        frame = outbox.get(timeout=0.5)
+        frame = stream.get(timeout=0.5)
         self.assertEqual(frame["type"], "message")
         self.assertEqual(frame["message_id"], 42)
         self.assertEqual(frame["text"], "hi")

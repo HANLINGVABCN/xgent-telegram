@@ -10,6 +10,7 @@ commands.py
 callbacks.py
 messages.py
 command_handlers.py
+token_stats.py
 idle.py
 other_messages.py
 lifecycle.py

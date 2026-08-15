@@ -527,7 +527,7 @@ confirm_uninstall() {
 
     warn "即将卸载本安装脚本创建的运行环境和服务记录。"
     echo "   会清理: venv、本项目 nohup/PM2 进程、xgent.pid、脚本记录的 apt 下载包。"
-    echo "   会保留: 项目文件、.env、数据库、日志、skill/ 下脚本服务、PM2 程序本体。"
+    echo "   会保留: 项目文件、.env、数据库、日志、skill-public/ 下脚本服务、PM2 程序本体。"
     echo ""
     read -r -p "确认继续？输入 y 继续: " answer
     if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
@@ -713,7 +713,7 @@ uninstall_app() {
     echo ""
     echo -e "${CYAN}========================================================${NC}"
     echo -e "${CYAN} XGent for Telegram 主安装内容已卸载。${NC}"
-    echo -e "${CYAN} 已保留项目文件、配置、数据库、日志、skill 服务和 PM2 本体。${NC}"
+    echo -e "${CYAN} 已保留项目文件、配置、数据库、日志、skill-public 服务和 PM2 本体。${NC}"
     echo -e "${CYAN}========================================================${NC}"
 }
 
@@ -1453,17 +1453,23 @@ start_with_pm2() {
         [ "$mode" = "default" ] && env_mode=""
         socks5_url=""
         [ "$mode" = "sock5" ] && socks5_url="$(get_socks5_proxy)"
-        env XGENT_IP_MODE="$env_mode" XGENT_SOCKS5_PROXY="$socks5_url" \
+        if env XGENT_IP_MODE="$env_mode" XGENT_SOCKS5_PROXY="$socks5_url" \
             TELEGRAM_AI_BOT_IP_MODE="" TELEGRAM_AI_BOT_SOCKS5_PROXY="" \
             TELEGRAM_AI_BOT_APP_ENTRY="" XGENT_APP_ENTRY="$APP_ENTRY" \
             PYTHONPATH="$(pythonpath_with_project)" \
-            pm2 restart "$PM2_APP_NAME" --update-env
-        echo "   PM2 原地重启成功（进程 ID 保持不变）。"
-        echo "   查看日志: pm2 logs $PM2_APP_NAME"
-        if pm2 save >/dev/null; then
-            echo "   PM2 进程列表已保存。"
+            pm2 restart "$PM2_APP_NAME" --update-env; then
+            echo "   PM2 原地重启成功（进程 ID 保持不变）。"
+            echo "   查看日志: pm2 logs $PM2_APP_NAME"
+            if pm2 save >/dev/null; then
+                echo "   PM2 进程列表已保存。"
+            fi
+            return
         fi
-        return
+        # restart 失败通常是 PM2 状态不一致（dump 记录了进程但实际不存在）。
+        # 清理残留记录后 fallback 到 start 分支重新创建。
+        warn "   PM2 restart 失败（进程状态不一致），正在清理残留并重新启动..."
+        pm2 delete "$PM2_APP_NAME" 2>/dev/null || true
+        sleep 1
     fi
 
     code="$(bot_python_code)"

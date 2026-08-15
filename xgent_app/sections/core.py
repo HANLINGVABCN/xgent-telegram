@@ -174,7 +174,7 @@ UPDATE_SKIP_SUFFIXES = (
     ".pid",
     ".pyc",
 )
-UPDATE_LOCAL_CUSTOM_DIRS = ("prompts", "skill")
+UPDATE_LOCAL_CUSTOM_DIRS = ("prompts", "skill-public", "skill")
 UPDATE_BACKUP_DIR = os.path.join(PROJECT_ROOT, "xgent_storage", "update_backups")
 COMMAND_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "xgent_storage", "command_outputs")
 _TRACE_LOG_OVERRIDE = (
@@ -354,8 +354,6 @@ def normalize_command_timeout(value: Any, default: int = DEFAULT_AGENT_COMMAND_T
         seconds = int(default)
     if seconds < MIN_AGENT_COMMAND_TIMEOUT:
         return MIN_AGENT_COMMAND_TIMEOUT
-    if seconds > MAX_AGENT_COMMAND_TIMEOUT:
-        return MAX_AGENT_COMMAND_TIMEOUT
     return seconds
 
 
@@ -368,8 +366,6 @@ def normalize_agent_max_iterations(value: Any, default: int = DEFAULT_AGENT_MAX_
         iterations = int(default)
     if iterations < MIN_AGENT_MAX_ITERATIONS:
         return MIN_AGENT_MAX_ITERATIONS
-    if iterations > MAX_AGENT_MAX_ITERATIONS:
-        return MAX_AGENT_MAX_ITERATIONS
     return iterations
 
 
@@ -399,8 +395,6 @@ def parse_agent_max_iterations(text: str) -> int:
         raise ValueError("iterations must be a number")
     if iterations < MIN_AGENT_MAX_ITERATIONS:
         raise ValueError(f"iterations must be at least {MIN_AGENT_MAX_ITERATIONS}")
-    if iterations > MAX_AGENT_MAX_ITERATIONS:
-        raise ValueError(f"iterations must be at most {MAX_AGENT_MAX_ITERATIONS}")
     return iterations
 
 
@@ -711,10 +705,23 @@ def build_token_usage_message(usage: Optional[Dict[str, int]], elapsed_seconds: 
 
 
 async def send_token_usage_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
-                                   usage: Optional[Dict[str, int]], elapsed_seconds: float):
+                                   usage: Optional[Dict[str, int]], elapsed_seconds: float,
+                                   token_text_sink: Optional[List[str]] = None) -> None:
+    """发送 token 用量提示消息。
+
+    落库不在本函数做——本函数在正文落库之前被调用，此时落库会让 token 记录的
+    timestamp 早于正文，刷新后顺序反成「tokens + 输出」。改为把 token 文本写进
+    token_text_sink，由调用方在正文落库之后再落库，保证顺序为「输出 + tokens」。
+    """
     text = build_token_usage_message(usage, elapsed_seconds)
     if not text:
         return
+    if token_text_sink is not None:
+        sink_usage = None
+        if usage:
+            sink_usage = {k: v for k, v in usage.items()
+                         if k != 'raw_usage' and v is not None}
+        token_text_sink.append({'text': text, 'usage': sink_usage})
     try:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -791,6 +798,9 @@ class BotState:
     SET_COMMAND_TIMEOUT = 'set_command_timeout'
     SET_AGENT_MAX_ITERATIONS = 'set_agent_max_iterations'
     SET_IDLE_MESSAGE_INTERVAL = 'set_idle_message_interval'
+    SET_SMART_MATCH = 'set_smart_match'
+    SET_PRICE_MODEL = 'set_price_model'
+    SET_MERGE_MAP = 'set_merge_map'
     SET_COMMAND_BLACKLIST = 'set_command_blacklist'
     SET_UPDATE_TOKEN = 'set_update_token'
     SET_SEARCH_KEY = 'set_search_key'
@@ -820,6 +830,7 @@ class MessageType:
     COMMAND = 'command'
     AGENT_CMD = 'agent_cmd'           # Agent 请求的工具动作
     AGENT_RESULT = 'agent_result'     # Agent 工具结果
+    TOKEN_USAGE = 'token_usage'       # 每轮回复末尾的 token 用量提示（独立消息，常驻历史）
 
 def _read_int_env(name: str, default: int, minimum: int = 1) -> int:
     try:
@@ -891,6 +902,32 @@ def normalize_text_stitch_mode(value: Any) -> str:
     if mode not in TEXT_STITCH_MODES:
         return DEFAULT_TEXT_STITCH_MODE
     return mode
+
+
+# 流式风格：仅当 stream_mode=True 时有意义
+STREAM_STYLE_FOREGROUND = "foreground"   # 前台流式：实时推送到 Telegram（draft / edit）
+STREAM_STYLE_BACKGROUND = "background"   # 后台流式：累积后一次性发送，避开限流
+STREAM_STYLES = {STREAM_STYLE_FOREGROUND, STREAM_STYLE_BACKGROUND}
+DEFAULT_STREAM_STYLE = STREAM_STYLE_FOREGROUND
+
+
+def normalize_stream_style(value: Any) -> str:
+    """归一化流式风格字段。任何无法识别的值都回退到默认（前台流式）。"""
+    style = str(value or DEFAULT_STREAM_STYLE).strip().lower()
+    if style in {"bg", "back", "后台", "后台流式"}:
+        return STREAM_STYLE_BACKGROUND
+    if style in {"fg", "front", "前台", "前台流式"}:
+        return STREAM_STYLE_FOREGROUND
+    if style not in STREAM_STYLES:
+        return DEFAULT_STREAM_STYLE
+    return style
+
+
+def get_stream_style_label(style: Optional[str] = None) -> str:
+    style = normalize_stream_style(style if style is not None else UserDataManager.get('stream_style'))
+    if style == STREAM_STYLE_BACKGROUND:
+        return "后台流式"
+    return "前台流式"
 
 
 def get_text_stitch_mode_label(mode: Optional[str] = None) -> str:

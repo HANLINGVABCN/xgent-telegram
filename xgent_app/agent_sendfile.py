@@ -6,6 +6,7 @@ import asyncio
 import os
 import shutil
 import uuid
+import urllib.parse
 from typing import Any, Awaitable, Callable
 
 
@@ -80,21 +81,25 @@ async def execute_sendfile_protocol(
         filename = os.path.basename(resolved_path)
 
         if file_size > max_file_size and api_base_url:
-            name_parts = filename.rsplit('.', 1)
-            if len(name_parts) == 2:
-                unique_name = f"{name_parts[0]}_sendfile_{uuid.uuid4().hex[:8]}.{name_parts[1]}"
-            else:
-                unique_name = f"{filename}_sendfile_{uuid.uuid4().hex[:8]}"
-            temp_host_path = os.path.join(local_api_host_data_dir, unique_name)
+            # 目录级隔离替代文件名篡改：每次发送生成独立随机子目录，原名文件存入
+            # 该目录。物理层面规避并发同名冲突，且传输给 Telegram 的文件名保持原样，
+            # 不再强制拼接 _sendfile_ + UUID 导致接收端文件名被篡改。
+            unique_dir = f"sendfile_{uuid.uuid4().hex[:8]}"
+            temp_host_dir = os.path.join(local_api_host_data_dir, unique_dir)
+            temp_host_path = os.path.join(temp_host_dir, filename)
+            os.makedirs(temp_host_dir, exist_ok=True)
             try:
                 await _prepare_local_api_file(
                     resolved_path,
-                    local_api_host_data_dir,
-                    unique_name,
+                    temp_host_dir,
+                    filename,
                     logger=logger,
                 )
+                # filename 进入 file:// URL 需编码（中文/空格等特殊字符会让本地
+                # Bot API server 解析路径出错）。目录内文件名保持原样。
+                encoded_filename = urllib.parse.quote(filename)
                 container_file_path = (
-                    f"file://{local_api_container_data_dir}/{unique_name}"
+                    f"file://{local_api_container_data_dir}/{unique_dir}/{encoded_filename}"
                 )
                 keep_alive = {"on": True}
 
@@ -133,7 +138,12 @@ async def execute_sendfile_protocol(
                     keep_alive["on"] = False
                     await cancel_task_quietly(indicator_task, timeout=0.2)
             finally:
-                await _remove_file(temp_host_path, logger=logger)
+                # 级联清理：删除整个隔离目录（含原名文件），空间零残留。
+                # 用 to_thread 避免大文件场景同步删除阻塞事件循环。
+                try:
+                    await asyncio.to_thread(shutil.rmtree, temp_host_dir, True)
+                except OSError:
+                    logger.warning("清理 sendfile 隔离目录失败: %s", temp_host_dir)
             return sendfile_notice
 
         if file_size > max_file_size:

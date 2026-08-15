@@ -833,7 +833,11 @@ class AgentExecutor:
     @classmethod
     def extract_protocol_blocks(cls, ai_response: str) -> List[Dict[str, Any]]:
         """兼容入口：协议解析委托给纯解析模块。"""
-        return ProtocolParser.extract_protocol_blocks(ai_response)
+        pct = UserDataManager.get('smart_match_threshold', 90)
+        threshold = max(0.0, min(1.0, int(pct) / 100.0))
+        return ProtocolParser.extract_protocol_blocks(
+            ai_response, smart_match_threshold=threshold
+        )
 
     @classmethod
     def strip_protocol_blocks(cls, ai_response: str) -> str:
