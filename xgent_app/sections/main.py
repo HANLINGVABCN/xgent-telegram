@@ -60,7 +60,7 @@ if __name__ == '__main__':
             ("prompts", cmd_prompts_menu),
             ("clear_memory", cmd_delete_chat),
             ("depth", cmd_depth_menu),
-            ("timeout", cmd_timeout_menu),
+            ("params", cmd_timeout_menu),
             ("thinking", cmd_thinking_menu),
             ("web", cmd_web_menu),
             ("agent", cmd_toggle_agent),
