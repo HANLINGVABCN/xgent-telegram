@@ -69,6 +69,7 @@ if __name__ == '__main__':
             ("skills", cmd_skills_menu),
             ("status", cmd_show_info),
             ("export", cmd_export_all),
+            ("stats", cmd_token_stats),
             ("show_chat_info", cmd_show_info),
         ]
         for cmd, handler in commands:

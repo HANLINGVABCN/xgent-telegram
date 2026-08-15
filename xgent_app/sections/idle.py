@@ -114,6 +114,8 @@ WEB_EDITABLE_SETTINGS = {
     'global_depth', 'agent_max_iterations', 'stream_timeout', 'chat_model',
     'disabled_skills', 'agent_command_timeout', 'idle_message_interval',
     'smart_match_threshold',
+    # token 统计相关：价格表 / 手动合并表 / 报表默认选项
+    'model_price_table', 'model_merge_map', 'stats_auto_merge', 'stats_metric',
 }
 
 
@@ -176,6 +178,40 @@ async def _web_read_settings() -> Dict[str, Any]:
     ]
     disabled_raw = UserDataManager.get('disabled_skills', [])
     disabled_skills = disabled_raw if isinstance(disabled_raw, list) else []
+
+    # token 统计相关：价格表 / 手动合并表 / 报表默认选项
+    price_table_raw = UserDataManager.get('model_price_table', {}) or {}
+    if isinstance(price_table_raw, str):
+        try:
+            price_table_raw = json.loads(price_table_raw)
+        except Exception:
+            price_table_raw = {}
+    model_price_table = {}
+    if isinstance(price_table_raw, dict):
+        for k, v in price_table_raw.items():
+            if isinstance(v, dict):
+                model_price_table[k] = {
+                    'input': float(v.get('input', 0) or 0),
+                    'output': float(v.get('output', 0) or 0),
+                    'cached': float(v.get('cached', 0) or 0),
+                }
+    merge_map_raw = UserDataManager.get('model_merge_map', {}) or {}
+    if isinstance(merge_map_raw, str):
+        try:
+            merge_map_raw = json.loads(merge_map_raw)
+        except Exception:
+            merge_map_raw = {}
+    model_merge_map = {}
+    if isinstance(merge_map_raw, dict):
+        for k, v in merge_map_raw.items():
+            if isinstance(v, list):
+                model_merge_map[k] = [str(x) for x in v if x]
+
+    stats_auto_merge_val = UserDataManager.get('stats_auto_merge', True)
+    stats_auto_merge = bool(stats_auto_merge_val) if not isinstance(stats_auto_merge_val, str) \
+        else str(stats_auto_merge_val).lower() in {'1', 'true', 'yes', 'on'}
+    stats_metric = UserDataManager.get('stats_metric', 'token') or 'token'
+
     return {
         'values': {
             'thinking_level': normalize_thinking_level(UserDataManager.get('thinking_level')),
@@ -196,6 +232,10 @@ async def _web_read_settings() -> Dict[str, Any]:
             'smart_match_threshold': int(UserDataManager.get('smart_match_threshold', 90) or 90),
             'chat_model': f"{prov_name}|{current_model}" if prov_name and current_model else '',
             'disabled_skills': disabled_skills,
+            'model_price_table': model_price_table,
+            'model_merge_map': model_merge_map,
+            'stats_auto_merge': stats_auto_merge,
+            'stats_metric': stats_metric,
         },
         'options': {
             'thinking_level': [
@@ -209,6 +249,10 @@ async def _web_read_settings() -> Dict[str, Any]:
             ],
             'chat_model': model_options,
             'skill_list': skill_list,
+            'stats_metric': [
+                {'value': 'token', 'label': 'Token 用量'},
+                {'value': 'cost', 'label': '费用 (USD)'},
+            ],
         },
     }
 
@@ -279,6 +323,47 @@ async def _web_write_setting(key: str, value: Any) -> Dict[str, Any]:
         cleaned = sorted({str(item) for item in raw if item})
         UserDataManager.set(key, cleaned)
         await UserDataManager.save_config(key, cleaned)
+    elif key == 'model_price_table':
+        # 前端传 dict: {model: {input,output,cached}}。校验并落库。
+        raw = value if isinstance(value, dict) else {}
+        cleaned = {}
+        for k, v in raw.items():
+            if not isinstance(k, str) or not k.strip():
+                continue
+            if not isinstance(v, dict):
+                continue
+            try:
+                cleaned[k.strip()] = {
+                    'input': float(v.get('input', 0) or 0),
+                    'output': float(v.get('output', 0) or 0),
+                    'cached': float(v.get('cached', 0) or 0),
+                }
+            except (TypeError, ValueError):
+                raise ValueError(f"模型 {k} 的价格必须是数字")
+        UserDataManager.set(key, cleaned)
+        await UserDataManager.save_config(key, cleaned)
+    elif key == 'model_merge_map':
+        # 前端传 dict: {规范名: [实际名...]}。校验并落库。
+        raw = value if isinstance(value, dict) else {}
+        cleaned = {}
+        for k, v in raw.items():
+            if not isinstance(k, str) or not k.strip():
+                continue
+            members = [str(x).strip() for x in (v if isinstance(v, list) else []) if str(x).strip()]
+            if members:
+                cleaned[k.strip()] = members
+        UserDataManager.set(key, cleaned)
+        await UserDataManager.save_config(key, cleaned)
+    elif key == 'stats_auto_merge':
+        flag = normalize_bool(value, True)
+        UserDataManager.set(key, flag)
+        await UserDataManager.save_config(key, flag)
+    elif key == 'stats_metric':
+        metric = str(value or 'token').strip().lower()
+        if metric not in {'token', 'cost'}:
+            raise ValueError("统计指标必须是 token 或 cost")
+        UserDataManager.set(key, metric)
+        await UserDataManager.save_config(key, metric)
 
     await GlobalRecorder.record_system_op(f"[Web] 修改配置 {key}", {"key": key})
     return await _web_read_settings()
@@ -403,6 +488,7 @@ def _ensure_web_command_map() -> None:
         ("skills", "cmd_skills_menu"),
         ("status", "cmd_show_info"),
         ("export", "cmd_export_all"),
+        ("stats", "cmd_token_stats"),
         ("show_chat_info", "cmd_show_info"),
     ]
     g = globals()

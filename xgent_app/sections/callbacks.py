@@ -47,7 +47,10 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=get_main_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
-        
+
+        elif data in {"menu_price_table", "add_price_model", "menu_merge_map"} or data.startswith("edit_price_"):
+            await handle_price_table_callbacks(update, context)
+
         elif data == "menu_more_settings":
             await query.message.edit_text(
                 build_settings_menu_text(),

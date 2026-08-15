@@ -503,6 +503,7 @@ def get_timeout_settings_menu():
          InlineKeyboardButton(f"⌨️ 命令等待：{_fmt_command_timeout(command_timeout)}", callback_data="cmd_set_command_timeout")],
         [InlineKeyboardButton(f"🔁 Agent轮数：{_fmt_agent_max_iterations(agent_max_iterations)}", callback_data="cmd_set_agent_max_iterations"),
          InlineKeyboardButton(f"💭 空闲提醒：{_fmt_idle_message_interval(idle_interval)}", callback_data="cmd_set_idle_message_interval")],
+        [InlineKeyboardButton("💵 模型价格表", callback_data="menu_price_table")],
         [InlineKeyboardButton("🔙 返回", callback_data="menu_more_settings")]
     ])
 

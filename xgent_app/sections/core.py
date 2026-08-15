@@ -717,7 +717,11 @@ async def send_token_usage_message(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     if not text:
         return
     if token_text_sink is not None:
-        token_text_sink.append(text)
+        sink_usage = None
+        if usage:
+            sink_usage = {k: v for k, v in usage.items()
+                         if k != 'raw_usage' and v is not None}
+        token_text_sink.append({'text': text, 'usage': sink_usage})
     try:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -795,6 +799,8 @@ class BotState:
     SET_AGENT_MAX_ITERATIONS = 'set_agent_max_iterations'
     SET_IDLE_MESSAGE_INTERVAL = 'set_idle_message_interval'
     SET_SMART_MATCH = 'set_smart_match'
+    SET_PRICE_MODEL = 'set_price_model'
+    SET_MERGE_MAP = 'set_merge_map'
     SET_COMMAND_BLACKLIST = 'set_command_blacklist'
     SET_UPDATE_TOKEN = 'set_update_token'
     SET_SEARCH_KEY = 'set_search_key'

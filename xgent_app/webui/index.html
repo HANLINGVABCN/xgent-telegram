@@ -847,7 +847,7 @@
     {cmd:"/stream", desc:"开关流式输出"},
     {cmd:"/thinking", desc:"设置思考深度"},
     {cmd:"/depth", desc:"设置记忆深度"},
-    {cmd:"/timeout", desc:"设置超时"},
+    {cmd:"/params", desc:"参数设置"},
     {cmd:"/models", desc:"选择默认模型"},
     {cmd:"/chat_model", desc:"选择对话模型"},
     {cmd:"/media_model", desc:"选择媒体模型"},
@@ -857,6 +857,7 @@
     {cmd:"/web", desc:"配置网页版"},
     {cmd:"/blacklist", desc:"命令黑名单"},
     {cmd:"/export", desc:"导出记忆"},
+    {cmd:"/stats", desc:"Token统计报表"},
     {cmd:"/update", desc:"更新代码"},
     {cmd:"/restart", desc:"重启 Bot"}
   ];
@@ -1360,12 +1361,287 @@
     { key: "idle_message_interval", label: "空闲提醒(秒, 0=关闭)", type: "number", min: 0 },
     { key: "smart_match_threshold", label: "智能匹配阈值(%)", type: "number", min: 0 },
     { key: "chat_model", label: "对话模型", type: "select" },
-    { key: "disabled_skills", label: "Skill 管理", type: "skills" }
+    { key: "disabled_skills", label: "Skill 管理", type: "skills" },
+    { key: "stats_auto_merge", label: "统计：相同模型自动合并", type: "bool" },
+    { key: "stats_metric", label: "统计：默认指标", type: "select" },
+    { key: "model_price_table", label: "💵 模型价格表（每百万 token / USD）", type: "price_table" },
+    { key: "model_merge_map", label: "🔗 手动模型合并表", type: "merge_map" }
   ];
   function saveSetting(key, value) {
     return api("/api/config", { method: "POST", body: JSON.stringify({ key: key, value: value }) })
       .catch(function (err) { toast("保存失败：" + err.message); loadSettings(); });
   }
+  // 价格表 / 合并表 编辑器：本地草稿模式，改动暂存，点保存才提交。
+  // 避免每个输入框失焦就 POST，减少抖动；也方便用户在多个模型间来回调整。
+  function renderPriceTableEditor(row, initData) {
+    var draft = {};
+    function loadDraft(d) {
+      draft = {};
+      if (d && typeof d === "object") {
+        Object.keys(d).forEach(function (k) {
+          var v = d[k] || {};
+          draft[k] = {
+            input: Number(v.input || 0),
+            output: Number(v.output || 0),
+            cached: Number(v.cached || 0)
+          };
+        });
+      }
+    }
+    loadDraft(initData);
+
+    var box = document.createElement("div");
+    box.className = "ptable";
+ box.style.border = "1px solid #eee";
+    box.style.borderRadius = "8px";
+    box.style.padding = "8px";
+    box.style.marginTop = "4px";
+
+    function refresh() {
+      box.innerHTML = "";
+      var keys = Object.keys(draft).sort();
+      if (!keys.length) {
+        var empty = document.createElement("div");
+        empty.style.color = "#999";
+        empty.style.fontSize = "13px";
+        empty.textContent = "（空，未配置价格的模型按 default 或 0 计费）";
+        box.appendChild(empty);
+      } else {
+        var tbl = document.createElement("table");
+        tbl.style.width = "100%";
+        tbl.style.borderCollapse = "collapse";
+        tbl.style.fontSize = "13px";
+        var thead = document.createElement("thead");
+        thead.innerHTML = '<tr><th style="text-align:left;padding:4px;">模型</th><th>输入</th><th>输出</th><th>缓存</th><th></th></tr>';
+        tbl.appendChild(thead);
+        var tbody = document.createElement("tbody");
+        keys.forEach(function (k) {
+          var tr = document.createElement("tr");
+          var tdName = document.createElement("td");
+          tdName.style.padding = "4px";
+          tdName.textContent = k;
+          tr.appendChild(tdName);
+          ["input", "output", "cached"].forEach(function (f) {
+            var td = document.createElement("td");
+            var inp = document.createElement("input");
+            inp.type = "number";
+            inp.step = "0.01";
+            inp.min = "0";
+            inp.value = draft[k][f];
+            inp.style.width = "70px";
+            inp.addEventListener("change", function () {
+              var v = Number(inp.value);
+              if (isNaN(v) || v < 0) v = 0;
+              draft[k][f] = v;
+            });
+            td.appendChild(inp);
+            tr.appendChild(td);
+          });
+          var tdDel = document.createElement("td");
+          var del = document.createElement("button");
+          del.type = "button";
+          del.textContent = "✕";
+          del.style.cssText = "background:#fee;border:0;color:#c33;border-radius:4px;padding:2px 6px;cursor:pointer;";
+          del.addEventListener("click", function () {
+            delete draft[k];
+            refresh();
+          });
+          tdDel.appendChild(del);
+          tr.appendChild(tdDel);
+          tbody.appendChild(tr);
+        });
+        tbl.appendChild(tbody);
+        box.appendChild(tbl);
+      }
+
+      // 新增一行
+      var add = document.createElement("div");
+      add.style.cssText = "display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;align-items:center;";
+      var nameInp = document.createElement("input");
+      nameInp.type = "text";
+      nameInp.placeholder = "模型名（如 gemini-3.6 或 default）";
+      nameInp.style.cssText = "flex:1;min-width:180px;";
+      var inInp = document.createElement("input");
+      inInp.type = "number"; inInp.step = "0.01"; inInp.min = "0";
+      inInp.placeholder = "输入"; inInp.style.width = "70px";
+      var outInp = document.createElement("input");
+      outInp.type = "number"; outInp.step = "0.01"; outInp.min = "0";
+      outInp.placeholder = "输出"; outInp.style.width = "70px";
+      var cacheInp = document.createElement("input");
+      cacheInp.type = "number"; cacheInp.step = "0.01"; cacheInp.min = "0";
+      cacheInp.placeholder = "缓存"; cacheInp.style.width = "70px";
+      var addBtn = document.createElement("button");
+      addBtn.type = "button";
+      addBtn.textContent = "➕ 添加";
+      addBtn.style.cssText = "padding:4px 10px;border:0;border-radius:6px;background:#4a90e2;color:#fff;cursor:pointer;";
+      addBtn.addEventListener("click", function () {
+        var name = nameInp.value.trim();
+        if (!name) { toast("请填写模型名"); return; }
+        draft[name] = {
+          input: Number(inInp.value) || 0,
+          output: Number(outInp.value) || 0,
+          cached: Number(cacheInp.value) || 0
+        };
+        nameInp.value = ""; inInp.value = ""; outInp.value = ""; cacheInp.value = "";
+        refresh();
+      });
+      add.appendChild(nameInp);
+      add.appendChild(inInp); add.appendChild(outInp); add.appendChild(cacheInp);
+      add.appendChild(addBtn);
+      box.appendChild(add);
+
+      // 保存按钮
+      var save = document.createElement("button");
+      save.type = "button";
+      save.textContent = "💾 保存价格表";
+      save.style.cssText = "margin-top:8px;padding:6px 14px;border:0;border-radius:6px;background:#2ecc71;color:#fff;cursor:pointer;";
+      save.addEventListener("click", function () {
+        save.disabled = true; save.textContent = "保存中…";
+        saveSetting("model_price_table", draft).then(function () {
+          toast("价格表已保存");
+          save.textContent = "💾 保存价格表"; save.disabled = false;
+        }).catch(function () {
+          save.textContent = "💾 保存价格表"; save.disabled = false;
+        });
+      });
+      box.appendChild(save);
+    }
+    refresh();
+    return box;
+  }
+
+  function renderMergeMapEditor(row, initData) {
+    var draft = {};
+    function loadDraft(d) {
+      draft = {};
+      if (d && typeof d === "object") {
+        Object.keys(d).forEach(function (k) {
+          var v = d[k];
+          if (Array.isArray(v)) draft[k] = v.map(String);
+        });
+      }
+    }
+    loadDraft(initData);
+
+    var box = document.createElement("div");
+    box.className = "mmap";
+    box.style.border = "1px solid #eee";
+    box.style.borderRadius = "8px";
+    box.style.padding = "8px";
+    box.style.marginTop = "4px";
+
+    function refresh() {
+      box.innerHTML = "";
+      var keys = Object.keys(draft).sort();
+      if (!keys.length) {
+        var empty = document.createElement("div");
+        empty.style.color = "#999";
+        empty.style.fontSize = "13px";
+        empty.textContent = "（空。手动合并优先于自动最小交集合并）";
+        box.appendChild(empty);
+      } else {
+        var tbl = document.createElement("table");
+        tbl.style.width = "100%";
+        tbl.style.borderCollapse = "collapse";
+        tbl.style.fontSize = "13px";
+        var thead = document.createElement("thead");
+        thead.innerHTML = '<tr><th style="text-align:left;padding:4px;">规范名（交集）</th><th style="text-align:left;">实际成员（逗号分隔）</th><th></th></tr>';
+        tbl.appendChild(thead);
+        var tbody = document.createElement("tbody");
+        keys.forEach(function (k) {
+          var tr = document.createElement("tr");
+          var tdName = document.createElement("td");
+          tdName.style.padding = "4px";
+          var nameInp = document.createElement("input");
+          nameInp.type = "text";
+          nameInp.value = k;
+          nameInp.style.width = "100%";
+          var oldName = k;
+          nameInp.addEventListener("change", function () {
+            var nn = nameInp.value.trim();
+            if (!nn || nn === oldName) return;
+            draft[nn] = draft[oldName];
+            delete draft[oldName];
+            oldName = nn;
+          });
+          tdName.appendChild(nameInp);
+          tr.appendChild(tdName);
+          var tdMem = document.createElement("td");
+          tdMem.style.padding = "4px";
+          var memInp = document.createElement("input");
+          memInp.type = "text";
+          memInp.value = (draft[k] || []).join(", ");
+          memInp.style.width = "100%";
+          memInp.addEventListener("change", function () {
+            var parts = memInp.value.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+            draft[oldName] = parts;
+          });
+          tdMem.appendChild(memInp);
+          tr.appendChild(tdMem);
+          var tdDel = document.createElement("td");
+          var del = document.createElement("button");
+          del.type = "button";
+          del.textContent = "✕";
+          del.style.cssText = "background:#fee;border:0;color:#c33;border-radius:4px;padding:2px 6px;cursor:pointer;";
+          del.addEventListener("click", function () {
+            delete draft[oldName];
+            refresh();
+          });
+          tdDel.appendChild(del);
+          tr.appendChild(tdDel);
+          tbody.appendChild(tr);
+        });
+        tbl.appendChild(tbody);
+        box.appendChild(tbl);
+      }
+
+      // 新增一行
+      var add = document.createElement("div");
+      add.style.cssText = "display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;align-items:center;";
+      var nameInp = document.createElement("input");
+      nameInp.type = "text";
+      nameInp.placeholder = "规范名（如 gemini-3.6）";
+      nameInp.style.cssText = "flex:1;min-width:160px;";
+      var memInp = document.createElement("input");
+      memInp.type = "text";
+      memInp.placeholder = "成员（逗号分隔，如 1er-gemini-3.6, abc-gemini-3.6）";
+      memInp.style.cssText = "flex:2;min-width:240px;";
+      var addBtn = document.createElement("button");
+      addBtn.type = "button";
+      addBtn.textContent = "➕ 添加";
+      addBtn.style.cssText = "padding:4px 10px;border:0;border-radius:6px;background:#4a90e2;color:#fff;cursor:pointer;";
+      addBtn.addEventListener("click", function () {
+        var name = nameInp.value.trim();
+        if (!name) { toast("请填写规范名"); return; }
+        var parts = memInp.value.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+        if (!parts.length) { toast("请至少填一个成员"); return; }
+        draft[name] = parts;
+        nameInp.value = ""; memInp.value = "";
+        refresh();
+      });
+      add.appendChild(nameInp); add.appendChild(memInp); add.appendChild(addBtn);
+      box.appendChild(add);
+
+      // 保存按钮
+      var save = document.createElement("button");
+      save.type = "button";
+      save.textContent = "💾 保存合并表";
+      save.style.cssText = "margin-top:8px;padding:6px 14px;border:0;border-radius:6px;background:#2ecc71;color:#fff;cursor:pointer;";
+      save.addEventListener("click", function () {
+        save.disabled = true; save.textContent = "保存中…";
+        saveSetting("model_merge_map", draft).then(function () {
+          toast("合并表已保存");
+          save.textContent = "💾 保存合并表"; save.disabled = false;
+        }).catch(function () {
+          save.textContent = "💾 保存合并表"; save.disabled = false;
+        });
+      });
+      box.appendChild(save);
+    }
+    refresh();
+    return box;
+  }
+
   function loadSettings() {
     return api("/api/config").then(function (data) {
       settingsRows.innerHTML = "";
@@ -1451,7 +1727,12 @@
             skillBox.textContent = "暂无 skill 文件";
           }
           row.appendChild(skillBox);
+        } else if (field.type === "price_table") {
+          row.appendChild(renderPriceTableEditor(row, data.values[field.key] || {}));
+        } else if (field.type === "merge_map") {
+          row.appendChild(renderMergeMapEditor(row, data.values[field.key] || {}));
         } else {
+          var num = document.createElement("input");
           num.type = "number";
           if (field.min != null) num.min = field.min;
           if (field.max != null) num.max = field.max;

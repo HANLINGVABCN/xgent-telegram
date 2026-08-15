@@ -1059,7 +1059,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             await update.message.reply_text("⚠️ 请输入不小于 0 的数字。")
         return
-    
+
+    if state in (BotState.SET_PRICE_MODEL, BotState.SET_MERGE_MAP):
+        if await handle_price_table_state(update, context, text):
+            return
+
     if state == BotState.ADD_PROV_NAME:
         providers = UserDataManager.get('providers', {})
         if text in providers:
@@ -1736,7 +1740,13 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     await db.add_chat_message(cid, 'assistant', response)
     # token 用量在正文落库之后落库，保证 timestamp 晚于正文，刷新后顺序为「输出 + tokens」。
     if token_text:
-        await GlobalRecorder.record_token_usage(token_text[0], update.effective_chat.id)
+        _entry = token_text[0]
+        await GlobalRecorder.record_token_usage(
+            _entry['text'] if isinstance(_entry, dict) else _entry,
+            update.effective_chat.id,
+            usage=_entry.get('usage') if isinstance(_entry, dict) else None,
+            model=model
+        )
     agent_turn_history: List[Dict[str, Any]] = list(history)
     agent_turn_history.append({'role': 'assistant', 'content': response})
     
@@ -2297,7 +2307,13 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             await GlobalRecorder.record_ai_reply(response, update.effective_chat.id)
             await db.add_chat_message(cid, 'assistant', response)
             if token_text:
-                await GlobalRecorder.record_token_usage(token_text[0], update.effective_chat.id)
+                _entry = token_text[0]
+                await GlobalRecorder.record_token_usage(
+                    _entry['text'] if isinstance(_entry, dict) else _entry,
+                    update.effective_chat.id,
+                    usage=_entry.get('usage') if isinstance(_entry, dict) else None,
+                    model=model
+                )
             agent_turn_history = next_history
             agent_turn_history.append({'role': 'assistant', 'content': response})
 

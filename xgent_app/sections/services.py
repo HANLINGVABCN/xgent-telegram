@@ -93,14 +93,31 @@ class GlobalRecorder:
         )
 
     @staticmethod
-    async def record_token_usage(content: str, chat_id: Optional[int] = None):
+    async def record_token_usage(content: str, chat_id: Optional[int] = None,
+                                 usage: Optional[Dict[str, Any]] = None,
+                                 model: Optional[str] = None):
         """记录 token 用量提示。须在 record_ai_reply 之后调用，保证 timestamp 晚于正文，
-        刷新后顺序为「输出 + tokens」而非反序。"""
+        刷新后顺序为「输出 + tokens」而非反序。usage/model 存进 metadata 供 token 统计。"""
+        metadata = None
+        if usage or model:
+            metadata = {}
+            if model:
+                metadata['model'] = model
+            if usage:
+                meta_usage = {}
+                for _k in ('input_tokens', 'output_tokens', 'cached_tokens',
+                           'reasoning_tokens', 'visible_output_tokens', 'total_tokens'):
+                    _v = usage.get(_k)
+                    if _v is not None:
+                        meta_usage[_k] = _v
+                if meta_usage:
+                    metadata['usage'] = meta_usage
         await GlobalRecorder.record(
             msg_type=MessageType.TOKEN_USAGE,
             role='assistant',
             content=content,
-            chat_id=chat_id
+            chat_id=chat_id,
+            metadata=metadata
         )
 
     @staticmethod

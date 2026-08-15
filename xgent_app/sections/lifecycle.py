@@ -60,6 +60,7 @@ async def setup_bot_commands(app):
                 BotCommand("stream", "开关流式输出"),
                 BotCommand("status", "查看状态"),
                 BotCommand("export", "导出全部记忆"),
+                BotCommand("stats", "Token统计报表"),
                 BotCommand("restart", "重启 Bot"),
                 BotCommand("show_chat_info", "查看状态与记忆统计"),
             ]
