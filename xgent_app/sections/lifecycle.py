@@ -52,7 +52,7 @@ async def setup_bot_commands(app):
                 BotCommand("prompts", "管理提示词"),
                 BotCommand("clear_memory", "清空上下文"),
                 BotCommand("depth", "设置记忆深度"),
-                BotCommand("timeout", "设置超时"),
+                BotCommand("timeout", "参数设置"),
                 BotCommand("thinking", "设置思考深度"),
                 BotCommand("web", "配置网页版聊天"),
                 BotCommand("agent", "开关 Agent 模式"),
