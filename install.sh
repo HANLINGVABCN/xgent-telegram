@@ -136,6 +136,17 @@ ip_mode_label() {
     esac
 }
 
+# .env 里有 BOT_TOKEN 就是权威判据（与 ensure_deploy_mode 的判断逻辑一致），
+# 不依赖 .install-state/deploy-mode——那个文件只在没有 Token 时才生效，
+# 单独读它会在"已经手动填过 Token 但状态文件还没更新"时显示过期的模式。
+deploy_mode_label() {
+    if [ -f ".env" ] && [ -n "$(local_api_env_value BOT_TOKEN)" ]; then
+        printf 'Telegram + Web'
+    else
+        printf '仅 Web'
+    fi
+}
+
 # 设置 IP 出站模式。ipv4 / ipv6 / sock5 / default 四选一，互斥。
 # sock5 模式需额外传入代理地址（socks5://[user:pass@]host:port）。
 # 切换到任一模式时，会先清除其它模式的环境变量，确保互斥。
@@ -1183,6 +1194,70 @@ ensure_env_file() {
     success ".env 配置已就绪"
 }
 
+switch_deploy_mode() {
+    # 之前只能靠"手动改 .env + 删状态文件"才能从仅 Web 切到 Telegram+Web，
+    # 用户明确反对"部署个项目还要我自己去改文件"。这里把整个切换流程收进
+    # 菜单里：填 Token、强制重新确认真实 Telegram 用户 ID（仅 Web 模式下的
+    # AUTHORIZED_USER_ID 只是占位数字，不是真实 ID，绝不能被当作已配置直接
+    # 沿用——这正是当初触发 AUTHORIZED_USER_ID 校验 bug 的同一类"沉默复用
+    # 旧值"问题，这里从设计上就避免它，用 remove_env_value 强制清掉旧值
+    # 再走一遍 int 校验的 ensure_env_value）、更新部署模式状态文件、最后
+    # 询问是否立即重启生效。
+    local current_token=""
+    if [ -f ".env" ]; then
+        current_token="$(local_api_env_value BOT_TOKEN)"
+    fi
+
+    if [ -n "$current_token" ]; then
+        echo ""
+        echo "当前模式：Telegram + Web"
+        echo "切换为「仅 Web」模式会移除 .env 中的 BOT_TOKEN，之后不再连接 Telegram"
+        echo "（历史记录、模型配置等其余数据保留在数据库里，不受影响）。"
+        local confirm=""
+        read -r -p "确认切换为仅 Web 模式？[y/N]: " confirm
+        case "$confirm" in
+            y|Y)
+                remove_env_value "BOT_TOKEN"
+                mkdir -p "$STATE_DIR"
+                printf 'web-only
+' > "$STATE_DIR/deploy-mode"
+                success "已切换为仅 Web 模式。"
+                ;;
+            *)
+                warn "已取消，未做任何修改。"
+                return
+                ;;
+        esac
+    else
+        echo ""
+        echo "当前模式：仅 Web"
+        echo "切换为「Telegram + Web」需要填写 Bot Token；同时 AUTHORIZED_USER_ID 必须"
+        echo "换成你真实的 Telegram 用户数字 ID —— 仅 Web 模式下填的只是占位数字，"
+        echo "不能直接沿用，下面会强制重新输入一次。"
+        echo ""
+        ensure_env_value "BOT_TOKEN" "请输入 Telegram Bot Token（输入时不显示）" secret
+        remove_env_value "AUTHORIZED_USER_ID"
+        ensure_env_value "AUTHORIZED_USER_ID" "请输入 Telegram 用户 ID（纯数字，在 @userinfobot 里查看）" int
+        mkdir -p "$STATE_DIR"
+        printf 'telegram
+' > "$STATE_DIR/deploy-mode"
+        success "已切换为 Telegram + Web 模式。"
+    fi
+
+    echo ""
+    local do_restart=""
+    read -r -p "是否现在重启服务以生效？[Y/n]: " do_restart
+    case "$do_restart" in
+        n|N)
+            warn "请稍后手动重启（菜单选项 5，或 bash install.sh restart）。"
+            ;;
+        *)
+            prepare_environment
+            restart_app || warn "自动重启未成功，请手动选择菜单里的启动方式。"
+            ;;
+    esac
+}
+
 ensure_web_password() {
     # 仅 Web 模式下，Web 服务是唯一入口：没有密码，start_web_chat_if_enabled
     # 会直接跳过启动，进程随即因“无法启动”而退出（参见 lifecycle.py 的
@@ -2218,6 +2293,7 @@ manage_local_api() {
 
 show_menu() {
     local current_mode_label="$(ip_mode_label)"
+    local current_deploy_label="$(deploy_mode_label)"
     echo ""
     echo "请选择操作:"
     echo "  1) 前台运行"
@@ -2230,6 +2306,7 @@ show_menu() {
     echo "  8) 本地 API 容器 (Docker) - 启动/关闭本地 Telegram Bot API server"
     echo "  9) 退出"
     echo " 10) 彻底重建 PM2 进程 (重新加载 PM2 启动参数，进程 ID 会 +1)"
+    echo " 11) 切换部署模式 (当前: $current_deploy_label)"
     echo ""
 }
 
@@ -2239,6 +2316,7 @@ show_usage() {
     echo "  ./install.sh install         打开数字菜单"
     echo "  ./install.sh restart         重启当前 PM2/nohup Bot 进程 (原地重启，进程 ID 不变)"
     echo "  ./install.sh rebuild         彻底重建 PM2 进程 (重新加载 PM2 启动参数，进程 ID 会 +1)"
+    echo "  ./install.sh switch-mode     在「Telegram + Web」与「仅 Web」部署模式间切换"
     echo "  ./install.sh uninstall       卸载本脚本安装的运行内容"
     echo "  ./install.sh uninstall -y    跳过确认直接卸载"
 }
@@ -2277,7 +2355,7 @@ main() {
     print_banner
 
     show_menu
-    read -r -p "请输入选项 [1-10，默认 1]: " choice
+    read -r -p "请输入选项 [1-11，默认 1]: " choice
 
     case "$choice" in
         ""|1)
@@ -2314,6 +2392,10 @@ main() {
             ;;
         8)
             manage_local_api
+            exit 0
+            ;;
+        11)
+            switch_deploy_mode
             exit 0
             ;;
         9)
@@ -2406,6 +2488,10 @@ case "${1:-}" in
         print_banner
         prepare_environment
         rebuild_pm2_app
+        ;;
+    switch-mode|--switch-mode)
+        print_banner
+        switch_deploy_mode
         ;;
     uninstall|--uninstall|remove|--remove)
         shift
