@@ -1101,6 +1101,41 @@ ensure_env_value() {
     upsert_env_value "$key" "$new_value"
 }
 
+ensure_deploy_mode() {
+    local current_token=""
+
+    if [ -f ".env" ]; then
+        current_token="$(local_api_env_value BOT_TOKEN)"
+    fi
+    if [ -n "$current_token" ]; then
+        DEPLOY_MODE="telegram"
+        return
+    fi
+    if [ -f "$STATE_DIR/deploy-mode" ]; then
+        DEPLOY_MODE="$(cat "$STATE_DIR/deploy-mode")"
+        if [ "$DEPLOY_MODE" = "web-only" ] || [ "$DEPLOY_MODE" = "telegram" ]; then
+            return
+        fi
+    fi
+
+    echo ""
+    echo "请选择部署模式:"
+    echo "  1) Telegram + Web（默认，需要 Telegram Bot Token）"
+    echo "  2) 仅 Web（不需要 Telegram，纯本地端口访问）"
+    local mode_choice=""
+    read -r -p "请输入选项 [1/2，默认 1]: " mode_choice
+    case "$mode_choice" in
+        2)
+            DEPLOY_MODE="web-only"
+            ;;
+        *)
+            DEPLOY_MODE="telegram"
+            ;;
+    esac
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$DEPLOY_MODE" > "$STATE_DIR/deploy-mode"
+}
+
 ensure_env_file() {
     info "[检查] 正在检查 .env..."
 
@@ -1109,13 +1144,269 @@ ensure_env_file() {
         : > .env
     fi
 
-    ensure_env_value "BOT_TOKEN" "请输入 Telegram Bot Token（输入时不显示）" secret
-    ensure_env_value "AUTHORIZED_USER_ID" "请输入 Telegram 用户 ID"
+    ensure_deploy_mode
+
+    if [ "$DEPLOY_MODE" = "web-only" ]; then
+        info "   仅 Web 模式：跳过 BOT_TOKEN，AUTHORIZED_USER_ID 仅作身份标识使用。"
+        ensure_env_value "AUTHORIZED_USER_ID" "请输入任意数字作为身份标识（例如 1）"
+    else
+        ensure_env_value "BOT_TOKEN" "请输入 Telegram Bot Token（输入时不显示）" secret
+        ensure_env_value "AUTHORIZED_USER_ID" "请输入 Telegram 用户 ID"
+    fi
 
     success ".env 配置已就绪"
 }
 
+ensure_web_password() {
+    # 仅 Web 模式下，Web 服务是唯一入口：没有密码，start_web_chat_if_enabled
+    # 会直接跳过启动，进程随即因“无法启动”而退出（参见 lifecycle.py 的
+    # run_web_only_main）。装完不给用户一条能连上的活路是最差的体验，所以
+    # 这一步在安装阶段就把密码设好，而不是让用户装完了才发现进不去。
+    if [ "${DEPLOY_MODE:-telegram}" != "web-only" ]; then
+        return
+    fi
+
+    info "[检查] 正在检查 Web 访问密码..."
+
+    local has_password
+    set +e
+    has_password=$(run_bot_python python - <<'PY'
+import asyncio
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath("."))
+os.environ.setdefault("AUTHORIZED_USER_ID", "1")
+
+import contextlib
+import io
+
+from xgent_app.bootstrap import load_sections
+
+ns = {"__file__": os.path.abspath("xgent_server.py")}
+# load_sections() 触发 core.py 顶层日志（"加载提示词: ..." 等），会直接写
+# 到 stdout——这段安装期一次性脚本靠 stdout 传回结果给 shell 的 $(...)，
+# 日志噪音混进去会让 shell 变量捕获到脏值（这条 bug 已经在人工测试里现形：
+# 端口检查捕获出一整段日志 + 数字粘在一起）。用 redirect_stdout 把加载期
+# 输出丢进黑洞，只留下面显式 print() 的那一行给 shell。
+with contextlib.redirect_stdout(io.StringIO()):
+    load_sections(ns)
+
+
+async def main():
+    await ns["UserDataManager"].init()
+    digest = await ns["read_web_password_hash"]()
+    print("yes" if digest else "no")
+    # BotMemoryDB 内部的 aiosqlite 连接起了一个非 daemon 工作线程；不显式
+    # 关闭，这个一次性检查脚本会卡死不退出（父 shell 跟着挂住）。同一类
+    # 问题也出现在 lifecycle.py 的 run_web_only_main，必须一并处理。
+    await (await ns["BotMemoryDB"].get_instance()).close()
+
+
+asyncio.run(main())
+PY
+)
+    local exit_code=$?
+    set -euo pipefail
+
+    if [ "$exit_code" -ne 0 ]; then
+        error "[错误] 检查 Web 密码状态失败，请查看上方输出。"
+        exit 1
+    fi
+
+    if [ "$has_password" = "yes" ]; then
+        success "Web 访问密码已设置。"
+        return
+    fi
+
+    warn "   仅 Web 模式下必须先设置访问密码，Web 服务才能启动。"
+    local password="" password_confirm=""
+    while true; do
+        read -r -s -p "请输入 Web 访问密码（至少 6 位，输入时不显示）: " password
+        echo
+        if [ "${#password}" -lt 6 ]; then
+            warn "   密码至少 6 位，请重新输入。"
+            continue
+        fi
+        read -r -s -p "请再次输入以确认: " password_confirm
+        echo
+        if [ "$password" != "$password_confirm" ]; then
+            warn "   两次输入不一致，请重新输入。"
+            continue
+        fi
+        break
+    done
+
+    set +e
+    XGENT_WEB_PASSWORD="$password" run_bot_python python - <<'PY'
+import asyncio
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath("."))
+os.environ.setdefault("AUTHORIZED_USER_ID", "1")
+
+import contextlib
+import io
+
+from xgent_app.bootstrap import load_sections
+
+ns = {"__file__": os.path.abspath("xgent_server.py")}
+# load_sections() 触发 core.py 顶层日志（"加载提示词: ..." 等），会直接写
+# 到 stdout——这段安装期一次性脚本靠 stdout 传回结果给 shell 的 $(...)，
+# 日志噪音混进去会让 shell 变量捕获到脏值（这条 bug 已经在人工测试里现形：
+# 端口检查捕获出一整段日志 + 数字粘在一起）。用 redirect_stdout 把加载期
+# 输出丢进黑洞，只留下面显式 print() 的那一行给 shell。
+with contextlib.redirect_stdout(io.StringIO()):
+    load_sections(ns)
+
+
+async def main():
+    await ns["UserDataManager"].init()
+    password = os.environ.get("XGENT_WEB_PASSWORD", "")
+    await ns["persist_web_password"](password)
+    print("ok")
+    # 同上：显式关闭数据库连接，避免非 daemon 工作线程卡住脚本退出。
+    await (await ns["BotMemoryDB"].get_instance()).close()
+
+
+asyncio.run(main())
+PY
+    exit_code=$?
+    set -euo pipefail
+    # 密码变量只在子进程环境里短暂存在，这里主动清掉，避免残留在当前 shell。
+    unset password password_confirm
+
+    if [ "$exit_code" -ne 0 ]; then
+        error "[错误] 设置 Web 访问密码失败，请查看上方输出。"
+        exit 1
+    fi
+    success "Web 访问密码已设置。"
+}
+
+ensure_web_port() {
+    # 仅 Web 模式下同样在装的时候把端口问清楚——默认 8790，但用户明确说了
+    # "纯本地端口访问"，装完不告诉端口/不给改端口的机会，同样是让人对着
+    # 一个连不上（或者不知道连哪）的服务发呆。和 ensure_web_password 对称。
+    if [ "${DEPLOY_MODE:-telegram}" != "web-only" ]; then
+        return
+    fi
+
+    info "[检查] 正在检查 Web 监听端口..."
+
+    local current_from_db
+    set +e
+    current_from_db=$(run_bot_python python - <<'PY'
+import asyncio
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath("."))
+os.environ.setdefault("AUTHORIZED_USER_ID", "1")
+
+import contextlib
+import io
+
+from xgent_app.bootstrap import load_sections
+
+ns = {"__file__": os.path.abspath("xgent_server.py")}
+# load_sections() 触发 core.py 顶层日志（"加载提示词: ..." 等），会直接写
+# 到 stdout——这段安装期一次性脚本靠 stdout 传回结果给 shell 的 $(...)，
+# 日志噪音混进去会让 shell 变量捕获到脏值（这条 bug 已经在人工测试里现形：
+# 端口检查捕获出一整段日志 + 数字粘在一起）。用 redirect_stdout 把加载期
+# 输出丢进黑洞，只留下面显式 print() 的那一行给 shell。
+with contextlib.redirect_stdout(io.StringIO()):
+    load_sections(ns)
+
+
+async def main():
+    await ns["UserDataManager"].init()
+    port = ns["normalize_web_port"](
+        ns["UserDataManager"].get("web_port", ns["DEFAULT_WEB_PORT"])
+    )
+    print(port)
+    await (await ns["BotMemoryDB"].get_instance()).close()
+
+
+asyncio.run(main())
+PY
+)
+    local exit_code=$?
+    set -euo pipefail
+
+    if [ "$exit_code" -ne 0 ]; then
+        error "[错误] 读取 Web 端口失败，请查看上方输出。"
+        exit 1
+    fi
+
+    echo ""
+    echo "当前监听端口：$current_from_db（默认 8790，只监听 127.0.0.1，不会自行暴露到公网）。"
+    local port_input=""
+    read -r -p "回车保持默认，或输入 1024-65535 之间的自定义端口: " port_input
+
+    if [ -z "$port_input" ]; then
+        success "Web 端口保持为 $current_from_db。"
+        return
+    fi
+
+    local set_output
+    set +e
+    set_output=$(XGENT_WEB_PORT_INPUT="$port_input" run_bot_python python - <<'PY'
+import asyncio
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath("."))
+os.environ.setdefault("AUTHORIZED_USER_ID", "1")
+
+import contextlib
+import io
+
+from xgent_app.bootstrap import load_sections
+
+ns = {"__file__": os.path.abspath("xgent_server.py")}
+# load_sections() 触发 core.py 顶层日志（"加载提示词: ..." 等），会直接写
+# 到 stdout——这段安装期一次性脚本靠 stdout 传回结果给 shell 的 $(...)，
+# 日志噪音混进去会让 shell 变量捕获到脏值（这条 bug 已经在人工测试里现形：
+# 端口检查捕获出一整段日志 + 数字粘在一起）。用 redirect_stdout 把加载期
+# 输出丢进黑洞，只留下面显式 print() 的那一行给 shell。
+with contextlib.redirect_stdout(io.StringIO()):
+    load_sections(ns)
+
+
+async def main():
+    await ns["UserDataManager"].init()
+    raw = os.environ.get("XGENT_WEB_PORT_INPUT", "")
+    try:
+        port = ns["parse_web_port"](raw)
+    except ValueError:
+        print(f"端口必须是 {ns['MIN_WEB_PORT']}-{ns['MAX_WEB_PORT']} 之间的整数")
+        await (await ns["BotMemoryDB"].get_instance()).close()
+        raise SystemExit(1)
+    ns["UserDataManager"].set("web_port", port)
+    await ns["UserDataManager"].save_config("web_port", port)
+    print(f"{port}")
+    await (await ns["BotMemoryDB"].get_instance()).close()
+
+
+asyncio.run(main())
+PY
+)
+    exit_code=$?
+    set -euo pipefail
+
+    if [ "$exit_code" -ne 0 ]; then
+        error "[错误] 设置 Web 端口失败：${set_output:-未知错误}"
+        exit 1
+    fi
+    success "Web 端口已设置为 ${port_input}。"
+}
+
 validate_telegram_token() {
+    if [ "${DEPLOY_MODE:-telegram}" = "web-only" ]; then
+        info "[检查] 仅 Web 模式，跳过 Telegram Bot Token 校验。"
+        return
+    fi
     info "[检查] 正在验证 Telegram Bot Token..."
 
     local status
@@ -1951,6 +2242,8 @@ prepare_environment() {
     install_requirements
     ensure_env_file
     validate_telegram_token
+    ensure_web_password
+    ensure_web_port
     check_database
 }
 
@@ -2012,6 +2305,62 @@ main() {
     echo -e "${CYAN} XGent for Telegram 已准备就绪。${NC}"
     echo -e "${CYAN} 已增强: 自动补环境、venv 自愈、PM2 自动安装${NC}"
     echo -e "${CYAN}========================================================${NC}"
+    print_web_only_access_hint
+}
+
+# 仅 Web 模式下，装完必须直接把访问地址打出来——用户明确要求的是“纯本地
+# 端口访问”，如果只在 ensure_web_port 那一步一闪而过提过端口号，装完後
+# 什么都不显示，等于让用户自己去翻代码猜端口。这里从数据库读一次实际生效的
+# 端口，跟 ensure_web_port/ensure_web_password 用的是同一份配置源。
+print_web_only_access_hint() {
+    if [ "${DEPLOY_MODE:-telegram}" != "web-only" ]; then
+        return
+    fi
+
+    local port
+    set +e
+    port=$(run_bot_python python - <<'PY'
+import asyncio
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath("."))
+os.environ.setdefault("AUTHORIZED_USER_ID", "1")
+
+import contextlib
+import io
+
+from xgent_app.bootstrap import load_sections
+
+ns = {"__file__": os.path.abspath("xgent_server.py")}
+# load_sections() 触发 core.py 顶层日志（"加载提示词: ..." 等），会直接写
+# 到 stdout——这段安装期一次性脚本靠 stdout 传回结果给 shell 的 $(...)，
+# 日志噪音混进去会让 shell 变量捕获到脏值（这条 bug 已经在人工测试里现形：
+# 端口检查捕获出一整段日志 + 数字粘在一起）。用 redirect_stdout 把加载期
+# 输出丢进黑洞，只留下面显式 print() 的那一行给 shell。
+with contextlib.redirect_stdout(io.StringIO()):
+    load_sections(ns)
+
+
+async def main():
+    await ns["UserDataManager"].init()
+    port = ns["normalize_web_port"](
+        ns["UserDataManager"].get("web_port", ns["DEFAULT_WEB_PORT"])
+    )
+    print(port)
+    await (await ns["BotMemoryDB"].get_instance()).close()
+
+
+asyncio.run(main())
+PY
+)
+    local exit_code=$?
+    set -euo pipefail
+    [ "$exit_code" -eq 0 ] || return 0
+
+    echo ""
+    echo -e "${GREEN}访问地址：http://127.0.0.1:${port}${NC}"
+    echo "（只监听 127.0.0.1，同机浏览器直接打开；远程访问需要自己配置端口转发或反向代理。）"
 }
 
 case "${1:-}" in

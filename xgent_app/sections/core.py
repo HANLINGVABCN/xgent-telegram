@@ -26,6 +26,7 @@ import math
 import base64
 import mimetypes
 import asyncio
+import signal
 import traceback
 import random
 import uuid
@@ -97,6 +98,10 @@ def build_stop_keyboard() -> InlineKeyboardMarkup:
 # --- ☆ 访问配置 ☆ ---
 class BotConfig:
     TOKEN = os.getenv("BOT_TOKEN", "")
+    # 纯 Web 模式：未配置 BOT_TOKEN，没有 Telegram 可用。此时 Web 服务是唯一
+    # 入口，"关闭 Web"/"清除密码"这类会真的停掉监听 socket 的操作必须被拦截
+    # ——否则用户会把自己锁在外面，只能物理重启进程才能恢复访问。
+    WEB_ONLY = not TOKEN
     try:
         AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
     except ValueError:
@@ -766,9 +771,15 @@ def setup_logging():
 
 logger = setup_logging()
 
-if not BotConfig.TOKEN or BotConfig.AUTHORIZED_USER_ID == 0:
-    logger.critical("❌ 配置错误！请检查 .env 文件里的 BOT_TOKEN 和 AUTHORIZED_USER_ID！")
+# AUTHORIZED_USER_ID 在任何模式下都是唯一用户的身份锚点（数据库记录、单用户
+# 校验），必须存在，否则致命退出。
+# BOT_TOKEN 允许为空：留空即代表“纯 Web 模式”——不起 PTB Application / 不跑
+# run_polling，只起 WebChatServer（main.py 据此分叉，见 sections/main.py）。
+if BotConfig.AUTHORIZED_USER_ID == 0:
+    logger.critical("❌ 配置错误！请检查 .env 文件里的 AUTHORIZED_USER_ID！")
     sys.exit(1)
+if not BotConfig.TOKEN:
+    logger.info("ℹ️ 未配置 BOT_TOKEN，将以纯 Web 模式运行（不连接 Telegram）。")
 
 write_model_trace("bot_process_start", {
     "pid": os.getpid(),

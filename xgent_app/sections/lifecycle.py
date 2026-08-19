@@ -160,6 +160,91 @@ async def setup_bot_commands(app):
             # 发送失败也不回滚 flag：避免并发/重连再次触发导致重复发送
             logger.warning(f"启动主菜单发送失败（不再重试，用户可手动 /start）: {e}")
 
+async def on_shutdown_web_only():
+    """纯 Web 模式（无 BOT_TOKEN、无 PTB Application）下的关闭清理。
+
+    与 on_shutdown(app) 做同样的资源清理，但跳过所有 app.bot.* 调用——纯
+    Web 模式下没有 PTB Application，也没有 SelfTriggerManager（其调度器
+    挂在 application.job_queue.scheduler 上，见 run_web_only_main 的说明）。
+    """
+    logger.info("🛑 服务正在关闭...")
+    try:
+        await asyncio.to_thread(flush_model_trace)
+    except Exception as e:
+        logger.debug(f"刷新 trace 队列失败: {e}")
+    try:
+        await stop_web_chat()
+    except Exception as e:
+        logger.error(f"关闭 Web Chat 失败: {e}")
+    try:
+        AgentShellSessionManager.kill_all()
+        logger.info("✅ Agent shell 会话已关闭")
+    except Exception as e:
+        logger.error(f"关闭 Agent shell 会话失败: {e}")
+    try:
+        db = await BotMemoryDB.get_instance()
+        await db.close()
+        logger.info("✅ 数据库连接已关闭")
+    except Exception as e:
+        logger.error(f"关闭数据库失败: {e}")
+    try:
+        await PortalManager.close_all()
+        logger.info("✅ OpenAI SDK 客户端池已关闭")
+    except Exception as e:
+        logger.error(f"关闭 OpenAI SDK 客户端池失败: {e}")
+    try:
+        await ModelClient.close_http_client()
+        logger.info("✅ 模型 HTTP 连接池已关闭")
+    except Exception as e:
+        logger.error(f"关闭模型 HTTP 连接池失败: {e}")
+
+
+async def run_web_only_main():
+    """纯 Web 模式主循环：未配置 BOT_TOKEN 时的入口，不建 PTB Application。
+
+    对照 setup_bot_commands + app.run_polling 的职责，纯 Web 模式下：
+    - 不跑 run_polling（没有 Telegram 连接）
+    - 不注册 Telegram 命令菜单 / 不发启动菜单消息（没有 chat 可发）
+    - 跳过 SelfTriggerManager（后台定时/长驻触发任务）：其调度器依赖 PTB
+      的 application.job_queue.scheduler（APScheduler），纯 Web 模式没有
+      这个对象。这是 v1 的已知限制，已在 README 中说明；后续如需支持，
+      可以单独起一个 AsyncIOScheduler 并给 SelfTriggerManager 一个 shim。
+    - Web 服务是唯一入口，强制启动（force=True，不受 web_enabled 开关影响）
+    """
+    await UserDataManager.init()
+    await BotMemoryDB.get_instance()
+
+    await start_web_chat_if_enabled(None, force=True)
+    if not is_web_chat_running():
+        logger.critical("❌ 纯 Web 模式启动失败：请确认已设置 Web 访问密码后重试。")
+        # sys.exit() 只抛 SystemExit，不会关掉 aiosqlite 内部起的非 daemon
+        # 工作线程——不先清理就退出，进程会卡成僵尸（日志打完却真的退不
+        # 出去，PM2 也看不出异常，仍显示"online"）。必须先走一遍关闭清理。
+        await on_shutdown_web_only()
+        sys.exit(1)
+
+    port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
+    logger.info("=" * 50)
+    logger.info("XGent Web (standalone) ready.")
+    logger.info(f"监听地址：http://{DEFAULT_WEB_HOST}:{port}")
+    logger.info("=" * 50)
+
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            # Windows 的 ProactorEventLoop 不支持 add_signal_handler；
+            # 退化为 KeyboardInterrupt（Ctrl+C 仍能正常触发下面的 except 分支）。
+            loop.add_signal_handler(sig, stop_event.set)
+
+    try:
+        await stop_event.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await on_shutdown_web_only()
+
+
 async def on_shutdown(app):
     """应用关闭时清理资源"""
     logger.info("🛑 服务正在关闭...")

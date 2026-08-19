@@ -178,8 +178,9 @@ def get_web_menu():
         rows.append([open_button])
     rows.extend([
         [InlineKeyboardButton(
-            f"{'🟢 已开启' if enabled else '🔴 已关闭'}　点击{'关闭' if enabled else '开启'}",
-            callback_data="toggle_web_enabled"
+            f"{'🟢 已开启' if enabled else '🔴 已关闭'}　点击{'关闭' if enabled else '开启'}"
+            if not (enabled and BotConfig.WEB_ONLY) else "🟢 已开启（纯 Web 模式常开，不可关闭）",
+            callback_data="toggle_web_enabled" if not (enabled and BotConfig.WEB_ONLY) else "noop"
         )],
         [InlineKeyboardButton(
             f"🔑 密码：{'已设置' if has_password else '未设置'}",
@@ -191,7 +192,7 @@ def get_web_menu():
             callback_data="act_set_web_public_url"
         )],
     ])
-    if has_password:
+    if has_password and not BotConfig.WEB_ONLY:
         rows.append([InlineKeyboardButton("🗑️ 清除密码", callback_data="confirm_clear_web_password")])
     if public_url:
         rows.append([InlineKeyboardButton("🧹 清除公开地址", callback_data="do_clear_web_public_url")])
@@ -200,9 +201,13 @@ def get_web_menu():
     term_button = _build_terminal_open_button()
     if term_button is not None:
         rows.append([term_button])
+    # 纯 Web 模式下，关闭终端可能连带关掉唯一的 Web 入口（当 web_enabled 本身
+    # 未被显式打开时），所以这里也锁住，与上面 toggle_web_enabled 的拦截对称。
+    term_locked = BotConfig.WEB_ONLY and term_on and not enabled
     rows.append([InlineKeyboardButton(
-        f"🖥 终端：{'🟢 开' if term_on else '🔴 关'}　点击{'关闭' if term_on else '开启'}",
-        callback_data="toggle_terminal_enabled"
+        f"🖥 终端：{'🟢 开' if term_on else '🔴 关'}　点击{'关闭' if term_on else '开启'}"
+        if not term_locked else "🖥 终端：🟢 开（纯 Web 模式下是唯一入口，不可关闭）",
+        callback_data="toggle_terminal_enabled" if not term_locked else "noop"
     )])
     rows.append([InlineKeyboardButton("🔙 返回", callback_data="act_main_menu")])
     return InlineKeyboardMarkup(rows)
@@ -217,6 +222,8 @@ def build_web_text() -> str:
     term_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
 
     status = "🟢 运行中" if running else ("🟡 已开启但未运行" if enabled else "🔴 已关闭")
+    if BotConfig.WEB_ONLY:
+        status += "（纯 Web 模式常开）"
     password_line = "✅ 已设置" if has_password else "⚠️ 未设置（未设置时拒绝启动）"
     public_line = (
         f"✅ <code>{safe_text(public_url)}</code>"

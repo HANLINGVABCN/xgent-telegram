@@ -2,6 +2,21 @@
 # Keep cross-section names available through the loader until the next decoupling phase.
 
 if __name__ == '__main__':
+    if not BotConfig.TOKEN:
+        # 纯 Web 模式：未配置 BOT_TOKEN，不建 PTB Application / 不跑 run_polling，
+        # 只起 WebChatServer。详见 lifecycle.py 的 run_web_only_main。
+        try:
+            print("=" * 60)
+            print("XGent Web (standalone) starting...")
+            print("=" * 60)
+            asyncio.run(run_web_only_main())
+        except Exception as e:
+            safe_error = redact_sensitive_text(str(e))
+            logger.critical(f"Fatal Error: {safe_error}")
+            print(redact_sensitive_text(traceback.format_exc()), file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
+
     try:
         print("=" * 60)
         print("XGent for Telegram starting...")

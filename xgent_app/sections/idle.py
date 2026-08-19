@@ -771,17 +771,28 @@ def _web_is_busy() -> bool:
     return _conversation_processing_lock.locked()
 
 
-async def start_web_chat_if_enabled(app: Any) -> None:
-    """按开关启动 Web 服务。失败只记日志，绝不影响 bot 主流程。"""
+async def start_web_chat_if_enabled(app: Optional[Any] = None, *, force: bool = False) -> None:
+    """按开关启动 Web 服务。失败只记日志，绝不影响 bot 主流程。
+
+    ``app`` 为 None 时代表纯 Web 模式（未配置 BOT_TOKEN，没有 PTB
+    Application）：``_web_real_bot``/``_web_application`` 保持 None，
+    MirrorBot/_web_deliver_file_to_tg 等调用点已原生支持 real_bot=None
+    （纯网页输出，不回灌 Telegram）。
+
+    ``force=True`` 时跳过 ``web_enabled`` 开关检查——纯 Web 模式下 Web 服务
+    本身就是唯一入口，不应该受“开关默认关闭”影响；密码缺失时也只记日志，
+    不尝试通过 Telegram 通知（可能没有 bot 可用）。
+    """
     global _web_chat_server, _web_real_bot, _web_application
     if _web_chat_server is not None:
         return
     web_on = normalize_bool(UserDataManager.get('web_enabled', False), False)
     term_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
-    if not (web_on or term_on):
+    if not force and not (web_on or term_on):
         return
 
     # 记下真实 bot，网页发起对话时 MirrorBot 用它把消息同步到 Telegram。
+    # app 为 None（纯 Web 模式）时保持 None，等价于纯网页输出。
     _web_real_bot = getattr(app, "bot", None)
     # 记下 application：网页触发配置状态（设密码/端口需 restart_web_chat）时，
     # 状态处理器会取 context.application，mirror context 默认没有该属性。
@@ -790,11 +801,12 @@ async def start_web_chat_if_enabled(app: Any) -> None:
     password_hash = await read_web_password_hash()
     if not password_hash:
         logger.warning("Web Chat 已开启但未设置密码，跳过启动")
-        with contextlib.suppress(Exception):
-            await app.bot.send_message(
-                chat_id=BotConfig.AUTHORIZED_USER_ID,
-                text="⚠️ Web/终端服务已开启但没有设置密码，未启动。请在 /start → 🌐 Web 里设置密码。",
-            )
+        if app is not None:
+            with contextlib.suppress(Exception):
+                await app.bot.send_message(
+                    chat_id=BotConfig.AUTHORIZED_USER_ID,
+                    text="⚠️ Web/终端服务已开启但没有设置密码，未启动。请在 /start → 🌐 Web 里设置密码。",
+                )
         return
 
     config = WebChatConfig(
@@ -821,18 +833,24 @@ async def start_web_chat_if_enabled(app: Any) -> None:
         request_stop=_web_request_stop,
         is_busy=_web_is_busy,
         is_terminal_enabled=lambda: normalize_bool(UserDataManager.get('terminal_enabled', False), False),
-        is_web_enabled=lambda: normalize_bool(UserDataManager.get('web_enabled', False), False),
+        # 纯 Web 模式（force=True）下 Web 服务本身就是唯一入口，不受
+        # web_enabled 开关影响，始终视为已开启。
+        is_web_enabled=(
+            (lambda: True) if force
+            else (lambda: normalize_bool(UserDataManager.get('web_enabled', False), False))
+        ),
     )
     server = WebChatServer(config)
     try:
         await asyncio.to_thread(server.start)
     except Exception as e:
         logger.error(f"Web Chat 启动失败: {e}")
-        with contextlib.suppress(Exception):
-            await app.bot.send_message(
-                chat_id=BotConfig.AUTHORIZED_USER_ID,
-                text=f"⚠️ Web Chat 启动失败：{safe_text(str(e)[:200])}",
-            )
+        if app is not None:
+            with contextlib.suppress(Exception):
+                await app.bot.send_message(
+                    chat_id=BotConfig.AUTHORIZED_USER_ID,
+                    text=f"⚠️ Web Chat 启动失败：{safe_text(str(e)[:200])}",
+                )
         return
     _web_chat_server = server
 
@@ -846,10 +864,17 @@ async def stop_web_chat() -> None:
         await asyncio.to_thread(server.stop)
 
 
-async def restart_web_chat(app: Any) -> None:
-    """改端口/密码后重启，让新配置立即生效。"""
+async def restart_web_chat(app: Optional[Any] = None, *, force: Optional[bool] = None) -> None:
+    """改端口/密码后重启，让新配置立即生效。
+
+    ``force`` 省略时按 ``app is None`` 自动判断：纯 Web 模式（app 为 None，
+    没有 PTB Application 可传）下重启也应强制起服务，不受 web_enabled 开关
+    影响，语义与 start_web_chat_if_enabled 的初次启动保持一致。
+    """
+    if force is None:
+        force = app is None
     await stop_web_chat()
-    await start_web_chat_if_enabled(app)
+    await start_web_chat_if_enabled(app, force=force)
 
 
 def is_web_chat_running() -> bool:

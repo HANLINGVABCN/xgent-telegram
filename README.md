@@ -102,13 +102,27 @@ flowchart LR
 
 ## 快速部署
 
+XGent 支持三种运行形态，`install.sh` 会在配置 `.env` 前询问你选哪种（也可以事后修改 `.env` 切换）：
+
+- **Telegram + Web**（默认）：连接 Telegram，Web 按开关叠加，两端共享同一份记忆并可互相镜像消息。
+- **仅 Web**：不需要 Telegram Bot Token，纯本地端口访问（详见下方[纯 Web 模式](#纯-web-模式)）。
+- **仅 Telegram**：Web 开关保持关闭即可，行为与现状完全一致。
+
 ### 准备
+
+**Telegram + Web 模式：**
 
 - Linux 服务器与可用的 Python 3.10+
   （install.sh 的自动补依赖只支持 Debian/Ubuntu；其它发行版需先手动装好 Python 3.10+、pip、git、curl）
 - 从 [BotFather](https://t.me/BotFather) 获取的 Telegram Bot Token
 - 你的 Telegram 用户 ID
 - 至少一个可用的模型 API Key
+
+**仅 Web 模式：**
+
+- 同上的 Linux 服务器 + Python 3.10+ + 模型 API Key
+- 不需要 Telegram Bot Token
+- 一个任意数字作为 `AUTHORIZED_USER_ID`（纯粹用作单用户身份标识，不必是真实 Telegram ID）
 
 ### 一键命令
 
@@ -310,6 +324,15 @@ Telegram 的内嵌网页按钮只接受 HTTPS 地址，因此：
 - 未填时，按钮降级为普通链接，用外部浏览器打开本地地址。
 
 在 Telegram 内打开时会通过 `initData` 签名自动登录，无需输入密码；用浏览器直接访问则需要密码。
+
+### 纯 Web 模式
+
+`.env` 不填 `BOT_TOKEN` 时，XGent 以纯 Web 模式运行：不连接 Telegram（不建 `Application`、不跑 `run_polling`），只启动 Web 服务，监听 `127.0.0.1:<端口>`（默认 `8790`），供你在本机或通过自建反向代理访问，不强制绑定域名。
+
+- **保留的功能**：对话、Agent 模式与全部协议执行（命令、文件读写、发文件、媒体生成）、流式/非流式回复、记忆（SQLite）、思考深度、Skill 开关、模型/提供商切换（提供商增删改仍需先在 `.env`/数据库里配置好，或通过 `/provider_config` 风格的导入——纯 Web 模式下暂无独立的提供商管理页面，需要先用 Telegram + Web 模式配置一次提供商，之后切回纯 Web 模式即可继续使用同一份数据库）、报错提示与系统提示、Web 设置面板里的全部选项。
+- **已知限制**：暂不支持后台定时/长驻触发任务（trigger 协议、cron 调度）——其调度器目前依赖 python-telegram-bot 的 `JobQueue`（底层是 APScheduler），纯 Web 模式下没有这个对象。此限制后续可能通过独立的 `AsyncIOScheduler` 解决。
+- **启动**：`install.sh` 选择"仅 Web"模式后，只需填 `AUTHORIZED_USER_ID`（任意数字身份标识）和 Web 访问密码即可；也可以手动在 `.env` 里只保留 `AUTHORIZED_USER_ID` 一项、不填 `BOT_TOKEN`，直接运行 `python xgent_server.py`。
+- **关闭**：Ctrl+C（或对进程发 SIGTERM）会走正常清理流程（数据库关闭、trace 落盘、Agent shell 会话清理），Windows 因不支持 `add_signal_handler` 会退化为 `KeyboardInterrupt`，Ctrl+C 依然有效。
 
 ## 安全说明
 

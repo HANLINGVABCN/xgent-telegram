@@ -32,6 +32,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await UserDataManager.init()
         await cancel_text_conversation(update)
         return
+
+    if data == "noop":
+        # 纯 Web 模式下被锁定的按钮（关闭 Web/终端会导致失联）用这个
+        # callback_data 占位，点击只提示原因，不做任何操作。
+        await query.answer("纯 Web 模式下这是你唯一的入口，不能关闭", show_alert=True)
+        return
     
     await UserDataManager.init()
     await query.answer()
@@ -679,6 +685,11 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             if enabled and not UserDataManager.get('_web_has_password', False):
                 await query.answer("请先设置访问密码", show_alert=True)
                 return
+            if not enabled and BotConfig.WEB_ONLY:
+                # 纯 Web 模式下 Web 服务是唯一入口，没有 Telegram 兜底。真的
+                # 关掉会让用户失联，只能物理重启进程才能恢复，所以拦截。
+                await query.answer("纯 Web 模式下这是你唯一的入口，不能关闭", show_alert=True)
+                return
             UserDataManager.set('web_enabled', enabled)
             await UserDataManager.save_config('web_enabled', enabled)
             # 解耦: 只在服务器运行状态需要改变时才 start/stop, 不无谓 restart
@@ -736,6 +747,9 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
         elif data == "confirm_clear_web_password":
+            if BotConfig.WEB_ONLY:
+                await query.answer("纯 Web 模式下这是你唯一的入口，不能清除密码", show_alert=True)
+                return
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ 确认清除", callback_data="do_clear_web_password")],
                 [InlineKeyboardButton("🔙 返回", callback_data="menu_web")]
@@ -748,6 +762,11 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
         elif data == "do_clear_web_password":
+            if BotConfig.WEB_ONLY:
+                # 防御性拦截：正常入口已经在 confirm 步骤挡住了，这里防止有人
+                # 直接拼 callback_data 绕过确认步骤。
+                await query.answer("纯 Web 模式下这是你唯一的入口，不能清除密码", show_alert=True)
+                return
             await clear_web_password()
             # 没有密码就不能继续对外服务，连同开关一起关掉。
             UserDataManager.set('web_enabled', False)
@@ -775,11 +794,17 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             if term_on and not UserDataManager.get('_web_has_password', False):
                 await query.answer("请先设置访问密码", show_alert=True)
                 return
+            web_still_on = normalize_bool(UserDataManager.get('web_enabled', False), False)
+            if not term_on and not web_still_on and BotConfig.WEB_ONLY:
+                # 纯 Web 模式下，关闭终端时如果 web_enabled 也是关的（常见——
+                # 该开关默认关闭，纯 Web 模式只是绕过了它，未必被显式打开过），
+                # 会导致下面的逻辑真的停掉唯一的服务入口，必须拦截。
+                await query.answer("纯 Web 模式下这是你唯一的入口，不能关闭", show_alert=True)
+                return
             UserDataManager.set('terminal_enabled', term_on)
             await UserDataManager.save_config('terminal_enabled', term_on)
             # 解耦: 终端与 Web 共享服务器但独立开关
             running = is_web_chat_running()
-            web_still_on = normalize_bool(UserDataManager.get('web_enabled', False), False)
             if term_on or web_still_on:
                 if not running:
                     await start_web_chat_if_enabled(context.application)
