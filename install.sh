@@ -1076,12 +1076,30 @@ telegram_log_out() {
 ensure_env_value() {
     local key="$1"
     local prompt="$2"
-    local secret="${3:-}"
+    # mode: 空=普通文本 / secret=输入不回显 / int=必须是纯数字，非法值反复重问
+    #
+    # 加 int 模式是因为一次真实用户报告过的连锁事故：AUTHORIZED_USER_ID 从
+    # 未填过，之前又手动往 .env 塞过一行中文说明（例如“系统信息”这类误粘贴
+    # 的占位文字），awk 抓到的 current_value 非空、这里直接 return 放行，
+    # 于是错误值一路带到运行时——core.py 的 int() 转换失败，AUTHORIZED_USER_ID
+    # 静默退化成 0，鉴权直接判死，Bot 陷入 PM2 重启死循环，且日志文案是英文
+    # 逻辑变量名，用户完全看不出问题出在 .env 里那一行。这里把校验挪到装的
+    # 时候做，比等运行时崩溃、翻日志排查省事得多。
+    local mode="${3:-}"
     local current_value=""
     local new_value=""
 
     if [ -f ".env" ]; then
         current_value="$(awk -F= -v k="$key" '$1==k && length($0)>length(k)+1{print substr($0,length(k)+2)}' .env | tail -n 1 || true)"
+    fi
+
+    if [ "$mode" = "int" ] && [ -n "$current_value" ]; then
+        case "$current_value" in
+            *[!0-9]* | "")
+                warn "   .env 中的 $key 当前值不是合法数字（值：$current_value），需要重新输入。"
+                current_value=""
+                ;;
+        esac
     fi
 
     if [ -n "$current_value" ]; then
@@ -1090,12 +1108,20 @@ ensure_env_value() {
 
     warn "   .env 中缺少 $key，请现在输入。"
     while [ -z "$new_value" ]; do
-        if [ "$secret" = "secret" ]; then
+        if [ "$mode" = "secret" ]; then
             # 密钥类输入不回显，避免留在终端回滚缓冲和录屏里
             read -r -s -p "$prompt: " new_value
             echo
         else
             read -r -p "$prompt: " new_value
+        fi
+        if [ "$mode" = "int" ] && [ -n "$new_value" ]; then
+            case "$new_value" in
+                *[!0-9]* | "")
+                    warn "   请只输入数字，重新输入。"
+                    new_value=""
+                    ;;
+            esac
         fi
     done
     upsert_env_value "$key" "$new_value"
@@ -1148,10 +1174,10 @@ ensure_env_file() {
 
     if [ "$DEPLOY_MODE" = "web-only" ]; then
         info "   仅 Web 模式：跳过 BOT_TOKEN，AUTHORIZED_USER_ID 仅作身份标识使用。"
-        ensure_env_value "AUTHORIZED_USER_ID" "请输入任意数字作为身份标识（例如 1）"
+        ensure_env_value "AUTHORIZED_USER_ID" "请输入任意数字作为身份标识（例如 1）" int
     else
         ensure_env_value "BOT_TOKEN" "请输入 Telegram Bot Token（输入时不显示）" secret
-        ensure_env_value "AUTHORIZED_USER_ID" "请输入 Telegram 用户 ID"
+        ensure_env_value "AUTHORIZED_USER_ID" "请输入 Telegram 用户 ID（纯数字，在 @userinfobot 里查看）" int
     fi
 
     success ".env 配置已就绪"
