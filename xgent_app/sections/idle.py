@@ -618,77 +618,129 @@ async def _web_deliver_file_to_tg(abs_path: str, filename: str, caption: str) ->
 
 async def _web_run_file_conversation(filename: str, content: bytes,
                                      caption: str, outbox: Any) -> None:
-    """网页上传文件后跑一轮对话。镜像 Telegram 端 handle_document_message 的普通分支
-    （messages.py:245-297）：存盘→记记忆→以路径+内联文本作 content_override 进对话核心。
+    """网页上传文件后跑一轮处理，复用 Telegram 端 process_incoming_document
+    （messages.py）的状态机分流，保证提供商配置导入 / 黑名单导入 / 记忆导入 /
+    提示词更新 / 普通文件对话这五条路径在网页和 Telegram 上行为完全一致。
 
-    与 TG 端唯一的差别在「文件来源」：TG 端用 get_file 下载，这里直接拿上传字节。
-    文件本体也同步发到 Telegram——走与 agent_sendfile.py 同款的三段分流：
-    ≤MAX_FILE_SIZE 原生 send_document 直发；超限且配了本地 Bot API server 则硬链到
-    .local-api-data/ 用 file:// 容器路径直发；超限且没配 server 则只告警不发（对话照跑）。
-    TG 失败不阻断网页对话，与 MirrorBot._tg_call 同样的容错策略。
+    历史 bug：本函数曾经只硬编码"普通文件对话"这一条路径，完全不检查
+    UserDataManager 的 state，导致网页上传 JSON 发起"覆盖导入提供商配置"
+    时，文件被当成普通附件喂给了 AI，而不是真正触发导入。现在改为调用
+    共享的 process_incoming_document，状态判断只维护一份。
+
+    与 TG 端唯一的差别在「文件来源」：TG 端用 get_file 下载，这里直接拿
+    上传字节。文件本体同步到 Telegram 这一步通过 sync_to_telegram 回调传入
+    process_incoming_document，只会在“普通文件”分支被调用——提供商配置等
+    配置类文件不会被转发进 Telegram 聊天记录（避免 API Key 泄露到聊天历史）。
     """
     try:
         update, context, _bot = build_web_mirror_objects(
             BotConfig.AUTHORIZED_USER_ID, outbox, _web_real_bot,
         )
 
-        saved_file = ArtifactManager.save_binary_upload(filename, content)
-        note = ArtifactManager.shorten_text(caption, 80) if caption else ""
-        memory_text = ArtifactManager.build_index_message(
-            "文件", filename, saved_file['rel_path'], note
+        async def _sync_to_tg(abs_path: str, file_name: str, file_caption: str) -> None:
+            # 三段分流对齐 agent_sendfile.py:79-174，阈值用同源的
+            # AgentExecutor.MAX_FILE_SIZE，保证两端「能发多大」一致。
+            # abs_path 是 process_incoming_document 里 save_binary_upload
+            # 已经落盘的路径，这里不重复存盘，避免同一份文件产生两个路径。
+            await _web_deliver_file_to_tg(abs_path, file_name, file_caption)
+
+        await process_incoming_document(
+            update, context,
+            doc_name=filename,
+            content_bytes=content,
+            caption=caption,
+            file_size=len(content),
+            sync_to_telegram=_sync_to_tg,
         )
-
-        # 文件本体同步到 Telegram。三段分流对齐 agent_sendfile.py:79-174，
-        # 阈值用同源的 AgentExecutor.MAX_FILE_SIZE，保证两端「能发多大」一致。
-        await _web_deliver_file_to_tg(saved_file['abs_path'], filename, caption)
-
-        await GlobalRecorder.record_user_message(
-            memory_text, MessageType.USER_FILE, BotConfig.AUTHORIZED_USER_ID
-        )
-
-        # 构造本轮临时上下文：附言 + 保存通知 + 内联文本（小文件）/ 路径提示（大文件）。
-        # 复刻 messages.py:257-286，保证网页上传与 TG 上传对模型完全一致。
-        turn_parts: List[Dict[str, str]] = []
-        if caption:
-            turn_parts.append({"type": "text", "text": f"用户附言：{caption}"})
-        turn_parts.append({
-            "type": "text",
-            "text": ArtifactManager.build_saved_notice(
-                "文件", saved_file['rel_path'], f"原文件名：{filename}"
-            )
-        })
-        inline_text = ArtifactManager.try_decode_text(content)
-        if inline_text is not None:
-            clipped_text, was_clipped = ArtifactManager.clip_inline_text(inline_text)
-            clip_note = (
-                "\n[系统提示] 文件内容过长，本轮只内联了前半部分，完整内容仍可通过保存路径重新读取。"
-                if was_clipped else ""
-            )
-            turn_parts.append({
-                "type": "text",
-                "text": (
-                    f"[文件内容开始]\n{clipped_text}{clip_note}\n[文件内容结束]\n"
-                    "请直接基于文件内容回答，并说明文件保存路径。"
-                )
-            })
-        else:
-            turn_parts.append({
-                "type": "text",
-                "text": (
-                    "这份文件已经保存到路径里了，但不会把全文长期塞在上下文里。"
-                    "如果后面还要继续分析，请优先按保存路径重新读取。"
-                )
-            })
-
-        await process_conversation(update, context, memory_text, content_override=turn_parts)
         outbox.put({"type": "turn_end"})
     except Exception as e:
         logger.exception("Web 文件对话失败")
         outbox.put({"type": "turn_error", "text": redact_sensitive_text(str(e))[:300]})
 
 
+async def _web_run_photo_conversation(filename: str, content: bytes,
+                                      caption: str, outbox: Any) -> None:
+    """网页上传图片后跑一轮对话，让 AI 真正"看懂"图片内容。
+
+    历史 bug：网页上传的图片此前统一走 _web_run_file_conversation（文档
+    语义），只存盘、记路径索引，从不构造 multimodal image content——AI
+    完全看不到图里画的是什么，只知道"有个文件"。这与 Telegram 端
+    handle_photo_message（other_messages.py）把图片 base64 编码后塞进
+    content_override 的行为不对等。
+
+    现在改为调用 build_photo_multimodal_payload（other_messages.py 里从
+    _prepare_photo_payload 抽取的纯函数），构造与 Telegram 端完全一致的
+    multimodal content，让 Web 上传图片时 AI 的识图能力和 Telegram 对齐。
+
+    图片本体仍同步到 Telegram（与文件上传路径一致），但图片是纯二进制，
+    不存在提供商配置/黑名单等需要按状态机分流的场景，所以不需要复用
+    process_incoming_document——这与 Telegram 端 handle_photo_message
+    不检查文档状态机、直接处理的行为一致。
+    """
+    try:
+        update, context, _bot = build_web_mirror_objects(
+            BotConfig.AUTHORIZED_USER_ID, outbox, _web_real_bot,
+        )
+
+        payload = build_photo_multimodal_payload(content, caption, filename)
+        saved_photo = payload["saved_photo"]
+        memory_text = payload["index_text"]
+
+        # 图片本体同步到 Telegram，对齐 _web_run_file_conversation 的现状行为。
+        await _web_deliver_file_to_tg(saved_photo['abs_path'], filename, caption)
+
+        await GlobalRecorder.record_user_message(
+            memory_text, MessageType.USER_PHOTO, BotConfig.AUTHORIZED_USER_ID
+        )
+
+        multimodal_content: List[Dict[str, str]] = []
+        if payload["caption"]:
+            multimodal_content.append({"type": "text", "text": f"用户附言：{payload['caption']}"})
+        multimodal_content.append({"type": "text", "text": payload["saved_notice"]})
+        multimodal_content.append({
+            "type": "image",
+            "mime_type": "image/jpeg",
+            "data": payload["image_b64"],
+        })
+
+        await process_conversation(update, context, memory_text, content_override=multimodal_content)
+        outbox.put({"type": "turn_end"})
+    except Exception as e:
+        logger.exception("Web 图片对话失败")
+        outbox.put({"type": "turn_error", "text": redact_sensitive_text(str(e))[:300]})
+
+
+# 图片文件后缀白名单，用于网页上传时区分"图片"（走 multimodal，AI 能看懂）
+# 和"普通文件"（走 process_incoming_document，只是路径索引）。与
+# Telegram 端 filters.PHOTO 依赖 Telegram 自己的媒体分类不同，网页上传
+# 只能拿到文件名，所以退化成按后缀判断——覆盖常见格式即可，不追求完备
+# （不在名单里的图片格式，比如小众的 .heic，会走普通文件路径，只是
+# AI 看不懂内容，不影响文件本身正常存盘和发送）。
+_WEB_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+
+
 def _web_submit_upload(filename: str, content: bytes, caption: str, outbox: Any) -> None:
-    """HTTP 线程调用：把网页上传文件的对话丢进事件循环，不等它跑完。"""
+    """HTTP 线程调用：把网页上传文件的对话丢进事件循环，不等它跑完。
+
+    按文件名后缀分流：图片走 _web_run_photo_conversation（AI 能看懂图片
+    内容），其余走 _web_run_file_conversation（process_incoming_document
+    的状态机分流，覆盖提供商配置导入等场景）。仅当当前不处于任何配置类
+    状态时才按图片处理——如果用户正在"覆盖导入提供商配置"流程中发了张
+    图片（几乎不会发生，但保持行为可预期），仍应交给状态机处理并提示
+    格式错误，而不是被当成图片直接喂给 AI。
+    """
+    _, ext = os.path.splitext(filename.lower())
+    state = UserDataManager.get('state')
+    if ext in _WEB_IMAGE_EXTENSIONS and state == BotState.IDLE:
+        loop = _web_chat_server.config.loop if _web_chat_server else None
+        if loop is None:
+            outbox.put({"type": "turn_error", "text": "服务未就绪"})
+            return
+        asyncio.run_coroutine_threadsafe(
+            _web_run_photo_conversation(filename, content, caption, outbox), loop,
+        )
+        return
+
     loop = _web_chat_server.config.loop if _web_chat_server else None
     if loop is None:
         outbox.put({"type": "turn_error", "text": "服务未就绪"})

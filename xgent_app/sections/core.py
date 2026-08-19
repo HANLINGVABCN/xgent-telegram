@@ -49,7 +49,7 @@ import hashlib
 import codecs
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from typing import Optional, Tuple, List, Dict, Any, Deque, cast
+from typing import Optional, Tuple, List, Dict, Any, Deque, cast, Callable, Awaitable
 from collections import OrderedDict, deque
 
 from apscheduler.triggers.cron import CronTrigger

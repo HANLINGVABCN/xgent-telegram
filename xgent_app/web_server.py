@@ -21,6 +21,7 @@ import contextlib
 import http.server
 import json
 import logging
+import mimetypes
 import os
 import socketserver
 import threading
@@ -30,7 +31,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from xgent_app import web_auth
 from xgent_app import web_terminal
-from xgent_app.web_bridge import WebOutbox, build_web_conversation_objects
+from xgent_app.web_bridge import MEDIA_TOKEN_REGISTRY, WebOutbox, build_web_conversation_objects
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,19 @@ MAX_UPLOAD_BODY_OFFICIAL = 50 * 1024 * 1024
 MAX_UPLOAD_BODY_LOCAL_API = 2 * 1024 * 1024 * 1024
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui")
+VENDOR_DIR = os.path.join(STATIC_DIR, "vendor")
+# 允许直接访问的静态资源白名单：路径 -> (磁盘文件名, Content-Type)。
+# 只列出这几个固定文件，不做通用目录遍历——避免 /vendor/../xxx 这类路径
+# 逃逸到 webui 之外读取任意文件。这几个文件本地自带，纯 Web 模式下不再需要
+# 联网拉取 telegram.org / cdn.jsdelivr.net（这两个域名在部分网络环境下访问
+# 缓慢甚至超时，之前把它们当阻塞 <script> 直接写在 <head> 里，会让整个页面
+# 卡在资源加载上迟迟不能渲染——这就是"访问网页端慢死"的根因）。
+VENDOR_ASSETS: Dict[str, Any] = {
+    "/vendor/telegram-web-app.js": ("telegram-web-app.js", "application/javascript; charset=utf-8"),
+    "/vendor/xterm.min.js": ("xterm.min.js", "application/javascript; charset=utf-8"),
+    "/vendor/xterm.min.css": ("xterm.min.css", "text/css; charset=utf-8"),
+    "/vendor/addon-fit.min.js": ("addon-fit.min.js", "application/javascript; charset=utf-8"),
+}
 
 # SSE 心跳间隔。低于常见反代的 60s 空闲超时。
 SSE_HEARTBEAT_SECONDS = 25.0
@@ -307,6 +321,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._serve_index()
             elif path == "/terminal":
                 self._serve_terminal()
+            elif path in VENDOR_ASSETS:
+                self._serve_vendor_asset(path)
+            elif path.startswith("/api/media/"):
+                self._handle_media_download(path[len("/api/media/"):])
             elif path == "/api/session":
                 self._send_json({"authenticated": self._is_authenticated()})
             elif path == "/api/history":
@@ -658,6 +676,77 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._send_html(b"<h1>terminal.html missing</h1>", status=500)
             return
         self._send_html(body)
+
+    def _handle_media_download(self, token: str) -> None:
+        """AI 生成/发送的图片与文件的下载出口。见 web_bridge.py 的
+        MediaTokenRegistry：send_photo/send_document 拿到本地路径时会注册
+        一个 token，SSE 帧里带上 /api/media/<token>，前端据此渲染 <img> 或
+        下载链接。
+
+        要求登录（和其它 /api/* 一致）——这不是公开静态资源，是用户自己的
+        聊天内容。token 本身只在当前进程内存里有效，重启后全部失效。
+        """
+        if not self._require_auth():
+            return
+        entry = MEDIA_TOKEN_REGISTRY.resolve(token)
+        if entry is None:
+            self._send_json({"error": "not found"}, status=404)
+            return
+        abs_path, filename, mime_type = entry
+        try:
+            size = os.path.getsize(abs_path)
+        except OSError:
+            self._send_json({"error": "file missing"}, status=404)
+            return
+
+        is_image = mime_type.startswith("image/")
+        disposition = "inline" if is_image else "attachment"
+        # RFC 5987 编码文件名，兼容非 ASCII 文件名（中文文件名很常见）。
+        quoted_name = urllib.parse.quote(filename)
+        self.send_response(200)
+        self.send_header("Content-Type", mime_type)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition", f"{disposition}; filename*=UTF-8''{quoted_name}")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "private, max-age=3600")
+        self.end_headers()
+        try:
+            # 流式分块读写：视频等大文件不能一次性 read() 进内存，否则一个
+            # 大文件下载就能把工作线程内存打爆（和 _read_multipart 的 50MB
+            # 量级完全不是一个数量级，这里必须流式处理）。
+            with open(abs_path, "rb") as handle:
+                while True:
+                    chunk = handle.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # 浏览器中途取消下载，或文件在两次 stat/read 之间被删除，都属正常。
+            pass
+
+    def _serve_vendor_asset(self, path: str) -> None:
+        """本地自带的第三方静态资源（xterm.js 等），不要求认证——与 index.html
+        / terminal.html 同级别的公开静态文件，浏览器渲染页面时就要加载它们，
+        这时候还没走完登录流程。真正的敏感操作都在需要认证的 /api/* 路由上。
+        """
+        filename, content_type = VENDOR_ASSETS[path]
+        asset_path = os.path.join(VENDOR_DIR, filename)
+        try:
+            with open(asset_path, "rb") as handle:
+                body = handle.read()
+        except OSError:
+            self._send_json({"error": "asset missing"}, status=404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        # 静态资源内容按文件名固定，可以放心长期缓存；改版本号（文件名或加
+        # query）时浏览器会当新资源处理，不用担心缓存吃到旧内容。
+        self.send_header("Cache-Control", "public, max-age=604800")
+        self.end_headers()
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            self.wfile.write(body)
 
     def _require_terminal_enabled(self) -> bool:
         if self.config.is_terminal_enabled():

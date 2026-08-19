@@ -13,12 +13,16 @@ shell_triggers.py 里的 _SelfTriggerUpdate / _SelfTriggerContext 已经用同�
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import logging
+import mimetypes
+import os
 import queue
+import secrets
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +51,68 @@ def _allocate_web_message_id() -> int:
 # “got multiple values for argument 'chat_id'”。用引用计数保证：已打补丁时只
 # 增计数不重裹，最后一个 release 才真正还原类，从根上杜绝双层包裹。
 _ACTIVE_MIRRORS: Dict[int, List[Any]] = {}
+
+
+class MediaTokenRegistry:
+    """把 AI 要发给用户的本地文件映射成一个随机 token，供网页端用
+    GET /api/media/<token> 拉取显示或下载。
+
+    只登记服务端 Agent/media 模块已经决定要发给用户的文件路径——不是
+    前端传路径进来读取任意文件，所以信任边界和现状的 sendfile/read 协议
+    一致，不需要比它们更严格的目录白名单。
+
+    token 用 secrets.token_urlsafe 生成，猜测空间足够大；注册表本身只是
+    进程内存里的一个有界字典（FIFO 淘汰最旧的），长时间运行也不会无限
+    增长。进程重启后 token 全部失效——这是预期行为，历史消息里的图片/
+    文件链接只在当前进程生命周期内有效，与 Telegram 侧消息互不影响。
+    """
+
+    def __init__(self, max_entries: int = 500):
+        self._max_entries = max(1, int(max_entries))
+        self._lock = threading.Lock()
+        self._entries = collections.OrderedDict()
+
+    def register(self, abs_path: str, filename: str) -> str:
+        mime_type, _ = mimetypes.guess_type(filename or abs_path)
+        token = secrets.token_urlsafe(24)
+        with self._lock:
+            self._entries[token] = (abs_path, filename, mime_type or "application/octet-stream")
+            self._entries.move_to_end(token)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+        return token
+
+    def resolve(self, token: str):
+        with self._lock:
+            return self._entries.get(token)
+
+
+def _local_path_from_send_arg(obj):
+    """尽力从 send_photo/send_document 的 photo/document 参数里挖出本地磁盘路径。
+
+    覆盖两种情况：打开的文件对象（open(path, 'rb')，取其 .name）和直接传
+    绝对路径字符串——这已经覆盖了 services.py 的媒体发送、
+    agent_file_delivery.py、agent_sendfile.py 里小于等于 50MB 直发这几条
+    最常用路径。特意排除 file:// 前缀（本地 Bot API 容器内路径，宿主机上
+    不存在对应文件，注册了也读不到）。拿不到路径时返回 None，调用方据此
+    跳过下载 token 注册，保持现状的纯文字提示，不引入死链接。
+    """
+    if isinstance(obj, str):
+        if obj.startswith("file://") or "://" in obj:
+            return None
+        return os.path.abspath(obj) if os.path.isfile(obj) else None
+    name = getattr(obj, "name", None)
+    if isinstance(name, str) and os.path.isfile(name):
+        return os.path.abspath(name)
+    return None
+
+
+# 进程级单例：Web 服务器路由（web_server.py 的 GET /api/media/<token>）与
+# 这里的 send_photo/send_document 共用同一份注册表，前者按 token 查文件，
+# 后者往里面登记文件。放在模块级而不是塞进某个类实例，是因为 WebBot /
+# MirrorBot 每次命令/回调/对话都会新建实例，token 必须能跨实例存活直到
+# 前端点击下载那一刻。
+MEDIA_TOKEN_REGISTRY = MediaTokenRegistry()
 
 
 def _offer(q: "queue.Queue[Optional[Dict[str, Any]]]", item: Optional[Dict[str, Any]]) -> None:
@@ -279,20 +345,34 @@ class WebBot:
     async def send_document(self, chat_id: Optional[int] = None, document: Any = None,
                             caption: Optional[str] = None, filename: Optional[str] = None,
                             **kwargs: Any) -> WebMessage:
-        # 文件本体不走 SSE：二进制塞进 JSON 帧会把内存和带宽打爆。
-        # 只报告文件名和标题，正文里已经有服务器路径，用户可以用文件管理器取。
+        # 文件本体不走 SSE：二进制塞进 JSON 帧会把内存和带宽打爆。改为注册一个
+        # 下载 token，前端拿 /api/media/<token> 去拉——能拿到本地路径时才注册
+        # （_local_path_from_send_arg 拿不到就是 None，前端据此不渲染下载入口）。
         name = filename or getattr(document, "filename", None) or getattr(document, "name", None)
+        display_name = str(name) if name else "file"
+        local_path = _local_path_from_send_arg(document)
+        download_url = None
+        if local_path is not None:
+            token = MEDIA_TOKEN_REGISTRY.register(local_path, display_name)
+            download_url = f"/api/media/{token}"
         message_id = self._allocate_message_id()
         self._emit("document", message_id=message_id,
-                   filename=str(name) if name else "file",
-                   caption=str(caption) if caption else None)
+                   filename=display_name,
+                   caption=str(caption) if caption else None,
+                   download_url=download_url)
         return WebMessage(self, message_id, int(chat_id or self.chat_id), str(caption or ""))
 
     async def send_photo(self, chat_id: Optional[int] = None, photo: Any = None,
                          caption: Optional[str] = None, **kwargs: Any) -> WebMessage:
+        local_path = _local_path_from_send_arg(photo)
+        download_url = None
+        if local_path is not None:
+            token = MEDIA_TOKEN_REGISTRY.register(local_path, os.path.basename(local_path))
+            download_url = f"/api/media/{token}"
         message_id = self._allocate_message_id()
         self._emit("photo", message_id=message_id,
-                   caption=str(caption) if caption else None)
+                   caption=str(caption) if caption else None,
+                   download_url=download_url)
         return WebMessage(self, message_id, int(chat_id or self.chat_id), str(caption or ""))
 
     async def get_file(self, *args: Any, **kwargs: Any) -> Any:
@@ -447,6 +527,11 @@ class MirrorBot:
                             **kwargs: Any) -> WebMessage:
         target = int(chat_id) if chat_id is not None else self.chat_id
         name = filename or getattr(document, "filename", None) or getattr(document, "name", None)
+        display_name = str(name) if name else "file"
+        # 在真实发送之前先取路径：send_document 内部会读取/上传文件对象，
+        # 部分实现读完后关闭文件，之后 getattr(obj, "name") 仍然可用（属性
+        # 不受读取位置影响），但提前取更保险，避免依赖未来实现细节。
+        local_path = _local_path_from_send_arg(document)
         message_id = self._allocate_message_id()
         real = await self._tg_call(
             "send_document", chat_id=target, document=document,
@@ -454,22 +539,33 @@ class MirrorBot:
         )
         if real is not None and getattr(real, "message_id", None) is not None:
             self._id_map[message_id] = real.message_id
+        download_url = None
+        if local_path is not None:
+            token = MEDIA_TOKEN_REGISTRY.register(local_path, display_name)
+            download_url = f"/api/media/{token}"
         self._emit("document", message_id=message_id,
-                   filename=str(name) if name else "file",
-                   caption=str(caption) if caption else None)
+                   filename=display_name,
+                   caption=str(caption) if caption else None,
+                   download_url=download_url)
         return WebMessage(self, message_id, target, str(caption or ""))
 
     async def send_photo(self, chat_id: Optional[int] = None, photo: Any = None,
                          caption: Optional[str] = None, **kwargs: Any) -> WebMessage:
         target = int(chat_id) if chat_id is not None else self.chat_id
+        local_path = _local_path_from_send_arg(photo)
         message_id = self._allocate_message_id()
         real = await self._tg_call(
             "send_photo", chat_id=target, photo=photo, caption=caption, **kwargs,
         )
         if real is not None and getattr(real, "message_id", None) is not None:
             self._id_map[message_id] = real.message_id
+        download_url = None
+        if local_path is not None:
+            token = MEDIA_TOKEN_REGISTRY.register(local_path, os.path.basename(local_path))
+            download_url = f"/api/media/{token}"
         self._emit("photo", message_id=message_id,
-                   caption=str(caption) if caption else None)
+                   caption=str(caption) if caption else None,
+                   download_url=download_url)
         return WebMessage(self, message_id, target, str(caption or ""))
 
     async def get_file(self, *args: Any, **kwargs: Any) -> Any:
@@ -719,9 +815,15 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
                     or getattr(doc, "filename", None)
                     or getattr(doc, "name", None)
                     or "file")
+            local_path = _local_path_from_send_arg(doc)
+            download_url = None
+            if local_path is not None:
+                token = MEDIA_TOKEN_REGISTRY.register(local_path, str(name))
+                download_url = f"/api/media/{token}"
             emit("document", message_id=getattr(result, "message_id", 0),
                  filename=str(name),
-                 caption=str(kwargs.get("caption")) if kwargs.get("caption") else None)
+                 caption=str(kwargs.get("caption")) if kwargs.get("caption") else None,
+                 download_url=download_url)
         except Exception:  # noqa: BLE001
             pass
         return result
@@ -731,8 +833,14 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
     async def send_photo(*args: Any, **kwargs: Any) -> Any:
         result = await saved["send_photo"](real_bot, *args, **kwargs)
         try:
+            local_path = _local_path_from_send_arg(kwargs.get("photo"))
+            download_url = None
+            if local_path is not None:
+                token = MEDIA_TOKEN_REGISTRY.register(local_path, os.path.basename(local_path))
+                download_url = f"/api/media/{token}"
             emit("photo", message_id=getattr(result, "message_id", 0),
-                 caption=str(kwargs.get("caption")) if kwargs.get("caption") else None)
+                 caption=str(kwargs.get("caption")) if kwargs.get("caption") else None,
+                 download_url=download_url)
         except Exception:  # noqa: BLE001
             pass
         return result

@@ -72,31 +72,46 @@ async def handle_photo_message_indexed(update: Update, context: ContextTypes.DEF
         logger.error(f"Photo multimodal processing error: {e}")
         await update.message.reply_text("图片已收到，但转给模型时失败。请稍后重试。")
 
-async def _prepare_photo_payload(update: Update) -> Dict[str, Any]:
-    """Download/encode one photo and build the per-photo artifacts used by both
-    the single-photo path and the album buffering path."""
-    largest_photo = update.message.photo[-1]
-    photo_bytes = await download_telegram_file(largest_photo)
-    saved_photo = ArtifactManager.save_binary_upload("telegram_photo.jpg", photo_bytes)
+def build_photo_multimodal_payload(photo_bytes: bytes, caption: str,
+                                   filename: str = "photo.jpg") -> Dict[str, Any]:
+    """Save one photo's bytes and build the artifacts shared by every photo
+    entry point (Telegram single photo / album, and Web upload).
+
+    Pure function (no Telegram Update object) so it can be reused by the Web
+    upload path without depending on update.message — this is the same
+    extraction pattern used for process_incoming_document: take the bytes,
+    build everything downstream identically regardless of where the bytes
+    came from.
+    """
+    saved_photo = ArtifactManager.save_binary_upload(filename, photo_bytes)
     image_b64 = base64.b64encode(photo_bytes).decode('ascii')
-    caption = (update.message.caption or "").strip()
-    # 转发的富文本消息：caption 可能为空，文字在 rich_message.blocks 里
-    if not caption:
-        caption = _extract_rich_message_text(update.message).strip()
-        if caption:
-            logger.warning(f"handle_photo_message: extracted caption via rich_message, len={len(caption)}: {caption[:200]}")
+    caption = (caption or "").strip()
     return {
         "image_b64": image_b64,
         "saved_photo": saved_photo,
         "saved_notice": ArtifactManager.build_saved_notice("图片", saved_photo['rel_path']),
         "index_text": ArtifactManager.build_index_message(
             "图片",
-            "telegram_photo.jpg",
+            filename,
             saved_photo['rel_path'],
             ArtifactManager.shorten_text(caption, 80) if caption else "",
         ),
         "caption": caption,
     }
+
+
+async def _prepare_photo_payload(update: Update) -> Dict[str, Any]:
+    """Download/encode one photo and build the per-photo artifacts used by both
+    the single-photo path and the album buffering path."""
+    largest_photo = update.message.photo[-1]
+    photo_bytes = await download_telegram_file(largest_photo)
+    caption = (update.message.caption or "").strip()
+    # 转发的富文本消息：caption 可能为空，文字在 rich_message.blocks 里
+    if not caption:
+        caption = _extract_rich_message_text(update.message).strip()
+        if caption:
+            logger.warning(f"handle_photo_message: extracted caption via rich_message, len={len(caption)}: {caption[:200]}")
+    return build_photo_multimodal_payload(bytes(photo_bytes), caption, "telegram_photo.jpg")
 
 
 def build_album_message(photos: List[Dict[str, str]], caption: str,

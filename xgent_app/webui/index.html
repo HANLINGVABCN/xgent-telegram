@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
 <title>XGent Web Chat</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="/vendor/telegram-web-app.js"></script>
 <style>
   /* ============================================================
      XGent Web — 设计系统
@@ -1076,6 +1076,68 @@
     return entry;
   }
 
+  // AI 生成/发送的图片或文件：sys 侧一个小气泡，有 download_url 时渲染
+  // 真实 img（图片）或可点击下载链接（文件）；没有 download_url（拿不到
+  // 本地路径的场景，比如内存 buffer 生成的导出文件）时退化为纯文字提示，
+  // 不引入死链接。
+  function makeMediaBubble(kind, filename, caption, downloadUrl, messageId) {
+    msgCount++;
+    updateEmptyState();
+    var row = document.createElement("div");
+    row.className = "msg-row sys";
+    var pill = document.createElement("div");
+    pill.className = "sys-pill";
+
+    if (kind === "photo" && downloadUrl) {
+      var img = document.createElement("img");
+      img.src = downloadUrl;
+      img.loading = "lazy";
+      img.style.maxWidth = "240px";
+      img.style.maxHeight = "240px";
+      img.style.borderRadius = "10px";
+      img.style.display = "block";
+      img.style.cursor = "pointer";
+      img.addEventListener("click", function () { window.open(downloadUrl, "_blank"); });
+      img.addEventListener("error", function () {
+        // 坏图兜底：换成文字提示，不能让一张加载失败的图片搞崩整条气泡。
+        img.replaceWith(document.createTextNode("\uD83D\uDDBC\uFE0F " + (filename || "图片") + "（加载失败）"));
+      });
+      pill.appendChild(img);
+      if (caption) {
+        var capEl = document.createElement("div");
+        capEl.style.marginTop = "4px";
+        capEl.textContent = caption;
+        pill.appendChild(capEl);
+      }
+    } else if (downloadUrl) {
+      var link = document.createElement("a");
+      link.href = downloadUrl;
+      link.download = filename || "file";
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = "\uD83D\uDCCE " + (filename || "文件") + "（点击下载）";
+      pill.appendChild(link);
+      if (caption) {
+        var capEl2 = document.createElement("div");
+        capEl2.style.marginTop = "4px";
+        capEl2.textContent = caption;
+        pill.appendChild(capEl2);
+      }
+    } else {
+      pill.innerHTML = renderText(
+        (kind === "photo" ? "\uD83D\uDDBC\uFE0F " : "\uD83D\uDCCE ") + (filename || (kind === "photo" ? "图片" : "文件")) +
+        (caption ? "\n" + caption : "")
+      );
+    }
+
+    row.appendChild(pill);
+    log.appendChild(row);
+    scrollDown();
+    var entry = { row: row, body: pill, btns: null };
+    if (messageId != null) { byMessageId[messageId] = entry; }
+    return entry;
+  }
+
   function renderButtons(rows, messageId) {
     var container = document.createElement("div");
     container.className = "inline-keyboard";
@@ -1155,9 +1217,7 @@
       makeBubble("user", frame.text, null, null, null);
       hideTyping();
     } else if (frame.type === "document" || frame.type === "photo") {
-      makeBubble("sys", (frame.type === "document" ? "📎 " : "🖼️ ") +
-        (frame.filename || (frame.type === "photo" ? "图片" : "文件")) +
-        (frame.caption ? "\n" + frame.caption : ""), frame.message_id, null, null);
+      makeMediaBubble(frame.type, frame.filename, frame.caption, frame.download_url, frame.message_id);
     } else if (frame.type === "chat_action") {
       if (frame.action === "typing") showTyping(); else hideTyping();
     } else if (frame.type === "callback_answer") {
