@@ -508,6 +508,23 @@ def plain_text_from_html(text: str) -> str:
     cleaned = re.sub(r'<[^>]+>', '', cleaned)
     return html.unescape(cleaned)
 
+
+def markdown_to_plain_text(text: str) -> str:
+    """将 Markdown 转换为纯文本，供 CLI 客户端使用。
+
+    不是从头再写一遍 markdown 解析：直接复用 markdown_to_telegram_html 的
+    解析阶段（代码块识别、表格提取、行内加粗/斜体识别——这些本来就是格式
+    无关的），再用 plain_text_from_html 剥掉 HTML 标签。这样表格/代码块/
+    加粗斜体的边界判定只维护一份，不会出现"CLI 端判定跟 Telegram 端不一致"
+    这类分裂 bug（历史上 Web 端的文件上传状态机就是因为独立实现过一次逻辑
+    才出的 bug，这次直接复用现成的解析结果，从设计上避免重蹈覆辙）。
+
+    代价：加粗/斜体/删除线的视觉强调在纯文本里会丢失（CLI 不做颜色/ANSI，
+    见规划文档里"先验证接口解耦、不做终端富文本渲染"的范围边界），链接
+    保留裸 URL，表格保留 <pre> 转换出的等宽对齐文本。
+    """
+    return plain_text_from_html(markdown_to_telegram_html(text))
+
 def _sanitize_telegram_html(text: str) -> str:
     """尝试修复无效的 Telegram HTML，而非直接降级到纯文本。
 

@@ -378,6 +378,21 @@ class WebBot:
     async def get_file(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError("Web 端不支持下载 Telegram 文件")
 
+    async def forward_message(self, chat_id: Optional[int] = None,
+                              from_chat_id: Optional[int] = None,
+                              message_id: Optional[int] = None,
+                              **kwargs: Any) -> WebMessage:
+        # 真实用途是"转发自己刚发的消息、再读回 text/caption、再删掉"这套
+        # 拉取完整内容的 trick（messages.py/other_messages.py 里处理转发消息
+        # 富文本回退时用）。纯网页/CLI 会话根本没有"转发"语义，也没有需要
+        # 拉取的隐藏内容——直接返回一个空文本的占位 WebMessage，调用方的
+        # try/except 会因为拿不到 text/caption 而自然走向下一个 fallback
+        # 分支，不需要在调用点加平台判断。之前这里完全没实现，是 Web 端一个
+        # 真实的接口缺口（CLI 接入会撞到同一处，这次一并补上）。
+        message_id_val = self._allocate_message_id()
+        target = int(chat_id) if chat_id is not None else self.chat_id
+        return WebMessage(self, message_id_val, target, "")
+
 
 class WebUpdate:
     """对照 shell_triggers.py 的 _SelfTriggerUpdate。"""
@@ -570,6 +585,31 @@ class MirrorBot:
 
     async def get_file(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError("Web 端不支持下载 Telegram 文件")
+
+    async def forward_message(self, chat_id: Optional[int] = None,
+                              from_chat_id: Optional[int] = None,
+                              message_id: Optional[int] = None,
+                              **kwargs: Any) -> WebMessage:
+        # 同 WebBot.forward_message：无 real_bot（纯网页会话）时和 WebBot 行为
+        # 一致，返回空文本占位消息。有 real_bot 时才是真实场景——转发确实需要
+        # 发生在 Telegram 那一侧才能拉到内容，网页帧本身不需要镜像这次转发/
+        # 删除动作（转发-读取-删除是纯粹的"取内容"手段，不是用户可见的
+        # 消息事件），所以这里不调用 _tg_call，直接透传给 real_bot。
+        target = int(chat_id) if chat_id is not None else self.chat_id
+        if self.real_bot is not None:
+            real = await self._tg_call(
+                "forward_message", chat_id=target,
+                from_chat_id=int(from_chat_id) if from_chat_id is not None else target,
+                message_id=message_id, **kwargs,
+            )
+            if real is not None:
+                text = getattr(real, "text", None) or getattr(real, "caption", None) or ""
+                wrapped = WebMessage(self, self._allocate_message_id(), target, str(text))
+                wrapped.text = text
+                wrapped.caption = getattr(real, "caption", None)
+                wrapped.message_id = getattr(real, "message_id", wrapped.message_id)
+                return wrapped
+        return WebMessage(self, self._allocate_message_id(), target, "")
 
 
 class MirrorMessage:
