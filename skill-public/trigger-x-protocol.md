@@ -1,5 +1,5 @@
 ```!
-trigger-x 后台任务调度协议完整文档。支持延迟执行（after: 30s）、定时任务（at: 2024-12-31 23:59）、周期任务（cron: 0 * * * *）、条件触发（when: READY）和持续监控。使用 YAML 格式，1 小时硬性超时。路径: skill/trigger-x-protocol.md
+trigger-x 后台任务调度协议完整文档。支持延迟执行（after: 30s）、定时任务（at: 2024-12-31 23:59）、周期任务（cron: 0 * * * *）、条件触发（when: READY）和持续监控。使用 YAML 格式，1 小时硬性超时。如有详细需求，请 read 本文件。
 ```
 
 # trigger-x 后台任务调度协议
