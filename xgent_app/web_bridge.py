@@ -411,6 +411,12 @@ class WebContext:
 
     def __init__(self, bot: WebBot):
         self.bot = bot
+        # PTB 的 CommandHandler 会把命令后面的空白分隔片段放进 context.args，
+        # cmd_token_stats（/stats 7）直接读它——而 _WEB_COMMAND_MAP 里就注册了
+        # stats，所以网页端点 /stats 之前会直接 AttributeError。空列表等价于
+        # "不带参数的命令"，是安全默认值；带参数的场景由
+        # build_web_command_objects 覆盖。
+        self.args: List[str] = []
 
 
 class MirrorBot:
@@ -592,9 +598,9 @@ class MirrorBot:
                               **kwargs: Any) -> WebMessage:
         # 同 WebBot.forward_message：无 real_bot（纯网页会话）时和 WebBot 行为
         # 一致，返回空文本占位消息。有 real_bot 时才是真实场景——转发确实需要
-        # 发生在 Telegram 那一侧才能拉到内容，网页帧本身不需要镜像这次转发/
-        # 删除动作（转发-读取-删除是纯粹的"取内容"手段，不是用户可见的
-        # 消息事件），所以这里不调用 _tg_call，直接透传给 real_bot。
+        # 发生在 Telegram 那一侧才能拉到内容，所以走 _tg_call 打到真实 bot；
+        # 但**不** _emit 网页帧：转发-读取-删除是纯粹的"取内容"手段，不是用户
+        # 可见的消息事件，镜像到网页只会凭空多出一条幽灵气泡。
         target = int(chat_id) if chat_id is not None else self.chat_id
         if self.real_bot is not None:
             real = await self._tg_call(
@@ -724,8 +730,12 @@ def build_web_command_objects(chat_id: int, outbox: WebOutbox, command_text: str
     """
     bot = MirrorBot(outbox, chat_id, real_bot)
     update = WebUpdate(bot, chat_id)
-    update.message.text = str(command_text or "")
-    return update, WebContext(bot), bot
+    text = str(command_text or "")
+    update.message.text = text
+    context = WebContext(bot)
+    # 与 PTB CommandHandler 对齐：命令名之后的空白分隔片段就是 context.args。
+    context.args = text.split()[1:]
+    return update, context, bot
 
 
 def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):

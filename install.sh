@@ -720,6 +720,7 @@ uninstall_app() {
     remove_virtualenv
     remove_recorded_apt_packages
     remove_ip_mode_state
+    remove_xgent_command
 
     echo ""
     echo -e "${CYAN}========================================================${NC}"
@@ -1630,6 +1631,55 @@ refresh_npm_global_bin_path() {
     hash -r
 }
 
+install_xgent_command() {
+    local launcher="$SCRIPT_DIR/bin/xgent"
+    local target_dir="${XGENT_CMD_LINK_DIR:-/usr/local/bin}"
+    local target="$target_dir/xgent"
+
+    [ -f "$launcher" ] || return 0
+    chmod +x "$launcher" 2>/dev/null || true
+
+    # 只在 /usr/local/bin 本来就在 PATH 里时建链接——否则建了也敲不到，
+    # 反而让用户以为装好了。与 persist_pm2_command 的判断保持一致。
+    case ":$PATH:" in
+        *":$target_dir:"*) ;;
+        *)
+            warn "   $target_dir 不在 PATH 中，跳过注册 xgent 命令。"
+            warn "   可直接运行: $launcher"
+            return 0
+            ;;
+    esac
+
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        if [ "$(readlink -f "$target" 2>/dev/null || true)" = "$(readlink -f "$launcher" 2>/dev/null || true)" ]; then
+            success "xgent 命令已就绪: $target"
+            return 0
+        fi
+        warn "   $target 已存在且指向别处，已保留原文件。"
+        warn "   可直接运行: $launcher"
+        return 0
+    fi
+
+    if run_privileged ln -s -- "$launcher" "$target"; then
+        hash -r
+        success "已注册 xgent 命令: $target（任意目录输入 xgent 打开终端界面）"
+    else
+        warn "   无法创建 $target；可直接运行: $launcher"
+    fi
+}
+
+remove_xgent_command() {
+    local target_dir="${XGENT_CMD_LINK_DIR:-/usr/local/bin}"
+    local target="$target_dir/xgent"
+    local launcher="$SCRIPT_DIR/bin/xgent"
+
+    [ -L "$target" ] || return 0
+    # 只删我们自己建的那个软链，指向别处的同名命令一律不碰。
+    if [ "$(readlink -f "$target" 2>/dev/null || true)" = "$(readlink -f "$launcher" 2>/dev/null || true)" ]; then
+        run_privileged rm -f -- "$target" && success "已移除 xgent 命令链接: $target"
+    fi
+}
+
 persist_pm2_command() {
     local pm2_bin target_dir="${XGENT_PM2_LINK_DIR:-/usr/local/bin}" target
 
@@ -2319,6 +2369,9 @@ show_usage() {
     echo "  ./install.sh switch-mode     在「Telegram + Web」与「仅 Web」部署模式间切换"
     echo "  ./install.sh uninstall       卸载本脚本安装的运行内容"
     echo "  ./install.sh uninstall -y    跳过确认直接卸载"
+    echo ""
+    echo "安装后可用命令:"
+    echo "  xgent                        打开本地终端客户端（与 Telegram/Web 共用同一套对话核心）"
 }
 
 parse_uninstall_options() {
@@ -2349,6 +2402,7 @@ prepare_environment() {
     ensure_web_password
     ensure_web_port
     check_database
+    install_xgent_command
 }
 
 main() {
@@ -2412,6 +2466,7 @@ main() {
     echo -e "${CYAN}========================================================${NC}"
     echo -e "${CYAN} XGent for Telegram 已准备就绪。${NC}"
     echo -e "${CYAN} 已增强: 自动补环境、venv 自愈、PM2 自动安装${NC}"
+    echo -e "${CYAN} 本地终端: 输入 ${GREEN}xgent${CYAN} 随时打开命令行客户端${NC}"
     echo -e "${CYAN}========================================================${NC}"
     print_web_only_access_hint
 }

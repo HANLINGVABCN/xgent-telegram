@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# XGent 本地终端客户端启动器。
+#
+# install.sh 会把 /usr/local/bin/xgent 指向本文件，让用户在任何目录下敲
+# `xgent` 都能打开终端界面。
+set -euo pipefail
+
+# 顺着符号链接找到仓库根目录。/usr/local/bin/xgent 通常是指向仓库里这个
+# 文件的软链，直接用 $0 的目录会落到 /usr/local/bin，那里既没有 venv 也
+# 没有 xgent_cli.py。优先用 readlink -f（GNU coreutils，一次解析完整条
+# 链），没有就退回手动循环（macOS 自带的 readlink 不支持 -f）。
+source_path="${BASH_SOURCE[0]}"
+if resolved="$(readlink -f "$source_path" 2>/dev/null)" && [ -n "$resolved" ]; then
+    source_path="$resolved"
+else
+    while [ -L "$source_path" ]; do
+        link_target="$(readlink "$source_path")"
+        case "$link_target" in
+            /*) source_path="$link_target" ;;
+            *)  source_path="$(cd "$(dirname "$source_path")" && pwd)/$link_target" ;;
+        esac
+    done
+fi
+BIN_DIR="$(cd "$(dirname "$source_path")" && pwd)"
+APP_DIR="${XGENT_HOME:-$(cd "$BIN_DIR/.." && pwd)}"
+
+ENTRY="$APP_DIR/xgent_cli.py"
+if [ ! -f "$ENTRY" ]; then
+    echo "[xgent] 找不到 $ENTRY" >&2
+    echo "[xgent] 如果仓库被移动过，请设置 XGENT_HOME=/path/to/xgent 后重试。" >&2
+    exit 1
+fi
+
+# 优先用安装脚本建好的 venv，其次退回系统解释器。逐个候选试运行再采用：
+# 光看 command -v 是不够的——Windows 商店会在 PATH 里放一个名叫 python3
+# 的占位程序，执行它只会弹商店、不报错也不输出；Linux 上也可能撞到指向已
+# 删除版本的死链。跑一次 -c 'pass' 才能确认这个解释器真的可用。
+PYTHON=""
+for candidate in "${XGENT_PYTHON:-}" "$APP_DIR/venv/bin/python3" python3 python; do
+    [ -n "$candidate" ] || continue
+    resolved_candidate="$(command -v "$candidate" 2>/dev/null || true)"
+    [ -n "$resolved_candidate" ] || continue
+    if "$resolved_candidate" -c 'pass' >/dev/null 2>&1; then
+        PYTHON="$resolved_candidate"
+        break
+    fi
+done
+if [ -z "$PYTHON" ]; then
+    echo "[xgent] 找不到可用的 python3，请先运行 ./install.sh 准备环境。" >&2
+    echo "[xgent] 也可以用 XGENT_PYTHON=/path/to/python 指定解释器。" >&2
+    exit 1
+fi
+
+# 必须切到项目目录再启动：数据库、日志、storage 都是相对 cwd 解析的
+# （core.py 的 DB_FILE = "xgent_memory.db"、log_file = getcwd()/…）。
+# 在别处直接跑会凭空建出一套空数据库，用户会以为配置和记忆全丢了。
+cd "$APP_DIR"
+exec "$PYTHON" "$ENTRY" "$@"

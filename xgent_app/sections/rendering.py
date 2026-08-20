@@ -508,22 +508,13 @@ def plain_text_from_html(text: str) -> str:
     cleaned = re.sub(r'<[^>]+>', '', cleaned)
     return html.unescape(cleaned)
 
-
-def markdown_to_plain_text(text: str) -> str:
-    """将 Markdown 转换为纯文本，供 CLI 客户端使用。
-
-    不是从头再写一遍 markdown 解析：直接复用 markdown_to_telegram_html 的
-    解析阶段（代码块识别、表格提取、行内加粗/斜体识别——这些本来就是格式
-    无关的），再用 plain_text_from_html 剥掉 HTML 标签。这样表格/代码块/
-    加粗斜体的边界判定只维护一份，不会出现"CLI 端判定跟 Telegram 端不一致"
-    这类分裂 bug（历史上 Web 端的文件上传状态机就是因为独立实现过一次逻辑
-    才出的 bug，这次直接复用现成的解析结果，从设计上避免重蹈覆辙）。
-
-    代价：加粗/斜体/删除线的视觉强调在纯文本里会丢失（CLI 不做颜色/ANSI，
-    见规划文档里"先验证接口解耦、不做终端富文本渲染"的范围边界），链接
-    保留裸 URL，表格保留 <pre> 转换出的等宽对齐文本。
-    """
-    return plain_text_from_html(markdown_to_telegram_html(text))
+# 注：这里曾有一个 markdown_to_plain_text(text) = plain_text_from_html(
+# markdown_to_telegram_html(text))，本意是给 CLI 客户端做 Markdown->纯文本。
+# 但它是死代码，而且层级放错了：文本流到客户端垫片（CliBot.send_message）
+# 时早已不是 Markdown——finalize_text_response 在上游就调用过
+# markdown_to_telegram_html，客户端拿到的是 Telegram HTML + parse_mode=HTML。
+# 所以 CLI 需要的是"HTML->纯文本"（直接用上面的 plain_text_from_html，由
+# xgent_cli.py 注入给 CliBot），不是"Markdown->纯文本"。
 
 def _sanitize_telegram_html(text: str) -> str:
     """尝试修复无效的 Telegram HTML，而非直接降级到纯文本。
