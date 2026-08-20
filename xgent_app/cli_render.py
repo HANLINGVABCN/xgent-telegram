@@ -318,6 +318,46 @@ def html_to_ansi(text: str, palette: Optional[Palette] = None) -> str:
 
 
 # --------------------------------------------------------------------------
+# 控制按钮：终端里点不了的那一类
+# --------------------------------------------------------------------------
+# Telegram/Web 上"停止回答"是一颗随时可点的按钮，所以对话核心把它做成
+# inline keyboard（core.py 的 build_stop_keyboard）。终端上这颗按钮**根本
+# 点不了**：一轮对话跑起来之后输入循环就在 await，用户敲不进任何编号。把它
+# 照直渲染成 " 1 ❌ 停止回答" 有两处不对——
+#   1. 它给出一个用户按不动的编号，是假承诺；
+#   2. ❌ 在终端里是"失败/出错"的通用记号，顶在"正在运行"的状态行下面，
+#      看起来像刚刚报了个错。
+# 所以这里把这类按钮从编号菜单里摘出来，改成一行灰色的键位提示——终端里
+# 中断的原生语义本来就是 Ctrl+C（xgent_cli.py 的 SIGINT 处理器会把它翻译
+# 成同一个 act_stop_generation）。
+#
+# 键是 callback_data 而不是按钮文字：文字随时可能改文案，callback_data 是
+# 对话核心和回调路由之间的稳定契约。
+CONTROL_BUTTON_HINTS = {
+    "act_stop_generation": ("⌃C", "中断回答"),
+}
+
+
+def split_control_buttons(
+    buttons: Sequence[Tuple[str, str]],
+) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    """拆成 (可编号点击的按钮, 键位提示)。
+
+    渲染和菜单登记必须用同一份拆分结果，否则屏幕上显示的编号和
+    cli_bridge 记下的 callback_data 会错位一格——用户点 1 触发了 2。
+    """
+    menu: List[Tuple[str, str]] = []
+    hints: List[Tuple[str, str]] = []
+    for text, data in buttons:
+        hint = CONTROL_BUTTON_HINTS.get(data)
+        if hint is None:
+            menu.append((text, data))
+        elif hint not in hints:
+            hints.append(hint)
+    return menu, hints
+
+
+# --------------------------------------------------------------------------
 # 消息排版
 # --------------------------------------------------------------------------
 
@@ -427,10 +467,26 @@ class MessageRenderer:
                 lines.append(indent + "".join(cells).rstrip())
         return lines
 
+    def render_hints(self, hints: Sequence[Tuple[str, str]],
+                     indent: str = "  ") -> List[str]:
+        """键位提示 -> 终端行（"⌃C  中断回答" 这种）。
+
+        整行走 muted 灰：它是操作说明，不是消息内容，不该跟正文抢注意力。
+        """
+        if not hints:
+            return []
+        pal = self.palette
+        key_width = max(display_width(key) for key, _desc in hints)
+        lines: List[str] = []
+        for key, desc in hints:
+            pad = " " * (key_width - display_width(key))
+            lines.append(indent + pal.paint(f"{key}{pad}  {desc}", pal.muted))
+        return lines
+
     def render_message(self, text: str, buttons: Sequence[Tuple[str, str]] = (),
                        parse_mode: Any = None, title: str = "XGent",
                        marker: str = "◆", style: str = "ai") -> List[str]:
-        """完整一条消息：标题行 + 正文 + 菜单。
+        """完整一条消息：标题行 + 正文 + 菜单 + 键位提示。
 
         标题只有一个记号加名字，不拉满屏宽的横线——每条消息都顶一条长横线
         会把界面变成"横线为主、内容为辅"。正文统一缩进 2 格，靠缩进而不是
@@ -443,11 +499,14 @@ class MessageRenderer:
         lines = [header]
         body = self.render_text(text, parse_mode)
         lines.extend(body)
-        button_lines = self.render_buttons(buttons)
+        menu_buttons, hints = split_control_buttons(buttons)
+        button_lines = self.render_buttons(menu_buttons)
         if button_lines:
             if body:
                 lines.append("")
             lines.extend(button_lines)
+        # 键位提示紧贴正文，不额外空行：它是状态行的附注，隔开反而像另一段。
+        lines.extend(self.render_hints(hints))
         return lines
 
 
@@ -589,6 +648,7 @@ def buttons_from_markup(reply_markup: Any) -> List[Tuple[str, str]]:
 
 
 __all__ = [
+    "CONTROL_BUTTON_HINTS",
     "Palette",
     "MessageRenderer",
     "TerminalScreen",
@@ -598,6 +658,7 @@ __all__ = [
     "enable_windows_vt",
     "html_to_ansi",
     "pad_to_width",
+    "split_control_buttons",
     "supports_color",
     "terminal_size",
     "wrap_line",

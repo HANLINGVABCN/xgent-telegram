@@ -21,8 +21,17 @@ LEGACY_APP_ENTRY="bot_server.py"
 STATE_DIR="$SCRIPT_DIR/.install-state"
 APT_STATE_FILE="$STATE_DIR/apt-packages.txt"
 IP_MODE_FILE="$STATE_DIR/ip-mode"
+RUNTIME_MODE_FILE="$STATE_DIR/runtime-mode"
 APT_UPDATED=0
 SKIP_CONFIRM=0
+
+# ensure_python 挑出来的解释器绝对路径。空串代表还没挑过。
+PYTHON_BIN=""
+
+# 系统级保活（systemd）。unit 名固定，卸载时才敢删——按名字删自己写的那个，
+# 不碰用户手工建的同类服务。
+SYSTEMD_SERVICE_NAME="xgent"
+SYSTEMD_UNIT_PATH="/etc/systemd/system/${SYSTEMD_SERVICE_NAME}.service"
 
 LOCAL_API_CONTAINER="telegram-local-bot-api"
 LOCAL_API_PORT="8081"
@@ -136,9 +145,9 @@ ip_mode_label() {
     esac
 }
 
-# .env 里有 BOT_TOKEN 就是权威判据（与 ensure_deploy_mode 的判断逻辑一致），
-# 不依赖 .install-state/deploy-mode——那个文件只在没有 Token 时才生效，
-# 单独读它会在"已经手动填过 Token 但状态文件还没更新"时显示过期的模式。
+# .env 里有 BOT_TOKEN 就是权威判据（与 sync_deploy_mode_state 的判断逻辑一致），
+# 不依赖 .install-state/deploy-mode——那个文件是同步出来的副本，单独读它会在
+# "刚手动往 .env 填了 Token 但还没跑过安装流程"时显示过期的模式。
 deploy_mode_label() {
     if [ -f ".env" ] && [ -n "$(local_api_env_value BOT_TOKEN)" ]; then
         printf 'Telegram + Web'
@@ -476,39 +485,126 @@ fix_line_endings() {
     done
 }
 
+python_version_ok() {
+    "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1
+}
+
+# 候选解释器文件名，按优先级从高到低。
+#
+# `python3` 排第一，而不是带版本号的那些：它是这台机器的"系统默认 Python"，
+# 配套的 python3-venv / python3-pip 一定装齐了。反过来把 python3.13 排前面会
+# 踩 Debian 的一个坑——`apt install python3.13` 不会带上 python3.13-venv，
+# 于是我们挑中一个建不了 venv 的解释器，而自动补包又只会去装 python3-venv，
+# 修的是另一个版本。只有当系统默认那个太旧时，才轮到带版本号的候选。
+python_candidate_names() {
+    printf '%s\n' python3 python3.14 python3.13 python3.12 python3.11 python3.10 python
+}
+
+# 要翻的目录：PATH 全部条目 + 几个常见安装位置，去重后保持顺序。
+python_search_dirs() {
+    local dir
+    local IFS=:
+    for dir in $PATH; do
+        [ -n "$dir" ] && printf '%s\n' "$dir"
+    done
+    printf '%s\n' /usr/local/bin /usr/bin /bin
+}
+
+# 这个解释器是不是某个 venv 里的。
+#
+# 只能比对原始路径，不能先 readlink -f：venv/bin/python3 通常就是指向
+# /usr/bin/pythonX.Y 的软链，解析完就认不出它来自 venv 了。
+is_project_venv_python() {
+    case "$1" in
+        "$VENV_DIR"/*) return 0 ;;
+        */venv/bin/python*) return 0 ;;
+    esac
+    return 1
+}
+
+# 找一个够新、而且不在任何 venv 里的解释器。
+#
+# 直接用 `python3` 会踩一个很难自证的坑：只要 PATH 首位落在某个 venv 的 bin
+# 目录（在激活了 venv 的 shell 里跑、或者从一个本身就跑在 venv 里的进程里调
+# 起本脚本——比如让 Bot 自己执行 install.sh），`python3` 解析到的就是那个
+# venv 的解释器。而 venv 解释器的版本被钉死在它**被创建的那一刻**，可能远比
+# 系统里现有的旧。于是同一台机器上，SSH 手敲能装、从 Bot 里调起就报"需要
+# Python 3.10"，看起来像"时好时坏"，实际只是 PATH 差异。
+#
+# 光换成 `command -v` 也不够：它只返回第一个命中，venv 排在 PATH 首位时后面
+# 所有同名解释器全被挡住。所以这里按"文件名优先级 × 全部搜索目录"逐个试，
+# 并跳过 venv 里的那些。第一个够新的就是答案——文件名顺序已经表达了偏好，
+# 没必要再去比较版本号大小（那会引入"挑了个更新但缺 venv 模块"的新问题）。
+discover_python() {
+    local name dir candidate dirs
+
+    if [ -n "${XGENT_PYTHON:-}" ]; then
+        candidate="$(command -v "$XGENT_PYTHON" 2>/dev/null || true)"
+        if [ -n "$candidate" ] && python_version_ok "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+        # 用户明确指定了却用不了，就该报错，而不是悄悄换一个——那样他会
+        # 以为自己的指定生效了。
+        return 1
+    fi
+
+    dirs="$(python_search_dirs | awk '!seen[$0]++')"
+    while IFS= read -r name; do
+        while IFS= read -r dir; do
+            candidate="$dir/$name"
+            [ -x "$candidate" ] || continue
+            is_project_venv_python "$candidate" && continue
+            python_version_ok "$candidate" || continue
+            printf '%s\n' "$candidate"
+            return 0
+        done <<< "$dirs"
+    done < <(python_candidate_names)
+    return 1
+}
+
 ensure_python() {
     info "[检查] 正在检查 Python 3..."
 
-    if ! command_exists python3; then
+    if ! command_exists python3 && ! command_exists python3.12 && ! command_exists python3.11; then
         warn "   未检测到 Python 3，尝试自动安装..."
         ensure_apt_packages python3 python3-pip python3-venv
     fi
 
-    if ! command_exists python3; then
-        error "[错误] 自动安装后仍然无法使用 Python 3。"
+    PYTHON_BIN="$(discover_python || true)"
+
+    if [ -z "$PYTHON_BIN" ] && [ -z "${XGENT_PYTHON:-}" ]; then
+        warn "   未找到 3.10 及以上的 Python，尝试自动安装..."
+        ensure_apt_packages python3 python3-pip python3-venv
+        PYTHON_BIN="$(discover_python || true)"
+    fi
+
+    if [ -z "$PYTHON_BIN" ]; then
+        error "[错误] 需要 Python 3.10 或更高版本，但当前系统里找不到可用的。"
+        if [ -n "${XGENT_PYTHON:-}" ]; then
+            error "       XGENT_PYTHON=${XGENT_PYTHON} 指向的解释器不可用或版本过低。"
+        fi
+        if command_exists python3; then
+            error "       当前 PATH 里的 python3: $(command -v python3) ($(python3 --version 2>&1))"
+            error "       注意：venv 里的解释器已被刻意跳过，它的版本停留在创建时那一刻。"
+        fi
+        error "       装好新版本后重跑本脚本，或用 XGENT_PYTHON=/path/to/python3.12 指定。"
         exit 1
     fi
 
-    if ! python3 -m venv --help >/dev/null 2>&1; then
+    if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1; then
         warn "   缺少 python3-venv，尝试自动安装..."
         ensure_apt_packages python3-venv python3-pip
     fi
 
-    if ! python3 -m pip --version >/dev/null 2>&1; then
+    if ! "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
         warn "   缺少 pip，尝试自动安装..."
         ensure_apt_packages python3-pip
     fi
 
-    echo "   Python 版本: $(python3 --version)"
-
-    if python3 -c "import sys; exit(0 if sys.version_info >= (3, 10) else 1)"; then
-        success "Python 版本满足要求 (>= 3.10)"
-    else
-        error "[错误] 需要 Python 3.10 或更高版本。"
-        error "       代码使用了 zoneinfo（3.9+）和 str.removesuffix（3.9+），"
-        error "       而 CI 只在 3.10/3.11/3.12 上验证，更低版本装完会在导入时崩溃。"
-        exit 1
-    fi
+    echo "   使用解释器: $PYTHON_BIN"
+    echo "   Python 版本: $("$PYTHON_BIN" --version 2>&1)"
+    success "Python 版本满足要求 (>= 3.10)"
 }
 
 resolve_path() {
@@ -537,7 +633,8 @@ confirm_uninstall() {
     fi
 
     warn "即将卸载本安装脚本创建的运行环境和服务记录。"
-    echo "   会清理: venv、本项目 nohup/PM2 进程、xgent.pid、脚本记录的 apt 下载包。"
+    echo "   会清理: venv、本项目 nohup/PM2 进程、systemd 服务 (${SYSTEMD_SERVICE_NAME})、"
+    echo "           xgent.pid、xgent 命令链接、脚本记录的 apt 下载包、保活方式记录。"
     echo "   会保留: 项目文件、.env、数据库、日志、skill-public/ 下脚本服务、PM2 程序本体。"
     echo ""
     read -r -p "确认继续？输入 y 继续: " answer
@@ -708,6 +805,13 @@ remove_ip_mode_state() {
     [ "$cleaned" -eq 1 ] && success "IP 出站模式设置已清理"
 }
 
+remove_runtime_mode_state() {
+    [ -f "$RUNTIME_MODE_FILE" ] || return 0
+    info "[卸载] 正在清理保活方式记录"
+    rm -f "$RUNTIME_MODE_FILE"
+    success "保活方式记录已清理"
+}
+
 uninstall_app() {
     if [ "${1:-}" != "--no-banner" ]; then
         print_banner
@@ -716,9 +820,11 @@ uninstall_app() {
     confirm_uninstall
 
     remove_pm2_process
+    remove_systemd_service
     stop_background_process
     remove_virtualenv
     remove_recorded_apt_packages
+    remove_runtime_mode_state
     remove_ip_mode_state
     remove_xgent_command
 
@@ -732,23 +838,30 @@ uninstall_app() {
 ensure_virtualenv() {
     info "[检查] 正在检查虚拟环境..."
 
-    if [ -x "$VENV_PYTHON" ] && [ -f "$VENV_ACTIVATE" ]; then
-        success "现有虚拟环境可正常使用"
-        return
-    fi
+    [ -n "$PYTHON_BIN" ] || ensure_python
 
-    if [ -e "$VENV_DIR" ]; then
+    if [ -x "$VENV_PYTHON" ] && [ -f "$VENV_ACTIVATE" ]; then
+        if python_version_ok "$VENV_PYTHON"; then
+            success "现有虚拟环境可正常使用（$("$VENV_PYTHON" --version 2>&1)）"
+            return
+        fi
+        # venv 的解释器版本钉死在它被创建的那一刻。系统后来升级了 Python，
+        # 旧 venv 不会跟着升——留着它只会让"系统 3.12 但项目跑在 3.9 上"这种
+        # 组合一直存在，而且是**运行期**才炸。这里直接重建。
+        warn "   现有 venv 的 Python 版本过低（$("$VENV_PYTHON" --version 2>&1)），正在用 $PYTHON_BIN 重建..."
+        safe_remove_venv
+    elif [ -e "$VENV_DIR" ]; then
         warn "   检测到损坏或不完整的 venv，正在重建..."
         safe_remove_venv
     fi
 
-    if ! python3 -m venv "$VENV_DIR"; then
+    if ! "$PYTHON_BIN" -m venv "$VENV_DIR"; then
         warn "   创建虚拟环境失败，正在安装 python3-venv 后重试..."
         ensure_apt_packages python3-venv python3-pip
         if [ -e "$VENV_DIR" ]; then
             safe_remove_venv
         fi
-        python3 -m venv "$VENV_DIR"
+        "$PYTHON_BIN" -m venv "$VENV_DIR"
     fi
 
     if [ ! -x "$VENV_PYTHON" ] || [ ! -f "$VENV_ACTIVATE" ]; then
@@ -756,7 +869,7 @@ ensure_virtualenv() {
         exit 1
     fi
 
-    success "虚拟环境创建完成"
+    success "虚拟环境创建完成（$("$VENV_PYTHON" --version 2>&1)）"
 }
 
 activate_virtualenv() {
@@ -818,10 +931,17 @@ remove_env_value() {
 }
 
 # 读取 .env 中某个键的值（不存在则空）
+#
+# 末尾的 \r 必须去掉：用户在 Windows 上编辑过 .env 再传到服务器是很常见的，
+# 那样每个值都会多带一个回车符。fix_line_endings 只在安装流程里跑，而
+# `install.sh status`、组件清单这些路径会先读 .env——不去掉的话
+# AUTHORIZED_USER_ID 会被判成"不是合法数字"，BOT_TOKEN 则会带着 \r 发给
+# Telegram 直接鉴权失败，两种症状都完全看不出根因在换行符上。
 local_api_env_value() {
     local key="$1"
     if [ -f ".env" ]; then
-        awk -F= -v k="$key" '$1==k{print substr($0,length(k)+2)}' .env 2>/dev/null | tail -n 1 || true
+        awk -F= -v k="$key" '$1==k{print substr($0,length(k)+2)}' .env 2>/dev/null \
+            | tail -n 1 | tr -d '\r' || true
     fi
 }
 
@@ -1139,198 +1259,45 @@ ensure_env_value() {
     upsert_env_value "$key" "$new_value"
 }
 
-ensure_deploy_mode() {
-    local current_token=""
-
-    if [ -f ".env" ]; then
-        current_token="$(local_api_env_value BOT_TOKEN)"
-    fi
-    if [ -n "$current_token" ]; then
-        DEPLOY_MODE="telegram"
-        return
-    fi
-    if [ -f "$STATE_DIR/deploy-mode" ]; then
-        DEPLOY_MODE="$(cat "$STATE_DIR/deploy-mode")"
-        if [ "$DEPLOY_MODE" = "web-only" ] || [ "$DEPLOY_MODE" = "telegram" ]; then
-            return
-        fi
-    fi
-
-    echo ""
-    echo "请选择部署模式:"
-    echo "  1) Telegram + Web（默认，需要 Telegram Bot Token）"
-    echo "  2) 仅 Web（不需要 Telegram，纯本地端口访问）"
-    local mode_choice=""
-    read -r -p "请输入选项 [1/2，默认 1]: " mode_choice
-    case "$mode_choice" in
-        2)
-            DEPLOY_MODE="web-only"
-            ;;
-        *)
-            DEPLOY_MODE="telegram"
-            ;;
-    esac
-    mkdir -p "$STATE_DIR"
-    printf '%s\n' "$DEPLOY_MODE" > "$STATE_DIR/deploy-mode"
-}
-
-ensure_env_file() {
-    info "[检查] 正在检查 .env..."
-
-    if [ ! -f ".env" ]; then
-        warn "   未找到 .env，正在创建新文件..."
-        : > .env
-    fi
-
-    ensure_deploy_mode
-
-    if [ "$DEPLOY_MODE" = "web-only" ]; then
-        info "   仅 Web 模式：跳过 BOT_TOKEN，AUTHORIZED_USER_ID 仅作身份标识使用。"
-        ensure_env_value "AUTHORIZED_USER_ID" "请输入任意数字作为身份标识（例如 1）" int
-    else
-        ensure_env_value "BOT_TOKEN" "请输入 Telegram Bot Token（输入时不显示）" secret
-        ensure_env_value "AUTHORIZED_USER_ID" "请输入 Telegram 用户 ID（纯数字，在 @userinfobot 里查看）" int
-    fi
-
-    success ".env 配置已就绪"
-}
-
+# 「切换部署模式」的入口（install.sh switch-mode）。真正的改法已经收进
+# 组件清单里的 bot 一项——填 Token / 换授权 ID / 移除 Bot 都在那里，
+# 这里只是把老命令名接过去，免得再维护第二份提示与校验逻辑。
 switch_deploy_mode() {
-    # 之前只能靠"手动改 .env + 删状态文件"才能从仅 Web 切到 Telegram+Web，
-    # 用户明确反对"部署个项目还要我自己去改文件"。这里把整个切换流程收进
-    # 菜单里：填 Token、强制重新确认真实 Telegram 用户 ID（仅 Web 模式下的
-    # AUTHORIZED_USER_ID 只是占位数字，不是真实 ID，绝不能被当作已配置直接
-    # 沿用——这正是当初触发 AUTHORIZED_USER_ID 校验 bug 的同一类"沉默复用
-    # 旧值"问题，这里从设计上就避免它，用 remove_env_value 强制清掉旧值
-    # 再走一遍 int 校验的 ensure_env_value）、更新部署模式状态文件、最后
-    # 询问是否立即重启生效。
-    local current_token=""
-    if [ -f ".env" ]; then
-        current_token="$(local_api_env_value BOT_TOKEN)"
-    fi
-
-    if [ -n "$current_token" ]; then
-        echo ""
-        echo "当前模式：Telegram + Web"
-        echo "切换为「仅 Web」模式会移除 .env 中的 BOT_TOKEN，之后不再连接 Telegram"
-        echo "（历史记录、模型配置等其余数据保留在数据库里，不受影响）。"
-        local confirm=""
-        read -r -p "确认切换为仅 Web 模式？[y/N]: " confirm
-        case "$confirm" in
-            y|Y)
-                remove_env_value "BOT_TOKEN"
-                mkdir -p "$STATE_DIR"
-                printf 'web-only
-' > "$STATE_DIR/deploy-mode"
-                success "已切换为仅 Web 模式。"
-                ;;
-            *)
-                warn "已取消，未做任何修改。"
-                return
-                ;;
-        esac
-    else
-        echo ""
-        echo "当前模式：仅 Web"
-        echo "切换为「Telegram + Web」需要填写 Bot Token；同时 AUTHORIZED_USER_ID 必须"
-        echo "换成你真实的 Telegram 用户数字 ID —— 仅 Web 模式下填的只是占位数字，"
-        echo "不能直接沿用，下面会强制重新输入一次。"
-        echo ""
-        ensure_env_value "BOT_TOKEN" "请输入 Telegram Bot Token（输入时不显示）" secret
-        remove_env_value "AUTHORIZED_USER_ID"
-        ensure_env_value "AUTHORIZED_USER_ID" "请输入 Telegram 用户 ID（纯数字，在 @userinfobot 里查看）" int
-        mkdir -p "$STATE_DIR"
-        printf 'telegram
-' > "$STATE_DIR/deploy-mode"
-        success "已切换为 Telegram + Web 模式。"
-    fi
+    local do_restart=""
 
     echo ""
-    local do_restart=""
+    echo "当前模式：$(deploy_mode_label)"
+    deploy_bot
+    sync_deploy_mode_state
+
+    echo ""
     read -r -p "是否现在重启服务以生效？[Y/n]: " do_restart
     case "$do_restart" in
         n|N)
-            warn "请稍后手动重启（菜单选项 5，或 bash install.sh restart）。"
+            warn "请稍后手动重启（主菜单第 3 项，或 bash install.sh restart）。"
             ;;
         *)
             prepare_environment
-            restart_app || warn "自动重启未成功，请手动选择菜单里的启动方式。"
+            restart_app || warn "自动重启未成功，请手动在主菜单里选择启动方式。"
             ;;
     esac
 }
 
-ensure_web_password() {
-    # 仅 Web 模式下，Web 服务是唯一入口：没有密码，start_web_chat_if_enabled
-    # 会直接跳过启动，进程随即因“无法启动”而退出（参见 lifecycle.py 的
-    # run_web_only_main）。装完不给用户一条能连上的活路是最差的体验，所以
-    # 这一步在安装阶段就把密码设好，而不是让用户装完了才发现进不去。
-    if [ "${DEPLOY_MODE:-telegram}" != "web-only" ]; then
-        return
-    fi
+set_web_password() {
+    # Web 服务没有密码就不会启动（start_web_chat_if_enabled 直接跳过），
+    # 仅 Web 模式下这等于装完连不上。所以密码是 web 组件的安装步骤本身，
+    # 不是"可选的加固项"。
+    local password="" password_confirm="" exit_code
 
-    info "[检查] 正在检查 Web 访问密码..."
-
-    local has_password
-    set +e
-    has_password=$(run_bot_python python - <<'PY'
-import asyncio
-import os
-import sys
-
-sys.path.insert(0, os.path.abspath("."))
-os.environ.setdefault("AUTHORIZED_USER_ID", "1")
-
-import contextlib
-import io
-
-from xgent_app.bootstrap import load_sections
-
-ns = {"__file__": os.path.abspath("xgent_server.py")}
-# load_sections() 触发 core.py 顶层日志（"加载提示词: ..." 等），会直接写
-# 到 stdout——这段安装期一次性脚本靠 stdout 传回结果给 shell 的 $(...)，
-# 日志噪音混进去会让 shell 变量捕获到脏值（这条 bug 已经在人工测试里现形：
-# 端口检查捕获出一整段日志 + 数字粘在一起）。用 redirect_stdout 把加载期
-# 输出丢进黑洞，只留下面显式 print() 的那一行给 shell。
-with contextlib.redirect_stdout(io.StringIO()):
-    load_sections(ns)
-
-
-async def main():
-    await ns["UserDataManager"].init()
-    digest = await ns["read_web_password_hash"]()
-    print("yes" if digest else "no")
-    # BotMemoryDB 内部的 aiosqlite 连接起了一个非 daemon 工作线程；不显式
-    # 关闭，这个一次性检查脚本会卡死不退出（父 shell 跟着挂住）。同一类
-    # 问题也出现在 lifecycle.py 的 run_web_only_main，必须一并处理。
-    await (await ns["BotMemoryDB"].get_instance()).close()
-
-
-asyncio.run(main())
-PY
-)
-    local exit_code=$?
-    set -euo pipefail
-
-    if [ "$exit_code" -ne 0 ]; then
-        error "[错误] 检查 Web 密码状态失败，请查看上方输出。"
-        exit 1
-    fi
-
-    if [ "$has_password" = "yes" ]; then
-        success "Web 访问密码已设置。"
-        return
-    fi
-
-    warn "   仅 Web 模式下必须先设置访问密码，Web 服务才能启动。"
-    local password="" password_confirm=""
+    info "[web] 设置访问密码"
     while true; do
-        read -r -s -p "请输入 Web 访问密码（至少 6 位，输入时不显示）: " password
+        read -r -s -p "   请输入 Web 访问密码（至少 6 位，输入时不显示）: " password
         echo
         if [ "${#password}" -lt 6 ]; then
             warn "   密码至少 6 位，请重新输入。"
             continue
         fi
-        read -r -s -p "请再次输入以确认: " password_confirm
+        read -r -s -p "   请再次输入以确认: " password_confirm
         echo
         if [ "$password" != "$password_confirm" ]; then
             warn "   两次输入不一致，请重新输入。"
@@ -1340,7 +1307,7 @@ PY
     done
 
     set +e
-    XGENT_WEB_PASSWORD="$password" run_bot_python python - <<'PY'
+    XGENT_WEB_PASSWORD="$password" run_bot_python "$VENV_PYTHON" - <<'PY'
 import asyncio
 import os
 import sys
@@ -1383,22 +1350,19 @@ PY
         error "[错误] 设置 Web 访问密码失败，请查看上方输出。"
         exit 1
     fi
+    reset_web_state_cache
     success "Web 访问密码已设置。"
 }
 
-ensure_web_port() {
-    # 仅 Web 模式下同样在装的时候把端口问清楚——默认 8790，但用户明确说了
-    # "纯本地端口访问"，装完不告诉端口/不给改端口的机会，同样是让人对着
-    # 一个连不上（或者不知道连哪）的服务发呆。和 ensure_web_password 对称。
-    if [ "${DEPLOY_MODE:-telegram}" != "web-only" ]; then
-        return
-    fi
+set_web_port() {
+    # 用户明确要的是"纯本地端口访问"，装完不告诉端口、也不给改端口的机会，
+    # 等于让人对着一个不知道连哪的服务发呆。和 set_web_password 对称。
+    local current_from_db exit_code
 
-    info "[检查] 正在检查 Web 监听端口..."
+    info "[web] 设置监听端口"
 
-    local current_from_db
     set +e
-    current_from_db=$(run_bot_python python - <<'PY'
+    current_from_db=$(run_bot_python "$VENV_PYTHON" - <<'PY'
 import asyncio
 import os
 import sys
@@ -1433,7 +1397,7 @@ async def main():
 asyncio.run(main())
 PY
 )
-    local exit_code=$?
+    exit_code=$?
     set -euo pipefail
 
     if [ "$exit_code" -ne 0 ]; then
@@ -1441,10 +1405,9 @@ PY
         exit 1
     fi
 
-    echo ""
-    echo "当前监听端口：$current_from_db（默认 8790，只监听 127.0.0.1，不会自行暴露到公网）。"
+    echo "   当前监听端口: $current_from_db（默认 8790，只监听 127.0.0.1，不会自行暴露到公网）"
     local port_input=""
-    read -r -p "回车保持默认，或输入 1024-65535 之间的自定义端口: " port_input
+    read -r -p "   回车保持不变，或输入 1024-65535 之间的自定义端口: " port_input
 
     if [ -z "$port_input" ]; then
         success "Web 端口保持为 $current_from_db。"
@@ -1453,7 +1416,7 @@ PY
 
     local set_output
     set +e
-    set_output=$(XGENT_WEB_PORT_INPUT="$port_input" run_bot_python python - <<'PY'
+    set_output=$(XGENT_WEB_PORT_INPUT="$port_input" run_bot_python "$VENV_PYTHON" - <<'PY'
 import asyncio
 import os
 import sys
@@ -1501,6 +1464,7 @@ PY
         error "[错误] 设置 Web 端口失败：${set_output:-未知错误}"
         exit 1
     fi
+    reset_web_state_cache
     success "Web 端口已设置为 ${port_input}。"
 }
 
@@ -1509,11 +1473,15 @@ validate_telegram_token() {
         info "[检查] 仅 Web 模式，跳过 Telegram Bot Token 校验。"
         return
     fi
+    if ! venv_ready; then
+        warn "   运行环境（venv）还没建好，跳过 Token 校验。"
+        return
+    fi
     info "[检查] 正在验证 Telegram Bot Token..."
 
     local status
     set +e
-    status=$(run_bot_python python - <<PY
+    status=$(run_bot_python "$VENV_PYTHON" - <<PY
 $(ip_family_restrictor_python)
 import asyncio
 import sys
@@ -2000,6 +1968,12 @@ rebuild_pm2_app() {
 restart_app() {
     info "[重启] 正在彻底重启 XGent for Telegram..."
 
+    if [ "$(get_runtime_mode)" = "systemd" ] && systemd_unit_installed; then
+        echo "   检测到 systemd 服务，将重写 unit 并重启（IP 模式等改动一并生效）。"
+        start_with_systemd
+        return
+    fi
+
     if command_exists pm2 && { pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1 || pm2 describe "$LEGACY_PM2_APP_NAME" >/dev/null 2>&1; }; then
         echo "   检测到 PM2 进程，将原地重启并刷新环境变量（进程 ID 保持不变）。"
         restart_pm2_detached
@@ -2014,9 +1988,9 @@ restart_app() {
         return
     fi
 
-    warn "   未检测到正在运行的 PM2/nohup 进程。"
-    echo "   请先选择 2) 后台运行 或 3) PM2 守护运行 启动一次。"
-    return 1
+    warn "   未检测到正在运行的服务进程。"
+    echo "   将按当前保活方式（$(runtime_mode_label)）直接启动一次。"
+    start_service
 }
 
 # 收集本地 API 所需 .env 变量；已有值则显示并允许回车保留
@@ -2341,22 +2315,713 @@ manage_local_api() {
     esac
 }
 
+# ==========================================================================
+# 保活方式（runtime mode）
+# ==========================================================================
+# 服务以什么方式常驻，和"装了哪些组件"是两个正交的问题：同一套 web+bot
+# 可以跑在 systemd 下，也可以跑在 PM2 下。所以它单独存一份状态，只在第一次
+# 安装时问一次，之后从主菜单改。
+
+get_runtime_mode() {
+    local mode=""
+    if [ -f "$RUNTIME_MODE_FILE" ]; then
+        mode="$(tr -d '[:space:]' < "$RUNTIME_MODE_FILE" 2>/dev/null || true)"
+    fi
+    case "$mode" in
+        systemd|pm2|nohup|foreground) printf '%s\n' "$mode" ;;
+        *) printf 'none\n' ;;
+    esac
+}
+
+runtime_mode_label() {
+    case "$(get_runtime_mode)" in
+        systemd)    printf '系统级保活 (systemd)' ;;
+        pm2)        printf 'PM2 保活' ;;
+        nohup)      printf '后台运行 (nohup)' ;;
+        foreground) printf '前台运行' ;;
+        *)          printf '尚未选择' ;;
+    esac
+}
+
+set_runtime_mode() {
+    ensure_state_dir
+    printf '%s\n' "$1" > "$RUNTIME_MODE_FILE"
+}
+
+choose_runtime_mode() {
+    local choice=""
+
+    echo ""
+    echo "请选择保活方式（决定服务以什么方式常驻，之后可以随时改）:"
+    if systemd_available; then
+        echo "  1) 系统级保活 (systemd)   开机自启、崩溃自动拉起；需要 root/sudo"
+    else
+        echo "  1) 系统级保活 (systemd)   当前系统不可用（没检测到 systemd）"
+    fi
+    echo "  2) PM2 保活               Node 进程守护，开机自启，pm2 logs 看日志"
+    echo "  3) 后台运行 (nohup)       最轻量，但不会开机自启"
+    echo "  4) 前台运行               调试用，关掉终端服务就停"
+    echo ""
+    read -r -p "请输入选项 [1-4，默认 2]: " choice
+
+    case "$choice" in
+        1)
+            if ! systemd_available; then
+                error "   当前系统没有可用的 systemd，请改选 2/3/4。"
+                choose_runtime_mode
+                return
+            fi
+            set_runtime_mode systemd
+            ;;
+        3) set_runtime_mode nohup ;;
+        4) set_runtime_mode foreground ;;
+        ""|2) set_runtime_mode pm2 ;;
+        *)
+            error "   无效选项，请重新选择。"
+            choose_runtime_mode
+            return
+            ;;
+    esac
+    success "保活方式: $(runtime_mode_label)"
+}
+
+# ==========================================================================
+# 系统级保活：systemd
+# ==========================================================================
+
+systemd_available() {
+    command_exists systemctl && [ -d /run/systemd/system ]
+}
+
+systemd_unit_installed() {
+    [ -f "$SYSTEMD_UNIT_PATH" ]
+}
+
+write_systemd_unit() {
+    local service_user unit_tmp
+    service_user="${SUDO_USER:-$(id -un)}"
+    unit_tmp="$(mktemp)"
+
+    # unit 里刻意不写具体启动参数，只写 "bash install.sh service-exec"：
+    # IP 出站模式、PYTHONPATH、入口文件这些都由 run_bot_python 统一决定，
+    # 写进 unit 就等于抄第二份——用户改完 IP 模式还得记得重写 unit 才生效。
+    # 顺带躲开在 unit 文件里给一大段内联 Python 加引号这件事。
+    cat > "$unit_tmp" <<EOF
+[Unit]
+Description=XGent for Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$service_user
+WorkingDirectory=$SCRIPT_DIR
+ExecStart=/usr/bin/env bash $SCRIPT_DIR/install.sh service-exec
+Restart=always
+RestartSec=3
+# 78 是应用主动要求"别再拉起来了"的退出码，与 PM2 的 --stop-exit-codes 一致。
+RestartPreventExitStatus=78
+KillSignal=SIGINT
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    run_privileged install -m 0644 "$unit_tmp" "$SYSTEMD_UNIT_PATH"
+    rm -f "$unit_tmp"
+}
+
+start_with_systemd() {
+    if ! systemd_available; then
+        error "[错误] 当前系统没有可用的 systemd，请在主菜单里改用 PM2 / nohup。"
+        exit 1
+    fi
+
+    info "[运行] 正在用 systemd 启动 XGent for Telegram..."
+    echo "   IP 出站模式: $(ip_mode_label)"
+
+    write_systemd_unit
+    run_privileged systemctl daemon-reload
+    if ! run_privileged systemctl enable "$SYSTEMD_SERVICE_NAME" >/dev/null 2>&1; then
+        warn "   开机自启配置失败，可手动执行: systemctl enable $SYSTEMD_SERVICE_NAME"
+    fi
+    run_privileged systemctl restart "$SYSTEMD_SERVICE_NAME"
+    sleep 2
+
+    if systemctl is-active --quiet "$SYSTEMD_SERVICE_NAME"; then
+        success "systemd 服务已启动: $SYSTEMD_SERVICE_NAME"
+        echo "   查看日志: journalctl -u $SYSTEMD_SERVICE_NAME -f"
+        echo "   停止命令: systemctl stop $SYSTEMD_SERVICE_NAME"
+        echo "   彻底重启: bash install.sh restart"
+    else
+        error "[错误] systemd 服务启动失败，下面是最近的状态输出:"
+        run_privileged systemctl status "$SYSTEMD_SERVICE_NAME" --no-pager -l 2>&1 | head -30 || true
+        exit 1
+    fi
+}
+
+stop_systemd_service() {
+    systemd_unit_installed || return 0
+    run_privileged systemctl stop "$SYSTEMD_SERVICE_NAME" >/dev/null 2>&1 || true
+}
+
+remove_systemd_service() {
+    if ! systemd_unit_installed; then
+        echo "   未发现 systemd 服务: $SYSTEMD_SERVICE_NAME"
+        return 0
+    fi
+    info "[卸载] 正在移除 systemd 服务: $SYSTEMD_SERVICE_NAME"
+    run_privileged systemctl disable --now "$SYSTEMD_SERVICE_NAME" >/dev/null 2>&1 || true
+    run_privileged rm -f -- "$SYSTEMD_UNIT_PATH"
+    run_privileged systemctl daemon-reload >/dev/null 2>&1 || true
+    success "systemd 服务已移除"
+}
+
+# systemd / 前台守护的实际进入点：不做任何交互，直接把服务跑起来。
+exec_app_process() {
+    if [ ! -x "$VENV_PYTHON" ]; then
+        error "[错误] 找不到虚拟环境解释器: $VENV_PYTHON"
+        error "       请先运行 ./install.sh 完成安装。"
+        exit 1
+    fi
+    XGENT_APP_ENTRY="$APP_ENTRY" TELEGRAM_AI_BOT_APP_ENTRY="" \
+        run_bot_python "$VENV_PYTHON" -c "$(bot_python_code)"
+}
+
+# ==========================================================================
+# 服务启停：按保活方式分发
+# ==========================================================================
+
+start_service() {
+    case "$(get_runtime_mode)" in
+        systemd)    start_with_systemd ;;
+        nohup)      start_background ;;
+        foreground) start_foreground ;;
+        pm2)        start_with_pm2 ;;
+        *)
+            choose_runtime_mode
+            start_service
+            ;;
+    esac
+}
+
+stop_service() {
+    case "$(get_runtime_mode)" in
+        systemd)
+            info "[停止] 正在停止 systemd 服务..."
+            stop_systemd_service
+            success "已停止: $SYSTEMD_SERVICE_NAME"
+            ;;
+        pm2)
+            if command_exists pm2 && pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
+                info "[停止] 正在停止 PM2 进程..."
+                pm2 stop "$PM2_APP_NAME" >/dev/null 2>&1 || true
+                success "已停止: $PM2_APP_NAME"
+            else
+                warn "   未发现正在运行的 PM2 进程。"
+            fi
+            ;;
+        *)
+            info "[停止] 正在停止后台进程..."
+            stop_background_process
+            ;;
+    esac
+}
+
+service_running() {
+    local pid
+    case "$(get_runtime_mode)" in
+        systemd)
+            command_exists systemctl || return 1
+            systemd_unit_installed || return 1
+            systemctl is-active --quiet "$SYSTEMD_SERVICE_NAME" 2>/dev/null
+            ;;
+        pm2)
+            command_exists pm2 && pm2 describe "$PM2_APP_NAME" 2>/dev/null | grep -q "online"
+            ;;
+        *)
+            [ -f "xgent.pid" ] || return 1
+            pid="$(cat xgent.pid 2>/dev/null || true)"
+            case "$pid" in
+                ""|*[!0-9]*) return 1 ;;
+            esac
+            ps -p "$pid" >/dev/null 2>&1
+            ;;
+    esac
+}
+
+# ==========================================================================
+# 组件清单：cli / web / bot
+# ==========================================================================
+# 三个组件共用一套代码和一份数据库，但"装没装"的判据各不相同：
+#   cli 看运行环境和 xgent 命令链接（文件系统）；
+#   web 看数据库里有没有访问密码（没密码 Web 服务根本不会启动）；
+#   bot 看 .env 里的 BOT_TOKEN 和 AUTHORIZED_USER_ID。
+# 每个探测函数统一输出 "状态|说明"，状态是 installed / missing / error 三选一。
+
+is_number() {
+    case "${1:-}" in
+        ""|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+venv_ready() {
+    [ -x "$VENV_PYTHON" ] && [ -f "$VENV_ACTIVATE" ]
+}
+
+port_is_listening() {
+    local port="$1"
+    if command_exists ss; then
+        ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"
+        return $?
+    fi
+    if command_exists netstat; then
+        netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"
+        return $?
+    fi
+    # 两个工具都没有就别下"异常"的结论——查不到不等于没监听。
+    return 0
+}
+
+WEB_STATE_LOADED=0
+WEB_HAS_PASSWORD="no"
+WEB_PORT=""
+
+reset_web_state_cache() {
+    WEB_STATE_LOADED=0
+}
+
+# Web 配置探测。跑一次要加载全部 section（约一两秒），所以结果缓存起来，
+# 只有改过密码/端口之后才 reset。
+load_web_state() {
+    local output exit_code
+
+    [ "$WEB_STATE_LOADED" -eq 1 ] && return 0
+    venv_ready || return 1
+
+    set +e
+    output=$(run_bot_python "$VENV_PYTHON" - <<'PY' 2>/dev/null
+import asyncio
+import contextlib
+import io
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath("."))
+os.environ.setdefault("AUTHORIZED_USER_ID", "1")
+
+from xgent_app.bootstrap import load_sections
+
+ns = {"__file__": os.path.abspath("xgent_server.py")}
+# load_sections() 会往 stdout 打加载日志，而 shell 靠 stdout 取结果，
+# 混进去就是脏值。丢进黑洞，只留下面显式 print 的两行。
+with contextlib.redirect_stdout(io.StringIO()):
+    load_sections(ns)
+
+
+async def main():
+    await ns["UserDataManager"].init()
+    digest = await ns["read_web_password_hash"]()
+    port = ns["normalize_web_port"](
+        ns["UserDataManager"].get("web_port", ns["DEFAULT_WEB_PORT"])
+    )
+    print(f"password={'yes' if digest else 'no'}")
+    print(f"port={port}")
+    # aiosqlite 起了非 daemon 工作线程，不显式关掉这段一次性脚本不会退出。
+    await (await ns["BotMemoryDB"].get_instance()).close()
+
+
+asyncio.run(main())
+PY
+)
+    exit_code=$?
+    set -euo pipefail
+
+    [ "$exit_code" -eq 0 ] || return 1
+
+    WEB_HAS_PASSWORD="$(printf '%s\n' "$output" | grep '^password=' | tail -n 1 | cut -d= -f2)"
+    WEB_PORT="$(printf '%s\n' "$output" | grep '^port=' | tail -n 1 | cut -d= -f2)"
+    [ -n "$WEB_PORT" ] || return 1
+    WEB_STATE_LOADED=1
+    return 0
+}
+
+component_state_cli() {
+    local launcher target
+
+    if ! venv_ready; then
+        printf 'missing|尚未创建运行环境（venv）\n'
+        return
+    fi
+    if ! python_version_ok "$VENV_PYTHON"; then
+        printf 'error|venv 里是 %s，低于 3.10，重新安装即可修复\n' "$("$VENV_PYTHON" --version 2>&1)"
+        return
+    fi
+
+    launcher="$SCRIPT_DIR/bin/xgent"
+    target="${XGENT_CMD_LINK_DIR:-/usr/local/bin}/xgent"
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        if [ "$(readlink -f "$target" 2>/dev/null || true)" = "$(readlink -f "$launcher" 2>/dev/null || true)" ]; then
+            printf 'installed|终端命令 xgent -> %s\n' "$target"
+        else
+            printf 'error|%s 已被别的文件占用，xgent 命令没指向本项目\n' "$target"
+        fi
+        return
+    fi
+    printf 'missing|终端命令 xgent 尚未注册\n'
+}
+
+component_state_web() {
+    if ! venv_ready; then
+        printf 'missing|尚未创建运行环境（venv）\n'
+        return
+    fi
+    if ! load_web_state; then
+        printf 'error|读取 Web 配置失败（数据库或依赖有问题）\n'
+        return
+    fi
+    if [ "$WEB_HAS_PASSWORD" != "yes" ]; then
+        printf 'missing|尚未设置访问密码，Web 服务不会启动\n'
+        return
+    fi
+    if service_running && ! port_is_listening "$WEB_PORT"; then
+        printf 'error|服务在运行，但端口 %s 没有监听\n' "$WEB_PORT"
+        return
+    fi
+    printf 'installed|http://127.0.0.1:%s（密码已设置）\n' "$WEB_PORT"
+}
+
+component_state_bot() {
+    local token id
+
+    token="$(local_api_env_value BOT_TOKEN)"
+    id="$(local_api_env_value AUTHORIZED_USER_ID)"
+
+    if [ -z "$token" ]; then
+        printf 'missing|未配置 Bot Token，当前是仅 Web 模式\n'
+        return
+    fi
+    if ! is_number "$id"; then
+        printf 'error|Token 已填，但 AUTHORIZED_USER_ID 不是合法数字（当前: %s）\n' "${id:-空}"
+        return
+    fi
+    if [ "$id" = "1" ]; then
+        printf 'error|AUTHORIZED_USER_ID 还是仅 Web 模式留下的占位值 1，Bot 会拒绝所有人\n'
+        return
+    fi
+    printf 'installed|Telegram Bot 已配置（授权用户 ID %s）\n' "$id"
+}
+
+component_icon() {
+    case "$1" in
+        installed) printf '%b' "${GREEN}✅${NC}" ;;
+        error)     printf '%b' "${YELLOW}🟡${NC}" ;;
+        *)         printf '%b' "${RED}❌${NC}" ;;
+    esac
+}
+
+component_state_text() {
+    case "$1" in
+        installed) printf '已安装' ;;
+        error)     printf '状态异常' ;;
+        *)         printf '未安装' ;;
+    esac
+}
+
+render_component_board() {
+    local row state detail index name
+    local names=("cli" "web" "bot")
+
+    echo ""
+    echo "部署组件:"
+    index=0
+    for name in "${names[@]}"; do
+        index=$((index + 1))
+        row="$(component_state_"$name")"
+        state="${row%%|*}"
+        detail="${row#*|}"
+        printf '  %b %d %s （%s）  %s\n' \
+            "$(component_icon "$state")" "$index" "$name" \
+            "$(component_state_text "$state")" "$detail"
+    done
+}
+
+deployment_configured() {
+    [ -n "$(local_api_env_value BOT_TOKEN)" ] && return 0
+    load_web_state || return 1
+    [ "$WEB_HAS_PASSWORD" = "yes" ]
+}
+
+require_deployment() {
+    deployment_configured && return 0
+    error "[错误] 还没有配置 web 或 bot，服务没有任何可用入口。"
+    error "       请先运行 ./install.sh，选择 1) 安装 / 部署 / 配置。"
+    exit 1
+}
+
+sync_deploy_mode_state() {
+    ensure_state_dir
+    if [ -n "$(local_api_env_value BOT_TOKEN)" ]; then
+        DEPLOY_MODE="telegram"
+    else
+        DEPLOY_MODE="web-only"
+    fi
+    printf '%s\n' "$DEPLOY_MODE" > "$STATE_DIR/deploy-mode"
+}
+
+# ==========================================================================
+# 组件安装 / 配置
+# ==========================================================================
+
+deploy_cli() {
+    local row state choice=""
+
+    echo ""
+    info "── 1  cli · 本地终端客户端 ──────────────────────────"
+    row="$(component_state_cli)"
+    state="${row%%|*}"
+
+    if [ "$state" = "installed" ]; then
+        echo "   状态: 已安装 — ${row#*|}"
+        echo "   cli 本身没有独立配置：模型、提示词、记忆都和 web/bot 共用同一份数据库，"
+        echo "   在 xgent 里用 /config、/providers 这些命令改就行。"
+        echo ""
+        echo "   1) 重新注册 xgent 命令"
+        echo "   2) 移除 xgent 命令"
+        echo "   3) 返回"
+        read -r -p "   请选择 [1-3，默认 3]: " choice
+        case "$choice" in
+            1) remove_xgent_command; install_xgent_command ;;
+            2) remove_xgent_command ;;
+            *) : ;;
+        esac
+        return
+    fi
+
+    if [ "$state" = "error" ]; then
+        warn "   ${row#*|}"
+    fi
+    install_xgent_command
+    echo "   在任意目录敲 xgent 就能打开终端界面。"
+}
+
+deploy_web() {
+    local row state choice=""
+
+    echo ""
+    info "── 2  web · 浏览器网页访问 ──────────────────────────"
+    ensure_identity_placeholder
+    row="$(component_state_web)"
+    state="${row%%|*}"
+
+    if [ "$state" = "installed" ] || [ "$state" = "error" ]; then
+        echo "   状态: $(component_state_text "$state") — ${row#*|}"
+        echo ""
+        echo "   1) 修改访问密码"
+        echo "   2) 修改监听端口"
+        echo "   3) 返回"
+        read -r -p "   请选择 [1-3，默认 3]: " choice
+        case "$choice" in
+            1) set_web_password ;;
+            2) set_web_port ;;
+            *) : ;;
+        esac
+        return
+    fi
+
+    warn "   Web 服务必须先有访问密码才会启动，下面把密码和端口一次设好。"
+    set_web_password
+    set_web_port
+}
+
+deploy_bot() {
+    local row state choice="" confirm=""
+
+    echo ""
+    info "── 3  bot · Telegram Bot ────────────────────────────"
+    row="$(component_state_bot)"
+    state="${row%%|*}"
+
+    if [ "$state" = "installed" ]; then
+        echo "   状态: 已安装 — ${row#*|}"
+        echo ""
+        echo "   1) 更换 Bot Token"
+        echo "   2) 更换授权用户 ID"
+        echo "   3) 移除 Bot（切换为仅 Web 模式）"
+        echo "   4) 返回"
+        read -r -p "   请选择 [1-4，默认 4]: " choice
+        case "$choice" in
+            1)
+                remove_env_value "BOT_TOKEN"
+                ensure_env_value "BOT_TOKEN" "   请输入 Telegram Bot Token（输入时不显示）" secret
+                sync_deploy_mode_state
+                validate_telegram_token
+                ;;
+            2)
+                prompt_authorized_user_id force
+                ;;
+            3)
+                read -r -p "   确认移除 Bot Token、切换为仅 Web 模式？[y/N]: " confirm
+                case "$confirm" in
+                    y|Y)
+                        remove_env_value "BOT_TOKEN"
+                        sync_deploy_mode_state
+                        success "已切换为仅 Web 模式（历史记录和模型配置都保留）。"
+                        ;;
+                    *) warn "   已取消。" ;;
+                esac
+                ;;
+            *) : ;;
+        esac
+        return
+    fi
+
+    if [ "$state" = "error" ]; then
+        warn "   ${row#*|}"
+    fi
+    ensure_env_value "BOT_TOKEN" "   请输入 Telegram Bot Token（输入时不显示）" secret
+    # 这里一律强制重问 ID：仅 Web 模式会把 AUTHORIZED_USER_ID 填成占位数字，
+    # 它是"合法数字"，ensure_env_value 会当成已配置直接放行——于是 Bot 装完
+    # 谁都用不了，日志里只有一句看不懂的鉴权失败。
+    prompt_authorized_user_id force
+    sync_deploy_mode_state
+    validate_telegram_token
+}
+
+# 仅 Web 模式也需要 AUTHORIZED_USER_ID（当身份标识用），但那只是个占位数字，
+# 没必要专门问用户一次。缺了才补，已有真实 ID 时绝不覆盖。
+ensure_identity_placeholder() {
+    local current
+    current="$(local_api_env_value AUTHORIZED_USER_ID)"
+    is_number "$current" && return 0
+    upsert_env_value "AUTHORIZED_USER_ID" "1"
+    info "   已把 AUTHORIZED_USER_ID 设为占位值 1（仅 Web 模式下它只是身份标识）。"
+}
+
+prompt_authorized_user_id() {
+    local force="${1:-}" current="" new_value=""
+
+    current="$(local_api_env_value AUTHORIZED_USER_ID)"
+    if [ "$force" != "force" ] && is_number "$current" && [ "$current" != "1" ]; then
+        return 0
+    fi
+    if [ "$current" = "1" ]; then
+        warn "   当前的 AUTHORIZED_USER_ID=1 只是仅 Web 模式下的占位数字，"
+        warn "   不能当成真实 Telegram ID 沿用，请重新输入。"
+    elif is_number "$current"; then
+        read -r -p "   当前授权用户 ID 是 $current，回车保留，或输入新的纯数字 ID: " new_value
+        if [ -z "$new_value" ]; then
+            return 0
+        fi
+    fi
+
+    while ! is_number "$new_value"; do
+        read -r -p "   请输入 Telegram 用户 ID（纯数字，在 @userinfobot 里查看）: " new_value
+        is_number "$new_value" || warn "   请只输入数字。"
+    done
+    upsert_env_value "AUTHORIZED_USER_ID" "$new_value"
+    success "授权用户 ID 已设置为 $new_value"
+}
+
+component_flow() {
+    local answer token pick_cli pick_web pick_bot invalid
+
+    while true; do
+        render_component_board
+        echo ""
+        echo "请输入要部署或配置的选项（可多选，空格隔开，例如: 1 2 3）"
+        answer=""
+        read -r -p "直接回车结束安装/配置: " answer
+        if [ -z "$answer" ]; then
+            return 0
+        fi
+
+        pick_cli=0; pick_web=0; pick_bot=0; invalid=0
+        for token in $answer; do
+            case "$token" in
+                1) pick_cli=1 ;;
+                2) pick_web=1 ;;
+                3) pick_bot=1 ;;
+                *) error "   无法识别的选项: $token（只能是 1 / 2 / 3）"; invalid=1 ;;
+            esac
+        done
+        if [ "$invalid" -eq 1 ]; then
+            continue
+        fi
+
+        # 固定按 1 -> 2 -> 3 执行，不按用户输入的顺序：web 会给
+        # AUTHORIZED_USER_ID 落一个占位值，bot 必须排在它后面才能把占位值
+        # 换成真实 ID；反过来的话真实 ID 会被占位值盖掉。
+        if [ "$pick_cli" -eq 1 ]; then deploy_cli; fi
+        if [ "$pick_web" -eq 1 ]; then deploy_web; fi
+        if [ "$pick_bot" -eq 1 ]; then deploy_bot; fi
+        reset_web_state_cache
+    done
+}
+
+install_flow() {
+    # 保活方式只在第一次问。已经装过的用户再点安装，看到的应该是同一套组件
+    # 清单，而不是又被问一遍"你想用 systemd 还是 PM2"——那个问题他上次已经
+    # 回答过了，答案就存在 .install-state/runtime-mode 里。
+    if [ "$(get_runtime_mode)" = "none" ]; then
+        choose_runtime_mode
+    else
+        info "[保活] 当前保活方式: $(runtime_mode_label)（在主菜单第 6 项可以更改）"
+    fi
+
+    prepare_base_environment
+    success "环境检查通过。"
+
+    component_flow
+    sync_deploy_mode_state
+
+    if ! deployment_configured; then
+        echo ""
+        warn "web 和 bot 都还没配置，服务没有可提供的入口，已跳过启动。"
+        warn "（只装 cli 也能用：直接敲 xgent 打开终端界面。）"
+        return 0
+    fi
+
+    echo ""
+    local answer=""
+    read -r -p "现在按「$(runtime_mode_label)」启动/重启服务？[Y/n]: " answer
+    case "$answer" in
+        n|N) warn "已跳过启动。之后在主菜单选 2) 启动服务 即可。" ;;
+        *) start_service ;;
+    esac
+}
+
+show_status() {
+    echo ""
+    echo "保活方式:   $(runtime_mode_label)"
+    if service_running; then
+        info "服务状态:   运行中"
+    else
+        warn "服务状态:   已停止"
+    fi
+    echo "部署模式:   $(deploy_mode_label)"
+    echo "IP 出站模式: $(ip_mode_label)"
+    render_component_board
+}
+
 show_menu() {
-    local current_mode_label="$(ip_mode_label)"
-    local current_deploy_label="$(deploy_mode_label)"
     echo ""
     echo "请选择操作:"
-    echo "  1) 前台运行"
-    echo "  2) 后台运行 (nohup)"
-    echo "  3) PM2 守护运行 (未安装时自动补齐)"
-    echo "  4) 仅检查环境"
-    echo "  5) 重启 Bot (当前: $current_mode_label)"
-    echo "  6) IP 出站模式 (当前: $current_mode_label)"
-    echo "  7) 卸载本脚本安装的运行内容"
-    echo "  8) 本地 API 容器 (Docker) - 启动/关闭本地 Telegram Bot API server"
-    echo "  9) 退出"
-    echo " 10) 彻底重建 PM2 进程 (重新加载 PM2 启动参数，进程 ID 会 +1)"
-    echo " 11) 切换部署模式 (当前: $current_deploy_label)"
+    echo "  1) 安装 / 部署 / 配置      检查环境后进入组件清单 (cli / web / bot)"
+    echo "  2) 启动服务                当前保活方式: $(runtime_mode_label)"
+    echo "  3) 重启服务"
+    echo "  4) 停止服务"
+    echo "  5) 运行状态"
+    echo "  6) 更改保活方式            当前: $(runtime_mode_label)"
+    echo "  7) IP 出站模式             当前: $(ip_mode_label)"
+    echo "  8) 本地 API 容器 (Docker)  启动/关闭本地 Telegram Bot API server"
+    echo "  9) 彻底重建 PM2 进程       重新加载 PM2 启动参数，进程 ID 会 +1"
+    echo " 10) 卸载本脚本安装的运行内容"
+    echo "  0) 退出"
     echo ""
 }
 
@@ -2364,9 +3029,12 @@ show_usage() {
     echo "用法:"
     echo "  ./install.sh                 打开数字菜单"
     echo "  ./install.sh install         打开数字菜单"
-    echo "  ./install.sh restart         重启当前 PM2/nohup Bot 进程 (原地重启，进程 ID 不变)"
+    echo "  ./install.sh status          打印保活方式、服务状态和组件清单"
+    echo "  ./install.sh start           按当前保活方式启动服务"
+    echo "  ./install.sh stop            按当前保活方式停止服务"
+    echo "  ./install.sh restart         重启服务 (PM2 为原地重启，进程 ID 不变)"
     echo "  ./install.sh rebuild         彻底重建 PM2 进程 (重新加载 PM2 启动参数，进程 ID 会 +1)"
-    echo "  ./install.sh switch-mode     在「Telegram + Web」与「仅 Web」部署模式间切换"
+    echo "  ./install.sh switch-mode     配置 / 移除 Telegram Bot（等价于组件清单里的第 3 项）"
     echo "  ./install.sh uninstall       卸载本脚本安装的运行内容"
     echo "  ./install.sh uninstall -y    跳过确认直接卸载"
     echo ""
@@ -2390,69 +3058,103 @@ parse_uninstall_options() {
     done
 }
 
-prepare_environment() {
+prepare_base_environment() {
     fix_line_endings
     migrate_legacy_installation
     ensure_python
     ensure_virtualenv
     activate_virtualenv
     install_requirements
-    ensure_env_file
-    validate_telegram_token
-    ensure_web_password
-    ensure_web_port
+    ensure_env_skeleton
     check_database
+}
+
+# 保证 .env 存在，并把部署模式状态和 .env 的实际内容对齐。不问任何问题。
+ensure_env_skeleton() {
+    info "[检查] 正在检查 .env..."
+    if [ ! -f ".env" ]; then
+        warn "   未找到 .env，正在创建新文件..."
+        : > .env
+        chmod 600 .env 2>/dev/null || true
+    fi
+    sync_deploy_mode_state
+    success ".env 已就绪（部署模式: $(deploy_mode_label)）"
+}
+
+# restart / rebuild / pm2-start-internal 用的准备流程：**绝不发问**。
+# 这几条路里有的是脱离终端跑的（restart_pm2_detached 起的后台 helper、
+# systemd 的 ExecStart），一旦弹出 read 提示就是无声挂起——没有人能回答它，
+# 而调用方只会看到"重启没生效"。要填的配置一律走 install_flow。
+prepare_environment() {
+    # 先做一次不需要 venv 的粗判。deployment_configured 要读数据库，得等 venv
+    # 就绪才能问；但"连 .env 和 venv 都没有"是全新机器的确凿信号，没必要先花
+    # 几分钟建 venv、装依赖，最后才告诉用户"你还没配置任何组件"。
+    if [ ! -f ".env" ] && [ ! -x "$VENV_PYTHON" ]; then
+        error "[错误] 还没安装过。"
+        error "       请先运行 ./install.sh，选择 1) 安装 / 部署 / 配置。"
+        exit 1
+    fi
+    prepare_base_environment
     install_xgent_command
+    require_deployment
+    validate_telegram_token
 }
 
 main() {
-    print_banner
+    local choice=""
 
+    print_banner
     show_menu
-    read -r -p "请输入选项 [1-11，默认 1]: " choice
+    read -r -p "请输入选项 [0-10，默认 1]: " choice
 
     case "$choice" in
         ""|1)
-            prepare_environment
-            start_foreground
+            install_flow
             ;;
         2)
             prepare_environment
-            start_background
+            start_service
             ;;
         3)
             prepare_environment
-            start_with_pm2
-            ;;
-        4)
-            prepare_environment
-            success "环境检查完成，未启动任何服务。"
-            ;;
-        5)
-            prepare_environment
             restart_app
             ;;
+        4)
+            stop_service
+            exit 0
+            ;;
+        5)
+            show_status
+            exit 0
+            ;;
         6)
-            configure_ip_mode
+            choose_runtime_mode
+            echo ""
+            local restart_now=""
+            read -r -p "现在按新的保活方式重新启动服务？[Y/n]: " restart_now
+            case "$restart_now" in
+                n|N) warn "已跳过。之后在主菜单选 2) 启动服务 即可。" ;;
+                *) prepare_environment; start_service ;;
+            esac
             exit 0
             ;;
         7)
-            uninstall_app --no-banner
+            configure_ip_mode
             exit 0
-            ;;
-        10)
-            prepare_environment
-            rebuild_pm2_app
             ;;
         8)
             manage_local_api
             exit 0
             ;;
-        11)
-            switch_deploy_mode
+        9)
+            prepare_environment
+            rebuild_pm2_app
+            ;;
+        10)
+            uninstall_app --no-banner
             exit 0
             ;;
-        9)
+        0|q|Q)
             warn "已退出。"
             exit 0
             ;;
@@ -2465,66 +3167,35 @@ main() {
     echo ""
     echo -e "${CYAN}========================================================${NC}"
     echo -e "${CYAN} XGent for Telegram 已准备就绪。${NC}"
-    echo -e "${CYAN} 已增强: 自动补环境、venv 自愈、PM2 自动安装${NC}"
+    echo -e "${CYAN} 保活方式: $(runtime_mode_label)${NC}"
     echo -e "${CYAN} 本地终端: 输入 ${GREEN}xgent${CYAN} 随时打开命令行客户端${NC}"
     echo -e "${CYAN}========================================================${NC}"
     print_web_only_access_hint
 }
 
-# 仅 Web 模式下，装完必须直接把访问地址打出来——用户明确要求的是“纯本地
-# 端口访问”，如果只在 ensure_web_port 那一步一闪而过提过端口号，装完後
-# 什么都不显示，等于让用户自己去翻代码猜端口。这里从数据库读一次实际生效的
-# 端口，跟 ensure_web_port/ensure_web_password 用的是同一份配置源。
+# 仅 Web 模式下，装完必须直接把访问地址打出来——用户明确要求的是"纯本地
+# 端口访问"，如果只在设端口那一步一闪而过提过端口号，装完后什么都不显示，
+# 等于让用户自己去翻代码猜端口。端口读的是 load_web_state 那份缓存，和
+# set_web_port / 组件清单用的是同一个配置源，不会各说各话。
 print_web_only_access_hint() {
     if [ "${DEPLOY_MODE:-telegram}" != "web-only" ]; then
         return
     fi
-
-    local port
-    set +e
-    port=$(run_bot_python python - <<'PY'
-import asyncio
-import os
-import sys
-
-sys.path.insert(0, os.path.abspath("."))
-os.environ.setdefault("AUTHORIZED_USER_ID", "1")
-
-import contextlib
-import io
-
-from xgent_app.bootstrap import load_sections
-
-ns = {"__file__": os.path.abspath("xgent_server.py")}
-# load_sections() 触发 core.py 顶层日志（"加载提示词: ..." 等），会直接写
-# 到 stdout——这段安装期一次性脚本靠 stdout 传回结果给 shell 的 $(...)，
-# 日志噪音混进去会让 shell 变量捕获到脏值（这条 bug 已经在人工测试里现形：
-# 端口检查捕获出一整段日志 + 数字粘在一起）。用 redirect_stdout 把加载期
-# 输出丢进黑洞，只留下面显式 print() 的那一行给 shell。
-with contextlib.redirect_stdout(io.StringIO()):
-    load_sections(ns)
-
-
-async def main():
-    await ns["UserDataManager"].init()
-    port = ns["normalize_web_port"](
-        ns["UserDataManager"].get("web_port", ns["DEFAULT_WEB_PORT"])
-    )
-    print(port)
-    await (await ns["BotMemoryDB"].get_instance()).close()
-
-
-asyncio.run(main())
-PY
-)
-    local exit_code=$?
-    set -euo pipefail
-    [ "$exit_code" -eq 0 ] || return 0
+    load_web_state || return 0
+    [ "$WEB_HAS_PASSWORD" = "yes" ] || return 0
 
     echo ""
-    echo -e "${GREEN}访问地址：http://127.0.0.1:${port}${NC}"
+    echo -e "${GREEN}访问地址：http://127.0.0.1:${WEB_PORT}${NC}"
     echo "（只监听 127.0.0.1，同机浏览器直接打开；远程访问需要自己配置端口转发或反向代理。）"
 }
+
+# 被 source 且设了 XGENT_INSTALL_SH_LIB=1 时只提供函数、不跑菜单。
+# 这样测试可以单独调用 is_number / component_state_bot / discover_python 这些
+# 判定逻辑——它们的 bug（比如"venv 里的 python3 抢了系统 python3"）只有真的
+# 跑一遍才看得出来，靠读脚本正则是抓不到的。
+if [ "${XGENT_INSTALL_SH_LIB:-}" = "1" ]; then
+    return 0
+fi
 
 case "${1:-}" in
     install|--install)
@@ -2533,6 +3204,24 @@ case "${1:-}" in
     pm2-start-internal)
         prepare_environment
         start_with_pm2
+        ;;
+    service-exec)
+        # systemd 的 ExecStart 进入点。刻意不做环境检查、不发问、不打横幅：
+        # 这里是服务进程本身，任何一次 read 提示都会变成"服务起不来但也不
+        # 报错"。环境准备是安装时的事，跑服务时只管跑。
+        exec_app_process
+        ;;
+    status|--status)
+        print_banner
+        show_status
+        ;;
+    start|--start)
+        print_banner
+        prepare_environment
+        start_service
+        ;;
+    stop|--stop)
+        stop_service
         ;;
     restart|--restart)
         print_banner

@@ -34,6 +34,7 @@ from xgent_app.cli_render import (
     MessageRenderer,
     TerminalScreen,
     buttons_from_markup,
+    split_control_buttons,
 )
 # 从磁盘路径参数里挖本地路径的逻辑与 Web 端完全一样（同样要处理"传字符串
 # 路径"和"传打开的文件对象"两种调用形式），直接复用 web_bridge 里那一份，
@@ -83,6 +84,13 @@ _active_menu_message_id: Optional[int] = None
 
 def _register_menu(message_id: Optional[int], buttons: Sequence[Tuple[str, str]],
                    is_edit: bool = False) -> None:
+    """登记可点按钮。
+
+    登记的必须是 cli_render.split_control_buttons() 摘掉控制按钮之后的那一份
+    ——屏幕上不显示编号的按钮如果还留在这张表里，编号就会和显示错开一格，
+    而且"停止回答"会以一颗隐形按钮的身份赖在当前菜单上：这一轮结束后用户
+    敲个裸数字本来是想点别的，结果打到了 act_stop_generation。
+    """
     global _active_menu_message_id
     with _MENU_LOCK:
         if buttons:
@@ -224,7 +232,7 @@ class CliBot:
         buttons = buttons_from_markup(reply_markup)
         lines = self._renderer().render_message(str(text), buttons, parse_mode)
         self.screen.print_block(lines, message_id=message_id)
-        _register_menu(message_id, buttons, is_edit=False)
+        _register_menu(message_id, split_control_buttons(buttons)[0], is_edit=False)
         return CliMessage(self, message_id, chat_id, str(text))
 
     async def edit_message_text(self, text: str, chat_id: Optional[int] = None,
@@ -241,7 +249,7 @@ class CliBot:
         lines = self._renderer().render_message(str(text), buttons, parse_mode)
         if not self.screen.update_block(lines, target_id):
             self.screen.print_block(lines, message_id=target_id)
-        _register_menu(target_id, buttons, is_edit=True)
+        _register_menu(target_id, split_control_buttons(buttons)[0], is_edit=True)
         return CliMessage(self, target_id, int(chat_id or self.chat_id), str(text))
 
     async def edit_message_reply_markup(self, chat_id: Optional[int] = None,
@@ -250,10 +258,14 @@ class CliBot:
         """只换按钮。终端没法单独重画消息尾部，所以把新按钮作为独立一块打印。"""
         target_id = int(message_id or 0)
         buttons = buttons_from_markup(reply_markup)
-        _register_menu(target_id, buttons, is_edit=True)
+        menu_buttons, hints = split_control_buttons(buttons)
+        _register_menu(target_id, menu_buttons, is_edit=True)
         if not buttons:
             return True
-        lines = self._renderer().render_buttons(buttons)
+        renderer = self._renderer()
+        lines = renderer.render_buttons(menu_buttons) + renderer.render_hints(hints)
+        if not lines:
+            return True
         self.screen.print_block(lines, message_id=None)
         return True
 

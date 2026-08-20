@@ -27,6 +27,7 @@ from xgent_app.cli_render import (
     TerminalScreen,
     display_width,
     html_to_ansi,
+    split_control_buttons,
     wrap_line,
 )
 
@@ -297,6 +298,97 @@ class CliObjectContractTests(unittest.TestCase):
         # 掉了的话 CLI 会去打 Telegram 的 HTTP 接口。
         _update, _context, bot = cli_bridge.build_cli_conversation_objects(1, self.screen)
         self.assertTrue(getattr(bot, "_is_xgent_web_bot", False))
+
+
+class ControlButtonTests(unittest.TestCase):
+    """"停止回答"这类终端里点不了的按钮，不能当成编号菜单项渲染。
+
+    Telegram 上它是一颗随时可点的按钮；终端上一轮对话跑起来之后输入循环就在
+    await，用户敲不进任何编号。照直渲染成 " 1 ❌ 停止回答" 既是假承诺，
+    又会让"正在运行"的状态行下面顶着一个通用的失败记号。
+    """
+
+    def setUp(self):
+        cli_bridge.reset_menu_state()
+        self.stream = io.StringIO()
+        self.screen = TerminalScreen(stream=self.stream, color=False, width=80)
+
+    def tearDown(self):
+        cli_bridge.reset_menu_state()
+
+    def test_stop_button_is_split_out_of_the_menu(self):
+        menu, hints = split_control_buttons([("❌ 停止回答", "act_stop_generation")])
+        self.assertEqual([], menu)
+        self.assertEqual(1, len(hints))
+        self.assertIn("C", hints[0][0])  # ⌃C
+
+    def test_ordinary_buttons_are_left_alone(self):
+        buttons = [("提供商", "menu_providers"), ("模型", "menu_models")]
+        menu, hints = split_control_buttons(buttons)
+        self.assertEqual(buttons, menu)
+        self.assertEqual([], hints)
+
+    def test_rendered_message_shows_keybinding_not_a_numbered_cross(self):
+        renderer = MessageRenderer(Palette(False), 80)
+        lines = renderer.render_message(
+            "Agent 第 1 轮 · 1 个操作进行中",
+            [("❌ 停止回答", "act_stop_generation")],
+        )
+        body = "\n".join(lines)
+        self.assertIn("Agent 第 1 轮", body)
+        self.assertIn("中断回答", body)
+        self.assertNotIn("❌", body)
+        self.assertNotIn("停止回答", body)
+        # 标题 + 正文 + 键位提示，正好三行：没有多出来的空行 + 编号菜单块。
+        self.assertEqual(3, len(lines), lines)
+
+    def test_mixed_buttons_keep_contiguous_numbering(self):
+        renderer = MessageRenderer(Palette(False), 80)
+        lines = renderer.render_message(
+            "正文",
+            [("提供商", "menu_providers"), ("❌ 停止回答", "act_stop_generation"),
+             ("模型", "menu_models")],
+        )
+        body = "\n".join(lines)
+        self.assertIn(" 1 提供商", body)
+        self.assertIn(" 2 模型", body)
+        self.assertNotIn(" 3 ", body)
+
+    def test_stop_button_never_becomes_the_active_menu(self):
+        # 登记了就意味着这一轮结束后用户随手敲个裸数字会打到 act_stop_generation。
+        bot = cli_bridge.CliBot(1, self.screen)
+        run(bot.send_message(
+            chat_id=1, text="Agent 第 1 轮",
+            reply_markup=FakeMarkup([[("❌ 停止回答", "act_stop_generation")]]),
+        ))
+        self.assertEqual([], cli_bridge.get_last_menu_options())
+        self.assertEqual([], cli_bridge.get_last_menu_labels())
+
+    def test_registered_options_line_up_with_displayed_numbers(self):
+        bot = cli_bridge.CliBot(1, self.screen)
+        run(bot.send_message(
+            chat_id=1, text="正文",
+            reply_markup=FakeMarkup([
+                [("提供商", "menu_providers")],
+                [("❌ 停止回答", "act_stop_generation")],
+                [("模型", "menu_models")],
+            ]),
+        ))
+        # 屏幕上显示 1=提供商 2=模型，注册表必须一一对应，不能错开一格。
+        self.assertEqual(
+            ["menu_providers", "menu_models"], cli_bridge.get_last_menu_options()
+        )
+        self.assertEqual(["提供商", "模型"], cli_bridge.get_last_menu_labels())
+
+    def test_reply_markup_edit_also_hides_the_stop_button(self):
+        bot = cli_bridge.CliBot(1, self.screen)
+        run(bot.edit_message_reply_markup(
+            chat_id=1, message_id=7,
+            reply_markup=FakeMarkup([[("❌ 停止回答", "act_stop_generation")]]),
+        ))
+        self.assertEqual([], cli_bridge.get_last_menu_options())
+        self.assertNotIn("❌", self.stream.getvalue())
+        self.assertIn("中断回答", self.stream.getvalue())
 
 
 if __name__ == "__main__":

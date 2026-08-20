@@ -102,11 +102,14 @@ flowchart LR
 
 ## 快速部署
 
-XGent 支持三种运行形态，`install.sh` 会在配置 `.env` 前询问你选哪种（也可以事后修改 `.env` 切换）：
+XGent 由三个可以自由组合的组件构成，`install.sh` 装完环境后会让你在清单里勾选（可多选，也可以事后随时加装或移除）：
 
-- **Telegram + Web**（默认）：连接 Telegram，Web 按开关叠加，两端共享同一份记忆并可互相镜像消息。
-- **仅 Web**：不需要 Telegram Bot Token，纯本地端口访问（详见下方[纯 Web 模式](#纯-web-模式)）。
-- **仅 Telegram**：Web 开关保持关闭即可，行为与现状完全一致。
+- **cli**：本地终端客户端，装完敲 `xgent` 就能用（详见下方[本地终端客户端](#本地终端客户端xgent)）。
+- **web**：浏览器网页访问，需要设访问密码和端口（详见下方[纯 Web 模式](#纯-web-模式)）。
+- **bot**：Telegram Bot，需要 Bot Token 和你的 Telegram 用户 ID。
+
+三者共用同一份数据库与模型配置，装哪几个都行：只装 `bot` 就是"仅 Telegram"，只装 `web` 就是"仅 Web"，
+`web` + `bot` 则两端共享记忆并可互相镜像消息。
 
 ### 准备
 
@@ -132,12 +135,24 @@ XGent 支持三种运行形态，`install.sh` 会在配置 `.env` 前询问你�
 cd /opt && sudo git clone https://github.com/HANLINGVABCN/xgent-telegram.git && sudo chown -R "$USER":"$USER" xgent-telegram && cd xgent-telegram && chmod +x install.sh && ./install.sh
 ```
 
-安装脚本会完成环境检查、虚拟环境创建、依赖安装、`.env` 创建与 Telegram Token 校验，然后让你选择启动方式：
+安装脚本会先让你选**保活方式**（系统级 systemd / PM2 / nohup / 前台，只在首次安装时问一次），
+接着完成环境检查、虚拟环境创建与依赖安装，然后给出**组件清单**：
 
-- 前台运行
-- 后台运行
-- PM2 守护运行
-- 仅检查环境
+```
+部署组件:
+  ❌ 1 cli （未安装）  终端命令 xgent 尚未注册
+  ❌ 2 web （未安装）  尚未设置访问密码，Web 服务不会启动
+  ❌ 3 bot （未安装）  未配置 Bot Token，当前是仅 Web 模式
+
+请输入要部署或配置的选项（可多选，空格隔开，例如: 1 2 3）
+```
+
+- ✅ 已安装 / ❌ 未安装 / 🟡 状态异常（配置齐了但跑不起来，后面会写明原因）
+- 可以多选，按 `1 → 2 → 3` 的顺序依次安装，过程中按需询问 Web 密码、端口、Bot Token 和用户 ID
+- 已安装的组件再选一次，进入的是**配置界面**（改密码/端口、换 Token、换授权 ID、移除组件）
+- 三个组件互相独立：只装 `cli` 就能在终端里用，不需要 Web 密码，也不需要 Telegram
+
+装完随时可以用 `./install.sh status` 查看这块清单和服务状态。
 
 ### 分步安装
 
@@ -331,8 +346,26 @@ Telegram 的内嵌网页按钮只接受 HTTPS 地址，因此：
 
 - **保留的功能**：对话、Agent 模式与全部协议执行（命令、文件读写、发文件、媒体生成）、流式/非流式回复、记忆（SQLite）、思考深度、Skill 开关、模型/提供商切换（提供商增删改仍需先在 `.env`/数据库里配置好，或通过 `/provider_config` 风格的导入——纯 Web 模式下暂无独立的提供商管理页面，需要先用 Telegram + Web 模式配置一次提供商，之后切回纯 Web 模式即可继续使用同一份数据库）、报错提示与系统提示、Web 设置面板里的全部选项。
 - **已知限制**：暂不支持后台定时/长驻触发任务（trigger 协议、cron 调度）——其调度器目前依赖 python-telegram-bot 的 `JobQueue`（底层是 APScheduler），纯 Web 模式下没有这个对象。此限制后续可能通过独立的 `AsyncIOScheduler` 解决。
-- **启动**：`install.sh` 选择"仅 Web"模式后，只需填 `AUTHORIZED_USER_ID`（任意数字身份标识）和 Web 访问密码即可；也可以手动在 `.env` 里只保留 `AUTHORIZED_USER_ID` 一项、不填 `BOT_TOKEN`，直接运行 `python xgent_server.py`。
+- **启动**：`install.sh` 的组件清单里只选 `2 web` 即可，会依次问你 Web 访问密码和端口；也可以手动在 `.env` 里只保留 `AUTHORIZED_USER_ID` 一项、不填 `BOT_TOKEN`，直接运行 `python xgent_server.py`。
 - **关闭**：Ctrl+C（或对进程发 SIGTERM）会走正常清理流程（数据库关闭、trace 落盘、Agent shell 会话清理），Windows 因不支持 `add_signal_handler` 会退化为 `KeyboardInterrupt`，Ctrl+C 依然有效。
+
+## 本地终端客户端（xgent）
+
+装好 `cli` 组件后，在任意目录敲 `xgent` 就能打开终端界面，和 Telegram / Web 共用同一套对话核心与数据库。
+
+| 输入 | 含义 |
+| --- | --- |
+| 直接输入文字 | 与 AI 对话 |
+| `/` | 立刻列出全部命令；继续打字 + Tab 可筛选补全 |
+| `/` 回车 | 打出带编号的命令面板，再输编号即可执行 |
+| 数字 | 选择当前菜单项（等价于点 inline keyboard 按钮） |
+| `:数字` | 强制当作点按钮——正在往状态机里输入内容时用它 |
+| Ctrl+C | 回答进行中＝中断本轮；空闲时＝退出 |
+| Ctrl+D / `exit` / `quit` | 退出 |
+
+`/` 的自动提示依赖 GNU readline。终端用的是 libedit（macOS 自带 Python）或
+根本没有 readline（Windows）时，自动弹出会静默降级，`/` 回车打面板这条路依然可用；
+不想要自动弹出可以设 `XGENT_CLI_NO_SLASH_HINT=1`。
 
 ## 安全说明
 
@@ -349,9 +382,25 @@ Agent 模式拥有真实服务器权限。建议至少执行以下措施：
 
 项目当前不是强隔离执行环境。如果你的威胁模型包含恶意用户、不可信模型或高价值服务器，请在容器、虚拟机或专用主机中进一步隔离。
 
+## 保活方式
+
+首次安装时选一次，之后在主菜单第 6 项随时改：
+
+| 方式 | 开机自启 | 崩溃拉起 | 看日志 |
+| --- | --- | --- | --- |
+| 系统级保活 (systemd) | ✅ | ✅ | `journalctl -u xgent -f` |
+| PM2 保活 | ✅ | ✅ | `pm2 logs xgent-telegram` |
+| 后台运行 (nohup) | ❌ | ❌ | `tail -f xgent_output.log` |
+| 前台运行 | ❌ | ❌ | 直接看终端（调试用） |
+
+systemd 的 unit 写在 `/etc/systemd/system/xgent.service`，`ExecStart` 只是
+`bash install.sh service-exec` —— IP 出站模式、`PYTHONPATH`、入口文件都由脚本
+自己决定，所以改完 IP 模式不用重写 unit。卸载时按这个固定名字删除，不碰你手工
+建的同类服务。
+
 ## PM2 重启后列表为空
 
-安装脚本在选择 PM2 守护运行时，会执行 `pm2 startup` 和 `pm2 save`，保存进程列表并配置开机恢复。如果服务器重启后 `pm2 list` 为空，请检查：
+安装脚本在选择 PM2 保活时，会执行 `pm2 startup` 和 `pm2 save`，保存进程列表并配置开机恢复。如果服务器重启后 `pm2 list` 为空，请检查：
 
 - 当前命令是否由安装时的同一 Linux 用户执行；`pm2 list` 与 `sudo pm2 list` 属于不同进程表。
 - 手动保存：`pm2 save`。

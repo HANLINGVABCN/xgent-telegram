@@ -18,14 +18,15 @@ keyboard、没有"编辑历史消息"能力的纯文本终端。
   - 直接输入文字：走 process_conversation，等价于 Telegram/Web 里发一条
     普通消息。
   - 输入 /命令（如 /providers）：路由到对应的 cmd_* 处理函数，与 Telegram
-    端共用同一批 handler。输入 /help 看完整命令列表。
+    端共用同一批 handler。敲下 `/` 就会列出全部命令，Tab 补全/继续筛选；
+    只敲 `/` 回车会打出带编号的命令面板，接着输编号即可执行。
   - 菜单以编号显示，输入编号即可触发，等价于点击 inline keyboard 按钮。
   - 正在往状态机里输入内容时（添加记忆、批量加黑名单、自定义超时秒数等），
     裸编号会让给状态机当正文；这时用 :1 这样的写法强制点按钮。这条歧义是
     CLI 特有的：Telegram/Web 的"点击"和"打字"是两个独立通道，终端只有一个
     输入通道，必须有一种显式写法把二者分开。
-  - AI 正在回答时按 Ctrl+C：等价于点"❌ 停止回答"按钮（终端里没法在一轮
-    对话进行中再输入编号，Ctrl+C 才是终端原生的中断语义）。
+  - AI 正在回答时按 Ctrl+C：等价于点 Telegram 上那颗"停止回答"按钮（终端里
+    没法在一轮对话进行中再输入编号，Ctrl+C 才是终端原生的中断语义）。
   - 输入 exit / quit 退出，或在空闲时按 Ctrl+C / Ctrl+D。
 """
 
@@ -34,13 +35,15 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
-import functools
 import io
 import logging
 import os
+import queue
 import signal
 import sys
+import threading
 from pathlib import Path
+from typing import Any, List, Optional, Sequence
 
 from xgent_app.bootstrap import (
     load_sections as _load_sections,
@@ -126,30 +129,36 @@ def _quiet_console_logging() -> None:
             root.removeHandler(handler)
 
 
-def _setup_readline() -> None:
-    """开启行编辑与历史记录。
+# --------------------------------------------------------------------------
+# 终端状态兜底
+# --------------------------------------------------------------------------
+# 读输入的守护线程在退出那一刻可能还阻塞在 readline 里，而 readline 进
+# readline() 时会改 termios（关回显、进 cbreak）。正常返回时它自己会还原，
+# 被进程退出打断则不会——留给用户一个不回显的 shell。这里在启动时抄一份
+# 原始 termios，退出前无条件写回去，代价是两次系统调用。
+_ORIGINAL_TERMIOS: Optional[tuple] = None
 
-    没有 readline 时（Windows 上标准库不带）静默跳过：input() 自身仍然可用，
-    只是没有上下方向键翻历史。为此装不上第三方依赖不值得。
-    """
+
+def _remember_terminal_state() -> None:
+    global _ORIGINAL_TERMIOS
     try:
-        import readline  # noqa: F401  (导入即生效)
+        import termios
+
+        fd = sys.stdin.fileno()
+        _ORIGINAL_TERMIOS = (fd, termios.tcgetattr(fd))
     except Exception:
+        # 非 POSIX、非 tty（管道/重定向）都会落到这里，本来就没有要还原的东西。
+        _ORIGINAL_TERMIOS = None
+
+
+def _restore_terminal_state() -> None:
+    if not _ORIGINAL_TERMIOS:
         return
     try:
-        if HISTORY_FILE.exists():
-            readline.read_history_file(str(HISTORY_FILE))
-        readline.set_history_length(1000)
-        atexit.register(_save_history)
-    except Exception:
-        logger.debug("CLI 历史记录初始化失败", exc_info=True)
+        import termios
 
-
-def _save_history() -> None:
-    try:
-        import readline
-
-        readline.write_history_file(str(HISTORY_FILE))
+        fd, attributes = _ORIGINAL_TERMIOS
+        termios.tcsetattr(fd, termios.TCSADRAIN, attributes)
     except Exception:
         pass
 
@@ -179,10 +188,34 @@ def _command_map() -> dict:
     return dict(_ns.get("_WEB_COMMAND_MAP") or {})
 
 
+def _command_names() -> List[str]:
+    return sorted(_command_map())
+
+
 def _resolve_command(name: str):
     table = _command_map()
     key = _CHINESE_ALIASES.get(name, name)
     return table.get(key)
+
+
+def _describe_command(name: str) -> str:
+    """命令的一句话说明。
+
+    说明文字来自 lifecycle.py 的 TELEGRAM_COMMAND_DESCRIPTIONS——Telegram
+    的 /命令 菜单用的就是它，CLI 读同一张表，不在这里抄第二份。
+    """
+    describe = _ns.get("command_description")
+    if not callable(describe):
+        return ""
+    try:
+        return describe(_CHINESE_ALIASES.get(name, name)) or ""
+    except Exception:
+        return ""
+
+
+def _matching_commands(prefix: str) -> List[str]:
+    prefix = prefix.lower()
+    return [name for name in _command_names() if name.startswith(prefix)]
 
 
 # --------------------------------------------------------------------------
@@ -202,9 +235,9 @@ def _banner() -> None:
     SCREEN.print_plain(pal.paint("─" * width, pal.muted))
     hints = [
         ("直接输入文字", "与 AI 对话"),
-        ("/help", "查看全部命令"),
+        ("/", "列出全部命令，Tab 继续补全"),
         ("数字", "选择菜单项，输入内容时用 :数字"),
-        ("Ctrl+C", "回答中断，空闲时退出"),
+        ("Ctrl+C", "回答时中断，空闲时退出"),
     ]
     label_width = max(display_width(label) for label, _ in hints)
     for label, desc in hints:
@@ -215,21 +248,31 @@ def _banner() -> None:
     SCREEN.print_plain("")
 
 
+def _command_rows(names: Sequence[str], numbered: bool = False) -> List[str]:
+    """命令清单 -> 终端行。/help、`/` 面板、Tab 补全列表共用这一份排版。"""
+    pal = PALETTE
+    if not names:
+        return []
+    label_width = max(display_width(f"/{name}") for name in names)
+    rows: List[str] = []
+    for index, name in enumerate(names, start=1):
+        label = f"/{name}"
+        pad = " " * (label_width - display_width(label))
+        prefix = f"{pal.paint(f'{index:>2}', pal.accent, pal.bold)} " if numbered else "   "
+        row = f"  {prefix}{pal.paint(label, pal.ai)}{pad}"
+        description = _describe_command(name)
+        if description:
+            row += f"  {pal.paint(description, pal.muted)}"
+        rows.append(row)
+    return rows
+
+
 def _print_help() -> None:
     pal = PALETTE
-    table = _command_map()
     SCREEN.print_plain("")
     SCREEN.print_plain(pal.paint("可用命令", pal.bold, pal.ai))
-    names = sorted(table)
-    width = max((display_width(n) for n in names), default=0) + 2
-    columns = max(1, min(3, SCREEN.width // (width + 4)))
-    for index in range(0, len(names), columns):
-        row = names[index:index + columns]
-        cells = []
-        for name in row:
-            cell = f"/{name}"
-            cells.append(cell + " " * max(0, width + 2 - display_width(cell)))
-        SCREEN.print_plain("  " + "".join(cells).rstrip())
+    for row in _command_rows(_command_names()):
+        SCREEN.print_plain(row)
     SCREEN.print_plain("")
     SCREEN.print_plain(pal.paint("  /黑名单 是 /blacklist 的中文别名（与 Telegram 端一致）", pal.muted))
     SCREEN.print_plain(pal.paint("  exit / quit 退出", pal.muted))
@@ -244,6 +287,184 @@ def _show_current_menu() -> None:
     renderer = SCREEN.renderer()
     lines = renderer.render_buttons([(label, "") for label in labels])
     SCREEN.print_block(lines, message_id=None)
+
+
+# --------------------------------------------------------------------------
+# 命令面板（`/` 回车）
+# --------------------------------------------------------------------------
+# 一次性状态：面板刚打出来的**下一行**输入，裸编号解释成"选第 N 条命令"。
+# 只活一轮，所以不会和按钮菜单的编号长期打架——用户刚看完命令面板就敲数字，
+# 意图是唯一的。
+_palette: List[str] = []
+
+
+def _show_command_palette(names: Sequence[str], title: str = "可用命令") -> None:
+    global _palette
+    _palette = list(names)
+    pal = PALETTE
+    SCREEN.print_plain("")
+    SCREEN.print_plain(pal.paint(title, pal.bold, pal.ai))
+    for row in _command_rows(_palette, numbered=True):
+        SCREEN.print_plain(row)
+    SCREEN.print_plain(pal.paint("  输入编号执行，或继续输入 /命令；Tab 可补全。", pal.muted))
+    SCREEN.print_plain("")
+
+
+def _take_palette() -> List[str]:
+    """取走并清空一次性面板状态。"""
+    global _palette
+    names, _palette = _palette, []
+    return names
+
+
+# --------------------------------------------------------------------------
+# readline：行编辑、历史、`/` 命令补全
+# --------------------------------------------------------------------------
+_readline: Any = None
+_completion_matches: List[str] = []
+
+
+def _setup_readline() -> None:
+    """开启行编辑、历史记录与 `/` 命令补全。
+
+    没有 readline 时（Windows 上标准库不带）静默跳过：input() 自身仍然可用，
+    只是没有方向键翻历史和 Tab 补全，`/` 回车打面板的那条路依然通。
+    """
+    global _readline
+    try:
+        import readline
+    except Exception:
+        return
+    _readline = readline
+
+    try:
+        if HISTORY_FILE.exists():
+            readline.read_history_file(str(HISTORY_FILE))
+        readline.set_history_length(1000)
+        atexit.register(_save_history)
+    except Exception:
+        logger.debug("CLI 历史记录初始化失败", exc_info=True)
+
+    _setup_completion(readline)
+
+
+def _is_libedit(readline_module: Any) -> bool:
+    """macOS 自带的是 libedit 伪装成 readline，键位绑定语法完全不同。"""
+    return "libedit" in (getattr(readline_module, "__doc__", "") or "")
+
+
+def _setup_completion(readline_module: Any) -> None:
+    libedit = _is_libedit(readline_module)
+    try:
+        readline_module.set_completer(_command_completer)
+        # 只按空白切词，`/` 留在词里：默认分隔符含 `/`，会把 "/providers"
+        # 切成空前缀，补全出来的是全部命令而不是按 /pro 过滤后的那几条。
+        readline_module.set_completer_delims(" \t\n")
+    except Exception:
+        logger.debug("CLI 补全初始化失败", exc_info=True)
+        return
+
+    try:
+        readline_module.set_completion_display_matches_hook(_display_command_matches)
+    except Exception:
+        # 老版本 / libedit 没有这个钩子，退化成 readline 自带的分栏列表。
+        logger.debug("CLI 补全列表钩子不可用", exc_info=True)
+
+    def bind(*lines: str) -> None:
+        for line in lines:
+            try:
+                readline_module.parse_and_bind(line)
+            except Exception:
+                logger.debug("readline 绑定失败: %s", line, exc_info=True)
+
+    if libedit:
+        bind("bind ^I rl_complete")
+        return
+
+    bind(
+        "tab: complete",
+        # 一次 Tab 直接列出候选，而不是先响一声再等第二次 Tab。
+        "set show-all-if-ambiguous on",
+        # 默认超过 100 条会先问一句 "Display all N possibilities?"，
+        # 命令面板要的是直接出列表。
+        "set completion-query-items 500",
+        # 补全无候选时不要响铃：句子中间打 `/` 是正常输入，不该被"嘟"一声。
+        "set bell-style none",
+    )
+
+    if os.environ.get("XGENT_CLI_NO_SLASH_HINT"):
+        return
+    # 敲下 `/` 就自动列出命令，不用再按 Tab——用户要的是 codex / claude code
+    # 那种"打出斜杠就弹提示"的手感。readline 没有"插入自己再补全"的内置函数，
+    # 只能绑一个宏：\C-q(quoted-insert) 把随后的 `/` 原样插入（关键：走
+    # quoted-insert 才不会让 `/` 再次触发本绑定而无限递归），\C-i 就是 Tab。
+    # 用 $if mode=emacs 圈起来：vi 模式下 `/` 是搜索，抢掉会毁掉 vi 用户的肌肉记忆。
+    bind("$if mode=emacs", r'"/": "\C-q/\C-i"', "$endif")
+
+
+def _command_completer(text: str, state: int) -> Optional[str]:
+    """Tab 补全：只在行首那个词上补 /命令。
+
+    句子中间的路径（"看看 /home/hanling"）不该弹出命令列表，所以用
+    get_begidx() 卡住"补全词必须从第 0 列开始"。
+    """
+    global _completion_matches
+    try:
+        if state == 0:
+            _completion_matches = []
+            if not text.startswith("/"):
+                return None
+            try:
+                if _readline is not None and _readline.get_begidx() != 0:
+                    return None
+            except Exception:
+                pass
+            prefix = text[1:].lower()
+            _completion_matches = [
+                f"/{name}" for name in _command_names() if name.startswith(prefix)
+            ]
+        return _completion_matches[state]
+    except IndexError:
+        return None
+    except Exception:
+        logger.debug("CLI 补全失败", exc_info=True)
+        return None
+
+
+def _display_command_matches(substitution: str, matches: Sequence[str],
+                             longest_match_length: int) -> None:
+    """替换 readline 自带的分栏候选列表，改成带说明的命令清单。
+
+    这个钩子在读输入的那个线程里被 readline 回调，主线程此刻正 await 着，
+    stdout 没有第二个写入方，直接写即可。写完必须让 readline 重画提示符和
+    当前行——rl_forced_update_display()，也就是 readline 自己列完候选后做的
+    同一件事。
+    """
+    try:
+        names = [str(item).lstrip("/") for item in matches]
+        names = [name for name in names if name]
+        rows = _command_rows(names)
+        if not rows:
+            return
+        sys.stdout.write("\n" + "\n".join(rows) + "\n")
+        sys.stdout.flush()
+        SCREEN.invalidate()
+        try:
+            _readline.redisplay()
+            sys.stdout.flush()
+        except Exception:
+            logger.debug("readline 重画失败", exc_info=True)
+    except Exception:
+        logger.debug("CLI 补全列表渲染失败", exc_info=True)
+
+
+def _save_history() -> None:
+    try:
+        import readline
+
+        readline.write_history_file(str(HISTORY_FILE))
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -314,6 +535,115 @@ async def _run_callback(callback_data: str) -> None:
 
 
 # --------------------------------------------------------------------------
+# 读输入：守护线程 + 事件循环
+# --------------------------------------------------------------------------
+# 哨兵对象，区分三种"没读到正文"的情况。用独立对象而不是空串：空串是
+# **用户直接按回车**的合法输入，早先和 EOF 混为一谈，于是在提示符上按一下
+# 回车就会静默退出 CLI。
+_EOF = object()     # Ctrl+D / stdin 关闭
+_EXIT = object()    # 空闲时按了 Ctrl+C
+
+
+class _StdinReader:
+    """在守护线程里做阻塞式 input()，把结果交回事件循环。
+
+    为什么不用 loop.run_in_executor(None, input)：默认执行器的工作线程是
+    **非守护**线程。用户在提示符上按 Ctrl+C 时它还阻塞在 input() 里，而且
+    永远不会返回，于是收尾路上连着两道都要等它——
+      1. asyncio.run() 的 loop.shutdown_default_executor()；
+      2. 解释器退出时 threading._shutdown() 里的 _python_exit() → t.join()。
+    表现就是用户报的那个 bug：打印了"再见"却退不出去，再按一次 Ctrl+C 才
+    退，还甩出一段 concurrent.futures/threading 的 traceback。守护线程不
+    参与这两道等待，进程说走就走。
+    """
+
+    def __init__(self) -> None:
+        self._requests: "queue.Queue[str]" = queue.Queue()
+        self._lock = threading.Lock()
+        self._pending: Optional[tuple] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def _ensure_thread(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._serve, name="xgent-cli-stdin", daemon=True,
+        )
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while True:
+            prompt = self._requests.get()
+            try:
+                value: Any = input(prompt)
+            except EOFError:
+                value = _EOF
+            except KeyboardInterrupt:
+                # 信号处理器在主线程，这里理论上收不到；真收到就当空行，
+                # 让主循环重新打提示符而不是把 CLI 带走。
+                value = ""
+            except Exception:
+                logger.debug("CLI 读取输入失败", exc_info=True)
+                value = _EOF
+            self._resolve(value)
+
+    def _resolve(self, value: Any) -> None:
+        """把结果投递回事件循环。先摘 pending，保证只兑现一次。"""
+        with self._lock:
+            pending, self._pending = self._pending, None
+        if pending is None:
+            return
+        future, loop = pending
+
+        def _apply() -> None:
+            if not future.done():
+                future.set_result(value)
+
+        try:
+            loop.call_soon_threadsafe(_apply)
+        except RuntimeError:
+            # 循环已经关了，没人再等这个结果。
+            pass
+
+    async def read(self, prompt: str) -> Any:
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        with self._lock:
+            self._pending = (future, loop)
+        self._ensure_thread()
+        self._requests.put(prompt)
+        return await future
+
+    def request_exit(self) -> bool:
+        """空闲时的 Ctrl+C：把正等着的那次读取兑现成"退出"。
+
+        返回 False 表示当前没有人在等输入（比如刚好在两次读取之间），
+        调用方该退回到抛 KeyboardInterrupt 的老路。
+        """
+        with self._lock:
+            has_pending = self._pending is not None
+        if not has_pending:
+            return False
+        self._resolve(_EXIT)
+        return True
+
+
+_READER = _StdinReader()
+
+
+def _prompt_text() -> str:
+    """提示符。
+
+    ANSI 序列必须用 \\001..\\002 包起来：readline 靠提示符的显示宽度算光标
+    位置，把颜色转义的字节数也算进去的话，方向键翻历史时行内容会画错位。
+    """
+    pal = PALETTE
+    if not pal.enabled:
+        return "❯ "
+    return f"\001{pal.ai}{pal.bold}\002❯\001{pal.reset}\002 "
+
+
+# --------------------------------------------------------------------------
 # 停止（Ctrl+C）
 # --------------------------------------------------------------------------
 
@@ -340,8 +670,15 @@ def _request_stop() -> bool:
 
 def _install_sigint_handler() -> None:
     def handler(_signum, _frame):
-        if _turn_active and _request_stop():
-            SCREEN.notice("已请求停止，正在收尾…", "warn")
+        if _turn_active:
+            if _request_stop():
+                SCREEN.notice("已请求停止，正在收尾…（再按一次 Ctrl+C 强制退出）", "warn")
+                return
+            raise KeyboardInterrupt
+        # 空闲时：兑现正在等待的那次读取，让主循环走正常的收尾路径。
+        # 直接抛 KeyboardInterrupt 会打断事件循环本身，收尾要靠 asyncio.run()
+        # 的异常路径，那条路上还得等一堆线程——正是这个 bug 的来源。
+        if _READER.request_exit():
             return
         raise KeyboardInterrupt
 
@@ -388,52 +725,40 @@ async def _shutdown_runtime() -> None:
         logger.exception("CLI 关闭数据库失败")
 
 
-def _read_input(prompt: str) -> str:
-    try:
-        return input(prompt)
-    except EOFError:
-        return ""
-
-
-async def _read_line_async(prompt: str) -> str:
-    """在不阻塞事件循环的前提下读一行输入。
-
-    prompt 交给 input() 自己打印，而不是先 print 再空 input()——readline
-    需要知道提示符宽度才能正确重绘行内容，否则按方向键翻历史会把提示符
-    一起吃掉。
-    """
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, functools.partial(_read_input, prompt))
-
-
-def _prompt_text() -> str:
-    pal = PALETTE
-    return f"\n{pal.paint('❯', pal.ai, pal.bold)} "
-
-
 async def _main_loop() -> None:
     _banner()
 
     while True:
         SCREEN.invalidate()  # 提示符一打出来，屏幕最后一块就不再是消息块
-        try:
-            line = await _read_line_async(_prompt_text())
-        except (KeyboardInterrupt, EOFError):
+        SCREEN.print_plain("")  # 提示符前留一行；不并进提示符是因为 readline
+                                # 处理不好含换行的提示符（重绘会错位）
+        line = await _READER.read(_prompt_text())
+        if line is _EXIT or line is _EOF:
             break
-        if not line:
-            # input() 在 EOF（Ctrl+D）时返回空串。
-            break
-        text = line.strip()
+        text = str(line).strip()
         if not text:
             continue
         low = text.lower()
         if low in ("exit", "quit"):
             break
         if low in ("/help", "help", "?", "/?"):
+            _take_palette()
             _print_help()
             continue
         if low in ("/menu", "menu"):
+            _take_palette()
             _show_current_menu()
+            continue
+
+        # 命令面板刚打出来时，裸编号先解释成"选第 N 条命令"。面板是一次性的：
+        # 取走即失效，所以它不会长期挡住按钮菜单的编号。
+        palette = _take_palette()
+        if palette and text.isdigit():
+            number = int(text)
+            if 1 <= number <= len(palette):
+                await _run_turn(_run_command(f"/{palette[number - 1]}"))
+                continue
+            SCREEN.notice(f"编号超出范围，命令面板共 {len(palette)} 项。", "warn")
             continue
 
         # CLI 把"点按钮"和"发消息"挤进了同一个输入通道，这是 Telegram/Web
@@ -463,13 +788,48 @@ async def _main_loop() -> None:
             # "42" 本来就只是发一条消息。
 
         if text.startswith("/"):
-            await _run_turn(_run_command(text))
+            routed = _route_command_prefix(text)
+            if routed is None:
+                continue
+            await _run_turn(_run_command(routed))
         else:
             await _run_turn(_run_conversation(text))
 
 
+def _route_command_prefix(text: str) -> Optional[str]:
+    """决定 `/…` 这一行到底要执行什么。
+
+    返回要执行的命令行；返回 None 表示"已经在屏幕上给了提示"，主循环该直接
+    进入下一轮。
+
+    没装 readline 的终端（Windows）敲不出 Tab 补全，这条路是它唯一的命令
+    发现方式；装了 readline 的终端里它同样有用——补全只在打字途中弹，
+    回车之后就没了。
+    """
+    if text == "/":
+        _show_command_palette(_command_names())
+        return None
+    # 带参数的命令（"/stats 7"）交给正常路由，不去猜前缀。
+    if " " in text:
+        return text
+    name = text[1:].lower()
+    if _resolve_command(name) is not None:
+        return text
+    matches = _matching_commands(name)
+    if not matches:
+        # 一条都不像：保持原行为，交给 _run_command 提示并转发给 AI。
+        return text
+    if len(matches) == 1:
+        # 前缀唯一，直接当成用户打全了——这正是补全的意义。
+        SCREEN.notice(f"/{name} → /{matches[0]}", "info")
+        return f"/{matches[0]}"
+    _show_command_palette(matches, title=f"匹配 /{name} 的命令")
+    return None
+
+
 def main() -> None:
     _quiet_console_logging()
+    _remember_terminal_state()
     _setup_readline()
     _install_sigint_handler()
 
@@ -484,6 +844,7 @@ def main() -> None:
         asyncio.run(_run())
     except KeyboardInterrupt:
         pass
+    _restore_terminal_state()
     SCREEN.print_plain("")
     SCREEN.notice("再见。", "ok")
 
