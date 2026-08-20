@@ -556,7 +556,7 @@ def build_smart_match_text() -> str:
         "🎯 <b>智能匹配阈值</b>\n"
         "━━━━━━━━━━━━━━\n"
         f"当前: <b>{current}%</b>\n\n"
-        "协议块用 AGENT_BEGIN_ 和 AGENT_END_ 携带同一个 nonce 成对标记。\n"
+        "协议块用 <<BEGIN_ 和 <<END_ 携带同一个 nonce 成对标记。\n"
         "nonce 完全一致时直接执行；相似度达到此阈值时容错执行，"
         "但会在回灌给 AI 的结果和聊天里标注系统提示，提醒下次保持 nonce 一致。\n"
         "设为 100% 表示只精确匹配，不做容错。"

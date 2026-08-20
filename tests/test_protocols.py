@@ -9,9 +9,9 @@ NONCE_B = "FEDCBA987654"
 
 def protocol_block(tag: str, body: str, nonce: str) -> str:
     return (
-        f"```{tag} <<AGENT_BEGIN_{nonce}\n"
+        f"```{tag}\n<<BEGIN_{nonce}\n"
         f"{body}\n"
-        f"AGENT_END_{nonce}\n"
+        f"<<END_{nonce}\n"
         "```"
     )
 
@@ -76,9 +76,9 @@ class ProtocolParserTests(unittest.TestCase):
 
     def test_mismatched_nonce_does_not_close_block(self):
         response = (
-            "```run-x <<AGENT_BEGIN_中文标记甲乙丙\n"
+            "```run-x\n<<BEGIN_中文标记甲乙丙\n"
             "echo ok\n"
-            "AGENT_END_中文标记丁戊己\n"          # 不同标记，不能闭合
+            "<<END_中文标记丁戊己\n"          # 不同标记，不能闭合
             "```"
         )
         self.assertEqual([], ProtocolParser.extract_protocol_blocks(response))
@@ -87,9 +87,9 @@ class ProtocolParserTests(unittest.TestCase):
         response = protocol_block(
             "run-x",
             "python - <<'PY'\n"
-            "```read-x <<AGENT_BEGIN_111111111111\n"
+            "```read-x\n<<BEGIN_111111111111\n"
             "/tmp/should-not-run\n"
-            "AGENT_END_111111111111\n"
+            "<<END_111111111111\n"
             "```",
             NONCE_A,
         )
@@ -101,7 +101,7 @@ class ProtocolParserTests(unittest.TestCase):
 
     def test_incomplete_outer_protocol_does_not_expose_nested_protocol(self):
         response = (
-            f"```run-x <<AGENT_BEGIN_{NONCE_A}\n"
+            f"```run-x\n<<BEGIN_{NONCE_A}\n"
             "outer body\n"
             f"{protocol_block('read-x', '/tmp/should-not-run', NONCE_B)}"
         )
@@ -121,7 +121,7 @@ class ProtocolParserTests(unittest.TestCase):
         self.assertEqual("echo one", blocks[0]["body"])
 
         stripped = ProtocolParser.strip_protocol_blocks(response)
-        self.assertNotIn("AGENT_BEGIN", stripped, "重复块的原始标记泄漏给了用户")
+        self.assertNotIn("<<BEGIN_", stripped, "重复块的原始标记泄漏给了用户")
         self.assertNotIn("echo two", stripped)
         self.assertIn("前言", stripped)
         self.assertIn("结尾", stripped)
@@ -129,7 +129,7 @@ class ProtocolParserTests(unittest.TestCase):
     def test_has_unclosed_block_detects_missing_end_marker(self):
         """未闭合会让后续协议全部不执行，必须能被检测到并提示。"""
         response = (
-            f"```run-x <<AGENT_BEGIN_{NONCE_A}\n"
+            f"```run-x\n<<BEGIN_{NONCE_A}\n"
             "echo ok\n"
             "（这里少了结束标记）"
         )
@@ -148,9 +148,9 @@ class ProtocolParserTests(unittest.TestCase):
         self.assertFalse(ProtocolParser.has_unclosed_block("普通回复，没有协议。"))
 
     def test_end_marker_without_closing_fence_remains_body(self):
-        end_marker = f"AGENT_END_{NONCE_A}"
+        end_marker = f"<<END_{NONCE_A}"
         response = (
-            f"```file-x:/tmp/demo.md <<AGENT_BEGIN_{NONCE_A}\n"
+            f"```file-x:/tmp/demo.md\n<<BEGIN_{NONCE_A}\n"
             "before\n"
             f"{end_marker}\n"
             "not-a-closing-fence\n"
@@ -191,30 +191,30 @@ class ProtocolParserTests(unittest.TestCase):
 
     def test_begin_and_end_nonce_must_match(self):
         response = (
-            f"```run-x <<AGENT_BEGIN_{NONCE_A}\n"
+            f"```run-x\n<<BEGIN_{NONCE_A}\n"
             "echo unsafe\n"
-            f"AGENT_END_{NONCE_B}\n"
+            f"<<END_{NONCE_B}\n"
             "```"
         )
         self.assertEqual([], ProtocolParser.extract_protocol_blocks(response))
 
     def test_begin_without_matching_end_is_not_executable(self):
-        response = f"before\n```run-x <<AGENT_BEGIN_{NONCE_A}\necho ok"
+        response = f"before\n```run-x\n<<BEGIN_{NONCE_A}\necho ok"
         self.assertEqual([], ProtocolParser.extract_protocol_blocks(response))
         self.assertEqual(response, ProtocolParser.strip_protocol_blocks(response))
 
     def test_end_without_final_fence_is_not_executable(self):
         response = (
-            f"before\n```run-x <<AGENT_BEGIN_{NONCE_A}\n"
-            f"echo ok\nAGENT_END_{NONCE_A}"
+            f"before\n```run-x\n<<BEGIN_{NONCE_A}\n"
+            f"echo ok\n<<END_{NONCE_A}"
         )
         self.assertEqual([], ProtocolParser.extract_protocol_blocks(response))
         self.assertEqual(response, ProtocolParser.strip_protocol_blocks(response))
 
     def test_old_single_end_marker_header_is_not_executable(self):
         response = (
-            f"```run-x <<AGENT_END_{NONCE_A}\n"
-            f"echo unsafe\nAGENT_END_{NONCE_A}\n```"
+            f"```run-x <<<<END_{NONCE_A}\n"
+            f"echo unsafe\n<<END_{NONCE_A}\n```"
         )
         self.assertEqual([], ProtocolParser.extract_protocol_blocks(response))
         self.assertEqual(response, ProtocolParser.strip_protocol_blocks(response))
@@ -282,22 +282,85 @@ class ProtocolParserTests(unittest.TestCase):
 
     def test_strip_only_removes_complete_new_protocols(self):
         old_block = (
-            f"```run-x <<AGENT_END_{NONCE_B}\n"
-            f"echo old\nAGENT_END_{NONCE_B}\n```"
+            f"```run-x <<<<END_{NONCE_B}\n"
+            f"echo old\n<<END_{NONCE_B}\n```"
         )
         response = f"before\n{protocol_block('run-x', 'echo ok', NONCE_A)}\n{old_block}\nafter"
         self.assertEqual(f"before\n{old_block}\nafter", ProtocolParser.strip_protocol_blocks(response))
 
     def test_windows_line_endings_are_supported(self):
         response = (
-            f"```run-x <<AGENT_BEGIN_{NONCE_A}\r\n"
+            f"```run-x\n<<BEGIN_{NONCE_A}\r\n"
             "echo ok\r\n"
-            f"AGENT_END_{NONCE_A}\r\n"
+            f"<<END_{NONCE_A}\r\n"
             "```"
         )
         block = ProtocolParser.extract_protocol_blocks(response)[0]
         self.assertEqual("run", block["type"])
         self.assertEqual("echo ok", block["body"])
+
+
+class FenceLineShapeTests(unittest.TestCase):
+    """围栏行只写标签，成对标记各自顶格独占一行。
+
+    这是从"标记挂在围栏行上"（```run-x <<AGENT_BEGIN_xxx）换过来的：那种写法
+    让 info string 里混进 <<AGENT_BEGIN_...，任何 Markdown 渲染器都只能把它
+    当成一个语言名不认识的代码块，而且 BEGIN 和 END 形状不对称，模型写结束
+    标记时得凭记忆重写而不是照抄上一行。
+    """
+
+    NONCE = "read_fstab_a60c"
+
+    def block(self, tag: str, body: str, nonce: str = "") -> str:
+        nonce = nonce or self.NONCE
+        return f"```{tag}\n<<BEGIN_{nonce}\n{body}\n<<END_{nonce}\n```"
+
+    def test_old_marker_on_the_fence_line_is_not_executed(self):
+        # 只解析新格式：老写法必须彻底不认，否则两套格式并存时模型会各写各的。
+        old = (
+            f"```run-x <<AGENT_BEGIN_{self.NONCE}\n"
+            f"rm -rf /tmp/whatever\n"
+            f"AGENT_END_{self.NONCE}\n```"
+        )
+        self.assertEqual([], ProtocolParser.extract_protocol_blocks(old))
+        self.assertFalse(ProtocolParser.has_unclosed_block(old))
+
+    def test_missing_begin_line_is_not_a_protocol(self):
+        # 光有围栏和标签不算协议——否则用户贴一段 ```run-x 代码就会被执行。
+        self.assertEqual(
+            [], ProtocolParser.extract_protocol_blocks("```run-x\necho ok\n```")
+        )
+
+    def test_begin_line_may_be_indented(self):
+        # 模型偶尔跟着围栏缩进一格，为这个丢掉整次操作不划算。
+        response = f"```run-x\n   <<BEGIN_{self.NONCE}\necho ok\n<<END_{self.NONCE}\n```"
+        blocks = ProtocolParser.extract_protocol_blocks(response)
+        self.assertEqual(1, len(blocks))
+        self.assertEqual("echo ok", blocks[0]["body"])
+
+    def test_tag_parameters_may_contain_spaces(self):
+        # 路径带空格是真事；标签参数一路吃到行尾，不能按空白切。
+        blocks = ProtocolParser.extract_protocol_blocks(
+            self.block("edit-x:/app/my file.py", "-----OLD-----\na\n-----NEW-----\nb")
+        )
+        self.assertEqual(1, len(blocks))
+        self.assertEqual("/app/my file.py", blocks[0]["path"])
+
+    def test_body_containing_a_full_nested_protocol_stays_opaque(self):
+        # file-x 写一份 markdown，正文里带着完整的另一个协议块：
+        # 只能解析出外层那一个，内层绝不能被执行。
+        inner = "```run-x\n<<BEGIN_inner_nonce_9f\nrm -rf /\n<<END_inner_nonce_9f\n```"
+        blocks = ProtocolParser.extract_protocol_blocks(
+            self.block("file-x:/tmp/doc.md", inner)
+        )
+        self.assertEqual(1, len(blocks))
+        self.assertEqual("file", blocks[0]["type"])
+        self.assertIn("rm -rf /", blocks[0]["body"])
+
+    def test_fence_line_with_trailing_content_is_rejected(self):
+        # 标签后面还有别的东西 -> 不是协议围栏行，别猜。
+        response = f"```run-x 顺便说一句\n<<BEGIN_{self.NONCE}\necho ok\n<<END_{self.NONCE}\n```"
+        self.assertEqual([], ProtocolParser.extract_protocol_blocks(response))
 
 
 if __name__ == "__main__":

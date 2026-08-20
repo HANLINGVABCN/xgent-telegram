@@ -1879,7 +1879,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     return (
                         "⚠️ 协议块 nonce 不相同，已智能匹配"
                         f"（相似度 {sim_pct}%），下次务必注意 "
-                        "AGENT_BEGIN 和 AGENT_END 的 nonce 保持完全一致。"
+                        "<<BEGIN_ 和 <<END_ 的 nonce 保持完全一致。"
                     )
 
                 def _ctx_with_notice(msg: Dict[str, Any], notice: str) -> Dict[str, Any]:
