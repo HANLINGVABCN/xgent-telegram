@@ -512,6 +512,58 @@ class KeepAliveTests(InstallScriptLibraryMixin, unittest.TestCase):
             )
             self.assertIn("OK", result.stdout)
 
+    def web_state(self, root, *, password="yes", enabled="yes",
+                  running="0", listening="0") -> str:
+        """跑 component_state_web，但把"要有 venv 和数据库"那两步换成桩。
+
+        真去读配置得先建 venv、装依赖、开数据库，那是集成测试的活；这里要钉的
+        是判定顺序本身——尤其是"开关关着"必须排在"端口没监听"前面。
+        """
+        result = self.run_lib(
+            'venv_ready() { return 0; }\n'
+            'load_web_state() { return 0; }\n'
+            f'WEB_HAS_PASSWORD={password}\n'
+            f'WEB_ENABLED={enabled}\n'
+            'WEB_PORT=8790\n'
+            f'service_running() {{ return {running}; }}\n'
+            f'port_is_listening() {{ return {listening}; }}\n'
+            'component_state_web\n',
+            root,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        return result.stdout.strip()
+
+    def test_web_disabled_in_bot_is_reported_instead_of_bare_port_failure(self):
+        with self.temp_dir() as temp_dir:
+            root = self.sandbox(temp_dir)
+
+            # 从老版本升上来的典型现场：装了 web 组件、密码也设了，但 bot 菜单里
+            # 的 web 开关还是关的。以前这里只说"端口没监听"，用户根本不知道去
+            # 哪儿开——必须把真正的原因说出来。
+            state = self.web_state(root, enabled="no", running="0", listening="1")
+            self.assertTrue(state.startswith("error|"), state)
+            self.assertIn("已在 bot 内关闭 Web 功能", state)
+
+            # 开关开着、端口确实不监听，才是"去看日志"那种异常。
+            state = self.web_state(root, enabled="yes", running="0", listening="1")
+            self.assertTrue(state.startswith("error|"), state)
+            self.assertNotIn("已在 bot 内关闭", state)
+
+            # 没密码的优先级最高：开关再开也起不来。
+            state = self.web_state(root, password="no", enabled="no")
+            self.assertTrue(state.startswith("missing|"), state)
+
+            state = self.web_state(root, enabled="yes", running="0", listening="0")
+            self.assertTrue(state.startswith("installed|"), state)
+
+    def test_web_toggle_writes_the_same_key_as_the_bot_menu(self):
+        # 装置页和 Telegram 菜单必须写同一个 key，否则两边显示会打架。
+        self.assertIn('"web_enabled"', INSTALL_SCRIPT)
+        self.assertIn("save_config", INSTALL_SCRIPT)
+        toggle = INSTALL_SCRIPT[INSTALL_SCRIPT.index("toggle_web_enabled() {"):]
+        self.assertIn("set_web_enabled 0", toggle)
+        self.assertIn("set_web_enabled 1", toggle)
+
     def test_uninstall_removes_the_systemd_unit(self):
         uninstall = INSTALL_SCRIPT[
             INSTALL_SCRIPT.index('uninstall_app() {'):

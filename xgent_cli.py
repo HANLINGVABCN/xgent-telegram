@@ -58,6 +58,10 @@ from xgent_app.cli_bridge import (
     get_screen,
 )
 from xgent_app.cli_render import display_width
+from xgent_app.cli_palette import (
+    SlashPalette,
+    interactive_supported as palette_supported,
+)
 
 _MIGRATED_RUNTIME_PATHS = _migrate_legacy_runtime_paths()
 _ns: dict = {"__file__": __file__}
@@ -265,6 +269,72 @@ def _command_rows(names: Sequence[str], numbered: bool = False) -> List[str]:
             row += f"  {pal.paint(description, pal.muted)}"
         rows.append(row)
     return rows
+
+
+def _palette_rows(names: Sequence[str], selected: int) -> List[str]:
+    """`/` 下拉面板的候选行：选中那条加箭头 + 反显。
+
+    复用 _command_rows 的排版（对齐宽度、命令说明），只在前面换一个标记位——
+    /help 的清单和面板里的候选长得一样，用户不用学两套。
+    """
+    pal = PALETTE
+    if not names:
+        return []
+    label_width = max(display_width(f"/{name}") for name in names)
+    rows: List[str] = []
+    for index, name in enumerate(names):
+        label = f"/{name}"
+        pad = " " * (label_width - display_width(label))
+        description = _describe_command(name)
+        if index == selected:
+            body = f" ❯ {label}{pad}"
+            if description:
+                body += f"  {description}"
+            rows.append(pal.paint(body, pal.ai, pal.bold))
+        else:
+            body = f"   {pal.paint(label, pal.ai)}{pad}"
+            if description:
+                body += f"  {pal.paint(description, pal.muted)}"
+            rows.append(body)
+    return rows
+
+
+def _prompt_plain() -> str:
+    """给命令面板用的提示符：带颜色，但不带 readline 的 \\001..\\002 标记。"""
+    pal = PALETTE
+    if not pal.enabled:
+        return "❯ "
+    return f"{pal.ai}{pal.bold}❯{pal.reset} "
+
+
+def _palette_enabled() -> bool:
+    return palette_supported()
+
+
+def _history_entries() -> List[str]:
+    """把 readline 的历史交给面板，两边翻到的是同一份记录。"""
+    if _readline is None:
+        return []
+    try:
+        return [
+            _readline.get_history_item(i)
+            for i in range(1, _readline.get_current_history_length() + 1)
+        ]
+    except Exception:
+        return []
+
+
+def _remember_history(line: str) -> None:
+    """面板不走 readline，得手动把行喂回去，退出时才存得进历史文件。"""
+    if not line.strip() or _readline is None:
+        return
+    try:
+        length = _readline.get_current_history_length()
+        if length and _readline.get_history_item(length) == line:
+            return
+        _readline.add_history(line)
+    except Exception:
+        logger.debug("写入 CLI 历史失败", exc_info=True)
 
 
 def _print_help() -> None:
@@ -575,7 +645,7 @@ class _StdinReader:
         while True:
             prompt = self._requests.get()
             try:
-                value: Any = input(prompt)
+                value: Any = self._read_one(prompt)
             except EOFError:
                 value = _EOF
             except KeyboardInterrupt:
@@ -586,6 +656,31 @@ class _StdinReader:
                 logger.debug("CLI 读取输入失败", exc_info=True)
                 value = _EOF
             self._resolve(value)
+
+    def _read_one(self, prompt: str) -> str:
+        """读一行。能画面板就画，不能就退回 input()。
+
+        面板要自己算光标列，所以拿的是没有 \\001..\\002 包裹的干净提示符——
+        那对标记是给 readline 看的，写进裸终端会变成两个不可见的垃圾字节，
+        把列数算歪。
+        """
+        if not _palette_enabled():
+            return input(prompt)
+        try:
+            line = SlashPalette(
+                _prompt_plain(),
+                _matching_commands,
+                _palette_rows,
+                history=_history_entries(),
+            ).read_line()
+        except (EOFError, KeyboardInterrupt):
+            raise
+        except Exception:
+            # 面板画崩了不能把 CLI 带走：退回 input()，下一轮还会再试。
+            logger.debug("CLI 命令面板异常，退回 input()", exc_info=True)
+            return input(prompt)
+        _remember_history(line)
+        return line
 
     def _resolve(self, value: Any) -> None:
         """把结果投递回事件循环。先摘 pending，保证只兑现一次。"""

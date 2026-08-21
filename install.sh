@@ -2588,11 +2588,15 @@ port_is_listening() {
 }
 
 WEB_STATE_LOADED=0
+WEB_ENABLED="no"
 WEB_HAS_PASSWORD="no"
 WEB_PORT=""
 
 reset_web_state_cache() {
     WEB_STATE_LOADED=0
+    # 只清 LOADED 标志不够：load_web_state 失败时会提前 return，把上一次的
+    # WEB_ENABLED 留在原地，组件清单就会拿旧值画一个错的状态。
+    WEB_ENABLED="no"
 }
 
 # Web 配置探测。跑一次要加载全部 section（约一两秒），所以结果缓存起来，
@@ -2629,8 +2633,12 @@ async def main():
     port = ns["normalize_web_port"](
         ns["UserDataManager"].get("web_port", ns["DEFAULT_WEB_PORT"])
     )
+    enabled = ns["normalize_bool"](
+        ns["UserDataManager"].get("web_enabled", False), False
+    )
     print(f"password={'yes' if digest else 'no'}")
     print(f"port={port}")
+    print(f"enabled={'yes' if enabled else 'no'}")
     # aiosqlite 起了非 daemon 工作线程，不显式关掉这段一次性脚本不会退出。
     await (await ns["BotMemoryDB"].get_instance()).close()
 
@@ -2645,6 +2653,7 @@ PY
 
     WEB_HAS_PASSWORD="$(printf '%s\n' "$output" | grep '^password=' | tail -n 1 | cut -d= -f2)"
     WEB_PORT="$(printf '%s\n' "$output" | grep '^port=' | tail -n 1 | cut -d= -f2)"
+    WEB_ENABLED="$(printf '%s\n' "$output" | grep '^enabled=' | tail -n 1 | cut -d= -f2)"
     [ -n "$WEB_PORT" ] || return 1
     WEB_STATE_LOADED=1
     return 0
@@ -2688,11 +2697,18 @@ component_state_web() {
         printf 'missing|尚未设置访问密码，Web 服务不会启动\n'
         return
     fi
-    if service_running && ! port_is_listening "$WEB_PORT"; then
-        printf 'error|服务在运行，但端口 %s 没有监听\n' "$WEB_PORT"
+    # 开关关着是"密码设了但端口不监听"最常见的原因，尤其是从老版本升上来的：
+    # 那会儿 web 是 bot 菜单里的一个开关，默认关着，装了 web 组件也不会自动开。
+    # 必须排在端口检查前面——否则用户只看到"端口未监听"，根本不知道去哪儿开。
+    if [ "$WEB_ENABLED" != "yes" ]; then
+        printf 'error|已在 bot 内关闭 Web 功能，端口 %s 未监听（本页第 3 项可开启）\n' "$WEB_PORT"
         return
     fi
-    printf 'installed|http://127.0.0.1:%s（密码已设置）\n' "$WEB_PORT"
+    if service_running && ! port_is_listening "$WEB_PORT"; then
+        printf 'error|Web 已开启，但服务在运行、端口 %s 没有监听（查日志排查）\n' "$WEB_PORT"
+        return
+    fi
+    printf 'installed|http://127.0.0.1:%s（密码已设置，Web 已开启）\n' "$WEB_PORT"
 }
 
 component_state_bot() {
@@ -2823,11 +2839,17 @@ deploy_web() {
         echo ""
         echo "   1) 修改访问密码"
         echo "   2) 修改监听端口"
-        echo "   3) 返回"
-        read -r -p "   请选择 [1-3，默认 3]: " choice
+        if [ "$WEB_ENABLED" = "yes" ]; then
+            echo "   3) 关闭 Web 功能（当前: 已开启）"
+        else
+            echo "   3) 开启 Web 功能（当前: 已关闭）"
+        fi
+        echo "   4) 返回"
+        read -r -p "   请选择 [1-4，默认 4]: " choice
         case "$choice" in
             1) set_web_password ;;
             2) set_web_port ;;
+            3) toggle_web_enabled ;;
             *) : ;;
         esac
         return
@@ -2836,6 +2858,65 @@ deploy_web() {
     warn "   Web 服务必须先有访问密码才会启动，下面把密码和端口一次设好。"
     set_web_password
     set_web_port
+    # 装完就打开：用户在组件清单里选了 web，意思就是"我要用网页"，没道理让他
+    # 装完再去 bot 菜单里手动开一次。从老版本升上来的人最容易踩这个——那时
+    # web 是 bot 菜单里的一个开关，默认关着。
+    if [ "$WEB_ENABLED" != "yes" ]; then
+        set_web_enabled 1 && success "Web 功能已开启"
+    fi
+}
+
+# 读写的是 bot 菜单里那个开关的同一个 key：UserDataManager 的 web_enabled，
+# callbacks.py:683 的 toggle_web_enabled 写的也是它。两边共用一份配置，
+# 在哪边改都一样。
+set_web_enabled() {
+    local want="$1"
+
+    venv_ready || { error "   [错误] 运行环境未就绪，无法修改。"; return 1; }
+    if ! run_bot_python "$VENV_PYTHON" - "$want" <<'WEBTOGGLE' >/dev/null 2>&1
+import asyncio
+import contextlib
+import io
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath("."))
+os.environ.setdefault("AUTHORIZED_USER_ID", "1")
+
+from xgent_app.bootstrap import load_sections
+
+ns = {"__file__": os.path.abspath("xgent_server.py")}
+with contextlib.redirect_stdout(io.StringIO()):
+    load_sections(ns)
+
+want = sys.argv[1] == "1"
+
+
+async def main():
+    await ns["UserDataManager"].init()
+    ns["UserDataManager"].set("web_enabled", want)
+    await ns["UserDataManager"].save_config("web_enabled", want)
+    await (await ns["BotMemoryDB"].get_instance()).close()
+
+
+asyncio.run(main())
+WEBTOGGLE
+    then
+        error "   [错误] 写入配置失败。"
+        return 1
+    fi
+    reset_web_state_cache
+    load_web_state || true
+    return 0
+}
+
+toggle_web_enabled() {
+    if [ "$WEB_ENABLED" = "yes" ]; then
+        set_web_enabled 0 && success "Web 功能已关闭"
+    else
+        set_web_enabled 1 && success "Web 功能已开启"
+    fi
+    warn "   改动需要重启服务才生效（主菜单 3) 重启服务）。"
 }
 
 deploy_bot() {
