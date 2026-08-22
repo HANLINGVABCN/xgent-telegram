@@ -81,14 +81,18 @@ class GlobalRecorder:
     
     @staticmethod
     async def record_user_message(content: str, msg_type: str = MessageType.USER_TEXT,
-                                   chat_id: Optional[int] = None):
-        """记录用户消息"""
+                                   chat_id: Optional[int] = None,
+                                   metadata: Optional[Dict[str, Any]] = None):
+        """记录用户消息。metadata 可带 origin=cli-chat（CLI 对话文本）：
+        服务端跨端观察者据此把这句话镜像到 Telegram，状态机输入不带
+        标记、不镜像——与 Telegram 端"配置过程不进聊天流"的语义一致。"""
         await GlobalRecorder.record(
             msg_type=msg_type,
             role='user',
             content=content,
             chat_id=chat_id,
-            user_id=BotConfig.AUTHORIZED_USER_ID
+            user_id=BotConfig.AUTHORIZED_USER_ID,
+            metadata=metadata
         )
     
     @staticmethod

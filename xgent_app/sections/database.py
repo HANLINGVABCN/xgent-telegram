@@ -422,11 +422,12 @@ class BotMemoryDB:
         return int(row['max_id'] or 0) if row else 0
 
     async def get_records_since_rowid(self, after_rowid: int, limit: int = 200) -> List[Dict]:
-        """按 rowid 增量取全局记录（含 metadata 解析出的 src）。
+        """按 rowid 增量取全局记录（含 metadata 解析出的 src/origin）。
 
         三端同步的基础设施：服务端网页观察者用它在别的进程（CLI）写入新
-        记录时推 SSE 帧；CLI 的 Telegram 镜像用它取回"这一轮对话新产生了
-        哪些 user/ai 记录"。冗余记录过滤与 get_conversation_messages 一致。
+        记录时推 SSE 帧/镜像 Telegram；origin=cli-chat 标记"这是 CLI 的对话
+        文本"（区别于状态机输入），观察者据此决定要不要镜像到 TG。冗余记录
+        过滤与 get_conversation_messages 一致。
         """
         conn = await self._get_conn()
         cursor = await conn.execute('''
@@ -443,13 +444,16 @@ class BotMemoryDB:
             if is_redundant_agent_command_record(msg.get('msg_type'), msg.get('content')):
                 continue
             src = None
+            origin = None
             try:
                 meta = json.loads(msg.get('metadata') or '{}')
                 if isinstance(meta, dict):
                     src = meta.get('src')
+                    origin = meta.get('origin')
             except (json.JSONDecodeError, TypeError):
                 src = None
             msg['src'] = src
+            msg['origin'] = origin
             result.append(msg)
         return result
 

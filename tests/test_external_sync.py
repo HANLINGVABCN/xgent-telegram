@@ -1,11 +1,14 @@
 """三端同步基础设施的测试。
 
-覆盖四件事：
+覆盖五件事：
   1. GlobalRecorder 给每条记录盖的进程源标记（metadata.src）——网页观察者
      靠它跳过本进程记录，漏盖会导致网页每句话显示两遍；
-  2. get_records_since_rowid 的 rowid 游标查询；
-  3. _external_row_to_frame 的记录→帧映射（CLI 的对话长什么样推给网页）；
-  4. CLI 侧的 Telegram 镜像分块与 /sync 跨端历史渲染。
+  2. get_records_since_rowid 的 rowid 游标查询（含 metadata.origin 透传）；
+  3. _external_row_to_frame 的记录→帧映射（CLI 的对话长什么样推给网页）：
+     显示语义对齐——AGENT_CMD 协议原文不推（刷屏根源），TOKEN_USAGE 走灰条；
+  4. CLI→Telegram 镜像（服务端观察者侧）：只镜像 origin=cli-chat 的用户
+     文本和 AI_REPLY，状态机输入/命令/token 统计不镜像；长文分块；
+  5. /sync 跨端历史渲染。
 
 sections 靠共享命名空间加载、xgent_cli 在 import 期就加载全部 section，
 所以都用带环境变量的子进程探针跑（同 test_cli_input 的做法）。
@@ -112,6 +115,10 @@ async def main():
     await GR.record_ai_reply("回 **加粗** 正文")
     await GR.record_system_op("系统操作记录")
     await GR.record(MT.AGENT_RESULT, "user", "[sendfile结果] 已发送服务器文件给用户: /x/a.txt (1 bytes)")
+    NL = chr(10)
+    await GR.record(MT.AGENT_CMD, "system",
+                    NL.join(["```run-x", "<<BEGIN_run_cmd_1a2b", "ls -la", "<<END_run_cmd_1a2b", "```"]))
+    await GR.record(MT.TOKEN_USAGE, "assistant", "↑ 21825 tokens (0 cached) · ↓ 1958 tokens")
     rows = await db.get_records_since_rowid(0)
     frames = [ns["_external_row_to_frame"](r) for r in rows]
     print(json.dumps({
@@ -120,6 +127,8 @@ async def main():
                "bold": "<b>" in frames[1]["text"]},
         "sys": {"type": frames[2]["type"]},
         "agent_result": {"type": frames[3]["type"], "external": frames[3].get("external")},
+        "agent_cmd_hidden": frames[4] is None,
+        "token_notice": frames[5] is not None and frames[5]["type"] == "notice",
         "empty": ns["_external_row_to_frame"]({"msg_type": MT.USER_TEXT, "role": "user", "content": "  "}),
     }))
     await db.close()
@@ -134,51 +143,103 @@ asyncio.run(main())
         self.assertEqual("notice", result["sys"]["type"])
         # AGENT_RESULT 显示到 AI 侧（role 改映射为 assistant -> message 帧）
         self.assertEqual("message", result["agent_result"]["type"])
+        self.assertTrue(result["agent_result"]["external"])
+        # AGENT_CMD 协议原文绝不推给网页——此前每个协议块一个新气泡，
+        # CLI 一轮 Agent 对话就是"网页刷屏"的根源。
+        self.assertTrue(result["agent_cmd_hidden"], "AGENT_CMD 协议原文不应推成网页帧")
+        self.assertTrue(result["token_notice"], "TOKEN_USAGE 要降级成 notice 灰条，与显示历史一致")
         self.assertIsNone(result["empty"])
 
 
-class CliMirrorTests(ProbeMixin, unittest.TestCase):
-    def test_tg_chunks_respect_limit_and_keep_content(self):
-        result = self.run_probe("""
-import xgent_cli
+class ServerSideCliMirrorTests(SectionsProbeMixin, unittest.TestCase):
+    """CLI→Telegram 镜像已移到服务端观察者（idle.py）——CLI 只写库，服务端用
+    自己的 PTB 连接镜像。这里测纯函数部分：记录→镜像文本的映射与开关。"""
 
-text = ("line\\n" * 1500) + "tail"
-chunks = xgent_cli._split_tg_chunks(text, limit=3800)
-joined = "".join(chunks)
-print(json.dumps({
-    "chunks": len(chunks),
-    "max_len": max(len(c) for c in chunks),
-    "chars_kept": len(joined.replace("\\n", "")) == len(text.replace("\\n", "")),
-    "short_passthrough": xgent_cli._split_tg_chunks("short") == ["short"],
-    "empty": xgent_cli._split_tg_chunks("") == [],
-}))
-""")
-        self.assertGreater(result["chunks"], 1)
-        self.assertLessEqual(result["max_len"], 3800)
-        self.assertTrue(result["chars_kept"])
-        self.assertTrue(result["short_passthrough"])
-        self.assertTrue(result["empty"])
-
-    def test_mirror_disabled_without_token_or_with_env_switch(self):
-        result = self.run_probe("""
+    def test_row_to_telegram_texts_scope_and_chunks(self):
+        result = self.run_probe(self.SECTIONS_PREAMBLE + """
 import asyncio
-import xgent_cli
 
 async def main():
-    # 测试环境 BOT_TOKEN 是占位值；用环境开关走"直接返回"分支即可验证开关。
-    import os
-    os.environ["XGENT_CLI_NO_TG_MIRROR"] = "1"
-    before = xgent_cli.BotConfig.TOKEN
-    token_saved = xgent_cli.BotConfig.TOKEN
-    xgent_cli.BotConfig.TOKEN = ""
-    await xgent_cli._mirror_turn_to_telegram(0)      # 无 token：静默返回
-    xgent_cli.BotConfig.TOKEN = token_saved
-    await xgent_cli._mirror_turn_to_telegram(0)      # 有 token + 开关：静默返回
-    print(json.dumps({"ok": True, "had_token": bool(before)}))
+    await ns["UserDataManager"].init()
+    db = await ns["BotMemoryDB"].get_instance()
+    GR = ns["GlobalRecorder"]
+    MT = ns["MessageType"]
+    # CLI 对话文本（带 origin 标记）与状态机输入（不带）都落库
+    await GR.record_user_message(
+        "我在 CLI 里说的话", MT.USER_TEXT, metadata={"origin": "cli-chat"})
+    await GR.record_user_message("填进状态机的 API Key", MT.USER_TEXT)
+    await GR.record_ai_reply("AI 在 CLI 里的回答")
+    await GR.record(MT.TOKEN_USAGE, "assistant", "↑ 1 tokens")
+    await GR.record(MT.AGENT_CMD, "system", "```run-x")
+    await GR.record(MT.AGENT_STATUS, "assistant", "✅ Agent 第 1 轮 · 1 个操作已完成")
+    rows = await db.get_records_since_rowid(0)
+    texts = []
+    for r in rows:
+        texts.extend(ns["_external_row_to_telegram_texts"](r))
+    # 长文分块：渲染层的 split_text_for_telegram 负责切 Telegram 发得下的块
+    long_reply = "AI 长回复" + ("x" * 9000)
+    chunks = ns["split_text_for_telegram"](long_reply)
+    print(json.dumps({
+        "user_sent": any("🖥 [CLI]" in t and "我在 CLI 里说的话" in t for t in texts),
+        "ai_sent": any("AI 在 CLI 里的回答" in t for t in texts),
+        "state_input_not_sent": all("API Key" not in t for t in texts),
+        "nothing_else": all(("tokens" not in t and "run-x" not in t and "Agent 第" not in t) for t in texts),
+        "chunks": len(chunks) > 1 and max(len(c) for c in chunks) <= 4000,
+        "chars_kept": sum(len(c) for c in chunks) >= len(long_reply.replace(" ", "")),
+    }))
+    await db.close()
 
 asyncio.run(main())
 """)
-        self.assertTrue(result["ok"])
+        self.assertTrue(result["user_sent"], "镜像必须带上用户的话（🖥 [CLI] 前缀）")
+        self.assertTrue(result["ai_sent"])
+        self.assertTrue(result["state_input_not_sent"], "状态机输入（填 Key 等）不镜像到 TG")
+        self.assertTrue(result["nothing_else"], "token 统计/协议块/轮次状态一律不镜像")
+        self.assertTrue(result["chunks"], "超长回复要切成 Telegram 发得下的块")
+        self.assertTrue(result["chars_kept"], "分块不能丢内容")
+
+    def test_tg_mirror_gate_requires_bot_and_env_switch(self):
+        result = self.run_probe(self.SECTIONS_PREAMBLE + """
+import os
+
+ns["_web_real_bot"] = None
+no_bot = ns["_web_external_tg_mirror_enabled"]()      # 没有真实 bot：不镜像
+ns["_web_real_bot"] = object()
+with_bot = ns["_web_external_tg_mirror_enabled"]()    # 有 bot：镜像
+os.environ["XGENT_CLI_NO_TG_MIRROR"] = "1"
+switched_off = ns["_web_external_tg_mirror_enabled"]()  # 环境开关：关
+del os.environ["XGENT_CLI_NO_TG_MIRROR"]
+print(json.dumps({"no_bot": no_bot, "with_bot": with_bot, "switched_off": switched_off}))
+""")
+        self.assertFalse(result["no_bot"], "纯 Web 模式（无真实 bot）不应镜像")
+        self.assertTrue(result["with_bot"])
+        self.assertFalse(result["switched_off"], "XGENT_CLI_NO_TG_MIRROR=1 要能关掉镜像")
+
+    def test_watcher_survives_web_off_and_swaps_outbox(self):
+        """观察者与 Web 开关解耦：Web 没开也要启动（CLI→TG 镜像依赖它）。"""
+        result = self.run_probe(self.SECTIONS_PREAMBLE + """
+import asyncio
+
+async def main():
+    await ns["UserDataManager"].init()
+    # web_enabled 关着：start_web_chat_if_enabled 仍要启动跨端观察者
+    ns["UserDataManager"].set("web_enabled", False)
+    await ns["start_web_chat_if_enabled"](None)
+    task = ns["_web_external_watch_task"]
+    print(json.dumps({
+        "watcher_running": task is not None and not task.done(),
+        "no_web_server": ns["_web_chat_server"] is None,
+    }))
+    if task is not None:
+        task.cancel()
+    # aiosqlite 连接线程非 daemon：不关掉，探针进程退出时会卡在 threading 收尾
+    db = await ns["BotMemoryDB"].get_instance()
+    await db.close()
+
+asyncio.run(main())
+""")
+        self.assertTrue(result["watcher_running"], "Web 关闭时跨端观察者也要运行")
+        self.assertTrue(result["no_web_server"])
 
     def test_sync_renders_roles_to_screen(self):
         result = self.run_probe("""
@@ -362,8 +423,8 @@ asyncio.run(main())
         self.assertTrue(result["ai_reply_html"], "AI 正文仍走 Markdown->HTML，不受影响")
 
 
-class CliUserEchoAndMirrorTests(ProbeMixin, unittest.TestCase):
-    """CLI 用户消息成块回显（user 样式）+ 镜像到 TG 时带上用户的话。"""
+class CliUserEchoTests(ProbeMixin, unittest.TestCase):
+    """CLI 用户消息成块回显（user 样式）。TG 镜像见 ServerSideCliMirrorTests。"""
 
     def test_user_block_and_line_echo(self):
         result = self.run_probe("""
@@ -394,40 +455,6 @@ asyncio.run(main())
         self.assertTrue(result["block_has_marker"], "对话消息要有 ❯ 你 用户块")
         self.assertTrue(result["block_has_text"])
         self.assertTrue(result["line_single"], "命令只回显单行，不带用户块")
-
-    def test_mirror_includes_user_text(self):
-        result = self.run_probe("""
-import asyncio
-import xgent_cli
-
-sent = []
-xgent_cli._tg_send_message = lambda text: sent.append(text)
-
-async def main():
-    await xgent_cli._init_runtime()
-    db = await xgent_cli.BotMemoryDB.get_instance()
-    cursor = await db.get_max_global_rowid()
-    # 与 _run_conversation 修复后的顺序一致：先取游标，再记用户消息
-    await xgent_cli.GlobalRecorder.record_user_message(
-        "我在 CLI 里说的话", xgent_cli.MessageType.USER_TEXT,
-        xgent_cli.BotConfig.AUTHORIZED_USER_ID)
-    # 用户消息即时镜像（不等回合结束）
-    await xgent_cli._mirror_user_text_to_telegram("我在 CLI 里说的话")
-    await xgent_cli.GlobalRecorder.record_ai_reply("AI 在 CLI 里的回答")
-    await xgent_cli._mirror_turn_to_telegram(cursor)
-    joined = chr(10).join(sent)
-    print(json.dumps({
-        "user_sent": any("🖥 [CLI]" in s and "我在 CLI 里说的话" in s for s in sent),
-        "ai_sent": any("AI 在 CLI 里的回答" in s for s in sent),
-        "nothing_else": all("tokens" not in s for s in sent),
-    }))
-    await xgent_cli._shutdown_runtime()
-
-asyncio.run(main())
-""")
-        self.assertTrue(result["user_sent"], "镜像必须带上用户的话（🖥 [CLI] 前缀）")
-        self.assertTrue(result["ai_sent"])
-        self.assertTrue(result["nothing_else"], "token 统计等其余记录不镜像")
 
 
 if __name__ == "__main__":

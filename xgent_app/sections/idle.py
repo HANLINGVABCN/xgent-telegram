@@ -104,8 +104,12 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
 # 和被 lifecycle.py 调用（更晚加载）。
 
 _web_chat_server: Optional[Any] = None
-# 跨端同步观察者任务（CLI→Web 实时帧），随 Web 服务启停。
+# 跨端同步观察者任务（CLI→Web 实时帧 + CLI→TG 镜像），随 bot 启停、
+# 不随 Web 服务启停（见 start_external_sync_watcher）。
 _web_external_watch_task: Optional[asyncio.Task] = None
+# 观察者当前推送的 outbox。Web 服务开着时是它的 outbox（帧直达网页），
+# 没开时是一个无订阅者的独立 outbox（put 落空，等 Web 启动后换接）。
+_web_external_outbox: Any = WebOutbox()
 # 真实 PTB bot 引用。网页发起对话时，MirrorBot 用它把消息同时投递到 Telegram。
 _web_real_bot: Optional[Any] = None
 _web_application: Optional[Any] = None
@@ -163,16 +167,26 @@ async def _web_read_history(limit: int) -> List[Dict[str, Any]]:
 def _external_row_to_frame(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """外部进程（CLI）写入的一条全局记录 -> SSE 帧。
 
-    映射对齐 _web_read_history：AI_REPLY 的 Markdown 转 Telegram HTML，
-    AGENT_RESULT/AGENT_CMD/MEDIA_REPLY 显示到 AI 侧，用户记录显示到用户侧，
-    系统记录走独立的 notice 帧（前端居中灰条）。帧带 external=1 标记：
-    前端只对带标记的帧做"从文本挖路径恢复媒体卡片"——本进程自己的实时帧
-    已有真正的 document/photo 帧，重复升级会把 AI 正文误换成卡片。
+    映射**逐条对齐** get_display_history / _web_read_history 的显示语义：
+    显示历史里整体隐藏的（AGENT_CMD 协议原文/媒体提示词）实时帧也不推；
+    显示成居中灰条的（TOKEN_USAGE）推 notice 帧。此前这里把 AGENT_CMD 协议
+    块也当 HTML 消息推给网页——CLI 一轮 Agent 对话的每个协议块、每条中间
+    记录都变成一个新气泡（外部帧没有 message_id，前端无法原地更新，只能
+    越堆越多），每秒一批地刷屏；刷新/断线重连后历史又按显示语义整页重画，
+    这些气泡成批消失——就是"CLI 发消息时网页刷屏+吞消息"的机制。
     """
     msg_type = row.get('msg_type')
     content = str(row.get('content') or '')
     if not content.strip():
         return None
+    if msg_type == MessageType.AGENT_CMD:
+        # 协议块原文/媒体提示词：bot 界面从不把它们当独立消息显示（用户
+        # 看到的是 AI 正文 + 每轮的 AGENT_STATUS 状态行），实时帧同样不推。
+        return None
+    if msg_type == MessageType.TOKEN_USAGE:
+        # token 统计是元信息不是正文：显示历史里降级成 system 灰条，实时
+        # 帧用 notice 对齐，不再混在 AI 气泡流里。
+        return {"type": "notice", "text": content, "parse_mode": "HTML", "external": True}
     if msg_type == MessageType.AI_REPLY:
         try:
             content = markdown_to_telegram_html(content)
@@ -181,16 +195,15 @@ def _external_row_to_frame(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return {"type": "message", "text": content, "parse_mode": "HTML", "external": True}
     display_role = (
         'assistant'
-        if msg_type in (MessageType.AGENT_RESULT, MessageType.AGENT_CMD,
-                        MessageType.AGENT_STATUS, MessageType.MEDIA_REPLY)
+        if msg_type in (MessageType.AGENT_RESULT, MessageType.AGENT_STATUS,
+                        MessageType.MEDIA_REPLY)
         else str(row.get('role') or 'user')
     )
     if display_role == 'user':
         return {"type": "user_message", "text": content, "external": True}
     if display_role in ('system', 'media_module'):
         return {"type": "notice", "text": content, "external": True}
-    html_types = (MessageType.TOKEN_USAGE, MessageType.AGENT_RESULT,
-                  MessageType.AGENT_CMD, MessageType.AGENT_STATUS,
+    html_types = (MessageType.AGENT_RESULT, MessageType.AGENT_STATUS,
                   MessageType.MEDIA_REPLY, MessageType.SYSTEM_OP)
     return {
         "type": "message",
@@ -200,31 +213,97 @@ def _external_row_to_frame(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-async def _web_external_record_watcher(outbox: Any) -> None:
+def _external_row_to_telegram_texts(row: Dict[str, Any]) -> list:
+    """外部进程（CLI）的一条记录 -> 要镜像到 Telegram 的消息文本列表。
+
+    只镜像真正的对话内容：带 origin=cli-chat 标记的 USER_TEXT（CLI 的对话
+    文本；加记忆、填 API Key 这类状态机输入不带标记，不镜像）和 AI_REPLY。
+    命令、菜单、系统操作、token 统计一律不同步，否则在 CLI 里点开一个
+    设置面板就会把 Telegram 刷成一串菜单。
+    """
+    msg_type = row.get('msg_type')
+    content = str(row.get('content') or '').strip()
+    if not content:
+        return []
+    if msg_type == MessageType.USER_TEXT and row.get('origin') == 'cli-chat':
+        return split_text_for_telegram(f"🖥 [CLI]\n{content}")
+    if msg_type == MessageType.AI_REPLY:
+        return split_text_for_telegram(content)
+    return []
+
+
+def _web_external_tg_mirror_enabled() -> bool:
+    """CLI->Telegram 镜像开关：要有真实 bot（纯 Web 模式没有），且环境变量
+    XGENT_CLI_NO_TG_MIRROR 未设（不想让 Telegram 被 CLI 刷屏时关掉）。"""
+    return (
+        bool(BotConfig.TOKEN)
+        and _web_real_bot is not None
+        and not os.environ.get("XGENT_CLI_NO_TG_MIRROR")
+    )
+
+
+async def _web_external_record_watcher() -> None:
     """跨进程同步：盯 global_messages 的新记录，把**其它进程**（CLI）写入的
-    对话推成 SSE 帧，网页不用刷新就能看到 CLI 里聊了什么。
+    记录推成 SSE 帧，并把对话内容镜像到 Telegram。
 
     CLI 与服务端是两个进程、只共享数据库，没有别的实时通道；轮询 rowid
     游标是最小代价的桥。本进程自己写的记录已经通过直发帧/MirrorBot 到达
     网页，靠 metadata.src（services._RECORDER_SOURCE_ID）跳过，否则同一句
     话会显示两遍。游标从启动时刻的最大 rowid 开始，不重播历史。
+
+    CLI→Telegram 镜像放在这里而不是在 CLI 进程里做：服务端持有健康的 PTB
+    连接池（网页↔TG 的秒同步走的就是它），而 CLI 进程自己开裸 urllib 连
+    Telegram，每条消息都重新 TCP+TLS 握手，网络不好时逐条拖到 30 秒超时，
+    就是"CLI→bot 同步极慢甚至不同步"；CLI 侧镜像还是 create_task 发完即忘，
+    进程一退出未发完的任务直接被砍（吞消息）。改由服务端镜像后，CLI 只写
+    库，网络与生命周期都由服务端兜底，三端速度一致。
     """
     db = await BotMemoryDB.get_instance()
     cursor_rowid = await db.get_max_global_rowid()
     while True:
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(1.0)
         try:
             rows = await db.get_records_since_rowid(cursor_rowid)
         except Exception:
             logger.debug("web 跨端同步轮询失败", exc_info=True)
             continue
+        mirror_texts = []
         for row in rows:
             cursor_rowid = max(cursor_rowid, int(row.get('rowid') or 0))
             if row.get('src') == _RECORDER_SOURCE_ID:
                 continue
             frame = _external_row_to_frame(row)
-            if frame:
+            outbox = _web_external_outbox
+            if frame is not None and outbox is not None:
                 outbox.put(frame)
+            if _web_external_tg_mirror_enabled():
+                mirror_texts.extend(_external_row_to_telegram_texts(row))
+        # 网页帧先推完再发 Telegram：TG 那边网络慢时不能拖住下一轮网页帧。
+        for text in mirror_texts:
+            try:
+                await _web_real_bot.send_message(
+                    chat_id=BotConfig.AUTHORIZED_USER_ID, text=text,
+                )
+            except Exception:
+                logger.warning("CLI 消息镜像到 Telegram 失败", exc_info=True)
+
+
+async def start_external_sync_watcher(outbox: Any = None, app: Any = None) -> None:
+    """启动/接线跨端同步观察者（CLI→网页帧 + CLI→Telegram 镜像）。
+
+    与 Web 服务开关**解耦**：Web 关着时网页帧没有订阅者（put 落空，无害），
+    但 CLI→Telegram 镜像仍然要工作，所以观察者跟随 bot 生命周期而不是 Web
+    服务生命周期——此前它挂在 start_web_chat_if_enabled 里，Web 一关 CLI 的
+    跨端同步就整个停摆。outbox 给了就记住（Web 服务启动后把自己的 outbox
+    接进来），app 给了就刷新真实 bot 引用。
+    """
+    global _web_external_watch_task, _web_external_outbox, _web_real_bot
+    if app is not None:
+        _web_real_bot = getattr(app, "bot", None)
+    if outbox is not None:
+        _web_external_outbox = outbox
+    if _web_external_watch_task is None or _web_external_watch_task.done():
+        _web_external_watch_task = asyncio.create_task(_web_external_record_watcher())
 
 
 async def _web_read_settings() -> Dict[str, Any]:
@@ -910,6 +989,9 @@ async def start_web_chat_if_enabled(app: Optional[Any] = None, *, force: bool = 
     global _web_chat_server, _web_real_bot, _web_application
     if _web_chat_server is not None:
         return
+    # 跨端同步观察者无论 Web 开不开都要跑（它还承担 CLI→TG 镜像），先启动
+    # 并记下真实 bot；Web 开着时下面再把新服务器的 outbox 接给它。
+    await start_external_sync_watcher(app=app)
     web_on = normalize_bool(UserDataManager.get('web_enabled', False), False)
     term_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
     if not force and not (web_on or term_on):
@@ -985,25 +1067,22 @@ async def start_web_chat_if_enabled(app: Optional[Any] = None, *, force: bool = 
                 )
         return
     _web_chat_server = server
-    # 跨端同步观察者：把 CLI 写进数据库的新对话推成网页帧。
-    global _web_external_watch_task
-    _web_external_watch_task = asyncio.create_task(
-        _web_external_record_watcher(server.outbox)
-    )
+    # 跨端同步观察者已在函数开头启动，这里把新服务器的 outbox 接给它：
+    # 此后 CLI 写库的实时帧直达当前在线的网页订阅者。
+    await start_external_sync_watcher(server.outbox)
 
 
 async def stop_web_chat() -> None:
-    global _web_chat_server, _web_external_watch_task
-    watch_task, _web_external_watch_task = _web_external_watch_task, None
-    if watch_task is not None:
-        watch_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await watch_task
+    global _web_chat_server, _web_external_outbox
     if _web_chat_server is None:
         return
     server, _web_chat_server = _web_chat_server, None
     with contextlib.suppress(Exception):
         await asyncio.to_thread(server.stop)
+    # 观察者**不**随 Web 服务停止：CLI→Telegram 镜像与 Web 开关无关。
+    # 只把 outbox 换回无订阅者的独立实例——旧 outbox 已 close，继续用它
+    # 会让后续帧全部落空；等下次 Web 启动再接新的。
+    _web_external_outbox = WebOutbox()
 
 
 async def restart_web_chat(app: Optional[Any] = None, *, force: Optional[bool] = None) -> None:

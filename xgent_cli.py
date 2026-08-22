@@ -36,7 +36,6 @@ import asyncio
 import atexit
 import contextlib
 import io
-import json
 import logging
 import os
 import queue
@@ -614,87 +613,16 @@ def _save_history() -> None:
 
 
 # --------------------------------------------------------------------------
-# 跨端同步：CLI -> Telegram 镜像
+# 跨端同步：CLI -> Telegram / Web
 # --------------------------------------------------------------------------
-# CLI 是独立进程，与服务器只共享数据库，Telegram 那边天然看不到 CLI 里聊
-# 了什么。对话结束后把这轮新产生的 user/ai 记录按 Bot API 直接推过去——
-# 用 urllib 裸 POST 而不是再养一个 PTB Bot：CLI 进程不该有第二个
-# getUpdates 消费者，sendMessage 本身无状态，零依赖最稳。
-# 设 XGENT_CLI_NO_TG_MIRROR=1 关闭（不想让 Telegram 被 CLI 刷屏时用）。
-
-def _split_tg_chunks(text: str, limit: int = 3800) -> List[str]:
-    """把长文本切成 Telegram 发得下的块，尽量在换行处断。"""
-    text = str(text or "")
-    if len(text) <= limit:
-        return [text] if text else []
-    chunks: List[str] = []
-    remaining = text
-    while remaining:
-        if len(remaining) <= limit:
-            chunks.append(remaining)
-            break
-        cut = remaining.rfind("\n", 0, limit)
-        if cut < limit // 2:
-            cut = limit
-        chunks.append(remaining[:cut].rstrip("\n"))
-        remaining = remaining[cut:].lstrip("\n")
-    return chunks
-
-
-def _tg_send_message(text: str) -> None:
-    import urllib.request
-
-    base = BotConfig.API_BASE_URL or "https://api.telegram.org"
-    url = f"{base}/bot{BotConfig.TOKEN}/sendMessage"
-    payload = json.dumps({
-        "chat_id": BotConfig.AUTHORIZED_USER_ID,
-        "text": text,
-    }).encode("utf-8")
-    request = urllib.request.Request(
-        url, data=payload, headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        response.read()
-
-
-def _cli_mirror_enabled() -> bool:
-    return bool(BotConfig.TOKEN) and not os.environ.get("XGENT_CLI_NO_TG_MIRROR")
-
-
-async def _mirror_user_text_to_telegram(text: str) -> None:
-    """用户消息落库后立即镜像——不等回合结束，Telegram 那边实时看到你在
-    CLI 里说了什么。失败只记日志，镜像是旁路，不能把对话本身搞失败。"""
-    if not _cli_mirror_enabled():
-        return
-    try:
-        for chunk in _split_tg_chunks("🖥 [CLI]" + chr(10) + text):
-            await asyncio.to_thread(_tg_send_message, chunk)
-    except Exception:
-        logger.warning("CLI 用户消息镜像到 Telegram 失败", exc_info=True)
-
-
-async def _mirror_turn_to_telegram(since_rowid: int) -> None:
-    """回合结束后把这一轮新产生的 AI 回复镜像到 Telegram。
-
-    用户消息已由 _mirror_user_text_to_telegram 即时发过，这里只补 AI_REPLY；
-    命令、菜单、系统操作、token 统计一律不同步，否则在 CLI 里点开一个
-    设置面板就会把 Telegram 刷成一串菜单。
-    """
-    if not _cli_mirror_enabled():
-        return
-    try:
-        db = await BotMemoryDB.get_instance()
-        rows = await db.get_records_since_rowid(since_rowid)
-        parts: List[str] = [
-            str(row.get("content") or "")
-            for row in rows
-            if row.get("msg_type") == MessageType.AI_REPLY and row.get("content")
-        ]
-        for part in parts:
-            for chunk in _split_tg_chunks(part):
-                await asyncio.to_thread(_tg_send_message, chunk)
-    except Exception:
-        logger.warning("CLI 对话镜像到 Telegram 失败", exc_info=True)
+# CLI 是独立进程，与服务器只共享数据库。CLI 里说的话不再由本进程直接推给
+# Telegram：早先这里是裸 urllib 逐条 POST Bot API，每条消息重新 TCP+TLS
+# 握手，网络不好时逐条拖到 30 秒超时（"CLI→bot 同步极慢甚至不同步"的根源），
+# 而且镜像是 create_task 发完即忘，CLI 一退出未发完的任务直接被砍（吞消息）。
+# 现在只负责把对话文本带上 origin=cli-chat 标记写库——服务端的跨端观察者
+# （idle.py 的 _web_external_record_watcher）看到后用自己那条健康的 PTB
+# 连接（网页↔TG 秒同步走的就是它）镜像到 Telegram、推帧给网页。
+# 设 XGENT_CLI_NO_TG_MIRROR=1（服务端环境变量）可关掉镜像。
 
 
 # --------------------------------------------------------------------------
@@ -817,19 +745,13 @@ async def _run_conversation(text: str) -> None:
         return
 
     try:
-        # 游标必须先于用户消息落库：镜像窗口取"since_rowid 之后的新记录"，
-        # 先记录再取游标会把用户这句话排除在窗口外——镜像就只剩 AI 回复。
-        db = await BotMemoryDB.get_instance()
-        since_rowid = await db.get_max_global_rowid()
+        # 对话文本带 origin=cli-chat 标记：服务端跨端观察者据此把它镜像到
+        # Telegram（🖥 [CLI] 前缀）。状态机输入不带标记，不镜像。
         await GlobalRecorder.record_user_message(
-            text, MessageType.USER_TEXT, BotConfig.AUTHORIZED_USER_ID
+            text, MessageType.USER_TEXT, BotConfig.AUTHORIZED_USER_ID,
+            metadata={'origin': 'cli-chat'},
         )
-        # 镜像全部后台发送（create_task）：服务器到 Telegram 的网络往返
-        # 可能要几秒甚至超时，await 它等于让每条消息先卡一记才进对话。
-        # 镜像是旁路，永远不阻塞主流程。
-        asyncio.create_task(_mirror_user_text_to_telegram(text))
         await process_conversation(update, context, text)
-        asyncio.create_task(_mirror_turn_to_telegram(since_rowid))
     except Exception:
         _report_failure("对话")
 
@@ -844,6 +766,7 @@ async def _run_command(command: str) -> None:
             SCREEN.notice(f"未知命令 /{name}，当作普通对话发给 AI（/help 看命令列表）。", "warn")
             await GlobalRecorder.record_user_message(
                 command, MessageType.USER_TEXT, BotConfig.AUTHORIZED_USER_ID,
+                metadata={'origin': 'cli-chat'},
             )
             await process_conversation(update, context, command)
         else:
