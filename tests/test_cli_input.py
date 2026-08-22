@@ -297,5 +297,69 @@ print(json.dumps({
         )
 
 
+class MenuNavigationTests(CliProbeMixin, unittest.TestCase):
+    """黄 ❯ 菜单导航档：提示符三档颜色 + Ctrl+C 关闭菜单而不是退出。"""
+
+    def test_prompt_tiers_menu_dismiss_and_text_exits_navigation(self):
+        result = self.run_probe("""
+import asyncio
+import xgent_cli
+from xgent_app import cli_bridge
+from xgent_app.cli_render import Palette
+
+xgent_cli.PALETTE = Palette(True)
+
+async def main():
+    await xgent_cli._init_runtime()
+    idle = xgent_cli._prompt_text()
+
+    # /start 之后是菜单导航：黄 ❯
+    await xgent_cli._run_command("/start")
+    menu = xgent_cli._prompt_text()
+    mode = xgent_cli._prompt_mode()
+
+    # Ctrl+C 的菜单档语义 = _MENU_DISMISS（信号处理器分支的判断依据）
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    xgent_cli._READER._pending = (future, loop, 1)
+    xgent_cli._cancel_event.set()
+    handled = xgent_cli._READER.request_menu_dismiss()
+    xgent_cli._cancel_event.clear()
+    # 主循环同款处理
+    dismissed = cli_bridge.dismiss_menu()
+    after = xgent_cli._prompt_text()
+
+    # 菜单导航中收到一条纯文本输出（如聊了一句 AI）-> 退出导航，恢复绿
+    await xgent_cli._run_command("/start")
+    in_menu_again = xgent_cli._prompt_mode() == "menu"
+    bot = cli_bridge.CliBot(1)
+    await bot.send_message(chat_id=1, text="普通文本输出")
+    after_plain = xgent_cli._prompt_text()
+
+    print(json.dumps({
+        "idle_green": "38;5;79" in idle,
+        "menu_yellow": "38;5;221" in menu,
+        "mode": mode,
+        "menu_dismiss_handled": handled,
+        "dismissed": dismissed,
+        "back_green": "38;5;79" in after,
+        "menu_again": in_menu_again,
+        "plain_exits_navigation": "38;5;79" in after_plain,
+    }))
+    await xgent_cli._shutdown_runtime()
+
+asyncio.run(main())
+""")
+        self.assertTrue(result["idle_green"])
+        self.assertTrue(result["menu_yellow"], "/start 后提示符应进入黄色菜单档")
+        self.assertEqual("menu", result["mode"])
+        self.assertTrue(result["menu_dismiss_handled"])
+        self.assertTrue(result["dismissed"])
+        self.assertTrue(result["back_green"])
+        self.assertTrue(result["menu_again"])
+        self.assertTrue(result["plain_exits_navigation"],
+                       "纯文本输出后应退出菜单导航，提示符恢复绿色")
+
+
 if __name__ == "__main__":
     unittest.main()

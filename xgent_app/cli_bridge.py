@@ -80,6 +80,11 @@ def _allocate_cli_message_id() -> int:
 _MENU_LOCK = threading.Lock()
 _menu_by_message: Dict[int, List[Tuple[str, str]]] = {}
 _active_menu_message_id: Optional[int] = None
+# 「菜单导航中」：最近一次交互输出是带按钮的菜单。区别于 _active_menu_message_id
+# （Telegram 语义里旧按钮永远可点），这个标志只看"最后展示的是不是菜单"，
+# 供 CLI 决定提示符颜色（黄 ❯）和 Ctrl+C 语义（关菜单而不是退出）。
+# 用户和 AI 正常聊天（纯文本输出）后即回到 False，避免黄灯常亮失去信号意义。
+_menu_top = False
 
 
 def _register_menu(message_id: Optional[int], buttons: Sequence[Tuple[str, str]],
@@ -91,19 +96,48 @@ def _register_menu(message_id: Optional[int], buttons: Sequence[Tuple[str, str]]
     而且"停止回答"会以一颗隐形按钮的身份赖在当前菜单上：这一轮结束后用户
     敲个裸数字本来是想点别的，结果打到了 act_stop_generation。
     """
-    global _active_menu_message_id
+    global _active_menu_message_id, _menu_top
     with _MENU_LOCK:
         if buttons:
             if message_id is not None:
                 _menu_by_message[message_id] = list(buttons)
                 _active_menu_message_id = message_id
+            _menu_top = True
             return
         if not is_edit:
-            return  # 新的纯文本消息：不影响已有菜单
+            # 新的纯文本消息：菜单注册表按 Telegram 语义保留（旧按钮仍可点），
+            # 但"导航中"信号结束——屏幕上最后一层已经不是菜单了。
+            _menu_top = False
+            return
         if message_id is not None:
             _menu_by_message.pop(message_id, None)
             if _active_menu_message_id == message_id:
+                # 只有当前菜单自己的按钮被移除（编辑/删除）才算退出导航；
+                # 删一条无关的旧消息（如 /export 完删状态提示）不该误伤信号。
                 _active_menu_message_id = None
+                _menu_top = False
+
+
+def menu_is_top() -> bool:
+    """最近一次交互输出是否是菜单（CLI 的"菜单导航中"信号）。"""
+    with _MENU_LOCK:
+        return _menu_top
+
+
+def dismiss_menu() -> bool:
+    """用户显式关闭当前菜单导航（CLI 的 Ctrl+C）。
+
+    与 Telegram 的"按钮永远可点"语义不同：终端里用户说"我要退出这个菜单"，
+    就真的清掉——编号不再生效，提示符恢复空闲色。返回是否确有菜单被关掉。
+    """
+    global _menu_top, _active_menu_message_id
+    with _MENU_LOCK:
+        had = _menu_top or _active_menu_message_id is not None
+        if _active_menu_message_id is not None:
+            _menu_by_message.pop(_active_menu_message_id, None)
+        _active_menu_message_id = None
+        _menu_top = False
+        return had
 
 
 def get_last_menu_options() -> List[str]:
@@ -124,10 +158,11 @@ def get_last_menu_labels() -> List[str]:
 
 def reset_menu_state() -> None:
     """清空菜单注册表（单测隔离用）。"""
-    global _active_menu_message_id
+    global _active_menu_message_id, _menu_top
     with _MENU_LOCK:
         _menu_by_message.clear()
         _active_menu_message_id = None
+        _menu_top = False
 
 
 # --------------------------------------------------------------------------
@@ -442,6 +477,8 @@ __all__ = [
     "build_cli_command_objects",
     "get_last_menu_options",
     "get_last_menu_labels",
+    "menu_is_top",
+    "dismiss_menu",
     "get_screen",
     "set_screen",
     "reset_menu_state",

@@ -54,9 +54,11 @@ from xgent_app.cli_bridge import (
     build_cli_callback_objects,
     build_cli_command_objects,
     build_cli_conversation_objects,
+    dismiss_menu,
     get_last_menu_labels,
     get_last_menu_options,
     get_screen,
+    menu_is_top,
 )
 from xgent_app.cli_render import display_width
 from xgent_app.cli_palette import (
@@ -284,8 +286,7 @@ def _banner() -> None:
         ("/", "列出全部命令，Tab 继续补全"),
         ("/sync", "拉取 Telegram/Web 端的跨端对话"),
         ("数字", "选择菜单项，输入内容时用 :数字"),
-        ("Ctrl+C", "回答时中断；空闲时退出"),
-        ("红 ❯ 期间", "正在输入配置，Ctrl+C 取消该输入"),
+        ("Ctrl+C", "红❯取消输入 / 黄❯关闭菜单 / 绿❯退出"),
     ]
     label_width = max(display_width(label) for label, _ in hints)
     for label, desc in hints:
@@ -347,15 +348,29 @@ def _palette_rows(names: Sequence[str], selected: int) -> List[str]:
 
 
 def _input_state_active() -> bool:
-    """对话核心的状态机是否正等着用户输入（API Key、轮数、密码这类）。
-
-    提示符颜色和 Ctrl+C 语义都看它：这种时候 ❯ 是红的，Ctrl+C 取消输入
-    状态；空闲时 ❯ 是青绿的，Ctrl+C 退出。
-    """
+    """对话核心的状态机是否正等着用户输入（API Key、轮数、密码这类）。"""
     try:
         return UserDataManager.get('state') != BotState.IDLE
     except Exception:
         return False
+
+
+def _prompt_mode() -> str:
+    """当前提示符档位：'input' 数值输入 > 'menu' 菜单导航 > 'idle' 空闲。
+
+    终端只有一个输入通道，用户分不清"这行字会进状态机/点按钮还是发给 AI"，
+    颜色就是这个模式的显式信号；Ctrl+C 的语义跟着档位走：
+    红=取消输入、黄=关闭菜单、绿=退出 CLI。
+    """
+    if _input_state_active():
+        return "input"
+    if menu_is_top():
+        return "menu"
+    return "idle"
+
+
+def _prompt_color_name() -> str:
+    return {"input": "err", "menu": "warn", "idle": "ai"}[_prompt_mode()]
 
 
 def _prompt_plain() -> str:
@@ -363,7 +378,7 @@ def _prompt_plain() -> str:
     pal = PALETTE
     if not pal.enabled:
         return "❯ "
-    color = pal.err if _input_state_active() else pal.ai
+    color = getattr(pal, _prompt_color_name())
     return f"{color}{pal.bold}❯{pal.reset} "
 
 
@@ -809,6 +824,7 @@ async def _run_callback(callback_data: str) -> None:
 _EOF = object()     # Ctrl+D / stdin 关闭
 _EXIT = object()    # 空闲时按了 Ctrl+C
 _CANCEL = object()  # 状态输入中按了 Ctrl+C：取消输入状态，不退出 CLI
+_MENU_DISMISS = object()  # 菜单导航中按了 Ctrl+C：关闭菜单，不退出 CLI
 
 # Ctrl+C 取消的跨线程信号。信号处理器在主线程里 set 它，命令面板的等键
 # 轮询（SlashPalette.abort_check）看到后抛 KeyboardInterrupt——cbreak 模式
@@ -938,6 +954,10 @@ class _StdinReader:
         """状态输入中的 Ctrl+C：把正等着的那次读取兑现成"取消输入状态"。"""
         return self._resolve_current(_CANCEL)
 
+    def request_menu_dismiss(self) -> bool:
+        """菜单导航中的 Ctrl+C：把正等着的那次读取兑现成"关闭菜单"。"""
+        return self._resolve_current(_MENU_DISMISS)
+
     def _resolve_current(self, sentinel: Any) -> bool:
         with self._lock:
             has_pending = self._pending is not None
@@ -956,14 +976,14 @@ def _prompt_text() -> str:
     ANSI 序列必须用 \\001..\\002 包起来：readline 靠提示符的显示宽度算光标
     位置，把颜色转义的字节数也算进去的话，方向键翻历史时行内容会画错位。
 
-    配置状态机等待输入时（设置 Key/轮数/密码等）整根变红——终端只有一个
-    输入通道，用户分不清"这行字会进状态机还是发给 AI"，红色就是这个模式
-    的显式信号；Ctrl+C 在红色期间是"取消输入状态"而不是退出。
+    配置状态机等待输入时（设置 Key/轮数/密码等）整根变红，菜单导航中黄色，
+    空闲青绿——终端只有一个输入通道，用户分不清"这行字会进状态机、点按钮
+    还是发给 AI"，颜色就是这个模式的显式信号；Ctrl+C 语义跟着颜色走。
     """
     pal = PALETTE
     if not pal.enabled:
         return "❯ "
-    color = pal.err if _input_state_active() else pal.ai
+    color = getattr(pal, _prompt_color_name())
     return f"\001{color}{pal.bold}\002❯\001{pal.reset}\002 "
 
 
@@ -999,17 +1019,24 @@ def _install_sigint_handler() -> None:
                 SCREEN.notice("已请求停止，正在收尾…（再按一次 Ctrl+C 强制退出）", "warn")
                 return
             raise KeyboardInterrupt
-        # 状态输入中（提示符是红色的那些时刻）：Ctrl+C = 取消输入状态。
-        # /start 里的数值输入、API Key、轮数这类状态机在 Telegram 上有
-        # "发送 cancel" 这条官方出口，终端的原生等价物就是 Ctrl+C。
-        # 先叫醒阻塞在等键里的面板（abort 轮询），再兑现等待中的读取；
-        # 两条路谁先到都只兑现一次。取消之后再按 Ctrl+C 才是退出。
+        # 红 ❯（状态输入中）：Ctrl+C = 取消输入状态。/start 里的数值输入、
+        # API Key、轮数这类状态机在 Telegram 上有 "发送 cancel" 这条官方
+        # 出口，终端的原生等价物就是 Ctrl+C。先叫醒阻塞在等键里的面板
+        # （abort 轮询），再兑现等待中的读取；两条路谁先到都只兑现一次。
         if _input_state_active():
             _cancel_event.set()
             if _READER.request_cancel():
                 return
             _cancel_event.clear()
-        # 空闲时：兑现正在等待的那次读取，让主循环走正常的收尾路径。
+        # 黄 ❯（菜单导航中）：Ctrl+C = 关闭菜单。用户在 /start 一层层菜单里
+        # 时并没有被困住（随时可以打字聊 AI），但"按 Ctrl+C 想退出菜单却
+        # 直接退出了 CLI"才是符合直觉的反例——菜单场景拦截一次退出。
+        if menu_is_top():
+            _cancel_event.set()
+            if _READER.request_menu_dismiss():
+                return
+            _cancel_event.clear()
+        # 绿 ❯（空闲）：兑现正在等待的那次读取，让主循环走正常的收尾路径。
         # 直接抛 KeyboardInterrupt 会打断事件循环本身，收尾要靠 asyncio.run()
         # 的异常路径，那条路上还得等一堆线程——正是这个 bug 的来源。
         if _READER.request_exit():
@@ -1069,6 +1096,13 @@ async def _main_loop() -> None:
         line = await _READER.read(_prompt_text())
         if line is _EXIT or line is _EOF:
             break
+        if line is _MENU_DISMISS:
+            # 菜单导航中按了 Ctrl+C：关闭当前菜单（编号不再生效），提示符
+            # 恢复空闲色。再按一次 Ctrl+C 才是退出 CLI。
+            _cancel_event.clear()
+            if dismiss_menu():
+                SCREEN.notice("已关闭菜单导航（编号不再生效）。再按 Ctrl+C 退出 CLI；直接输入文字则与 AI 对话。", "info")
+            continue
         if line is _CANCEL:
             # 状态输入中按了 Ctrl+C：喂 "cancel" 给状态机——messages.py 的
             # 官方取消路径会清掉 state 和全部 pending buffer 并回主菜单，
