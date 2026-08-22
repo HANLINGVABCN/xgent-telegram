@@ -141,8 +141,8 @@ async def _web_read_history(limit: int) -> List[Dict[str, Any]]:
                 pass  # 转换失败退回原文，总比报错好
             result.append({'role': 'assistant', 'content': content, 'parse_mode': 'HTML'})
         elif msg_type in (MessageType.TOKEN_USAGE, MessageType.AGENT_RESULT,
-                          MessageType.AGENT_CMD, MessageType.MEDIA_REPLY,
-                          MessageType.SYSTEM_OP):
+                          MessageType.AGENT_CMD, MessageType.AGENT_STATUS,
+                          MessageType.MEDIA_REPLY, MessageType.SYSTEM_OP):
             # 这些类型存库时已是 Telegram HTML，直接带 parse_mode 让前端渲染。
             # token 统计行是元信息不是正文：降级成 system 角色，前端渲染成居中
             # 灰条，不再混在 AI 气泡流里（对齐实时流的观感）。
@@ -181,7 +181,8 @@ def _external_row_to_frame(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return {"type": "message", "text": content, "parse_mode": "HTML", "external": True}
     display_role = (
         'assistant'
-        if msg_type in (MessageType.AGENT_RESULT, MessageType.AGENT_CMD, MessageType.MEDIA_REPLY)
+        if msg_type in (MessageType.AGENT_RESULT, MessageType.AGENT_CMD,
+                        MessageType.AGENT_STATUS, MessageType.MEDIA_REPLY)
         else str(row.get('role') or 'user')
     )
     if display_role == 'user':
@@ -189,7 +190,8 @@ def _external_row_to_frame(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if display_role in ('system', 'media_module'):
         return {"type": "notice", "text": content, "external": True}
     html_types = (MessageType.TOKEN_USAGE, MessageType.AGENT_RESULT,
-                  MessageType.AGENT_CMD, MessageType.MEDIA_REPLY, MessageType.SYSTEM_OP)
+                  MessageType.AGENT_CMD, MessageType.AGENT_STATUS,
+                  MessageType.MEDIA_REPLY, MessageType.SYSTEM_OP)
     return {
         "type": "message",
         "text": content,

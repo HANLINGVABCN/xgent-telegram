@@ -2235,6 +2235,28 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         round_decision['status_text'],
                         reply_markup=None,
                     )
+                if not round_decision['continue_loop']:
+                    # 终态状态（停止/超限/失败）是这条消息最终呈现的文字，落库一份
+                    with contextlib.suppress(Exception):
+                        await GlobalRecorder.record(
+                            MessageType.AGENT_STATUS, 'assistant',
+                            round_decision['status_text'],
+                            chat_id=update.effective_chat.id,
+                        )
+
+            round_status_text = build_agent_round_status(
+                operation_iteration,
+                "completed",
+                origin=agent_origin,
+                operation_count=len(protocol_blocks),
+            )
+            # 每轮的 ✅ 状态行是用户在 Telegram/网页上真实看到的内容，落库一份：
+            # 刷新后的历史显示与实时流逐字一致（AGENT_STATUS 只进显示，不进 AI 上下文）。
+            with contextlib.suppress(Exception):
+                await GlobalRecorder.record(
+                    MessageType.AGENT_STATUS, 'assistant', round_status_text,
+                    chat_id=update.effective_chat.id,
+                )
 
             if not round_decision['continue_loop']:
                 if round_decision['show_completion_status'] and round_decision['status_text'] is None:
@@ -2243,12 +2265,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         agent_stop_msg,
                         context,
                         update.effective_chat.id,
-                        build_agent_round_status(
-                            operation_iteration,
-                            "completed",
-                            origin=agent_origin,
-                            operation_count=len(protocol_blocks),
-                        ),
+                        round_status_text,
                     )
                 break
 
@@ -2257,12 +2274,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 agent_stop_msg,
                 context,
                 update.effective_chat.id,
-                build_agent_round_status(
-                    operation_iteration,
-                    "completed",
-                    origin=agent_origin,
-                    operation_count=len(protocol_blocks),
-                ),
+                round_status_text,
             )
 
             # Continue from this turn's in-memory transcript. Re-reading global history here would

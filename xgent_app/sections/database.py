@@ -327,6 +327,9 @@ class BotMemoryDB:
             # 文本会混进上下文污染对话。
             if msg_type == MessageType.TOKEN_USAGE:
                 continue
+            # 轮次状态行（✅ Agent 第 N 轮…）同理：纯 UI，不进上下文。
+            if msg_type == MessageType.AGENT_STATUS:
+                continue
             
             # 系统操作以 system 角色注入（OpenAI 格式原样支持；Gemini/Claude 在各自构建器里降级为 user），
             # 避免系统旁白伪装成用户消息、破坏对话轮换结构
@@ -339,6 +342,14 @@ class BotMemoryDB:
                 result.append({
                     'role': 'user', 
                     'content': f"[操作] {msg['content']}"
+                })
+            elif msg_type == MessageType.COMMAND:
+                # 命令是系统执行的，不是用户打在聊天框里的话。不加标记时，
+                # 它和紧随其后的普通消息在上下文里看起来像被拼在一起，
+                # 模型会误读成"用户把命令和闲话黏成一条发出"。
+                result.append({
+                    'role': 'user',
+                    'content': f"[命令] {msg['content']}"
                 })
             elif msg_type == MessageType.AGENT_CMD:
                 result.append({
@@ -380,41 +391,27 @@ class BotMemoryDB:
         rows = await cursor.fetchall()
 
         result = []
-        pending_cmds = 0  # 连续 AGENT_CMD 的个数，遇到下一个非 CMD 记录时结算成状态行
-
-        def _flush_cmds() -> None:
-            nonlocal pending_cmds
-            if pending_cmds:
-                result.append({
-                    'role': 'assistant',
-                    'content': f"✅ Agent · {pending_cmds} 个操作已完成",
-                    'msg_type': MessageType.AGENT_CMD,
-                })
-                pending_cmds = 0
-
         for row in reversed(rows):
             msg = dict(row)
             msg_type = msg.get('msg_type')
             if is_redundant_agent_command_record(msg_type, msg.get('content')):
                 continue
             if msg_type == MessageType.AGENT_CMD:
-                # 原文是协议块/[Agent媒体生成]提示词，实时流上用户看到的只是
-                # 轮次状态——显示层同样只给状态行。
-                pending_cmds += 1
+                # 协议块原文/[Agent媒体生成]提示词：bot 界面从不把它们当独立
+                # 消息显示（用户看到的是 AI 正文 + 每轮的 AGENT_STATUS 状态行），
+                # 刷新后的历史同样不显示。
                 continue
-            _flush_cmds()
             # 执行结果 / 媒体回复：AI 侧产出 → 显示到对面（assistant）。
             # msg_type 一并返回，供 _web_read_history 决定哪些消息需 Markdown→HTML 转换
             # （AI_REPLY 存的是 Markdown 原文，TOKEN_USAGE/AGENT_RESULT 已是 HTML）。
             display_role = 'assistant' if msg_type in (
-                MessageType.AGENT_RESULT, MessageType.MEDIA_REPLY,
+                MessageType.AGENT_RESULT, MessageType.MEDIA_REPLY, MessageType.AGENT_STATUS,
             ) else msg['role']
             result.append({
                 'role': display_role,
                 'content': msg['content'],
                 'msg_type': msg_type,
             })
-        _flush_cmds()
         return result
 
     async def get_max_global_rowid(self) -> int:

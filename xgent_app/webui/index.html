@@ -1132,6 +1132,7 @@
 
   // ---- 气泡渲染 ----
   function makeBubble(role, text, messageId, parseMode, markup) {
+    var stick = isNearBottom();   // 只有本来就贴底才自动滚动：用户往上翻历史时，新消息不许把页面拽到底部
     msgCount++;
     updateEmptyState();
     var row = document.createElement("div");
@@ -1142,7 +1143,7 @@
       pill.innerHTML = renderText(text, parseMode);
       row.appendChild(pill);
       log.appendChild(row);
-      scrollDown();
+      if (stick) scrollDown();
       return { row: row, body: pill, btns: null };
     }
     var bubble = document.createElement("div");
@@ -1177,7 +1178,7 @@
     if (markup && markup.length) { btns = renderButtons(markup, messageId); if (btns) bubble.appendChild(btns); }
     row.appendChild(bubble);
     log.appendChild(row);
-    scrollDown();
+    if (stick) scrollDown();
     var entry = { row: row, body: body, btns: btns };
     if (messageId != null) { byMessageId[messageId] = entry; }
     return entry;
@@ -1202,6 +1203,7 @@
   // side 决定显示在用户侧还是 AI 侧（自己上传的图片在用户侧）。
   function makeMediaBubble(kind, filename, caption, downloadUrl, messageId, side) {
     side = side || "ai";
+    var stick = isNearBottom();
     msgCount++;
     updateEmptyState();
     var row = document.createElement("div");
@@ -1295,7 +1297,7 @@
       bubble.appendChild(ts);
       row.appendChild(bubble);
       log.appendChild(row);
-      scrollDown();
+      if (stick) scrollDown();
       entry = { row: row, body: bubble, btns: null };
     } else {
       row.className = "msg-row sys";
@@ -1307,7 +1309,7 @@
       );
       row.appendChild(pill);
       log.appendChild(row);
-      scrollDown();
+      if (stick) scrollDown();
       entry = { row: row, body: pill, btns: null };
     }
     if (messageId != null) { byMessageId[messageId] = entry; }
@@ -1361,7 +1363,7 @@
     statusText.classList.toggle("busy", busy);
     if (busy) showTyping(); else hideTyping();
   }
-  function showTyping() { typing.classList.remove("hidden"); scrollDown(); }
+  function showTyping() { typing.classList.remove("hidden"); if (isNearBottom()) scrollDown(); }
   function hideTyping() { typing.classList.add("hidden"); }
 
   // ---- SSE 帧处理 ----
@@ -1380,7 +1382,6 @@
       } else {
         makeBubble("ai", frame.text, frame.message_id, frame.parse_mode, frame.reply_markup);
       }
-      scrollDown();
     } else if (frame.type === "edit_markup") {
       var em = byMessageId[frame.message_id];
       if (em) setButtons(em, frame.reply_markup, frame.message_id);

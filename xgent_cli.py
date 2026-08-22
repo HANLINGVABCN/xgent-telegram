@@ -657,28 +657,39 @@ def _tg_send_message(text: str) -> None:
         response.read()
 
 
-async def _mirror_turn_to_telegram(since_rowid: int) -> None:
-    """把 since_rowid 之后这一轮新产生的对话记录镜像到 Telegram。
+def _cli_mirror_enabled() -> bool:
+    return bool(BotConfig.TOKEN) and not os.environ.get("XGENT_CLI_NO_TG_MIRROR")
 
-    只镜像 USER_TEXT 和 AI_REPLY——命令、菜单、系统操作不同步，否则在
-    CLI 里点开一个设置面板就会把 Telegram 刷成一串菜单。失败只记日志，
-    镜像是旁路，不能把对话本身搞失败。
+
+async def _mirror_user_text_to_telegram(text: str) -> None:
+    """用户消息落库后立即镜像——不等回合结束，Telegram 那边实时看到你在
+    CLI 里说了什么。失败只记日志，镜像是旁路，不能把对话本身搞失败。"""
+    if not _cli_mirror_enabled():
+        return
+    try:
+        for chunk in _split_tg_chunks("🖥 [CLI]" + chr(10) + text):
+            await asyncio.to_thread(_tg_send_message, chunk)
+    except Exception:
+        logger.warning("CLI 用户消息镜像到 Telegram 失败", exc_info=True)
+
+
+async def _mirror_turn_to_telegram(since_rowid: int) -> None:
+    """回合结束后把这一轮新产生的 AI 回复镜像到 Telegram。
+
+    用户消息已由 _mirror_user_text_to_telegram 即时发过，这里只补 AI_REPLY；
+    命令、菜单、系统操作、token 统计一律不同步，否则在 CLI 里点开一个
+    设置面板就会把 Telegram 刷成一串菜单。
     """
-    if not BotConfig.TOKEN or os.environ.get("XGENT_CLI_NO_TG_MIRROR"):
+    if not _cli_mirror_enabled():
         return
     try:
         db = await BotMemoryDB.get_instance()
         rows = await db.get_records_since_rowid(since_rowid)
-        parts: List[str] = []
-        for row in rows:
-            msg_type = row.get("msg_type")
-            content = str(row.get("content") or "")
-            if not content:
-                continue
-            if msg_type == MessageType.USER_TEXT and row.get("role") == "user":
-                parts.append(f"🖥 [CLI]\n{content}")
-            elif msg_type == MessageType.AI_REPLY:
-                parts.append(content)
+        parts: List[str] = [
+            str(row.get("content") or "")
+            for row in rows
+            if row.get("msg_type") == MessageType.AI_REPLY and row.get("content")
+        ]
         for part in parts:
             for chunk in _split_tg_chunks(part):
                 await asyncio.to_thread(_tg_send_message, chunk)
@@ -813,6 +824,8 @@ async def _run_conversation(text: str) -> None:
         await GlobalRecorder.record_user_message(
             text, MessageType.USER_TEXT, BotConfig.AUTHORIZED_USER_ID
         )
+        # 用户消息即时镜像；AI 回复等回合结束由 _mirror_turn_to_telegram 补
+        await _mirror_user_text_to_telegram(text)
         await process_conversation(update, context, text)
         await _mirror_turn_to_telegram(since_rowid)
     except Exception:

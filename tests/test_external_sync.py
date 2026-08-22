@@ -328,26 +328,34 @@ async def main():
                              "OLD", "<<END_edit_greet_82e6", "```"]))
     await GR.record(MT.TOKEN_USAGE, "assistant", "↑ 21825 tokens (0 cached) · ↓ 1958 tokens")
     await GR.record_ai_reply("正文回复 **加粗**")
+    await GR.record(MT.AGENT_STATUS, "assistant", "✅ Agent 第 1 轮 · 1 个操作已完成")
+    await GR.record_user_message("/restart", MT.COMMAND)
 
     rows = await db.get_display_history(10)
     web = await ns["_web_read_history"](10)
-    cmd_rows = [r for r in rows if r["msg_type"] == MT.AGENT_CMD]
+    ctx = await db.get_conversation_messages(50)
+    status_rows = [r for r in rows if r["msg_type"] == MT.AGENT_STATUS]
     token_web = [r for r in web if r.get("parse_mode") and "21825" in r["content"]]
     all_display = " ".join(r["content"] for r in rows)
+    all_ctx = " ".join(str(m.get("content") or "") for m in ctx)
     print(json.dumps({
-        "cmds_merged_one": len(cmd_rows) == 1,
-        "status_line": cmd_rows and cmd_rows[0]["content"] == "✅ Agent · 3 个操作已完成",
+        "cmd_hidden": all(r["msg_type"] != MT.AGENT_CMD for r in rows),
+        "status_shown": any(r["content"] == "✅ Agent 第 1 轮 · 1 个操作已完成" for r in status_rows),
         "no_raw_fence": "```" not in all_display,
         "no_media_prompt": "Please generate" not in all_display,
         "token_gray": token_web and token_web[0]["role"] == "system",
         "ai_reply_html": any("<b>" in r["content"] for r in web if r.get("parse_mode") == "HTML"),
+        "status_not_in_ctx": "Agent 第 1 轮" not in all_ctx,
+        "cmd_prefixed_in_ctx": "[命令] /restart" in all_ctx or "[命令]" in all_ctx,
     }))
     await db.close()
 
 asyncio.run(main())
 """)
-        self.assertTrue(result["cmds_merged_one"], "连续 AGENT_CMD 要合并成一条状态行")
-        self.assertTrue(result["status_line"], "状态行要与实时流同款：✅ Agent · N 个操作已完成")
+        self.assertTrue(result["cmd_hidden"], "AGENT_CMD 协议原文在显示历史里应整体隐藏")
+        self.assertTrue(result["status_shown"], "落库的轮次状态行要原样显示（与 bot 界面逐字一致）")
+        self.assertTrue(result["status_not_in_ctx"], "轮次状态是 UI 信息，不进 AI 上下文")
+        self.assertTrue(result["cmd_prefixed_in_ctx"], "命令记录在 AI 上下文里要带 [命令] 前缀")
         self.assertTrue(result["no_raw_fence"], "刷新后的显示里不允许出现协议围栏原文")
         self.assertTrue(result["no_media_prompt"], "媒体生成的完整提示词不该出现在显示里")
         self.assertTrue(result["token_gray"], "token 统计行要降级成 system 灰条")
@@ -403,6 +411,8 @@ async def main():
     await xgent_cli.GlobalRecorder.record_user_message(
         "我在 CLI 里说的话", xgent_cli.MessageType.USER_TEXT,
         xgent_cli.BotConfig.AUTHORIZED_USER_ID)
+    # 用户消息即时镜像（不等回合结束）
+    await xgent_cli._mirror_user_text_to_telegram("我在 CLI 里说的话")
     await xgent_cli.GlobalRecorder.record_ai_reply("AI 在 CLI 里的回答")
     await xgent_cli._mirror_turn_to_telegram(cursor)
     joined = chr(10).join(sent)

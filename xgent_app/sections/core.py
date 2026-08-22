@@ -875,6 +875,7 @@ class MessageType:
     AGENT_CMD = 'agent_cmd'           # Agent 请求的工具动作
     AGENT_RESULT = 'agent_result'     # Agent 工具结果
     TOKEN_USAGE = 'token_usage'       # 每轮回复末尾的 token 用量提示（独立消息，常驻历史）
+    AGENT_STATUS = 'agent_status'     # Agent 轮次状态行（✅ Agent 第 N 轮…，仅显示，不进 AI 上下文）
 
 def _read_int_env(name: str, default: int, minimum: int = 1) -> int:
     try:
