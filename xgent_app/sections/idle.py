@@ -220,7 +220,12 @@ def _external_row_to_telegram_texts(row: Dict[str, Any]) -> list:
     文本；加记忆、填 API Key 这类状态机输入不带标记，不镜像）和**最终**
     AI_REPLY——agent_intermediate 标记的 Agent 中间轮响应、no_mirror 标记的
     停止标记（⏹️ 已停止）都跳过，否则 CLI 一轮 Agent 对话/连按 Ctrl+C 会把
-    Telegram 刷成十几条中间输出。命令、菜单、系统操作、token 统计一律不同步。
+    Telegram 刷成十几条中间输出。命令、菜单、系统操作一律不同步；TOKEN_USAGE
+    则同步——CLI 里聊天本来就看不到 token 用量，镜像到 Telegram 后至少能在
+    那边看到这轮花了多少 token（原生 Telegram 对话里这条消息本就存在，CLI
+    镜像不该比原生体验差）。content 已是 `<i>…</i>` 包裹的 HTML，这里的镜像
+    走纯文本 send_message（没有 parse_mode 通道），先把 <i> 标签剥掉再发，
+    避免用户在 Telegram 里看到裸露的尖括号标签。
     """
     msg_type = row.get('msg_type')
     content = str(row.get('content') or '').strip()
@@ -232,6 +237,9 @@ def _external_row_to_telegram_texts(row: Dict[str, Any]) -> list:
             and not row.get('no_mirror'):
         # no_mirror：停止标记（⏹️ 已停止）这类回合收尾的内部状态，不是对话内容。
         return split_text_for_telegram(content)
+    if msg_type == MessageType.TOKEN_USAGE:
+        plain = re.sub(r'</?i>', '', content)
+        return split_text_for_telegram(plain)
     return []
 
 

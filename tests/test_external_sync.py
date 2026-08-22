@@ -6,8 +6,9 @@
   2. get_records_since_rowid 的 rowid 游标查询（含 metadata.origin 透传）；
   3. _external_row_to_frame 的记录→帧映射（CLI 的对话长什么样推给网页）：
      显示语义对齐——AGENT_CMD 协议原文不推（刷屏根源），TOKEN_USAGE 走灰条；
-  4. CLI→Telegram 镜像（服务端观察者侧）：只镜像 origin=cli-chat 的用户
-     文本和 AI_REPLY，状态机输入/命令/token 统计不镜像；长文分块；
+  4. CLI→Telegram 镜像（服务端观察者侧）：镜像 origin=cli-chat 的用户文本、
+     最终 AI_REPLY、TOKEN_USAGE（去 <i> 标签的纯文本）；状态机输入/命令/
+     协议块/轮次状态不镜像；长文分块；
   5. /sync 跨端历史渲染。
 
 sections 靠共享命名空间加载、xgent_cli 在 import 期就加载全部 section，
@@ -187,7 +188,7 @@ async def main():
     # Ctrl+C 停止标记：no_mirror，绝不镜像到 TG
     await GR.record_ai_reply(
         "⏹️ 当前回复已被用户手动停止", metadata={"no_mirror": True})
-    await GR.record(MT.TOKEN_USAGE, "assistant", "↑ 1 tokens")
+    await GR.record(MT.TOKEN_USAGE, "assistant", "<i>↑ 1 tokens</i>")
     await GR.record(MT.AGENT_CMD, "system", "```run-x")
     await GR.record(MT.AGENT_STATUS, "assistant", "✅ Agent 第 1 轮 · 1 个操作已完成")
     rows = await db.get_records_since_rowid(0)
@@ -203,7 +204,8 @@ async def main():
         "intermediate_skipped": all("中间轮" not in t for t in texts),
         "stop_marker_skipped": all("⏹️" not in t for t in texts),
         "state_input_not_sent": all("API Key" not in t for t in texts),
-        "nothing_else": all(("tokens" not in t and "run-x" not in t and "Agent 第" not in t) for t in texts),
+        "token_sent_plain": any("↑ 1 tokens" in t and "<i>" not in t for t in texts),
+        "protocol_and_status_skipped": all(("run-x" not in t and "Agent 第" not in t) for t in texts),
         "chunks": len(chunks) > 1 and max(len(c) for c in chunks) <= 4000,
         "chars_kept": sum(len(c) for c in chunks) >= len(long_reply.replace(" ", "")),
     }))
@@ -218,7 +220,9 @@ asyncio.run(main())
         self.assertTrue(result["stop_marker_skipped"],
                         "Ctrl+C 停止标记（⏹️）是回合收尾噪音，绝不镜像到 TG")
         self.assertTrue(result["state_input_not_sent"], "状态机输入（填 Key 等）不镜像到 TG")
-        self.assertTrue(result["nothing_else"], "token 统计/协议块/轮次状态一律不镜像")
+        self.assertTrue(result["token_sent_plain"],
+                        "token 用量要镜像到 TG（去掉 <i> 标签，走纯文本发送）")
+        self.assertTrue(result["protocol_and_status_skipped"], "协议块/轮次状态一律不镜像")
         self.assertTrue(result["chunks"], "超长回复要切成 Telegram 发得下的块")
         self.assertTrue(result["chars_kept"], "分块不能丢内容")
 

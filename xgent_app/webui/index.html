@@ -214,6 +214,10 @@
   .msg-row.user { justify-content: flex-end; }
   .msg-row.ai { justify-content: flex-start; }
   .msg-row.sys { justify-content: center; margin: 14px 0; }
+  /* token 用量提示条：不居中，和上方 AI 气泡一样贴左——实时帧（"message"）与
+     刷新后历史（降级成 system 角色）内容一致时统一走这条路径，不再一边是
+     左对齐的大长方形气泡、一边是居中偏右的小圆角药丸。 */
+  .msg-row.token { justify-content: flex-start; }
 
   .bubble {
     position: relative; min-width: 0;
@@ -1130,15 +1134,32 @@
     });
   }
 
+  // token 用量提示条识别："↑ X tokens (Y cached) · ↓ Z tokens... · ⚡ R tokens/s"
+  // （build_token_usage_message 固定产出的格式，带 <i> 斜体包裹）。按内容而非
+  // 角色识别：同一句话在实时帧里 role 是 "ai"（send_message 直发），刷新后
+  // 历史里被服务端降级成 "system"（_web_read_history），角色不统一，只有
+  // 内容特征是稳定的判据。
+  function isTokenUsageText(text) {
+    return typeof text === "string" && /tokens\/s/.test(text) &&
+      text.indexOf("↑") >= 0 && text.indexOf("↓") >= 0;
+  }
+
   // ---- 气泡渲染 ----
   var lastStreamEntry = null;  // 最近的 AI 气泡：edit 帧找不到 id 时复用它，而不是每次新建（防重复刷屏）
   function makeBubble(role, text, messageId, parseMode, markup) {
     var stick = isNearBottom();   // 只有本来就贴底才自动滚动：用户往上翻历史时，新消息不许把页面拽到底部
     msgCount++;
     updateEmptyState();
+    // token 用量提示条：无论来路是实时 message 帧（role="ai"）还是刷新后
+    // 降级的 system 角色，统一按内容识别、渲染成同一种左对齐小药丸——避免
+    // "未刷新时是左对齐大长方形气泡，刷新后变成居中偏右的小圆角矩形"这种
+    // 视觉跳变。
+    if ((role === "ai" || role === "sys") && isTokenUsageText(text)) {
+      role = "token";
+    }
     var row = document.createElement("div");
     row.className = "msg-row " + role;
-    if (role === "sys") {
+    if (role === "sys" || role === "token") {
       var pill = document.createElement("div");
       pill.className = "sys-pill";
       pill.innerHTML = renderText(text, parseMode);
@@ -1522,8 +1543,11 @@
   var MEDIA_PATH_PATTERNS = [
     // 用户上传："[图片] 名字，已保存到 /abs/path。说明：附言" → 用户侧，整条换成卡片
     { re: /已保存到 (\/[^\s，。；)）]+)/, side: "user", replace: true, caption: /说明：([\s\S]*)$/ },
-    // AI 媒体回复尾部："【系统自动生成：本图片已自动存入 /abs/path，…】" → 保留正文，卡片追加在后
-    { re: /已自动存入 (\/[^\s，。；)）】]+)/, side: "ai", replace: false },
+    // AI 媒体回复尾部："【系统自动生成：本图片已自动存入 /abs/path，…】" → 整条换成卡片，
+    // 正文（如"已生成媒体"）作为 caption 带进卡片——不再是"正文一个块、卡片另一个块"，
+    // 和实时帧里 caption=完整正文（含存档说明）的合并观感保持一致。
+    { re: /已自动存入 (\/[^\s，。；)）】]+)/, side: "ai", replace: true,
+      caption: /^([\s\S]*?)(?=【系统自动生成：)/ },
     // Agent sendfile 结果 → AI 侧，整条换成卡片
     { re: /已发送服务器文件给用户[:：]\s*(\/[^\s(（]+)\s*[(（]/, side: "ai", replace: true },
     // Agent file 写入结果 → AI 侧，整条换成卡片
