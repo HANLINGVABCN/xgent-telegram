@@ -1543,11 +1543,13 @@
   var MEDIA_PATH_PATTERNS = [
     // 用户上传："[图片] 名字，已保存到 /abs/path。说明：附言" → 用户侧，整条换成卡片
     { re: /已保存到 (\/[^\s，。；)）]+)/, side: "user", replace: true, caption: /说明：([\s\S]*)$/ },
-    // AI 媒体回复尾部："【系统自动生成：本图片已自动存入 /abs/path，…】" → 整条换成卡片，
-    // 正文（如"已生成媒体"）作为 caption 带进卡片——不再是"正文一个块、卡片另一个块"，
-    // 和实时帧里 caption=完整正文（含存档说明）的合并观感保持一致。
+    // AI 媒体回复尾部："【系统自动生成：本图片已自动存入 /abs/path，…】" → 整条换成卡片。
+    // caption 取整条原文（含存档说明本身）——实时帧发送时 caption 就是完整
+    // 正文（build_generated_media_reply_text 把存档说明拼进正文后整体当
+    // caption 发出），刷新后必须显示同一段文字，不能"未刷新时有说明、刷新
+    // 后说明消失"。
     { re: /已自动存入 (\/[^\s，。；)）】]+)/, side: "ai", replace: true,
-      caption: /^([\s\S]*?)(?=【系统自动生成：)/ },
+      caption: /^([\s\S]*)$/ },
     // Agent sendfile 结果 → AI 侧，整条换成卡片
     { re: /已发送服务器文件给用户[:：]\s*(\/[^\s(（]+)\s*[(（]/, side: "ai", replace: true },
     // Agent file 写入结果 → AI 侧，整条换成卡片

@@ -183,6 +183,26 @@ _CHINESE_ALIASES = {
     "黑名单": "blacklist",
 }
 
+# CLI 专属命令：只在终端里有意义，不进 Telegram/Web 的 _WEB_COMMAND_MAP
+# （那两端没有"本地终端"这个概念，getchat 拉的是本地屏幕输出，不是发消息）。
+# 和 cmd_* handler 走同一套接口（update, context）->协程，这样才能复用
+# _command_names/_resolve_command/_describe_command 这一整套 Tab 补全、
+# `/` 面板、/help 列表逻辑，不用另开一条特判分支。
+async def _cmd_getchat(update: Any, context: Any) -> None:
+    """/getchat [N]：拉取 Telegram/Web 端的跨端对话（默认 50 条，上限 500）。
+
+    历史上这个命令叫 /sync（还留了 /pull 别名），改名是因为"sync"暗示会
+    自动同步，但这里只是单次按需拉取——命令名容易让人误解成"开启同步"。
+    """
+    args = list(getattr(context, "args", None) or [])
+    limit = int(args[0]) if args and args[0].isdigit() else 50
+    await _pull_cross_client_history(max(1, min(limit, 500)))
+
+
+_CLI_LOCAL_COMMANDS = {
+    "getchat": _cmd_getchat,
+}
+
 
 def _command_map() -> dict:
     ensure = _ns.get("_ensure_web_command_map")
@@ -191,7 +211,9 @@ def _command_map() -> dict:
             ensure()
         except Exception:
             logger.debug("构建命令表失败", exc_info=True)
-    return dict(_ns.get("_WEB_COMMAND_MAP") or {})
+    table = dict(_ns.get("_WEB_COMMAND_MAP") or {})
+    table.update(_CLI_LOCAL_COMMANDS)
+    return table
 
 
 def _command_names() -> List[str]:
@@ -283,7 +305,7 @@ def _banner() -> None:
     hints = [
         ("直接输入文字", "与 AI 对话（自动镜像到 Telegram）"),
         ("/", "列出全部命令，Tab 继续补全"),
-        ("/sync", "拉取 Telegram/Web 端的跨端对话"),
+        ("/getchat", "拉取 Telegram/Web 端的跨端对话"),
         ("数字", "选择菜单项，输入内容时用 :数字"),
         ("Ctrl+C", "红❯取消输入 / 黄❯关闭菜单 / 绿❯退出"),
     ]
@@ -419,7 +441,7 @@ def _print_help() -> None:
         SCREEN.print_plain(row)
     SCREEN.print_plain("")
     SCREEN.print_plain(pal.paint("  /黑名单 是 /blacklist 的中文别名（与 Telegram 端一致）", pal.muted))
-    SCREEN.print_plain(pal.paint("  /sync [N] 拉取 Telegram/Web 端的跨端对话（默认 50 条）", pal.muted))
+    SCREEN.print_plain(pal.paint("  /getchat [N] 可指定拉取条数（默认 50，上限 500）", pal.muted))
     SCREEN.print_plain(pal.paint("  exit / quit 退出", pal.muted))
     SCREEN.print_plain("")
 
@@ -626,10 +648,10 @@ def _save_history() -> None:
 
 
 # --------------------------------------------------------------------------
-# 跨端同步：拉取（/sync）
+# 跨端同步：拉取（/getchat）
 # --------------------------------------------------------------------------
 # 反方向（Telegram/Web -> CLI）不自动同步：终端里正打着字，别处一条消息
-# 突然插进来会把输入行冲乱。按需拉取——/sync 把数据库里的跨端历史渲染
+# 突然插进来会把输入行冲乱。按需拉取——/getchat 把数据库里的跨端历史渲染
 # 出来，看完继续聊，新消息不会自己冒出来。
 
 def _render_history_rows(rows: Sequence[dict]) -> None:
@@ -644,7 +666,7 @@ def _render_history_rows(rows: Sequence[dict]) -> None:
             continue
         if role == "user":
             lines = renderer.render_message(
-                content, (), None, title="你", marker="❯", style="user",
+                content, (), None, title="User", marker="❯", style="user",
             )
             SCREEN.print_block(lines, message_id=None)
         elif role == "assistant":
@@ -674,11 +696,11 @@ async def _pull_cross_client_history(limit: int) -> None:
         SCREEN.notice("还没有任何跨端记录。", "info")
         return
     SCREEN.print_plain(
-        pal.paint(f"── 跨端历史 · 最近 {len(rows)} 条（/sync N 可加大，默认 50）──", pal.muted)
+        pal.paint(f"── 跨端历史 · 最近 {len(rows)} 条（/getchat N 可加大，默认 50）──", pal.muted)
     )
     _render_history_rows(rows)
     SCREEN.print_plain(
-        pal.paint("── 拉取结束。新消息不会自动出现，需要时再 /sync ──", pal.muted)
+        pal.paint("── 拉取结束。新消息不会自动出现，需要时再 /getchat ──", pal.muted)
     )
     SCREEN.print_plain("")
 
@@ -690,14 +712,14 @@ def _echo_user_line(text: str) -> None:
 
 
 def _print_user_block(text: str) -> None:
-    """对话消息的用户块：和 AI 块同款排版（❯ 你 + 正文，user 色）。
+    """对话消息的用户块：和 AI 块同款排版（❯ User + 正文，user 色）。
 
     面板提交后不再自带回显，这里把用户的话作为正式消息块打进回卷——
     AI 回复再怎么原地重绘刷屏，用户消息都在上面留着，和 Web/Telegram
     的左右分栏一个意思。
     """
     lines = SCREEN.renderer().render_message(
-        text, (), None, title="你", marker="❯", style="user",
+        text, (), None, title="User", marker="❯", style="user",
     )
     SCREEN.print_block(lines, message_id=None)
 
@@ -1146,16 +1168,6 @@ async def _main_loop() -> None:
             # 裸编号但当前没有菜单：当普通文本处理——在 Telegram 里输入
             # "42" 本来就只是发一条消息。
 
-        # 跨端历史拉取：Telegram/Web 的对话不自动插进终端（会冲乱正在输入的
-        # 行），按需 /sync 或 /sync 200 拉出来看。
-        if low == "/sync" or low == "/pull" or low.startswith("/sync ") or low.startswith("/pull "):
-            _take_palette()
-            _echo_submitted(text, conversation=False)
-            parts = text.split()
-            limit = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 50
-            await _run_turn(_pull_cross_client_history(max(1, min(limit, 500))))
-            continue
-
         if text.startswith("/"):
             routed = _route_command_prefix(text)
             if routed is None:
@@ -1163,7 +1175,7 @@ async def _main_loop() -> None:
             _echo_submitted(routed, conversation=False)
             await _run_turn(_run_command(routed))
         else:
-            # 对话消息：打印用户块（❯ 你 + 正文），消息在回卷里永久可见
+            # 对话消息：打印用户块（❯ User + 正文），消息在回卷里永久可见
             _echo_submitted(text, conversation=True)
             await _run_turn(_run_conversation(text))
 

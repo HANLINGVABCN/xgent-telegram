@@ -389,12 +389,12 @@ rows = [
 xgent_cli._render_history_rows(rows)
 out = stream.getvalue()
 print(json.dumps({
-    "user_row": "❯ 你" in out and "跨端的用户消息" in out,
+    "user_row": "❯ User" in out and "跨端的用户消息" in out,
     "ai_row": "◆ XGent" in out and "加粗" in out,
     "sys_row": "系统操作记录" in out,
 }))
 """)
-        self.assertTrue(result["user_row"], "用户消息要带 ❯ 你 标记")
+        self.assertTrue(result["user_row"], "用户消息要带 ❯ User 标记")
         self.assertTrue(result["ai_row"], "AI 回复要走 Markdown 渲染并带 XGent 头")
         self.assertTrue(result["sys_row"])
 
@@ -574,15 +574,15 @@ async def main():
     xgent_cli._echo_submitted("/start", conversation=False)
     line_out = stream.getvalue()[len(block_out):]
     print(json.dumps({
-        "block_has_marker": "❯ 你" in block_out,
+        "block_has_marker": "❯ User" in block_out,
         "block_has_text": "你好，洛溪" in block_out,
-        "line_single": "/start" in line_out and "❯ 你" not in line_out,
+        "line_single": "/start" in line_out and "❯ User" not in line_out,
     }))
     await xgent_cli._shutdown_runtime()
 
 asyncio.run(main())
 """)
-        self.assertTrue(result["block_has_marker"], "对话消息要有 ❯ 你 用户块")
+        self.assertTrue(result["block_has_marker"], "对话消息要有 ❯ User 用户块")
         self.assertTrue(result["block_has_text"])
         self.assertTrue(result["line_single"], "命令只回显单行，不带用户块")
 

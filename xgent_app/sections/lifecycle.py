@@ -33,8 +33,12 @@ TELEGRAM_COMMAND_DESCRIPTIONS = (
 # 只在某个客户端存在的命令说明。skills 没注册进 Telegram 命令菜单
 # （main.py 没给它建 CommandHandler，只有 _WEB_COMMAND_MAP 里有），
 # 但 Web/CLI 都能敲，说明文字同样需要一处来源。
+# getchat 是 CLI 专属命令（只在 xgent_cli.py 的 _CLI_LOCAL_COMMANDS 里注册，
+# 拉的是本地终端的跨端历史，Telegram/Web 没有对应物），说明文字仍然放在
+# 这张共享表里，理由同上——不给每个客户端各开一份命令说明。
 EXTRA_COMMAND_DESCRIPTIONS = (
     ("skills", "管理技能库"),
+    ("getchat", "拉取 Telegram/Web 端的跨端对话"),
 )
 
 

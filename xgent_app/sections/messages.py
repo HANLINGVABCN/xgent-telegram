@@ -1949,6 +1949,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             conversation_id=cid,
                             chat_id=update.effective_chat.id,
                             operation=standard_operation,
+                            presentation=operation_presentation,
                         )
                         round_state.add_context(
                             _ctx_with_notice(standard_operation['context_message'], smart_notice)
