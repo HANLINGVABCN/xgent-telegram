@@ -217,9 +217,10 @@ def _external_row_to_telegram_texts(row: Dict[str, Any]) -> list:
     """外部进程（CLI）的一条记录 -> 要镜像到 Telegram 的消息文本列表。
 
     只镜像真正的对话内容：带 origin=cli-chat 标记的 USER_TEXT（CLI 的对话
-    文本；加记忆、填 API Key 这类状态机输入不带标记，不镜像）和 AI_REPLY。
-    命令、菜单、系统操作、token 统计一律不同步，否则在 CLI 里点开一个
-    设置面板就会把 Telegram 刷成一串菜单。
+    文本；加记忆、填 API Key 这类状态机输入不带标记，不镜像）和**最终**
+    AI_REPLY（agent_intermediate 标记的 Agent 中间轮响应跳过——每轮都镜像
+    的话，CLI 一轮 Agent 对话会把 Telegram 刷成十几条中间输出）。命令、
+    菜单、系统操作、token 统计一律不同步。
     """
     msg_type = row.get('msg_type')
     content = str(row.get('content') or '').strip()
@@ -227,9 +228,16 @@ def _external_row_to_telegram_texts(row: Dict[str, Any]) -> list:
         return []
     if msg_type == MessageType.USER_TEXT and row.get('origin') == 'cli-chat':
         return split_text_for_telegram(f"🖥 [CLI]\n{content}")
-    if msg_type == MessageType.AI_REPLY:
+    if msg_type == MessageType.AI_REPLY and not row.get('agent_intermediate'):
         return split_text_for_telegram(content)
     return []
+
+
+# 镜像限流保险丝：无论上游出什么 bug，Telegram 每分钟最多收到这么多条 CLI
+# 镜像。CLI 一轮对话正常最多产生「1 条用户消息 + 1 条最终回复（可能分块）」，
+# 这个上限给长回复分块和连续几轮对话留了余量，同时把失控场景（曾把用户逼到
+# kill pm2 的刷屏事故）硬性截停。
+_TG_MIRROR_MAX_PER_MINUTE = 20
 
 
 def _web_external_tg_mirror_enabled() -> bool:
@@ -260,6 +268,7 @@ async def _web_external_record_watcher() -> None:
     """
     db = await BotMemoryDB.get_instance()
     cursor_rowid = await db.get_max_global_rowid()
+    mirror_send_times: list = []   # 滚动窗口：最近一分钟内实际发出的镜像条数
     while True:
         await asyncio.sleep(1.0)
         try:
@@ -279,13 +288,26 @@ async def _web_external_record_watcher() -> None:
             if _web_external_tg_mirror_enabled():
                 mirror_texts.extend(_external_row_to_telegram_texts(row))
         # 网页帧先推完再发 Telegram：TG 那边网络慢时不能拖住下一轮网页帧。
+        # 限流保险丝在文本生成侧就砍掉超量，绝不向上游（TG API）放行洪水。
+        now = time.time()
+        mirror_send_times = [t for t in mirror_send_times if now - t < 60.0]
+        dropped = 0
         for text in mirror_texts:
+            if len(mirror_send_times) >= _TG_MIRROR_MAX_PER_MINUTE:
+                dropped += 1
+                continue
             try:
                 await _web_real_bot.send_message(
                     chat_id=BotConfig.AUTHORIZED_USER_ID, text=text,
                 )
             except Exception:
                 logger.warning("CLI 消息镜像到 Telegram 失败", exc_info=True)
+            mirror_send_times.append(time.time())
+        if dropped:
+            logger.warning(
+                "CLI 镜像限流：本批 %d 条文本超限，丢弃 %d 条（每分钟上限 %d）",
+                len(mirror_texts), dropped, _TG_MIRROR_MAX_PER_MINUTE,
+            )
 
 
 async def start_external_sync_watcher(outbox: Any = None, app: Any = None) -> None:

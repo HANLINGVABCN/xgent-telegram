@@ -445,15 +445,18 @@ class BotMemoryDB:
                 continue
             src = None
             origin = None
+            agent_intermediate = False
             try:
                 meta = json.loads(msg.get('metadata') or '{}')
                 if isinstance(meta, dict):
                     src = meta.get('src')
                     origin = meta.get('origin')
+                    agent_intermediate = bool(meta.get('agent_intermediate'))
             except (json.JSONDecodeError, TypeError):
                 src = None
             msg['src'] = src
             msg['origin'] = origin
+            msg['agent_intermediate'] = agent_intermediate
             result.append(msg)
         return result
 

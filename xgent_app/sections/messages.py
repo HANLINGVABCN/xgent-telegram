@@ -1783,8 +1783,14 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
         await db.remove_last_chat_message(cid)
         return
     
-    # 保存 AI 回复
-    await GlobalRecorder.record_ai_reply(response, update.effective_chat.id)
+    # 保存 AI 回复。Agent 多轮里带协议块的中间响应打 agent_intermediate 标记：
+    # 跨端镜像只同步最终回复——每轮都镜像的话，CLI 一轮 Agent 对话会把
+    # Telegram 刷成十几条中间输出（曾在生产上把用户逼到 kill pm2）。
+    _has_protocol_blocks = bool(AgentExecutor.extract_protocol_blocks(response))
+    await GlobalRecorder.record_ai_reply(
+        response, update.effective_chat.id,
+        metadata={'agent_intermediate': True} if _has_protocol_blocks else None,
+    )
     await db.add_chat_message(cid, 'assistant', response)
     # token 用量在正文落库之后落库，保证 timestamp 晚于正文，刷新后顺序为「输出 + tokens」。
     if token_text:
@@ -2364,7 +2370,12 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     pending_round_iteration = None
                 break
 
-            await GlobalRecorder.record_ai_reply(response, update.effective_chat.id)
+            # 同上：带协议块＝还有下一轮，是中间响应，打标不镜像到 Telegram。
+            _has_protocol_blocks = bool(AgentExecutor.extract_protocol_blocks(response))
+            await GlobalRecorder.record_ai_reply(
+                response, update.effective_chat.id,
+                metadata={'agent_intermediate': True} if _has_protocol_blocks else None,
+            )
             await db.add_chat_message(cid, 'assistant', response)
             if token_text:
                 _entry = token_text[0]

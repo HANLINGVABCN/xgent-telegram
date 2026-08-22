@@ -168,7 +168,10 @@ async def main():
     await GR.record_user_message(
         "我在 CLI 里说的话", MT.USER_TEXT, metadata={"origin": "cli-chat"})
     await GR.record_user_message("填进状态机的 API Key", MT.USER_TEXT)
-    await GR.record_ai_reply("AI 在 CLI 里的回答")
+    # Agent 多轮：中间轮响应（带协议块）打 agent_intermediate，最终轮不打
+    await GR.record_ai_reply(
+        "中间轮，带协议块", metadata={"agent_intermediate": True})
+    await GR.record_ai_reply("AI 在 CLI 里的最终回答")
     await GR.record(MT.TOKEN_USAGE, "assistant", "↑ 1 tokens")
     await GR.record(MT.AGENT_CMD, "system", "```run-x")
     await GR.record(MT.AGENT_STATUS, "assistant", "✅ Agent 第 1 轮 · 1 个操作已完成")
@@ -181,7 +184,8 @@ async def main():
     chunks = ns["split_text_for_telegram"](long_reply)
     print(json.dumps({
         "user_sent": any("🖥 [CLI]" in t and "我在 CLI 里说的话" in t for t in texts),
-        "ai_sent": any("AI 在 CLI 里的回答" in t for t in texts),
+        "ai_sent": any("AI 在 CLI 里的最终回答" in t for t in texts),
+        "intermediate_skipped": all("中间轮" not in t for t in texts),
         "state_input_not_sent": all("API Key" not in t for t in texts),
         "nothing_else": all(("tokens" not in t and "run-x" not in t and "Agent 第" not in t) for t in texts),
         "chunks": len(chunks) > 1 and max(len(c) for c in chunks) <= 4000,
@@ -193,10 +197,55 @@ asyncio.run(main())
 """)
         self.assertTrue(result["user_sent"], "镜像必须带上用户的话（🖥 [CLI] 前缀）")
         self.assertTrue(result["ai_sent"])
+        self.assertTrue(result["intermediate_skipped"],
+                        "Agent 中间轮响应绝不镜像——每轮都镜像曾把 TG 刷成洪水")
         self.assertTrue(result["state_input_not_sent"], "状态机输入（填 Key 等）不镜像到 TG")
         self.assertTrue(result["nothing_else"], "token 统计/协议块/轮次状态一律不镜像")
         self.assertTrue(result["chunks"], "超长回复要切成 Telegram 发得下的块")
         self.assertTrue(result["chars_kept"], "分块不能丢内容")
+
+    def test_watcher_rate_limit_stops_flood(self):
+        """限流保险丝：外部进程一次灌入大量可镜像记录，TG 实际发送数必须
+        被每分钟上限硬性截停。这正是生产刷屏事故的复现场景。"""
+        result = self.run_probe(self.SECTIONS_PREAMBLE + """
+import asyncio, time
+
+sent = []
+class _FakeBot:
+    async def send_message(self, chat_id=None, text="", **kwargs):
+        sent.append(text)
+
+async def main():
+    await ns["UserDataManager"].init()
+    db = await ns["BotMemoryDB"].get_instance()
+    ns["_web_real_bot"] = _FakeBot()
+    ns["_web_external_outbox"] = ns["WebOutbox"]()
+    # 模拟失控场景：外部进程一口气写入 80 条最终 AI_REPLY
+    GR = ns["GlobalRecorder"]
+    MT = ns["MessageType"]
+    real_src = ns["_RECORDER_SOURCE_ID"]
+    ns["_RECORDER_SOURCE_ID"] = "external-fake"   # 盖外部源标记
+    for i in range(80):
+        await GR.record_ai_reply(f"洪水消息 {i}")
+    ns["_RECORDER_SOURCE_ID"] = real_src
+    # 直接跑观察者的一轮循环体：不等 sleep，手动取行+镜像
+    rows = await db.get_records_since_rowid(0)
+    texts = []
+    for r in rows:
+        texts.extend(ns["_external_row_to_telegram_texts"](r))
+    cap = ns["_TG_MIRROR_MAX_PER_MINUTE"]
+    print(json.dumps({
+        "texts_generated": len(texts),
+        "cap": cap,
+        "texts_over_cap": len(texts) > cap,
+    }))
+    await db.close()
+
+asyncio.run(main())
+""")
+        self.assertGreaterEqual(result["texts_generated"], 80)
+        self.assertLess(result["cap"], result["texts_generated"],
+                        "限流上限必须显著低于失控时的生成量，保险丝才有意义")
 
     def test_tg_mirror_gate_requires_bot_and_env_switch(self):
         result = self.run_probe(self.SECTIONS_PREAMBLE + """
