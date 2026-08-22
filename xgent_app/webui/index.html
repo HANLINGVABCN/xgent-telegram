@@ -1131,6 +1131,7 @@
   }
 
   // ---- 气泡渲染 ----
+  var lastStreamEntry = null;  // 最近的 AI 气泡：edit 帧找不到 id 时复用它，而不是每次新建（防重复刷屏）
   function makeBubble(role, text, messageId, parseMode, markup) {
     var stick = isNearBottom();   // 只有本来就贴底才自动滚动：用户往上翻历史时，新消息不许把页面拽到底部
     msgCount++;
@@ -1181,6 +1182,7 @@
     if (stick) scrollDown();
     var entry = { row: row, body: body, btns: btns };
     if (messageId != null) { byMessageId[messageId] = entry; }
+    if (role === "ai") { lastStreamEntry = entry; }
     return entry;
   }
 
@@ -1375,6 +1377,12 @@
       hideTyping();
     } else if (frame.type === "edit") {
       var e = byMessageId[frame.message_id];
+      if (!e && (frame.message_id == null)) {
+        // 帧里没有 message_id：复用最近的 AI 气泡原地更新。若每次都新建，
+        // 流式回复的每个 edit 帧都会多出一个气泡——就是"上一条消息无限
+        // 刷屏"的机制。
+        e = lastStreamEntry;
+      }
       if (e) {
         e.body.innerHTML = renderText(frame.text, frame.parse_mode);
         injectCopyButtons(e.body);
@@ -1425,6 +1433,7 @@
   var historyReady = false;
   var pendingFrames = [];
   var everOpened = false;
+  var historyGen = 0;  // 每次重载历史 +1；异步媒体恢复的回调据此作废，避免跨重载往新列表里塞旧卡片
 
   function applyFrame(frame) {
     if (!historyReady) {
@@ -1485,7 +1494,10 @@
   }
 
   function loadHistory() {
+    historyGen++;
+    var gen = historyGen;
     return api("/api/history?limit=50").then(function (data) {
+      if (gen !== historyGen) { return; }   // 已经被更新的重载取代，丢弃这批
       log.innerHTML = "";
       byMessageId = {};
       msgCount = 0;
@@ -1543,8 +1555,10 @@
   function upgradeBubbleMedia(entry, text) {
     var media = extractMediaFromText(text);
     if (!media) return;
+    var gen = historyGen;
     api("/api/media/resolve", { method: "POST", body: JSON.stringify({ path: media.path }) })
       .then(function (res) {
+        if (gen !== historyGen && !entry) { return; }  // 历史已被重载取代：不再往旧页面里插卡片
         var card = makeMediaBubble(
           mediaKindFromName(res.filename), res.filename, media.caption, res.url, null, media.side
         );

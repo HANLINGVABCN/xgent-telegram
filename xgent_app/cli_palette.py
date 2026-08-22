@@ -445,12 +445,16 @@ class SlashPalette:
         with _RawMode(fd):
             self._render()
             try:
-                return self._event_loop(fd)
+                result = self._event_loop(fd)
             except (EOFError, KeyboardInterrupt):
                 # 中断/EOF 也要把面板收干净再走：光标留在半行上，下一条
                 # 输出会直接糊在候选列表中间。
                 self._finish()
                 raise
+            # 正常提交同样要收尾：擦掉输入行/候选面板。漏了这步的话输入行
+            # 留在屏上，主循环再打印用户块，同一条消息就显示两遍。
+            self._finish()
+            return result
 
     def _event_loop(self, fd: int) -> str:
         while True:
