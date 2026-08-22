@@ -2,8 +2,8 @@
 
 PTB 的 text_markdown/caption_markdown 对所有普通文本段做 escape_markdown；
 上一版按"有无格式实体"分流后，富粘贴（代码块复制按钮 -> bold/code 实体）
-生成的混合消息里明文部分仍被转义。现在改为自研 _markdown_no_escape：
-按实体重构成 Markdown 标记但全程不转义。
+生成的混合消息里明文部分仍被转义。最终方案：彻底放弃格式重构，Telegram 原文（message.text）
+一字不差直传，格式属性丢弃。
 
 sections 靠共享命名空间加载（需要环境变量、会写数据库），按仓库惯例用
 子进程探针跑。
@@ -36,7 +36,6 @@ def build(text, entities=None):
 
 BS = ns["BotState"]
 extract = ns["_initial_message_text"]
-md = ns["_markdown_no_escape"]
 
 plain = "我的API key是 sk_live_bvheiwv_vwrs_vbebvw_9917 请保存"
 
@@ -74,16 +73,13 @@ cjk = build(cjk_text, entities=[
 print(json.dumps({{
     "plain_exact": extract(build(plain), BS.IDLE) == plain,
     "mixed_no_backslash": chr(92) not in mixed_out,
-    "mixed_keeps_marks": "_星号_" in mixed_out and "`反引号`" in mixed_out,
+    "mixed_is_raw": mixed_out == mixed_text,
     "mixed_key_intact": "sk_live_bvheiwv_vwrs_vbebvw_9917" in mixed_out,
     "url_entity_exact": extract(url_msg, BS.IDLE) == url_msg.text,
-    "bold_markdown": extract(bold_msg, BS.IDLE) == "注意 *这个很重要*",
+    "bold_raw": extract(bold_msg, BS.IDLE) == "注意 这个很重要",
     "config_raw": all(extract(bold_key, s) == "sk_plain_value"
                       for s in (BS.SET_SEARCH_KEY, BS.SET_UPDATE_TOKEN, BS.SET_WEB_PASSWORD)),
-    "cjk_offsets": extract(cjk, BS.IDLE) == "前缀_abc_中间*强调*后缀_xyz_尾部",
-    "no_entities_passthrough": md("a_b_c", []) == "a_b_c",
-    "bad_offsets_fallback": md("short", [MessageEntity(
-        type=MessageEntity.BOLD, offset=99, length=5)]) == "short",
+    "cjk_raw": extract(cjk, BS.IDLE) == cjk_text,
 }}))
 """.format(root=str(ROOT))
 
@@ -114,14 +110,12 @@ class TelegramTextExtractionTests(unittest.TestCase):
         self.assertTrue(result["plain_exact"], "纯文本必须原文字节进上下文")
         self.assertTrue(result["mixed_no_backslash"],
                         "富粘贴的混合消息里不允许出现任何反斜杠转义")
-        self.assertTrue(result["mixed_keeps_marks"], "格式实体的 Markdown 标记要保留")
+        self.assertTrue(result["mixed_is_raw"], "富粘贴混合消息必须原文直传（格式属性丢弃）")
         self.assertTrue(result["mixed_key_intact"], "混合消息里的 API Key 必须原样")
         self.assertTrue(result["url_entity_exact"], "自动 URL 实体原样透传")
-        self.assertTrue(result["bold_markdown"])
+        self.assertTrue(result["bold_raw"], "加粗消息也只传字符，不加标记")
         self.assertTrue(result["config_raw"], "配置态一律原文")
-        self.assertTrue(result["cjk_offsets"], "中文的 UTF-16 偏移换算要正确")
-        self.assertTrue(result["no_entities_passthrough"])
-        self.assertTrue(result["bad_offsets_fallback"], "越界实体兜底回原文")
+        self.assertTrue(result["cjk_raw"], "中文消息原文字节直传")
 
 
 if __name__ == "__main__":

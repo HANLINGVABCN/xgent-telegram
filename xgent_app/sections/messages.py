@@ -324,12 +324,8 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 
     doc = update.message.document
     doc_name = doc.file_name or f"document_{uuid.uuid4().hex[:8]}.bin"
-    # caption 同样按实体重构成 Markdown、全程不转义（caption_markdown 的
-    # 转义问题和 text_markdown 一模一样）。
-    caption = _markdown_no_escape(
-        update.message.caption or "",
-        getattr(update.message, "caption_entities", None) or [],
-    ).strip()
+    # caption 同样只取原文：格式属性丢弃，字符一字不差。
+    caption = (update.message.caption or "").strip()
     # 转发的富文本消息：caption 可能为空，文字在 rich_message.blocks 里
     if not caption:
         caption = _extract_rich_message_text(update.message).strip()
@@ -535,92 +531,17 @@ def _extract_rich_message_plain_text(msg):
     )
 
 
-def _markdown_no_escape(text, entities) -> str:
-    r"""按实体重构成 Markdown 标记，但**不转义任何文本**。
-
-    PTB 的 text_markdown/caption_markdown 会对普通文本段做 escape_markdown
-    (\_ \* 等)。按"有无格式实体"分流只能保护纯文本消息——用户从代码块
-    复制按钮粘贴的文本带着富文本格式，Telegram 发送时就是 bold/code 实体，
-    这种**混合消息**里没格式的那部分（比如正文里的 API Key）仍会被整体
-    转义。这里沿用 PTB 的遍历算法（含 UTF-16 偏移处理），但去掉全部转义：
-    对喂给模型的上下文而言，内容字节精确远比 Markdown 语法严格重要。
-    嵌套/重叠实体按 V1 语义跳过；自动实体（url/mention 等）原样透传。
-    """
-    if not text:
-        return ""
-    entity_list = [
-        entity for entity in (entities or [])
-        if entity is not None and entity.offset is not None and entity.length
-    ]
-    if not entity_list:
-        return text
-    try:
-        utf16 = text.encode("utf-16-le")
-
-        def _segment(start: int, end: int) -> str:
-            return utf16[start * 2:end * 2].decode("utf-16-le")
-
-        parts = []
-        last = 0
-        for entity in sorted(entity_list, key=lambda e: e.offset):
-            start = entity.offset
-            end = start + entity.length
-            if start < last or end * 2 > len(utf16):
-                continue  # 重叠/嵌套/越界：按 V1 语义跳过
-            segment = _segment(start, end)
-            parts.append(_segment(last, start))
-            etype = str(getattr(entity, "type", "") or "")
-            if etype == "bold":
-                parts.append(f"*{segment}*")
-            elif etype == "italic":
-                parts.append(f"_{segment}_")
-            elif etype == "underline":
-                parts.append(f"__{segment}__")
-            elif etype == "strikethrough":
-                parts.append(f"~{segment}~")
-            elif etype == "spoiler":
-                parts.append(f"||{segment}||")
-            elif etype == "code":
-                parts.append(f"`{segment}`")
-            elif etype == "pre":
-                language = str(getattr(entity, "language", "") or "").strip()
-                fence_open = "```" + language + "\n" if language else "```\n"
-                parts.append(fence_open + segment + "```")
-            elif etype == "text_link":
-                parts.append(f"[{segment}]({getattr(entity, 'url', '') or ''})")
-            elif etype == "text_mention":
-                user_id = getattr(getattr(entity, "user", None), "id", "")
-                parts.append(f"[{segment}](tg://user?id={user_id})")
-            elif etype in ("blockquote", "expandable_blockquote"):
-                parts.append(">".join((">" + line) for line in segment.splitlines()))
-            else:
-                parts.append(segment)  # url/email/mention 等自动实体：原样
-            last = end
-        parts.append(_segment(last, len(utf16) // 2))
-        return "".join(parts)
-    except Exception:
-        return text
-
-
 def _initial_message_text(message, state) -> str:
-    """handle_text_message 的第一步取文本。
+    r"""handle_text_message 的第一步取文本：Telegram 原文，一字不差。
 
-    配置态取原文字节（凭据/模型 ID 不能有任何改写）；普通对话按实体重构成
-    Markdown 保格式，但全程不转义——见 _markdown_no_escape 的说明。
+    这里曾经走过 text_markdown（想给 AI 保留加粗/代码等格式标记），但它会
+    给普通文本插转义符（\_ \*），API Key 两度被改写；后来试过自研"无转义
+    重构"，又引入实体偏移这类新的出错面。最终取舍：格式属性直接丢弃，
+    字符字节直传——"用户发什么，AI 和记忆库就收到什么"是唯一硬性要求，
+    任何为了锦上添花而改写正文的路径都不值得。
     """
     if message.text:
-        if state is not None and state in {
-            BotState.ADD_PROV_NAME, BotState.ADD_PROV_URL, BotState.ADD_PROV_KEY,
-            BotState.EDIT_PROV_NAME, BotState.EDIT_PROV_KEY, BotState.EDIT_PROV_URL,
-            BotState.ADD_MODEL_MANUAL, BotState.SEARCH_FETCHED, BotState.SEARCH_SAVED,
-            BotState.IMPORT_PROVIDER_CONFIG, BotState.SET_UPDATE_TOKEN,
-            BotState.SET_COMMAND_BLACKLIST, BotState.SET_SEARCH_KEY,
-            BotState.SET_WEB_PASSWORD, BotState.SET_WEB_PUBLIC_URL,
-        }:
-            return message.text.strip()
-        return _markdown_no_escape(
-            message.text, getattr(message, "entities", None) or [],
-        ).strip()
+        return message.text.strip()
     return (getattr(message, "caption", None) or "").strip()
 
 
@@ -704,8 +625,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         # URL 含下划线和连字符，转义会写出无法访问的地址。
         BotState.SET_WEB_PUBLIC_URL,
     }
-    # 普通对话按实体重构成 Markdown 保格式，但全程不转义；配置态取原文。
-    # 详见 _markdown_no_escape 的注释。
+    # 原文直传，无任何改写层（见 _initial_message_text 的注释）。
     text = _initial_message_text(update.message, state)
 
     # 转发消息 text 可能为 None（python-telegram-bot 解析问题），
