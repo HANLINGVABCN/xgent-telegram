@@ -494,7 +494,13 @@ class MessageRenderer:
         """
         pal = self.palette
         color = getattr(pal, style, "")
-        header = pal.paint(f"{marker} {title}", color, pal.bold)
+        # 标记用消息自己的颜色，标题加粗用前景色，后面跟一小段弱分隔——
+        # 固定 8 格不拉满屏宽（每条消息都顶一条通栏横线会喧宾夺主），
+        # 但足够把"标题行"和下面的正文切开，长对话里更容易扫读。
+        header = (
+            f"{pal.paint(marker, color, pal.bold)} {pal.paint(title, pal.bold)}"
+            f" {pal.paint('╌' * 8, pal.muted)}"
+        )
 
         lines = [header]
         body = self.render_text(text, parse_mode)

@@ -36,6 +36,7 @@ import asyncio
 import atexit
 import contextlib
 import io
+import json
 import logging
 import os
 import queue
@@ -230,25 +231,37 @@ def _banner() -> None:
     pal = PALETTE
     width = min(SCREEN.width, 72)
     title = "XGent CLI"
+
+    def _box_row(content: str = "") -> str:
+        """一行框：│ 内容（按显示宽度补齐，中文按 2 列算）│。"""
+        filler = max(1, width - 2 - 1 - display_width(content) - 1)
+        return (
+            f"{pal.paint('│', pal.muted)} {content}"
+            f"{' ' * filler}{pal.paint('│', pal.muted)}"
+        )
+
     SCREEN.print_plain("")
-    SCREEN.print_plain(pal.paint("─" * width, pal.muted))
-    SCREEN.print_plain(
+    SCREEN.print_plain(pal.paint("╭" + "─" * (width - 2) + "╮", pal.muted))
+    SCREEN.print_plain(_box_row(
         f"{pal.paint('◆', pal.ai, pal.bold)} {pal.paint(title, pal.bold)}"
         f"  {pal.paint('本地终端客户端', pal.muted)}"
-    )
-    SCREEN.print_plain(pal.paint("─" * width, pal.muted))
+    ))
+    SCREEN.print_plain(_box_row())
     hints = [
-        ("直接输入文字", "与 AI 对话"),
+        ("直接输入文字", "与 AI 对话（自动镜像到 Telegram）"),
         ("/", "列出全部命令，Tab 继续补全"),
+        ("/sync", "拉取 Telegram/Web 端的跨端对话"),
         ("数字", "选择菜单项，输入内容时用 :数字"),
-        ("Ctrl+C", "回答时中断，空闲时退出"),
+        ("Ctrl+C", "回答时中断；空闲时退出"),
+        ("红 ❯ 期间", "正在输入配置，Ctrl+C 取消该输入"),
     ]
     label_width = max(display_width(label) for label, _ in hints)
     for label, desc in hints:
         pad = " " * (label_width - display_width(label))
-        SCREEN.print_plain(
-            f"  {pal.paint(label, pal.accent)}{pad}  {pal.paint(desc, pal.muted)}"
-        )
+        SCREEN.print_plain(_box_row(
+            f"{pal.paint(label, pal.accent)}{pad}  {pal.paint(desc, pal.muted)}"
+        ))
+    SCREEN.print_plain(pal.paint("╰" + "─" * (width - 2) + "╯", pal.muted))
     SCREEN.print_plain("")
 
 
@@ -272,10 +285,12 @@ def _command_rows(names: Sequence[str], numbered: bool = False) -> List[str]:
 
 
 def _palette_rows(names: Sequence[str], selected: int) -> List[str]:
-    """`/` 下拉面板的候选行：选中那条加箭头 + 反显。
+    """`/` 下拉面板的候选行：选中那条加箭头 + 淡蓝高亮。
 
     复用 _command_rows 的排版（对齐宽度、命令说明），只在前面换一个标记位——
-    /help 的清单和面板里的候选长得一样，用户不用学两套。
+    /help 的清单和面板里的候选长得一样，用户不用学两套。选中行用淡蓝
+    （pal.user）加粗：和青绿的 AI 输出、灰色的说明拉开层次，扫一眼就知道
+    回车会执行哪条。
     """
     pal = PALETTE
     if not names:
@@ -290,7 +305,7 @@ def _palette_rows(names: Sequence[str], selected: int) -> List[str]:
             body = f" ❯ {label}{pad}"
             if description:
                 body += f"  {description}"
-            rows.append(pal.paint(body, pal.ai, pal.bold))
+            rows.append(pal.paint(body, pal.user, pal.bold))
         else:
             body = f"   {pal.paint(label, pal.ai)}{pad}"
             if description:
@@ -299,12 +314,25 @@ def _palette_rows(names: Sequence[str], selected: int) -> List[str]:
     return rows
 
 
+def _input_state_active() -> bool:
+    """对话核心的状态机是否正等着用户输入（API Key、轮数、密码这类）。
+
+    提示符颜色和 Ctrl+C 语义都看它：这种时候 ❯ 是红的，Ctrl+C 取消输入
+    状态；空闲时 ❯ 是青绿的，Ctrl+C 退出。
+    """
+    try:
+        return UserDataManager.get('state') != BotState.IDLE
+    except Exception:
+        return False
+
+
 def _prompt_plain() -> str:
     """给命令面板用的提示符：带颜色，但不带 readline 的 \\001..\\002 标记。"""
     pal = PALETTE
     if not pal.enabled:
         return "❯ "
-    return f"{pal.ai}{pal.bold}❯{pal.reset} "
+    color = pal.err if _input_state_active() else pal.ai
+    return f"{color}{pal.bold}❯{pal.reset} "
 
 
 def _palette_enabled() -> bool:
@@ -345,6 +373,7 @@ def _print_help() -> None:
         SCREEN.print_plain(row)
     SCREEN.print_plain("")
     SCREEN.print_plain(pal.paint("  /黑名单 是 /blacklist 的中文别名（与 Telegram 端一致）", pal.muted))
+    SCREEN.print_plain(pal.paint("  /sync [N] 拉取 Telegram/Web 端的跨端对话（默认 50 条）", pal.muted))
     SCREEN.print_plain(pal.paint("  exit / quit 退出", pal.muted))
     SCREEN.print_plain("")
 
@@ -538,6 +567,137 @@ def _save_history() -> None:
 
 
 # --------------------------------------------------------------------------
+# 跨端同步：CLI -> Telegram 镜像
+# --------------------------------------------------------------------------
+# CLI 是独立进程，与服务器只共享数据库，Telegram 那边天然看不到 CLI 里聊
+# 了什么。对话结束后把这轮新产生的 user/ai 记录按 Bot API 直接推过去——
+# 用 urllib 裸 POST 而不是再养一个 PTB Bot：CLI 进程不该有第二个
+# getUpdates 消费者，sendMessage 本身无状态，零依赖最稳。
+# 设 XGENT_CLI_NO_TG_MIRROR=1 关闭（不想让 Telegram 被 CLI 刷屏时用）。
+
+def _split_tg_chunks(text: str, limit: int = 3800) -> List[str]:
+    """把长文本切成 Telegram 发得下的块，尽量在换行处断。"""
+    text = str(text or "")
+    if len(text) <= limit:
+        return [text] if text else []
+    chunks: List[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        cut = remaining.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(remaining[:cut].rstrip("\n"))
+        remaining = remaining[cut:].lstrip("\n")
+    return chunks
+
+
+def _tg_send_message(text: str) -> None:
+    import urllib.request
+
+    base = BotConfig.API_BASE_URL or "https://api.telegram.org"
+    url = f"{base}/bot{BotConfig.TOKEN}/sendMessage"
+    payload = json.dumps({
+        "chat_id": BotConfig.AUTHORIZED_USER_ID,
+        "text": text,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=payload, headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        response.read()
+
+
+async def _mirror_turn_to_telegram(since_rowid: int) -> None:
+    """把 since_rowid 之后这一轮新产生的对话记录镜像到 Telegram。
+
+    只镜像 USER_TEXT 和 AI_REPLY——命令、菜单、系统操作不同步，否则在
+    CLI 里点开一个设置面板就会把 Telegram 刷成一串菜单。失败只记日志，
+    镜像是旁路，不能把对话本身搞失败。
+    """
+    if not BotConfig.TOKEN or os.environ.get("XGENT_CLI_NO_TG_MIRROR"):
+        return
+    try:
+        db = await BotMemoryDB.get_instance()
+        rows = await db.get_records_since_rowid(since_rowid)
+        parts: List[str] = []
+        for row in rows:
+            msg_type = row.get("msg_type")
+            content = str(row.get("content") or "")
+            if not content:
+                continue
+            if msg_type == MessageType.USER_TEXT and row.get("role") == "user":
+                parts.append(f"🖥 [CLI]\n{content}")
+            elif msg_type == MessageType.AI_REPLY:
+                parts.append(content)
+        for part in parts:
+            for chunk in _split_tg_chunks(part):
+                await asyncio.to_thread(_tg_send_message, chunk)
+    except Exception:
+        logger.warning("CLI 对话镜像到 Telegram 失败", exc_info=True)
+
+
+# --------------------------------------------------------------------------
+# 跨端同步：拉取（/sync）
+# --------------------------------------------------------------------------
+# 反方向（Telegram/Web -> CLI）不自动同步：终端里正打着字，别处一条消息
+# 突然插进来会把输入行冲乱。按需拉取——/sync 把数据库里的跨端历史渲染
+# 出来，看完继续聊，新消息不会自己冒出来。
+
+def _render_history_rows(rows: Sequence[dict]) -> None:
+    """把 get_display_history 的行渲染到终端。独立成函数方便单测。"""
+    renderer = SCREEN.renderer()
+    pal = PALETTE
+    for row in rows:
+        role = str(row.get("role") or "")
+        content = str(row.get("content") or "")
+        msg_type = row.get("msg_type")
+        if not content.strip():
+            continue
+        if role == "user":
+            lines = renderer.render_message(
+                content, (), None, title="你", marker="❯", style="user",
+            )
+            SCREEN.print_block(lines, message_id=None)
+        elif role == "assistant":
+            if msg_type == MessageType.AI_REPLY:
+                convert = _ns.get("markdown_to_telegram_html")
+                if callable(convert):
+                    try:
+                        content = convert(content)
+                    except Exception:
+                        pass
+                lines = renderer.render_message(content, (), "HTML")
+            else:
+                # AGENT_RESULT/媒体回执存库时已是 Telegram HTML
+                lines = renderer.render_message(content, (), "HTML")
+            SCREEN.print_block(lines, message_id=None)
+        else:
+            compact = content if len(content) <= 160 else content[:157] + "…"
+            SCREEN.notice(compact, "info")
+
+
+async def _pull_cross_client_history(limit: int) -> None:
+    db = await BotMemoryDB.get_instance()
+    rows = await db.get_display_history(limit)
+    pal = PALETTE
+    SCREEN.print_plain("")
+    if not rows:
+        SCREEN.notice("还没有任何跨端记录。", "info")
+        return
+    SCREEN.print_plain(
+        pal.paint(f"── 跨端历史 · 最近 {len(rows)} 条（/sync N 可加大，默认 50）──", pal.muted)
+    )
+    _render_history_rows(rows)
+    SCREEN.print_plain(
+        pal.paint("── 拉取结束。新消息不会自动出现，需要时再 /sync ──", pal.muted)
+    )
+    SCREEN.print_plain("")
+
+
+# --------------------------------------------------------------------------
 # 一轮处理
 # --------------------------------------------------------------------------
 
@@ -570,7 +730,11 @@ async def _run_conversation(text: str) -> None:
         await GlobalRecorder.record_user_message(
             text, MessageType.USER_TEXT, BotConfig.AUTHORIZED_USER_ID
         )
+        # 记下这轮开始前的游标：结束后只镜像这一轮新产生的 user/ai 记录。
+        db = await BotMemoryDB.get_instance()
+        since_rowid = await db.get_max_global_rowid()
         await process_conversation(update, context, text)
+        await _mirror_turn_to_telegram(since_rowid)
     except Exception:
         _report_failure("对话")
 
@@ -607,11 +771,17 @@ async def _run_callback(callback_data: str) -> None:
 # --------------------------------------------------------------------------
 # 读输入：守护线程 + 事件循环
 # --------------------------------------------------------------------------
-# 哨兵对象，区分三种"没读到正文"的情况。用独立对象而不是空串：空串是
+# 哨兵对象，区分四种"没读到正文"的情况。用独立对象而不是空串：空串是
 # **用户直接按回车**的合法输入，早先和 EOF 混为一谈，于是在提示符上按一下
 # 回车就会静默退出 CLI。
 _EOF = object()     # Ctrl+D / stdin 关闭
 _EXIT = object()    # 空闲时按了 Ctrl+C
+_CANCEL = object()  # 状态输入中按了 Ctrl+C：取消输入状态，不退出 CLI
+
+# Ctrl+C 取消的跨线程信号。信号处理器在主线程里 set 它，命令面板的等键
+# 轮询（SlashPalette.abort_check）看到后抛 KeyboardInterrupt——cbreak 模式
+# 下 Ctrl+C 走 SIGINT 而不是输入字节，阻塞中的 os.read 自己醒不过来。
+_cancel_event = threading.Event()
 
 
 class _StdinReader:
@@ -628,10 +798,14 @@ class _StdinReader:
     """
 
     def __init__(self) -> None:
-        self._requests: "queue.Queue[str]" = queue.Queue()
+        self._requests: "queue.Queue[tuple]" = queue.Queue()
         self._lock = threading.Lock()
         self._pending: Optional[tuple] = None
         self._thread: Optional[threading.Thread] = None
+        # 读取代次号。取消输入状态后，还阻塞在 input() 里的旧读取会在
+        # **下一次**读取开始后才返回，代次号对不上就丢弃，否则用户按掉
+        # 取消之后随手补敲的那个键会被当成新输入发给 AI。
+        self._epoch = 0
 
     def _ensure_thread(self) -> None:
         if self._thread is not None:
@@ -643,19 +817,20 @@ class _StdinReader:
 
     def _serve(self) -> None:
         while True:
-            prompt = self._requests.get()
+            prompt, epoch = self._requests.get()
             try:
                 value: Any = self._read_one(prompt)
             except EOFError:
                 value = _EOF
             except KeyboardInterrupt:
-                # 信号处理器在主线程，这里理论上收不到；真收到就当空行，
-                # 让主循环重新打提示符而不是把 CLI 带走。
-                value = ""
+                # 面板的 abort 轮询（状态输入中的 Ctrl+C）从这条路进来。
+                # 兑现成 _CANCEL；主循环会再校验一次状态，误触发也只会
+                # 被当成空行丢弃，不会把 "cancel" 发给 AI。
+                value = _CANCEL
             except Exception:
                 logger.debug("CLI 读取输入失败", exc_info=True)
                 value = _EOF
-            self._resolve(value)
+            self._resolve(value, epoch)
 
     def _read_one(self, prompt: str) -> str:
         """读一行。能画面板就画，不能就退回 input()。
@@ -666,12 +841,15 @@ class _StdinReader:
         """
         if not _palette_enabled():
             return input(prompt)
+        pal = PALETTE
         try:
             line = SlashPalette(
                 _prompt_plain(),
                 _matching_commands,
                 _palette_rows,
                 history=_history_entries(),
+                abort_check=_cancel_event.is_set,
+                echo_ansi=pal.user if pal.enabled else "",
             ).read_line()
         except (EOFError, KeyboardInterrupt):
             raise
@@ -682,13 +860,18 @@ class _StdinReader:
         _remember_history(line)
         return line
 
-    def _resolve(self, value: Any) -> None:
-        """把结果投递回事件循环。先摘 pending，保证只兑现一次。"""
+    def _resolve(self, value: Any, epoch: Optional[int] = None) -> None:
+        """把结果投递回事件循环。先摘 pending，保证只兑现一次。
+
+        epoch 不是 None 时只兑现同代次的读取——见 __init__ 里代次号的说明。
+        """
         with self._lock:
             pending, self._pending = self._pending, None
         if pending is None:
             return
-        future, loop = pending
+        future, loop, pending_epoch = pending
+        if epoch is not None and epoch != pending_epoch:
+            return  # 迟到的旧读取：那一轮已经被 Ctrl+C 兑现掉了
 
         def _apply() -> None:
             if not future.done():
@@ -704,9 +887,11 @@ class _StdinReader:
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         with self._lock:
-            self._pending = (future, loop)
+            self._epoch += 1
+            epoch = self._epoch
+            self._pending = (future, loop, epoch)
         self._ensure_thread()
-        self._requests.put(prompt)
+        self._requests.put((prompt, epoch))
         return await future
 
     def request_exit(self) -> bool:
@@ -715,11 +900,18 @@ class _StdinReader:
         返回 False 表示当前没有人在等输入（比如刚好在两次读取之间），
         调用方该退回到抛 KeyboardInterrupt 的老路。
         """
+        return self._resolve_current(_EXIT)
+
+    def request_cancel(self) -> bool:
+        """状态输入中的 Ctrl+C：把正等着的那次读取兑现成"取消输入状态"。"""
+        return self._resolve_current(_CANCEL)
+
+    def _resolve_current(self, sentinel: Any) -> bool:
         with self._lock:
             has_pending = self._pending is not None
         if not has_pending:
             return False
-        self._resolve(_EXIT)
+        self._resolve(sentinel)
         return True
 
 
@@ -731,11 +923,16 @@ def _prompt_text() -> str:
 
     ANSI 序列必须用 \\001..\\002 包起来：readline 靠提示符的显示宽度算光标
     位置，把颜色转义的字节数也算进去的话，方向键翻历史时行内容会画错位。
+
+    配置状态机等待输入时（设置 Key/轮数/密码等）整根变红——终端只有一个
+    输入通道，用户分不清"这行字会进状态机还是发给 AI"，红色就是这个模式
+    的显式信号；Ctrl+C 在红色期间是"取消输入状态"而不是退出。
     """
     pal = PALETTE
     if not pal.enabled:
         return "❯ "
-    return f"\001{pal.ai}{pal.bold}\002❯\001{pal.reset}\002 "
+    color = pal.err if _input_state_active() else pal.ai
+    return f"\001{color}{pal.bold}\002❯\001{pal.reset}\002 "
 
 
 # --------------------------------------------------------------------------
@@ -770,6 +967,16 @@ def _install_sigint_handler() -> None:
                 SCREEN.notice("已请求停止，正在收尾…（再按一次 Ctrl+C 强制退出）", "warn")
                 return
             raise KeyboardInterrupt
+        # 状态输入中（提示符是红色的那些时刻）：Ctrl+C = 取消输入状态。
+        # /start 里的数值输入、API Key、轮数这类状态机在 Telegram 上有
+        # "发送 cancel" 这条官方出口，终端的原生等价物就是 Ctrl+C。
+        # 先叫醒阻塞在等键里的面板（abort 轮询），再兑现等待中的读取；
+        # 两条路谁先到都只兑现一次。取消之后再按 Ctrl+C 才是退出。
+        if _input_state_active():
+            _cancel_event.set()
+            if _READER.request_cancel():
+                return
+            _cancel_event.clear()
         # 空闲时：兑现正在等待的那次读取，让主循环走正常的收尾路径。
         # 直接抛 KeyboardInterrupt 会打断事件循环本身，收尾要靠 asyncio.run()
         # 的异常路径，那条路上还得等一堆线程——正是这个 bug 的来源。
@@ -830,6 +1037,15 @@ async def _main_loop() -> None:
         line = await _READER.read(_prompt_text())
         if line is _EXIT or line is _EOF:
             break
+        if line is _CANCEL:
+            # 状态输入中按了 Ctrl+C：喂 "cancel" 给状态机——messages.py 的
+            # 官方取消路径会清掉 state 和全部 pending buffer 并回主菜单，
+            # 提示符随之恢复绿色。状态已经不在（误触发）就当空行丢弃，
+            # 绝不能把 "cancel" 当普通对话发给 AI。
+            _cancel_event.clear()
+            if _input_state_active():
+                await _run_turn(_run_conversation("cancel"))
+            continue
         text = str(line).strip()
         if not text:
             continue
@@ -881,6 +1097,15 @@ async def _main_loop() -> None:
                 continue
             # 裸编号但当前没有菜单：当普通文本处理——在 Telegram 里输入
             # "42" 本来就只是发一条消息。
+
+        # 跨端历史拉取：Telegram/Web 的对话不自动插进终端（会冲乱正在输入的
+        # 行），按需 /sync 或 /sync 200 拉出来看。
+        if low == "/sync" or low == "/pull" or low.startswith("/sync ") or low.startswith("/pull "):
+            _take_palette()
+            parts = text.split()
+            limit = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 50
+            await _run_turn(_pull_cross_client_history(max(1, min(limit, 500))))
+            continue
 
         if text.startswith("/"):
             routed = _route_command_prefix(text)

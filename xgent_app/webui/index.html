@@ -306,6 +306,83 @@
     box-shadow: var(--ai-shadow);
   }
 
+  /* ---- AI 发来的媒体 / 文件卡片 ---- */
+  /* flex 列容器里 float 无效，时间戳改绝对定位，并给底部留一条专属窄条。 */
+  .media-bubble { padding: 7px 7px 16px; position: relative; display: flex; flex-direction: column; gap: 6px; }
+  .media-bubble .ts { position: absolute; right: 11px; bottom: 3px; margin: 0; }
+  /* 用户侧媒体（自己上传的图片回显）不用渐变底，给媒体一个中性画框。 */
+  .bubble.user.media-bubble {
+    background: var(--surface); border: 1px solid var(--line);
+    box-shadow: var(--ai-shadow); color: var(--text);
+    border-radius: var(--r-lg) var(--r-xs) var(--r-lg) var(--r-lg);
+  }
+  .bubble.user.media-bubble .ts { color: var(--text-3); }
+  .media-img {
+    display: block; max-width: min(420px, 74vw); max-height: 380px;
+    border-radius: var(--r-md); cursor: zoom-in;
+    border: 1px solid var(--line);
+  }
+  .media-video {
+    display: block; width: min(420px, 74vw); max-height: 380px;
+    border-radius: var(--r-md); background: #000; border: 1px solid var(--line);
+  }
+  .media-audio { display: block; width: min(320px, 70vw); }
+  .media-cap { font-size: 13px; color: var(--text-2); padding: 0 6px 3px; }
+  /* 图片/视频/音频的悬停下载按钮：下载永远点按钮，不点链接。 */
+  .media-dl {
+    position: absolute; right: 11px; top: 11px; z-index: 2;
+    width: 32px; height: 32px; border-radius: var(--r-full);
+    display: flex; align-items: center; justify-content: center;
+    background: color-mix(in srgb, var(--surface) 78%, transparent);
+    border: 1px solid var(--line-2); color: var(--text-2);
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    opacity: 0; transform: translateY(-3px);
+    transition: opacity var(--t), transform var(--t), color var(--t), border-color var(--t);
+  }
+  .media-bubble:hover .media-dl { opacity: 1; transform: none; }
+  .media-dl:hover { color: var(--accent); border-color: var(--accent-ring); }
+  .media-dl .icon { width: 15px; height: 15px; }
+  @media (hover: none) { .media-dl { opacity: .9; transform: none; } }
+  /* 自己发的图片的本地缩略图 */
+  .user-thumb {
+    display: block; margin-top: 7px; cursor: zoom-in;
+    max-width: 220px; max-height: 220px; border-radius: var(--r-md);
+    border: 1px solid var(--line-2);
+  }
+  .file-card {
+    display: flex; align-items: center; gap: 11px; min-width: 240px; max-width: 380px;
+    background: var(--surface-2); border: 1px solid var(--line);
+    border-radius: var(--r-md); padding: 10px 11px; cursor: pointer;
+    transition: border-color var(--t), background var(--t);
+  }
+  .file-card:hover { border-color: var(--accent-ring); background: var(--surface); }
+  .fc-icon {
+    width: 38px; height: 38px; border-radius: var(--r-sm); flex-shrink: 0;
+    background: var(--accent-soft); color: var(--accent);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .fc-icon .icon { width: 17px; height: 17px; }
+  .fc-body { flex: 1; min-width: 0; }
+  .fc-name {
+    font-size: 13.5px; font-weight: 600; color: var(--text);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .fc-cap {
+    font-size: 12px; color: var(--text-3); margin-top: 1px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .fc-dl {
+    flex-shrink: 0; display: inline-flex; align-items: center; gap: 5px;
+    padding: 8px 14px; border-radius: var(--r-sm); text-decoration: none;
+    background: var(--grad); color: #fff;
+    font: 550 12.5px var(--font); letter-spacing: 0;
+    box-shadow: 0 2px 8px var(--accent-ring);
+    transition: opacity var(--t), transform .1s var(--ease);
+  }
+  .fc-dl:hover { opacity: .92; color: #fff; }
+  .fc-dl:active { transform: scale(.95); }
+  .fc-dl .icon { width: 13px; height: 13px; }
+
   /* ---- 内联按钮 ---- */
   .inline-keyboard { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
   .ik-row { display: flex; gap: 6px; }
@@ -359,6 +436,19 @@
   #empty-state .mark .icon { width: 28px; height: 28px; }
   #empty-state .title { font-size: 17px; font-weight: 620; letter-spacing: -.018em; color: var(--text); }
   #empty-state .desc { font-size: 13.5px; color: var(--text-3); max-width: 280px; line-height: 1.6; }
+  #empty-state .chips {
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 8px;
+    margin-top: 18px; pointer-events: auto;   /* 父层为避免挡点击设了 none，这里要可点 */
+  }
+  .chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 8px 14px; border-radius: var(--r-full);
+    background: var(--surface); border: 1px solid var(--line-2); color: var(--text-2);
+    font: 500 13px var(--font); cursor: pointer;
+    transition: background var(--t), border-color var(--t), color var(--t), transform .1s var(--ease);
+  }
+  .chip:hover { border-color: var(--accent-ring); color: var(--accent); background: var(--accent-soft); }
+  .chip:active { transform: scale(.96); }
 
   /* ---- 输入栏 ---- */
   footer {
@@ -434,15 +524,17 @@
     border-radius: var(--r-md); overflow: hidden auto; max-height: 264px; z-index: 8;
     box-shadow: 0 12px 36px rgba(8, 10, 16, .16), 0 2px 6px rgba(8, 10, 16, .08);
     animation: rise .16s var(--ease);
-  }
-  .cmd-item {
+  }  .cmd-item {
     display: flex; align-items: baseline; gap: 10px;
     padding: 9px 13px; cursor: pointer;
     border-bottom: 1px solid var(--line);
+    border-left: 2px solid transparent;
     transition: background var(--t);
   }
-  .cmd-item:last-child { border-bottom: none; }
-  .cmd-item:hover, .cmd-item.active { background: var(--accent-soft); }
+  .cmd-item:last-of-type { border-bottom: none; }
+  .cmd-item:hover, .cmd-item.active {
+    background: var(--accent-soft); border-left-color: var(--accent);
+  }
   .cmd-item .c-cmd {
     font: 600 13px var(--mono); color: var(--accent);
     white-space: nowrap; letter-spacing: 0;
@@ -450,6 +542,12 @@
   .cmd-item .c-desc {
     color: var(--text-3); font-size: 12.5px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .cmd-foot {
+    position: sticky; bottom: 0;
+    padding: 7px 13px; font-size: 11.5px; color: var(--text-3);
+    background: var(--surface-2); border-top: 1px solid var(--line);
+    user-select: none;
   }
 
   /* ---- 滚动到底部 ---- */
@@ -705,6 +803,11 @@
   <div class="mark"><svg class="icon" viewBox="0 0 24 24"><use href="#i-spark"/></svg></div>
   <div class="title">开始对话</div>
   <div class="desc">在下方输入消息，或点击左上角菜单查看全部命令。</div>
+  <div class="chips">
+    <button class="chip" type="button" data-cmd="/start">▶ 主菜单</button>
+    <button class="chip" type="button" data-cmd="/status">ℹ 运行状态</button>
+    <button class="chip" type="button" data-cmd="/export">📦 导出记忆</button>
+  </div>
 </div>
 
 <div id="typing" class="hidden"><span></span><span></span><span></span></div>
@@ -947,7 +1050,11 @@
   function renderText(text, parseMode) {
     text = text == null ? "" : String(text);
     if (parseMode && String(parseMode).toUpperCase().indexOf("HTML") >= 0) {
-      return sanitizeHtml(text);
+      // Telegram 的 HTML 模式里 \n 就是换行（TG 客户端渲染时保留）；浏览器
+      // innerHTML 却会把 \n 折叠成一个空格——/status 这类多行面板在网页上
+      // 挤成一整行就是这个原因。先补 <br> 再走白名单清洗：BR 在白名单里，
+      // <pre> 内的 <br> 视觉上仍是换行，无副作用。
+      return sanitizeHtml(text.replace(/\n/g, "<br>"));
     }
     // 纯文本：转义后还原代码块与换行。
     var out = escapeHtml(text);
@@ -1076,64 +1183,133 @@
     return entry;
   }
 
-  // AI 生成/发送的图片或文件：sys 侧一个小气泡，有 download_url 时渲染
-  // 真实 img（图片）或可点击下载链接（文件）；没有 download_url（拿不到
-  // 本地路径的场景，比如内存 buffer 生成的导出文件）时退化为纯文字提示，
-  // 不引入死链接。
-  function makeMediaBubble(kind, filename, caption, downloadUrl, messageId) {
+  // ---- 媒体类型识别 ----
+  var IMG_EXT = { jpg: 1, jpeg: 1, png: 1, gif: 1, webp: 1, bmp: 1, svg: 1 };
+  var VIDEO_EXT = { mp4: 1, webm: 1, mov: 1, m4v: 1, mkv: 1 };
+  var AUDIO_EXT = { mp3: 1, wav: 1, ogg: 1, m4a: 1, flac: 1, aac: 1 };
+  function mediaKindFromName(filename) {
+    var m = /\.([a-zA-Z0-9]+)$/.exec(String(filename || ""));
+    var ext = m ? m[1].toLowerCase() : "";
+    if (IMG_EXT[ext]) return "photo";
+    if (VIDEO_EXT[ext]) return "video";
+    if (AUDIO_EXT[ext]) return "audio";
+    return "file";
+  }
+
+  // AI/用户侧的媒体气泡：图片内联、视频/音频带播放器、其余文件卡片。
+  // 有 download_url 时按类型渲染（下载一律走按钮，不出裸链接）；没有
+  // download_url（拿不到本地路径的场景）退化为纯文字提示，不引入死链接。
+  // side 决定显示在用户侧还是 AI 侧（自己上传的图片在用户侧）。
+  function makeMediaBubble(kind, filename, caption, downloadUrl, messageId, side) {
+    side = side || "ai";
     msgCount++;
     updateEmptyState();
     var row = document.createElement("div");
-    row.className = "msg-row sys";
-    var pill = document.createElement("div");
-    pill.className = "sys-pill";
+    var entry;
+    if (downloadUrl) {
+      row.className = "msg-row " + side;
+      var bubble = document.createElement("div");
+      bubble.className = "bubble " + side + " media-bubble";
 
-    if (kind === "photo" && downloadUrl) {
-      var img = document.createElement("img");
-      img.src = downloadUrl;
-      img.loading = "lazy";
-      img.style.maxWidth = "240px";
-      img.style.maxHeight = "240px";
-      img.style.borderRadius = "10px";
-      img.style.display = "block";
-      img.style.cursor = "pointer";
-      img.addEventListener("click", function () { window.open(downloadUrl, "_blank"); });
-      img.addEventListener("error", function () {
-        // 坏图兜底：换成文字提示，不能让一张加载失败的图片搞崩整条气泡。
-        img.replaceWith(document.createTextNode("\uD83D\uDDBC\uFE0F " + (filename || "图片") + "（加载失败）"));
-      });
-      pill.appendChild(img);
-      if (caption) {
-        var capEl = document.createElement("div");
-        capEl.style.marginTop = "4px";
-        capEl.textContent = caption;
-        pill.appendChild(capEl);
+      var media = null;
+      if (kind === "photo") {
+        media = document.createElement("img");
+        media.src = downloadUrl;
+        media.loading = "lazy";
+        media.className = "media-img";
+        media.addEventListener("click", function () { window.open(downloadUrl, "_blank"); });
+        media.addEventListener("error", function () {
+          // 坏图兜底：换成文字提示，不能让一张加载失败的图片搞崩整条气泡。
+          media.replaceWith(document.createTextNode("🖼️ " + (filename || "图片") + "（加载失败）"));
+        });
+      } else if (kind === "video") {
+        media = document.createElement("video");
+        media.src = downloadUrl;
+        media.controls = true;
+        media.preload = "metadata";
+        media.className = "media-video";
+      } else if (kind === "audio") {
+        media = document.createElement("audio");
+        media.src = downloadUrl;
+        media.controls = true;
+        media.preload = "metadata";
+        media.className = "media-audio";
       }
-    } else if (downloadUrl) {
-      var link = document.createElement("a");
-      link.href = downloadUrl;
-      link.download = filename || "file";
-      link.target = "_blank";
-      link.rel = "noopener noreferrer";
-      link.textContent = "\uD83D\uDCCE " + (filename || "文件") + "（点击下载）";
-      pill.appendChild(link);
-      if (caption) {
-        var capEl2 = document.createElement("div");
-        capEl2.style.marginTop = "4px";
-        capEl2.textContent = caption;
-        pill.appendChild(capEl2);
+
+      if (media) {
+        bubble.appendChild(media);
+        if (caption) {
+          var capEl = document.createElement("div");
+          capEl.className = "media-cap";
+          capEl.textContent = caption;
+          bubble.appendChild(capEl);
+        }
+      } else {
+        var card = document.createElement("div");
+        card.className = "file-card";
+        var fcIcon = document.createElement("div");
+        fcIcon.className = "fc-icon";
+        fcIcon.innerHTML = svgIcon("down");
+        var fcBody = document.createElement("div");
+        fcBody.className = "fc-body";
+        var fcName = document.createElement("div");
+        fcName.className = "fc-name";
+        fcName.textContent = filename || "文件";
+        fcBody.appendChild(fcName);
+        if (caption) {
+          var fcCap = document.createElement("div");
+          fcCap.className = "fc-cap";
+          fcCap.textContent = caption;
+          fcBody.appendChild(fcCap);
+        }
+        var fcBtn = document.createElement("a");
+        fcBtn.className = "fc-dl";
+        fcBtn.href = downloadUrl;
+        fcBtn.download = filename || "file";
+        fcBtn.target = "_blank";
+        fcBtn.rel = "noopener noreferrer";
+        fcBtn.innerHTML = svgIcon("down") + "<span>下载</span>";
+        card.appendChild(fcIcon);
+        card.appendChild(fcBody);
+        card.appendChild(fcBtn);
+        card.addEventListener("click", function (e) {
+          // 点卡片整体也下载；点按钮本身时让它走默认行为，别触发两次。
+          if (e.target.closest(".fc-dl")) return;
+          fcBtn.click();
+        });
+        bubble.appendChild(card);
       }
+
+      // 图片/视频/音频右下角的悬停下载按钮——下载永远点按钮，不点链接。
+      var dlBtn = document.createElement("a");
+      dlBtn.className = "media-dl";
+      dlBtn.href = downloadUrl;
+      dlBtn.download = filename || "file";
+      dlBtn.title = "下载";
+      dlBtn.innerHTML = svgIcon("down");
+      bubble.appendChild(dlBtn);
+
+      var ts = document.createElement("span");
+      ts.className = "ts";
+      ts.textContent = nowTime();
+      bubble.appendChild(ts);
+      row.appendChild(bubble);
+      log.appendChild(row);
+      scrollDown();
+      entry = { row: row, body: bubble, btns: null };
     } else {
+      row.className = "msg-row sys";
+      var pill = document.createElement("div");
+      pill.className = "sys-pill";
       pill.innerHTML = renderText(
-        (kind === "photo" ? "\uD83D\uDDBC\uFE0F " : "\uD83D\uDCCE ") + (filename || (kind === "photo" ? "图片" : "文件")) +
+        (kind === "photo" ? "🖼️ " : "📎 ") + (filename || (kind === "photo" ? "图片" : "文件")) +
         (caption ? "\n" + caption : "")
       );
+      row.appendChild(pill);
+      log.appendChild(row);
+      scrollDown();
+      entry = { row: row, body: pill, btns: null };
     }
-
-    row.appendChild(pill);
-    log.appendChild(row);
-    scrollDown();
-    var entry = { row: row, body: pill, btns: null };
     if (messageId != null) { byMessageId[messageId] = entry; }
     return entry;
   }
@@ -1191,7 +1367,9 @@
   // ---- SSE 帧处理 ----
   function handleFrame(frame) {
     if (frame.type === "message") {
-      makeBubble("ai", frame.text, frame.message_id, frame.parse_mode, frame.reply_markup);
+      var mEntry = makeBubble("ai", frame.text, frame.message_id, frame.parse_mode, frame.reply_markup);
+      // 跨端帧（服务端从数据库转推的 CLI 记录）：文本里带媒体路径时升级成卡片。
+      if (frame.external) upgradeBubbleMedia(mEntry, frame.text);
       hideTyping();
     } else if (frame.type === "edit") {
       var e = byMessageId[frame.message_id];
@@ -1213,11 +1391,18 @@
       msgCount = Math.max(0, msgCount - 1);
       updateEmptyState();
     } else if (frame.type === "user_message") {
-      // Telegram 侧发来的用户消息，镜像到网页
-      makeBubble("user", frame.text, null, null, null);
+      // 跨端来的用户消息（CLI 里聊的），镜像到网页用户侧
+      var uEntry = makeBubble("user", frame.text, null, null, null);
+      if (frame.external) upgradeBubbleMedia(uEntry, frame.text);
       hideTyping();
+    } else if (frame.type === "notice") {
+      // 跨端来的系统记录（[系统操作] 这类），居中灰条显示
+      var nEntry = makeBubble("sys", frame.text, null, frame.parse_mode);
+      if (frame.external) upgradeBubbleMedia(nEntry, frame.text);
     } else if (frame.type === "document" || frame.type === "photo") {
-      makeMediaBubble(frame.type, frame.filename, frame.caption, frame.download_url, frame.message_id);
+      // document 帧按文件名分流：mp4 给播放器、jpg 给图片、其余文件卡片。
+      var mediaKind = frame.type === "photo" ? "photo" : mediaKindFromName(frame.filename);
+      makeMediaBubble(mediaKind, frame.filename, frame.caption, frame.download_url, frame.message_id, "ai");
     } else if (frame.type === "chat_action") {
       if (frame.action === "typing") showTyping(); else hideTyping();
     } else if (frame.type === "callback_answer") {
@@ -1305,11 +1490,90 @@
       msgCount = 0;
       (data.messages || []).forEach(function (m) {
         var role = m.role === "user" ? "user" : (m.role === "assistant" ? "ai" : "sys");
-        makeBubble(role, m.content, null, m.parse_mode);
+        var media = extractMediaFromText(m.content);
+        if (!media) {
+          makeBubble(role, m.content, null, m.parse_mode);
+          return;
+        }
+        restoreMediaFromHistory(m, role, media);
       });
       updateEmptyState();
       scrollDown();
     });
+  }
+
+  // ---- 刷新后的媒体恢复 ----
+  // 下载 URL 只活在 SSE 帧里，刷新即失；但每条媒体操作入库的文本都带着
+  // 服务器绝对路径。这里从历史文本里把路径挖出来，向 /api/media/resolve
+  // 换一个新 token，媒体卡片因此跨刷新、跨进程重启都能恢复。
+  var MEDIA_PATH_PATTERNS = [
+    // 用户上传："[图片] 名字，已保存到 /abs/path。说明：附言" → 用户侧，整条换成卡片
+    { re: /已保存到 (\/[^\s，。；)）]+)/, side: "user", replace: true, caption: /说明：([\s\S]*)$/ },
+    // AI 媒体回复尾部："【系统自动生成：本图片已自动存入 /abs/path，…】" → 保留正文，卡片追加在后
+    { re: /已自动存入 (\/[^\s，。；)）】]+)/, side: "ai", replace: false },
+    // Agent sendfile 结果 → AI 侧，整条换成卡片
+    { re: /已发送服务器文件给用户[:：]\s*(\/[^\s(（]+)\s*[(（]/, side: "ai", replace: true },
+    // Agent file 写入结果 → AI 侧，整条换成卡片
+    { re: /已写入服务器文件[:：]\s*(\/[^\s(（]+)\s*[(（]/, side: "ai", replace: true },
+    // /export 系统消息（新版带路径）→ AI 侧，整条换成卡片
+    { re: /服务器文件路径[:：]\s*(\/[^\s(（]+)/, side: "ai", replace: true }
+  ];
+  function extractMediaFromText(text) {
+    text = String(text == null ? "" : text);
+    for (var i = 0; i < MEDIA_PATH_PATTERNS.length; i++) {
+      var p = MEDIA_PATH_PATTERNS[i];
+      var m = p.re.exec(text);
+      if (!m) continue;
+      var path = m[1];
+      // 必须像个文件路径（带扩展名），避免把正文里偶然出现的词误判成媒体。
+      if (!/\.[a-zA-Z0-9]{1,8}$/.test(path)) continue;
+      var caption = null;
+      if (p.caption) {
+        var cm = p.caption.exec(text);
+        if (cm && cm[1].trim()) caption = cm[1].trim();
+      }
+      return { path: path, side: p.side, replace: p.replace, caption: caption };
+    }
+    return null;
+  }
+
+  // 把一个已渲染的文本气泡按其内容里的媒体路径升级成媒体卡片。
+  // 历史恢复（loadHistory）和跨端实时帧（external=1）共用这一份逻辑。
+  function upgradeBubbleMedia(entry, text) {
+    var media = extractMediaFromText(text);
+    if (!media) return;
+    api("/api/media/resolve", { method: "POST", body: JSON.stringify({ path: media.path }) })
+      .then(function (res) {
+        var card = makeMediaBubble(
+          mediaKindFromName(res.filename), res.filename, media.caption, res.url, null, media.side
+        );
+        if (!entry || !entry.row || !entry.row.parentNode) {
+          // 原气泡已不在页面（正文被剥空 / 用户又刷新了）：直接追加卡片。
+          log.appendChild(card.row);
+          return;
+        }
+        if (media.replace) {
+          entry.row.parentNode.replaceChild(card.row, entry.row);
+        } else {
+          entry.row.parentNode.insertBefore(card.row, entry.row.nextSibling);
+        }
+      })
+      .catch(function () {
+        /* resolve 失败（文件被清理/路径不在白名单）：保留原文本，不引入死链 */
+      });
+  }
+
+  function restoreMediaFromHistory(m, role, media) {
+    var target = null;
+    if (media.replace) {
+      // 先按原文渲染占位：resolve 失败时用户至少还能看到路径文本。
+      target = makeBubble(role, m.content, null, m.parse_mode);
+    } else {
+      // 媒体回复：正文有价值，剥掉自动存档说明行后保留，卡片插在后面。
+      var stripped = String(m.content).replace(/【系统自动生成：[^】]+】/g, "").trim();
+      if (stripped) target = makeBubble(role, stripped, null, m.parse_mode);
+    }
+    upgradeBubbleMedia(target, m.content);
   }
 
   // ---- 发送 ----
@@ -1323,13 +1587,24 @@
     // 没文本又没文件，或正在忙，直接拦下。纯文件（无附言）允许发送。
     if ((!text && !hasFiles) || btnSend.disabled) return;
 
-    // 本地先显示用户气泡：有文件时把文件名列进去，方便用户看到自己发了什么。
+    // 本地先显示用户气泡：有文件时把文件名列进去，图片文件直接给本地
+    // 缩略图（blob URL，立即可见，不用等服务器回显；刷新后由历史恢复接管）。
     var preview = text;
     if (hasFiles) {
       var names = pendingFiles.map(function (f) { return "📎 " + f.name; }).join("\n");
       preview = text ? (names + "\n" + text) : names;
     }
-    makeBubble("user", preview);
+    var sentEntry = makeBubble("user", preview);
+    if (hasFiles) {
+      pendingFiles.forEach(function (f) {
+        if (mediaKindFromName(f.name) !== "photo") return;
+        var thumb = document.createElement("img");
+        thumb.src = URL.createObjectURL(f);
+        thumb.className = "user-thumb";
+        thumb.addEventListener("click", function () { window.open(thumb.src, "_blank"); });
+        sentEntry.body.appendChild(thumb);
+      });
+    }
     input.value = "";
     input.style.height = "auto";
     syncSendState();
@@ -1384,12 +1659,20 @@
   }
 
   // ---- / 命令补全 ----
+  var suggestMatches = [];
+  function markActive() {
+    var items = suggest.querySelectorAll(".cmd-item");
+    Array.prototype.forEach.call(items, function (it, i) {
+      it.classList.toggle("active", i === suggestIndex);
+    });
+  }
   function showSuggest(q) {
     var prefix = q.toLowerCase();
     var matches = COMMANDS.filter(function (c) { return c.cmd.toLowerCase().indexOf(prefix) === 0; });
     if (!matches.length) { hideSuggest(); return; }
     suggest.innerHTML = "";
-    matches.slice(0, 6).forEach(function (c, i) {
+    suggestMatches = matches.slice(0, 6);
+    suggestMatches.forEach(function (c, i) {
       var item = document.createElement("div");
       item.className = "cmd-item";
       item.innerHTML = '<span class="c-cmd">' + escapeHtml(c.cmd) + "</span><span class=\"c-desc\">" + escapeHtml(c.desc) + "</span>";
@@ -1400,13 +1683,25 @@
         input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 168) + "px";
         syncSendState();
       });
+      // 鼠标划过即接管高亮：键盘和鼠标两条选择路径看到的是同一个选中态。
+      item.addEventListener("mouseenter", function () {
+        suggestIndex = i;
+        markActive();
+      });
       item.dataset.idx = i;
       suggest.appendChild(item);
     });
-    suggestIndex = -1;
+    // 打出 /s 就默认选中第一条（比如 /start）：不用再先按一下 ↓。
+    // Enter 会识别"已经打全了这条命令"直接发送，不会把补全变成二次确认。
+    suggestIndex = 0;
+    markActive();
+    var foot = document.createElement("div");
+    foot.className = "cmd-foot";
+    foot.textContent = "↑↓ 选择 · Tab 填入 · Enter 执行 · Esc 关闭";
+    suggest.appendChild(foot);
     suggest.classList.remove("hidden");
   }
-  function hideSuggest() { suggest.classList.add("hidden"); suggestIndex = -1; }
+  function hideSuggest() { suggest.classList.add("hidden"); suggestIndex = -1; suggestMatches = []; }
 
   // ---- 设置 ----
   var SETTING_FIELDS = [
@@ -1869,17 +2164,29 @@
       if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
       return;
     }
-    // 补全菜单激活时：上下选择 / Enter 确认 / Esc 关闭
+    // 补全菜单激活时：上下选择 / Tab 填入 / Enter 执行或发送 / Esc 关闭
     var items = suggest.querySelectorAll(".cmd-item");
     if (e.key === "ArrowDown") { e.preventDefault(); suggestIndex = Math.min(suggestIndex + 1, items.length - 1); }
     else if (e.key === "ArrowUp") { e.preventDefault(); suggestIndex = Math.max(suggestIndex - 1, 0); }
-    else if (e.key === "Enter") {
+    else if (e.key === "Tab") {
       e.preventDefault();
       if (suggestIndex >= 0 && items[suggestIndex]) { items[suggestIndex].click(); return; }
+    }
+    else if (e.key === "Enter") {
+      e.preventDefault();
+      if (suggestIndex >= 0 && items[suggestIndex]) {
+        var sel = suggestMatches[suggestIndex];
+        // 输入已经完整等于选中命令（/status 打全了）：Enter 是"发送"，
+        // 不是"再填一遍"——否则每条打全的命令都要按两次回车。
+        if (sel && input.value.trim().toLowerCase() === sel.cmd.toLowerCase()) {
+          hideSuggest(); send(); return;
+        }
+        items[suggestIndex].click(); return;
+      }
       hideSuggest(); send(); return;
     } else if (e.key === "Escape") { hideSuggest(); return; }
     else { return; }
-    Array.prototype.forEach.call(items, function (it, i) { it.classList.toggle("active", i === suggestIndex); });
+    markActive();
   });
   input.addEventListener("input", function () {
     input.style.height = "auto";
@@ -1933,6 +2240,17 @@
     pendingFiles = [];
     renderPendingFiles();
   }
+
+  // 空状态快捷命令：点一下填进输入框（与命令菜单侧栏的行为一致——
+  // 填入而不是直接执行，让用户有机会补参数）。
+  var chips = document.querySelectorAll("#empty-state .chip");
+  Array.prototype.forEach.call(chips, function (chip) {
+    chip.addEventListener("click", function () {
+      input.value = chip.dataset.cmd + " ";
+      input.focus();
+      syncSendState();
+    });
+  });
 
   // 滚动检测 & 滚动到底部按钮
   log.addEventListener("scroll", function () {

@@ -6,6 +6,9 @@ web_auth / web_bridge / web_server 都是可导入模块，不依赖 sections �
 
 import asyncio
 import hashlib
+import os
+import shutil
+import tempfile
 import hmac
 import json
 import threading
@@ -18,6 +21,18 @@ import urllib.request
 from xgent_app import web_auth
 from xgent_app.web_bridge import WebBot, WebOutbox, build_web_conversation_objects
 from xgent_app.web_server import WebChatConfig, WebChatServer
+
+
+def _async_result(value):
+    async def _read(*_args, **_kwargs):
+        return value
+    return _read
+
+
+def _async_value(value):
+    async def _write(*_args, **_kwargs):
+        return value
+    return _write
 
 
 class PasswordTests(unittest.TestCase):
@@ -615,6 +630,149 @@ class WebServerStartupGuardTests(unittest.TestCase):
         server.stop()  # 二次调用不该抛
         self.assertFalse(server.running)
         config.loop.close()
+
+
+class MediaResolveHttpTests(unittest.TestCase):
+    """/api/media/resolve：历史文本挖出的服务器路径 -> 新下载 token。
+
+    这是"刷新后媒体卡片不丢"的服务端半边：前端从历史文本里挖出路径，
+   来这里换 token。信任边界必须钉死——白名单根之外的路不给换（否则等于
+    开放任意文件读取），不存在的文件不给换。
+    """
+
+    PASSWORD = "test-password"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.loop = asyncio.new_event_loop()
+        cls.loop_thread = threading.Thread(target=cls.loop.run_forever, daemon=True)
+        cls.loop_thread.start()
+
+        # 白名单根：一个临时目录当 xgent_storage；系统临时目录本身当"外部"。
+        cls.storage_root = tempfile.mkdtemp(prefix="xgent-media-root-")
+        cls.outside_root = tempfile.mkdtemp(prefix="xgent-outside-")
+
+        cls.config = WebChatConfig(
+            host="127.0.0.1",
+            port=0,
+            password_hash=web_auth.hash_password(cls.PASSWORD),
+            bot_token="123456:ABCdefGhIJKlmNoPQRsTUVwxyZ",
+            authorized_user_id=42,
+            loop=cls.loop,
+            submit_message=lambda text, outbox: None,
+            read_history=_async_result([]),
+            read_settings=_async_result({"values": {}, "options": {}}),
+            write_setting=_async_value({"values": {}, "options": {}}),
+            request_stop=lambda: None,
+            is_busy=lambda: False,
+            media_allowed_roots=[cls.storage_root],
+        )
+        cls.server = WebChatServer(cls.config)
+        cls.server.start()
+        cls.port = cls.server._httpd.server_address[1]
+        cls.base = f"http://127.0.0.1:{cls.port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.stop()
+        cls.loop.call_soon_threadsafe(cls.loop.stop)
+        cls.loop_thread.join(timeout=5)
+        shutil.rmtree(cls.storage_root, ignore_errors=True)
+        shutil.rmtree(cls.outside_root, ignore_errors=True)
+
+    def request(self, path, method="POST", body=None, cookie=None):
+        url = self.base + path
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Origin", self.base)
+        if cookie:
+            req.add_header("Cookie", cookie)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status, json.loads(resp.read().decode()), resp.headers
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode()
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = {"raw": raw}
+            return exc.code, parsed, exc.headers
+
+    def login(self):
+        status, _body, headers = self.request(
+            "/api/login", method="POST", body={"password": self.PASSWORD}
+        )
+        self.assertEqual(200, status)
+        return headers["Set-Cookie"].split(";")[0]
+
+    def _write(self, root, name, content):
+        path = os.path.join(root, name)
+        with open(path, "wb") as handle:
+            handle.write(content)
+        return path
+
+    def test_resolve_in_allowed_root_returns_download_url(self):
+        path = self._write(self.storage_root, "exports", b"PK-zip-bytes")
+        cookie = self.login()
+        status, body, _h = self.request(
+            "/api/media/resolve", body={"path": path}, cookie=cookie
+        )
+        self.assertEqual(200, status, body)
+        self.assertIn("/api/media/", body["url"])
+        self.assertEqual("exports", body["filename"])
+        self.assertEqual(len(b"PK-zip-bytes"), body["size"])
+
+    def test_resolved_url_downloads_bytes_with_attachment_for_zip(self):
+        path = self._write(self.storage_root, "exports", b"PK-zip-bytes")
+        cookie = self.login()
+        _s, body, _h = self.request("/api/media/resolve", body={"path": path}, cookie=cookie)
+        req = urllib.request.Request(self.base + body["url"])
+        req.add_header("Cookie", cookie)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            self.assertEqual(200, resp.status)
+            self.assertEqual(b"PK-zip-bytes", resp.read())
+            self.assertIn("attachment", resp.headers.get("Content-Disposition", ""))
+
+    def test_image_gets_inline_disposition(self):
+        path = self._write(self.storage_root, "pic.png", b"FAKEPNGDATA")
+        cookie = self.login()
+        _s, body, _h = self.request("/api/media/resolve", body={"path": path}, cookie=cookie)
+        req = urllib.request.Request(self.base + body["url"])
+        req.add_header("Cookie", cookie)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            self.assertIn("inline", resp.headers.get("Content-Disposition", ""))
+            self.assertTrue(resp.headers.get("Content-Type", "").startswith("image/"))
+
+    def test_resolve_rejects_paths_outside_allowed_roots(self):
+        secret = self._write(self.outside_root, "secret.txt", b"nope")
+        cookie = self.login()
+        status, body, _h = self.request(
+            "/api/media/resolve", body={"path": secret}, cookie=cookie
+        )
+        self.assertEqual(403, status, body)
+
+    def test_traversal_escape_is_rejected(self):
+        # 指向白名单内不存在但借 ../ 逃逸的路径：realpath 归一化后落在根之外。
+        cookie = self.login()
+        sneaky = os.path.join(self.storage_root, "..", "escape.txt")
+        status, _body, _h = self.request(
+            "/api/media/resolve", body={"path": sneaky}, cookie=cookie
+        )
+        self.assertEqual(403, status)
+
+    def test_resolve_missing_file_is_404(self):
+        cookie = self.login()
+        missing = os.path.join(self.storage_root, "gone.zip")
+        status, body, _h = self.request(
+            "/api/media/resolve", body={"path": missing}, cookie=cookie
+        )
+        self.assertEqual(404, status, body)
+
+    def test_resolve_requires_auth(self):
+        path = self._write(self.storage_root, "auth.zip", b"x")
+        status, _body, _h = self.request("/api/media/resolve", body={"path": path})
+        self.assertEqual(401, status)
 
 
 if __name__ == "__main__":

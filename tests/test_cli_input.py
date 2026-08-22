@@ -96,7 +96,7 @@ async def main():
     loop = asyncio.get_running_loop()
     future = loop.create_future()
     # 直接摆一个"正在等输入"的状态，不真的去读 stdin（探针没有 tty）。
-    reader._pending = (future, loop)
+    reader._pending = (future, loop, 1)
     handled = reader.request_exit()
     value = await asyncio.wait_for(future, timeout=5)
     again = reader.request_exit()
@@ -112,6 +112,40 @@ asyncio.run(main())
         self.assertTrue(result["is_exit"])
         # 兑现过就不该再兑现第二次，否则 handler 会重复触发退出。
         self.assertFalse(result["second_call"])
+
+    def test_cancel_ctrl_c_resolves_and_stale_reads_are_dropped(self):
+        # 状态输入中的 Ctrl+C 兑现成 _CANCEL；之后旧读取才姗姗返回时，
+        # 代次号对不上必须丢弃——否则用户取消后随手补敲的键会冒充新输入。
+        result = self.run_probe("""
+import asyncio
+
+async def main():
+    reader = xgent_cli._StdinReader()
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    reader._pending = (future, loop, 1)
+    handled = reader.request_cancel()
+    value = await asyncio.wait_for(future, timeout=5)
+
+    next_future = loop.create_future()
+    reader._pending = (next_future, loop, 2)
+    reader._resolve("x", 1)   # 旧代次的迟到结果
+    try:
+        await asyncio.wait_for(asyncio.shield(next_future), timeout=0.2)
+        landed = True
+    except asyncio.TimeoutError:
+        landed = False
+    print(json.dumps({
+        "handled": handled,
+        "is_cancel": value is xgent_cli._CANCEL,
+        "stale_dropped": not landed,
+    }))
+
+asyncio.run(main())
+""")
+        self.assertTrue(result["handled"])
+        self.assertTrue(result["is_cancel"])
+        self.assertTrue(result["stale_dropped"])
 
     def test_blank_line_is_not_end_of_file(self):
         # 老实现里 _read_input 把 EOFError 也翻译成空串，于是在提示符上按一下

@@ -104,6 +104,8 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
 # 和被 lifecycle.py 调用（更晚加载）。
 
 _web_chat_server: Optional[Any] = None
+# 跨端同步观察者任务（CLI→Web 实时帧），随 Web 服务启停。
+_web_external_watch_task: Optional[asyncio.Task] = None
 # 真实 PTB bot 引用。网页发起对话时，MirrorBot 用它把消息同时投递到 Telegram。
 _web_real_bot: Optional[Any] = None
 _web_application: Optional[Any] = None
@@ -153,6 +155,71 @@ async def _web_read_history(limit: int) -> List[Dict[str, Any]]:
                 'content': content,
             })
     return result
+
+
+def _external_row_to_frame(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """外部进程（CLI）写入的一条全局记录 -> SSE 帧。
+
+    映射对齐 _web_read_history：AI_REPLY 的 Markdown 转 Telegram HTML，
+    AGENT_RESULT/AGENT_CMD/MEDIA_REPLY 显示到 AI 侧，用户记录显示到用户侧，
+    系统记录走独立的 notice 帧（前端居中灰条）。帧带 external=1 标记：
+    前端只对带标记的帧做"从文本挖路径恢复媒体卡片"——本进程自己的实时帧
+    已有真正的 document/photo 帧，重复升级会把 AI 正文误换成卡片。
+    """
+    msg_type = row.get('msg_type')
+    content = str(row.get('content') or '')
+    if not content.strip():
+        return None
+    if msg_type == MessageType.AI_REPLY:
+        try:
+            content = markdown_to_telegram_html(content)
+        except Exception:
+            pass
+        return {"type": "message", "text": content, "parse_mode": "HTML", "external": True}
+    display_role = (
+        'assistant'
+        if msg_type in (MessageType.AGENT_RESULT, MessageType.AGENT_CMD, MessageType.MEDIA_REPLY)
+        else str(row.get('role') or 'user')
+    )
+    if display_role == 'user':
+        return {"type": "user_message", "text": content, "external": True}
+    if display_role in ('system', 'media_module'):
+        return {"type": "notice", "text": content, "external": True}
+    html_types = (MessageType.TOKEN_USAGE, MessageType.AGENT_RESULT,
+                  MessageType.AGENT_CMD, MessageType.MEDIA_REPLY, MessageType.SYSTEM_OP)
+    return {
+        "type": "message",
+        "text": content,
+        "parse_mode": "HTML" if msg_type in html_types else None,
+        "external": True,
+    }
+
+
+async def _web_external_record_watcher(outbox: Any) -> None:
+    """跨进程同步：盯 global_messages 的新记录，把**其它进程**（CLI）写入的
+    对话推成 SSE 帧，网页不用刷新就能看到 CLI 里聊了什么。
+
+    CLI 与服务端是两个进程、只共享数据库，没有别的实时通道；轮询 rowid
+    游标是最小代价的桥。本进程自己写的记录已经通过直发帧/MirrorBot 到达
+    网页，靠 metadata.src（services._RECORDER_SOURCE_ID）跳过，否则同一句
+    话会显示两遍。游标从启动时刻的最大 rowid 开始，不重播历史。
+    """
+    db = await BotMemoryDB.get_instance()
+    cursor_rowid = await db.get_max_global_rowid()
+    while True:
+        await asyncio.sleep(2.0)
+        try:
+            rows = await db.get_records_since_rowid(cursor_rowid)
+        except Exception:
+            logger.debug("web 跨端同步轮询失败", exc_info=True)
+            continue
+        for row in rows:
+            cursor_rowid = max(cursor_rowid, int(row.get('rowid') or 0))
+            if row.get('src') == _RECORDER_SOURCE_ID:
+                continue
+            frame = _external_row_to_frame(row)
+            if frame:
+                outbox.put(frame)
 
 
 async def _web_read_settings() -> Dict[str, Any]:
@@ -885,6 +952,14 @@ async def start_web_chat_if_enabled(app: Optional[Any] = None, *, force: bool = 
         request_stop=_web_request_stop,
         is_busy=_web_is_busy,
         is_terminal_enabled=lambda: normalize_bool(UserDataManager.get('terminal_enabled', False), False),
+        # /api/media/resolve 的白名单根：本应用自己的数据目录。xgent_storage
+        # 覆盖 uploads/generated_media/exports；workspace 是 Agent 的默认
+        # 工作目录（sendfile/file 协议产出的文件大多在这里）。除此之外的
+        # 服务器路径一律不给换 token——那等于开放任意文件读取。
+        media_allowed_roots=[
+            ArtifactManager.ROOT_DIR,
+            os.path.join(AgentExecutor.WORK_DIR, 'workspace'),
+        ],
         # 纯 Web 模式（force=True）下 Web 服务本身就是唯一入口，不受
         # web_enabled 开关影响，始终视为已开启。
         is_web_enabled=(
@@ -905,10 +980,20 @@ async def start_web_chat_if_enabled(app: Optional[Any] = None, *, force: bool = 
                 )
         return
     _web_chat_server = server
+    # 跨端同步观察者：把 CLI 写进数据库的新对话推成网页帧。
+    global _web_external_watch_task
+    _web_external_watch_task = asyncio.create_task(
+        _web_external_record_watcher(server.outbox)
+    )
 
 
 async def stop_web_chat() -> None:
-    global _web_chat_server
+    global _web_chat_server, _web_external_watch_task
+    watch_task, _web_external_watch_task = _web_external_watch_task, None
+    if watch_task is not None:
+        watch_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watch_task
     if _web_chat_server is None:
         return
     server, _web_chat_server = _web_chat_server, None

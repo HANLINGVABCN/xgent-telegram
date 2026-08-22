@@ -29,9 +29,16 @@ from xgent_app.web_bridge import (
     install_tg_to_web_mirror,
 )
 from xgent_app.web_server import WebChatConfig, WebChatServer
+# 记录来源标记：写进每条 global_messages 的 metadata.src。
+# CLI 与服务端是两个进程、只共享数据库；服务端的网页观察者（idle.py 的
+# _web_external_record_watcher）靠它区分"本进程写的（SSE 已直发，跳过）"和
+# "别的进程写的（CLI 的对话，要推成帧）"，否则同一句话会在网页上显示两遍。
+_RECORDER_SOURCE_ID = f"pid{os.getpid()}-{uuid.uuid4().hex[:6]}"
+
+
 class GlobalRecorder:
     """始终记录所有操作（无论什么模式）"""
-    
+
     @staticmethod
     async def record(msg_type: str, role: str, content: str,
                      chat_id: Optional[int] = None, user_id: Optional[int] = None,
@@ -41,6 +48,8 @@ class GlobalRecorder:
         记录是旁路：数据库抖动、磁盘满不应该中断用户正在进行的对话。
         这里的 91 处调用点全是主流程里的裸 await，异常会直接冒到用户面前。
         """
+        stamped_metadata = dict(metadata or {})
+        stamped_metadata.setdefault('src', _RECORDER_SOURCE_ID)
         try:
             db = await BotMemoryDB.get_instance()
             await db.record_global_message(
@@ -50,7 +59,7 @@ class GlobalRecorder:
                 role=role,
                 content=content,
                 session_id=session_id or UserDataManager.get('current_chat_id'),
-                metadata=metadata
+                metadata=stamped_metadata
             )
         except Exception as e:
             logger.error(f"全局消息记录失败（已忽略，不中断主流程）: {e}")
@@ -1066,6 +1075,26 @@ class ArtifactManager:
     @classmethod
     def save_binary_upload(cls, original_name: str, content: bytes) -> Dict[str, Any]:
         abs_path, rel_path = cls._build_relative_path('uploads', original_name, 'upload')
+        with open(abs_path, 'wb') as f:
+            f.write(content)
+
+        mime_type, _ = mimetypes.guess_type(original_name or "")
+        return {
+            'abs_path': abs_path,
+            'rel_path': rel_path,
+            'mime_type': mime_type or 'application/octet-stream',
+            'size': len(content),
+        }
+
+    @classmethod
+    def save_export(cls, original_name: str, content: bytes) -> Dict[str, Any]:
+        """导出产物（/export 的记忆 zip 等）落盘。
+
+        与 uploads/generated_media 分开存放：导出文件是"服务器生成、要长期
+        留在磁盘上给用户回取"的产物，路径会写进系统消息让 AI 也看得到，
+        不和用户上传的临时附件混在一个目录里。
+        """
+        abs_path, rel_path = cls._build_relative_path('exports', original_name, 'export')
         with open(abs_path, 'wb') as f:
             f.write(content)
 

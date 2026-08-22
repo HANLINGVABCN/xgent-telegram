@@ -397,6 +397,45 @@ class BotMemoryDB:
             })
         return result
 
+    async def get_max_global_rowid(self) -> int:
+        """global_messages 的最大 rowid，作为增量游标的起点。"""
+        conn = await self._get_conn()
+        cursor = await conn.execute('SELECT MAX(rowid) AS max_id FROM global_messages')
+        row = await cursor.fetchone()
+        return int(row['max_id'] or 0) if row else 0
+
+    async def get_records_since_rowid(self, after_rowid: int, limit: int = 200) -> List[Dict]:
+        """按 rowid 增量取全局记录（含 metadata 解析出的 src）。
+
+        三端同步的基础设施：服务端网页观察者用它在别的进程（CLI）写入新
+        记录时推 SSE 帧；CLI 的 Telegram 镜像用它取回"这一轮对话新产生了
+        哪些 user/ai 记录"。冗余记录过滤与 get_conversation_messages 一致。
+        """
+        conn = await self._get_conn()
+        cursor = await conn.execute('''
+            SELECT rowid, msg_type, role, content, timestamp, metadata
+            FROM global_messages
+            WHERE rowid > ?
+            ORDER BY rowid ASC LIMIT ?
+        ''', (int(after_rowid), int(limit)))
+        rows = await cursor.fetchall()
+
+        result = []
+        for row in rows:
+            msg = dict(row)
+            if is_redundant_agent_command_record(msg.get('msg_type'), msg.get('content')):
+                continue
+            src = None
+            try:
+                meta = json.loads(msg.get('metadata') or '{}')
+                if isinstance(meta, dict):
+                    src = meta.get('src')
+            except (json.JSONDecodeError, TypeError):
+                src = None
+            msg['src'] = src
+            result.append(msg)
+        return result
+
     async def get_last_user_message_time(self) -> Optional[float]:
         """获取用户最后一次发消息的时间"""
         conn = await self._get_conn()

@@ -93,6 +93,7 @@ class WebChatConfig:
         upload_body_limit: int = MAX_UPLOAD_BODY_OFFICIAL,
         is_terminal_enabled: Optional[Callable[[], bool]] = None,
         is_web_enabled: Optional[Callable[[], bool]] = None,
+        media_allowed_roots: Optional[List[str]] = None,
     ):
         self.host = host
         self.port = port
@@ -113,6 +114,10 @@ class WebChatConfig:
         # 终端开关。默认关闭——终端是任意命令执行，必须显式开启。
         self.is_terminal_enabled = is_terminal_enabled or (lambda: False)
         self.is_web_enabled = is_web_enabled or (lambda: True)
+        # /api/media/resolve 允许换 token 的根目录白名单（xgent_storage、
+        # agent workspace 这类"本应用自己的数据目录"）。由 sections 侧组装
+        # 传入：web_server 不 import sections，保持可独立单测的约定。
+        self.media_allowed_roots = [str(r) for r in (media_allowed_roots or [])]
         self.read_history = read_history
         self.read_settings = read_settings
         self.write_setting = write_setting
@@ -363,6 +368,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._handle_command()
             elif path == "/api/stop":
                 self._handle_stop()
+            elif path == "/api/media/resolve":
+                self._handle_media_resolve()
             elif path == "/api/config":
                 self._handle_write_config()
             elif path == "/api/term/open":
@@ -677,6 +684,68 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         self._send_html(body)
 
+    def _handle_media_resolve(self) -> None:
+        """按服务器路径换一个下载 token（POST /api/media/resolve）。
+
+        为什么需要它：媒体帧里的 download_url 只在当前进程生命周期内有效，
+        而且刷新后 /api/history 只回文本——但每条媒体操作入库的文本都带着
+        服务器绝对路径（"已保存到 x""已发送服务器文件给用户: x"）。前端刷新
+        时从历史文本里挖出路径，来这里换一个**新** token，媒体卡片因此跨
+        刷新、跨进程重启都能恢复。
+
+        信任边界：不是任意路径读取。只接受 media_allowed_roots（本应用自己
+        的数据目录：xgent_storage、agent workspace）之内的**已存在文件**，
+        且要求登录 + 同源，与 /api/media/<token> 的口子等宽。
+        """
+        if not self._require_auth():
+            return
+        if not self._require_web_enabled():
+            return
+        data = self._read_json()
+        if data is None:
+            return
+        raw_path = str(data.get("path") or "").strip()
+        if not raw_path:
+            self._send_json({"error": "缺少 path"}, status=400)
+            return
+
+        try:
+            real = os.path.realpath(os.path.abspath(raw_path))
+        except (OSError, ValueError):
+            self._send_json({"error": "invalid path"}, status=400)
+            return
+
+        allowed = False
+        for root in self.config.media_allowed_roots:
+            try:
+                root_real = os.path.realpath(os.path.abspath(root))
+                if os.path.commonpath([real, root_real]) == root_real:
+                    allowed = True
+                    break
+            except (OSError, ValueError):
+                continue
+        if not allowed:
+            self._send_json({"error": "路径不在允许的目录内"}, status=403)
+            return
+        if not os.path.isfile(real):
+            self._send_json({"error": "文件不存在"}, status=404)
+            return
+
+        filename = os.path.basename(real)
+        mime_type, _ = mimetypes.guess_type(filename)
+        mime_type = mime_type or "application/octet-stream"
+        token = MEDIA_TOKEN_REGISTRY.register(real, filename)
+        try:
+            size = os.path.getsize(real)
+        except OSError:
+            size = 0
+        self._send_json({
+            "url": f"/api/media/{token}",
+            "filename": filename,
+            "mime_type": mime_type,
+            "size": size,
+        })
+
     def _handle_media_download(self, token: str) -> None:
         """AI 生成/发送的图片与文件的下载出口。见 web_bridge.py 的
         MediaTokenRegistry：send_photo/send_document 拿到本地路径时会注册
@@ -699,8 +768,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._send_json({"error": "file missing"}, status=404)
             return
 
-        is_image = mime_type.startswith("image/")
-        disposition = "inline" if is_image else "attachment"
+        # inline 让 <video>/<audio> 标签能直接播放、<img> 能直接显示；
+        # 其余类型保持 attachment，浏览器落盘而不是尝试内联执行。
+        inline_mime = mime_type.startswith(("image/", "video/", "audio/", "text/"))
+        disposition = "inline" if inline_mime else "attachment"
         # RFC 5987 编码文件名，兼容非 ASCII 文件名（中文文件名很常见）。
         quoted_name = urllib.parse.quote(filename)
         self.send_response(200)
