@@ -1,12 +1,12 @@
-"""Telegram 入站文本提取：转义损坏修复的回归测试。
+"""Telegram 入站文本提取：转义损坏修复的回归测试（无转义重构版）。
 
-text_markdown/caption_markdown 会对**所有普通文本段**做 escape_markdown
-（哪怕消息没有任何实体），用户直接打的 API Key / 带下划线的 URL 会被改写成
-带 \_ 的版本喂给 AI 并入库。修复后：纯文本一律用原文字节，只有消息里
-真有格式实体（加粗/代码块/链接等）才走 Markdown 重构。
+PTB 的 text_markdown/caption_markdown 对所有普通文本段做 escape_markdown；
+上一版按"有无格式实体"分流后，富粘贴（代码块复制按钮 -> bold/code 实体）
+生成的混合消息里明文部分仍被转义。现在改为自研 _markdown_no_escape：
+按实体重构成 Markdown 标记但全程不转义。
 
-sections 靠共享命名空间加载（需要环境变量、会写数据库），所以按仓库惯例
-用子进程探针跑，不污染收集期。
+sections 靠共享命名空间加载（需要环境变量、会写数据库），按仓库惯例用
+子进程探针跑。
 """
 
 import json
@@ -19,13 +19,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-PROBE = r"""
+PROBE = """
 import json, sys
 from datetime import datetime, timezone
-sys.path.insert(0, %r)
+sys.path.insert(0, {root!r})
 from telegram import Chat, Message, MessageEntity
 from xgent_app.bootstrap import load_sections
-ns = {"__file__": "xgent_server.py"}
+ns = {{"__file__": "xgent_server.py"}}
 load_sections(ns)
 
 def build(text, entities=None):
@@ -36,35 +36,56 @@ def build(text, entities=None):
 
 BS = ns["BotState"]
 extract = ns["_initial_message_text"]
-has_worthy = ns["_has_markdown_worthy_entities"]
-plain = "我的API key是 bvheiwv_vwrs_vbebvw. 请保存"
+md = ns["_markdown_no_escape"]
 
-url_msg = build(
-    "看下 https://example.com/a_b/c 我的key是 bvheiwv_vwrs_vbebvw",
-    entities=[MessageEntity(type=MessageEntity.URL, offset=3, length=26)],
-)
-bold_msg = build("注意 这个很重要",
-                 entities=[MessageEntity(type=MessageEntity.BOLD, offset=3, length=5)])
-bold_key = build("sk_plain_value",
-                 entities=[MessageEntity(type=MessageEntity.BOLD, offset=0, length=13)])
+plain = "我的API key是 sk_live_bvheiwv_vwrs_vbebvw_9917 请保存"
 
-print(json.dumps({
+mixed_text = ("把这段原样重复 测试样本A1: sk_live_bvheiwv_vwrs_vbebvw_9917 "
+              "星号 反引号 方括号 链接 https://example.com/a_b/c_key 结束标记Z9")
+mixed = build(mixed_text, entities=[
+    MessageEntity(type=MessageEntity.ITALIC,
+                  offset=mixed_text.index("星号"), length=len("星号")),
+    MessageEntity(type=MessageEntity.CODE,
+                  offset=mixed_text.index("反引号"), length=len("反引号")),
+    MessageEntity(type=MessageEntity.URL,
+                  offset=mixed_text.index("https://"),
+                  length=len("https://example.com/a_b/c_key")),
+])
+mixed_out = extract(mixed, BS.IDLE)
+
+url_text = "看下 https://example.com/a_b/c 我的key是 sk_a_b_c"
+url_msg = build(url_text, entities=[
+    MessageEntity(type=MessageEntity.URL,
+                  offset=url_text.index("https://"),
+                  length=len("https://example.com/a_b/c")),
+])
+
+bold_msg = build("注意 这个很重要", entities=[
+    MessageEntity(type=MessageEntity.BOLD, offset=3, length=5)])
+
+bold_key = build("sk_plain_value", entities=[
+    MessageEntity(type=MessageEntity.BOLD, offset=0, length=13)])
+
+cjk_text = "前缀_abc_中间强调后缀_xyz_尾部"
+cjk = build(cjk_text, entities=[
+    MessageEntity(type=MessageEntity.BOLD,
+                  offset=cjk_text.index("强调"), length=len("强调"))])
+
+print(json.dumps({{
     "plain_exact": extract(build(plain), BS.IDLE) == plain,
+    "mixed_no_backslash": chr(92) not in mixed_out,
+    "mixed_keeps_marks": "_星号_" in mixed_out and "`反引号`" in mixed_out,
+    "mixed_key_intact": "sk_live_bvheiwv_vwrs_vbebvw_9917" in mixed_out,
     "url_entity_exact": extract(url_msg, BS.IDLE) == url_msg.text,
     "bold_markdown": extract(bold_msg, BS.IDLE) == "注意 *这个很重要*",
     "config_raw": all(extract(bold_key, s) == "sk_plain_value"
                       for s in (BS.SET_SEARCH_KEY, BS.SET_UPDATE_TOKEN, BS.SET_WEB_PASSWORD)),
-    "worthy_none": not has_worthy(build("x")),
-    "worthy_url_no": not has_worthy(url_msg),
-    "worthy_code_yes": has_worthy(build("x", [MessageEntity(
-        type=MessageEntity.CODE, offset=0, length=1)])),
-    "caption_entity_yes": has_worthy(
-        Message(message_id=1, date=datetime.now(timezone.utc), chat=Chat(id=1, type="private"),
-                text=None, caption="c",
-                caption_entities=[MessageEntity(type=MessageEntity.BOLD, offset=0, length=1)]),
-        caption=True),
-}))
-""" % str(ROOT)
+    "cjk_offsets": extract(cjk, BS.IDLE) == "前缀_abc_中间*强调*后缀_xyz_尾部",
+    "no_entities_passthrough": md("a_b_c", []) == "a_b_c",
+    "bad_offsets_fallback": md("short", [MessageEntity(
+        type=MessageEntity.BOLD, offset=99, length=5)]) == "short",
+}}))
+""".format(root=str(ROOT))
 
 
 class TelegramTextExtractionTests(unittest.TestCase):
@@ -85,20 +106,22 @@ class TelegramTextExtractionTests(unittest.TestCase):
                 capture_output=True, timeout=120,
             )
         if result.returncode != 0:
-            self.fail(f"probe failed\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
+            self.fail("probe failed stdout: " + result.stdout + " stderr: " + result.stderr)
         return json.loads(result.stdout.strip().splitlines()[-1])
 
-    def test_plain_and_auto_entities_stay_byte_exact(self):
+    def test_extraction_never_escapes_and_keeps_format_marks(self):
         result = self.run_probe()
         self.assertTrue(result["plain_exact"], "纯文本必须原文字节进上下文")
-        self.assertTrue(result["url_entity_exact"],
-                        "客户端自动加的 URL 实体不该触发整条消息转义")
-        self.assertTrue(result["bold_markdown"], "真格式实体的 Markdown 要保留")
+        self.assertTrue(result["mixed_no_backslash"],
+                        "富粘贴的混合消息里不允许出现任何反斜杠转义")
+        self.assertTrue(result["mixed_keeps_marks"], "格式实体的 Markdown 标记要保留")
+        self.assertTrue(result["mixed_key_intact"], "混合消息里的 API Key 必须原样")
+        self.assertTrue(result["url_entity_exact"], "自动 URL 实体原样透传")
+        self.assertTrue(result["bold_markdown"])
         self.assertTrue(result["config_raw"], "配置态一律原文")
-        self.assertTrue(result["worthy_none"], "无实体的消息不该判为需要 Markdown")
-        self.assertTrue(result["worthy_url_no"], "自动 URL 实体不算格式实体")
-        self.assertTrue(result["worthy_code_yes"])
-        self.assertTrue(result["caption_entity_yes"])
+        self.assertTrue(result["cjk_offsets"], "中文的 UTF-16 偏移换算要正确")
+        self.assertTrue(result["no_entities_passthrough"])
+        self.assertTrue(result["bad_offsets_fallback"], "越界实体兜底回原文")
 
 
 if __name__ == "__main__":
