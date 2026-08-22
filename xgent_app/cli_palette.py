@@ -151,6 +151,7 @@ class SlashPalette:
         history: Optional[List[str]] = None,
         abort_check: Optional[Callable[[], bool]] = None,
         echo_ansi: str = "",
+        echo_on_submit: bool = True,
     ) -> None:
         self.prompt = prompt
         self.list_commands = list_commands
@@ -163,6 +164,10 @@ class SlashPalette:
         self.abort_check = abort_check
         # echo_ansi：回车提交后回显那一行用的 ANSI 前缀（用户输入淡蓝着色）。
         self.echo_ansi = echo_ansi
+        # echo_on_submit=False：提交后不回显，由调用方按消息类型自己打印
+        # （对话给完整用户块、命令给单行）——避免"打完的字在 AI 回复刷屏后
+        # 找不到"，也避免同一条消息显示两遍。
+        self.echo_on_submit = echo_on_submit
 
         self.buffer = ""
         self.cursor = 0
@@ -356,12 +361,20 @@ class SlashPalette:
     def _finish(self) -> None:
         """收尾：抹掉面板，把光标留在输入行的下一行。
 
-        提交的那一行按 echo_ansi 着色回显——用户敲的命令/消息在终端里
-        染成淡蓝，和 AI 输出的青绿、系统的灰阶区分开。
+        echo_on_submit=True（默认）时把提交的那一行按 echo_ansi 着色回显；
+        False 时只清面板不回显——调用方（xgent_cli 主循环）会按消息类型
+        自己打印：对话给完整用户块，命令/编号给单行。
         """
         out: List[str] = []
         if self._cursor_row:
             out.append(f"\x1b[{self._cursor_row}A")
+        if not self.echo_on_submit:
+            out.append("\r\x1b[J\n")
+            sys.stdout.write("".join(out))
+            sys.stdout.flush()
+            self.drawn_rows = 0
+            self._cursor_row = 0
+            return
         body = self.buffer
         if body and self.echo_ansi:
             body = f"{self.echo_ansi}{body}\x1b[0m"

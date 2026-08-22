@@ -331,12 +331,14 @@ async def main():
 
     rows = await db.get_display_history(10)
     web = await ns["_web_read_history"](10)
-    compact = [r for r in rows if r["msg_type"] == MT.AGENT_CMD]
+    cmd_rows = [r for r in rows if r["msg_type"] == MT.AGENT_CMD]
     token_web = [r for r in web if r.get("parse_mode") and "21825" in r["content"]]
+    all_display = " ".join(r["content"] for r in rows)
     print(json.dumps({
-        "media_folded": compact[0]["content"] == "🖼 [Agent媒体生成] 提示词已折叠",
-        "media_fence": compact[1]["content"] == "⚙ 已执行 media-x",
-        "edit_fence": compact[2]["content"] == "⚙ 已执行 edit-x",
+        "cmds_merged_one": len(cmd_rows) == 1,
+        "status_line": cmd_rows and cmd_rows[0]["content"] == "✅ Agent · 3 个操作已完成",
+        "no_raw_fence": "```" not in all_display,
+        "no_media_prompt": "Please generate" not in all_display,
         "token_gray": token_web and token_web[0]["role"] == "system",
         "ai_reply_html": any("<b>" in r["content"] for r in web if r.get("parse_mode") == "HTML"),
     }))
@@ -344,11 +346,78 @@ async def main():
 
 asyncio.run(main())
 """)
-        self.assertTrue(result["media_folded"], "媒体生成提示词要折叠成一行")
-        self.assertTrue(result["media_fence"], "协议块要压缩成 ⚙ 已执行 media-x")
-        self.assertTrue(result["edit_fence"])
+        self.assertTrue(result["cmds_merged_one"], "连续 AGENT_CMD 要合并成一条状态行")
+        self.assertTrue(result["status_line"], "状态行要与实时流同款：✅ Agent · N 个操作已完成")
+        self.assertTrue(result["no_raw_fence"], "刷新后的显示里不允许出现协议围栏原文")
+        self.assertTrue(result["no_media_prompt"], "媒体生成的完整提示词不该出现在显示里")
         self.assertTrue(result["token_gray"], "token 统计行要降级成 system 灰条")
         self.assertTrue(result["ai_reply_html"], "AI 正文仍走 Markdown->HTML，不受影响")
+
+
+class CliUserEchoAndMirrorTests(ProbeMixin, unittest.TestCase):
+    """CLI 用户消息成块回显（user 样式）+ 镜像到 TG 时带上用户的话。"""
+
+    def test_user_block_and_line_echo(self):
+        result = self.run_probe("""
+import asyncio, io
+import xgent_cli
+from xgent_app.cli_render import TerminalScreen
+
+stream = io.StringIO()
+xgent_cli.SCREEN = TerminalScreen(stream=stream, color=False, width=100)
+xgent_cli._READER.last_read_native_echo = False
+
+async def main():
+    await xgent_cli._init_runtime()
+    xgent_cli.UserDataManager.set('state', xgent_cli.BotState.IDLE)
+    xgent_cli._echo_submitted("你好，洛溪", conversation=True)
+    block_out = stream.getvalue()
+    xgent_cli._echo_submitted("/start", conversation=False)
+    line_out = stream.getvalue()[len(block_out):]
+    print(json.dumps({
+        "block_has_marker": "❯ 你" in block_out,
+        "block_has_text": "你好，洛溪" in block_out,
+        "line_single": "/start" in line_out and "❯ 你" not in line_out,
+    }))
+    await xgent_cli._shutdown_runtime()
+
+asyncio.run(main())
+""")
+        self.assertTrue(result["block_has_marker"], "对话消息要有 ❯ 你 用户块")
+        self.assertTrue(result["block_has_text"])
+        self.assertTrue(result["line_single"], "命令只回显单行，不带用户块")
+
+    def test_mirror_includes_user_text(self):
+        result = self.run_probe("""
+import asyncio
+import xgent_cli
+
+sent = []
+xgent_cli._tg_send_message = lambda text: sent.append(text)
+
+async def main():
+    await xgent_cli._init_runtime()
+    db = await xgent_cli.BotMemoryDB.get_instance()
+    cursor = await db.get_max_global_rowid()
+    # 与 _run_conversation 修复后的顺序一致：先取游标，再记用户消息
+    await xgent_cli.GlobalRecorder.record_user_message(
+        "我在 CLI 里说的话", xgent_cli.MessageType.USER_TEXT,
+        xgent_cli.BotConfig.AUTHORIZED_USER_ID)
+    await xgent_cli.GlobalRecorder.record_ai_reply("AI 在 CLI 里的回答")
+    await xgent_cli._mirror_turn_to_telegram(cursor)
+    joined = chr(10).join(sent)
+    print(json.dumps({
+        "user_sent": any("🖥 [CLI]" in s and "我在 CLI 里说的话" in s for s in sent),
+        "ai_sent": any("AI 在 CLI 里的回答" in s for s in sent),
+        "nothing_else": all("tokens" not in s for s in sent),
+    }))
+    await xgent_cli._shutdown_runtime()
+
+asyncio.run(main())
+""")
+        self.assertTrue(result["user_sent"], "镜像必须带上用户的话（🖥 [CLI] 前缀）")
+        self.assertTrue(result["ai_sent"])
+        self.assertTrue(result["nothing_else"], "token 统计等其余记录不镜像")
 
 
 if __name__ == "__main__":

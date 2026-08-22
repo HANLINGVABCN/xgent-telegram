@@ -744,6 +744,38 @@ async def _pull_cross_client_history(limit: int) -> None:
     SCREEN.print_plain("")
 
 
+def _echo_user_line(text: str) -> None:
+    """命令/编号这类输入的回显：单行、user 色。"""
+    pal = PALETTE
+    SCREEN.print_plain(f"{pal.paint('❯', pal.user, pal.bold)} {pal.paint(text, pal.user)}")
+
+
+def _print_user_block(text: str) -> None:
+    """对话消息的用户块：和 AI 块同款排版（❯ 你 + 正文，user 色）。
+
+    面板提交后不再自带回显，这里把用户的话作为正式消息块打进回卷——
+    AI 回复再怎么原地重绘刷屏，用户消息都在上面留着，和 Web/Telegram
+    的左右分栏一个意思。
+    """
+    lines = SCREEN.renderer().render_message(
+        text, (), None, title="你", marker="❯", style="user",
+    )
+    SCREEN.print_block(lines, message_id=None)
+
+
+def _echo_submitted(text: str, *, conversation: bool) -> None:
+    """按消息类型补回显（面板路径提交时不自带回显）。
+
+    input() 回退路径系统已回显（last_read_native_echo），不重复打印。
+    """
+    if getattr(_READER, "last_read_native_echo", False):
+        return
+    if conversation and not _input_state_active():
+        _print_user_block(text)
+    else:
+        _echo_user_line(text)
+
+
 # --------------------------------------------------------------------------
 # 一轮处理
 # --------------------------------------------------------------------------
@@ -774,12 +806,13 @@ async def _run_conversation(text: str) -> None:
         return
 
     try:
+        # 游标必须先于用户消息落库：镜像窗口取"since_rowid 之后的新记录"，
+        # 先记录再取游标会把用户这句话排除在窗口外——镜像就只剩 AI 回复。
+        db = await BotMemoryDB.get_instance()
+        since_rowid = await db.get_max_global_rowid()
         await GlobalRecorder.record_user_message(
             text, MessageType.USER_TEXT, BotConfig.AUTHORIZED_USER_ID
         )
-        # 记下这轮开始前的游标：结束后只镜像这一轮新产生的 user/ai 记录。
-        db = await BotMemoryDB.get_instance()
-        since_rowid = await db.get_max_global_rowid()
         await process_conversation(update, context, text)
         await _mirror_turn_to_telegram(since_rowid)
     except Exception:
@@ -854,6 +887,9 @@ class _StdinReader:
         # **下一次**读取开始后才返回，代次号对不上就丢弃，否则用户按掉
         # 取消之后随手补敲的那个键会被当成新输入发给 AI。
         self._epoch = 0
+        # 最近一次读取是否已由终端/系统回显（input() 路径会）。
+        # 主循环据此决定要不要补打回显，避免同一条消息显示两遍。
+        self.last_read_native_echo = False
 
     def _ensure_thread(self) -> None:
         if self._thread is not None:
@@ -888,8 +924,10 @@ class _StdinReader:
         把列数算歪。
         """
         if not _palette_enabled():
+            self.last_read_native_echo = True  # input() 自带终端回显
             return input(prompt)
         pal = PALETTE
+        self.last_read_native_echo = False
         try:
             line = SlashPalette(
                 _prompt_plain(),
@@ -898,12 +936,14 @@ class _StdinReader:
                 history=_history_entries(),
                 abort_check=_cancel_event.is_set,
                 echo_ansi=pal.user if pal.enabled else "",
+                echo_on_submit=False,
             ).read_line()
         except (EOFError, KeyboardInterrupt):
             raise
         except Exception:
             # 面板画崩了不能把 CLI 带走：退回 input()，下一轮还会再试。
             logger.debug("CLI 命令面板异常，退回 input()", exc_info=True)
+            self.last_read_native_echo = True
             return input(prompt)
         _remember_history(line)
         return line
@@ -1120,10 +1160,12 @@ async def _main_loop() -> None:
             break
         if low in ("/help", "help", "?", "/?"):
             _take_palette()
+            _echo_submitted(text, conversation=False)
             _print_help()
             continue
         if low in ("/menu", "menu"):
             _take_palette()
+            _echo_submitted(text, conversation=False)
             _show_current_menu()
             continue
 
@@ -1133,6 +1175,7 @@ async def _main_loop() -> None:
         if palette and text.isdigit():
             number = int(text)
             if 1 <= number <= len(palette):
+                _echo_submitted(f"/{palette[number - 1]}", conversation=False)
                 await _run_turn(_run_command(f"/{palette[number - 1]}"))
                 continue
             SCREEN.notice(f"编号超出范围，命令面板共 {len(palette)} 项。", "warn")
@@ -1153,6 +1196,7 @@ async def _main_loop() -> None:
             options = get_last_menu_options()
             number = int(text[1:].strip() if explicit_pick else text)
             if options and 1 <= number <= len(options):
+                _echo_submitted(text, conversation=False)
                 await _run_turn(_run_callback(options[number - 1]))
                 continue
             if options:
@@ -1168,6 +1212,7 @@ async def _main_loop() -> None:
         # 行），按需 /sync 或 /sync 200 拉出来看。
         if low == "/sync" or low == "/pull" or low.startswith("/sync ") or low.startswith("/pull "):
             _take_palette()
+            _echo_submitted(text, conversation=False)
             parts = text.split()
             limit = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 50
             await _run_turn(_pull_cross_client_history(max(1, min(limit, 500))))
@@ -1177,8 +1222,11 @@ async def _main_loop() -> None:
             routed = _route_command_prefix(text)
             if routed is None:
                 continue
+            _echo_submitted(routed, conversation=False)
             await _run_turn(_run_command(routed))
         else:
+            # 对话消息：打印用户块（❯ 你 + 正文），消息在回卷里永久可见
+            _echo_submitted(text, conversation=True)
             await _run_turn(_run_conversation(text))
 
 
