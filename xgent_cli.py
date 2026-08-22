@@ -228,21 +228,31 @@ def _matching_commands(prefix: str) -> List[str]:
 # --------------------------------------------------------------------------
 
 def _code_version() -> str:
-    """当前代码的 git 短哈希（取不到就显示 dev）。
+    """当前代码的版本标识：git 短哈希 -> install.sh 写的 .xgent-version -> dev。
 
     标在 banner 上，一眼就能确认跑的是不是刚拉的新版——排查"功能没生效"
-    类问题时，先看版本号再查逻辑。
+    类问题时，先看版本号再查逻辑。部署目录不是 git 检出（zip 解压部署）
+    时 git 取不到，install.sh 会把哈希写进 .xgent-version 兜底。
     """
+    here = os.path.dirname(os.path.abspath(__file__))
     try:
         import subprocess
 
         result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
+            ["git", "-C", here, "rev-parse", "--short", "HEAD"],
             capture_output=True, text=True, timeout=5,
         )
-        if result.returncode == 0:
-            return result.stdout.strip()[:10] or "dev"
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()[:10]
+    except Exception:
+        pass
+    try:
+        version_file = os.path.join(here, ".xgent-version")
+        if os.path.isfile(version_file):
+            with open(version_file, encoding="utf-8") as handle:
+                stamped = handle.read().strip()
+            if stamped:
+                return stamped[:10]
     except Exception:
         pass
     return "dev"

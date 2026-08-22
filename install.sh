@@ -483,6 +483,11 @@ fix_line_endings() {
             sed -i 's/\r$//' "$file" 2>/dev/null || true
         fi
     done
+    # 版本标记：部署目录不是 git 检出（zip 解压）时 CLI banner 拿不到哈希，
+    # 这里写一份到 .xgent-version 兜底。CLI 读它显示 vXxx。
+    git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null \
+        | head -c 10 > "$SCRIPT_DIR/.xgent-version" || true
+    [ -s "$SCRIPT_DIR/.xgent-version" ] || printf 'installed-%s' "$(date +%Y%m%d)" > "$SCRIPT_DIR/.xgent-version"
 }
 
 python_version_ok() {

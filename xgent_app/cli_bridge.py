@@ -215,6 +215,9 @@ class CliBot:
     """
 
     _is_xgent_web_bot = True
+    # CLI 专属标记：commands.py 的 /restart 据此区分"当前进程是被托管的
+    # 服务"和"另起的 CLI 会话"——后者不该被 sys.exit 带走。
+    _is_xgent_cli_bot = True
 
     def __init__(self, chat_id: int, screen: Optional[TerminalScreen] = None):
         self.chat_id = chat_id

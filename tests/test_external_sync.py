@@ -208,5 +208,103 @@ print(json.dumps({
         self.assertTrue(result["sys_row"])
 
 
+class RestartFromCliTests(SectionsProbeMixin, unittest.TestCase):
+    """CLI 发起 /restart：检测外部 PM2 托管、CLI 会话不退出。"""
+
+    @unittest.skipIf(os.name == "nt", "fake pm2 是 shell 脚本，只在 POSIX 可执行")
+    def test_cli_restart_finds_external_pm2_and_keeps_session(self):
+        result = self.run_probe(self.SECTIONS_PREAMBLE + """
+import asyncio, json, os, tempfile
+
+# 假 pm2：jlist 返回一个 pm_cwd 指向项目根的应用
+bindir = tempfile.mkdtemp()
+fake_pm2 = os.path.join(bindir, "pm2")
+project_root = ns["PROJECT_ROOT"]
+with open(fake_pm2, "w") as handle:
+    handle.write(
+        "#!/bin/sh\\n"
+        "echo '[{\\"name\\": \\"xgent-telegram\\", \\"pm2_env\\": {\\"pm_cwd\\": \\"%s\\"}}]'\\n"
+        % project_root
+    )
+os.chmod(fake_pm2, 0o755)
+os.environ["PATH"] = bindir + os.pathsep + os.environ["PATH"]
+
+app = ns["_find_external_pm2_app"]()
+
+# 探针里 PROJECT_ROOT 是临时目录，放一个只会写标记的假 install.sh：
+# restart 真去跑它也无害，跑没跑过看标记文件。
+marker = os.path.join(project_root, "restart-marker")
+install_sh = os.path.join(project_root, "install.sh")
+with open(install_sh, "w") as handle:
+    handle.write("#!/bin/sh\\necho restart-called >> %s\\n" % marker)
+
+sent = []
+class _FakeCliBot:
+    _is_xgent_cli_bot = True
+    async def send_message(self, chat_id=None, text="", **kwargs):
+        sent.append(text)
+
+async def main():
+    await ns["UserDataManager"].init()
+    # CLI 进程环境里没有任何 PM2 变量——这正是要修的场景
+    for key in ("PM2_HOME", "pm_id", "PM2_USAGE"):
+        os.environ.pop(key, None)
+    await ns["restart_current_process"](42, _FakeCliBot())
+    print(json.dumps({
+        "app_found": app == "xgent-telegram",
+        "no_exit": True,
+        "install_restart_called": os.path.exists(marker),
+        "kept_session_msg": any("CLI 会话保持" in t for t in sent),
+    }))
+    db = await ns["BotMemoryDB"].get_instance()
+    await db.close()
+
+asyncio.run(main())
+""")
+        self.assertTrue(result["app_found"], "pm2 jlist 里应按项目目录匹配到应用")
+        self.assertTrue(result["no_exit"], "走到这里说明 CLI 会话没有被 sys.exit 带走")
+        self.assertTrue(result["install_restart_called"])
+        self.assertTrue(result["kept_session_msg"])
+
+    @unittest.skipIf(os.name == "nt", "fake pm2 是 shell 脚本，只在 POSIX 可执行")
+    def test_cli_restart_without_any_daemon_still_keeps_session(self):
+        result = self.run_probe(self.SECTIONS_PREAMBLE + """
+import asyncio, json, os, tempfile
+
+# 没有 pm2 可执行文件 -> 外部检测落空
+os.environ["PATH"] = tempfile.mkdtemp()
+for key in ("PM2_HOME", "pm_id", "PM2_USAGE", "INVOCATION_ID", "JOURNAL_STREAM"):
+    os.environ.pop(key, None)
+
+project_root = ns["PROJECT_ROOT"]
+marker = os.path.join(project_root, "restart-marker")
+install_sh = os.path.join(project_root, "install.sh")
+with open(install_sh, "w") as handle:
+    handle.write("#!/bin/sh\\necho restart-called >> %s\\n" % marker)
+
+sent = []
+class _FakeCliBot:
+    _is_xgent_cli_bot = True
+    async def send_message(self, chat_id=None, text="", **kwargs):
+        sent.append(text)
+
+async def main():
+    await ns["UserDataManager"].init()
+    await ns["restart_current_process"](42, _FakeCliBot())
+    print(json.dumps({
+        "no_exit": True,
+        "no_install_call": not os.path.exists(marker),
+        "manual_hint": any("install.sh" in t for t in sent),
+    }))
+    db = await ns["BotMemoryDB"].get_instance()
+    await db.close()
+
+asyncio.run(main())
+""")
+        self.assertTrue(result["no_exit"])
+        self.assertTrue(result["no_install_call"])
+        self.assertTrue(result["manual_hint"])
+
+
 if __name__ == "__main__":
     unittest.main()

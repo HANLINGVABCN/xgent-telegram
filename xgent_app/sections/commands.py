@@ -69,6 +69,38 @@ async def cmd_restart_system(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await GlobalRecorder.record_system_op("重启机器人")
     await restart_current_process(update.effective_chat.id, context.bot)
 
+def _find_external_pm2_app():
+    """当前进程不在 PM2 里时，看服务本身是否被 PM2 托管。
+
+    为什么需要它：/restart 从 Telegram 发起时，当前进程就是 PM2 托管的服务，
+    环境变量（PM2_HOME/pm_id）一查便知；但从 CLI 发起时，当前进程是**另一个**
+    进程，环境里什么都没有——于是误报"没有守护进程"然后 sys.exit 把用户的
+    CLI 会话带走，服务本身反倒没重启。按"应用工作目录 == 项目目录，或应用名
+    是 install.sh 的固定名"去 pm2 jlist 里找，找到就说明服务有 PM2 兜底。
+    """
+    try:
+        result = subprocess.run(
+            ['pm2', 'jlist'], capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        apps = json.loads(result.stdout or '[]')
+        if not isinstance(apps, list):
+            return None
+        known_names = {'xgent-telegram', 'telegram-ai-bot'}  # install.sh 的 PM2 应用名
+        for app in apps:
+            if not isinstance(app, dict):
+                continue
+            env = app.get('pm2_env') or {}
+            cwd = str(env.get('pm_cwd') or '')
+            name = str(app.get('name') or '')
+            if cwd == PROJECT_ROOT or name in known_names:
+                return name or None
+    except Exception:
+        return None
+    return None
+
+
 async def restart_current_process(chat_id: int, bot: Any = None):
     """彻底重启进程，确保重新加载所有配置和代码。
 
@@ -76,14 +108,23 @@ async def restart_current_process(chat_id: int, bot: Any = None):
     - PM2 / nohup：调用 install.sh restart（detached，含完整 stop+start），由它拉起新进程。
     - systemd：依赖 unit 的 Restart= 自动拉起。
     - 兜底（无任何守护）：先给用户发提示，再退出，避免静默掉线。
-    退出前写入重启标记（PID + 时间戳），新进程启动时据此判断“代码是否真的换了”。
+
+    CLI 场景（bot 是 CliBot 垫片）：当前进程不是被托管的那个——按环境变量
+    判断守护一定落空，所以额外用 pm2 jlist 查服务是否被外部 PM2 托管；查到
+    就照样触发 install.sh restart 重启服务，而 CLI 会话本身**不退出**。
+    退出前写入重启标记（PID + 时间戳），新进程启动时据此判断"代码是否真的换了"。
     """
+    # CLI 垫片上带着这个标记；真 PTB bot 没有。
+    from_cli = bool(getattr(bot, '_is_xgent_cli_bot', False)) if bot is not None else False
+
     db = await BotMemoryDB.get_instance()
     await db.set_config('restart_notify_chat_id', chat_id)
     # 写入重启校验标记：新进程启动时对比 PID，判断是否真的换了新进程/新代码
     await db.set_config('restart_expected_ts', time.time())
     await db.set_config('restart_expected_pid', os.getpid())
-    await db.close()
+    # CLI 会话要继续跑，不能提前关库；只有即将退出的服务进程才关。
+    if not from_cli:
+        await db.close()
 
     install_sh = os.path.join(PROJECT_ROOT, 'install.sh')
     has_install_sh = os.path.exists(install_sh)
@@ -92,12 +133,26 @@ async def restart_current_process(chat_id: int, bot: Any = None):
     # systemd 会在被托管进程的环境里注入 INVOCATION_ID（及 JOURNAL_STREAM）
     is_systemd = 'INVOCATION_ID' in os.environ or 'JOURNAL_STREAM' in os.environ
 
+    # 当前进程不受托管时，服务本身可能仍被 PM2 托管（CLI 发起的场景）。
+    external_pm2 = None
+    if not (is_pm2 or is_nohup or is_systemd):
+        external_pm2 = await asyncio.to_thread(_find_external_pm2_app)
+
+    async def _notify(text: str) -> None:
+        if bot is not None:
+            with contextlib.suppress(Exception):
+                await bot.send_message(chat_id=chat_id, text=text)
+            await asyncio.sleep(0.3)
+
     restart_via_install = False
     if is_pm2:
         logger.info("检测到 PM2 环境，调用 install.sh restart 彻底重启")
         restart_via_install = True
     elif is_nohup and has_install_sh:
         logger.info("检测到 nohup（xgent.pid）环境，调用 install.sh restart 彻底重启")
+        restart_via_install = True
+    elif external_pm2 and has_install_sh:
+        logger.info(f"当前进程不受托管，但服务由 PM2 托管({external_pm2})，触发 install.sh restart")
         restart_via_install = True
     elif is_systemd:
         # systemd 会按 unit 的 Restart= 策略自动拉起新进程
@@ -116,27 +171,32 @@ async def restart_current_process(chat_id: int, bot: Any = None):
         except Exception as e:
             logger.warning(f"调用 install.sh restart 失败: {e}，回退到直接退出")
             # 失败时若 PM2 仍在，PM2 还会自动拉起；否则需要兜底提示
-            if not is_pm2 and bot is not None:
-                with contextlib.suppress(Exception):
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text="⚠️ 自动重启脚本调用失败，进程即将退出。"
-                             "如果没有自动恢复，请手动运行 install.sh 重启。"
-                    )
-                await asyncio.sleep(0.3)
+            if not is_pm2 and not external_pm2:
+                await _notify(
+                    "⚠️ 自动重启脚本调用失败，进程即将退出。"
+                    "如果没有自动恢复，请手动运行 install.sh 重启。"
+                )
     elif not is_systemd:
         # 兜底：既不是 PM2/nohup 也不是 systemd，退出后没有守护进程拉起，
         # 先提示用户手动重启，避免静默掉线后不知所措。
         logger.warning("未检测到 PM2/nohup/systemd 守护，进程退出后可能无法自动恢复")
-        if bot is not None:
-            with contextlib.suppress(Exception):
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text="⚠️ 检测到当前没有 PM2/nohup/systemd 守护进程。\n"
-                         "进程即将退出，可能无法自动重启。\n"
-                         "如果 Bot 没有恢复，请手动到服务器运行 install.sh 启动。"
-                )
-            await asyncio.sleep(0.3)
+        if from_cli:
+            await _notify(
+                "⚠️ 未检测到 PM2/nohup/systemd 守护，未触发自动重启。\n"
+                "请手动到服务器运行 install.sh 重启。CLI 会话保持。"
+            )
+        else:
+            await _notify(
+                "⚠️ 检测到当前没有 PM2/nohup/systemd 守护进程。\n"
+                "进程即将退出，可能无法自动重启。\n"
+                "如果 Bot 没有恢复，请手动到服务器运行 install.sh 启动。"
+            )
+
+    if from_cli:
+        # CLI 不是被托管的进程：服务的重启交给 install.sh，当前会话保持。
+        if restart_via_install:
+            await _notify("🔄 已触发服务重启（PM2 托管）。CLI 会话保持，可继续使用。")
+        return
 
     # 彻底退出进程，让外层管理器（PM2/systemd/nohup）重新启动
     # 这样确保重新加载 .env 和所有配置文件，以及最新代码
