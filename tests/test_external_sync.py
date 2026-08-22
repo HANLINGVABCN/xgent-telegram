@@ -84,12 +84,20 @@ async def main():
     await GR.record_system_op("导出全部数据")
     rows = await db.get_records_since_rowid(cursor)
     own_id = ns["_RECORDER_SOURCE_ID"]
+    MT2 = ns["MessageType"]
+    # 游标可用性：返回的行必须带非空 rowid——id 是 INTEGER PRIMARY KEY 时
+    # SQLite 对裸 SELECT rowid 回的列名是 id 不是 rowid，取不到 rowid 游标
+    # 就永远停在 0，观察者每个周期全量重发（"一条消息在 TG 出现 12 遍"）。
+    rowids = [r.get("rowid") for r in rows]
+    advanced_cursor = max(rowids) if rowids else cursor
     print(json.dumps({
         "count": len(rows),
         "src_all_own": all(r.get("src") == own_id for r in rows),
         "types": [r["msg_type"] for r in rows],
         "old_cursor_empty": (await db.get_records_since_rowid(
             await db.get_max_global_rowid())) == [],
+        "rowids_all_present": all(rid is not None and rid > 0 for rid in rowids),
+        "cursor_advances": (await db.get_records_since_rowid(advanced_cursor)) == [],
     }))
     await db.close()
 
@@ -99,6 +107,10 @@ asyncio.run(main())
         self.assertTrue(result["src_all_own"], "漏盖 src 会让网页观察者把本进程消息推两遍")
         self.assertEqual(["user_text", "ai_reply", "system_op"], result["types"])
         self.assertTrue(result["old_cursor_empty"], "游标在最大 rowid 上时不应再取到旧记录")
+        self.assertTrue(result["rowids_all_present"],
+                        "行里必须带非空 rowid——否则观察者游标永远不前进，全量重发")
+        self.assertTrue(result["cursor_advances"],
+                        "用返回行里的 rowid 推进游标后，必须取不到已处理过的行")
 
 
 class ExternalFrameMappingTests(SectionsProbeMixin, unittest.TestCase):
@@ -172,6 +184,9 @@ async def main():
     await GR.record_ai_reply(
         "中间轮，带协议块", metadata={"agent_intermediate": True})
     await GR.record_ai_reply("AI 在 CLI 里的最终回答")
+    # Ctrl+C 停止标记：no_mirror，绝不镜像到 TG
+    await GR.record_ai_reply(
+        "⏹️ 当前回复已被用户手动停止", metadata={"no_mirror": True})
     await GR.record(MT.TOKEN_USAGE, "assistant", "↑ 1 tokens")
     await GR.record(MT.AGENT_CMD, "system", "```run-x")
     await GR.record(MT.AGENT_STATUS, "assistant", "✅ Agent 第 1 轮 · 1 个操作已完成")
@@ -186,6 +201,7 @@ async def main():
         "user_sent": any("🖥 [CLI]" in t and "我在 CLI 里说的话" in t for t in texts),
         "ai_sent": any("AI 在 CLI 里的最终回答" in t for t in texts),
         "intermediate_skipped": all("中间轮" not in t for t in texts),
+        "stop_marker_skipped": all("⏹️" not in t for t in texts),
         "state_input_not_sent": all("API Key" not in t for t in texts),
         "nothing_else": all(("tokens" not in t and "run-x" not in t and "Agent 第" not in t) for t in texts),
         "chunks": len(chunks) > 1 and max(len(c) for c in chunks) <= 4000,
@@ -199,10 +215,71 @@ asyncio.run(main())
         self.assertTrue(result["ai_sent"])
         self.assertTrue(result["intermediate_skipped"],
                         "Agent 中间轮响应绝不镜像——每轮都镜像曾把 TG 刷成洪水")
+        self.assertTrue(result["stop_marker_skipped"],
+                        "Ctrl+C 停止标记（⏹️）是回合收尾噪音，绝不镜像到 TG")
         self.assertTrue(result["state_input_not_sent"], "状态机输入（填 Key 等）不镜像到 TG")
         self.assertTrue(result["nothing_else"], "token 统计/协议块/轮次状态一律不镜像")
         self.assertTrue(result["chunks"], "超长回复要切成 Telegram 发得下的块")
         self.assertTrue(result["chars_kept"], "分块不能丢内容")
+
+    def test_watcher_each_row_mirrored_exactly_once(self):
+        """端到端：跑真正的观察者循环多个轮询周期，另一个进程（模拟 CLI）
+        写入记录。每行必须恰好镜像一次——不多不少。这是"一条 CLI 消息在
+        TG 重复出现 12 遍"生产事故的回归测试。"""
+        result = self.run_probe(self.SECTIONS_PREAMBLE + """
+import asyncio, os, subprocess, sys, time
+
+sent = []
+class _FakeBot:
+    async def send_message(self, chat_id=None, text="", **kwargs):
+        sent.append(text)
+
+WATCH_SECONDS = 5.5   # 覆盖 5 个轮询周期（1s 间隔）
+
+# 模拟 CLI 的独立进程：延迟启动（等观察者先起跑），写入一条用户消息 + 最终回复。
+# 项目根从 PYTHONPATH 继承（run_probe 已设好），避免嵌套字符串插值。
+WRITER = (
+    "import asyncio, os, sys\\n"
+    "sys.path.insert(0, os.environ['PYTHONPATH'])\\n"
+    "from xgent_app.bootstrap import load_sections\\n"
+    "ns = {'__file__': 'xgent_server.py'}\\n"
+    "load_sections(ns)\\n"
+    "async def main():\\n"
+    "    await asyncio.sleep(2.0)\\n"
+    "    GR = ns['GlobalRecorder']; MT = ns['MessageType']\\n"
+    "    await GR.record_user_message('在吗', MT.USER_TEXT, metadata={'origin': 'cli-chat'})\\n"
+    "    await GR.record_ai_reply('最终回复，只该出现一次')\\n"
+    "    db = await ns['BotMemoryDB'].get_instance()\\n"
+    "    await db.close()\\n"
+    "asyncio.run(main())\\n"
+)
+
+async def main():
+    await ns["UserDataManager"].init()
+    ns["_web_real_bot"] = _FakeBot()
+    ns["_web_external_outbox"] = ns["WebOutbox"]()
+    task = asyncio.get_running_loop().create_task(ns["_web_external_record_watcher"]())
+    proc = subprocess.Popen([sys.executable, "-c", WRITER])
+    await asyncio.sleep(WATCH_SECONDS)
+    proc.wait(timeout=30)
+    task.cancel()
+    user_count = sum(1 for t in sent if "在吗" in t)
+    reply_count = sum(1 for t in sent if "最终回复" in t)
+    print(json.dumps({
+        "user_count": user_count,
+        "reply_count": reply_count,
+        "total": len(sent),
+    }))
+    db = await ns["BotMemoryDB"].get_instance()
+    await db.close()
+
+asyncio.run(main())
+""")
+        self.assertEqual(1, result["user_count"],
+                         f"用户消息必须恰好镜像一次，实际 {result['user_count']} 次——重复即刷屏事故回归")
+        self.assertEqual(1, result["reply_count"],
+                         f"最终回复必须恰好镜像一次，实际 {result['reply_count']} 次")
+        self.assertEqual(2, result["total"])
 
     def test_watcher_rate_limit_stops_flood(self):
         """限流保险丝：外部进程一次灌入大量可镜像记录，TG 实际发送数必须

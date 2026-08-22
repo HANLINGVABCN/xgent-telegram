@@ -1588,11 +1588,13 @@ async def _send_agent_iteration_limit_notice(
 
 async def _record_user_stopped_reply(db, cid, chat_id, partial_text: str) -> str:
     """用户在接收 AI 回复期间手动停止：把已生成的部分文本 + 停止标记写入
-    全局记录与模型可见历史，返回写入内容。与正常回复保存路径一致。"""
+    全局记录与模型可见历史，返回写入内容。与正常回复保存路径一致。
+    带 no_mirror 标记：停止标记是回合收尾的内部状态，不是对话内容——
+    CLI 里每 Ctrl+C 一次就往 Telegram 镜像一条"⏹️ 已停止"纯属噪音。"""
     marker = "⏹️ 当前回复已被用户手动停止"
     partial = (partial_text or "").strip()
     content = f"{partial}\n\n{marker}" if partial else marker
-    await GlobalRecorder.record_ai_reply(content, chat_id)
+    await GlobalRecorder.record_ai_reply(content, chat_id, metadata={'no_mirror': True})
     await db.add_chat_message(cid, 'assistant', content)
     return content
 

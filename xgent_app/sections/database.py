@@ -430,8 +430,14 @@ class BotMemoryDB:
         过滤与 get_conversation_messages 一致。
         """
         conn = await self._get_conn()
+        # rowid AS rowid 的别名**不可省**：global_messages 的 id 是 INTEGER
+        # PRIMARY KEY，rowid 是它的别名——SQLite 对「SELECT rowid」返回的
+        # 结果列名用的是真实列名 id，不是 rowid。调用方（跨端观察者）按
+        # row.get('rowid') 取游标，取不到就永远是 None→0，游标永远不前进，
+        # 每个轮询周期把全部记录重读重发一遍——"CLI 一条消息在 Telegram
+        # 出现 12 遍"的生产事故就是这个。显式 AS 强制结果列名为 rowid。
         cursor = await conn.execute('''
-            SELECT rowid, msg_type, role, content, timestamp, metadata
+            SELECT rowid AS rowid, msg_type, role, content, timestamp, metadata
             FROM global_messages
             WHERE rowid > ?
             ORDER BY rowid ASC LIMIT ?
@@ -446,17 +452,20 @@ class BotMemoryDB:
             src = None
             origin = None
             agent_intermediate = False
+            no_mirror = False
             try:
                 meta = json.loads(msg.get('metadata') or '{}')
                 if isinstance(meta, dict):
                     src = meta.get('src')
                     origin = meta.get('origin')
                     agent_intermediate = bool(meta.get('agent_intermediate'))
+                    no_mirror = bool(meta.get('no_mirror'))
             except (json.JSONDecodeError, TypeError):
                 src = None
             msg['src'] = src
             msg['origin'] = origin
             msg['agent_intermediate'] = agent_intermediate
+            msg['no_mirror'] = no_mirror
             result.append(msg)
         return result
 

@@ -218,9 +218,9 @@ def _external_row_to_telegram_texts(row: Dict[str, Any]) -> list:
 
     只镜像真正的对话内容：带 origin=cli-chat 标记的 USER_TEXT（CLI 的对话
     文本；加记忆、填 API Key 这类状态机输入不带标记，不镜像）和**最终**
-    AI_REPLY（agent_intermediate 标记的 Agent 中间轮响应跳过——每轮都镜像
-    的话，CLI 一轮 Agent 对话会把 Telegram 刷成十几条中间输出）。命令、
-    菜单、系统操作、token 统计一律不同步。
+    AI_REPLY——agent_intermediate 标记的 Agent 中间轮响应、no_mirror 标记的
+    停止标记（⏹️ 已停止）都跳过，否则 CLI 一轮 Agent 对话/连按 Ctrl+C 会把
+    Telegram 刷成十几条中间输出。命令、菜单、系统操作、token 统计一律不同步。
     """
     msg_type = row.get('msg_type')
     content = str(row.get('content') or '').strip()
@@ -228,7 +228,9 @@ def _external_row_to_telegram_texts(row: Dict[str, Any]) -> list:
         return []
     if msg_type == MessageType.USER_TEXT and row.get('origin') == 'cli-chat':
         return split_text_for_telegram(f"🖥 [CLI]\n{content}")
-    if msg_type == MessageType.AI_REPLY and not row.get('agent_intermediate'):
+    if msg_type == MessageType.AI_REPLY and not row.get('agent_intermediate') \
+            and not row.get('no_mirror'):
+        # no_mirror：停止标记（⏹️ 已停止）这类回合收尾的内部状态，不是对话内容。
         return split_text_for_telegram(content)
     return []
 
@@ -237,7 +239,7 @@ def _external_row_to_telegram_texts(row: Dict[str, Any]) -> list:
 # 镜像。CLI 一轮对话正常最多产生「1 条用户消息 + 1 条最终回复（可能分块）」，
 # 这个上限给长回复分块和连续几轮对话留了余量，同时把失控场景（曾把用户逼到
 # kill pm2 的刷屏事故）硬性截停。
-_TG_MIRROR_MAX_PER_MINUTE = 20
+_TG_MIRROR_MAX_PER_MINUTE = 15
 
 
 def _web_external_tg_mirror_enabled() -> bool:
@@ -269,6 +271,11 @@ async def _web_external_record_watcher() -> None:
     db = await BotMemoryDB.get_instance()
     cursor_rowid = await db.get_max_global_rowid()
     mirror_send_times: list = []   # 滚动窗口：最近一分钟内实际发出的镜像条数
+    # 行级去重：已处理过的 rowid 绝不二次推帧/镜像。游标是"从哪继续读"，
+    # 去重集是"哪些已经发过"——两者独立。生产上出现过同一行被重复镜像的事故
+    # （一条 CLI 消息在 TG 出现 12 遍，用户被迫 kill pm2），无论根因是游标
+    # 回退、多实例还是别的，"每行只发一次"在这里硬性兜底。
+    processed_rowids: set = set()
     while True:
         await asyncio.sleep(1.0)
         try:
@@ -279,6 +286,16 @@ async def _web_external_record_watcher() -> None:
         mirror_texts = []
         for row in rows:
             cursor_rowid = max(cursor_rowid, int(row.get('rowid') or 0))
+            rowid_val = int(row.get('rowid') or 0)
+            if rowid_val and rowid_val in processed_rowids:
+                continue
+            if rowid_val:
+                processed_rowids.add(rowid_val)
+                # rowid 单调递增，旧值永远不会再命中；定期修剪防无限增长。
+                if len(processed_rowids) > 10000:
+                    processed_rowids = {
+                        r for r in processed_rowids if r > cursor_rowid - 5000
+                    }
             if row.get('src') == _RECORDER_SOURCE_ID:
                 continue
             frame = _external_row_to_frame(row)
