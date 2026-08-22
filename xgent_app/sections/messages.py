@@ -324,12 +324,16 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 
     doc = update.message.document
     doc_name = doc.file_name or f"document_{uuid.uuid4().hex[:8]}.bin"
-    # 使用 caption 保留格式
+    # 使用 caption 保留格式——但仅当 caption 里真有格式实体；纯文本 caption
+    # 走原文，避免 caption_markdown 给 _ * ` [ 加转义改坏内容（同 text_markdown）。
     caption = ""
     if update.message.caption:
-        try:
-            caption = (update.message.caption_markdown or update.message.caption or "").strip()
-        except Exception:
+        if _has_markdown_worthy_entities(update.message, caption=True):
+            try:
+                caption = (update.message.caption_markdown or update.message.caption or "").strip()
+            except Exception:
+                caption = (update.message.caption or "").strip()
+        else:
             caption = (update.message.caption or "").strip()
     # 转发的富文本消息：caption 可能为空，文字在 rich_message.blocks 里
     if not caption:
@@ -536,6 +540,61 @@ def _extract_rich_message_plain_text(msg):
     )
 
 
+# 只有这些"用户手工做的格式"才值得用 Markdown 重构文本。刻意不含
+# url/email/mention/phone/hashtag/bot_command——它们是客户端**自动识别**的
+# 实体，Markdown V1 对它们本来也不加任何标记，走 text_markdown 纯属陪跑，
+# 还会让整条消息的 _ * ` [ 被反斜杠转义。
+_MARKDOWN_WORTHY_ENTITIES = {
+    'bold', 'italic', 'underline', 'strikethrough', 'spoiler', 'code', 'pre',
+    'blockquote', 'expandable_blockquote', 'text_link', 'text_mention',
+    'custom_emoji',
+}
+
+
+def _has_markdown_worthy_entities(message, caption: bool = False) -> bool:
+    r"""消息里是否有值得 Markdown 重构的格式实体。
+
+    text_markdown / caption_markdown 的实现（PTB _parse_markdown）对
+    **所有普通文本段**做 escape_markdown——哪怕消息一个实体都没有。用户
+    直接打字发的 API Key（如 sk_xxx、bvheiwv_vwrs_vbebvw）会被改写成
+    带 \_ 的版本，AI 看到的是被转义损坏的内容，且原样写进记忆库；AI 再
+    把它写进 .env/配置就是坏凭据（配置态曾因此 GitHub Token 401，见
+    exact_value_states 的注释）。只有真格式实体存在时才值得付这个代价。
+    """
+    entities = (getattr(message, 'caption_entities', None) if caption
+                else getattr(message, 'entities', None)) or []
+    return any(
+        str(getattr(entity, 'type', '') or '') in _MARKDOWN_WORTHY_ENTITIES
+        for entity in entities
+    )
+
+
+def _initial_message_text(message, state) -> str:
+    """handle_text_message 的第一步取文本。
+
+    优先级：配置态精确值（原文字节）> 带格式实体的 Markdown 重构 > 原文。
+    """
+    if message.text:
+        if state is not None and state in {
+            BotState.ADD_PROV_NAME, BotState.ADD_PROV_URL, BotState.ADD_PROV_KEY,
+            BotState.EDIT_PROV_NAME, BotState.EDIT_PROV_KEY, BotState.EDIT_PROV_URL,
+            BotState.ADD_MODEL_MANUAL, BotState.SEARCH_FETCHED, BotState.SEARCH_SAVED,
+            BotState.IMPORT_PROVIDER_CONFIG, BotState.SET_UPDATE_TOKEN,
+            BotState.SET_COMMAND_BLACKLIST, BotState.SET_SEARCH_KEY,
+            BotState.SET_WEB_PASSWORD, BotState.SET_WEB_PUBLIC_URL,
+        }:
+            return message.text.strip()
+        if _has_markdown_worthy_entities(message):
+            # 用户真的做了加粗/代码块/链接等格式：Markdown 重构保格式，
+            # 接受其中的转义（转义只影响格式段周边，且是用户主动格式化的消息）。
+            try:
+                return (message.text_markdown or message.text or "").strip()
+            except Exception:
+                return (message.text or "").strip()
+        return (message.text or "").strip()
+    return (getattr(message, 'caption', None) or "").strip()
+
+
 def _extract_rich_message_text(msg):
     """Extract text from rich_message (Telegram rich text format), preserving formatting as markdown."""
     extra = getattr(msg, 'api_kwargs', None) or {}
@@ -616,17 +675,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         # URL 含下划线和连字符，转义会写出无法访问的地址。
         BotState.SET_WEB_PUBLIC_URL,
     }
-    text = ""
-    if update.message.text:
-        if state in exact_value_states:
-            text = update.message.text.strip()
-        else:
-            try:
-                text = (update.message.text_markdown or update.message.text or "").strip()
-            except Exception:
-                text = (update.message.text or "").strip()
-    else:
-        text = (update.message.caption or "").strip()
+    # 普通聊天：只有消息里真有格式实体（加粗/代码块/链接等）才走 Markdown
+    # 重构保格式；纯文本一律用 Telegram 原文——text_markdown 会给 _ * ` [
+    # 插转义符，API Key/带下划线的 URL 会被改写（详见 _has_markdown_worthy_entities
+    # 的注释）。配置值更是必须原文字节精确。
+    text = _initial_message_text(update.message, state)
 
     # 转发消息 text 可能为 None（python-telegram-bot 解析问题），
     # 用 forwardMessage API 重新拉取完整消息内容
