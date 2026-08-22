@@ -1,15 +1,18 @@
 """三端同步基础设施的测试。
 
-覆盖五件事：
+覆盖六件事：
   1. GlobalRecorder 给每条记录盖的进程源标记（metadata.src）——网页观察者
      靠它跳过本进程记录，漏盖会导致网页每句话显示两遍；
   2. get_records_since_rowid 的 rowid 游标查询（含 metadata.origin 透传）；
-  3. _external_row_to_frame 的记录→帧映射（CLI 的对话长什么样推给网页）：
-     显示语义对齐——AGENT_CMD 协议原文不推（刷屏根源），TOKEN_USAGE 走灰条；
-  4. CLI→Telegram 镜像（服务端观察者侧）：镜像 origin=cli-chat 的用户文本、
-     最终 AI_REPLY、TOKEN_USAGE（去 <i> 标签的纯文本）；状态机输入/命令/
-     协议块/轮次状态不镜像；长文分块；
-  5. /sync 跨端历史渲染。
+  3. _external_row_to_frame 的记录到帧映射（CLI 的对话长什么样推给网页）：
+     显示语义对齐，AGENT_CMD 协议原文不推（刷屏根源），TOKEN_USAGE 走灰条，
+     CLI_STREAM_NOTICE 同样不推给网页（网页已有 SSE busy 状态，不需要这条）；
+  4. CLI 到 Telegram 镜像（服务端观察者侧）：镜像 origin=cli-chat 的用户
+     文本、最终 AI_REPLY、TOKEN_USAGE 和 CLI_STREAM_NOTICE（去 i 标签的纯
+     文本）；状态机输入/命令/协议块/轮次状态不镜像；长文分块；
+  5. getchat 跨端历史渲染；
+  6. CLI 生成开始时落一条 CLI_STREAM_NOTICE，让 Telegram 镜像不必等到最终
+     回复落库才有反应，见 rendering.py 的 _notify_cli_generation_started。
 
 sections 靠共享命名空间加载、xgent_cli 在 import 期就加载全部 section，
 所以都用带环境变量的子进程探针跑（同 test_cli_input 的做法）。
@@ -131,7 +134,8 @@ async def main():
     NL = chr(10)
     await GR.record(MT.AGENT_CMD, "system",
                     NL.join(["```run-x", "<<BEGIN_run_cmd_1a2b", "ls -la", "<<END_run_cmd_1a2b", "```"]))
-    await GR.record(MT.TOKEN_USAGE, "assistant", "↑ 21825 tokens (0 cached) · ↓ 1958 tokens")
+    await GR.record(MT.TOKEN_USAGE, "assistant", "up 21825 tokens (0 cached), down 1958 tokens")
+    await GR.record(MT.CLI_STREAM_NOTICE, "assistant", "CLI is generating a reply")
     rows = await db.get_records_since_rowid(0)
     frames = [ns["_external_row_to_frame"](r) for r in rows]
     print(json.dumps({
@@ -142,6 +146,7 @@ async def main():
         "agent_result": {"type": frames[3]["type"], "external": frames[3].get("external")},
         "agent_cmd_hidden": frames[4] is None,
         "token_notice": frames[5] is not None and frames[5]["type"] == "notice",
+        "cli_stream_notice_hidden": frames[6] is None,
         "empty": ns["_external_row_to_frame"]({"msg_type": MT.USER_TEXT, "role": "user", "content": "  "}),
     }))
     await db.close()
@@ -161,6 +166,9 @@ asyncio.run(main())
         # CLI 一轮 Agent 对话就是"网页刷屏"的根源。
         self.assertTrue(result["agent_cmd_hidden"], "AGENT_CMD 协议原文不应推成网页帧")
         self.assertTrue(result["token_notice"], "TOKEN_USAGE 要降级成 notice 灰条，与显示历史一致")
+        self.assertTrue(result["cli_stream_notice_hidden"],
+                        "CLI_STREAM_NOTICE 不该推给网页——网页已经通过 SSE 的 busy/typing "
+                        "状态知道生成中了，只有 Telegram 镜像需要这条信号")
         self.assertIsNone(result["empty"])
 
 
@@ -188,7 +196,8 @@ async def main():
     # Ctrl+C 停止标记：no_mirror，绝不镜像到 TG
     await GR.record_ai_reply(
         "⏹️ 当前回复已被用户手动停止", metadata={"no_mirror": True})
-    await GR.record(MT.TOKEN_USAGE, "assistant", "<i>↑ 1 tokens</i>")
+    await GR.record(MT.TOKEN_USAGE, "assistant", "<i>up 1 tokens</i>")
+    await GR.record(MT.CLI_STREAM_NOTICE, "assistant", "<i>CLI notice text</i>")
     await GR.record(MT.AGENT_CMD, "system", "```run-x")
     await GR.record(MT.AGENT_STATUS, "assistant", "✅ Agent 第 1 轮 · 1 个操作已完成")
     rows = await db.get_records_since_rowid(0)
@@ -204,7 +213,8 @@ async def main():
         "intermediate_skipped": all("中间轮" not in t for t in texts),
         "stop_marker_skipped": all("⏹️" not in t for t in texts),
         "state_input_not_sent": all("API Key" not in t for t in texts),
-        "token_sent_plain": any("↑ 1 tokens" in t and "<i>" not in t for t in texts),
+        "token_sent_plain": any("up 1 tokens" in t and "<i>" not in t for t in texts),
+        "cli_notice_sent_plain": any("CLI notice text" in t and "<i>" not in t for t in texts),
         "protocol_and_status_skipped": all(("run-x" not in t and "Agent 第" not in t) for t in texts),
         "chunks": len(chunks) > 1 and max(len(c) for c in chunks) <= 4000,
         "chars_kept": sum(len(c) for c in chunks) >= len(long_reply.replace(" ", "")),
@@ -222,6 +232,9 @@ asyncio.run(main())
         self.assertTrue(result["state_input_not_sent"], "状态机输入（填 Key 等）不镜像到 TG")
         self.assertTrue(result["token_sent_plain"],
                         "token 用量要镜像到 TG（去掉 <i> 标签，走纯文本发送）")
+        self.assertTrue(result["cli_notice_sent_plain"],
+                        "CLI 生成开始占位提示要镜像到 TG（去掉 <i> 标签），"
+                        "否则 Telegram 端要等到最终回复落库才有反应，感觉不到立即同步")
         self.assertTrue(result["protocol_and_status_skipped"], "协议块/轮次状态一律不镜像")
         self.assertTrue(result["chunks"], "超长回复要切成 Telegram 发得下的块")
         self.assertTrue(result["chars_kept"], "分块不能丢内容")
@@ -517,7 +530,8 @@ async def main():
     await GR.record(MT.AGENT_CMD, "system",
                     NL.join(["```edit-x:/app/bot.py", "<<BEGIN_edit_greet_82e6",
                              "OLD", "<<END_edit_greet_82e6", "```"]))
-    await GR.record(MT.TOKEN_USAGE, "assistant", "↑ 21825 tokens (0 cached) · ↓ 1958 tokens")
+    await GR.record(MT.TOKEN_USAGE, "assistant", "up 21825 tokens (0 cached), down 1958 tokens")
+    await GR.record(MT.CLI_STREAM_NOTICE, "assistant", "CLI is generating a reply")
     await GR.record_ai_reply("正文回复 **加粗**")
     await GR.record(MT.AGENT_STATUS, "assistant", "✅ Agent 第 1 轮 · 1 个操作已完成")
     await GR.record_user_message("/restart", MT.COMMAND)
@@ -531,6 +545,7 @@ async def main():
     all_ctx = " ".join(str(m.get("content") or "") for m in ctx)
     print(json.dumps({
         "cmd_hidden": all(r["msg_type"] != MT.AGENT_CMD for r in rows),
+        "cli_stream_notice_hidden": all(r["msg_type"] != MT.CLI_STREAM_NOTICE for r in rows),
         "status_shown": any(r["content"] == "✅ Agent 第 1 轮 · 1 个操作已完成" for r in status_rows),
         "no_raw_fence": "```" not in all_display,
         "no_media_prompt": "Please generate" not in all_display,
@@ -544,6 +559,8 @@ async def main():
 asyncio.run(main())
 """)
         self.assertTrue(result["cmd_hidden"], "AGENT_CMD 协议原文在显示历史里应整体隐藏")
+        self.assertTrue(result["cli_stream_notice_hidden"],
+                        "CLI_STREAM_NOTICE 是纯跨端信号行，Web/CLI 的历史列表里不该出现")
         self.assertTrue(result["status_shown"], "落库的轮次状态行要原样显示（与 bot 界面逐字一致）")
         self.assertTrue(result["status_not_in_ctx"], "轮次状态是 UI 信息，不进 AI 上下文")
         self.assertTrue(result["cmd_prefixed_in_ctx"], "命令记录在 AI 上下文里要带 [命令] 前缀")
@@ -585,6 +602,49 @@ asyncio.run(main())
         self.assertTrue(result["block_has_marker"], "对话消息要有 ❯ User 用户块")
         self.assertTrue(result["block_has_text"])
         self.assertTrue(result["line_single"], "命令只回显单行，不带用户块")
+
+
+class CliStreamNoticeTests(SectionsProbeMixin, unittest.TestCase):
+    """CLI 生成开始时的即时同步：见用户报告的"后台流式输出中...这个消息没有
+    立即同步到 bot 里"——CliBot.send_message 只画终端屏幕不落库，服务端
+    跨端观察者要等到最终回复落库才第一次有动静可镜像。_notify_cli_generation_started
+    补一条 CLI_STREAM_NOTICE 记录，让观察者能在生成刚开始时就推一条镜像。"""
+
+    def test_notify_only_fires_for_cli_bot(self):
+        result = self.run_probe(self.SECTIONS_PREAMBLE + """
+import asyncio
+
+async def main():
+    await ns["UserDataManager"].init()
+    db = await ns["BotMemoryDB"].get_instance()
+    GR = ns["GlobalRecorder"]
+    MT = ns["MessageType"]
+
+    class FakeCliBot:
+        _is_xgent_cli_bot = True
+
+    class FakeWebBot:
+        pass
+
+    class Ctx:
+        def __init__(self, bot):
+            self.bot = bot
+
+    cursor = await db.get_max_global_rowid()
+    await ns["_notify_cli_generation_started"](Ctx(FakeCliBot()), 1)
+    await ns["_notify_cli_generation_started"](Ctx(FakeWebBot()), 1)
+    rows = await db.get_records_since_rowid(cursor)
+    notice_rows = [r for r in rows if r["msg_type"] == MT.CLI_STREAM_NOTICE]
+    print(json.dumps({
+        "cli_bot_wrote_one": len(notice_rows) == 1,
+    }))
+    await db.close()
+
+asyncio.run(main())
+""")
+        self.assertTrue(result["cli_bot_wrote_one"],
+                        "只有 CLI bot（_is_xgent_cli_bot 标记）该落这条通知，"
+                        "Web/Telegram 会话本来就是原生实时发消息，不需要额外信号")
 
 
 if __name__ == "__main__":

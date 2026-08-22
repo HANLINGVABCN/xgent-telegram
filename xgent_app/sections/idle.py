@@ -183,6 +183,11 @@ def _external_row_to_frame(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         # 协议块原文/媒体提示词：bot 界面从不把它们当独立消息显示（用户
         # 看到的是 AI 正文 + 每轮的 AGENT_STATUS 状态行），实时帧同样不推。
         return None
+    if msg_type == MessageType.CLI_STREAM_NOTICE:
+        # 同 AGENT_CMD：这是纯粹为了触发 Telegram 镜像才落库的信号行，
+        # 网页自己的对话流早已经通过直发帧看到"生成中"（SSE typing/busy
+        # 状态），不需要再多一条气泡。
+        return None
     if msg_type == MessageType.TOKEN_USAGE:
         # token 统计是元信息不是正文：显示历史里降级成 system 灰条，实时
         # 帧用 notice 对齐，不再混在 AI 气泡流里。
@@ -226,6 +231,11 @@ def _external_row_to_telegram_texts(row: Dict[str, Any]) -> list:
     镜像不该比原生体验差）。content 已是 `<i>…</i>` 包裹的 HTML，这里的镜像
     走纯文本 send_message（没有 parse_mode 通道），先把 <i> 标签剥掉再发，
     避免用户在 Telegram 里看到裸露的尖括号标签。
+
+    CLI_STREAM_NOTICE 同样镜像——它就是专门为了这件事才落库的：CLI 会话
+    发起生成时立刻写一行"AI 正在生成回复…"，让观察者在最终回复落库之前
+    就有东西可以推给 Telegram，用户在 Telegram 侧几乎实时看到"CLI 那边
+    有动静了"，而不是要等到（可能几十秒后的）完整回复才第一次收到消息。
     """
     msg_type = row.get('msg_type')
     content = str(row.get('content') or '').strip()
@@ -237,7 +247,7 @@ def _external_row_to_telegram_texts(row: Dict[str, Any]) -> list:
             and not row.get('no_mirror'):
         # no_mirror：停止标记（⏹️ 已停止）这类回合收尾的内部状态，不是对话内容。
         return split_text_for_telegram(content)
-    if msg_type == MessageType.TOKEN_USAGE:
+    if msg_type in (MessageType.TOKEN_USAGE, MessageType.CLI_STREAM_NOTICE):
         plain = re.sub(r'</?i>', '', content)
         return split_text_for_telegram(plain)
     return []

@@ -876,6 +876,11 @@ class MessageType:
     AGENT_RESULT = 'agent_result'     # Agent 工具结果
     TOKEN_USAGE = 'token_usage'       # 每轮回复末尾的 token 用量提示（独立消息，常驻历史）
     AGENT_STATUS = 'agent_status'     # Agent 轮次状态行（✅ Agent 第 N 轮…，仅显示，不进 AI 上下文）
+    # CLI 生成开始时的一次性占位提示，只为跨端镜像到 Telegram 存在——CliBot.send_message
+    # 只往终端画，不落库，服务端跨端观察者靠轮询 global_messages 发现新记录才推镜像；
+    # 不落这一行的话，Telegram 端要等到最终回复落库才有动静，看起来"没有立即同步"。
+    # 不进 AI 上下文（get_conversation_messages 跳过）、不进 Web/CLI 显示历史（同 AGENT_CMD）。
+    CLI_STREAM_NOTICE = 'cli_stream_notice'
 
 def _read_int_env(name: str, default: int, minimum: int = 1) -> int:
     try:

@@ -327,6 +327,10 @@ class BotMemoryDB:
             # 文本会混进上下文污染对话。
             if msg_type == MessageType.TOKEN_USAGE:
                 continue
+            # CLI 生成开始时的占位提示：纯粹为了让跨端观察者尽快发现"生成已开始"
+            # 才落库的信号行，不是对话内容，不该喂给模型。
+            if msg_type == MessageType.CLI_STREAM_NOTICE:
+                continue
             # 轮次状态行（✅ Agent 第 N 轮…）同理：纯 UI，不进上下文。
             if msg_type == MessageType.AGENT_STATUS:
                 continue
@@ -400,6 +404,10 @@ class BotMemoryDB:
                 # 协议块原文/[Agent媒体生成]提示词：bot 界面从不把它们当独立
                 # 消息显示（用户看到的是 AI 正文 + 每轮的 AGENT_STATUS 状态行），
                 # 刷新后的历史同样不显示。
+                continue
+            if msg_type == MessageType.CLI_STREAM_NOTICE:
+                # 同 AGENT_CMD：纯粹的跨端信号行，Web/CLI 的历史列表里不该
+                # 显示"生成开始"这种瞬时状态——用户刷新时看到的应该只有最终结果。
                 continue
             # 执行结果 / 媒体回复：AI 侧产出 → 显示到对面（assistant）。
             # msg_type 一并返回，供 _web_read_history 决定哪些消息需 Markdown→HTML 转换
