@@ -227,6 +227,27 @@ def _matching_commands(prefix: str) -> List[str]:
 # 界面片段
 # --------------------------------------------------------------------------
 
+def _code_version() -> str:
+    """当前代码的 git 短哈希（取不到就显示 dev）。
+
+    标在 banner 上，一眼就能确认跑的是不是刚拉的新版——排查"功能没生效"
+    类问题时，先看版本号再查逻辑。
+    """
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()[:10] or "dev"
+    except Exception:
+        pass
+    return "dev"
+
+
 def _banner() -> None:
     pal = PALETTE
     width = min(SCREEN.width, 72)
@@ -245,6 +266,7 @@ def _banner() -> None:
     SCREEN.print_plain(_box_row(
         f"{pal.paint('◆', pal.ai, pal.bold)} {pal.paint(title, pal.bold)}"
         f"  {pal.paint('本地终端客户端', pal.muted)}"
+        f"  {pal.paint(f'v{_code_version()}', pal.muted)}"
     ))
     SCREEN.print_plain(_box_row())
     hints = [
