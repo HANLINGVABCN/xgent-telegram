@@ -9,6 +9,7 @@ if __name__ == '__main__':
             print("=" * 60)
             print("XGent Web (standalone) starting...")
             print("=" * 60)
+            log_runtime_code_version()
             asyncio.run(run_web_only_main())
         except Exception as e:
             safe_error = redact_sensitive_text(str(e))
@@ -23,6 +24,8 @@ if __name__ == '__main__':
         if BotConfig.API_BASE_URL:
             print(f"Using LOCAL Telegram Bot API: {BotConfig.API_BASE_URL}")
         print("=" * 60)
+        # 启动即报版本：pm2 logs 里一眼对出进程加载的是哪个提交
+        log_runtime_code_version()
         
         # 创建应用
         _app_builder = (

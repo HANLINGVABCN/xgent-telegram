@@ -126,6 +126,39 @@ class BotConfig:
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
+
+def log_runtime_code_version() -> None:
+    """启动时把当前代码版本打进日志。
+
+    "功能没生效"类问题里最常见的根因是 git pull 了但没重启（或反过来），
+    进程里跑的还是旧代码。有这行日志，`pm2 logs` 一眼就能对出进程
+    加载的到底是哪个提交，不用猜。CLI banner 的版本号同源同逻辑。
+    """
+    version = "dev"
+    try:
+        import subprocess as _sp
+
+        result = _sp.run(
+            ["git", "-C", PROJECT_ROOT, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            version = result.stdout.strip()[:10]
+        else:
+            raise RuntimeError("git 不可用")
+    except Exception:
+        try:
+            stamped_path = os.path.join(PROJECT_ROOT, ".xgent-version")
+            if os.path.isfile(stamped_path):
+                with open(stamped_path, encoding="utf-8") as handle:
+                    stamped = handle.read().strip()
+                if stamped:
+                    version = stamped[:10]
+        except Exception:
+            pass
+    logger.info(f"代码版本: v{version}")
+
+
 # 本地 Bot API server 容器内的数据根路径（卷映射的另一端）
 _LOCAL_API_CONTAINER_DATA_DIR = "/var/lib/telegram-bot-api"
 # 宿主机上对应的本地 API 数据目录
