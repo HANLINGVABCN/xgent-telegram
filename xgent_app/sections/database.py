@@ -363,12 +363,32 @@ class BotMemoryDB:
         
         return result
 
+    @staticmethod
+    def _compact_agent_cmd_for_display(content: Any) -> str:
+        """AGENT_CMD 记录的显示压缩。
+
+        入库存的是 AI 原样输出的协议块（```media-x … <<END_…）或
+        "[Agent媒体生成] {完整英文提示词}"——实时流上用户看到的是整理过的
+        轮次状态，刷新后这些原文整块吐出来就是"一坨"。显示层压缩成一行：
+        协议块 → ⚙ 已执行 media-x；媒体生成 → 🖼 折叠提示词。
+        只影响显示（本函数只在 get_display_history 调用），AI 上下文不受影响。
+        """
+        text = str(content or "").strip()
+        fence = re.match(r'```([A-Za-z_]+-x)', text)
+        if fence:
+            return f"⚙ 已执行 {fence.group(1)}"
+        if text.startswith('[Agent媒体生成]'):
+            return "🖼 [Agent媒体生成] 提示词已折叠"
+        compact = ' '.join(text.split())
+        return f"⚙ {compact[:60]}…" if len(compact) > 60 else f"⚙ {compact}"
+
     async def get_display_history(self, limit: int = 50) -> List[Dict]:
         """供 web 前端显示用的历史。与 get_conversation_messages（给模型上下文）解耦：
 
         模型上下文里执行结果要当 user 喂给 AI；但前端显示时这些是「AI/系统侧产出的结果」，
         应显示在 AI 一侧。这里把 AGENT_RESULT/AGENT_CMD/MEDIA_REPLY 映射成 assistant，
         其余按真实 role。冗余记录过滤与 get_conversation_messages 保持一致。
+        AGENT_CMD 的原文（协议块/媒体提示词）压缩成一行，对齐实时流的观感。
         """
         conn = await self._get_conn()
         cursor = await conn.execute('''
@@ -390,9 +410,12 @@ class BotMemoryDB:
             display_role = 'assistant' if msg_type in (
                 MessageType.AGENT_RESULT, MessageType.AGENT_CMD, MessageType.MEDIA_REPLY,
             ) else msg['role']
+            content = msg['content']
+            if msg_type == MessageType.AGENT_CMD:
+                content = self._compact_agent_cmd_for_display(content)
             result.append({
                 'role': display_role,
-                'content': msg['content'],
+                'content': content,
                 'msg_type': msg_type,
             })
         return result

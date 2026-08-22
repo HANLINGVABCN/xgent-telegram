@@ -306,5 +306,50 @@ asyncio.run(main())
         self.assertTrue(result["manual_hint"])
 
 
+class DisplayHistoryCompactionTests(SectionsProbeMixin, unittest.TestCase):
+    """刷新后的历史显示压缩：协议块/媒体提示词折叠成一行，token 行降级灰条。"""
+
+    def test_agent_cmd_and_token_rows_compact_for_display(self):
+        result = self.run_probe(self.SECTIONS_PREAMBLE + """
+import asyncio
+
+async def main():
+    await ns["UserDataManager"].init()
+    db = await ns["BotMemoryDB"].get_instance()
+    GR = ns["GlobalRecorder"]
+    MT = ns["MessageType"]
+    await GR.record(MT.AGENT_CMD, "system", "[Agent媒体生成] Please generate an image: " + "x" * 500)
+    NL = chr(10)
+    await GR.record(MT.AGENT_CMD, "system",
+                    NL.join(["```media-x", "<<BEGIN_gen_luoxi_3d1a",
+                             "Please generate", "<<END_gen_luoxi_3d1a", "```"]))
+    await GR.record(MT.AGENT_CMD, "system",
+                    NL.join(["```edit-x:/app/bot.py", "<<BEGIN_edit_greet_82e6",
+                             "OLD", "<<END_edit_greet_82e6", "```"]))
+    await GR.record(MT.TOKEN_USAGE, "assistant", "↑ 21825 tokens (0 cached) · ↓ 1958 tokens")
+    await GR.record_ai_reply("正文回复 **加粗**")
+
+    rows = await db.get_display_history(10)
+    web = await ns["_web_read_history"](10)
+    compact = [r for r in rows if r["msg_type"] == MT.AGENT_CMD]
+    token_web = [r for r in web if r.get("parse_mode") and "21825" in r["content"]]
+    print(json.dumps({
+        "media_folded": compact[0]["content"] == "🖼 [Agent媒体生成] 提示词已折叠",
+        "media_fence": compact[1]["content"] == "⚙ 已执行 media-x",
+        "edit_fence": compact[2]["content"] == "⚙ 已执行 edit-x",
+        "token_gray": token_web and token_web[0]["role"] == "system",
+        "ai_reply_html": any("<b>" in r["content"] for r in web if r.get("parse_mode") == "HTML"),
+    }))
+    await db.close()
+
+asyncio.run(main())
+""")
+        self.assertTrue(result["media_folded"], "媒体生成提示词要折叠成一行")
+        self.assertTrue(result["media_fence"], "协议块要压缩成 ⚙ 已执行 media-x")
+        self.assertTrue(result["edit_fence"])
+        self.assertTrue(result["token_gray"], "token 统计行要降级成 system 灰条")
+        self.assertTrue(result["ai_reply_html"], "AI 正文仍走 Markdown->HTML，不受影响")
+
+
 if __name__ == "__main__":
     unittest.main()

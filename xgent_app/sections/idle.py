@@ -144,8 +144,11 @@ async def _web_read_history(limit: int) -> List[Dict[str, Any]]:
                           MessageType.AGENT_CMD, MessageType.MEDIA_REPLY,
                           MessageType.SYSTEM_OP):
             # 这些类型存库时已是 Telegram HTML，直接带 parse_mode 让前端渲染。
+            # token 统计行是元信息不是正文：降级成 system 角色，前端渲染成居中
+            # 灰条，不再混在 AI 气泡流里（对齐实时流的观感）。
             result.append({
-                'role': str(row.get('role') or 'user'),
+                'role': 'system' if msg_type == MessageType.TOKEN_USAGE
+                        else str(row.get('role') or 'user'),
                 'content': content,
                 'parse_mode': 'HTML',
             })
