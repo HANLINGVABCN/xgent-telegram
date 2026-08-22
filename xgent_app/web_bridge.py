@@ -447,6 +447,7 @@ class MirrorBot:
         self._next_message_id = 1
         self._id_lock = threading.Lock()
         self._id_map: Dict[int, int] = {}  # fake_id -> real Telegram message_id
+        self._reverse_id_map: Dict[int, int] = {}  # real_id -> fake_id（网端帧回发用）
 
     def _allocate_message_id(self) -> int:
         return _allocate_web_message_id()
@@ -465,6 +466,22 @@ class MirrorBot:
         except (TypeError, ValueError):
             return None
         return self._id_map.get(mid, mid)
+
+    def _web_frame_id(self, message_id: Optional[int]) -> Optional[int]:
+        """网端帧该用的 message_id：real -> fake 的反查。
+
+        MirrorMessage（包装真实 TG 消息）的 edit/delete 传的是 real id，而网页
+        首次收到这条消息的帧带的是 fake id——直接透传 real id 前端 byMessageId
+        查不到：流式编辑每 0.35s 一次，每次都新建气泡，就是"上一条消息无限
+        刷屏"的根源。反查回 fake id，前端就能原地更新。查不到就原样返回。
+        """
+        if message_id is None:
+            return None
+        try:
+            mid = int(message_id)
+        except (TypeError, ValueError):
+            return message_id
+        return self._reverse_id_map.get(mid, mid)
 
     async def _tg_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         if self.real_bot is None:
@@ -486,6 +503,7 @@ class MirrorBot:
         )
         if real is not None and getattr(real, "message_id", None) is not None:
             self._id_map[message_id] = real.message_id
+            self._reverse_id_map[real.message_id] = message_id
         self._emit(
             "message", message_id=message_id, text=str(text),
             parse_mode=str(parse_mode) if parse_mode else None,
@@ -504,7 +522,7 @@ class MirrorBot:
                 text=str(text), reply_markup=reply_markup, parse_mode=parse_mode, **kwargs,
             )
         self._emit(
-            "edit", message_id=message_id, text=str(text),
+            "edit", message_id=self._web_frame_id(message_id), text=str(text),
             parse_mode=str(parse_mode) if parse_mode else None,
             reply_markup=_markup_to_frame(reply_markup),
         )
@@ -520,7 +538,7 @@ class MirrorBot:
                 "edit_message_reply_markup", chat_id=target, message_id=real_id,
                 reply_markup=reply_markup, **kwargs,
             )
-        self._emit("edit_markup", message_id=message_id,
+        self._emit("edit_markup", message_id=self._web_frame_id(message_id),
                    reply_markup=_markup_to_frame(reply_markup))
         return True
 
@@ -530,7 +548,7 @@ class MirrorBot:
         real_id = self._resolve_real_id(message_id)
         if real_id is not None:
             await self._tg_call("delete_message", chat_id=target, message_id=real_id, **kwargs)
-        self._emit("delete", message_id=message_id)
+        self._emit("delete", message_id=self._web_frame_id(message_id))
         return True
 
     async def send_chat_action(self, chat_id: Optional[int] = None,
@@ -560,6 +578,7 @@ class MirrorBot:
         )
         if real is not None and getattr(real, "message_id", None) is not None:
             self._id_map[message_id] = real.message_id
+            self._reverse_id_map[real.message_id] = message_id
         download_url = None
         if local_path is not None:
             token = MEDIA_TOKEN_REGISTRY.register(local_path, display_name)
@@ -580,6 +599,7 @@ class MirrorBot:
         )
         if real is not None and getattr(real, "message_id", None) is not None:
             self._id_map[message_id] = real.message_id
+            self._reverse_id_map[real.message_id] = message_id
         download_url = None
         if local_path is not None:
             token = MEDIA_TOKEN_REGISTRY.register(local_path, os.path.basename(local_path))

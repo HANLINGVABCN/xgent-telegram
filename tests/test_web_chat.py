@@ -775,5 +775,56 @@ class MediaResolveHttpTests(unittest.TestCase):
         self.assertEqual(401, status)
 
 
+class MirrorBotFrameIdTests(unittest.TestCase):
+    """MirrorBot 网端帧的 id 一致性：edit/delete 必须用网页见过的假 id。
+
+    MirrorMessage（包装真实 TG 消息）传 real id，网页首帧却是 fake id——
+    直接透传 real id 会让前端 byMessageId 落空，流式编辑每次新建气泡，
+    表现为"上一条消息无限刷屏"。
+    """
+
+    def _run(self, coro):
+        import asyncio
+        return asyncio.run(coro)
+
+    def test_edit_and_delete_frames_use_web_facing_fake_id(self):
+        import asyncio
+        from xgent_app.web_bridge import MirrorBot
+
+        frames = []
+        outbox = WebOutbox()
+        outbox.put = lambda frame: frames.append(frame)  # 直接截获帧
+
+        class FakeRealMessage:
+            message_id = 777  # Telegram 真实 id
+
+        class FakeRealBot:
+            async def send_message(self, *args, **kwargs):
+                return FakeRealMessage()
+            async def edit_message_text(self, *args, **kwargs):
+                return FakeRealMessage()
+            async def delete_message(self, *args, **kwargs):
+                return True
+
+        async def scenario():
+            bot = MirrorBot(outbox, 42, FakeRealBot())
+            # 对话核心第一次发消息（流式首块）——网页收到 fake id 的 message 帧
+            await bot.send_message(chat_id=42, text="流式首块")
+            fake_id = frames[-1]["message_id"]
+            # MirrorMessage.edit_text 走 real id（包装的是真实 TG 消息）
+            await bot.edit_message_text(text="流式更新", chat_id=42, message_id=777)
+            await bot.edit_message_reply_markup(chat_id=42, message_id=777, reply_markup=None)
+            await bot.delete_message(chat_id=42, message_id=777)
+            return fake_id
+
+        fake_id = asyncio.run(scenario())
+        kinds = [(f["type"], f.get("message_id")) for f in frames]
+        self.assertEqual("message", kinds[0][0])
+        self.assertEqual(fake_id, kinds[1][1], "edit 帧必须用网页见过的 fake id")
+        self.assertEqual(fake_id, kinds[2][1], "edit_markup 帧同样")
+        self.assertEqual(fake_id, kinds[3][1], "delete 帧同样")
+        self.assertNotEqual(fake_id, 777)
+
+
 if __name__ == "__main__":
     unittest.main()

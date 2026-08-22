@@ -824,10 +824,12 @@ async def _run_conversation(text: str) -> None:
         await GlobalRecorder.record_user_message(
             text, MessageType.USER_TEXT, BotConfig.AUTHORIZED_USER_ID
         )
-        # 用户消息即时镜像；AI 回复等回合结束由 _mirror_turn_to_telegram 补
-        await _mirror_user_text_to_telegram(text)
+        # 镜像全部后台发送（create_task）：服务器到 Telegram 的网络往返
+        # 可能要几秒甚至超时，await 它等于让每条消息先卡一记才进对话。
+        # 镜像是旁路，永远不阻塞主流程。
+        asyncio.create_task(_mirror_user_text_to_telegram(text))
         await process_conversation(update, context, text)
-        await _mirror_turn_to_telegram(since_rowid)
+        asyncio.create_task(_mirror_turn_to_telegram(since_rowid))
     except Exception:
         _report_failure("对话")
 
