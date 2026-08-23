@@ -98,9 +98,7 @@ class GlobalRecorder:
     @staticmethod
     async def record_ai_reply(content: str, chat_id: Optional[int] = None,
                               metadata: Optional[Dict[str, Any]] = None):
-        """记录AI回复。metadata 可带 agent_intermediate=True（Agent 多轮里的
-        中间响应）：跨端镜像据此跳过，只把最终回复同步到 Telegram——否则
-        CLI 一轮 Agent 对话的每轮中间响应都会被镜像，Telegram 被刷屏。"""
+        """记录AI回复。"""
         await GlobalRecorder.record(
             msg_type=MessageType.AI_REPLY,
             role='assistant',

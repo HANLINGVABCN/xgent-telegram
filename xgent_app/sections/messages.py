@@ -1588,13 +1588,11 @@ async def _send_agent_iteration_limit_notice(
 
 async def _record_user_stopped_reply(db, cid, chat_id, partial_text: str) -> str:
     """用户在接收 AI 回复期间手动停止：把已生成的部分文本 + 停止标记写入
-    全局记录与模型可见历史，返回写入内容。与正常回复保存路径一致。
-    带 no_mirror 标记：停止标记是回合收尾的内部状态，不是对话内容——
-    CLI 里每 Ctrl+C 一次就往 Telegram 镜像一条"⏹️ 已停止"纯属噪音。"""
+    全局记录与模型可见历史，返回写入内容。与正常回复保存路径一致。"""
     marker = "⏹️ 当前回复已被用户手动停止"
     partial = (partial_text or "").strip()
     content = f"{partial}\n\n{marker}" if partial else marker
-    await GlobalRecorder.record_ai_reply(content, chat_id, metadata={'no_mirror': True})
+    await GlobalRecorder.record_ai_reply(content, chat_id)
     await db.add_chat_message(cid, 'assistant', content)
     return content
 
@@ -1785,14 +1783,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
         await db.remove_last_chat_message(cid)
         return
     
-    # 保存 AI 回复。Agent 多轮里带协议块的中间响应打 agent_intermediate 标记：
-    # 跨端镜像只同步最终回复——每轮都镜像的话，CLI 一轮 Agent 对话会把
-    # Telegram 刷成十几条中间输出（曾在生产上把用户逼到 kill pm2）。
-    _has_protocol_blocks = bool(AgentExecutor.extract_protocol_blocks(response))
-    await GlobalRecorder.record_ai_reply(
-        response, update.effective_chat.id,
-        metadata={'agent_intermediate': True} if _has_protocol_blocks else None,
-    )
+    # 保存 AI 回复。
+    await GlobalRecorder.record_ai_reply(response, update.effective_chat.id)
     await db.add_chat_message(cid, 'assistant', response)
     # token 用量在正文落库之后落库，保证 timestamp 晚于正文，刷新后顺序为「输出 + tokens」。
     if token_text:
@@ -2373,12 +2365,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     pending_round_iteration = None
                 break
 
-            # 同上：带协议块＝还有下一轮，是中间响应，打标不镜像到 Telegram。
-            _has_protocol_blocks = bool(AgentExecutor.extract_protocol_blocks(response))
-            await GlobalRecorder.record_ai_reply(
-                response, update.effective_chat.id,
-                metadata={'agent_intermediate': True} if _has_protocol_blocks else None,
-            )
+            await GlobalRecorder.record_ai_reply(response, update.effective_chat.id)
             await db.add_chat_message(cid, 'assistant', response)
             if token_text:
                 _entry = token_text[0]

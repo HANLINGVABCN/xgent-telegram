@@ -164,107 +164,160 @@ async def _web_read_history(limit: int) -> List[Dict[str, Any]]:
     return result
 
 
-def _external_row_to_frame(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """外部进程（CLI）写入的一条全局记录 -> SSE 帧。
+def _relay_markup_to_telegram(rows: Any) -> Optional[Any]:
+    """中继过来的扁平按钮结构 -> InlineKeyboardMarkup。
 
-    映射**逐条对齐** get_display_history / _web_read_history 的显示语义：
-    显示历史里整体隐藏的（AGENT_CMD 协议原文/媒体提示词）实时帧也不推；
-    显示成居中灰条的（TOKEN_USAGE）推 notice 帧。此前这里把 AGENT_CMD 协议
-    块也当 HTML 消息推给网页——CLI 一轮 Agent 对话的每个协议块、每条中间
-    记录都变成一个新气泡（外部帧没有 message_id，前端无法原地更新，只能
-    越堆越多），每秒一批地刷屏；刷新/断线重连后历史又按显示语义整页重画，
-    这些气泡成批消失——就是"CLI 发消息时网页刷屏+吞消息"的机制。
+    web_bridge._markup_to_frame 的逆运算：CLI 进程里对话核心构造的是真的
+    InlineKeyboardMarkup，跨进程只能传 JSON，回放时必须还原回来——"带停止
+    按钮的占位消息"能不能在 Telegram 上真的带着按钮出现，全看这一步。
     """
-    msg_type = row.get('msg_type')
-    content = str(row.get('content') or '')
-    if not content.strip():
+    if not rows:
         return None
-    if msg_type == MessageType.AGENT_CMD:
-        # 协议块原文/媒体提示词：bot 界面从不把它们当独立消息显示（用户
-        # 看到的是 AI 正文 + 每轮的 AGENT_STATUS 状态行），实时帧同样不推。
-        return None
-    if msg_type == MessageType.CLI_STREAM_NOTICE:
-        # 同 AGENT_CMD：这是纯粹为了触发 Telegram 镜像才落库的信号行，
-        # 网页自己的对话流早已经通过直发帧看到"生成中"（SSE typing/busy
-        # 状态），不需要再多一条气泡。
-        return None
-    if msg_type == MessageType.TOKEN_USAGE:
-        # token 统计是元信息不是正文：显示历史里降级成 system 灰条，实时
-        # 帧用 notice 对齐，不再混在 AI 气泡流里。
-        return {"type": "notice", "text": content, "parse_mode": "HTML", "external": True}
-    if msg_type == MessageType.AI_REPLY:
-        try:
-            content = markdown_to_telegram_html(content)
-        except Exception:
-            pass
-        return {"type": "message", "text": content, "parse_mode": "HTML", "external": True}
-    display_role = (
-        'assistant'
-        if msg_type in (MessageType.AGENT_RESULT, MessageType.AGENT_STATUS,
-                        MessageType.MEDIA_REPLY)
-        else str(row.get('role') or 'user')
-    )
-    if display_role == 'user':
-        return {"type": "user_message", "text": content, "external": True}
-    if display_role in ('system', 'media_module'):
-        return {"type": "notice", "text": content, "external": True}
-    html_types = (MessageType.AGENT_RESULT, MessageType.AGENT_STATUS,
-                  MessageType.MEDIA_REPLY, MessageType.SYSTEM_OP)
-    return {
-        "type": "message",
-        "text": content,
-        "parse_mode": "HTML" if msg_type in html_types else None,
-        "external": True,
-    }
+    keyboard = []
+    for row in rows:
+        buttons = []
+        for btn in row or []:
+            if not isinstance(btn, dict):
+                continue
+            buttons.append(InlineKeyboardButton(
+                str(btn.get('text') or ''),
+                callback_data=str(btn.get('callback_data') or ''),
+            ))
+        if buttons:
+            keyboard.append(buttons)
+    return InlineKeyboardMarkup(keyboard) if keyboard else None
 
 
-def _external_row_to_telegram_texts(row: Dict[str, Any]) -> list:
-    """外部进程（CLI）的一条记录 -> 要镜像到 Telegram 的消息文本列表。
+# 每个 CLI 会话一个 MirrorBot。它持有 CLI 的 message_id -> 真实 Telegram
+# message_id 的映射，回放 edit/delete 时靠它定位目标消息；丢了映射，流式回复
+# 的每一次编辑都会变成新发一条消息（历史上的"无限刷屏"）。
+# 会话结束没有明确信号（CLI 可能直接被 kill），按数量上限淘汰最旧的。
+_relay_mirrors: "OrderedDict[str, Any]" = OrderedDict()
+_RELAY_MIRROR_MAX_SESSIONS = 8
 
-    只镜像真正的对话内容：带 origin=cli-chat 标记的 USER_TEXT（CLI 的对话
-    文本；加记忆、填 API Key 这类状态机输入不带标记，不镜像）和**最终**
-    AI_REPLY——agent_intermediate 标记的 Agent 中间轮响应、no_mirror 标记的
-    停止标记（⏹️ 已停止）都跳过，否则 CLI 一轮 Agent 对话/连按 Ctrl+C 会把
-    Telegram 刷成十几条中间输出。命令、菜单、系统操作一律不同步；TOKEN_USAGE
-    则同步——CLI 里聊天本来就看不到 token 用量，镜像到 Telegram 后至少能在
-    那边看到这轮花了多少 token（原生 Telegram 对话里这条消息本就存在，CLI
-    镜像不该比原生体验差）。content 已是 `<i>…</i>` 包裹的 HTML，这里的镜像
-    走纯文本 send_message（没有 parse_mode 通道），先把 <i> 标签剥掉再发，
-    避免用户在 Telegram 里看到裸露的尖括号标签。
 
-    CLI_STREAM_NOTICE 同样镜像——它就是专门为了这件事才落库的：CLI 会话
-    发起生成时，把调用方实际发出的那句占位文本（"流式输出中..."/"后台流式
-    输出中..."/"非流式输出中..."，与原生 Telegram 会话完全一致，不是另编
-    的提示语）立刻落一行，让观察者在最终回复落库之前就有东西可以推给
-    Telegram，用户在 Telegram 侧几乎实时看到"CLI 那边有动静了"，而不是要
-    等到（可能几十秒后的）完整回复才第一次收到消息。
+def _relay_mirror_for(session_id: str, chat_id: int) -> Any:
+    # real_bot 按 Telegram 通道开关取：关掉（或纯 Web 模式没有真实 bot）时传
+    # None，MirrorBot 原生退化成只推网页帧——网页那一路照常同步。
+    tg_bot = _web_real_bot if _web_external_tg_mirror_enabled() else None
+    mirror = _relay_mirrors.get(session_id)
+    if mirror is None:
+        mirror = MirrorBot(_web_external_outbox, chat_id, real_bot=tg_bot)
+        while len(_relay_mirrors) >= _RELAY_MIRROR_MAX_SESSIONS:
+            _relay_mirrors.popitem(last=False)
+        _relay_mirrors[session_id] = mirror
+    else:
+        # outbox 和 real_bot 都可能在会话中途才就绪（Web 服务后启动、bot 重连），
+        # 每次取用时刷新，否则一个长命 CLI 会话会一直抱着启动时的空引用。
+        mirror.outbox = _web_external_outbox
+        mirror.real_bot = tg_bot
+    return mirror
+
+
+async def _replay_relay_op(mirror: Any, op: str, payload: Dict[str, Any]) -> None:
+    """把 CLI 侧的一次 bot 调用原样重放到 Telegram + 网页。
+
+    这里**不做任何过滤、不改写任何文案**：CLI 里对话核心发了什么，Telegram
+    和网页就看到什么，与在 Telegram 里直接对话逐条一致——占位消息带着停止
+    按钮出现、编辑就地更新、跑完被删掉，Agent 每轮的状态行、工具/命令返回、
+    token 用量行全都在。唯一的例外是 user_echo（用户自己的那句话），它是全
+    流程里唯一带来源标识的地方。
     """
-    msg_type = row.get('msg_type')
-    content = str(row.get('content') or '').strip()
-    if not content:
-        return []
-    if msg_type == MessageType.USER_TEXT and row.get('origin') == 'cli-chat':
-        return split_text_for_telegram(f"🖥 [CLI]\n{content}")
-    if msg_type == MessageType.AI_REPLY and not row.get('agent_intermediate') \
-            and not row.get('no_mirror'):
-        # no_mirror：停止标记（⏹️ 已停止）这类回合收尾的内部状态，不是对话内容。
-        return split_text_for_telegram(content)
-    if msg_type in (MessageType.TOKEN_USAGE, MessageType.CLI_STREAM_NOTICE):
-        plain = re.sub(r'</?i>', '', content)
-        return split_text_for_telegram(plain)
-    return []
+    message_id = payload.get('message_id')
 
+    if op == 'user_echo':
+        text = str(payload.get('text') or '')
+        if not text:
+            return
+        # 唯一加来源标识的地方。走 mirror.real_bot 而不是模块级 _web_real_bot：
+        # 前者已经按 Telegram 通道开关取过值，关掉时这里自然跳过。
+        if mirror.real_bot is not None:
+            for chunk in split_text_for_telegram(f"🖥 [CLI]\n{text}"):
+                try:
+                    await mirror.real_bot.send_message(
+                        chat_id=BotConfig.AUTHORIZED_USER_ID, text=chunk,
+                    )
+                except Exception:
+                    logger.warning("CLI 用户消息同步到 Telegram 失败", exc_info=True)
+        outbox = _web_external_outbox
+        if outbox is not None:
+            # user_message 帧让网页渲染成用户气泡（右侧），而不是 AI 气泡。
+            outbox.put({"type": "user_message", "text": text,
+                        "ts": time.time(), "external": True})
+        return
 
-# 镜像限流保险丝：无论上游出什么 bug，Telegram 每分钟最多收到这么多条 CLI
-# 镜像。CLI 一轮对话正常最多产生「1 条用户消息 + 1 条最终回复（可能分块）」，
-# 这个上限给长回复分块和连续几轮对话留了余量，同时把失控场景（曾把用户逼到
-# kill pm2 的刷屏事故）硬性截停。
-_TG_MIRROR_MAX_PER_MINUTE = 15
+    if op == 'send_message':
+        await mirror.send_message(
+            chat_id=mirror.chat_id,
+            text=str(payload.get('text') or ''),
+            reply_markup=_relay_markup_to_telegram(payload.get('reply_markup')),
+            parse_mode=payload.get('parse_mode'),
+            relay_message_id=message_id,
+        )
+        return
+
+    if op == 'edit_message_text':
+        await mirror.edit_message_text(
+            text=str(payload.get('text') or ''),
+            chat_id=mirror.chat_id,
+            message_id=message_id,
+            reply_markup=_relay_markup_to_telegram(payload.get('reply_markup')),
+            parse_mode=payload.get('parse_mode'),
+        )
+        return
+
+    if op == 'edit_message_reply_markup':
+        await mirror.edit_message_reply_markup(
+            chat_id=mirror.chat_id, message_id=message_id,
+            reply_markup=_relay_markup_to_telegram(payload.get('reply_markup')),
+        )
+        return
+
+    if op == 'delete_message':
+        await mirror.delete_message(chat_id=mirror.chat_id, message_id=message_id)
+        return
+
+    if op == 'send_chat_action':
+        await mirror.send_chat_action(
+            chat_id=mirror.chat_id, action=payload.get('action') or 'typing',
+        )
+        return
+
+    if op in ('send_document', 'send_photo'):
+        # CLI 与服务端在同一台机器上（共享同一个数据库文件），中继传的是本地
+        # 路径，这里按路径把真文件发给 Telegram。文件没了就跳过——CLI 那边
+        # 早就把路径打在终端上了，为一个临时文件中断整条流不值得。
+        path = payload.get('path')
+        if not path or not os.path.exists(str(path)):
+            return
+        caption = payload.get('caption')
+        with open(str(path), 'rb') as handle:
+            if op == 'send_document':
+                await mirror.send_document(
+                    chat_id=mirror.chat_id, document=handle,
+                    filename=payload.get('filename'), caption=caption,
+                    relay_message_id=message_id,
+                    read_timeout=120, write_timeout=120,
+                )
+            else:
+                await mirror.send_photo(
+                    chat_id=mirror.chat_id, photo=handle, caption=caption,
+                    relay_message_id=message_id,
+                    read_timeout=120, write_timeout=120,
+                )
+        return
+
+    logger.debug("未知的 CLI 中继操作，已跳过: %s", op)
 
 
 def _web_external_tg_mirror_enabled() -> bool:
-    """CLI->Telegram 镜像开关：要有真实 bot（纯 Web 模式没有），且环境变量
-    XGENT_CLI_NO_TG_MIRROR 未设（不想让 Telegram 被 CLI 刷屏时关掉）。"""
+    """CLI->Telegram 通道开关：要有真实 bot（纯 Web 模式没有），且环境变量
+    XGENT_CLI_NO_TG_MIRROR 未设（不想让 Telegram 被 CLI 刷屏时关掉）。
+
+    只管 Telegram 这一路。回放循环本身由 _cli_relay_enabled 控制——纯 Web
+    模式下没有真实 bot，但 CLI→网页仍然要同步（MirrorBot 原生支持
+    real_bot=None，退化成纯网页输出）。
+    """
     return (
         bool(BotConfig.TOKEN)
         and _web_real_bot is not None
@@ -272,89 +325,86 @@ def _web_external_tg_mirror_enabled() -> bool:
     )
 
 
+def _cli_relay_enabled() -> bool:
+    """回放循环总开关。
+
+    只要 XGENT_CLI_NO_TG_MIRROR 没设就跑：Telegram 和网页两条出口至少有一条
+    能收就有意义，而 MirrorBot 对"没有真实 bot"和"outbox 没有订阅者"都是原生
+    容错的（分别退化为纯网页输出 / put 落空）。用 Telegram 的有无来决定整个
+    循环跑不跑，会让纯 Web 模式的用户在 CLI 里说的话完全到不了网页。
+    """
+    return not os.environ.get("XGENT_CLI_NO_TG_MIRROR")
+
+
 async def _web_external_record_watcher() -> None:
-    """跨进程同步：盯 global_messages 的新记录，把**其它进程**（CLI）写入的
-    记录推成 SSE 帧，并把对话内容镜像到 Telegram。
+    """跨进程回放：把 CLI 进程写入的 bot 操作流原样重放到 Telegram + 网页。
 
-    CLI 与服务端是两个进程、只共享数据库，没有别的实时通道；轮询 rowid
-    游标是最小代价的桥。本进程自己写的记录已经通过直发帧/MirrorBot 到达
-    网页，靠 metadata.src（services._RECORDER_SOURCE_ID）跳过，否则同一句
-    话会显示两遍。游标从启动时刻的最大 rowid 开始，不重播历史。
+    CLI 与服务端是两个进程、只共享数据库。CLI 里对话核心对 bot 的每一次调用
+    都按顺序落进 cli_relay_ops（见 cli_bridge._CliRelay），这里读出来回放到
+    MirrorBot 上——MirrorBot 同时打真实 Telegram 和网页 SSE，正是 Telegram↔
+    网页之所以天然一致的那套机制。结果就是：CLI 里对话，另外两端看到的东西
+    和在 Telegram 里直接对话逐条一致。
 
-    CLI→Telegram 镜像放在这里而不是在 CLI 进程里做：服务端持有健康的 PTB
-    连接池（网页↔TG 的秒同步走的就是它），而 CLI 进程自己开裸 urllib 连
-    Telegram，每条消息都重新 TCP+TLS 握手，网络不好时逐条拖到 30 秒超时，
-    就是"CLI→bot 同步极慢甚至不同步"；CLI 侧镜像还是 create_task 发完即忘，
-    进程一退出未发完的任务直接被砍（吞消息）。改由服务端镜像后，CLI 只写
-    库，网络与生命周期都由服务端兜底，三端速度一致。
+    这里**刻意不做任何过滤**。早先的实现是读 global_messages 的行、按消息
+    类型白名单重新编成文本再发——那必然丢东西：带停止按钮的占位消息、每轮的
+    Agent 状态行、工具/命令返回卡片、流式编辑、消息删除，都不是"一条落库的
+    文本"，重编不出来。丢了占位消息还得另造一条假的"生成中"提示去弥补。
+    改成回放操作流之后，这些补丁全部删除。
+
+    回放放在服务端而不是 CLI 进程里：服务端持有健康的 PTB 连接池（网页↔TG
+    的秒同步走的就是它），而 CLI 进程自己开裸连接连 Telegram，每条消息重新
+    TCP+TLS 握手，网络不好时逐条拖到 30 秒超时，就是"CLI→bot 同步极慢甚至
+    不同步"的根因。
+
+    轮询间隔比记录同步短：流式回复每秒要编辑好几次，间隔太长会把连续的编辑
+    压成一跳一跳的。操作回放完即删，这张表稳态下几乎是空的。
     """
     db = await BotMemoryDB.get_instance()
-    cursor_rowid = await db.get_max_global_rowid()
-    mirror_send_times: list = []   # 滚动窗口：最近一分钟内实际发出的镜像条数
-    # 行级去重：已处理过的 rowid 绝不二次推帧/镜像。游标是"从哪继续读"，
-    # 去重集是"哪些已经发过"——两者独立。生产上出现过同一行被重复镜像的事故
-    # （一条 CLI 消息在 TG 出现 12 遍，用户被迫 kill pm2），无论根因是游标
-    # 回退、多实例还是别的，"每行只发一次"在这里硬性兜底。
-    processed_rowids: set = set()
+    cursor_id = await db.seed_relay_cursor()
     while True:
-        await asyncio.sleep(1.0)
-        try:
-            rows = await db.get_records_since_rowid(cursor_rowid)
-        except Exception:
-            logger.debug("web 跨端同步轮询失败", exc_info=True)
+        await asyncio.sleep(0.3)
+        if not _cli_relay_enabled():
+            # 关掉同步时游标要跟着走，否则重新打开的瞬间会把积压的操作
+            # 一次性全放出来（对着 Telegram 刷屏）。同样按时间划界——只丢
+            # 足够旧的，亲手刚写的别误伤。
+            with contextlib.suppress(Exception):
+                cursor_id = await db.seed_relay_cursor()
             continue
-        mirror_texts = []
-        for row in rows:
-            cursor_rowid = max(cursor_rowid, int(row.get('rowid') or 0))
-            rowid_val = int(row.get('rowid') or 0)
-            if rowid_val and rowid_val in processed_rowids:
+        try:
+            ops = await db.fetch_relay_ops(cursor_id)
+        except Exception:
+            logger.debug("CLI 中继轮询失败", exc_info=True)
+            continue
+        if not ops:
+            continue
+        for item in ops:
+            cursor_id = max(cursor_id, int(item.get('id') or 0))
+            payload = item.get('payload')
+            if not isinstance(payload, dict):
                 continue
-            if rowid_val:
-                processed_rowids.add(rowid_val)
-                # rowid 单调递增，旧值永远不会再命中；定期修剪防无限增长。
-                if len(processed_rowids) > 10000:
-                    processed_rowids = {
-                        r for r in processed_rowids if r > cursor_rowid - 5000
-                    }
-            if row.get('src') == _RECORDER_SOURCE_ID:
-                continue
-            frame = _external_row_to_frame(row)
-            outbox = _web_external_outbox
-            if frame is not None and outbox is not None:
-                outbox.put(frame)
-            if _web_external_tg_mirror_enabled():
-                mirror_texts.extend(_external_row_to_telegram_texts(row))
-        # 网页帧先推完再发 Telegram：TG 那边网络慢时不能拖住下一轮网页帧。
-        # 限流保险丝在文本生成侧就砍掉超量，绝不向上游（TG API）放行洪水。
-        now = time.time()
-        mirror_send_times = [t for t in mirror_send_times if now - t < 60.0]
-        dropped = 0
-        for text in mirror_texts:
-            if len(mirror_send_times) >= _TG_MIRROR_MAX_PER_MINUTE:
-                dropped += 1
-                continue
+            session_id = str(item.get('session_id') or '')
+            chat_id = int(item.get('chat_id') or BotConfig.AUTHORIZED_USER_ID)
             try:
-                await _web_real_bot.send_message(
-                    chat_id=BotConfig.AUTHORIZED_USER_ID, text=text,
-                )
+                mirror = _relay_mirror_for(session_id, chat_id)
+                await _replay_relay_op(mirror, str(item.get('op') or ''), payload)
             except Exception:
-                logger.warning("CLI 消息镜像到 Telegram 失败", exc_info=True)
-            mirror_send_times.append(time.time())
-        if dropped:
-            logger.warning(
-                "CLI 镜像限流：本批 %d 条文本超限，丢弃 %d 条（每分钟上限 %d）",
-                len(mirror_texts), dropped, _TG_MIRROR_MAX_PER_MINUTE,
-            )
+                # 单个操作失败不能中断整条流：后面还有这轮对话的其余部分，
+                # 与 MirrorBot._tg_call "TG 失败只记日志" 的取舍一致。
+                logger.warning("CLI 中继操作回放失败: %s", item.get('op'), exc_info=True)
+        with contextlib.suppress(Exception):
+            await db.purge_relay_ops(cursor_id)
 
 
 async def start_external_sync_watcher(outbox: Any = None, app: Any = None) -> None:
-    """启动/接线跨端同步观察者（CLI→网页帧 + CLI→Telegram 镜像）。
+    """启动/接线跨端回放器（CLI 的 bot 操作流 → Telegram + 网页）。
 
     与 Web 服务开关**解耦**：Web 关着时网页帧没有订阅者（put 落空，无害），
-    但 CLI→Telegram 镜像仍然要工作，所以观察者跟随 bot 生命周期而不是 Web
+    但 CLI→Telegram 同步仍然要工作，所以它跟随 bot 生命周期而不是 Web
     服务生命周期——此前它挂在 start_web_chat_if_enabled 里，Web 一关 CLI 的
-    跨端同步就整个停摆。outbox 给了就记住（Web 服务启动后把自己的 outbox
-    接进来），app 给了就刷新真实 bot 引用。
+    跨端同步就整个停摆。（这也是中继走数据库而不是走 Web 服务 HTTP 接口的
+    原因：走 HTTP 会让关掉 Web 的用户直接失去 CLI→Telegram 同步。）
+    outbox 给了就记住（Web 服务启动后把自己的 outbox 接进来），app 给了就
+    刷新真实 bot 引用。
     """
     global _web_external_watch_task, _web_external_outbox, _web_real_bot
     if app is not None:

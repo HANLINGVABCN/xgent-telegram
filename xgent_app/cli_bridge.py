@@ -25,9 +25,15 @@ update.message.reply_text()、update.callback_query 以及 context.bot 上的
 
 from __future__ import annotations
 
+import atexit
+import contextlib
+import json
 import logging
 import os
+import queue
+import sqlite3
 import threading
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from xgent_app.cli_render import (
@@ -40,7 +46,8 @@ from xgent_app.cli_render import (
 # 路径"和"传打开的文件对象"两种调用形式），直接复用 web_bridge 里那一份，
 # 不在这里抄第二遍——两边判定一旦分裂就会出现"Web 能显示路径、CLI 不能"
 # 这类只在某个客户端复现的 bug。web_bridge 只依赖标准库，导入无副作用。
-from xgent_app.web_bridge import _local_path_from_send_arg
+from xgent_app.web_bridge import _local_path_from_send_arg, _markup_to_frame
+
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +65,236 @@ def _allocate_cli_message_id() -> int:
         mid = _cli_message_id_counter
         _cli_message_id_counter += 1
         return mid
+
+
+# --------------------------------------------------------------------------
+# 跨端中继：把 CLI 里的每一次 bot 调用送到服务端
+# --------------------------------------------------------------------------
+# 目标是"在 CLI 里对话，Telegram/网页看到的东西和在 Telegram 里对话完全一样"。
+# 做到这件事只有一个办法：在 **bot 方法层**扇出——对话核心调 send_message /
+# edit_message_text / delete_message 时，除了画到终端，把这次调用本身原样送给
+# 服务端，由服务端回放到 web_bridge.MirrorBot 上（它同时打真实 TG 和网页 SSE）。
+# 这正是 Telegram↔网页之所以天然一致的机制（MirrorBot / install_tg_to_web_mirror），
+# CLI 只是接到同一条路上。
+#
+# 早先的做法是服务端事后读 global_messages、**按类型白名单把行重新编成文本**再
+# 发 TG。那条路走不通，也不该修补：带停止按钮的占位消息、每轮的 Agent 状态行、
+# 工具/命令返回卡片、流式编辑、消息删除，这些根本不是"一条落库的文本"，重编
+# 必然要丢东西——中间轮次没了、命令返回没了，还得另造一条假的"生成中"提示来
+# 弥补占位消息的缺失。操作流送过去就全都不需要了。
+#
+# 传输走数据库而不是 HTTP：跨端观察者刻意挂在 bot 生命周期而不是 Web 服务生命
+# 周期（idle.start_external_sync_watcher 的注释写明了原因），Web 关掉时
+# CLI→Telegram 仍然要工作；而且 CLI 没有网页的登录凭证。
+#
+# 直连远端 Telegram Bot API 这条路更是明确否掉的：那是 CLI 进程自己开裸连接，
+# 每条消息重新 TCP+TLS 握手，网络差时逐条拖到 30 秒超时，就是历史上"CLI→bot
+# 同步极慢甚至不同步"的根因。服务端那条 PTB 连接池是健康的，交给它。
+
+_RELAY_TABLE_DDL = '''
+    CREATE TABLE IF NOT EXISTS cli_relay_ops (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        chat_id INTEGER NOT NULL,
+        op TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at REAL NOT NULL
+    )
+'''
+
+# 队列上限。正常一轮对话几百个操作；到顶说明服务端没在消费（没起服务、
+# 数据库锁死），此时丢弃新操作也不能阻塞终端——CLI 本地对话必须照常能用。
+_RELAY_QUEUE_MAX = 5000
+
+# 陈旧操作的保留时长。服务端没在跑时没人消费这张表，靠它兜底不让表无限增长。
+_RELAY_OP_MAX_AGE_SECONDS = 3600.0
+
+
+class _CliRelay:
+    """把 bot 操作按顺序写进 cli_relay_ops，供服务端回放。
+
+    后台单线程 + 队列：终端渲染路径永远不因为数据库/网络卡住。单线程也顺带
+    保证了写入顺序——回放侧依赖 id 升序（先 send_message 建消息，后续 edit
+    才有东西可编辑）。
+    """
+
+    def __init__(self) -> None:
+        self._queue: "queue.Queue[Optional[Tuple[str, Dict[str, Any]]]]" = queue.Queue(
+            maxsize=_RELAY_QUEUE_MAX
+        )
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+        self._db_path: Optional[str] = None
+        self._chat_id: int = 0
+        self._session_id: str = ""
+        self._enabled = False
+        self._warned_full = False
+
+    # -- 配置 --
+
+    def configure(self, db_path: str, chat_id: int, session_id: str,
+                  enabled: bool = True) -> None:
+        """由 xgent_cli.py 在启动时调用。
+
+        cli_bridge 刻意不 import sections（模块头的约定：可独立 import 和单测），
+        所以数据库路径、chat_id 这些都从外面注入，而不是在这里读 BotConfig。
+        """
+        with self._lock:
+            self._db_path = str(db_path) if db_path else None
+            self._chat_id = int(chat_id or 0)
+            self._session_id = str(session_id or "")
+            self._enabled = bool(enabled and self._db_path)
+            if self._enabled and self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="cli-relay", daemon=True,
+                )
+                self._thread.start()
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    # -- 生产端 --
+
+    def emit(self, op: str, **payload: Any) -> None:
+        if not self._enabled:
+            return
+        try:
+            self._queue.put_nowait((str(op), payload))
+        except queue.Full:
+            # 只抱怨一次：队列满通常意味着服务端整个没在消费，每条都记会把
+            # 日志刷爆，而这本身不是对话失败。
+            if not self._warned_full:
+                self._warned_full = True
+                logger.warning("CLI 跨端中继队列已满，本次会话后续操作不再同步到 Telegram/网页")
+
+    def close(self, timeout: float = 5.0) -> None:
+        """退出前把队列排空。
+
+        历史教训：早先的镜像是 create_task 发完即忘，CLI 一退出未发完的任务
+        直接被砍——用户看到的是"最后几条消息没同步"。这里必须真的等写完。
+        """
+        if not self._enabled or self._thread is None:
+            return
+        try:
+            self._queue.put_nowait(None)   # 毒丸：让写线程收尾退出
+        except queue.Full:
+            return
+        self._thread.join(timeout=timeout)
+
+    # -- 消费端（后台线程） --
+
+    def _connect(self) -> Optional[sqlite3.Connection]:
+        try:
+            conn = sqlite3.connect(self._db_path, timeout=30.0)
+            # 服务端主进程用的是同一个库文件；WAL 让读写互不阻塞，
+            # 中继写入不会把服务端的对话读取卡住。
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute(_RELAY_TABLE_DDL)
+            # 清掉陈旧操作。正常情况下服务端回放完就删，这张表几乎是空的；
+            # 但服务端没跑时（只用 CLI 本地对话）没人消费，不清理就会一直涨。
+            # 界面操作流是一次性的，过了这么久再回放也没有意义。
+            conn.execute(
+                'DELETE FROM cli_relay_ops WHERE created_at < ?',
+                (time.time() - _RELAY_OP_MAX_AGE_SECONDS,),
+            )
+            conn.commit()
+            return conn
+        except Exception:
+            logger.warning("CLI 跨端中继无法打开数据库，本次会话不同步", exc_info=True)
+            return None
+
+    def _run(self) -> None:
+        conn = self._connect()
+        if conn is None:
+            self._enabled = False
+            return
+        try:
+            while True:
+                item = self._queue.get()
+                if item is None:
+                    break
+                batch = [item]
+                # 顺手把已经排队的一起写：流式编辑每秒好几次，逐条一个事务
+                # 纯属浪费。上限防止一次事务过大。
+                while len(batch) < 64:
+                    try:
+                        nxt = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if nxt is None:
+                        self._write(conn, batch)
+                        return
+                    batch.append(nxt)
+                self._write(conn, batch)
+        finally:
+            with contextlib.suppress(Exception):
+                conn.close()
+
+    def _write(self, conn: sqlite3.Connection,
+               batch: Sequence[Tuple[str, Dict[str, Any]]]) -> None:
+        now = time.time()
+        rows = []
+        for op, payload in batch:
+            try:
+                blob = json.dumps(payload, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                continue
+            rows.append((self._session_id, self._chat_id, op, blob, now))
+        if not rows:
+            return
+        try:
+            conn.executemany(
+                'INSERT INTO cli_relay_ops (session_id, chat_id, op, payload, created_at)'
+                ' VALUES (?, ?, ?, ?, ?)',
+                rows,
+            )
+            conn.commit()
+        except Exception:
+            # 中继失败绝不能影响本地对话——终端上该显示的都已经显示过了。
+            logger.debug("CLI 跨端中继写入失败", exc_info=True)
+
+
+class contextlib_suppress:
+    """极小的 suppress，避免为一行 close() 引入 contextlib 依赖。"""
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *exc: Any) -> bool:
+        return True
+
+
+_RELAY = _CliRelay()
+
+
+def configure_relay(db_path: str, chat_id: int, session_id: str,
+                    enabled: bool = True) -> None:
+    """启动跨端中继。由 xgent_cli.py 调用。"""
+    _RELAY.configure(db_path, chat_id, session_id, enabled)
+
+
+def close_relay(timeout: float = 5.0) -> None:
+    """退出前排空中继队列。"""
+    _RELAY.close(timeout)
+
+
+def relay_enabled() -> bool:
+    return _RELAY.enabled
+
+
+def relay_user_message(text: str) -> None:
+    """用户自己在 CLI 里说的那句话。
+
+    **这是全流程里唯一带来源标识的地方**：Telegram/网页那边显示成
+    "🖥 [CLI]" 加原话，其余所有消息（占位提示、Agent 状态行、工具返回、
+    最终回复）都与原生 Telegram 会话逐字一致，不加任何标记、不加任何额外
+    文案。加标识的动作放在服务端回放时做，这里只负责把原话送过去。
+    """
+    _RELAY.emit("user_echo", text=str(text))
+
+
+atexit.register(close_relay)
 
 
 # --------------------------------------------------------------------------
@@ -241,12 +478,21 @@ class CliMessage:
 
 
 class CliBot:
-    """把对话核心的调用渲染到终端。
+    """把对话核心的调用渲染到终端，并同步中继给服务端。
 
-    对照 web_bridge.WebBot——同样的方法集合，同样的 _is_xgent_web_bot 标记
-    （复用这个既有的判别点，rendering.py 里检查它来跳过 TelegramRichAPI
-    的私有协议直连、跳过 TG->Web 镜像安装，CLI 需要同样的行为，没有必要
-    另开一个 _is_xgent_cli_bot 标记再改一遍所有判断点）。
+    对照 web_bridge.MirrorBot 的双通道形状：每个输出方法都做两件事——画到
+    终端，以及把这次调用本身 emit 进中继（_CliRelay），由服务端回放到
+    Telegram 和网页。所以 CLI 里的一轮对话在另外两端看到的东西与在 Telegram
+    里直接对话逐条一致，包括带停止按钮的占位消息、Agent 每轮状态行、工具
+    返回卡片、流式编辑和消息删除。
+
+    _is_xgent_web_bot 标记复用既有判别点（rendering.py 检查它来跳过
+    TelegramRichAPI 的私有协议直连、跳过 TG->Web 镜像安装），CLI 需要同样的
+    行为，没必要另开一个标记再改一遍所有判断点。这个标记会让最终回复走
+    HTML edit 而不是原生 RichBlock 排版——**这是刻意的**：TelegramRichAPI 绕过
+    context.bot 直连远端 Bot API，在 CLI 进程里既不会被中继（Telegram/网页
+    都收不到），又是那条历史上把 CLI 拖到 30 秒超时的裸连接。网页会话本来
+    也是这个降级（MirrorBot 同样设了这个标记），两端一致。
     """
 
     _is_xgent_web_bot = True
@@ -271,6 +517,11 @@ class CliBot:
         lines = self._renderer().render_message(str(text), buttons, parse_mode)
         self.screen.print_block(lines, message_id=message_id)
         _register_menu(message_id, split_control_buttons(buttons)[0], is_edit=False)
+        _RELAY.emit(
+            "send_message", message_id=message_id, text=str(text),
+            parse_mode=str(parse_mode) if parse_mode else None,
+            reply_markup=_markup_to_frame(reply_markup),
+        )
         return CliMessage(self, message_id, chat_id, str(text))
 
     async def edit_message_text(self, text: str, chat_id: Optional[int] = None,
@@ -281,6 +532,9 @@ class CliBot:
         重绘不可行的情况：中间夹了别的输出（这条已经不是屏幕最后一块）、块比
         终端还高、或者输出不是 tty（重定向到文件）。这几种情况下宁可多打一份
         也不能上移光标去擦不属于自己的内容。
+
+        注意终端的降级（追加一份）不影响中继：Telegram/网页那边是真的能原地
+        编辑的，照常发 edit——终端画不出来的东西不该拉低另外两端。
         """
         target_id = int(message_id or 0)
         buttons = buttons_from_markup(reply_markup)
@@ -288,6 +542,11 @@ class CliBot:
         if not self.screen.update_block(lines, target_id):
             self.screen.print_block(lines, message_id=target_id)
         _register_menu(target_id, split_control_buttons(buttons)[0], is_edit=True)
+        _RELAY.emit(
+            "edit_message_text", message_id=target_id, text=str(text),
+            parse_mode=str(parse_mode) if parse_mode else None,
+            reply_markup=_markup_to_frame(reply_markup),
+        )
         return CliMessage(self, target_id, int(chat_id or self.chat_id), str(text))
 
     async def edit_message_reply_markup(self, chat_id: Optional[int] = None,
@@ -298,6 +557,8 @@ class CliBot:
         buttons = buttons_from_markup(reply_markup)
         menu_buttons, hints = split_control_buttons(buttons)
         _register_menu(target_id, menu_buttons, is_edit=True)
+        _RELAY.emit("edit_message_reply_markup", message_id=target_id,
+                    reply_markup=_markup_to_frame(reply_markup))
         if not buttons:
             return True
         renderer = self._renderer()
@@ -311,14 +572,18 @@ class CliBot:
                              message_id: Optional[int] = None, **kwargs: Any) -> bool:
         # 终端没有"删除已滚出去的历史输出"的概念，静默忽略——这与 Web 端
         # emit("delete", ...) 交给前端处理 DOM 节点是同一类"平台特有能力，
-        # CLI 没有对应物就降级为空操作"的取舍。
+        # CLI 没有对应物就降级为空操作"的取舍。但中继照发：Telegram/网页
+        # 删得掉，"带停止按钮的占位消息跑完就消失"靠的正是这一条。
         _register_menu(int(message_id or 0), (), is_edit=True)
+        _RELAY.emit("delete_message", message_id=int(message_id or 0))
         return True
 
     async def send_chat_action(self, chat_id: Optional[int] = None,
                                action: Any = None, **kwargs: Any) -> bool:
         # "typing" 状态在终端里没有直接对应物，且高频调用
         # （keep_typing_while_waiting 每隔几秒就调一次）——打印出来只会刷屏。
+        # 中继照发：Telegram 那边本来就该看到"正在输入"。
+        _RELAY.emit("send_chat_action", action=str(action or "typing"))
         return True
 
     def _file_lines(self, icon: str, headline: str, path: Optional[str],
@@ -345,6 +610,11 @@ class CliBot:
         message_id = self._allocate_message_id()
         lines = self._file_lines("📎", f"文件：{display_name}", local_path, caption, parse_mode)
         self.screen.print_block(lines, message_id=message_id)
+        _RELAY.emit(
+            "send_document", message_id=message_id, path=local_path,
+            filename=display_name, caption=str(caption or "") or None,
+            parse_mode=str(parse_mode) if parse_mode else None,
+        )
         return CliMessage(self, message_id, int(chat_id or self.chat_id), str(caption or ""))
 
     async def send_photo(self, chat_id: Optional[int] = None, photo: Any = None,
@@ -352,10 +622,17 @@ class CliBot:
                          **kwargs: Any) -> CliMessage:
         # 终端显示不了图片，能给的最有用信息就是本地路径——用户可以直接
         # 复制去打开。这也是 send_document/send_photo 必须挖出本地路径的原因。
+        # 中继送的是本地路径，服务端按路径把真文件发给 Telegram：CLI 与服务端
+        # 在同一台机器上（共享同一个数据库文件），路径天然可达。
         local_path = _local_path_from_send_arg(photo)
         message_id = self._allocate_message_id()
         lines = self._file_lines("🖼", "图片已生成", local_path, caption, parse_mode)
         self.screen.print_block(lines, message_id=message_id)
+        _RELAY.emit(
+            "send_photo", message_id=message_id, path=local_path,
+            caption=str(caption or "") or None,
+            parse_mode=str(parse_mode) if parse_mode else None,
+        )
         return CliMessage(self, message_id, int(chat_id or self.chat_id), str(caption or ""))
 
     async def get_file(self, *args: Any, **kwargs: Any) -> Any:

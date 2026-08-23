@@ -30,36 +30,6 @@ async def keep_typing_while_waiting(context: ContextTypes.DEFAULT_TYPE, chat_id:
             continue
 
 
-async def _notify_cli_generation_started(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
-                                          placeholder_text: str) -> None:
-    """CLI 会话开始生成时，落一条占位记录，让跨端观察者立刻镜像到 Telegram。
-
-    CliBot.send_message 只把占位提示（"流式输出中..."/"后台流式输出中..."/
-    "非流式输出中..."）画到终端屏幕，不落库——三种响应函数开头发的那条占位
-    消息，在 CLI 会话下只有本地终端看得到。服务端跨端观察者
-    （_web_external_record_watcher）靠轮询 global_messages 表发现新记录才会
-    把内容镜像到 Telegram；不落这一行的话，Telegram 端要一直等到最终回复
-    落库（往往几秒到几十秒之后）才有动静，体感上就是"CLI 说话，Telegram
-    半天没反应，不是立即同步"。
-
-    镜像内容必须是调用方实际发出的那句占位文本本身（"流式输出中..." 等），
-    一字不改——只在前面加 CLI 消息统一的"🖥 [CLI]"来源标记，其余与 bot
-    原版逐字一致，不能替换成另一句话。
-    只在 CLI 会话下记（用 cli_bridge.CliBot 独有的 _is_xgent_cli_bot 标记
-    判断），Telegram/Web 会话本来就是原生发消息，不需要这条额外信号。
-    """
-    if not getattr(context.bot, "_is_xgent_cli_bot", False):
-        return
-    try:
-        await GlobalRecorder.record(
-            msg_type=MessageType.CLI_STREAM_NOTICE,
-            role='assistant',
-            content=f"🖥 [CLI]\n{placeholder_text}",
-            chat_id=chat_id,
-        )
-    except Exception as e:
-        logger.debug(f"CLI 生成开始占位记录失败（可忽略）: {e}")
-
 # --- ☆ Rich Messages (Bot API 10.1) ☆ ---
 # Telegram Bot API 10.1 (2026-06-11) 原生支持表格、标题、引用块、分割线、嵌套列表等富文本。
 # 使用 sendRichMessage / sendRichMessageDraft 直接发送结构化 JSON，
@@ -1075,7 +1045,6 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             text="流式输出中...",
             reply_markup=stop_kb
         )
-        await _notify_cli_generation_started(context, chat_id, "流式输出中...")
         renderer = TelegramStreamRenderer(context, chat_id, msg, stop_kb, TELEGRAM_MSG_LIMIT, stop_event)
         renderer.start()
         typing_stop = asyncio.Event()
@@ -1391,7 +1360,6 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
             text="后台流式输出中...",
             reply_markup=stop_kb
         )
-        await _notify_cli_generation_started(context, chat_id, "后台流式输出中...")
         typing_stop = asyncio.Event()
         typing_task = asyncio.create_task(
             keep_typing_while_waiting(
@@ -1683,7 +1651,6 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
             text="非流式输出中...",
             reply_markup=stop_kb
         )
-        await _notify_cli_generation_started(context, chat_id, "非流式输出中...")
         typing_stop = asyncio.Event()
         typing_task = asyncio.create_task(
             keep_typing_while_waiting(

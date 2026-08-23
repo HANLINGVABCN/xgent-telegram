@@ -452,6 +452,22 @@ class MirrorBot:
     def _allocate_message_id(self) -> int:
         return _allocate_web_message_id()
 
+    def _resolve_send_id(self, override: Any = None) -> int:
+        """本条消息在"帧侧"用的 id。
+
+        override 给 CLI 中继回放用：CLI 进程里对话核心早就拿着自己分配的
+        message_id 在后续 edit/delete 里引用它了，服务端回放时必须沿用同一个
+        id 当映射键，否则 edit 找不到对应的真实 Telegram 消息——流式回复会变成
+        每次编辑都新发一条，就是历史上"上一条消息无限刷屏"的那类故障。
+        网页自己的路径不传 override，行为完全不变。
+        """
+        if override is None:
+            return self._allocate_message_id()
+        try:
+            return int(override)
+        except (TypeError, ValueError):
+            return self._allocate_message_id()
+
     def _emit(self, frame_type: str, **fields: Any) -> None:
         frame: Dict[str, Any] = {"type": frame_type, "ts": time.time()}
         frame.update(fields)
@@ -494,9 +510,10 @@ class MirrorBot:
 
     async def send_message(self, chat_id: Optional[int] = None, text: str = "",
                            reply_markup: Any = None, parse_mode: Any = None,
+                           relay_message_id: Any = None,
                            **kwargs: Any) -> WebMessage:
         target = int(chat_id) if chat_id is not None else self.chat_id
-        message_id = self._allocate_message_id()
+        message_id = self._resolve_send_id(relay_message_id)
         real = await self._tg_call(
             "send_message", chat_id=target, text=str(text),
             reply_markup=reply_markup, parse_mode=parse_mode, **kwargs,
@@ -563,6 +580,7 @@ class MirrorBot:
 
     async def send_document(self, chat_id: Optional[int] = None, document: Any = None,
                             caption: Optional[str] = None, filename: Optional[str] = None,
+                            relay_message_id: Any = None,
                             **kwargs: Any) -> WebMessage:
         target = int(chat_id) if chat_id is not None else self.chat_id
         name = filename or getattr(document, "filename", None) or getattr(document, "name", None)
@@ -571,7 +589,7 @@ class MirrorBot:
         # 部分实现读完后关闭文件，之后 getattr(obj, "name") 仍然可用（属性
         # 不受读取位置影响），但提前取更保险，避免依赖未来实现细节。
         local_path = _local_path_from_send_arg(document)
-        message_id = self._allocate_message_id()
+        message_id = self._resolve_send_id(relay_message_id)
         real = await self._tg_call(
             "send_document", chat_id=target, document=document,
             caption=caption, filename=filename, **kwargs,
@@ -590,10 +608,11 @@ class MirrorBot:
         return WebMessage(self, message_id, target, str(caption or ""))
 
     async def send_photo(self, chat_id: Optional[int] = None, photo: Any = None,
-                         caption: Optional[str] = None, **kwargs: Any) -> WebMessage:
+                         caption: Optional[str] = None,
+                         relay_message_id: Any = None, **kwargs: Any) -> WebMessage:
         target = int(chat_id) if chat_id is not None else self.chat_id
         local_path = _local_path_from_send_arg(photo)
-        message_id = self._allocate_message_id()
+        message_id = self._resolve_send_id(relay_message_id)
         real = await self._tg_call(
             "send_photo", chat_id=target, photo=photo, caption=caption, **kwargs,
         )

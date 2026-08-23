@@ -42,6 +42,7 @@ import queue
 import signal
 import sys
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, List, Optional, Sequence
 
@@ -53,11 +54,14 @@ from xgent_app.cli_bridge import (
     build_cli_callback_objects,
     build_cli_command_objects,
     build_cli_conversation_objects,
+    close_relay,
+    configure_relay,
     dismiss_menu,
     get_last_menu_labels,
     get_last_menu_options,
     get_screen,
     menu_is_top,
+    relay_user_message,
 )
 from xgent_app.cli_render import display_width
 from xgent_app.cli_palette import (
@@ -110,6 +114,10 @@ SCREEN = get_screen()
 PALETTE = SCREEN.palette
 
 HISTORY_FILE = Path.home() / ".xgent_cli_history"
+
+# 本次 CLI 会话的标识。服务端按它区分不同 CLI 会话的中继流——每个会话一个
+# MirrorBot，各自维护"CLI 的 message_id -> 真实 Telegram message_id"映射。
+_CLI_SESSION_ID = f"cli-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
 # --------------------------------------------------------------------------
@@ -637,14 +645,27 @@ def _save_history() -> None:
 # --------------------------------------------------------------------------
 # 跨端同步：CLI -> Telegram / Web
 # --------------------------------------------------------------------------
-# CLI 是独立进程，与服务器只共享数据库。CLI 里说的话不再由本进程直接推给
-# Telegram：早先这里是裸 urllib 逐条 POST Bot API，每条消息重新 TCP+TLS
-# 握手，网络不好时逐条拖到 30 秒超时（"CLI→bot 同步极慢甚至不同步"的根源），
-# 而且镜像是 create_task 发完即忘，CLI 一退出未发完的任务直接被砍（吞消息）。
-# 现在只负责把对话文本带上 origin=cli-chat 标记写库——服务端的跨端观察者
-# （idle.py 的 _web_external_record_watcher）看到后用自己那条健康的 PTB
-# 连接（网页↔TG 秒同步走的就是它）镜像到 Telegram、推帧给网页。
-# 设 XGENT_CLI_NO_TG_MIRROR=1（服务端环境变量）可关掉镜像。
+# 目标：在 CLI 里对话，Telegram 和网页看到的东西**和在 Telegram 里直接对话
+# 完全一样**——带停止按钮的占位提示、Agent 每轮的状态行、工具/命令返回卡片、
+# 流式编辑、token 用量行，一条不少；唯一的差异是用户自己那句话前面带一个
+# "🖥 [CLI]" 来源标识。
+#
+# 做法是在 **bot 方法层**扇出：对话核心在本进程里跑，它对 CliBot 的每一次调用
+# （send_message / edit_message_text / delete_message …）除了画到终端，还按顺序
+# 写进 cli_relay_ops 表；服务端的回放器读出来重放到 MirrorBot 上，后者同时打
+# 真实 Telegram 和网页 SSE。这正是 Telegram↔网页天然一致的那套机制，CLI 只是
+# 接到同一条路上。见 cli_bridge._CliRelay 与 idle._replay_relay_op。
+#
+# 早先是服务端事后读 global_messages、按消息类型白名单把行重新编成文本再发
+# Telegram。那条路必然丢东西：占位消息、中间轮次、命令返回、Agent 状态行都不是
+# "一条落库的文本"，重编不出来；丢了占位消息还得另造一条假的"生成中"提示去
+# 弥补。改成回放操作流之后那些补丁全部删掉了。
+#
+# 也不要退回"CLI 进程自己发 Telegram"：那是裸连接逐条 POST Bot API，每条重新
+# TCP+TLS 握手，网络差时逐条拖到 30 秒超时（"CLI→bot 同步极慢甚至不同步"的
+# 根因），而且发完即忘，CLI 一退未发完的直接被砍（吞消息）。服务端那条 PTB
+# 连接池是健康的，交给它。
+# 设 XGENT_CLI_NO_TG_MIRROR=1 关掉同步。
 
 
 # --------------------------------------------------------------------------
@@ -767,12 +788,17 @@ async def _run_conversation(text: str) -> None:
         return
 
     try:
-        # 对话文本带 origin=cli-chat 标记：服务端跨端观察者据此把它镜像到
-        # Telegram（🖥 [CLI] 前缀）。状态机输入不带标记，不镜像。
+        # 对话文本带 origin=cli-chat 标记：标记这是 CLI 的对话文本（区别于
+        # 状态机输入），跨端历史据此识别来源。
         await GlobalRecorder.record_user_message(
             text, MessageType.USER_TEXT, BotConfig.AUTHORIZED_USER_ID,
             metadata={'origin': 'cli-chat'},
         )
+        # 把用户自己的这句话送到另外两端。**这是全流程里唯一带来源标识的
+        # 地方**（Telegram/网页显示成 "🖥 [CLI]" 加原话）——接下来
+        # process_conversation 产生的每一条消息都由 CliBot 逐个中继过去，
+        # 与在 Telegram 里直接对话逐条一致，不加任何标记、不加任何额外文案。
+        relay_user_message(text)
         await process_conversation(update, context, text)
     except Exception:
         _report_failure("对话")
@@ -790,6 +816,7 @@ async def _run_command(command: str) -> None:
                 command, MessageType.USER_TEXT, BotConfig.AUTHORIZED_USER_ID,
                 metadata={'origin': 'cli-chat'},
             )
+            relay_user_message(command)
             await process_conversation(update, context, command)
         else:
             await handler(update, context)
@@ -1076,9 +1103,24 @@ async def _run_turn(coro) -> None:
 async def _init_runtime() -> None:
     await UserDataManager.init()
     await BotMemoryDB.get_instance()
+    # 启动跨端中继：从这里起，对话核心在 CLI 里对 bot 的每一次调用都会被
+    # 服务端原样回放到 Telegram 和网页。必须在 BotMemoryDB 之后——中继线程
+    # 自己开一条 sqlite 连接，建表要等主库初始化完，免得两边同时建。
+    configure_relay(
+        BotConfig.DB_FILE,
+        BotConfig.AUTHORIZED_USER_ID,
+        _CLI_SESSION_ID,
+        enabled=not os.environ.get("XGENT_CLI_NO_TG_MIRROR"),
+    )
 
 
 async def _shutdown_runtime() -> None:
+    # 先排空中继再关库：本轮最后几条操作还在队列里，直接退出就是"最后几条
+    # 消息没同步"（历史上 create_task 发完即忘留下的老毛病）。
+    try:
+        close_relay()
+    except Exception:
+        logger.exception("CLI 关闭跨端中继失败")
     try:
         db = await BotMemoryDB.get_instance()
         await db.close()
