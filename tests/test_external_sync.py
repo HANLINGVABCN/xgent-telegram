@@ -450,8 +450,12 @@ class _FakeCliBot:
 
 async def main():
     await ns["UserDataManager"].init()
-    # CLI 进程环境里没有任何 PM2 变量——这正是要修的场景
-    for key in ("PM2_HOME", "pm_id", "PM2_USAGE"):
+    # CLI 进程环境里没有任何托管标记——这正是要修的场景。也要清 systemd 的
+    # INVOCATION_ID/JOURNAL_STREAM：GitHub Actions 的 ubuntu-latest runner
+    # 本身跑在 systemd 单元里，这两个变量会从 runner 进程一路继承到测试
+    # 子进程，本地跑（非 systemd 环境）测不出来，CI 上却让 is_systemd 提前
+    # 为真，restart_via_install 分支被跳过，install.sh 从未被调用。
+    for key in ("PM2_HOME", "pm_id", "PM2_USAGE", "INVOCATION_ID", "JOURNAL_STREAM"):
         os.environ.pop(key, None)
     await ns["restart_current_process"](42, _FakeCliBot())
     print(json.dumps({
