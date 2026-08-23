@@ -233,9 +233,11 @@ def _external_row_to_telegram_texts(row: Dict[str, Any]) -> list:
     避免用户在 Telegram 里看到裸露的尖括号标签。
 
     CLI_STREAM_NOTICE 同样镜像——它就是专门为了这件事才落库的：CLI 会话
-    发起生成时立刻写一行"AI 正在生成回复…"，让观察者在最终回复落库之前
-    就有东西可以推给 Telegram，用户在 Telegram 侧几乎实时看到"CLI 那边
-    有动静了"，而不是要等到（可能几十秒后的）完整回复才第一次收到消息。
+    发起生成时，把调用方实际发出的那句占位文本（"流式输出中..."/"后台流式
+    输出中..."/"非流式输出中..."，与原生 Telegram 会话完全一致，不是另编
+    的提示语）立刻落一行，让观察者在最终回复落库之前就有东西可以推给
+    Telegram，用户在 Telegram 侧几乎实时看到"CLI 那边有动静了"，而不是要
+    等到（可能几十秒后的）完整回复才第一次收到消息。
     """
     msg_type = row.get('msg_type')
     content = str(row.get('content') or '').strip()

@@ -635,12 +635,13 @@ async def main():
             self.bot = bot
 
     cursor = await db.get_max_global_rowid()
-    await ns["_notify_cli_generation_started"](Ctx(FakeCliBot()), 1)
-    await ns["_notify_cli_generation_started"](Ctx(FakeWebBot()), 1)
+    await ns["_notify_cli_generation_started"](Ctx(FakeCliBot()), 1, "流式输出中...")
+    await ns["_notify_cli_generation_started"](Ctx(FakeWebBot()), 1, "流式输出中...")
     rows = await db.get_records_since_rowid(cursor)
     notice_rows = [r for r in rows if r["msg_type"] == MT.CLI_STREAM_NOTICE]
     print(json.dumps({
         "cli_bot_wrote_one": len(notice_rows) == 1,
+        "content_matches_placeholder": bool(notice_rows) and notice_rows[0]["content"] == "🖥 [CLI]\\n流式输出中...",
     }))
     await db.close()
 
@@ -649,6 +650,9 @@ asyncio.run(main())
         self.assertTrue(result["cli_bot_wrote_one"],
                         "只有 CLI bot（_is_xgent_cli_bot 标记）该落这条通知，"
                         "Web/Telegram 会话本来就是原生实时发消息，不需要额外信号")
+        self.assertTrue(result["content_matches_placeholder"],
+                        "镜像内容必须是调用方实际发出的占位文本本身（如\"流式输出中...\"），"
+                        "只加 CLI 来源前缀，不能替换成另一句话")
 
 
 if __name__ == "__main__":
