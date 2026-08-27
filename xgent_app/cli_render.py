@@ -90,6 +90,24 @@ def terminal_size(default_width: int = 80, default_height: int = 24) -> Tuple[in
         return default_width, default_height
 
 
+# 消息块的横线、灰底按**终端满宽**画（可被 XGENT_CLI_WIDTH 覆盖）。
+#
+# 满宽覆盖是用户的明确要求：灰底和横线要盖住整行，不能只长到文字部分
+# 就停——半截灰底看起来像渲染烂尾。代价是回卷里的满宽行在窗口拖窄时
+# 会被终端折行，但那是回卷的物理特性（纯文本无法重排），灰底折行后
+# 底色仍然连续，视觉可接受。
+def content_width(width: Optional[int] = None) -> int:
+    """渲染宽度：XGENT_CLI_WIDTH 优先，否则终端宽。满宽覆盖。"""
+    try:
+        override = int(os.environ.get("XGENT_CLI_WIDTH", "") or 0)
+    except ValueError:
+        override = 0
+    if override > 0:
+        return max(40, override)
+    actual = width if width else terminal_size()[0]
+    return max(40, actual)
+
+
 # --------------------------------------------------------------------------
 # 显示宽度（CJK 占两列）
 # --------------------------------------------------------------------------
@@ -127,6 +145,46 @@ def display_width(text: str) -> int:
     # 变体选择符 FE0F / 零宽连接符不额外占位，先去掉再逐字符累加。
     stripped = stripped.replace("️", "").replace("‍", "")
     return sum(char_width(ch) for ch in stripped)
+
+
+def visual_rows(text: str, width: int) -> int:
+    """text 被 width 列的终端软换行后实际占几行。
+
+    不能用 ceil(display_width/width)：终端折行时宽字符不会跨行——折行点
+    落在 CJK/emoji 正中间时整个字符被推到下一行，实际行数可能比理论值
+    多 1。resize 后要按新宽度上移回旧块顶部（擦干净重画），行数差 1 就
+    会留下残骸或擦掉别人的内容，必须逐字符精确模拟终端的折行。
+    """
+    if width < 1:
+        return 1
+    rows, col = 1, 0
+    for ch in _ANSI_RE.sub("", text):
+        w = char_width(ch)
+        if col + w > width:
+            rows += 1
+            col = 0
+        col += w
+    return rows
+
+
+def visual_row_of_col(text: str, width: int, col_target: int) -> int:
+    """width 列终端上，text 里第 col_target 列处的字符落在第几行（0 起）。
+
+    光标锚定在文本位置：旧块被终端按新宽度折行后，光标跟着掉到第几行
+    由"光标之前的字符"决定，逐字符模拟折行到目标列即得。
+    """
+    if width < 1:
+        return 0
+    row, col = 0, 0
+    for ch in _ANSI_RE.sub("", text):
+        w = char_width(ch)
+        if col + w > width:
+            row += 1
+            col = 0
+        col += w
+        if col > col_target:
+            return row
+    return row
 
 
 def _tokenize_with_ansi(text: str) -> List[Tuple[str, bool]]:
@@ -236,18 +294,75 @@ def chunk_by_width(text: str, width: int) -> List[str]:
     return chunks or [""]
 
 
+def fill_line(text: str, width: int, palette: Optional["Palette"] = None) -> List[str]:
+    """整行铺灰底，返回若干条"每条都恰好占满 width"的行。
+
+    命令返回用这个把输出圈出来。三处讲究：
+
+    1. **不剥行内 ANSI**。原来的做法是先 _ANSI_RE.sub("") 剥光再统一上色，
+       结果命令名、参数的高亮全丢了。这里保留原色，只把每个 reset(\\x1b[0m)
+       后面补一个底色码——reset 会把背景一起清掉，不补的话灰底就在第一个
+       彩色片段结束的地方断掉，后半行变成裸色。
+    2. **不叠 dim**。dim 压在 236 灰底上会把字糊成暗灰，几乎读不出来；
+       无色文字走终端默认前景（正常白）即可。"小一号"的视觉线索交给
+       "◇ 命令"抬头行。
+    3. **先按宽度硬切再补齐**。只补齐到 width 的话，本来就超宽的行（长路径、
+       表格）会被终端软换行，第二段没有底色，屏幕上出现半截灰条。切开之后
+       每个可视行都是完整一条灰带，窗口拉到多窄都不断。
+    """
+    pal = palette or Palette(False)
+    width = max(1, width)
+    if not pal.enabled:
+        return chunk_by_width(text, width)
+    out: List[str] = []
+    for piece in chunk_by_width(text, width):
+        # reset 之后立刻把底色续上，否则灰底会在行中断掉。
+        repainted = piece.replace(pal.reset, pal.reset + pal.bg)
+        out.append(pal.bg + repainted + " " * max(0, width - display_width(piece)) + pal.reset)
+    return out
+
+
 # --------------------------------------------------------------------------
 # 画框
 # --------------------------------------------------------------------------
-# 消息之间原来只靠"标题行 + 缩进"分隔。对话一长就糊成一片：AI 的正文、用户
-# 的话、系统提示三种东西挤在同一个左边界上，扫读时找不到一条消息从哪开始、
-# 到哪结束。围一个框，边界就是显式的——这也是 Telegram/Web 端用气泡在做的事，
-# 终端里等价物就是框线。
+# 消息块用"上下双横线"而不是四边框：四边框带左右竖线，终端窗口一拉窄，
+# 已打印的行软换行会把右边框甩到下一行，整个框当场散架；终端没有重排
+# 滚动历史的原语，谁也救不回来。双横线没有右边界，超宽行最多多占一行，
+# 永不错位——这是"页面呈现"层面对抗窗口缩放的手段。
+# box_block 仍保留给输入框（cli_palette）：它是交互件，每次按键整块重画，
+# 拉完窗口敲一下键就自动对齐。
 BOX_TOP_LEFT, BOX_TOP_RIGHT = "╭", "╮"
 BOX_BOTTOM_LEFT, BOX_BOTTOM_RIGHT = "╰", "╯"
 BOX_H, BOX_V = "─", "│"
 # 框线两侧各吃掉 "│ " 和 " │"。
 BOX_CHROME = 4
+
+
+def rule_block(body: Sequence[str], width: int, title: str = "",
+               palette: Optional["Palette"] = None,
+               rule_style: str = "") -> List[str]:
+    """把若干行夹在上下两条横线之间，标题嵌在上横线里。
+
+    正文行不做补齐、不硬切：没有右边框就没有可错位的的东西，超宽的行
+    （代码块、表格）交给终端自己软换行即可。
+
+    横线铺满整个渲染宽度：灰底、横线都要整行覆盖，不能只长到文字部分。
+    """
+    pal = palette or Palette(False)
+    width = max(12, width)
+
+    def paint(text: str) -> str:
+        return pal.paint(text, rule_style) if rule_style else text
+
+    # 标题放不下就退化成纯横线：硬塞会把上横线顶到第二行，双横线块的
+    # "永不错位"承诺当场破功。极窄终端下宁可丢标题也要保住排版。
+    if title and display_width(title) + 6 <= width:
+        fill = max(2, width - display_width(title) - 4)
+        top = paint("── ") + title + paint(" " + BOX_H * fill)
+    else:
+        top = paint(BOX_H * width)
+    bottom = paint(BOX_H * width)
+    return [top] + list(body) + [bottom]
 
 
 def box_block(body: Sequence[str], width: int, title: str = "",
@@ -308,6 +423,7 @@ class Palette:
         "ok": "\x1b[38;5;114m",
         "warn": "\x1b[38;5;221m",
         "err": "\x1b[38;5;203m",
+        "bg": "\x1b[48;5;236m",      # 灰底：命令返回整行填充
     }
 
     def __init__(self, enabled: bool = True):
@@ -551,7 +667,8 @@ class MessageRenderer:
                      indent: str = "  ") -> List[str]:
         """键位提示 -> 终端行（"⌃C  中断回答" 这种）。
 
-        整行走 muted 灰：它是操作说明，不是消息内容，不该跟正文抢注意力。
+        用正常白字，不压暗：这行是"你现在能按什么键"，是要被读到的操作
+        信息。之前套 muted 灰把它压成了背景噪音，屏幕上几乎看不见。
         """
         if not hints:
             return []
@@ -560,38 +677,67 @@ class MessageRenderer:
         lines: List[str] = []
         for key, desc in hints:
             pad = " " * (key_width - display_width(key))
-            lines.append(indent + pal.paint(f"{key}{pad}  {desc}", pal.muted))
+            lines.append(indent + f"{key}{pad}  {desc}")
         return lines
 
     def render_message(self, text: str, buttons: Sequence[Tuple[str, str]] = (),
                        parse_mode: Any = None, title: str = "XGent",
                        marker: str = "◆", style: str = "ai") -> List[str]:
-        """完整一条消息：一个框，标题嵌在上边框里，正文/菜单/键位提示在框内。
+        """完整一条消息，按 style 分两档呈现：
 
-        为什么是框而不是"标题行 + 缩进"：终端只有一根从上往下的滚动条，AI 的
-        正文、用户的话、系统提示全挤在同一个左边界上，对话一长就分不清一条
-        消息从哪开始、到哪结束。框线把边界画成显式的——Telegram/Web 端那边
-        是气泡在做这件事。框线用消息自己的颜色，说话的是谁一眼可辨。
+        - "ai" / "user"：上下双横线夹住，标题嵌在上横线里，横线用消息自己
+          的颜色——说话的是谁一眼可辨。这是对话的"气泡"。
+        - "cmd" / "system"：不画横线，只用"◇ 命令 / ◇ 系统"抬头区分。字
+          一律**正常白**——不压暗、不涂灰：这些是要被读到的信息（返回码、
+          轮次状态、能按哪个键），压暗等于让人看不见。区分靠的是有没有
+          横线块，不是靠把字弄糊。命令返回（cmd）额外铺底色圈出范围。
+        - "token"：连抬头都不要，纯一行。
 
-        正文按**框内宽度**重新排版（外框吃掉 4 列），否则折行按整屏宽算，
-        右边框会被顶出去。
+        正文统一缩进 2 格、按整屏宽折行；没有右边框，就不存在被顶散架的
+        问题，超宽行交给终端软换行。
         """
         pal = self.palette
-        color = getattr(pal, style, "")
-        inner = MessageRenderer(pal, max(20, self.width - BOX_CHROME))
-
-        lines = inner.render_text(text, parse_mode, indent="")
+        lines = self.render_text(text, parse_mode, indent="  ")
         menu_buttons, hints = split_control_buttons(buttons)
-        button_lines = inner.render_buttons(menu_buttons, indent="")
+        button_lines = self.render_buttons(menu_buttons, indent="  ")
         if button_lines:
             if lines:
                 lines.append("")
             lines.extend(button_lines)
         # 键位提示紧贴正文，不额外空行：它是状态行的附注，隔开反而像另一段。
-        lines.extend(inner.render_hints(hints, indent=""))
+        lines.extend(self.render_hints(hints, indent="  "))
 
+        # 什么都没有就整块不打。空消息（占位被清空、只剩一个已被摘掉的停止
+        # 按钮）照打的话，屏幕上会留下一个空的"◆ XGent"框或光秃秃的
+        # "◇ 命令"抬头——框里没有内容，等于告诉用户"它说了句话"却什么都
+        # 没说。
+        if not any(line.strip() for line in lines):
+            return []
+
+        if style == "token":
+            return [pal.paint(_ANSI_RE.sub("", line), pal.dim) for line in lines]
+
+        if style in ("cmd", "system"):
+            # 抬头用白色加粗，不用灰：它是这一块的名字，得看得见。
+            heading = f"{pal.paint(marker, pal.bold)} {pal.paint(title, pal.bold)}"
+            out = [heading]
+            for line in lines:
+                if not line.strip():
+                    out.append("")
+                elif style == "cmd":
+                    # 命令返回：整行铺灰底，一眼圈出"这是命令的输出"。灰底
+                    # 铺满整个渲染宽度——盖住整行，不能只长到文字部分。原色
+                    # 保留、底色不断（见 fill_line）。空行不上底色，免得块
+                    # 与块之间夹出灰条。
+                    out.extend(fill_line(line, self.width, pal))
+                else:
+                    # 系统提示：正常白字，无底色。原色照留。
+                    out.append(line)
+            return out
+
+        color = getattr(pal, style, "")
         heading = f"{pal.paint(marker, color, pal.bold)} {pal.paint(title, color, pal.bold)}"
-        return box_block(lines, self.width, heading, pal, color)
+        return rule_block(lines, self.width, heading, pal, color)
 
 
 # --------------------------------------------------------------------------
@@ -620,6 +766,8 @@ class TerminalScreen:
         self._last_message_id: Optional[int] = None
         self._last_line_count = 0
         self._can_redraw = False
+        # 上次 print_block 时的终端宽度：宽度一变账本作废（见 update_block）。
+        self._last_printed_width = 0
 
     # -- 基础 ------------------------------------------------------------
     @property
@@ -633,7 +781,9 @@ class TerminalScreen:
         return terminal_size()[1]
 
     def renderer(self) -> MessageRenderer:
-        return MessageRenderer(self.palette, self.width)
+        # 排版宽度 = 终端满宽（XGENT_CLI_WIDTH 可覆盖）：灰底、横线都要
+        # 整行覆盖。原地重绘的行数记账（_visual_rows）按同一宽度算。
+        return MessageRenderer(self.palette, content_width(self.width))
 
     def _write(self, text: str) -> None:
         try:
@@ -660,14 +810,10 @@ class TerminalScreen:
         不能直接用 len(lines)：超过终端宽度的行会被终端自己软换行成多行。
         代码块/表格（<pre>）刻意不折行——折了对齐就毁了——所以这种超宽行
         真实存在。按 len() 记账会让重绘时上移的行数偏少，光标停在块中间，
-        擦掉的就是别人的内容。
+        擦掉的就是别人的内容。折行数用 visual_rows 精确算（宽字符不跨行）。
         """
         width = self.width
-        total = 0
-        for line in lines:
-            line_width = display_width(line)
-            total += max(1, -(-line_width // width)) if line_width else 1
-        return total
+        return sum(visual_rows(line, width) for line in lines)
 
     # -- 打印 ------------------------------------------------------------
     def print_block(self, lines: Sequence[str], message_id: Optional[int] = None,
@@ -679,10 +825,20 @@ class TerminalScreen:
         # 记录的是"块在屏幕上占的行数"，重绘时要连同前置空行一起算。
         self._last_line_count = self._visual_rows(lines) + (1 if leading_blank else 0)
         self._can_redraw = message_id is not None and self.palette.enabled
+        # 记住画这块时的终端宽度：宽度一变（拖窗口），屏幕上这块会被终端
+        # 按新宽度折行重排，高度变了，行数账本当场作废。
+        self._last_printed_width = self.width
 
     def update_block(self, lines: Sequence[str], message_id: int) -> bool:
         """尝试原地重绘 message_id 对应的块。成功返回 True。"""
         if not self._can_redraw or self._last_message_id != message_id:
+            return False
+        # 终端宽度变了（拖拽窗口）：旧块已被终端按新宽度折行重排，记账的
+        # 行数不再对应屏幕上的任何东西——照着上移会擦掉别人的内容，流式
+        # 更新期间拖窗口后的"满屏错位"正是从这儿来的。放弃原地重绘，退
+        # 化成追加打印：宁可同一条消息多打一份，也不能错位。
+        if self._last_printed_width != self.width:
+            self.invalidate()
             return False
         # 块比屏幕还高时，顶部已经滚出可视区，上移会越界擦到别的内容。
         if self._last_line_count + 1 >= self.height:
@@ -692,6 +848,7 @@ class TerminalScreen:
         payload = "\n" + "\n".join(lines) + "\n"
         self._write(payload)
         self._last_line_count = self._visual_rows(lines) + 1
+        self._last_printed_width = self.width
         return True
 
     def print_plain(self, text: str = "") -> None:
@@ -707,7 +864,9 @@ class TerminalScreen:
             "warn": ("!", pal.warn),
             "err": ("✗", pal.err),
         }.get(level, ("ℹ", pal.muted))
-        self.print_plain(f"{pal.paint(marker, style)} {pal.paint(text, style)}")
+        # 记号保留语义色（✓ 绿 / ! 黄 / ✗ 红），正文用正常白字——压暗会
+        # 让提示糊成背景，而这些恰恰是需要被读到的。
+        self.print_plain(f"{pal.paint(marker, style)} {text}")
 
 
 def buttons_from_markup(reply_markup: Any) -> List[Tuple[str, str]]:
@@ -743,8 +902,10 @@ __all__ = [
     "chunk_by_width",
     "display_width",
     "enable_windows_vt",
+    "fill_line",
     "html_to_ansi",
     "pad_to_width",
+    "rule_block",
     "split_control_buttons",
     "supports_color",
     "terminal_size",

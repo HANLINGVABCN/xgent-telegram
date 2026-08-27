@@ -62,8 +62,9 @@ from xgent_app.cli_bridge import (
     get_screen,
     menu_is_top,
     relay_user_message,
+    set_turn_kind,
 )
-from xgent_app.cli_render import box_block, display_width
+from xgent_app.cli_render import content_width, display_width, fill_line, rule_block
 from xgent_app.cli_palette import (
     SlashPalette,
     interactive_supported as palette_supported,
@@ -291,7 +292,8 @@ def _code_version() -> str:
 
 def _banner() -> None:
     pal = PALETTE
-    width = min(SCREEN.width, 72)
+    # 和消息块共用同一个宽度与画线函数（rule_block）：满宽覆盖。
+    width = content_width(SCREEN.width)
     title = (
         f"{pal.paint('◆', pal.ai, pal.bold)} {pal.paint('XGent CLI', pal.bold)}"
         f"  {pal.paint('本地终端客户端', pal.muted)}"
@@ -310,10 +312,9 @@ def _banner() -> None:
         f"  {pal.paint(desc, pal.muted)}"
         for label, desc in hints
     ]
-    # 和消息框、输入框共用同一个画框函数：三种框宽度算法一致，边界才对得齐。
-    # （手写那版把补齐算少了一列，上边框一直比内容行长一格。）
+    # 和消息块共用同一个画线函数（rule_block）：双横线式，拉窄终端不错位。
     SCREEN.print_plain("")
-    for line in box_block(body, width, title, pal, pal.muted):
+    for line in rule_block(body, width, title, pal, pal.muted):
         SCREEN.print_plain(line)
     SCREEN.print_plain("")
 
@@ -437,17 +438,38 @@ def _remember_history(line: str) -> None:
         logger.debug("写入 CLI 历史失败", exc_info=True)
 
 
-def _print_help() -> None:
+def _compact_cmd_line(text: str) -> List[str]:
+    """命令返回的整行样式：整行灰底填充，字符保留原色。
+
+    /help、`/` 面板、/getchat 的头尾说明都是这一档——用灰底圈出"这一段是
+    命令打的"。和 cli_render.MessageRenderer 的 cmd 档共用同一个 fill_line，
+    两处样式不会漂移。返回的是**行列表**：超宽内容会被切成多条，每条各自
+    占满一行灰带，窗口拉多窄都不会出现半截灰条。
+    """
+    return fill_line(text, content_width(SCREEN.width), PALETTE)
+
+
+def _print_cmd_line(text: str) -> None:
+    for line in _compact_cmd_line(text):
+        SCREEN.print_plain(line)
+
+
+def _cmd_heading(title: str = "命令") -> str:
+    """命令返回块的人物行（◇ 命令），与 cli_bridge 里核心侧命令返回同款。"""
     pal = PALETTE
+    return f"{pal.paint('◇', pal.muted, pal.bold)} {pal.paint(title, pal.muted, pal.bold)}"
+
+
+def _print_help() -> None:
     SCREEN.print_plain("")
-    SCREEN.print_plain(pal.paint("可用命令", pal.bold, pal.ai))
+    SCREEN.print_plain(_cmd_heading())
     for row in _command_rows(_command_names()):
-        SCREEN.print_plain(row)
+        _print_cmd_line(row)
     SCREEN.print_plain("")
-    SCREEN.print_plain(pal.paint("  /黑名单 是 /blacklist 的中文别名（与 Telegram 端一致）", pal.muted))
-    SCREEN.print_plain(pal.paint("  /getchat [N] 可指定拉取条数（默认 50，上限 500）", pal.muted))
-    SCREEN.print_plain(pal.paint("  粘贴多行文本会收成一个 [粘贴 …] 占位块，回车才发出；退格可整块删掉", pal.muted))
-    SCREEN.print_plain(pal.paint("  exit / quit 退出", pal.muted))
+    _print_cmd_line("  /黑名单 是 /blacklist 的中文别名（与 Telegram 端一致）")
+    _print_cmd_line("  /getchat [N] 可指定拉取条数（默认 50，上限 500）")
+    _print_cmd_line("  粘贴多行文本会收成一个 [粘贴 …] 占位块，回车才发出；退格可整块删掉")
+    _print_cmd_line("  exit / quit 退出")
     SCREEN.print_plain("")
 
 
@@ -470,15 +492,14 @@ def _show_current_menu() -> None:
 _palette: List[str] = []
 
 
-def _show_command_palette(names: Sequence[str], title: str = "可用命令") -> None:
+def _show_command_palette(names: Sequence[str], title: str = "命令") -> None:
     global _palette
     _palette = list(names)
-    pal = PALETTE
     SCREEN.print_plain("")
-    SCREEN.print_plain(pal.paint(title, pal.bold, pal.ai))
+    SCREEN.print_plain(_cmd_heading(title))
     for row in _command_rows(_palette, numbered=True):
-        SCREEN.print_plain(row)
-    SCREEN.print_plain(pal.paint("  输入编号执行，或继续输入 /命令；Tab 可补全。", pal.muted))
+        _print_cmd_line(row)
+    _print_cmd_line("  输入编号执行，或继续输入 /命令；Tab 可补全。")
     SCREEN.print_plain("")
 
 
@@ -712,18 +733,14 @@ def _render_history_rows(rows: Sequence[dict]) -> None:
 async def _pull_cross_client_history(limit: int) -> None:
     db = await BotMemoryDB.get_instance()
     rows = await db.get_display_history(limit)
-    pal = PALETTE
     SCREEN.print_plain("")
     if not rows:
         SCREEN.notice("还没有任何跨端记录。", "info")
         return
-    SCREEN.print_plain(
-        pal.paint(f"── 跨端历史 · 最近 {len(rows)} 条（/getchat N 可加大，默认 50）──", pal.muted)
-    )
+    SCREEN.print_plain(_cmd_heading("命令"))
+    _print_cmd_line(f"  跨端历史 · 最近 {len(rows)} 条（/getchat N 可加大，默认 50）")
     _render_history_rows(rows)
-    SCREEN.print_plain(
-        pal.paint("── 拉取结束。新消息不会自动出现，需要时再 /getchat ──", pal.muted)
-    )
+    _print_cmd_line("  拉取结束。新消息不会自动出现，需要时再 /getchat")
     SCREEN.print_plain("")
 
 
@@ -773,6 +790,8 @@ async def _run_conversation(text: str) -> None:
     # 不当 AI 对话——对照 idle.py 的同一处理。
     state = UserDataManager.get('state')
     if state != BotState.IDLE:
+        # 状态机的追问（"请输入 API Key"这类）是系统提示，不是 AI 正文。
+        set_turn_kind("system")
         try:
             update.message.text = text
         except Exception:
@@ -783,6 +802,7 @@ async def _run_conversation(text: str) -> None:
             _report_failure("状态处理")
         return
 
+    set_turn_kind("chat")
     try:
         # 对话文本带 origin=cli-chat 标记：标记这是 CLI 的对话文本（区别于
         # 状态机输入），跨端历史据此识别来源。
@@ -807,6 +827,8 @@ async def _run_command(command: str) -> None:
     update, context, _bot = build_cli_command_objects(BotConfig.AUTHORIZED_USER_ID, command)
     try:
         if handler is None:
+            # 未知命令降级成普通对话：接下来的输出是 AI 正文，不是命令返回。
+            set_turn_kind("chat")
             SCREEN.notice(f"未知命令 /{name}，当作普通对话发给 AI（/help 看命令列表）。", "warn")
             await GlobalRecorder.record_user_message(
                 command, MessageType.USER_TEXT, BotConfig.AUTHORIZED_USER_ID,
@@ -815,6 +837,8 @@ async def _run_command(command: str) -> None:
             relay_user_message(command)
             await process_conversation(update, context, command)
         else:
+            # 命令处理器的回复（/stats 报表、/start 菜单……）一律按命令返回呈现。
+            set_turn_kind("cmd")
             await handler(update, context)
     except Exception:
         _report_failure(f"命令 /{name}")
@@ -822,6 +846,8 @@ async def _run_command(command: str) -> None:
 
 async def _run_callback(callback_data: str) -> None:
     """按编号触发的按钮点击等价操作。对照 idle.py 的 _web_handle_callback。"""
+    # 菜单点击产生的回复（进一层菜单/执行动作的结果）按命令返回呈现。
+    set_turn_kind("cmd")
     update, context, _bot = build_cli_callback_objects(
         BotConfig.AUTHORIZED_USER_ID, callback_data, 0,
     )

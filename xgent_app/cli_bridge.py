@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sqlite3
 import threading
 import time
@@ -65,6 +66,62 @@ def _allocate_cli_message_id() -> int:
         mid = _cli_message_id_counter
         _cli_message_id_counter += 1
         return mid
+
+
+# --------------------------------------------------------------------------
+# 消息呈现分类信号（只服务显示层，不参与任何处理逻辑）
+# --------------------------------------------------------------------------
+# 核心侧所有消息都走同一个 send_message 过来，参数里没有"这是 AI 正文还是
+# 命令返回"的类型标记。分两级判断：
+#
+#   1. **按消息内容**认出旁白类消息（token 行、Agent 轮次状态、Agent 操作
+#      结果）。这一级最要紧：一次对话轮里，除了最后那段 AI 正文，中间的
+#      状态行和工具输出全是旁白，可它们和正文一样走 send_message、一样在
+#      "对话轮"里——只按轮次分类的话，它们会全部被套上 ◆ XGent 横线块，
+#      屏幕上就是一屏的框。
+#   2. 内容认不出来时，回落到轮次类型（命令轮 / 状态机轮）。
+#
+# 按内容识别是这里的既定做法：token 行本来就是这么认的，Web 前端
+# （index.html 的 isTokenUsageText）用的也是同一个判据，两端永远一致。
+_turn_kind = "chat"
+
+# token 用量行："↑ X tokens … · ⚡ R tokens/s"（build_token_usage_message）。
+_TOKEN_LINE_RE = re.compile(r"tokens\s*/\s*s\b")
+
+# Agent 轮次状态行（agent_status.py）："Agent 第 3 轮 · 1 个操作进行中"、
+# "✅ Agent 第 3 轮 · 已完成"。纯 UI 状态，核心侧连上下文都不喂给 AI
+# （core.py 的 MessageType.AGENT_STATUS 注释）——它是系统旁白，不是回复。
+_AGENT_STATUS_RE = re.compile(r"Agent\s*第\s*\d+\s*轮")
+
+# Agent 操作结果（agent_presenter.py 的 build_*_presentation）：
+# "⌨️ <b>Agent Run</b>"、"🔎 <b>Agent Grep</b> 命中 3 处" …
+# 这些是工具的输出——命令返回，不是 AI 说的话。
+_AGENT_RESULT_RE = re.compile(r"<b>\s*Agent\s+\w+\s*</b>", re.I)
+
+
+def set_turn_kind(kind: str) -> None:
+    """登记当前轮的显示分类：chat=对话 / cmd=命令返回 / system=系统提示。"""
+    global _turn_kind
+    _turn_kind = kind if kind in ("chat", "cmd", "system") else "chat"
+
+
+def current_turn_kind() -> str:
+    return _turn_kind
+
+
+def _render_kind_for(text: str) -> str:
+    """这条 send_message 该用哪种呈现样式。
+
+    内容特征优先于轮次类型：轮次只知道"用户敲的是命令还是对话"，认不出
+    一次对话轮内部的状态行和工具输出。
+    """
+    if _TOKEN_LINE_RE.search(text):
+        return "token"
+    if _AGENT_RESULT_RE.search(text):
+        return "cmd"
+    if _AGENT_STATUS_RE.search(text):
+        return "system"
+    return _turn_kind
 
 
 # --------------------------------------------------------------------------
@@ -510,12 +567,43 @@ class CliBot:
     def _renderer(self) -> MessageRenderer:
         return self.screen.renderer()
 
+    def _render_by_kind(self, text: str, buttons: Any, parse_mode: Any) -> Tuple[List[str], str]:
+        """按当前轮的显示分类排版一条消息，返回 (行, 分类)。
+
+        send_message 和 edit_message_text 必须共用这一处：命令返回常常是
+        "先发占位、跑完再 edit"，两边各算各的样式的话，同一条消息会在
+        编辑那一刻从"◇ 命令 + 灰底"翻成"◆ XGent 双横线块"，中途换皮。
+        """
+        kind = _render_kind_for(text)
+        renderer = self._renderer()
+        if kind == "token":
+            return renderer.render_message(text, buttons, parse_mode, style="token"), kind
+        if kind in ("cmd", "system"):
+            # 命令返回/系统提示：换人物（◇ 命令 / ◇ 系统）+ 紧凑呈现。
+            # 按钮照常渲染成编号菜单——/start 这类命令的菜单不能因为换
+            # 皮肤而点不了。
+            return renderer.render_message(
+                text, buttons, parse_mode,
+                title=("命令" if kind == "cmd" else "系统"), marker="◇", style=kind,
+            ), kind
+        return renderer.render_message(text, buttons, parse_mode), kind
+
     async def send_message(self, chat_id: int, text: str, reply_markup: Any = None,
                            parse_mode: Any = None, **kwargs: Any) -> CliMessage:
         message_id = self._allocate_message_id()
         buttons = buttons_from_markup(reply_markup)
-        lines = self._renderer().render_message(str(text), buttons, parse_mode)
-        self.screen.print_block(lines, message_id=message_id)
+        lines, kind = self._render_by_kind(str(text), buttons, parse_mode)
+        if not lines:
+            # 渲染成��（空消息、只剩一颗被摘掉的停止按钮）：屏幕上什么都不
+            # 打，连空行都不留。中继照发——Telegram 那边有它自己的表示。
+            pass
+        elif kind == "token":
+            # token 统计行紧贴上一块（不留前置空行），行距放到它下面——
+            # 它是刚才那条回复的脚注，隔开就成了孤零零的一行。
+            self.screen.print_block(list(lines) + [""], message_id=message_id,
+                                    leading_blank=False)
+        else:
+            self.screen.print_block(lines, message_id=message_id)
         _register_menu(message_id, split_control_buttons(buttons)[0], is_edit=False)
         _RELAY.emit(
             "send_message", message_id=message_id, text=str(text),
@@ -538,8 +626,8 @@ class CliBot:
         """
         target_id = int(message_id or 0)
         buttons = buttons_from_markup(reply_markup)
-        lines = self._renderer().render_message(str(text), buttons, parse_mode)
-        if not self.screen.update_block(lines, target_id):
+        lines, _kind = self._render_by_kind(str(text), buttons, parse_mode)
+        if lines and not self.screen.update_block(lines, target_id):
             self.screen.print_block(lines, message_id=target_id)
         _register_menu(target_id, split_control_buttons(buttons)[0], is_edit=True)
         _RELAY.emit(

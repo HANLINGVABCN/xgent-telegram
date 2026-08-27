@@ -25,8 +25,11 @@ from xgent_app.cli_render import (
     MessageRenderer,
     Palette,
     TerminalScreen,
+    content_width,
     display_width,
+    fill_line,
     html_to_ansi,
+    rule_block,
     split_control_buttons,
     wrap_line,
 )
@@ -390,6 +393,225 @@ class ControlButtonTests(unittest.TestCase):
         self.assertEqual([], cli_bridge.get_last_menu_options())
         self.assertNotIn("❌", self.stream.getvalue())
         self.assertIn("中断回答", self.stream.getvalue())
+
+
+class MessagePresentationTests(unittest.TestCase):
+    """消息呈现的四档样式：ai/user 双横线块、cmd 灰底、system 小字、token 裸行。
+
+    这几条断言守的是"页面呈现"层的约定，不是实现细节：框线一旦重新长出
+    左右竖线，终端窗口一拉窄整块就散架（这正是改成双横线的原因）；灰底
+    一旦在行中断掉，命令输出看起来就像半截。
+    """
+
+    def setUp(self):
+        cli_bridge.reset_menu_state()
+        self.stream = io.StringIO()
+        self.screen = TerminalScreen(stream=self.stream, color=True, width=60)
+        cli_bridge.set_screen(self.screen)
+        self.bot = cli_bridge.CliBot(1, self.screen)
+
+    def tearDown(self):
+        cli_bridge.set_turn_kind("chat")
+        cli_bridge.set_screen(None)
+        cli_bridge.reset_menu_state()
+
+    # -- ai / user 块 ---------------------------------------------------
+    def test_ai_block_has_no_vertical_border(self):
+        renderer = MessageRenderer(Palette(False), 60)
+        body = "\n".join(renderer.render_message("你好", style="ai"))
+        self.assertIn("◆ XGent", body)
+        for char in ("│", "╭", "╰", "╮", "╯"):
+            self.assertNotIn(char, body, f"消息块不该再有 {char}：左右包边会被拉窄的窗口顶散架")
+
+    def test_user_block_keeps_the_same_shape(self):
+        renderer = MessageRenderer(Palette(False), 60)
+        lines = renderer.render_message("你好", title="User", marker="❯", style="user")
+        self.assertIn("❯ User", lines[0])
+        self.assertTrue(set(lines[-1]) <= {"─"}, lines[-1])
+
+    def test_rule_title_degrades_instead_of_overflowing(self):
+        # 终端窄到放不下标题时退化成纯横线：硬塞会把上横线顶到第二行。
+        lines = rule_block(["正文"], 12, "◆ XGent 一个很长的标题")
+        self.assertEqual(12, display_width(lines[0]))
+        self.assertEqual(12, display_width(lines[-1]))
+
+    # -- cmd 灰底 -------------------------------------------------------
+    def test_cmd_line_keeps_inline_color_and_refills_bg(self):
+        pal = Palette(True)
+        renderer = MessageRenderer(pal, 60)
+        lines = renderer.render_message(
+            "<b>可用命令</b>", parse_mode="HTML",
+            title="命令", marker="◇", style="cmd",
+        )
+        body_lines = [line for line in lines[1:] if line.strip()]
+        self.assertTrue(body_lines)
+        body = "\n".join(body_lines)
+        # 原色保留（bold 还在），灰底也在。
+        self.assertIn(pal.bold, body)
+        self.assertIn(pal.bg, body)
+        # 每个 reset 后面都要立刻把灰底续上，否则底色在行中断掉。
+        for line in body_lines:
+            chunks = line.split(pal.reset)
+            for chunk in chunks[1:-1]:
+                self.assertTrue(chunk.startswith(pal.bg),
+                                f"reset 之后没有补回灰底：{chunk!r}")
+
+    def test_cmd_line_is_not_dimmed(self):
+        # 要求 7：灰底上的字要正常亮度，dim 叠在 236 灰底上会糊成暗灰。
+        pal = Palette(True)
+        lines = MessageRenderer(pal, 60).render_message(
+            "普通输出", title="命令", marker="◇", style="cmd")
+        for line in lines[1:]:
+            self.assertNotIn(pal.dim, line)
+
+    def test_cmd_fill_survives_narrow_terminal(self):
+        pal = Palette(True)
+        long_line = "路径 " * 40
+        for width in (40, 60, 100):
+            with self.subTest(width=width):
+                for line in fill_line(long_line, width, pal):
+                    self.assertEqual(width, display_width(line))
+                    self.assertTrue(line.startswith(pal.bg))
+                    self.assertTrue(line.endswith(pal.reset))
+
+    # -- system / token -------------------------------------------------
+    def test_system_style_has_no_background(self):
+        # 系统提示要白字：状态信息是要被读到的，dim 压暗等于让人看不见。
+        pal = Palette(True)
+        lines = MessageRenderer(pal, 60).render_message(
+            "请输入 API Key", title="系统", marker="◇", style="system")
+        self.assertIn("◇", lines[0])
+        self.assertIn("系统", lines[0])
+        body = "\n".join(lines[1:])
+        self.assertNotIn(pal.bg, body)
+        self.assertNotIn(pal.dim, body)
+
+    def test_token_style_has_no_title_and_no_rule(self):
+        lines = MessageRenderer(Palette(False), 60).render_message(
+            "↑ 21825 tokens · ⚡ 43 tokens/s", style="token")
+        body = "\n".join(lines)
+        self.assertIn("tokens/s", body)
+        self.assertNotIn("─", body)
+        self.assertNotIn("◆", body)
+        self.assertNotIn("XGent", body)
+
+    def test_token_line_hugs_the_reply_above_it(self):
+        # 要求 5：token 行紧贴上一块，行距放到它下面。
+        run(self.bot.send_message(chat_id=1, text="回复正文"))
+        self.stream.truncate(0)
+        self.stream.seek(0)
+        run(self.bot.send_message(chat_id=1, text="↑ 100 tokens · ⚡ 43 tokens/s"))
+        output = self.stream.getvalue()
+        self.assertFalse(output.startswith("\n"), "token 行前面不该再空一行")
+        self.assertTrue(output.endswith("\n\n"), "行距要放到 token 行下面")
+
+    # -- 轮次分类跨 send/edit 一致 --------------------------------------
+    def test_edit_keeps_cmd_style(self):
+        cli_bridge.set_turn_kind("cmd")
+        message = run(self.bot.send_message(chat_id=1, text="正在执行…"))
+        first = self.stream.getvalue()
+        self.stream.truncate(0)
+        self.stream.seek(0)
+        run(self.bot.edit_message_text(
+            text="执行完成", chat_id=1, message_id=message.message_id))
+        second = self.stream.getvalue()
+        # 同一条消息不能在 edit 那一刻从"◇ 命令"翻成"◆ XGent"。
+        for output in (first, second):
+            self.assertIn("◇", output)
+            self.assertIn("命令", output)
+        self.assertNotIn("XGent", second)
+
+    def test_chat_turn_still_edits_as_ai_block(self):
+        cli_bridge.set_turn_kind("chat")
+        run(self.bot.edit_message_text(text="AI 回复", chat_id=1, message_id=42))
+        self.assertIn("XGent", self.stream.getvalue())
+
+
+class MessageKindClassificationTests(unittest.TestCase):
+    """一次对话轮里，只有"AI 说的那段话"配得上横线块。
+
+    这是改造里最容易搞错的一处：状态行、工具输出和最终回复都走同一个
+    send_message、都发生在"对话轮"里。只按轮次分类的话，它们会全部被套上
+    ◆ XGent 横线块——屏幕上就是一屏的框，而框���该只圈住"我问的"和"它答的"。
+    """
+
+    def setUp(self):
+        cli_bridge.reset_menu_state()
+        self.stream = io.StringIO()
+        self.screen = TerminalScreen(stream=self.stream, color=False, width=100)
+        cli_bridge.set_screen(self.screen)
+        self.bot = cli_bridge.CliBot(1, self.screen)
+        cli_bridge.set_turn_kind("chat")
+
+    def tearDown(self):
+        cli_bridge.set_turn_kind("chat")
+        cli_bridge.set_screen(None)
+        cli_bridge.reset_menu_state()
+
+    def send(self, text, parse_mode=None):
+        self.stream.truncate(0)
+        self.stream.seek(0)
+        run(self.bot.send_message(chat_id=1, text=text, parse_mode=parse_mode))
+        return self.stream.getvalue()
+
+    def test_agent_status_line_is_system_not_a_boxed_reply(self):
+        for text in ("Agent 第 1 轮 · 1 个操作进行中",
+                     "✅ Agent 第 3 轮 · 1 个操作已完成",
+                     "⏹️ Agent 第 2 轮 · 已停止"):
+            with self.subTest(text=text):
+                out = self.send(text)
+                self.assertIn("◇", out)
+                self.assertIn("系统", out)
+                self.assertNotIn("XGent", out)
+                self.assertNotIn("─", out)
+
+    def test_agent_tool_result_is_command_output(self):
+        for text in ("⌨️ <b>Agent Run</b>\n✅ 返回码: <code>0</code>",
+                     "🔎 <b>Agent Grep</b> 命中 3 处",
+                     "🌐 <b>Agent Search</b> 命中 2 条"):
+            with self.subTest(text=text):
+                out = self.send(text, "HTML")
+                self.assertIn("◇", out)
+                self.assertIn("命令", out)
+                self.assertNotIn("XGent", out)
+                self.assertNotIn("─", out)
+
+    def test_the_actual_reply_still_gets_its_block(self):
+        out = self.send("系统与网络环境信息如下：测试正常。", "HTML")
+        self.assertIn("◆", out)
+        self.assertIn("XGent", out)
+        self.assertIn("─", out)
+
+    def test_only_one_kind_of_block_in_a_whole_turn(self):
+        # 走一遍真实对话轮：状态 → 工具输出 → 状态 → 正文 → token。
+        # 整轮下来横线块只该出现一次（那段正文）。
+        turn = [
+            ("Agent 第 1 轮 · 1 个操作进行中", None),
+            ("⌨️ <b>Agent Run</b>\n✅ 返回码: <code>0</code>", "HTML"),
+            ("✅ Agent 第 1 轮 · 1 个操作已完成", None),
+            ("测试正常，随时可以开始。", "HTML"),
+            ("↑ 5459 tokens · ↓ 117 tokens · ⚡ 30 tokens/s", None),
+        ]
+        self.stream.truncate(0)
+        self.stream.seek(0)
+        for text, parse_mode in turn:
+            run(self.bot.send_message(chat_id=1, text=text, parse_mode=parse_mode))
+        output = self.stream.getvalue()
+        self.assertEqual(1, output.count("◆ XGent"),
+                         f"一轮里横线块只该有一个（AI 正文）：\n{output}")
+        # 横线只来自那一个块：上下各一条。
+        rule_lines = [ln for ln in output.split("\n") if ln and set(ln) <= {"─"}]
+        self.assertEqual(1, len(rule_lines), rule_lines)
+
+    def test_every_line_stays_within_the_content_width(self):
+        # 要求 9：满宽横线扛不住 resize，所以一律按 content_width 画。
+        cap = content_width(200)
+        for text, parse_mode in (("Agent 第 1 轮 · 进行中", None),
+                                 ("⌨️ <b>Agent Run</b>", "HTML"),
+                                 ("一段普通的 AI 回复", "HTML")):
+            with self.subTest(text=text):
+                for line in self.send(text, parse_mode).split("\n"):
+                    self.assertLessEqual(display_width(line), cap, repr(line))
 
 
 if __name__ == "__main__":

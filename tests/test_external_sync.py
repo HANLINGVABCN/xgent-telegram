@@ -580,10 +580,10 @@ async def main():
     print(json.dumps({
         "block_has_marker": "❯ User" in block_out,
         "block_has_text": "你好，洛溪" in block_out,
-        "block_is_boxed": "╭" in block_out and "╰" in block_out,
+        "block_is_boxed": ("─" * 8) in block_out,
         "cmd_has_marker": "❯ User" in cmd_out,
         "cmd_has_text": "/start" in cmd_out,
-        "cmd_is_boxed": "╭" in cmd_out and "╰" in cmd_out,
+        "cmd_is_boxed": ("─" * 8) in cmd_out,
     }))
     await xgent_cli._shutdown_runtime()
 
@@ -591,12 +591,12 @@ asyncio.run(main())
 """)
         self.assertTrue(result["block_has_marker"], "对话消息要有 ❯ User 用户块")
         self.assertTrue(result["block_has_text"])
-        self.assertTrue(result["block_is_boxed"], "用户消息要围在框里")
-        # 命令也是"用户敲进去的东西"，同款框——回卷里我说的话长得一致，
+        self.assertTrue(result["block_is_boxed"], "用户消息要有上下双横线围出的块")
+        # 命令也是"用户敲进去的东西"，同款块——回卷里我说的话长得一致，
         # 才看得出"我说了什么、它回了什么"这条交替的线。
         self.assertTrue(result["cmd_has_marker"], "命令回显也走用户块")
         self.assertTrue(result["cmd_has_text"])
-        self.assertTrue(result["cmd_is_boxed"], "命令回显同样要围在框里")
+        self.assertTrue(result["cmd_is_boxed"], "命令回显同样要双横线块")
 
 
 if __name__ == "__main__":

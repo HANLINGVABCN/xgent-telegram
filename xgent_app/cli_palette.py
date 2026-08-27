@@ -56,6 +56,8 @@ from .cli_render import (
     display_width,
     pad_to_width,
     terminal_size,
+    visual_row_of_col,
+    visual_rows,
 )
 
 # 面板最多显示几条。再多屏幕就被候选吃光了，而且超过十来条时用户本来就该
@@ -257,6 +259,17 @@ class SlashPalette:
         # 上次画屏后光标停在输入行的第几个可视行。输入超宽折行后光标不在
         # 首行，重画前必须先上移回来，这是长输入"疯狂复制"bug 的账本。
         self._cursor_row = 0
+        # 上次画屏时的终端宽度。窗口一被拖动，终端会把已经打出去的行按新
+        # 宽度重排，_cursor_row 这本"第几个可视行"的账当场作废——照着它
+        # 上移就会把光标停在块中间，接下来的 [J 清掉的是别人的内容，
+        # 屏幕上留下半截边框。宽度变了就按新宽度重算旧框高度（见 _render）。
+        self._last_width = 0
+        # 上次画屏的实际内容与光标位置：宽度变化时旧框被终端折行重排、
+        # 高度变了，要按新宽度把"框顶到光标"的行数重新算出来才能上移回
+        # 框顶擦干净，否则旧框残骸留在新框上面（见 _render）。
+        self._drawn_lines: List[str] = []
+        self._drawn_row = 0
+        self._drawn_col = 0
         self._history_index: Optional[int] = None
         self._history_stash = ""
         # 占位符 -> 真正的粘贴正文。大段粘贴不进输入行本体（见 _apply_paste）。
@@ -291,17 +304,26 @@ class SlashPalette:
         return first
 
     def _read_byte_polling(self, fd: int) -> bytes:
-        """带取消轮询的读字节。select 不可用（非 POSIX）时退回阻塞读。"""
+        """带取消轮询的读字节。select 不可用（非 POSIX）时退回阻塞读。
+
+        顺带盯着终端宽度：用户拖动窗口时不会按任何键，光靠"下次按键再重画"
+        的话，输入框会一直保持旧宽度挂在那儿——横向拖宽是空一截，拖窄则被
+        终端折行成残缺的两截边框。这里每 0.2 秒瞄一眼宽度，变了就立刻重画，
+        松开鼠标基本就对齐了。用轮询而不是 SIGWINCH：信号处理器会在 raw
+        模式下打断正在进行的 read，还要跨线程转发，得不偿失。
+        """
         if self._pending:
             return self._read_byte(fd)
-        if select is None or self.abort_check is None:
+        if select is None:
             return self._read_byte(fd)
         while True:
             ready, _, _ = select.select([fd], [], [], 0.2)
             if ready:
                 return self._read_byte(fd)
-            if self.abort_check():
+            if self.abort_check is not None and self.abort_check():
                 raise KeyboardInterrupt
+            if self._last_width and terminal_size()[0] != self._last_width:
+                self._render()
 
     def _read_key(self, fd: int) -> str:
         """读一个"键"。多字节 UTF-8 和 ESC 序列都在这里收拢成一个 token。"""
@@ -594,7 +616,23 @@ class SlashPalette:
         lines.extend(candidates)
 
         out: List[str] = []
-        if self._cursor_row:
+        # 终端被拖宽/拖窄之后，上一次画的那块已经被终端按新宽度重排过，
+        # _cursor_row 记的"第几个可视行"不再对应任何东西。终端折行时光标
+        # 锚定在文本位置，所以旧框顶部到光标的行数可以按新宽度重算：光标
+        # 之前每一行折成几行（visual_rows 精确模拟终端折行，宽字符不跨行
+        # ——ceil 除法在这种边界会少算 1 行，上移不到位留下残骸），加上
+        # 光标在自己那行内掉到第几个折行段。上移这个行数就回到旧框顶部，
+        # 清屏后旧框被整块擦掉重画。
+        if (self._last_width and self._last_width != width
+                and self._drawn_lines
+                and self._drawn_row < len(self._drawn_lines)):
+            up = sum(visual_rows(line, width)
+                     for line in self._drawn_lines[:self._drawn_row])
+            up += visual_row_of_col(self._drawn_lines[self._drawn_row],
+                                    width, self._drawn_col)
+            if up:
+                out.append(f"\x1b[{up}A")
+        elif self._cursor_row:
             out.append(f"\x1b[{self._cursor_row}A")
         out.append("\r\x1b[J")
         out.append("\n".join(lines))
@@ -608,6 +646,11 @@ class SlashPalette:
         cursor_col = 2 + prompt_width + cur_col
         out.append(f"\x1b[{min(cursor_col, width - 1) + 1}G")
         self._cursor_row = target_row
+        self._last_width = width
+        # 记下这次画的内容和光标位置，宽度再变时按当时的宽度重算框高。
+        self._drawn_lines = list(lines)
+        self._drawn_row = target_row
+        self._drawn_col = cursor_col
         self.drawn_rows = len(candidates)
         sys.stdout.write("".join(out))
         sys.stdout.flush()
@@ -620,7 +663,19 @@ class SlashPalette:
         当成一条正式消息、连同框一起打进回卷。
         """
         out: List[str] = []
-        if self._cursor_row:
+        # 提交前终端宽度又变了（粘贴那一瞬拖了窗口）：账本失效，按新宽度
+        # 精确重算上移（同 _render），否则擦错行、把旧框残骸留给回卷。
+        width_now = terminal_size()[0]
+        if (self._last_width and self._last_width != width_now
+                and self._drawn_lines
+                and self._drawn_row < len(self._drawn_lines)):
+            up = sum(visual_rows(line, width_now)
+                     for line in self._drawn_lines[:self._drawn_row])
+            up += visual_row_of_col(self._drawn_lines[self._drawn_row],
+                                    width_now, self._drawn_col)
+            if up:
+                out.append(f"\x1b[{up}A")
+        elif self._cursor_row:
             out.append(f"\x1b[{self._cursor_row}A")
         if not self.echo_on_submit:
             out.append("\r\x1b[J")
