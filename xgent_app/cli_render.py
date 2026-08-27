@@ -205,6 +205,86 @@ def pad_to_width(text: str, width: int) -> str:
     return text + " " * gap if gap > 0 else text
 
 
+def chunk_by_width(text: str, width: int) -> List[str]:
+    """按显示宽度硬切成若干段，ANSI 转义不占宽度也不会被从中间切断。
+
+    和 wrap_line 的区别：那个按词折行（适合正文），这个是硬切（适合代码、
+    表格这类不能按空格断的内容，也用来给画框兜底——框里的行一旦超宽，右边
+    框线就会被顶出去，整个框当场散架）。
+    """
+    if width <= 0:
+        return [text]
+    if display_width(text) <= width:
+        return [text]
+    chunks: List[str] = []
+    current = ""
+    used = 0
+    for token, is_ansi in _tokenize_with_ansi(text):
+        if is_ansi:
+            current += token
+            continue
+        for ch in token:
+            ch_width = char_width(ch)
+            if used + ch_width > width:
+                chunks.append(current)
+                current = ""
+                used = 0
+            current += ch
+            used += ch_width
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
+
+# --------------------------------------------------------------------------
+# 画框
+# --------------------------------------------------------------------------
+# 消息之间原来只靠"标题行 + 缩进"分隔。对话一长就糊成一片：AI 的正文、用户
+# 的话、系统提示三种东西挤在同一个左边界上，扫读时找不到一条消息从哪开始、
+# 到哪结束。围一个框，边界就是显式的——这也是 Telegram/Web 端用气泡在做的事，
+# 终端里等价物就是框线。
+BOX_TOP_LEFT, BOX_TOP_RIGHT = "╭", "╮"
+BOX_BOTTOM_LEFT, BOX_BOTTOM_RIGHT = "╰", "╯"
+BOX_H, BOX_V = "─", "│"
+# 框线两侧各吃掉 "│ " 和 " │"。
+BOX_CHROME = 4
+
+
+def box_block(body: Sequence[str], width: int, title: str = "",
+              palette: Optional["Palette"] = None,
+              border_style: str = "") -> List[str]:
+    """把若干行围进一个框，标题嵌在上边框里。
+
+    body 里的行可能带 ANSI，补空格必须按**显示宽度**算（display_width 会跳过
+    转义序列），否则带颜色的行右边框会往右串。超宽的行（<pre> 代码块、表格）
+    在这里硬切开，宁可切也不能让框散架。
+    """
+    pal = palette or Palette(False)
+    width = max(BOX_CHROME + 8, width)
+    inner = width - BOX_CHROME
+
+    def paint(text: str) -> str:
+        return pal.paint(text, border_style) if border_style else text
+
+    head = BOX_TOP_LEFT + BOX_H
+    if title:
+        title_width = display_width(title)
+        fill = max(0, inner - title_width - 1)
+        top = paint(head + " ") + title + paint(" " + BOX_H * fill + BOX_TOP_RIGHT)
+    else:
+        top = paint(head + BOX_H * (inner + 1) + BOX_TOP_RIGHT)
+    bottom = paint(BOX_BOTTOM_LEFT + BOX_H * (width - 2) + BOX_BOTTOM_RIGHT)
+
+    left, right = paint(BOX_V) + " ", " " + paint(BOX_V)
+    lines = [top]
+    for line in body:
+        for piece in chunk_by_width(line, inner):
+            reset = pal.reset if pal.enabled else ""
+            lines.append(left + pad_to_width(piece, inner) + reset + right)
+    lines.append(bottom)
+    return lines
+
+
 # --------------------------------------------------------------------------
 # 调色板
 # --------------------------------------------------------------------------
@@ -486,34 +566,32 @@ class MessageRenderer:
     def render_message(self, text: str, buttons: Sequence[Tuple[str, str]] = (),
                        parse_mode: Any = None, title: str = "XGent",
                        marker: str = "◆", style: str = "ai") -> List[str]:
-        """完整一条消息：标题行 + 正文 + 菜单 + 键位提示。
+        """完整一条消息：一个框，标题嵌在上边框里，正文/菜单/键位提示在框内。
 
-        标题只有一个记号加名字，不拉满屏宽的横线——每条消息都顶一条长横线
-        会把界面变成"横线为主、内容为辅"。正文统一缩进 2 格，靠缩进而不是
-        线条来划分层次，配合消息之间的空行已经足够分清边界。
+        为什么是框而不是"标题行 + 缩进"：终端只有一根从上往下的滚动条，AI 的
+        正文、用户的话、系统提示全挤在同一个左边界上，对话一长就分不清一条
+        消息从哪开始、到哪结束。框线把边界画成显式的——Telegram/Web 端那边
+        是气泡在做这件事。框线用消息自己的颜色，说话的是谁一眼可辨。
+
+        正文按**框内宽度**重新排版（外框吃掉 4 列），否则折行按整屏宽算，
+        右边框会被顶出去。
         """
         pal = self.palette
         color = getattr(pal, style, "")
-        # 标记用消息自己的颜色，标题加粗用前景色，后面跟一小段弱分隔——
-        # 固定 8 格不拉满屏宽（每条消息都顶一条通栏横线会喧宾夺主），
-        # 但足够把"标题行"和下面的正文切开，长对话里更容易扫读。
-        header = (
-            f"{pal.paint(marker, color, pal.bold)} {pal.paint(title, pal.bold)}"
-            f" {pal.paint('╌' * 8, pal.muted)}"
-        )
+        inner = MessageRenderer(pal, max(20, self.width - BOX_CHROME))
 
-        lines = [header]
-        body = self.render_text(text, parse_mode)
-        lines.extend(body)
+        lines = inner.render_text(text, parse_mode, indent="")
         menu_buttons, hints = split_control_buttons(buttons)
-        button_lines = self.render_buttons(menu_buttons)
+        button_lines = inner.render_buttons(menu_buttons, indent="")
         if button_lines:
-            if body:
+            if lines:
                 lines.append("")
             lines.extend(button_lines)
         # 键位提示紧贴正文，不额外空行：它是状态行的附注，隔开反而像另一段。
-        lines.extend(self.render_hints(hints))
-        return lines
+        lines.extend(inner.render_hints(hints, indent=""))
+
+        heading = f"{pal.paint(marker, color, pal.bold)} {pal.paint(title, color, pal.bold)}"
+        return box_block(lines, self.width, heading, pal, color)
 
 
 # --------------------------------------------------------------------------
@@ -654,12 +732,15 @@ def buttons_from_markup(reply_markup: Any) -> List[Tuple[str, str]]:
 
 
 __all__ = [
+    "BOX_CHROME",
     "CONTROL_BUTTON_HINTS",
     "Palette",
     "MessageRenderer",
     "TerminalScreen",
+    "box_block",
     "buttons_from_markup",
     "char_width",
+    "chunk_by_width",
     "display_width",
     "enable_windows_vt",
     "html_to_ansi",

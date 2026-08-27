@@ -339,8 +339,9 @@ class ControlButtonTests(unittest.TestCase):
         self.assertIn("中断回答", body)
         self.assertNotIn("❌", body)
         self.assertNotIn("停止回答", body)
-        # 标题 + 正文 + 键位提示，正好三行：没有多出来的空行 + 编号菜单块。
-        self.assertEqual(3, len(lines), lines)
+        # 上框线 + 正文 + 键位提示 + 下框线，正好四行：没有多出来的空行 +
+        # 编号菜单块。
+        self.assertEqual(4, len(lines), lines)
 
     def test_mixed_buttons_keep_contiguous_numbering(self):
         renderer = MessageRenderer(Palette(False), 80)

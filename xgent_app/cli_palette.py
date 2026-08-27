@@ -11,6 +11,18 @@ readline 能做的只有"按 Tab 把候选**打印**出来"——列表打完就
 历史翻页，外加 `/` 开头时的候选面板。不是要复刻 readline 的全部功能，只要覆盖
 在终端里敲一行命令真正会用到的那些键。
 
+粘贴
+----
+自己接管按键就得自己处理粘贴。终端把粘贴的内容当普通按键流送过来，里面的换行
+和"用户按了回车"在字节上一模一样——不区分的话，粘一段多行日志就等于替用户按了
+几十次回车，一行一条全发给 AI。解法是括号粘贴：进 raw 模式时开 \x1b[?2004h，
+之后粘贴内容会被包在 \x1b[200~ … \x1b[201~ 里整块到达，read_line 把它当一次
+输入收下（见 _apply_paste）。
+
+不是所有终端都认这个开关（老 conhost、部分 SSH 客户端），所以还有第二道：读到
+回车时看看后面是不是还紧跟着字节（_read_burst）。人按回车之后 5ms 内不可能再
+送来一个字节，粘贴则必然还有——时序是这类终端唯一剩下的线索。
+
 降级路径
 --------
 不是 TTY（管道、重定向）、平台没有 termios（Windows）、或者用户设了
@@ -24,6 +36,7 @@ import atexit
 import os
 import re
 import sys
+from collections import OrderedDict
 from typing import Callable, List, Optional, Sequence, Tuple
 
 try:  # Windows 没有这几个模块
@@ -35,7 +48,15 @@ except ImportError:  # pragma: no cover - 平台相关
     tty = None  # type: ignore[assignment]
     select = None  # type: ignore[assignment]
 
-from .cli_render import char_width, display_width, pad_to_width, terminal_size
+from .cli_render import (
+    BOX_CHROME,
+    Palette,
+    box_block,
+    char_width,
+    display_width,
+    pad_to_width,
+    terminal_size,
+)
 
 # 面板最多显示几条。再多屏幕就被候选吃光了，而且超过十来条时用户本来就该
 # 继续打字收窄，而不是用方向键一条条翻。
@@ -45,7 +66,44 @@ _ESC = "\x1b"
 _CTRL_C = "\x03"
 _CTRL_D = "\x04"
 
+# 括号粘贴（bracketed paste）。开启后终端会把粘贴的内容包在 200~/201~ 之间
+# 送过来，我们才分得清"用户按了回车"和"粘贴的文本里有换行"。不开的话，粘贴
+# 一段多行文本 = 每个换行都被当成一次回车提交，用户只是贴了点日志，却眼睁睁
+# 看着几十条消息被逐行发给 AI——这正是这个开关存在的理由。
+_BRACKETED_ON = "\x1b[?2004h"
+_BRACKETED_OFF = "\x1b[?2004l"
+_PASTE_START = "\x1b[200~"
+_PASTE_END = "\x1b[201~"
+# 结束标记迟迟不来（终端只发了开始标记就断了）时，等这么久就认栽收工。
+_PASTE_IDLE_TIMEOUT = 1.0
+# 没有括号粘贴的终端（老 conhost、部分 SSH 客户端）靠"回车后面还紧跟着字节"
+# 来识别粘贴：人按下回车之后不可能在 _BURST_PEEK 之内再送来一个字节（键盘
+# 扫描本身就要十几毫秒），而粘贴是整块灌进 tty 缓冲区的，回车后面必然还有。
+# _BURST_IDLE 是这一整块读到"安静"为止的判据。
+_BURST_PEEK = 0.005
+_BURST_IDLE = 0.05
+# 单行且不超过这个显示宽度的粘贴直接进输入行；再长或者带换行的改用占位符，
+# 见 SlashPalette._apply_paste。
+_PASTE_INLINE_MAX = 200
+
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _normalize_paste(data: bytes) -> str:
+    """把粘贴过来的原始字节整理成可以放进输入行的文本。
+
+    \\r\\n / \\r 统一成 \\n（终端行尾风格不一）；除换行和制表符外的控制字符
+    全部丢掉——那些多半是被一起复制走的 ANSI 残渣，留着只会污染发给 AI 的
+    正文。末尾的换行也去掉：复制整行时通常会带一个，用户并不是想让消息以
+    空行结尾。
+    """
+    text = data.decode("utf-8", "replace")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = "".join(
+        ch for ch in text
+        if ch in ("\n", "\t") or (ch >= " " and ch != "\x7f")
+    )
+    return text.rstrip("\n")
 
 
 def _clip_ansi(text: str, width: int) -> str:
@@ -92,11 +150,16 @@ def interactive_supported() -> bool:
 
 
 class _RawMode:
-    """cbreak + 一个 atexit 兜底。
+    """cbreak + 括号粘贴 + 一个 atexit 兜底。
 
     用 cbreak 而不是 setraw：cbreak 保留 ISIG，Ctrl+C 仍然走进程的 SIGINT
     处理器，xgent_cli 那套"回答中断 / 空闲退出"的语义不用改。代价是这里读不到
     \\x03，所以中断完全交给信号处理器。
+
+    进出的同时开关括号粘贴（_BRACKETED_ON/OFF）：开着的时候粘贴内容会被终端
+    包在 \\x1b[200~ … \\x1b[201~ 里整块送来，读取循环才能把它当"一次粘贴"而
+    不是"一串回车"。离开时必须关掉，否则用户回到 shell 后粘贴会看见裸的
+    200~/201~ 标记。
 
     atexit 兜底是给"主线程收到 KeyboardInterrupt 退出、而读取线程还阻塞在
     read() 上"这种情况用的——那时 finally 不一定跑得到，终端会留在无回显
@@ -113,9 +176,11 @@ class _RawMode:
         self.saved = termios.tcgetattr(self.fd)
         _RawMode._restore = (self.fd, self.saved)
         tty.setcbreak(self.fd)
+        _write_raw(_BRACKETED_ON)
         return self
 
     def __exit__(self, *_exc) -> None:
+        _write_raw(_BRACKETED_OFF)
         if self.saved is not None:
             try:
                 termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
@@ -124,12 +189,21 @@ class _RawMode:
         _RawMode._restore = None
 
 
+def _write_raw(text: str) -> None:
+    try:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
 @atexit.register
 def _restore_terminal_on_exit() -> None:  # pragma: no cover - 退出路径
     pending = _RawMode._restore
     if not pending:
         return
     fd, saved = pending
+    _write_raw(_BRACKETED_OFF)
     try:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
     except Exception:
@@ -152,6 +226,7 @@ class SlashPalette:
         abort_check: Optional[Callable[[], bool]] = None,
         echo_ansi: str = "",
         echo_on_submit: bool = True,
+        box_ansi: str = "",
     ) -> None:
         self.prompt = prompt
         self.list_commands = list_commands
@@ -168,6 +243,11 @@ class SlashPalette:
         # （对话给完整用户块、命令给单行）——避免"打完的字在 AI 回复刷屏后
         # 找不到"，也避免同一条消息显示两遍。
         self.echo_on_submit = echo_on_submit
+        # box_ansi：输入框框线的颜色。用的是提示符那一档的颜色（红=状态输入中、
+        # 黄=菜单导航中、绿=空闲），框线跟着提示符一起变，"这行字会去哪"这个
+        # 信号就从一个字符扩大成整个框。
+        self.box_ansi = box_ansi
+        self._box_palette = Palette(bool(box_ansi))
 
         self.buffer = ""
         self.cursor = 0
@@ -179,10 +259,32 @@ class SlashPalette:
         self._cursor_row = 0
         self._history_index: Optional[int] = None
         self._history_stash = ""
+        # 占位符 -> 真正的粘贴正文。大段粘贴不进输入行本体（见 _apply_paste）。
+        self._pastes: "OrderedDict[str, str]" = OrderedDict()
+        self._paste_seq = 0
+        # 已经从 fd 读出来、但还没当成按键消化掉的字节。粘贴是整块读的
+        # （os.read 一次拿一大片），结束标记后面可能还粘着用户随后敲的键；
+        # 丢掉它们等于吞掉用户的按键，所以退回这里，下一次读键先吃它。
+        self._pending = bytearray()
 
     # ---------------- 输入 ----------------
 
+    def _ready(self, fd: int, timeout: float) -> bool:
+        """timeout 秒内有没有字节可读。退回的字节算"立刻可读"。"""
+        if self._pending:
+            return True
+        return self._fd_ready(fd, timeout)
+
+    def _fd_ready(self, fd: int, timeout: float) -> bool:
+        """只问 fd，不看退回缓冲。要真去 os.read 之前用这个，免得空读阻塞。"""
+        if select is None:
+            return True  # 没有 select 只能盲读（会阻塞），交给调用方
+        ready, _, _ = select.select([fd], [], [], timeout)
+        return bool(ready)
+
     def _read_byte(self, fd: int) -> bytes:
+        if self._pending:
+            return bytes([self._pending.pop(0)])
         first = os.read(fd, 1)
         if not first:
             raise EOFError
@@ -190,6 +292,8 @@ class SlashPalette:
 
     def _read_byte_polling(self, fd: int) -> bytes:
         """带取消轮询的读字节。select 不可用（非 POSIX）时退回阻塞读。"""
+        if self._pending:
+            return self._read_byte(fd)
         if select is None or self.abort_check is None:
             return self._read_byte(fd)
         while True:
@@ -215,7 +319,7 @@ class SlashPalette:
             extra = 3
         data = first
         for _ in range(extra):
-            data += os.read(fd, 1)
+            data += self._read_byte(fd)
         return data.decode("utf-8", "replace")
 
     def _read_escape(self, fd: int) -> str:
@@ -224,22 +328,127 @@ class SlashPalette:
         裸 Esc 后面不会紧跟别的字节，所以用一个极短的 select 超时来判断：
         20ms 内没有后续字节就是用户真的按了 Esc。
         """
-        ready, _, _ = select.select([fd], [], [], 0.02)
+        ready = self._ready(fd, 0.02)
         if not ready:
             return _ESC
-        second = os.read(fd, 1).decode("latin-1")
+        second = self._read_byte(fd).decode("latin-1")
         if second not in ("[", "O"):
             return _ESC + second
         seq = _ESC + second
         while True:
-            ready, _, _ = select.select([fd], [], [], 0.02)
-            if not ready:
+            # 粘贴开始标记只要拼到一半就必须等下去：网络终端可能把
+            # \x1b[200~ 拆成两个包，20ms 等不到后半截就会把这次粘贴当成
+            # 一串普通按键读，换行又变回"回车提交"。
+            timeout = 0.2 if _PASTE_START.startswith(seq) else 0.02
+            if not self._ready(fd, timeout):
                 break
-            ch = os.read(fd, 1).decode("latin-1")
+            ch = self._read_byte(fd).decode("latin-1")
             seq += ch
             if ch.isalpha() or ch == "~":
                 break
         return seq
+
+    # ---------------- 粘贴 ----------------
+
+    def _read_paste(self, fd: int) -> str:
+        """读完 \\x1b[200~ 之后、\\x1b[201~ 之前的整块内容。
+
+        一次粘贴通常分好几次 read 才收完（终端和 pty 都有缓冲区上限），所以
+        边读边在**累积的字节**里找结束标记——标记本身也可能被切成两半落在
+        两次 read 里，只查最后一块会漏。
+
+        结束标记之后如果还粘着字节（用户紧接着敲的键），退回 _pending 让
+        下一次读键去消化，不能连同粘贴一起丢掉。
+        """
+        end = _PASTE_END.encode()
+        data = bytearray(self._pending)
+        self._pending = bytearray()
+        while True:
+            index = data.find(end)
+            if index >= 0:
+                self._pending = bytearray(data[index + len(end):])
+                return _normalize_paste(bytes(data[:index]))
+            if not self._ready(fd, _PASTE_IDLE_TIMEOUT):
+                # 结束标记没来（粘贴被打断、终端行为异常）：手里这些
+                # 就当作全部内容，总好过把后面的按键当粘贴一直吞。
+                return _normalize_paste(bytes(data))
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                return _normalize_paste(bytes(data))
+            data += chunk
+
+    def _read_burst(self, fd: int) -> Optional[str]:
+        """回车后面是不是还紧跟着一整块字节？是就整块读回来，否则 None。
+
+        这是给**不支持括号粘贴**的终端兜底的。那种终端把粘贴当普通按键流发，
+        里面的换行和真回车在字节上没有区别，唯一还留下的线索就是时序：粘贴
+        是一整块灌进 tty 缓冲区的，第一个换行后面必然立刻还有字节；人手按
+        回车之后 5ms 内不可能再送来一个字节。
+
+        顺带治了另一个毛病：老实现一次只读一个字节，CLI 一边发消息一边没人
+        排空 tty，4096 字节的缓冲区一满就丢字节，粘贴的汉字被从中间截断成
+        乱码（用户看到的"�见。"）。这里一次 64KB 整块吞下，来不及溢出。
+        """
+        if select is None:
+            return None  # 没有 select 就没法看时序，只能相信这是真回车
+        if not self._ready(fd, _BURST_PEEK):
+            return None
+        data = bytearray(self._pending)
+        self._pending = bytearray()
+        while self._fd_ready(fd, _BURST_IDLE if data else 0.0):
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            data += chunk
+        return _normalize_paste(bytes(data))
+
+    def _paste_placeholder(self, text: str) -> str:
+        """给一段粘贴生成占位符。带序号是为了两次粘贴同样内容也能各自还原。"""
+        self._paste_seq += 1
+        lines = text.count("\n") + 1
+        size = f"{lines} 行 · {len(text)} 字" if lines > 1 else f"{len(text)} 字"
+        return f"[粘贴 {size} #{self._paste_seq}]"
+
+    def _apply_paste(self, text: str) -> None:
+        """把粘贴内容放进输入行。
+
+        短的单行粘贴（贴个路径、token、URL）直接插进去，手感和打字一样。
+        带换行、带制表符或者很长的，插的是占位符、正文另存——理由有两条：
+          1. 输入行的光标记账（_render 的 _cursor_row）建立在"内容不超过
+             一屏"上，把几十行日志摊进输入行会当场画崩；
+          2. 用户贴一大段日志是想让它当**一条**消息的正文，不是想在终端里
+             逐行审阅它。
+        提交时 _expand_pastes 再把正文原样还回去。
+        """
+        if not text:
+            return
+        simple = "\n" not in text and "\t" not in text
+        if simple and display_width(text) <= _PASTE_INLINE_MAX:
+            self._insert(text)
+            return
+        marker = self._paste_placeholder(text)
+        self._pastes[marker] = text
+        self._insert(marker)
+
+    def _expand_pastes(self, line: str) -> str:
+        """把占位符换回粘贴正文。没粘贴过就是原样返回。"""
+        for marker, text in self._pastes.items():
+            if marker in line:
+                line = line.replace(marker, text)
+        return line
+
+    def _take_paste_before_cursor(self) -> Optional[str]:
+        """光标左边紧挨着的那个占位符（没有就返回 None）。
+
+        占位符是一个整体，退格该把它整块删掉：让用户一格一格啃掉
+        "[粘贴 118 行 · 4821 字 #1]" 这二十来个字符毫无意义，中途还会把它
+        啃成一段还不回原文的死文本。
+        """
+        head = self.buffer[:self.cursor]
+        for marker in reversed(list(self._pastes)):
+            if head.endswith(marker):
+                return marker
+        return None
 
     # ---------------- 候选 ----------------
 
@@ -309,67 +518,112 @@ class SlashPalette:
         rows.append(f"  … 还有 {hidden} 条 · ↑↓ 选择 · 继续输入可收窄")
         return rows
 
-    def _render(self) -> None:
-        """整块重画。所有位置都按**可视行**算，而不是按字符串行数算。
+    def _layout(self, avail: int) -> Tuple[List[str], int, int]:
+        """把输入内容切成框内每行放得下的若干段，并算出光标落在哪一段第几列。
 
-        prompt + buffer 超过终端宽度时会被终端自动折成多个可视行，光标
-        停在哪一行哪一列必须显式记账（_cursor_row）：
-          - 重画前先上移到输入行的**第一个**可视行再 \r\x1b[J 清屏——
-            老实现假设输入行只占一行，折行后 \r 回到的只是折行中段，
-            清不干净旧内容，每敲一个键就在下面多叠一份，正是
-            "长输入疯狂复制好几行"那个 bug；
-          - 画完候选后用 CSI A + CSI G 把光标精确放回逻辑位置，列号
-            按 CJK 双宽折算，还要吃掉 xterm 的延迟换行边界（写到整行
-            末尾时光标仍停在上一行行尾，不会提前跳到下一行行首）。
+        不能交给终端自动折行：框内每一行左右都要补上框线，必须自己知道断点
+        在哪。断点按**显示宽度**算，CJK 占两列——按字符数算的话一行中文会
+        把右框线顶出去半个屏幕。
         """
-        width = max(20, terminal_size()[0])
+        rows: List[str] = [""]
+        col = 0
+        cur_row, cur_col = 0, 0
+        for index, ch in enumerate(self.buffer):
+            ch_width = char_width(ch)
+            if col + ch_width > avail:
+                rows.append("")
+                col = 0
+            if index == self.cursor:
+                cur_row, cur_col = len(rows) - 1, col
+            rows[-1] += ch
+            col += ch_width
+        if self.cursor >= len(self.buffer):
+            if col >= avail:
+                # 最后一行正好填满：光标要落到下一行行首，否则它会压在
+                # 右框线上（也会被下一次画屏算错行数）。
+                rows.append("")
+                col = 0
+            cur_row, cur_col = len(rows) - 1, col
+        return rows, cur_row, cur_col
+
+    def _fit_rows(self, rows: List[str], cur_row: int, budget: int) -> Tuple[List[str], int]:
+        """输入行比预算还多时，开一个跟着光标走的窗口。
+
+        终端只有那么高。画出去的行数一旦超过屏幕，终端会滚动，而重画靠的是
+        "上移 N 行"——滚过之后这个 N 就对不上了，每敲一个键就在下面多叠一份
+        （历史上"长输入疯狂复制"那个 bug）。宁可少显示几行也不能让记账失真。
+        """
+        if len(rows) <= budget:
+            return rows, cur_row
+        start = min(max(0, cur_row - budget + 1), len(rows) - budget)
+        return rows[start:start + budget], cur_row - start
+
+    def _render(self) -> None:
+        """整块重画：输入框 + 候选面板，然后把光标放回框内。
+
+        位置全部按**可视行**记账（_cursor_row = 光标在整块里的第几行）：
+          - 重画前先上移回整块的第一行再 \r\x1b[J 清屏，否则清不干净，
+            每敲一个键就在下面多叠一份；
+          - 画完之后用 CSI A + CSI G 把光标精确放回框内的逻辑位置，列号
+            要加上左框线占的两列（"│ "），并按 CJK 双宽折算。
+        """
+        width, height = terminal_size()
+        width = max(20, width)
+        inner = width - BOX_CHROME
         prompt_width = display_width(self.prompt)
-        end_col = prompt_width + display_width(self.buffer)
-        # 输入行（prompt+buffer）占几个可视行；ceil 除法。
-        input_rows = max(1, -(-end_col // width))
-        cursor_col = prompt_width + display_width(self.buffer[:self.cursor])
-        cur_row, cur_col = divmod(cursor_col, width)
-        if cur_col == 0 and cursor_col > 0 and cursor_col == end_col:
-            cur_row -= 1
-            cur_col = width  # 延迟换行：物理光标还在上一行行尾
+        avail = max(4, inner - prompt_width)
+
+        rows, cur_row, cur_col = self._layout(avail)
+        # 候选面板挂在框下面，缩进 2 格对齐框内文字——不缩进的话它贴着屏幕
+        # 左边，和框里的输入错开一格，看起来像两个不相干的东西。
+        candidates = [" " * 2 + row for row in self._candidate_rows(width - 2)]
+        # 高度预算：整块（上下框线 + 输入行 + 候选）不能顶满屏幕。先砍候选，
+        # 再对输入行开窗口——候选是辅助信息，正在编辑的那一行不能不见。
+        budget = max(3, height - 1)
+        room = budget - 2 - len(candidates)
+        if room < 1:
+            candidates = []
+            room = budget - 2
+        rows, cur_row = self._fit_rows(rows, cur_row, max(1, room))
+
+        body = [
+            (self.prompt if index == 0 else " " * prompt_width) + row
+            for index, row in enumerate(rows)
+        ]
+        lines = box_block(body, width, "", self._box_palette, self.box_ansi)
+        lines.extend(candidates)
 
         out: List[str] = []
         if self._cursor_row:
             out.append(f"\x1b[{self._cursor_row}A")
         out.append("\r\x1b[J")
-        out.append(self.prompt)
-        out.append(self.buffer)
+        out.append("\n".join(lines))
 
-        rows = self._candidate_rows(width)
-        if rows:
-            out.append("\n" + "\n".join(rows))
-            # 此刻光标在最后一条候选的行尾，位于输入首行下方
-            # input_rows-1+len(rows) 行；要回到逻辑光标行 cur_row。
-            up = len(rows) + (input_rows - 1) - cur_row
-        else:
-            up = (input_rows - 1) - cur_row
+        target_row = 1 + cur_row  # 1 = 上边框
+        up = (len(lines) - 1) - target_row
         if up > 0:
             out.append(f"\x1b[{up}A")
         out.append("\r")
-        if cur_col:
-            out.append(f"\x1b[{min(cur_col, width - 1) + 1}G")
-        self._cursor_row = cur_row
-        self.drawn_rows = len(rows)
+        # 左框线 "│ " 占两列，行首还有提示符（续行是等宽空格）。
+        cursor_col = 2 + prompt_width + cur_col
+        out.append(f"\x1b[{min(cursor_col, width - 1) + 1}G")
+        self._cursor_row = target_row
+        self.drawn_rows = len(candidates)
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 
     def _finish(self) -> None:
-        """收尾：抹掉面板，把光标留在输入行的下一行。
+        """收尾：抹掉输入框和候选面板，把光标留在下一行。
 
         echo_on_submit=True（默认）时把提交的那一行按 echo_ansi 着色回显；
-        False 时只清面板不回显——调用方（xgent_cli 主循环）会按消息类型
-        自己打印：对话给完整用户块，命令/编号给单行。
+        False 时只清面板不回显——调用方（xgent_cli 主循环）会把用户这句话
+        当成一条正式消息、连同框一起打进回卷。
         """
         out: List[str] = []
         if self._cursor_row:
             out.append(f"\x1b[{self._cursor_row}A")
         if not self.echo_on_submit:
-            out.append("\r\x1b[J\n")
+            out.append("\r\x1b[J")
             sys.stdout.write("".join(out))
             sys.stdout.flush()
             self.drawn_rows = 0
@@ -393,6 +647,14 @@ class SlashPalette:
 
     def _backspace(self) -> None:
         if self.cursor:
+            marker = self._take_paste_before_cursor()
+            if marker is not None:
+                cut = self.cursor - len(marker)
+                self.buffer = self.buffer[:cut] + self.buffer[self.cursor:]
+                self.cursor = cut
+                self._pastes.pop(marker, None)
+                self._history_index = None
+                return
             self.buffer = self.buffer[:self.cursor - 1] + self.buffer[self.cursor:]
             self.cursor -= 1
             self._history_index = None
@@ -454,13 +716,22 @@ class SlashPalette:
             # 正常提交同样要收尾：擦掉输入行/候选面板。漏了这步的话输入行
             # 留在屏上，主循环再打印用户块，同一条消息就显示两遍。
             self._finish()
-            return result
+            return self._expand_pastes(result)
 
     def _event_loop(self, fd: int) -> str:
         while True:
             key = self._read_key(fd)
 
             if key in ("\r", "\n"):
+                # 终端不支持括号粘贴时，粘贴里的换行和真回车字节上一模一样，
+                # 只能靠"后面还紧跟着东西"来分辨。是粘贴就把整块收下当正文，
+                # 绝不能替用户提交——那就是"贴一段日志，被逐行发给 AI"。
+                burst = self._read_burst(fd)
+                if burst:
+                    self._apply_paste("\n" + burst)
+                    self._refresh_matches()
+                    self._render()
+                    continue
                 # 面板开着且用户没打全 -> 回车 = 选中这条并直接执行，
                 # 这是"数字/方向键选菜单"在命令面板上的等价物。
                 if self.matches and self.buffer[1:] != self.matches[self.selected]:
@@ -472,6 +743,9 @@ class SlashPalette:
                 if self.matches:
                     self._accept_selection()
                     self._refresh_matches()
+            elif key == _PASTE_START:
+                # 粘贴：整块收进来当一次输入，里面的换行是**正文**，不是回车。
+                self._apply_paste(self._read_paste(fd))
             elif key == _CTRL_D:
                 if not self.buffer:
                     raise EOFError
@@ -519,6 +793,14 @@ class SlashPalette:
                 pass  # 不认识的转义序列，忽略掉别插进输入
             elif key.isprintable():
                 self._insert(key)
+                # 这个字符后面还紧跟着一整块？那它是粘贴的第一个字，不是打字。
+                # 只在回车上做时序判断是不够的：粘一行末尾带换行的文本
+                # （"hello\n"），第一个换行前面没有别的换行，回车那一刻缓冲区
+                # 已经空了，于是"粘完自动发出去"。从第一个字符就开始认粘贴，
+                # 才能把那个尾随换行连同正文一起收走。
+                burst = self._read_burst(fd)
+                if burst:
+                    self._apply_paste(burst)
 
             self._refresh_matches()
             self._render()

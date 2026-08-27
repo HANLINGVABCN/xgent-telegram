@@ -558,9 +558,9 @@ asyncio.run(main())
 
 
 class CliUserEchoTests(ProbeMixin, unittest.TestCase):
-    """CLI 用户消息成块回显（user 样式）。TG 镜像见 ServerSideCliMirrorTests。"""
+    """CLI 用户消息成块回显（user 样式的框）。TG 镜像见 ServerSideCliMirrorTests。"""
 
-    def test_user_block_and_line_echo(self):
+    def test_everything_the_user_types_gets_the_same_box(self):
         result = self.run_probe("""
 import asyncio, io
 import xgent_cli
@@ -576,11 +576,14 @@ async def main():
     xgent_cli._echo_submitted("你好，洛溪", conversation=True)
     block_out = stream.getvalue()
     xgent_cli._echo_submitted("/start", conversation=False)
-    line_out = stream.getvalue()[len(block_out):]
+    cmd_out = stream.getvalue()[len(block_out):]
     print(json.dumps({
         "block_has_marker": "❯ User" in block_out,
         "block_has_text": "你好，洛溪" in block_out,
-        "line_single": "/start" in line_out and "❯ User" not in line_out,
+        "block_is_boxed": "╭" in block_out and "╰" in block_out,
+        "cmd_has_marker": "❯ User" in cmd_out,
+        "cmd_has_text": "/start" in cmd_out,
+        "cmd_is_boxed": "╭" in cmd_out and "╰" in cmd_out,
     }))
     await xgent_cli._shutdown_runtime()
 
@@ -588,7 +591,12 @@ asyncio.run(main())
 """)
         self.assertTrue(result["block_has_marker"], "对话消息要有 ❯ User 用户块")
         self.assertTrue(result["block_has_text"])
-        self.assertTrue(result["line_single"], "命令只回显单行，不带用户块")
+        self.assertTrue(result["block_is_boxed"], "用户消息要围在框里")
+        # 命令也是"用户敲进去的东西"，同款框——回卷里我说的话长得一致，
+        # 才看得出"我说了什么、它回了什么"这条交替的线。
+        self.assertTrue(result["cmd_has_marker"], "命令回显也走用户块")
+        self.assertTrue(result["cmd_has_text"])
+        self.assertTrue(result["cmd_is_boxed"], "命令回显同样要围在框里")
 
 
 if __name__ == "__main__":

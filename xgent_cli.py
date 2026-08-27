@@ -63,7 +63,7 @@ from xgent_app.cli_bridge import (
     menu_is_top,
     relay_user_message,
 )
-from xgent_app.cli_render import display_width
+from xgent_app.cli_render import box_block, display_width
 from xgent_app.cli_palette import (
     SlashPalette,
     interactive_supported as palette_supported,
@@ -292,24 +292,11 @@ def _code_version() -> str:
 def _banner() -> None:
     pal = PALETTE
     width = min(SCREEN.width, 72)
-    title = "XGent CLI"
-
-    def _box_row(content: str = "") -> str:
-        """一行框：│ 内容（按显示宽度补齐，中文按 2 列算）│。"""
-        filler = max(1, width - 2 - 1 - display_width(content) - 1)
-        return (
-            f"{pal.paint('│', pal.muted)} {content}"
-            f"{' ' * filler}{pal.paint('│', pal.muted)}"
-        )
-
-    SCREEN.print_plain("")
-    SCREEN.print_plain(pal.paint("╭" + "─" * (width - 2) + "╮", pal.muted))
-    SCREEN.print_plain(_box_row(
-        f"{pal.paint('◆', pal.ai, pal.bold)} {pal.paint(title, pal.bold)}"
+    title = (
+        f"{pal.paint('◆', pal.ai, pal.bold)} {pal.paint('XGent CLI', pal.bold)}"
         f"  {pal.paint('本地终端客户端', pal.muted)}"
         f"  {pal.paint(f'v{_code_version()}', pal.muted)}"
-    ))
-    SCREEN.print_plain(_box_row())
+    )
     hints = [
         ("直接输入文字", "与 AI 对话（自动镜像到 Telegram）"),
         ("/", "列出全部命令，Tab 继续补全"),
@@ -318,12 +305,16 @@ def _banner() -> None:
         ("Ctrl+C", "红❯取消输入 / 黄❯关闭菜单 / 绿❯退出"),
     ]
     label_width = max(display_width(label) for label, _ in hints)
-    for label, desc in hints:
-        pad = " " * (label_width - display_width(label))
-        SCREEN.print_plain(_box_row(
-            f"{pal.paint(label, pal.accent)}{pad}  {pal.paint(desc, pal.muted)}"
-        ))
-    SCREEN.print_plain(pal.paint("╰" + "─" * (width - 2) + "╯", pal.muted))
+    body = [
+        f"{pal.paint(label, pal.accent)}{' ' * (label_width - display_width(label))}"
+        f"  {pal.paint(desc, pal.muted)}"
+        for label, desc in hints
+    ]
+    # 和消息框、输入框共用同一个画框函数：三种框宽度算法一致，边界才对得齐。
+    # （手写那版把补齐算少了一列，上边框一直比内容行长一格。）
+    SCREEN.print_plain("")
+    for line in box_block(body, width, title, pal, pal.muted):
+        SCREEN.print_plain(line)
     SCREEN.print_plain("")
 
 
@@ -429,8 +420,13 @@ def _history_entries() -> List[str]:
 
 
 def _remember_history(line: str) -> None:
-    """面板不走 readline，得手动把行喂回去，退出时才存得进历史文件。"""
-    if not line.strip() or _readline is None:
+    """面板不走 readline，得手动把行喂回去，退出时才存得进历史文件。
+
+    多行内容（粘贴进来的日志之类）不进历史：历史文件一行一条，存进去下次
+    读回来会碎成几十条假记录，↑ 翻历史时还会把带换行的串塞进输入行——面板
+    的光标记账假设输入行没有换行，塞进去当场画歪。
+    """
+    if not line.strip() or "\n" in line or _readline is None:
         return
     try:
         length = _readline.get_current_history_length()
@@ -450,6 +446,7 @@ def _print_help() -> None:
     SCREEN.print_plain("")
     SCREEN.print_plain(pal.paint("  /黑名单 是 /blacklist 的中文别名（与 Telegram 端一致）", pal.muted))
     SCREEN.print_plain(pal.paint("  /getchat [N] 可指定拉取条数（默认 50，上限 500）", pal.muted))
+    SCREEN.print_plain(pal.paint("  粘贴多行文本会收成一个 [粘贴 …] 占位块，回车才发出；退格可整块删掉", pal.muted))
     SCREEN.print_plain(pal.paint("  exit / quit 退出", pal.muted))
     SCREEN.print_plain("")
 
@@ -565,6 +562,10 @@ def _setup_completion(readline_module: Any) -> None:
         "set completion-query-items 500",
         # 补全无候选时不要响铃：句子中间打 `/` 是正常输入，不该被"嘟"一声。
         "set bell-style none",
+        # 粘贴按整块处理，别把内容里的换行当成回车逐行提交。readline 8.1 起
+        # 默认就是 on，这里显式写一遍是给老版本兜底——命令面板那条路自己
+        # 开括号粘贴（cli_palette._RawMode），这条是 input() 回退路径的等价物。
+        "set enable-bracketed-paste on",
     )
 
     if os.environ.get("XGENT_CLI_NO_SLASH_HINT"):
@@ -726,14 +727,8 @@ async def _pull_cross_client_history(limit: int) -> None:
     SCREEN.print_plain("")
 
 
-def _echo_user_line(text: str) -> None:
-    """命令/编号这类输入的回显：单行、user 色。"""
-    pal = PALETTE
-    SCREEN.print_plain(f"{pal.paint('❯', pal.user, pal.bold)} {pal.paint(text, pal.user)}")
-
-
 def _print_user_block(text: str) -> None:
-    """对话消息的用户块：和 AI 块同款排版（❯ User + 正文，user 色）。
+    """用户这句话的消息块：和 AI 块同款的框（❯ User + 正文，user 色）。
 
     面板提交后不再自带回显，这里把用户的话作为正式消息块打进回卷——
     AI 回复再怎么原地重绘刷屏，用户消息都在上面留着，和 Web/Telegram
@@ -746,16 +741,17 @@ def _print_user_block(text: str) -> None:
 
 
 def _echo_submitted(text: str, *, conversation: bool) -> None:
-    """按消息类型补回显（面板路径提交时不自带回显）。
+    """补回显：面板路径提交时不自带回显，这里补一个用户块。
+
+    对话、命令、编号一律同款框——用户敲进去的每一样东西在回卷里长得一样，
+    才看得出"我说了什么、它回了什么"这条交替的线。conversation 这个参数
+    留着是给调用方表达语义用的，排版上不再分叉。
 
     input() 回退路径系统已回显（last_read_native_echo），不重复打印。
     """
     if getattr(_READER, "last_read_native_echo", False):
         return
-    if conversation and not _input_state_active():
-        _print_user_block(text)
-    else:
-        _echo_user_line(text)
+    _print_user_block(text)
 
 
 # --------------------------------------------------------------------------
@@ -924,6 +920,7 @@ class _StdinReader:
                 abort_check=_cancel_event.is_set,
                 echo_ansi=pal.user if pal.enabled else "",
                 echo_on_submit=False,
+                box_ansi=getattr(pal, _prompt_color_name()) if pal.enabled else "",
             ).read_line()
         except (EOFError, KeyboardInterrupt):
             raise
@@ -1156,6 +1153,13 @@ async def _main_loop() -> None:
             continue
         text = str(line).strip()
         if not text:
+            continue
+        if "\n" in text:
+            # 多行只可能来自粘贴。命令、编号、exit 都是单行的东西，多行内容
+            # 一律当正文——否则贴一段以 "/" 或数字开头的日志会被解析成命令或
+            # 菜单选择，把用户想问的那段话吃掉。
+            _echo_submitted(text, conversation=True)
+            await _run_turn(_run_conversation(text))
             continue
         low = text.lower()
         if low in ("exit", "quit"):
