@@ -15,8 +15,8 @@
   <img alt="Self-hosted" src="https://img.shields.io/badge/Self--hosted-private-24A1DE?logo=telegram&logoColor=white">
 </p>
 
-> [!IMPORTANT]
-> 本项目面向**单用户私有部署**。Agent 模式能够在服务器上执行真实命令，不是完整沙箱；请先阅读[安全说明](#安全说明)，并使用独立的低权限账号运行。
+> [!CAUTION]
+> **本项目不提供任何沙箱、容器或强制安全隔离。** 除命令黑名单外，Agent 模式的执行行为没有任何拦截机制：模型生成的命令将以运行账号的完整权限直接作用于服务器，可访问的文件、可执行的操作均由该账号的权限边界决定。命令黑名单仅为字符串匹配，可被规避，不应视为安全边界。部署前请务必阅读[安全说明](#安全说明)，并使用独立的低权限账号运行。
 
 > [!NOTE]
 > **本仓库（`xgent-telegram-test`）是发布仓库 `xgent-telegram` 的测试副本。**
@@ -31,6 +31,7 @@
 | 服务器排障 | “检查磁盘为什么快满了，找出最大的文件并给我一份报告。” |
 | 文件处理 | “找到今天生成的备份，压缩后直接发给我。” |
 | 长驻任务 | “启动这个服务，持续观察日志，遇到异常时告诉我。” |
+| 定时与延迟任务 | “半小时后检查一次备份结果” / “每天凌晨 3 点跑这个脚本，失败了叫我。” |
 | 私人助理 | “结合之前的对话和这份文件，整理一份执行清单。” |
 | 媒体生成 | “用默认媒体模型生成一张封面图并发给我。” |
 | 自定义能力 | 通过 `skill-public/` 增加工作流；私有 skill 放 `skill-private/`，每个可单独启用/禁用。 |
@@ -47,6 +48,11 @@ AI：我会先采集系统状态，然后分析异常项。
     ✓ 已将 report.md 发送到 Telegram
 
 AI：当前主要问题是 /var/log 占用增长过快……
+
+你：那每天凌晨 3 点清理一次旧日志，空间低于 10% 就直接告诉我。
+
+AI：已创建 trigger-x 后台任务：cron 每天 03:00 清理 /var/log 下 7 天前的
+    日志；同时部署条件监控，剩余空间 < 10% 时立即通知你。
 ```
 
 这不是一个公开群聊机器人，也不只是把模型 API 接到 Telegram。它更适合把 Telegram 变成你的**私人 AI 控制台**。
@@ -54,9 +60,12 @@ AI：当前主要问题是 /var/log 占用增长过快……
 ## 核心能力
 
 - **真实 Agent 执行**：运行一次性命令，管理交互式或持续输出的 Shell 会话。
+- **后台任务调度**：`trigger-x` 协议支持延迟执行、定时任务（cron）、条件触发和持续监控，到点自动执行并把结果推回对话。
+- **用量统计**：`/stats` 导出交互式 token 用量报表，按时间维度查看消耗趋势。
 - **服务器文件操作**：读取、创建、覆盖和发送服务器文件，命令完整输出自动归档。
 - **多模型提供商**：支持 OpenAI、OpenAI 兼容接口、Gemini、Vertex 和 Claude。
 - **思考深度控制**：8 档全局思考深度，按提供商自动翻译成 `thinking.budget_tokens`、`thinkingConfig.thinkingBudget`、`reasoning_effort` 或 `reasoning.effort`。
+- **本地终端客户端**：可选的 `xgent` 终端界面，与 Telegram / Web 共用同一套对话核心、记忆与 Agent 能力。
 - **网页版聊天**：可选的本地 Web 界面，与 Telegram 共享同一套对话核心、记忆与 Agent 能力，可作为 Telegram Web App 内嵌打开。
 - **对话与媒体模型分离**：可分别设置默认聊天模型和默认媒体模型。
 - **全局记忆**：使用 SQLite 保存对话、系统操作、按钮操作和 Agent 结果。
@@ -108,24 +117,29 @@ XGent 由三个可以自由组合的组件构成，`install.sh` 装完环境后�
 - **web**：浏览器网页访问，需要设访问密码和端口（详见下方[纯 Web 模式](#纯-web-模式)）。
 - **bot**：Telegram Bot，需要 Bot Token 和你的 Telegram 用户 ID。
 
-三者共用同一份数据库与模型配置，装哪几个都行：只装 `bot` 就是"仅 Telegram"，只装 `web` 就是"仅 Web"，
-`web` + `bot` 则两端共享记忆并可互相镜像消息。
+三种模式彼此独立，每个都能单独成立，也可以任意组合：
+
+- **仅 CLI**：只装 `cli`。终端里敲 `xgent` 就能用，不需要 Telegram，也不需要 Web 密码；
+- **仅 Telegram**：只装 `bot`；
+- **仅 Web**：只装 `web`；
+- **组合**：装哪几个都行，同装时共用同一份数据库与模型配置——`web` + `bot` 两端共享记忆并可互相镜像消息；`cli` 和哪端装在一起，里面的操作就原样同步到哪端（可通过 `XGENT_CLI_NO_TG_MIRROR=1` 关闭同步）。
 
 ### 准备
 
-**Telegram + Web 模式：**
+所有模式共同的要求：
 
 - Linux 服务器与可用的 Python 3.10+
   （install.sh 的自动补依赖只支持 Debian/Ubuntu；其它发行版需先手动装好 Python 3.10+、pip、git、curl）
-- 从 [BotFather](https://t.me/BotFather) 获取的 Telegram Bot Token
-- 你的 Telegram 用户 ID
 - 至少一个可用的模型 API Key
 
-**仅 Web 模式：**
+再按你要用的模式补齐：
 
-- 同上的 Linux 服务器 + Python 3.10+ + 模型 API Key
-- 不需要 Telegram Bot Token
-- 一个任意数字作为 `AUTHORIZED_USER_ID`（纯粹用作单用户身份标识，不必是真实 Telegram ID）
+| 模式 | 额外需要 |
+| --- | --- |
+| 仅 CLI | 无。提供商和模型直接在 `xgent` 里用 `/providers`、`/config` 配置 |
+| 仅 Web | 一个 Web 访问密码（端口默认 8790）；`AUTHORIZED_USER_ID` 填任意数字（仅作单用户身份标识） |
+| 仅 Telegram | 从 [BotFather](https://t.me/BotFather) 获取的 Bot Token + 你的 Telegram 用户 ID |
+| 组合 | 把用到的每个模式的要求加起来即可 |
 
 ### 一键命令
 
@@ -165,7 +179,7 @@ chmod +x install.sh
 ./install.sh
 ```
 
-首次安装时，脚本会提示填写：
+首次安装时勾选了 `bot` 组件的话，脚本会提示填写：
 
 ```env
 BOT_TOKEN=你的 Telegram Bot Token
@@ -184,11 +198,15 @@ UPDATE_ZIP_URL=https://api.github.com/repos/HANLINGVABCN/xgent-telegram/zipball/
 
 ## 第一次使用
 
-1. 在 Telegram 中向机器人发送 `/start`。
+Telegram / Web 端：
+
+1. 在 Telegram 中向机器人发送 `/start`（或浏览器打开 Web 地址）。
 2. 打开「提供商」，添加 API URL、API Key 和模型列表。
 3. 打开「默认模型」，选择默认对话模型。
 4. 如需媒体生成，再选择默认媒体模型。
 5. 确认安全边界后，根据需要开启 Agent 模式。
+
+CLI 端流程完全一样：敲 `xgent` 进入终端界面后，`/start` 打开主菜单，`/providers` 配置提供商，`/models` 选默认模型——和 Telegram 里的操作一一对应。
 
 配置完成后，可以直接发送普通消息、图片或文件，无需使用专门的聊天命令。
 
@@ -206,12 +224,14 @@ UPDATE_ZIP_URL=https://api.github.com/repos/HANLINGVABCN/xgent-telegram/zipball/
 | `/prompts` | 管理提示词 |
 | `/clear_memory` | 清空上下文 |
 | `/depth` | 设置记忆深度 |
-| `/timeout` | 设置请求超时 |
+| `/params` | 设置请求超时等参数 |
 | `/thinking` | 设置思考深度 |
 | `/web` | 配置网页版聊天 |
 | `/agent` | 开关 Agent 模式 |
 | `/blacklist` | 管理 Agent 命令黑名单 |
 | `/stream` | 开关流式输出 |
+| `/skills` | 管理公有/私有 Skill 的启用与禁用 |
+| `/stats` | 导出 token 用量统计报表（交互式网页，可选天数或日期区间） |
 | `/status` | 查看状态 |
 | `/show_chat_info` | 查看状态与记忆统计，等同 `/status` |
 | `/export` | 导出全部记忆 |
@@ -261,6 +281,19 @@ UPDATE_ZIP_URL=https://api.github.com/repos/HANLINGVABCN/xgent-telegram/zipball/
 - 公有 skill 放 `skill-public/`；仅本部署实例使用的私有 skill 放 `skill-private/`（被 git 忽略，更新不覆盖）。
 - 每个 skill 默认启用。不需要的可在 TG 的 `/skills` 菜单或 web 设置面板「Skill 管理」中关闭，关掉的不进 Prompt。
 
+仓库自带的公有 skill：
+
+| Skill | 用途 |
+| --- | --- |
+| `bot-system` | Bot 自身的系统信息与运行状态查询 |
+| `memory` | 记忆库结构与查询方式说明 |
+| `notes` | 服务器上的笔记管理（含配套 web 服务） |
+| `proxy-setup` | 一键配置服务器代理 |
+| `skill-creator` | 引导模型按规范创建新 skill |
+| `stdin-syntax` | `stdin-x` 协议的详细用法 |
+| `trigger-x-protocol` | `trigger-x` 后台任务调度协议完整文档 |
+| `webdav-filemanager` | WebDAV 文件管理器（含配套 web 服务） |
+
 执行 `/update` 时，可选择保留或覆盖 `prompts/` 提示词。skill 文件随仓库更新，`skill-private/` 私有 skill 永不被覆盖。覆盖前，当前内容会备份到：
 
 ```text
@@ -271,16 +304,17 @@ xgent_storage/update_backups/custom_时间戳/
 
 Agent 模式开启后，模型可通过内部协议调用真实工具能力：
 
-- `run`：执行一次性命令并保存完整结果；
-- `shell`：管理长驻、持续输出和交互式命令；
-- `read`：读取服务器文件；
-- `edit`：按精确匹配替换文件中的片段；
-- `grep`：在文件或目录中检索内容；
-- `file`：创建或覆盖服务器文件；
-- `sendfile`：将服务器文件发送到 Telegram；
-- `search`：联网检索（需配置 Tavily API Key）；
-- `fetch`：抓取指定网页内容；
-- 媒体协议：调用默认媒体模型生成内容。
+- `run-x`：执行一次性命令并保存完整结果；
+- `shell-x`：创建长驻、持续输出和交互式命令的会话；配套 `stdin-x`（写入输入）、`shellread-x`（读取输出）、`shellkill-x`（结束会话）；
+- `trigger-x`：后台任务调度——延迟执行（`after: 30s`）、定时任务（`at: 2024-12-31 23:59`）、周期任务（`cron: 0 * * * *`）、条件触发（`when: READY`）和持续监控，YAML 格式，单次命令 1 小时硬性超时；
+- `read-x`：读取服务器文件；
+- `edit-x`：按精确匹配替换文件中的片段；
+- `grep-x`：在文件或目录中检索内容；
+- `file-x`：创建或覆盖服务器文件；
+- `sendfile-x`：将服务器文件发送到 Telegram；
+- `search-x`：联网检索（需配置 Tavily API Key）；
+- `fetch-x`：抓取指定网页内容；
+- `media-x`：调用默认媒体模型生成内容。
 
 Agent 协议的围栏行只写标签，成对标记 `<<BEGIN_<nonce>` / `<<END_<nonce>` 各自顶格独占正文的首尾一行。nonce 每块唯一。提示词要求模型使用 10～32 位，解析器接受 6～32 位——中间 4 位是有意留的容错冗余，模型少给几位时协议块仍能正常执行，不要为了"一致"把解析器收紧到 10；协议正文按不透明文本处理，内部 Markdown 或协议示例不会被二次解析。
 
@@ -340,6 +374,10 @@ Telegram 的内嵌网页按钮只接受 HTTPS 地址，因此：
 
 在 Telegram 内打开时会通过 `initData` 签名自动登录，无需输入密码；用浏览器直接访问则需要密码。
 
+### 浏览器终端
+
+网页版还内置一个真终端（xterm.js + 服务器侧 pty）：在网页里点开终端就能得到一个跑在服务器上的完整 shell，和聊天界面共用同一套登录。适合偶尔需要手动敲命令、又懒得开 SSH 的场景。会话数上限 3 个、空闲 30 分钟自动回收；仅在 Linux/macOS 等 posix 平台可用，Windows 服务端不提供。
+
 ### 纯 Web 模式
 
 `.env` 不填 `BOT_TOKEN` 时，XGent 以纯 Web 模式运行：不连接 Telegram（不建 `Application`、不跑 `run_polling`），只启动 Web 服务，监听 `127.0.0.1:<端口>`（默认 `8790`），供你在本机或通过自建反向代理访问，不强制绑定域名。
@@ -352,6 +390,31 @@ Telegram 的内嵌网页按钮只接受 HTTPS 地址，因此：
 ## 本地终端客户端（xgent）
 
 装好 `cli` 组件后，在任意目录敲 `xgent` 就能打开终端界面，和 Telegram / Web 共用同一套对话核心与数据库。
+
+### 界面样式
+
+消息用上下双横线夹住正文，抬头嵌在上横线里；命令返回是一整块灰底，一眼圈出"这是命令的输出"；系统提示用独立抬头、白字无底色（灰底、配色以实际终端为准）：
+
+```text
+── ❯ User ───────────────────────────────────────────────────────────────────
+  检查磁盘为什么快满了，找出最大的文件并给我一份报告。
+──────────────────────────────────────────────────────────────────────────────
+── ◆ XGent ───────────────────────────────────────────────────────────────────
+  我先看一下磁盘占用。
+──────────────────────────────────────────────────────────────────────────────
+◇ 命令
+  ⌨ Agent Run
+  ✅ 返回码: 0
+  完整输出: xgent_storage/command_outputs/2026-08-28/035725_3eb48a16.txt
+  │ Filesystem  Size Used Avail Use% Mounted on
+  │ /dev/sda1    40G   31G  7G   82% /
+◇ 系统
+  已将报告发送到 Telegram。
+```
+
+每条回复末尾有一行小字的 token 用量统计。窗口随便拖：输入框会在 0.2 秒内按新宽度重新对齐，流式回复中途拖动也不会错位。
+
+### 输入操作
 
 | 输入 | 含义 |
 | --- | --- |
@@ -367,9 +430,16 @@ Telegram 的内嵌网页按钮只接受 HTTPS 地址，因此：
 根本没有 readline（Windows）时，自动弹出会静默降级，`/` 回车打面板这条路依然可用；
 不想要自动弹出可以设 `XGENT_CLI_NO_SLASH_HINT=1`。
 
+横线和灰底默认铺满终端宽度。想固定一个排版宽度（比如截图、录屏时），
+设 `XGENT_CLI_WIDTH=80` 即可，不用再拖窗口。
+
 ## 安全说明
 
-Agent 模式拥有真实服务器权限。建议至少执行以下措施：
+**在部署之前必须明确：除命令黑名单外，本项目不存在任何其他安全机制。** 具体而言，本项目不提供命令审计、路径白名单、资源配额、网络隔离，也没有沙箱或容器隔离。Agent 模式下，模型生成的每一条命令都以运行账号的身份直接在服务器上执行，其能力上限完全等同于该账号的权限——运行账号可读的文件即可读，可删的数据即可删。
+
+命令黑名单基于字符串匹配实现，仅能拦截字面命中的已知危险片段，通过改写命令、拼接变量或调用其他工具即可绕过。它的定位是降低模型误操作的风险，**不构成任何意义上的安全边界**。
+
+基于以上事实，建议至少执行以下措施：
 
 1. **使用独立低权限 Linux 用户运行 Bot**，不要直接使用 `root`。
 2. **默认关闭 Agent**，确认模型、Prompt 和权限配置后再开启。
@@ -411,14 +481,19 @@ systemd 的 unit 写在 `/etc/systemd/system/xgent.service`，`ExecStart` 只是
 
 ```text
 xgent-telegram/
-├─ xgent_server.py              # 可执行入口
+├─ xgent_server.py              # Bot / Web 可执行入口
+├─ xgent_cli.py               # 终端客户端入口（安装 cli 组件后注册为 xgent 命令）
 ├─ install.sh                 # 安装、启动、更新与维护脚本
 ├─ requirements.txt
 ├─ xgent_app/
 │  ├─ bootstrap.py            # 模块加载与完整性检查
+│  ├─ cli_bridge.py           # 终端客户端与对话核心之间的垫片
+│  ├─ cli_palette.py          # 终端输入框、命令面板与按键处理
+│  ├─ cli_render.py           # 终端消息块渲染、配色与原地重绘
 │  ├─ web_auth.py             # 网页版认证：密码哈希、会话签名、登录限速
 │  ├─ web_bridge.py           # 网页版与对话核心之间的垫片
 │  ├─ web_server.py           # 网页版 HTTP / SSE 服务
+│  ├─ web_terminal.py         # 网页版 xterm.js 终端服务
 │  ├─ webui/                  # 网页版前端（单文件，无构建步骤）
 │  └─ sections/               # Bot 功能模块
 ├─ prompts/                   # 系统与 Agent 提示词
