@@ -1,5 +1,5 @@
 ```!
-trigger-x 后台任务调度协议完整文档。支持延迟执行（after: 30s）、定时任务（at: 2024-12-31 23:59）、周期任务（cron: 0 * * * *）、条件触发（when: READY）和持续监控。使用 YAML 格式，1 小时硬性超时。路径: skill/trigger-x-protocol.md
+trigger-x 后台任务调度协议完整文档。支持延迟执行（after: 30s）、定时任务（at: 2024-12-31 23:59）、周期任务（cron: 0 * * * *）、条件触发（when: READY）和持续监控。使用 YAML 格式，1 小时硬性超时。如有详细需求，请 read 本文件。
 ```
 
 # trigger-x 后台任务调度协议
@@ -16,7 +16,8 @@ trigger-x 是后台任务调度协议，支持延迟执行、定时任务、条�
 ## YAML 格式速查
 
 ```yaml
-trigger-x <<AGENT_BEGIN_随机10-32字符
+trigger-x
+<<BEGIN_场景词_随机尾
 task: 一句话任务概述（必填，≤600字符）
 schedule:              # 可选，默认立即执行
   after: 30s           # 或 at: 2024-12-31 23:59 / cron: 0 * * * *
@@ -26,7 +27,7 @@ condition:             # 可选
   repeat: true         # 条件满足后自动重启（需配合 when）
 command: |             # 必填
   实际命令
-AGENT_END_随机字符
+<<END_task_ae05
 ```
 
 ### 字段规则
@@ -121,16 +122,19 @@ command: |
 
 ```yaml
 # 查看所有任务
-trigger-x:show <<AGENT_BEGIN_xxx
-AGENT_END_xxx
+trigger-x:show
+<<BEGIN_show_tasks_1a7f
+<<END_show_tasks_b60d
 
 # 取消指定任务
-trigger-x:kill:trg_abc123 <<AGENT_BEGIN_yyy
-AGENT_END_yyy
+trigger-x:kill:trg_abc123
+<<BEGIN_kill_task_4d90
+<<END_kill_task_1861
 
 # 取消所有任务
-trigger-x:kill:all <<AGENT_BEGIN_zzz
-AGENT_END_zzz
+trigger-x:kill:all
+<<BEGIN_kill_all_b3c6
+<<END_kill_all_40fa
 ```
 
 ## 1小时超时详解

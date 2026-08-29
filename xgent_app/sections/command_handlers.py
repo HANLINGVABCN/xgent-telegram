@@ -148,17 +148,35 @@ async def cmd_export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         zf.writestr("陌生人拦截记录.txt", unauthorized_content)
     
     zip_buffer.seek(0)
+    # 先落盘再发送：发的必须是打开的文件对象而不是 BytesIO——
+    #   Web/CLI 端靠 _local_path_from_send_arg 从文件对象挖出磁盘路径，
+    #   挖到路径 Web 才有下载入口（BytesIO 挖不到，网页只显示一行文字）；
+    #   CLI 才能把服务器路径显示在 📎 卡片上；
+    #   进程重启后路径仍在磁盘上，用户和 AI 都还能回取。
+    export_info = ArtifactManager.save_export("系统记忆.zip", zip_buffer.getvalue())
     await GlobalRecorder.record_system_op("导出全部数据")
-    await context.bot.send_document(
-        chat_id=update.effective_chat.id,
-        document=InputFile(zip_buffer, "系统记忆.zip"),
-        caption="导出完成。"
-    )
+    try:
+        with open(export_info['abs_path'], 'rb') as export_file:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=export_file,
+                filename="系统记忆.zip",
+                caption="导出完成。"
+            )
+    except Exception as e:
+        logger.error(f"发送导出文件失败: {e}")
+        await message.reply_text(
+            f"⚠️ 导出文件已生成，但发送失败：{str(e)[:120]}\n"
+            f"服务器文件路径：{export_info['abs_path']}"
+        )
     await status_msg.delete()
 
-    # 记录导出成功到上下文
+    # 记录导出成功到上下文。路径必须写进去：这条以 system 角色进 AI 上下文，
+    # 让 AI 知道"文件已导出并发送、服务器目录在哪"，后续对话里用户问
+    # "刚才导出的文件在哪"时能直接答出来，而不是只看到一句"导出成功"。
     await GlobalRecorder.record_system_message(
-        "✅ 已成功导出全部数据（包括提示词、全局记忆、陌生人拦截记录）到压缩文件。",
+        f"✅ 已成功导出全部数据（包括提示词、全局记忆、陌生人拦截记录）到压缩文件并发送给用户，"
+        f"服务器文件路径：{export_info['abs_path']}（{export_info['size']} bytes）",
         update.effective_chat.id
     )
 

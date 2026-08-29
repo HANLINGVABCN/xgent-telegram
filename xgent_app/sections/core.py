@@ -26,6 +26,7 @@ import math
 import base64
 import mimetypes
 import asyncio
+import signal
 import traceback
 import random
 import uuid
@@ -48,7 +49,7 @@ import hashlib
 import codecs
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from typing import Optional, Tuple, List, Dict, Any, Deque, cast
+from typing import Optional, Tuple, List, Dict, Any, Deque, cast, Callable, Awaitable
 from collections import OrderedDict, deque
 
 from apscheduler.triggers.cron import CronTrigger
@@ -97,6 +98,10 @@ def build_stop_keyboard() -> InlineKeyboardMarkup:
 # --- ☆ 访问配置 ☆ ---
 class BotConfig:
     TOKEN = os.getenv("BOT_TOKEN", "")
+    # 纯 Web 模式：未配置 BOT_TOKEN，没有 Telegram 可用。此时 Web 服务是唯一
+    # 入口，"关闭 Web"/"清除密码"这类会真的停掉监听 socket 的操作必须被拦截
+    # ——否则用户会把自己锁在外面，只能物理重启进程才能恢复访问。
+    WEB_ONLY = not TOKEN
     try:
         AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
     except ValueError:
@@ -120,6 +125,39 @@ class BotConfig:
 
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def log_runtime_code_version() -> None:
+    """启动时把当前代码版本打进日志。
+
+    "功能没生效"类问题里最常见的根因是 git pull 了但没重启（或反过来），
+    进程里跑的还是旧代码。有这行日志，`pm2 logs` 一眼就能对出进程
+    加载的到底是哪个提交，不用猜。CLI banner 的版本号同源同逻辑。
+    """
+    version = "dev"
+    try:
+        import subprocess as _sp
+
+        result = _sp.run(
+            ["git", "-C", PROJECT_ROOT, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            version = result.stdout.strip()[:10]
+        else:
+            raise RuntimeError("git 不可用")
+    except Exception:
+        try:
+            stamped_path = os.path.join(PROJECT_ROOT, ".xgent-version")
+            if os.path.isfile(stamped_path):
+                with open(stamped_path, encoding="utf-8") as handle:
+                    stamped = handle.read().strip()
+                if stamped:
+                    version = stamped[:10]
+        except Exception:
+            pass
+    logger.info(f"代码版本: v{version}")
+
 
 # 本地 Bot API server 容器内的数据根路径（卷映射的另一端）
 _LOCAL_API_CONTAINER_DATA_DIR = "/var/lib/telegram-bot-api"
@@ -766,9 +804,15 @@ def setup_logging():
 
 logger = setup_logging()
 
-if not BotConfig.TOKEN or BotConfig.AUTHORIZED_USER_ID == 0:
-    logger.critical("❌ 配置错误！请检查 .env 文件里的 BOT_TOKEN 和 AUTHORIZED_USER_ID！")
+# AUTHORIZED_USER_ID 在任何模式下都是唯一用户的身份锚点（数据库记录、单用户
+# 校验），必须存在，否则致命退出。
+# BOT_TOKEN 允许为空：留空即代表“纯 Web 模式”——不起 PTB Application / 不跑
+# run_polling，只起 WebChatServer（main.py 据此分叉，见 sections/main.py）。
+if BotConfig.AUTHORIZED_USER_ID == 0:
+    logger.critical("❌ 配置错误！请检查 .env 文件里的 AUTHORIZED_USER_ID！")
     sys.exit(1)
+if not BotConfig.TOKEN:
+    logger.info("ℹ️ 未配置 BOT_TOKEN，将以纯 Web 模式运行（不连接 Telegram）。")
 
 write_model_trace("bot_process_start", {
     "pid": os.getpid(),
@@ -831,6 +875,7 @@ class MessageType:
     AGENT_CMD = 'agent_cmd'           # Agent 请求的工具动作
     AGENT_RESULT = 'agent_result'     # Agent 工具结果
     TOKEN_USAGE = 'token_usage'       # 每轮回复末尾的 token 用量提示（独立消息，常驻历史）
+    AGENT_STATUS = 'agent_status'     # Agent 轮次状态行（✅ Agent 第 N 轮…，仅显示，不进 AI 上下文）
 
 def _read_int_env(name: str, default: int, minimum: int = 1) -> int:
     try:

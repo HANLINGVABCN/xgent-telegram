@@ -111,6 +111,32 @@ class BotMemoryDB:
             )
         ''')
         
+        # CLI 跨进程中继表：CLI 进程里对话核心对 bot 的每一次调用
+        # （send_message / edit_message_text / delete_message ...）按顺序落一行，
+        # 服务端观察者读出后原样回放到 MirrorBot 上，从而在 Telegram/网页得到
+        # 与原生会话**逐条一致**的呈现。
+        #
+        # 为什么不用 global_messages：那张表是"对话真相"，喂模型、拉历史都读它；
+        # 这里是**界面操作流**（同一条消息流式编辑几十次、占位消息发完又删掉），
+        # 混进去会污染上下文。也不能像以前那样在服务端按 global_messages 的行
+        # 重新编文本——那必须按类型白名单过滤，中间轮次、命令返回、Agent 状态行、
+        # 带停止按钮的占位消息全都会丢，正是本表要解决的问题。
+        #
+        # 为什么不走 HTTP：跨端观察者刻意挂在 bot 生命周期而非 Web 服务生命周期
+        # （见 idle.start_external_sync_watcher），Web 关掉时 CLI→Telegram 仍要工作；
+        # 走 Web 服务会让关掉 Web 的用户直接失去同步，且 CLI 没有登录凭证。
+        # 消费后即删，这张表稳态下几乎是空的。
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS cli_relay_ops (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                op TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+        ''')
+
         # 内部兼容索引表（当前单一全局记忆模式下仅保留一条固定记录）
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS chat_sessions (
@@ -327,6 +353,9 @@ class BotMemoryDB:
             # 文本会混进上下文污染对话。
             if msg_type == MessageType.TOKEN_USAGE:
                 continue
+            # 轮次状态行（✅ Agent 第 N 轮…）同理：纯 UI，不进上下文。
+            if msg_type == MessageType.AGENT_STATUS:
+                continue
             
             # 系统操作以 system 角色注入（OpenAI 格式原样支持；Gemini/Claude 在各自构建器里降级为 user），
             # 避免系统旁白伪装成用户消息、破坏对话轮换结构
@@ -339,6 +368,14 @@ class BotMemoryDB:
                 result.append({
                     'role': 'user', 
                     'content': f"[操作] {msg['content']}"
+                })
+            elif msg_type == MessageType.COMMAND:
+                # 命令是系统执行的，不是用户打在聊天框里的话。不加标记时，
+                # 它和紧随其后的普通消息在上下文里看起来像被拼在一起，
+                # 模型会误读成"用户把命令和闲话黏成一条发出"。
+                result.append({
+                    'role': 'user',
+                    'content': f"[命令] {msg['content']}"
                 })
             elif msg_type == MessageType.AGENT_CMD:
                 result.append({
@@ -367,8 +404,10 @@ class BotMemoryDB:
         """供 web 前端显示用的历史。与 get_conversation_messages（给模型上下文）解耦：
 
         模型上下文里执行结果要当 user 喂给 AI；但前端显示时这些是「AI/系统侧产出的结果」，
-        应显示在 AI 一侧。这里把 AGENT_RESULT/AGENT_CMD/MEDIA_REPLY 映射成 assistant，
-        其余按真实 role。冗余记录过滤与 get_conversation_messages 保持一致。
+        应显示在 AI 一侧。这里把 AGENT_RESULT/MEDIA_REPLY 映射成 assistant，其余按真实
+        role。冗余记录过滤与 get_conversation_messages 保持一致。
+        AGENT_CMD 不显示原文（协议块/媒体提示词），连续的合并成一条与实时流
+        同款的状态行"✅ Agent · N 个操作已完成"，刷新前后观感一致。
         """
         conn = await self._get_conn()
         cursor = await conn.execute('''
@@ -383,18 +422,136 @@ class BotMemoryDB:
             msg_type = msg.get('msg_type')
             if is_redundant_agent_command_record(msg_type, msg.get('content')):
                 continue
+            if msg_type == MessageType.AGENT_CMD:
+                # 协议块原文/[Agent媒体生成]提示词：bot 界面从不把它们当独立
+                # 消息显示（用户看到的是 AI 正文 + 每轮的 AGENT_STATUS 状态行），
+                # 刷新后的历史同样不显示。
+                continue
             # 执行结果 / 媒体回复：AI 侧产出 → 显示到对面（assistant）。
-            # 去掉模型上下文里加的 [系统结果]/[Agent执行] 前缀，前端直接看原文。
             # msg_type 一并返回，供 _web_read_history 决定哪些消息需 Markdown→HTML 转换
             # （AI_REPLY 存的是 Markdown 原文，TOKEN_USAGE/AGENT_RESULT 已是 HTML）。
             display_role = 'assistant' if msg_type in (
-                MessageType.AGENT_RESULT, MessageType.AGENT_CMD, MessageType.MEDIA_REPLY,
+                MessageType.AGENT_RESULT, MessageType.MEDIA_REPLY, MessageType.AGENT_STATUS,
             ) else msg['role']
             result.append({
                 'role': display_role,
                 'content': msg['content'],
                 'msg_type': msg_type,
             })
+        return result
+
+    async def get_max_relay_op_id(self) -> int:
+        """cli_relay_ops 的最大 id。"""
+        conn = await self._get_conn()
+        cursor = await conn.execute('SELECT MAX(id) AS max_id FROM cli_relay_ops')
+        row = await cursor.fetchone()
+        return int(row['max_id'] or 0) if row else 0
+
+    async def seed_relay_cursor(self, fresh_window_seconds: float = 15.0) -> int:
+        """回放游标的起点：**按时间**而不是按位置划界。
+
+        直觉做法是拿当前最大 id 当起点（"从现在开始，不重播历史"），但那会
+        丢消息：CLI 是独立进程，它完全可能在服务端回放器起来之前就已经写入了
+        本轮对话的头几个操作（服务端刚重启、bot 重连、或者用户就是先开的 CLI）。
+        按位置划界会把这些直接跳过——用户看到的是"这轮对话在 Telegram 那边
+        缺了开头"。
+
+        按时间划界则两头都对：还很新的操作说明有个活着的 CLI 会话正在说话，
+        照常回放；足够旧的操作是死会话留下的垃圾（进程被 kill、服务端停了很久），
+        回放它们只会把一堆过期的占位消息糊到 Telegram 上，跳过。
+        """
+        conn = await self._get_conn()
+        cutoff = time.time() - max(0.0, float(fresh_window_seconds))
+        cursor = await conn.execute(
+            'SELECT MAX(id) AS max_id FROM cli_relay_ops WHERE created_at < ?',
+            (cutoff,),
+        )
+        row = await cursor.fetchone()
+        return int(row['max_id'] or 0) if row else 0
+
+    async def fetch_relay_ops(self, after_id: int, limit: int = 500) -> List[Dict]:
+        """按 id 增量取 CLI 中继操作，payload 已解析成 dict。
+
+        **必须按 id 升序**：这是一串有序的界面操作（先 send_message 拿到
+        message_id，后续 edit/delete 都指向它），乱序回放会让编辑落到不存在的
+        消息上。CLI 侧也是单线程顺序写入，两端一起保证顺序。
+        """
+        conn = await self._get_conn()
+        cursor = await conn.execute('''
+            SELECT id, session_id, chat_id, op, payload, created_at
+            FROM cli_relay_ops
+            WHERE id > ?
+            ORDER BY id ASC LIMIT ?
+        ''', (int(after_id), int(limit)))
+        rows = await cursor.fetchall()
+
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item['payload'] = json.loads(item.get('payload') or '{}')
+            except (json.JSONDecodeError, TypeError):
+                # 单行坏掉不能卡住整条流：给个空 payload 让回放侧自己跳过。
+                item['payload'] = {}
+            result.append(item)
+        return result
+
+    async def purge_relay_ops(self, upto_id: int) -> None:
+        """删掉已回放的中继操作。界面操作流是一次性的，回放完就没有价值了。"""
+        if upto_id <= 0:
+            return
+        async with self._write() as conn:
+            await conn.execute('DELETE FROM cli_relay_ops WHERE id <= ?', (int(upto_id),))
+
+    async def get_max_global_rowid(self) -> int:
+        """global_messages 的最大 rowid，作为增量游标的起点。"""
+        conn = await self._get_conn()
+        cursor = await conn.execute('SELECT MAX(rowid) AS max_id FROM global_messages')
+        row = await cursor.fetchone()
+        return int(row['max_id'] or 0) if row else 0
+
+    async def get_records_since_rowid(self, after_rowid: int, limit: int = 200) -> List[Dict]:
+        """按 rowid 增量取全局记录（含 metadata 解析出的 src/origin）。
+
+        跨端同步的通用增量读取。CLI 的界面同步**不**走这里——那条路读的是
+        cli_relay_ops 里的 bot 操作流（见 fetch_relay_ops），因为按消息记录
+        重编文本必然丢掉占位消息、流式编辑、消息删除这类非"一条文本"的东西。
+        本方法保留给需要按对话记录增量拉取的场景（如 TG/Web → CLI 的反向
+        历史同步）。origin=cli-chat 标记"这是 CLI 的对话文本"（区别于状态机
+        输入）。冗余记录过滤与 get_conversation_messages 一致。
+        """
+        conn = await self._get_conn()
+        # rowid AS rowid 的别名**不可省**：global_messages 的 id 是 INTEGER
+        # PRIMARY KEY，rowid 是它的别名——SQLite 对「SELECT rowid」返回的
+        # 结果列名用的是真实列名 id，不是 rowid。调用方（跨端观察者）按
+        # row.get('rowid') 取游标，取不到就永远是 None→0，游标永远不前进，
+        # 每个轮询周期把全部记录重读重发一遍——"CLI 一条消息在 Telegram
+        # 出现 12 遍"的生产事故就是这个。显式 AS 强制结果列名为 rowid。
+        cursor = await conn.execute('''
+            SELECT rowid AS rowid, msg_type, role, content, timestamp, metadata
+            FROM global_messages
+            WHERE rowid > ?
+            ORDER BY rowid ASC LIMIT ?
+        ''', (int(after_rowid), int(limit)))
+        rows = await cursor.fetchall()
+
+        result = []
+        for row in rows:
+            msg = dict(row)
+            if is_redundant_agent_command_record(msg.get('msg_type'), msg.get('content')):
+                continue
+            src = None
+            origin = None
+            try:
+                meta = json.loads(msg.get('metadata') or '{}')
+                if isinstance(meta, dict):
+                    src = meta.get('src')
+                    origin = meta.get('origin')
+            except (json.JSONDecodeError, TypeError):
+                src = None
+            msg['src'] = src
+            msg['origin'] = origin
+            result.append(msg)
         return result
 
     async def get_last_user_message_time(self) -> Optional[float]:

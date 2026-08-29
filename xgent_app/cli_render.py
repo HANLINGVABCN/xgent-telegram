@@ -1,0 +1,1018 @@
+"""终端渲染层：把对话核心发来的 Telegram 风味 HTML 渲染成像样的终端界面。
+
+为什么需要单独一层
+------------------
+对话核心跨客户端边界传过来的从来不是"中立文本"，而是 Telegram 风味的
+HTML + 一个 parse_mode 标记（finalize_text_response 对所有客户端都做
+markdown_to_telegram_html）。Web 端把还原这件事记在前端 JS（index.html 的
+renderText）；CLI 没有前端层，这个模块就是 CLI 的"前端"。
+
+它做四件 Web 前端在做、而终端必须自己做的事：
+  1. 把 <b>/<i>/<code>/<pre>/<a> 还原成 ANSI 样式，而不是简单剥成纯文本
+     ——剥成纯文本会把"哪里是标题、哪里是代码"这些信息全部丢掉。
+  2. 按终端实际宽度换行，并且按**显示宽度**算（中日韩字符占 2 列）。
+     用 len() 算宽度会让中文界面的框线全部错位。
+  3. 用 ANSI 光标控制做真正的"原地编辑"。这是 CLI 能不能用的关键：流式
+     回复每 0.35 秒就把**累计全文**重发一次（rendering.py 的
+     _flush_pending），没有原地编辑的话，一条 2000 字的回复会把整个终端
+     刷屏上百次。
+  4. 把 inline keyboard 渲染成可扫读的编号菜单。
+
+本模块不 import telegram，也不依赖 sections 共享命名空间，可以直接单测。
+"""
+
+from __future__ import annotations
+
+import html as _html
+import os
+import re
+import shutil
+import sys
+import unicodedata
+from typing import Any, List, Optional, Sequence, Tuple
+
+# --------------------------------------------------------------------------
+# 终端能力探测
+# --------------------------------------------------------------------------
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def enable_windows_vt() -> bool:
+    """在 Windows 控制台上打开 VT 转义序列支持。
+
+    Windows 10 起的 conhost 默认不解释 ANSI 转义序列，需要显式设置
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING(0x4)，否则我们输出的颜色和光标控制
+    会原样打印成乱码。失败就当作不支持颜色，由 supports_color 兜底。
+    """
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        for handle_id in (-11, -12):  # STDOUT, STDERR
+            handle = kernel32.GetStdHandle(handle_id)
+            mode = ctypes.c_uint32()
+            if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                continue
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+        return True
+    except Exception:
+        return False
+
+
+def supports_color(stream: Any = None) -> bool:
+    """是否应该输出颜色。
+
+    尊重社区约定的 NO_COLOR / FORCE_COLOR，其余按"是不是真终端"判断——
+    输出被重定向到文件或管道时（比如用户 `xgent > log.txt`）不该塞进转义
+    序列，那会让日志变成乱码。
+    """
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    stream = stream or sys.stdout
+    if not hasattr(stream, "isatty") or not stream.isatty():
+        return False
+    if os.name == "nt":
+        return enable_windows_vt()
+    return os.environ.get("TERM", "") != "dumb"
+
+
+def terminal_size(default_width: int = 80, default_height: int = 24) -> Tuple[int, int]:
+    try:
+        size = shutil.get_terminal_size((default_width, default_height))
+        # 宽度过窄时排版没有意义，给一个能放下框线的下限。
+        return max(40, size.columns), max(10, size.lines)
+    except Exception:
+        return default_width, default_height
+
+
+# 消息块的横线、灰底按**终端满宽**画（可被 XGENT_CLI_WIDTH 覆盖）。
+#
+# 满宽覆盖是用户的明确要求：灰底和横线要盖住整行，不能只长到文字部分
+# 就停——半截灰底看起来像渲染烂尾。代价是回卷里的满宽行在窗口拖窄时
+# 会被终端折行，但那是回卷的物理特性（纯文本无法重排），灰底折行后
+# 底色仍然连续，视觉可接受。
+def content_width(width: Optional[int] = None) -> int:
+    """渲染宽度：XGENT_CLI_WIDTH 优先，否则终端宽。满宽覆盖。"""
+    try:
+        override = int(os.environ.get("XGENT_CLI_WIDTH", "") or 0)
+    except ValueError:
+        override = 0
+    if override > 0:
+        return max(40, override)
+    actual = width if width else terminal_size()[0]
+    return max(40, actual)
+
+
+# --------------------------------------------------------------------------
+# 显示宽度（CJK 占两列）
+# --------------------------------------------------------------------------
+
+def char_width(ch: str) -> int:
+    """单个字符在终端里占几列。
+
+    组合记号（重音等）不占位；East Asian Wide/Fullwidth 占 2 列。emoji 在
+    unicodedata 里大多已经是 'W'，少数落在 'N'，这里对常见 emoji 区段补一刀
+    ——否则带 emoji 的菜单项会算窄，右边框线跟着错位。
+    """
+    if not ch:
+        return 0
+    if unicodedata.combining(ch):
+        return 0
+    codepoint = ord(ch)
+    if codepoint < 32 or 0x7F <= codepoint < 0xA0:
+        return 0
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    # 常见 emoji / 符号区段：unicodedata 判为窄，但绝大多数终端按两列渲染。
+    if (
+        0x1F300 <= codepoint <= 0x1FAFF
+        or 0x2600 <= codepoint <= 0x27BF
+        or 0x2B00 <= codepoint <= 0x2BFF
+        or codepoint in (0x2190, 0x2191, 0x2192, 0x2193)
+    ):
+        return 2
+    return 1
+
+
+def display_width(text: str) -> int:
+    """字符串的终端显示宽度，忽略 ANSI 转义序列本身的长度。"""
+    stripped = _ANSI_RE.sub("", text)
+    # 变体选择符 FE0F / 零宽连接符不额外占位，先去掉再逐字符累加。
+    stripped = stripped.replace("️", "").replace("‍", "")
+    return sum(char_width(ch) for ch in stripped)
+
+
+def visual_rows(text: str, width: int) -> int:
+    """text 被 width 列的终端软换行后实际占几行。
+
+    不能用 ceil(display_width/width)：终端折行时宽字符不会跨行——折行点
+    落在 CJK/emoji 正中间时整个字符被推到下一行，实际行数可能比理论值
+    多 1。resize 后要按新宽度上移回旧块顶部（擦干净重画），行数差 1 就
+    会留下残骸或擦掉别人的内容，必须逐字符精确模拟终端的折行。
+    """
+    if width < 1:
+        return 1
+    rows, col = 1, 0
+    for ch in _ANSI_RE.sub("", text):
+        w = char_width(ch)
+        if col + w > width:
+            rows += 1
+            col = 0
+        col += w
+    return rows
+
+
+def visual_row_of_col(text: str, width: int, col_target: int) -> int:
+    """width 列终端上，text 里第 col_target 列处的字符落在第几行（0 起）。
+
+    光标锚定在文本位置：旧块被终端按新宽度折行后，光标跟着掉到第几行
+    由"光标之前的字符"决定，逐字符模拟折行到目标列即得。
+    """
+    if width < 1:
+        return 0
+    row, col = 0, 0
+    for ch in _ANSI_RE.sub("", text):
+        w = char_width(ch)
+        if col + w > width:
+            row += 1
+            col = 0
+        col += w
+        if col > col_target:
+            return row
+    return row
+
+
+def _tokenize_with_ansi(text: str) -> List[Tuple[str, bool]]:
+    """把字符串切成 (片段, 是否为 ANSI 转义) 序列，供按宽度切分时跳过转义。"""
+    tokens: List[Tuple[str, bool]] = []
+    pos = 0
+    for match in _ANSI_RE.finditer(text):
+        if match.start() > pos:
+            tokens.append((text[pos:match.start()], False))
+        tokens.append((match.group(0), True))
+        pos = match.end()
+    if pos < len(text):
+        tokens.append((text[pos:], False))
+    return tokens
+
+
+def wrap_line(text: str, width: int) -> List[str]:
+    """按显示宽度折行，ANSI 转义不计宽度也不会被从中间切断。
+
+    优先在空白处断行；一个"词"本身就超过整行宽度时（长 URL、连续中文）
+    直接按列硬切，不留一行只有半个字的残行。
+    """
+    if width <= 0:
+        return [text]
+    if display_width(text) <= width:
+        return [text]
+
+    lines: List[str] = []
+    current = ""
+    current_width = 0
+    pending_space = ""
+
+    def flush() -> None:
+        nonlocal current, current_width, pending_space
+        lines.append(current)
+        current = ""
+        current_width = 0
+        pending_space = ""
+
+    for chunk, is_ansi in _tokenize_with_ansi(text):
+        if is_ansi:
+            # 转义序列跟随当前行，不占宽度。
+            current += chunk
+            continue
+        for word in re.findall(r"\s+|\S+", chunk):
+            if word.isspace():
+                pending_space = word.replace("\t", "    ")
+                continue
+            word_width = display_width(word)
+            space_width = display_width(pending_space)
+            if current_width and current_width + space_width + word_width > width:
+                flush()
+            elif pending_space:
+                current += pending_space
+                current_width += space_width
+                pending_space = ""
+            if word_width <= width:
+                current += word
+                current_width += word_width
+                continue
+            # 超长词：按列硬切。
+            for ch in word:
+                cw = char_width(ch)
+                if current_width + cw > width:
+                    flush()
+                current += ch
+                current_width += cw
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+
+def pad_to_width(text: str, width: int) -> str:
+    """右侧补空格到指定显示宽度（用于列对齐）。"""
+    gap = width - display_width(text)
+    return text + " " * gap if gap > 0 else text
+
+
+def chunk_by_width(text: str, width: int) -> List[str]:
+    """按显示宽度硬切成若干段，ANSI 转义不占宽度也不会被从中间切断。
+
+    和 wrap_line 的区别：那个按词折行（适合正文），这个是硬切（适合代码、
+    表格这类不能按空格断的内容，也用来给画框兜底——框里的行一旦超宽，右边
+    框线就会被顶出去，整个框当场散架）。
+    """
+    if width <= 0:
+        return [text]
+    if display_width(text) <= width:
+        return [text]
+    chunks: List[str] = []
+    current = ""
+    used = 0
+    for token, is_ansi in _tokenize_with_ansi(text):
+        if is_ansi:
+            current += token
+            continue
+        for ch in token:
+            ch_width = char_width(ch)
+            if used + ch_width > width:
+                chunks.append(current)
+                current = ""
+                used = 0
+            current += ch
+            used += ch_width
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
+
+def fill_line(text: str, width: int, palette: Optional["Palette"] = None) -> List[str]:
+    """整行铺灰底，返回若干条"每条都恰好占满 width"的行。
+
+    命令返回用这个把输出圈出来。三处讲究：
+
+    1. **不剥行内 ANSI**。原来的做法是先 _ANSI_RE.sub("") 剥光再统一上色，
+       结果命令名、参数的高亮全丢了。这里保留原色，只把每个 reset(\\x1b[0m)
+       后面补一个底色码——reset 会把背景一起清掉，不补的话灰底就在第一个
+       彩色片段结束的地方断掉，后半行变成裸色。
+    2. **不叠 dim**。dim 压在 236 灰底上会把字糊成暗灰，几乎读不出来；
+       无色文字走终端默认前景（正常白）即可。"小一号"的视觉线索交给
+       "◇ 命令"抬头行。
+    3. **先按宽度硬切再补齐**。只补齐到 width 的话，本来就超宽的行（长路径、
+       表格）会被终端软换行，第二段没有底色，屏幕上出现半截灰条。切开之后
+       每个可视行都是完整一条灰带，窗口拉到多窄都不断。
+    """
+    pal = palette or Palette(False)
+    width = max(1, width)
+    if not pal.enabled:
+        return chunk_by_width(text, width)
+    out: List[str] = []
+    for piece in chunk_by_width(text, width):
+        # reset 之后立刻把底色续上，否则灰底会在行中断掉。
+        repainted = piece.replace(pal.reset, pal.reset + pal.bg)
+        out.append(pal.bg + repainted + " " * max(0, width - display_width(piece)) + pal.reset)
+    return out
+
+
+# --------------------------------------------------------------------------
+# 画框
+# --------------------------------------------------------------------------
+# 消息块用"上下双横线"而不是四边框：四边框带左右竖线，终端窗口一拉窄，
+# 已打印的行软换行会把右边框甩到下一行，整个框当场散架；终端没有重排
+# 滚动历史的原语，谁也救不回来。双横线没有右边界，超宽行最多多占一行，
+# 永不错位——这是"页面呈现"层面对抗窗口缩放的手段。
+# box_block 仍保留给输入框（cli_palette）：它是交互件，每次按键整块重画，
+# 拉完窗口敲一下键就自动对齐。
+BOX_TOP_LEFT, BOX_TOP_RIGHT = "╭", "╮"
+BOX_BOTTOM_LEFT, BOX_BOTTOM_RIGHT = "╰", "╯"
+BOX_H, BOX_V = "─", "│"
+# 框线两侧各吃掉 "│ " 和 " │"。
+BOX_CHROME = 4
+
+
+def rule_block(body: Sequence[str], width: int, title: str = "",
+               palette: Optional["Palette"] = None,
+               rule_style: str = "") -> List[str]:
+    """把若干行夹在上下两条横线之间，标题嵌在上横线里。
+
+    正文行不做补齐、不硬切：没有右边框就没有可错位的的东西，超宽的行
+    （代码块、表格）交给终端自己软换行即可。
+
+    横线铺满整个渲染宽度：灰底、横线都要整行覆盖，不能只长到文字部分。
+    """
+    pal = palette or Palette(False)
+    width = max(12, width)
+
+    def paint(text: str) -> str:
+        return pal.paint(text, rule_style) if rule_style else text
+
+    # 标题放不下就退化成纯横线：硬塞会把上横线顶到第二行，双横线块的
+    # "永不错位"承诺当场破功。极窄终端下宁可丢标题也要保住排版。
+    if title and display_width(title) + 6 <= width:
+        fill = max(2, width - display_width(title) - 4)
+        top = paint("── ") + title + paint(" " + BOX_H * fill)
+    else:
+        top = paint(BOX_H * width)
+    bottom = paint(BOX_H * width)
+    return [top] + list(body) + [bottom]
+
+
+def box_block(body: Sequence[str], width: int, title: str = "",
+              palette: Optional["Palette"] = None,
+              border_style: str = "") -> List[str]:
+    """把若干行围进一个框，标题嵌在上边框里。
+
+    body 里的行可能带 ANSI，补空格必须按**显示宽度**算（display_width 会跳过
+    转义序列），否则带颜色的行右边框会往右串。超宽的行（<pre> 代码块、表格）
+    在这里硬切开，宁可切也不能让框散架。
+    """
+    pal = palette or Palette(False)
+    width = max(BOX_CHROME + 8, width)
+    inner = width - BOX_CHROME
+
+    def paint(text: str) -> str:
+        return pal.paint(text, border_style) if border_style else text
+
+    head = BOX_TOP_LEFT + BOX_H
+    if title:
+        title_width = display_width(title)
+        fill = max(0, inner - title_width - 1)
+        top = paint(head + " ") + title + paint(" " + BOX_H * fill + BOX_TOP_RIGHT)
+    else:
+        top = paint(head + BOX_H * (inner + 1) + BOX_TOP_RIGHT)
+    bottom = paint(BOX_BOTTOM_LEFT + BOX_H * (width - 2) + BOX_BOTTOM_RIGHT)
+
+    left, right = paint(BOX_V) + " ", " " + paint(BOX_V)
+    lines = [top]
+    for line in body:
+        for piece in chunk_by_width(line, inner):
+            reset = pal.reset if pal.enabled else ""
+            lines.append(left + pad_to_width(piece, inner) + reset + right)
+    lines.append(bottom)
+    return lines
+
+
+# --------------------------------------------------------------------------
+# 调色板
+# --------------------------------------------------------------------------
+
+class Palette:
+    """一组 ANSI 样式。关掉颜色时所有字段都是空串，调用点无需再判断。"""
+
+    _FIELDS = {
+        "reset": "\x1b[0m",
+        "bold": "\x1b[1m",
+        "dim": "\x1b[2m",
+        "italic": "\x1b[3m",
+        "underline": "\x1b[4m",
+        "strike": "\x1b[9m",
+        "ai": "\x1b[38;5;79m",       # 青绿：AI 说话
+        "user": "\x1b[38;5;110m",    # 淡蓝：用户输入回显
+        "accent": "\x1b[38;5;215m",  # 橙：菜单编号、强调
+        "muted": "\x1b[38;5;245m",   # 灰：分隔线、次要说明
+        "code": "\x1b[38;5;180m",    # 米色：行内代码
+        "link": "\x1b[38;5;75m",
+        "ok": "\x1b[38;5;114m",
+        "warn": "\x1b[38;5;221m",
+        "err": "\x1b[38;5;203m",
+        "bg": "\x1b[48;5;236m",      # 灰底：命令返回整行填充
+    }
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        for name, code in self._FIELDS.items():
+            setattr(self, name, code if enabled else "")
+
+    def paint(self, text: str, *styles: str) -> str:
+        if not self.enabled or not styles:
+            return text
+        prefix = "".join(styles)
+        return f"{prefix}{text}{self.reset}" if prefix else text
+
+
+# --------------------------------------------------------------------------
+# Telegram HTML -> ANSI
+# --------------------------------------------------------------------------
+
+_PRE_RE = re.compile(r"<pre>(.*?)</pre>", re.S | re.I)
+_A_RE = re.compile(r'<a\s+href="([^"]*)"\s*>(.*?)</a>', re.S | re.I)
+
+# Telegram 支持的行内标签 -> ANSI 样式名。对话核心只会产出这些
+# （markdown_to_telegram_html 的输出集合），未知标签一律剥掉。
+_INLINE_TAGS = {
+    "b": ("bold",), "strong": ("bold",),
+    "i": ("italic",), "em": ("italic",),
+    "u": ("underline",),
+    "s": ("strike",), "del": ("strike",), "strike": ("strike",),
+    "code": ("code",),
+}
+
+
+def html_to_ansi(text: str, palette: Optional[Palette] = None) -> str:
+    """把 Telegram HTML 子集渲染成带 ANSI 样式的纯文本。
+
+    与 rendering.plain_text_from_html 的区别：那个函数把标签**删掉**，用于
+    "HTML 解析失败时降级成纯文本"；这里是把标签**翻译成样式**。CLI 用后者，
+    否则终端上"标题、代码、正文"看起来完全一样，正是用户说的"极其简陋"。
+
+    <pre> 块单独走 render_code_block（在 MessageRenderer 里），这里只把它
+    还原成带标记的占位段落，交给上层排版。
+    """
+    pal = palette or Palette(False)
+    result = str(text)
+
+    # <a href="x">y</a> -> y (x)：终端里链接不可点，裸 URL 才是可用信息。
+    def _link(match: "re.Match[str]") -> str:
+        href, label = match.group(1), match.group(2)
+        label_clean = re.sub(r"<[^>]+>", "", label)
+        if not label_clean.strip() or label_clean.strip() == href.strip():
+            return pal.paint(href, pal.link, pal.underline)
+        return f"{pal.paint(label_clean, pal.link)} {pal.paint('(' + href + ')', pal.muted)}"
+
+    result = _A_RE.sub(_link, result)
+
+    # 块级标签换行化。
+    result = re.sub(r"</(p|div|blockquote|li|h[1-6])\s*>", "\n", result, flags=re.I)
+    result = re.sub(r"<br\s*/?>", "\n", result, flags=re.I)
+    result = re.sub(r"<blockquote>", "", result, flags=re.I)
+
+    # 行内样式标签 -> ANSI。用栈式替换而不是一次性正则，保证嵌套
+    # （<b><code>x</code></b>）时内层 reset 不会把外层样式一起清掉。
+    def _inline(match: "re.Match[str]") -> str:
+        tag = match.group(1).lower()
+        inner = match.group(2)
+        styles = _INLINE_TAGS.get(tag)
+        if not styles:
+            return inner
+        codes = "".join(getattr(pal, name, "") for name in styles)
+        if not codes:
+            return inner
+        # 内层结束后重新开启外层可能仍需要的样式：结尾用 reset 再补回本层
+        # 之外的上下文由调用方（整段最后统一 reset）负责，这里保持简单：
+        # reset 之后不残留样式，嵌套场景由外层重新着色。
+        return f"{codes}{inner}{pal.reset}"
+
+    inline_pattern = re.compile(
+        r"<(" + "|".join(_INLINE_TAGS) + r")>(.*?)</\1>", re.S | re.I
+    )
+    for _ in range(4):  # 允许 4 层嵌套，够用且不会无限循环
+        new_result = inline_pattern.sub(_inline, result)
+        if new_result == result:
+            break
+        result = new_result
+
+    result = re.sub(r"<[^>]+>", "", result)          # 剩余未知标签一律剥掉
+    return _html.unescape(result)
+
+
+# --------------------------------------------------------------------------
+# 控制按钮：终端里点不了的那一类
+# --------------------------------------------------------------------------
+# Telegram/Web 上"停止回答"是一颗随时可点的按钮，所以对话核心把它做成
+# inline keyboard（core.py 的 build_stop_keyboard）。终端上这颗按钮**根本
+# 点不了**：一轮对话跑起来之后输入循环就在 await，用户敲不进任何编号。把它
+# 照直渲染成 " 1 ❌ 停止回答" 有两处不对——
+#   1. 它给出一个用户按不动的编号，是假承诺；
+#   2. ❌ 在终端里是"失败/出错"的通用记号，顶在"正在运行"的状态行下面，
+#      看起来像刚刚报了个错。
+# 所以这里把这类按钮从编号菜单里摘出来，改成一行灰色的键位提示——终端里
+# 中断的原生语义本来就是 Ctrl+C（xgent_cli.py 的 SIGINT 处理器会把它翻译
+# 成同一个 act_stop_generation）。
+#
+# 键是 callback_data 而不是按钮文字：文字随时可能改文案，callback_data 是
+# 对话核心和回调路由之间的稳定契约。
+CONTROL_BUTTON_HINTS = {
+    "act_stop_generation": ("⌃C", "中断回答"),
+}
+
+
+def split_control_buttons(
+    buttons: Sequence[Tuple[str, str]],
+) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    """拆成 (可编号点击的按钮, 键位提示)。
+
+    渲染和菜单登记必须用同一份拆分结果，否则屏幕上显示的编号和
+    cli_bridge 记下的 callback_data 会错位一格——用户点 1 触发了 2。
+    """
+    menu: List[Tuple[str, str]] = []
+    hints: List[Tuple[str, str]] = []
+    for text, data in buttons:
+        hint = CONTROL_BUTTON_HINTS.get(data)
+        if hint is None:
+            menu.append((text, data))
+        elif hint not in hints:
+            hints.append(hint)
+    return menu, hints
+
+
+# --------------------------------------------------------------------------
+# 消息排版
+# --------------------------------------------------------------------------
+
+class MessageRenderer:
+    """把一条消息（文本 + 按钮）排版成终端行列表。
+
+    只负责"算出要打印哪些行"，不碰 stdout——这样可以脱离终端直接单测：
+    给定 HTML 进去，断言渲染出的行长什么样。
+    """
+
+    def __init__(self, palette: Optional[Palette] = None, width: int = 80):
+        self.palette = palette or Palette(False)
+        self.width = width
+
+    # -- 分块 ------------------------------------------------------------
+    def _split_pre_blocks(self, text: str) -> List[Tuple[str, str]]:
+        """切成 [("text"|"pre", 内容), ...]，保持原顺序。"""
+        parts: List[Tuple[str, str]] = []
+        pos = 0
+        for match in _PRE_RE.finditer(text):
+            if match.start() > pos:
+                parts.append(("text", text[pos:match.start()]))
+            parts.append(("pre", match.group(1)))
+            pos = match.end()
+        if pos < len(text):
+            parts.append(("text", text[pos:]))
+        return parts or [("text", text)]
+
+    def _render_pre(self, raw: str, body_width: int) -> List[str]:
+        """代码块/表格：加左边框、不折行。
+
+        markdown_to_telegram_html 把 Markdown 表格也转成 <pre>，内容是按等宽
+        对齐过的——一旦折行对齐就全毁了。所以这里宁可让超宽内容被终端自己
+        软换行，也不主动折。
+        """
+        pal = self.palette
+        inner = _html.unescape(re.sub(r"<[^>]+>", "", raw)).strip("\n")
+        bar = pal.paint("│", pal.muted)
+        lines = [f"{bar} {pal.paint(line, pal.code)}" for line in inner.split("\n")]
+        return lines or [f"{bar} "]
+
+    # -- 对外接口 --------------------------------------------------------
+    def render_text(self, text: str, parse_mode: Any = None,
+                    indent: str = "  ") -> List[str]:
+        """消息正文 -> 终端行。"""
+        raw = str(text)
+        is_html = parse_mode is not None and "html" in str(parse_mode).lower()
+        body_width = max(20, self.width - display_width(indent))
+        lines: List[str] = []
+
+        for kind, chunk in self._split_pre_blocks(raw) if is_html else [("text", raw)]:
+            if kind == "pre":
+                lines.extend(indent + line for line in self._render_pre(chunk, body_width))
+                continue
+            rendered = html_to_ansi(chunk, self.palette) if is_html else chunk
+            for paragraph in rendered.split("\n"):
+                if not paragraph.strip():
+                    lines.append("")
+                    continue
+                for wrapped in wrap_line(paragraph.rstrip(), body_width):
+                    lines.append(indent + wrapped)
+
+        # 去掉首尾多余空行，并把连续空行压成一行——Telegram HTML 里
+        # <pre>/</p> 前后常常各带一个换行，直译过来就是大片空白。
+        collapsed: List[str] = []
+        for line in lines:
+            if not line.strip() and collapsed and not collapsed[-1].strip():
+                continue
+            collapsed.append(line)
+        while collapsed and not collapsed[0].strip():
+            collapsed.pop(0)
+        while collapsed and not collapsed[-1].strip():
+            collapsed.pop()
+        return collapsed
+
+    def render_buttons(self, buttons: Sequence[Tuple[str, str]],
+                       indent: str = "  ") -> List[str]:
+        """inline keyboard -> 编号菜单。
+
+        buttons 是 [(显示文字, callback_data), ...]，编号即用户要输入的数字。
+        终端够宽且条目够多时排成两列——9 项的主菜单单列会占掉大半屏，正是
+        用户说的"不适配"。
+        """
+        if not buttons:
+            return []
+        pal = self.palette
+        labels = []
+        for idx, (text, _data) in enumerate(buttons, start=1):
+            number = pal.paint(f"{idx:>2}", pal.accent, pal.bold)
+            labels.append(f"{number} {text}")
+
+        body_width = max(20, self.width - display_width(indent))
+        widest = max(display_width(label) for label in labels)
+        columns = 2 if (len(labels) >= 4 and widest * 2 + 4 <= body_width) else 1
+
+        lines: List[str] = []
+        if columns == 1:
+            lines.extend(indent + label for label in labels)
+        else:
+            # 行优先（1 2 / 3 4），不是列优先（1 3 / 2 4）——编号菜单是拿来
+            # 从左到右扫读的，列优先会让视线在"1 3"之间跳。
+            column_width = widest + 4
+            for row_start in range(0, len(labels), columns):
+                row = labels[row_start:row_start + columns]
+                cells = [pad_to_width(cell, column_width) for cell in row[:-1]]
+                cells.append(row[-1])
+                lines.append(indent + "".join(cells).rstrip())
+        return lines
+
+    def render_hints(self, hints: Sequence[Tuple[str, str]],
+                     indent: str = "  ") -> List[str]:
+        """键位提示 -> 终端行（"⌃C  中断回答" 这种）。
+
+        用正常白字，不压暗：这行是"你现在能按什么键"，是要被读到的操作
+        信息。之前套 muted 灰把它压成了背景噪音，屏幕上几乎看不见。
+        """
+        if not hints:
+            return []
+        pal = self.palette
+        key_width = max(display_width(key) for key, _desc in hints)
+        lines: List[str] = []
+        for key, desc in hints:
+            pad = " " * (key_width - display_width(key))
+            lines.append(indent + f"{key}{pad}  {desc}")
+        return lines
+
+    def render_message(self, text: str, buttons: Sequence[Tuple[str, str]] = (),
+                       parse_mode: Any = None, title: str = "XGent",
+                       marker: str = "◆", style: str = "ai") -> List[str]:
+        """完整一条消息，按 style 分两档呈现：
+
+        - "ai" / "user"：上下双横线夹住，标题嵌在上横线里，横线用消息自己
+          的颜色——说话的是谁一眼可辨。这是对话的"气泡"。
+        - "cmd" / "system"：不画横线，只用"◇ 命令 / ◇ 系统"抬头区分。字
+          一律**正常白**——不压暗、不涂灰：这些是要被读到的信息（返回码、
+          轮次状态、能按哪个键），压暗等于让人看不见。区分靠的是有没有
+          横线块，不是靠把字弄糊。命令返回（cmd）额外铺底色圈出范围。
+        - "token"：连抬头都不要，纯一行。
+
+        正文统一缩进 2 格、按整屏宽折行；没有右边框，就不存在被顶散架的
+        问题，超宽行交给终端软换行。
+        """
+        pal = self.palette
+        lines = self.render_text(text, parse_mode, indent="  ")
+        menu_buttons, hints = split_control_buttons(buttons)
+        button_lines = self.render_buttons(menu_buttons, indent="  ")
+        if button_lines:
+            if lines:
+                lines.append("")
+            lines.extend(button_lines)
+        # 键位提示紧贴正文，不额外空行：它是状态行的附注，隔开反而像另一段。
+        lines.extend(self.render_hints(hints, indent="  "))
+
+        # 什么都没有就整块不打。空消息（占位被清空、只剩一个已被摘掉的停止
+        # 按钮）照打的话，屏幕上会留下一个空的"◆ XGent"框或光秃秃的
+        # "◇ 命令"抬头——框里没有内容，等于告诉用户"它说了句话"却什么都
+        # 没说。
+        if not any(line.strip() for line in lines):
+            return []
+
+        if style == "token":
+            return [pal.paint(_ANSI_RE.sub("", line), pal.dim) for line in lines]
+
+        if style in ("cmd", "system"):
+            # 抬头用白色加粗，不用灰：它是这一块的名字，得看得见。
+            heading = f"{pal.paint(marker, pal.bold)} {pal.paint(title, pal.bold)}"
+            out = [heading]
+            for line in lines:
+                if not line.strip():
+                    out.append("")
+                elif style == "cmd":
+                    # 命令返回：整行铺灰底，一眼圈出"这是命令的输出"。灰底
+                    # 铺满整个渲染宽度——盖住整行，不能只长到文字部分。原色
+                    # 保留、底色不断（见 fill_line）。空行不上底色，免得块
+                    # 与块之间夹出灰条。
+                    out.extend(fill_line(line, self.width, pal))
+                else:
+                    # 系统提示：正常白字，无底色。原色照留。
+                    out.append(line)
+            return out
+
+        color = getattr(pal, style, "")
+        heading = f"{pal.paint(marker, color, pal.bold)} {pal.paint(title, color, pal.bold)}"
+        return rule_block(lines, self.width, heading, pal, color)
+
+
+# --------------------------------------------------------------------------
+# 屏幕：负责真正的打印与原地重绘
+# --------------------------------------------------------------------------
+
+class TerminalScreen:
+    """管理 stdout，并在可能时用 ANSI 光标控制做原地重绘。
+
+    原地重绘是 CLI 可用性的关键。对话核心把"更新一条消息"表达成
+    edit_message_text(message_id=…)，流式回复每 0.35 秒就调一次且带的是
+    **累计全文**。终端没有"编辑历史气泡"的原语，但只要记住"最后打印的那个
+    块属于哪条消息、占了几行"，就能用 CSI A（上移）+ CSI J（清到屏幕末尾）
+    把它擦掉重画——效果等价于原地编辑，而不是刷屏上百次。
+
+    只有当目标消息**仍是屏幕上最后一个块**时才重绘；中间夹了别的输出（用户
+    敲了回车、又发了一条新消息）就退化成追加打印一份，宁可多打一份也不能
+    擦掉不属于自己的内容。
+
+    块比终端屏幕还高时分两档：
+
+    - **整块可见**（块高 + 1 < 屏高）：照旧上移到块顶、清屏、整块重画。
+      任意改写都能表达。
+    - **顶部已滚出可视区**：上移会越界，整块重画不可行。这时改走**增量
+      续写**（_append_delta）：流式编辑带的是累计全文，块的头尾（标题、
+      键位提示）稳定、正文在中部增长——按前缀和后缀双向 diff 找到发散
+      点，只重写发散点之后的几行；最后一行不收换行符（"开放行"），下次
+      编辑只需再擦这几行。每个字符在回卷里只出现一次，长回复流式生成
+      不再把终端刷成同一消息的 N 份递增拷贝。
+    """
+
+    def __init__(self, stream: Any = None, color: Optional[bool] = None,
+                 width: Optional[int] = None):
+        self.stream = stream or sys.stdout
+        self.palette = Palette(supports_color(self.stream) if color is None else color)
+        self._forced_width = width
+        self._last_message_id: Optional[int] = None
+        self._last_line_count = 0
+        self._can_redraw = False
+        # 上次 print_block 时的终端宽度：宽度一变账本作废（见 update_block）。
+        self._last_printed_width = 0
+        # 增量续写的账本：最后一个块的行列表、最后一行是否还"开放"
+        # （没写换行符，光标停在它末尾，下次编辑可原地改写）。
+        self._last_lines: List[str] = []
+        self._open_line: Optional[str] = None
+        self._last_leading_blank = True
+
+    # -- 基础 ------------------------------------------------------------
+    @property
+    def width(self) -> int:
+        if self._forced_width:
+            return self._forced_width
+        return terminal_size()[0]
+
+    @property
+    def height(self) -> int:
+        return terminal_size()[1]
+
+    def renderer(self) -> MessageRenderer:
+        # 排版宽度 = 终端满宽（XGENT_CLI_WIDTH 可覆盖）：灰底、横线都要
+        # 整行覆盖。原地重绘的行数记账（_visual_rows）按同一宽度算。
+        return MessageRenderer(self.palette, content_width(self.width))
+
+    def _write(self, text: str) -> None:
+        try:
+            self.stream.write(text)
+            self.stream.flush()
+        except UnicodeEncodeError:
+            # Windows 上非 UTF-8 代码页（GBK）遇到 emoji 会抛这个。丢字符也
+            # 比丢整条消息强——直接崩掉会让用户以为程序死了。
+            safe = text.encode(getattr(self.stream, "encoding", "utf-8") or "utf-8",
+                               errors="replace").decode(
+                getattr(self.stream, "encoding", "utf-8") or "utf-8", errors="replace")
+            self.stream.write(safe)
+            self.stream.flush()
+
+    def invalidate(self) -> None:
+        """声明"屏幕最后一块已经不是我们记住的那块了"，禁用下一次原地重绘。"""
+        self._can_redraw = False
+        self._last_message_id = None
+        self._last_line_count = 0
+
+    def _visual_rows(self, lines: Sequence[str]) -> int:
+        """这些行在终端上实际占几行。
+
+        不能直接用 len(lines)：超过终端宽度的行会被终端自己软换行成多行。
+        代码块/表格（<pre>）刻意不折行——折了对齐就毁了——所以这种超宽行
+        真实存在。按 len() 记账会让重绘时上移的行数偏少，光标停在块中间，
+        擦掉的就是别人的内容。折行数用 visual_rows 精确算（宽字符不跨行）。
+        """
+        width = self.width
+        return sum(visual_rows(line, width) for line in lines)
+
+    # -- 打印 ------------------------------------------------------------
+    def _close_open_line(self) -> None:
+        """收掉开放行（补上欠的换行符），让后续输出从新的一行开始。"""
+        if self._open_line is not None:
+            self._write("\n")
+            self._open_line = None
+
+    def print_block(self, lines: Sequence[str], message_id: Optional[int] = None,
+                    leading_blank: bool = True) -> None:
+        """打印一个新块，并记住它，以便后续原地重绘。"""
+        self._close_open_line()
+        payload = ("\n" if leading_blank else "") + "\n".join(lines) + "\n"
+        self._write(payload)
+        self._last_message_id = message_id
+        self._last_lines = list(lines)
+        self._last_leading_blank = leading_blank
+        self._open_line = None
+        # 记录的是"块在屏幕上占的行数"，重绘时要连同前置空行一起算。
+        self._last_line_count = self._visual_rows(lines) + (1 if leading_blank else 0)
+        self._can_redraw = message_id is not None and self.palette.enabled
+        # 记住画这块时的终端宽度：宽度一变（拖窗口），屏幕上这块会被终端
+        # 按新宽度折行重排，高度变了，行数账本当场作废。
+        self._last_printed_width = self.width
+
+    def update_block(self, lines: Sequence[str], message_id: int) -> bool:
+        """尝试原地重绘 message_id 对应的块。成功返回 True。"""
+        if not self._can_redraw or self._last_message_id != message_id:
+            return False
+        # 终端宽度变了（拖拽窗口）：旧块已被终端按新宽度折行重排，记账的
+        # 行数不再对应屏幕上的任何东西——照着上移会擦掉别人的内容，流式
+        # 更新期间拖窗口后的"满屏错位"正是从这儿来的。放弃原地重绘，退
+        # 化成追加打印：宁可同一条消息多打一份，也不能错位。
+        if self._last_printed_width != self.width:
+            self.invalidate()
+            return False
+        # 块比屏幕还高时，顶部已经滚出可视区，上移到块顶会越界擦到别的
+        # 内容——整块重画不可行，改走增量续写（只动尾部，光标不出可视区）。
+        if self._last_line_count + 1 >= self.height:
+            return self._append_delta(lines)
+        # 上移到块的第一行，清掉从这里到屏幕末尾的所有内容，再重画。
+        # 开放行时光标停在最后一行**末尾**（列不为 0，且比已收块少隔一行）：
+        # 上移距离少一行，还要用 \r 把列归零，否则整块会向右错半行。
+        if self._open_line is not None:
+            up = self._last_line_count - 1
+        else:
+            up = self._last_line_count
+        if up:
+            self._write(f"\x1b[{up}A")
+        self._write("\r\x1b[J")
+        payload = "\n" + "\n".join(lines) + "\n"
+        self._write(payload)
+        self._last_lines = list(lines)
+        self._open_line = None
+        self._last_line_count = self._visual_rows(lines) + 1
+        self._last_printed_width = self.width
+        return True
+
+    def _append_delta(self, lines: Sequence[str]) -> bool:
+        """超高块的增量续写：只重写发散点之后的行，不整块重打。
+
+        流式编辑带的是累计全文，块的头（横线+标题）和尾（键位提示+横线）
+        在流式期间是稳定的，变化发生在中部。所以 diff 按前缀**和后缀**
+        双向找公共部分，真正的发散点通常就在当前正文的末尾——从那里到
+        块尾不过几行，上移擦掉重写的距离永远在可视区内，不会越界。
+
+        续不上的情况（发散点远到滚出屏幕、单行比屏幕还高）返回 False，
+        调用方退回整块追加。
+        """
+        old, new = self._last_lines, list(lines)
+        if not old or not new:
+            return False
+        if new == old:
+            return True
+        k = 0
+        while k < len(old) and k < len(new) and old[k] == new[k]:
+            k += 1
+        if k >= len(old):
+            # 纯追加：已有的行一个都没变（开放行原样定稿，后面接新行）。
+            # 不能擦任何东西——擦开放行会把上面的内容一起抹掉——只把
+            # 新增的行接上去。
+            if self._open_line is not None:
+                self._write("\n")  # 收掉开放行，新行另起一行
+            tail = new[k:]
+            if len(tail) > 1:
+                self._write("\n".join(tail[:-1]) + "\n")
+            self._write(tail[-1])  # 最后一行不收换行：下次增量还能原地改写
+            self._commit_delta_state(new, tail[-1])
+            return True
+        s = 0
+        while (s < len(old) - k and s < len(new) - k
+               and old[len(old) - 1 - s] == new[len(new) - 1 - s]):
+            s += 1
+        # 光标到发散行（块的第 k 行）隔了多少可视行。开放时光标停在最后
+        # 一行末尾，比"已收行"少移一行。
+        if self._open_line is not None:
+            distance = sum(visual_rows(line, self.width)
+                           for line in old[k:len(old) - 1])
+            distance += visual_rows(self._open_line, self.width) - 1
+        else:
+            distance = sum(visual_rows(line, self.width) for line in old[k:])
+        if distance >= self.height:
+            # 发散点已经滚出可视区（或单行软换行就比屏幕高），擦不到了。
+            return False
+        if distance:
+            self._write(f"\x1b[{distance}A")
+        self._write("\r\x1b[J")
+        tail = new[k:]
+        if not tail:
+            # 消息缩短了：擦掉之后没有要写的。
+            self._commit_delta_state(new, None)
+            return True
+        if len(tail) > 1:
+            self._write("\n".join(tail[:-1]) + "\n")
+        self._write(tail[-1])  # 最后一行不收换行：下次增量还能原地改写
+        self._commit_delta_state(new, tail[-1])
+        return True
+
+    def _commit_delta_state(self, new: List[str], open_line: Optional[str]) -> None:
+        """增量续写成功后更新账本。"""
+        self._last_lines = new
+        self._open_line = open_line
+        self._last_line_count = self._visual_rows(new) + (1 if self._last_leading_blank else 0)
+        self._last_printed_width = self.width
+
+    def print_plain(self, text: str = "") -> None:
+        """打印一行普通文本（提示、警告等），并让下一次原地重绘失效。"""
+        self._close_open_line()
+        self._write(text + "\n")
+        self.invalidate()
+
+    def notice(self, text: str, level: str = "info") -> None:
+        pal = self.palette
+        marker, style = {
+            "info": ("ℹ", pal.muted),
+            "ok": ("✓", pal.ok),
+            "warn": ("!", pal.warn),
+            "err": ("✗", pal.err),
+        }.get(level, ("ℹ", pal.muted))
+        # 记号保留语义色（✓ 绿 / ! 黄 / ✗ 红），正文用正常白字——压暗会
+        # 让提示糊成背景，而这些恰恰是需要被读到的。
+        self.print_plain(f"{pal.paint(marker, style)} {text}")
+
+
+def buttons_from_markup(reply_markup: Any) -> List[Tuple[str, str]]:
+    """InlineKeyboardMarkup -> [(显示文字, callback_data), ...]。
+
+    没有 callback_data 的按钮（url / web_app）在终端里点不了，直接跳过——
+    与 Web 前端 renderButtons 里 "if (!btn.callback_data) return" 的处理一致。
+    """
+    if reply_markup is None:
+        return []
+    keyboard = getattr(reply_markup, "inline_keyboard", None)
+    if not keyboard:
+        return []
+    buttons: List[Tuple[str, str]] = []
+    for row in keyboard:
+        for button in row:
+            data = str(getattr(button, "callback_data", "") or "")
+            if not data:
+                continue
+            buttons.append((str(getattr(button, "text", "") or ""), data))
+    return buttons
+
+
+__all__ = [
+    "BOX_CHROME",
+    "CONTROL_BUTTON_HINTS",
+    "Palette",
+    "MessageRenderer",
+    "TerminalScreen",
+    "box_block",
+    "buttons_from_markup",
+    "char_width",
+    "chunk_by_width",
+    "display_width",
+    "enable_windows_vt",
+    "fill_line",
+    "html_to_ansi",
+    "pad_to_width",
+    "rule_block",
+    "split_control_buttons",
+    "supports_color",
+    "terminal_size",
+    "wrap_line",
+]

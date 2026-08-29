@@ -1,6 +1,55 @@
 # This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
+# 命令名 -> 一句话说明。Telegram 侧用它同步 /命令 菜单，CLI（xgent_cli.py 的
+# `/` 提示与 /help）直接读同一张表——命令的说明文字只能有一处来源，抄第二份
+# 的结果一定是加了新命令后两边不一致，而用户看到的是哪一份完全取决于他用的
+# 是哪个客户端。
+TELEGRAM_COMMAND_DESCRIPTIONS = (
+    ("start", "打开主菜单"),
+    ("config", "打开设置面板"),
+    ("update", "更新代码并重启"),
+    ("providers", "管理提供商与模型列表"),
+    ("provider_config", "导入导出提供商配置"),
+    ("models", "选择默认模型"),
+    ("chat_model", "选择默认对话模型"),
+    ("media_model", "选择默认媒体模型"),
+    ("prompts", "管理提示词"),
+    ("clear_memory", "清空上下文"),
+    ("depth", "设置记忆深度"),
+    ("params", "参数设置"),
+    ("thinking", "设置思考深度"),
+    ("web", "配置网页版聊天"),
+    ("agent", "开关 Agent 模式"),
+    ("blacklist", "管理 Agent 命令黑名单"),
+    ("stream", "开关流式输出"),
+    ("status", "查看状态"),
+    ("export", "导出全部记忆"),
+    ("stats", "Token统计报表"),
+    ("restart", "重启 Bot"),
+    ("show_chat_info", "查看状态与记忆统计"),
+)
+
+# 只在某个客户端存在的命令说明。skills 没注册进 Telegram 命令菜单
+# （main.py 没给它建 CommandHandler，只有 _WEB_COMMAND_MAP 里有），
+# 但 Web/CLI 都能敲，说明文字同样需要一处来源。
+# getchat 是 CLI 专属命令（只在 xgent_cli.py 的 _CLI_LOCAL_COMMANDS 里注册，
+# 拉的是本地终端的跨端历史，Telegram/Web 没有对应物），说明文字仍然放在
+# 这张共享表里，理由同上——不给每个客户端各开一份命令说明。
+EXTRA_COMMAND_DESCRIPTIONS = (
+    ("skills", "管理技能库"),
+    ("getchat", "拉取 Telegram/Web 端的跨端对话"),
+)
+
+
+def command_description(name: str) -> str:
+    """命令的一句话说明；没有登记过就返回空串。"""
+    for command_name, description in TELEGRAM_COMMAND_DESCRIPTIONS + EXTRA_COMMAND_DESCRIPTIONS:
+        if command_name == name:
+            return description
+    return ""
+
+
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("全局错误处理捕获异常", exc_info=context.error)
 
@@ -41,28 +90,8 @@ async def setup_bot_commands(app):
     if not _startup_commands_synced:
         try:
             commands = [
-                BotCommand("start", "打开主菜单"),
-                BotCommand("config", "打开设置面板"),
-                BotCommand("update", "更新代码并重启"),
-                BotCommand("providers", "管理提供商与模型列表"),
-                BotCommand("provider_config", "导入导出提供商配置"),
-                BotCommand("models", "选择默认模型"),
-                BotCommand("chat_model", "选择默认对话模型"),
-                BotCommand("media_model", "选择默认媒体模型"),
-                BotCommand("prompts", "管理提示词"),
-                BotCommand("clear_memory", "清空上下文"),
-                BotCommand("depth", "设置记忆深度"),
-                BotCommand("params", "参数设置"),
-                BotCommand("thinking", "设置思考深度"),
-                BotCommand("web", "配置网页版聊天"),
-                BotCommand("agent", "开关 Agent 模式"),
-                BotCommand("blacklist", "管理 Agent 命令黑名单"),
-                BotCommand("stream", "开关流式输出"),
-                BotCommand("status", "查看状态"),
-                BotCommand("export", "导出全部记忆"),
-                BotCommand("stats", "Token统计报表"),
-                BotCommand("restart", "重启 Bot"),
-                BotCommand("show_chat_info", "查看状态与记忆统计"),
+                BotCommand(name, description)
+                for name, description in TELEGRAM_COMMAND_DESCRIPTIONS
             ]
             private_scope = BotCommandScopeAllPrivateChats()
             await app.bot.delete_my_commands(scope=private_scope)
@@ -159,6 +188,91 @@ async def setup_bot_commands(app):
         except Exception as e:
             # 发送失败也不回滚 flag：避免并发/重连再次触发导致重复发送
             logger.warning(f"启动主菜单发送失败（不再重试，用户可手动 /start）: {e}")
+
+async def on_shutdown_web_only():
+    """纯 Web 模式（无 BOT_TOKEN、无 PTB Application）下的关闭清理。
+
+    与 on_shutdown(app) 做同样的资源清理，但跳过所有 app.bot.* 调用——纯
+    Web 模式下没有 PTB Application，也没有 SelfTriggerManager（其调度器
+    挂在 application.job_queue.scheduler 上，见 run_web_only_main 的说明）。
+    """
+    logger.info("🛑 服务正在关闭...")
+    try:
+        await asyncio.to_thread(flush_model_trace)
+    except Exception as e:
+        logger.debug(f"刷新 trace 队列失败: {e}")
+    try:
+        await stop_web_chat()
+    except Exception as e:
+        logger.error(f"关闭 Web Chat 失败: {e}")
+    try:
+        AgentShellSessionManager.kill_all()
+        logger.info("✅ Agent shell 会话已关闭")
+    except Exception as e:
+        logger.error(f"关闭 Agent shell 会话失败: {e}")
+    try:
+        db = await BotMemoryDB.get_instance()
+        await db.close()
+        logger.info("✅ 数据库连接已关闭")
+    except Exception as e:
+        logger.error(f"关闭数据库失败: {e}")
+    try:
+        await PortalManager.close_all()
+        logger.info("✅ OpenAI SDK 客户端池已关闭")
+    except Exception as e:
+        logger.error(f"关闭 OpenAI SDK 客户端池失败: {e}")
+    try:
+        await ModelClient.close_http_client()
+        logger.info("✅ 模型 HTTP 连接池已关闭")
+    except Exception as e:
+        logger.error(f"关闭模型 HTTP 连接池失败: {e}")
+
+
+async def run_web_only_main():
+    """纯 Web 模式主循环：未配置 BOT_TOKEN 时的入口，不建 PTB Application。
+
+    对照 setup_bot_commands + app.run_polling 的职责，纯 Web 模式下：
+    - 不跑 run_polling（没有 Telegram 连接）
+    - 不注册 Telegram 命令菜单 / 不发启动菜单消息（没有 chat 可发）
+    - 跳过 SelfTriggerManager（后台定时/长驻触发任务）：其调度器依赖 PTB
+      的 application.job_queue.scheduler（APScheduler），纯 Web 模式没有
+      这个对象。这是 v1 的已知限制，已在 README 中说明；后续如需支持，
+      可以单独起一个 AsyncIOScheduler 并给 SelfTriggerManager 一个 shim。
+    - Web 服务是唯一入口，强制启动（force=True，不受 web_enabled 开关影响）
+    """
+    await UserDataManager.init()
+    await BotMemoryDB.get_instance()
+
+    await start_web_chat_if_enabled(None, force=True)
+    if not is_web_chat_running():
+        logger.critical("❌ 纯 Web 模式启动失败：请确认已设置 Web 访问密码后重试。")
+        # sys.exit() 只抛 SystemExit，不会关掉 aiosqlite 内部起的非 daemon
+        # 工作线程——不先清理就退出，进程会卡成僵尸（日志打完却真的退不
+        # 出去，PM2 也看不出异常，仍显示"online"）。必须先走一遍关闭清理。
+        await on_shutdown_web_only()
+        sys.exit(1)
+
+    port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
+    logger.info("=" * 50)
+    logger.info("XGent Web (standalone) ready.")
+    logger.info(f"监听地址：http://{DEFAULT_WEB_HOST}:{port}")
+    logger.info("=" * 50)
+
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            # Windows 的 ProactorEventLoop 不支持 add_signal_handler；
+            # 退化为 KeyboardInterrupt（Ctrl+C 仍能正常触发下面的 except 分支）。
+            loop.add_signal_handler(sig, stop_event.set)
+
+    try:
+        await stop_event.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await on_shutdown_web_only()
+
 
 async def on_shutdown(app):
     """应用关闭时清理资源"""

@@ -16,6 +16,7 @@ xgent_memory.db-*
 *.db-shm
 *.db-wal
 xgent_storage/
+.xgent-version
 
 # Pre-XGent runtime names kept ignored during compatibility migration
 bot_memory.db

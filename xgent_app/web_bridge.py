@@ -13,12 +13,16 @@ shell_triggers.py 里的 _SelfTriggerUpdate / _SelfTriggerContext 已经用同�
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import logging
+import mimetypes
+import os
 import queue
+import secrets
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +51,68 @@ def _allocate_web_message_id() -> int:
 # “got multiple values for argument 'chat_id'”。用引用计数保证：已打补丁时只
 # 增计数不重裹，最后一个 release 才真正还原类，从根上杜绝双层包裹。
 _ACTIVE_MIRRORS: Dict[int, List[Any]] = {}
+
+
+class MediaTokenRegistry:
+    """把 AI 要发给用户的本地文件映射成一个随机 token，供网页端用
+    GET /api/media/<token> 拉取显示或下载。
+
+    只登记服务端 Agent/media 模块已经决定要发给用户的文件路径——不是
+    前端传路径进来读取任意文件，所以信任边界和现状的 sendfile/read 协议
+    一致，不需要比它们更严格的目录白名单。
+
+    token 用 secrets.token_urlsafe 生成，猜测空间足够大；注册表本身只是
+    进程内存里的一个有界字典（FIFO 淘汰最旧的），长时间运行也不会无限
+    增长。进程重启后 token 全部失效——这是预期行为，历史消息里的图片/
+    文件链接只在当前进程生命周期内有效，与 Telegram 侧消息互不影响。
+    """
+
+    def __init__(self, max_entries: int = 500):
+        self._max_entries = max(1, int(max_entries))
+        self._lock = threading.Lock()
+        self._entries = collections.OrderedDict()
+
+    def register(self, abs_path: str, filename: str) -> str:
+        mime_type, _ = mimetypes.guess_type(filename or abs_path)
+        token = secrets.token_urlsafe(24)
+        with self._lock:
+            self._entries[token] = (abs_path, filename, mime_type or "application/octet-stream")
+            self._entries.move_to_end(token)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+        return token
+
+    def resolve(self, token: str):
+        with self._lock:
+            return self._entries.get(token)
+
+
+def _local_path_from_send_arg(obj):
+    """尽力从 send_photo/send_document 的 photo/document 参数里挖出本地磁盘路径。
+
+    覆盖两种情况：打开的文件对象（open(path, 'rb')，取其 .name）和直接传
+    绝对路径字符串——这已经覆盖了 services.py 的媒体发送、
+    agent_file_delivery.py、agent_sendfile.py 里小于等于 50MB 直发这几条
+    最常用路径。特意排除 file:// 前缀（本地 Bot API 容器内路径，宿主机上
+    不存在对应文件，注册了也读不到）。拿不到路径时返回 None，调用方据此
+    跳过下载 token 注册，保持现状的纯文字提示，不引入死链接。
+    """
+    if isinstance(obj, str):
+        if obj.startswith("file://") or "://" in obj:
+            return None
+        return os.path.abspath(obj) if os.path.isfile(obj) else None
+    name = getattr(obj, "name", None)
+    if isinstance(name, str) and os.path.isfile(name):
+        return os.path.abspath(name)
+    return None
+
+
+# 进程级单例：Web 服务器路由（web_server.py 的 GET /api/media/<token>）与
+# 这里的 send_photo/send_document 共用同一份注册表，前者按 token 查文件，
+# 后者往里面登记文件。放在模块级而不是塞进某个类实例，是因为 WebBot /
+# MirrorBot 每次命令/回调/对话都会新建实例，token 必须能跨实例存活直到
+# 前端点击下载那一刻。
+MEDIA_TOKEN_REGISTRY = MediaTokenRegistry()
 
 
 def _offer(q: "queue.Queue[Optional[Dict[str, Any]]]", item: Optional[Dict[str, Any]]) -> None:
@@ -182,6 +248,11 @@ class WebMessage:
             chat_id=self.chat_id, message_id=self.message_id, text=text, **kwargs
         )
 
+    async def edit_reply_markup(self, reply_markup: Any = None, **kwargs: Any) -> bool:
+        return await self.bot.edit_message_reply_markup(
+            chat_id=self.chat_id, message_id=self.message_id, reply_markup=reply_markup, **kwargs
+        )
+
     async def delete(self) -> bool:
         return await self.bot.delete_message(chat_id=self.chat_id, message_id=self.message_id)
 
@@ -279,24 +350,53 @@ class WebBot:
     async def send_document(self, chat_id: Optional[int] = None, document: Any = None,
                             caption: Optional[str] = None, filename: Optional[str] = None,
                             **kwargs: Any) -> WebMessage:
-        # 文件本体不走 SSE：二进制塞进 JSON 帧会把内存和带宽打爆。
-        # 只报告文件名和标题，正文里已经有服务器路径，用户可以用文件管理器取。
+        # 文件本体不走 SSE：二进制塞进 JSON 帧会把内存和带宽打爆。改为注册一个
+        # 下载 token，前端拿 /api/media/<token> 去拉——能拿到本地路径时才注册
+        # （_local_path_from_send_arg 拿不到就是 None，前端据此不渲染下载入口）。
         name = filename or getattr(document, "filename", None) or getattr(document, "name", None)
+        display_name = str(name) if name else "file"
+        local_path = _local_path_from_send_arg(document)
+        download_url = None
+        if local_path is not None:
+            token = MEDIA_TOKEN_REGISTRY.register(local_path, display_name)
+            download_url = f"/api/media/{token}"
         message_id = self._allocate_message_id()
         self._emit("document", message_id=message_id,
-                   filename=str(name) if name else "file",
-                   caption=str(caption) if caption else None)
+                   filename=display_name,
+                   caption=str(caption) if caption else None,
+                   download_url=download_url)
         return WebMessage(self, message_id, int(chat_id or self.chat_id), str(caption or ""))
 
     async def send_photo(self, chat_id: Optional[int] = None, photo: Any = None,
                          caption: Optional[str] = None, **kwargs: Any) -> WebMessage:
+        local_path = _local_path_from_send_arg(photo)
+        download_url = None
+        if local_path is not None:
+            token = MEDIA_TOKEN_REGISTRY.register(local_path, os.path.basename(local_path))
+            download_url = f"/api/media/{token}"
         message_id = self._allocate_message_id()
         self._emit("photo", message_id=message_id,
-                   caption=str(caption) if caption else None)
+                   caption=str(caption) if caption else None,
+                   download_url=download_url)
         return WebMessage(self, message_id, int(chat_id or self.chat_id), str(caption or ""))
 
     async def get_file(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError("Web 端不支持下载 Telegram 文件")
+
+    async def forward_message(self, chat_id: Optional[int] = None,
+                              from_chat_id: Optional[int] = None,
+                              message_id: Optional[int] = None,
+                              **kwargs: Any) -> WebMessage:
+        # 真实用途是"转发自己刚发的消息、再读回 text/caption、再删掉"这套
+        # 拉取完整内容的 trick（messages.py/other_messages.py 里处理转发消息
+        # 富文本回退时用）。纯网页/CLI 会话根本没有"转发"语义，也没有需要
+        # 拉取的隐藏内容——直接返回一个空文本的占位 WebMessage，调用方的
+        # try/except 会因为拿不到 text/caption 而自然走向下一个 fallback
+        # 分支，不需要在调用点加平台判断。之前这里完全没实现，是 Web 端一个
+        # 真实的接口缺口（CLI 接入会撞到同一处，这次一并补上）。
+        message_id_val = self._allocate_message_id()
+        target = int(chat_id) if chat_id is not None else self.chat_id
+        return WebMessage(self, message_id_val, target, "")
 
 
 class WebUpdate:
@@ -316,6 +416,12 @@ class WebContext:
 
     def __init__(self, bot: WebBot):
         self.bot = bot
+        # PTB 的 CommandHandler 会把命令后面的空白分隔片段放进 context.args，
+        # cmd_token_stats（/stats 7）直接读它——而 _WEB_COMMAND_MAP 里就注册了
+        # stats，所以网页端点 /stats 之前会直接 AttributeError。空列表等价于
+        # "不带参数的命令"，是安全默认值；带参数的场景由
+        # build_web_command_objects 覆盖。
+        self.args: List[str] = []
 
 
 class MirrorBot:
@@ -346,9 +452,26 @@ class MirrorBot:
         self._next_message_id = 1
         self._id_lock = threading.Lock()
         self._id_map: Dict[int, int] = {}  # fake_id -> real Telegram message_id
+        self._reverse_id_map: Dict[int, int] = {}  # real_id -> fake_id（网端帧回发用）
 
     def _allocate_message_id(self) -> int:
         return _allocate_web_message_id()
+
+    def _resolve_send_id(self, override: Any = None) -> int:
+        """本条消息在"帧侧"用的 id。
+
+        override 给 CLI 中继回放用：CLI 进程里对话核心早就拿着自己分配的
+        message_id 在后续 edit/delete 里引用它了，服务端回放时必须沿用同一个
+        id 当映射键，否则 edit 找不到对应的真实 Telegram 消息——流式回复会变成
+        每次编辑都新发一条，就是历史上"上一条消息无限刷屏"的那类故障。
+        网页自己的路径不传 override，行为完全不变。
+        """
+        if override is None:
+            return self._allocate_message_id()
+        try:
+            return int(override)
+        except (TypeError, ValueError):
+            return self._allocate_message_id()
 
     def _emit(self, frame_type: str, **fields: Any) -> None:
         frame: Dict[str, Any] = {"type": frame_type, "ts": time.time()}
@@ -365,6 +488,22 @@ class MirrorBot:
             return None
         return self._id_map.get(mid, mid)
 
+    def _web_frame_id(self, message_id: Optional[int]) -> Optional[int]:
+        """网端帧该用的 message_id：real -> fake 的反查。
+
+        MirrorMessage（包装真实 TG 消息）的 edit/delete 传的是 real id，而网页
+        首次收到这条消息的帧带的是 fake id——直接透传 real id 前端 byMessageId
+        查不到：流式编辑每 0.35s 一次，每次都新建气泡，就是"上一条消息无限
+        刷屏"的根源。反查回 fake id，前端就能原地更新。查不到就原样返回。
+        """
+        if message_id is None:
+            return None
+        try:
+            mid = int(message_id)
+        except (TypeError, ValueError):
+            return message_id
+        return self._reverse_id_map.get(mid, mid)
+
     async def _tg_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         if self.real_bot is None:
             return None
@@ -376,15 +515,17 @@ class MirrorBot:
 
     async def send_message(self, chat_id: Optional[int] = None, text: str = "",
                            reply_markup: Any = None, parse_mode: Any = None,
+                           relay_message_id: Any = None,
                            **kwargs: Any) -> WebMessage:
         target = int(chat_id) if chat_id is not None else self.chat_id
-        message_id = self._allocate_message_id()
+        message_id = self._resolve_send_id(relay_message_id)
         real = await self._tg_call(
             "send_message", chat_id=target, text=str(text),
             reply_markup=reply_markup, parse_mode=parse_mode, **kwargs,
         )
         if real is not None and getattr(real, "message_id", None) is not None:
             self._id_map[message_id] = real.message_id
+            self._reverse_id_map[real.message_id] = message_id
         self._emit(
             "message", message_id=message_id, text=str(text),
             parse_mode=str(parse_mode) if parse_mode else None,
@@ -403,7 +544,7 @@ class MirrorBot:
                 text=str(text), reply_markup=reply_markup, parse_mode=parse_mode, **kwargs,
             )
         self._emit(
-            "edit", message_id=message_id, text=str(text),
+            "edit", message_id=self._web_frame_id(message_id), text=str(text),
             parse_mode=str(parse_mode) if parse_mode else None,
             reply_markup=_markup_to_frame(reply_markup),
         )
@@ -419,7 +560,7 @@ class MirrorBot:
                 "edit_message_reply_markup", chat_id=target, message_id=real_id,
                 reply_markup=reply_markup, **kwargs,
             )
-        self._emit("edit_markup", message_id=message_id,
+        self._emit("edit_markup", message_id=self._web_frame_id(message_id),
                    reply_markup=_markup_to_frame(reply_markup))
         return True
 
@@ -429,7 +570,7 @@ class MirrorBot:
         real_id = self._resolve_real_id(message_id)
         if real_id is not None:
             await self._tg_call("delete_message", chat_id=target, message_id=real_id, **kwargs)
-        self._emit("delete", message_id=message_id)
+        self._emit("delete", message_id=self._web_frame_id(message_id))
         return True
 
     async def send_chat_action(self, chat_id: Optional[int] = None,
@@ -444,36 +585,81 @@ class MirrorBot:
 
     async def send_document(self, chat_id: Optional[int] = None, document: Any = None,
                             caption: Optional[str] = None, filename: Optional[str] = None,
+                            relay_message_id: Any = None,
                             **kwargs: Any) -> WebMessage:
         target = int(chat_id) if chat_id is not None else self.chat_id
         name = filename or getattr(document, "filename", None) or getattr(document, "name", None)
-        message_id = self._allocate_message_id()
+        display_name = str(name) if name else "file"
+        # 在真实发送之前先取路径：send_document 内部会读取/上传文件对象，
+        # 部分实现读完后关闭文件，之后 getattr(obj, "name") 仍然可用（属性
+        # 不受读取位置影响），但提前取更保险，避免依赖未来实现细节。
+        local_path = _local_path_from_send_arg(document)
+        message_id = self._resolve_send_id(relay_message_id)
         real = await self._tg_call(
             "send_document", chat_id=target, document=document,
             caption=caption, filename=filename, **kwargs,
         )
         if real is not None and getattr(real, "message_id", None) is not None:
             self._id_map[message_id] = real.message_id
+            self._reverse_id_map[real.message_id] = message_id
+        download_url = None
+        if local_path is not None:
+            token = MEDIA_TOKEN_REGISTRY.register(local_path, display_name)
+            download_url = f"/api/media/{token}"
         self._emit("document", message_id=message_id,
-                   filename=str(name) if name else "file",
-                   caption=str(caption) if caption else None)
+                   filename=display_name,
+                   caption=str(caption) if caption else None,
+                   download_url=download_url)
         return WebMessage(self, message_id, target, str(caption or ""))
 
     async def send_photo(self, chat_id: Optional[int] = None, photo: Any = None,
-                         caption: Optional[str] = None, **kwargs: Any) -> WebMessage:
+                         caption: Optional[str] = None,
+                         relay_message_id: Any = None, **kwargs: Any) -> WebMessage:
         target = int(chat_id) if chat_id is not None else self.chat_id
-        message_id = self._allocate_message_id()
+        local_path = _local_path_from_send_arg(photo)
+        message_id = self._resolve_send_id(relay_message_id)
         real = await self._tg_call(
             "send_photo", chat_id=target, photo=photo, caption=caption, **kwargs,
         )
         if real is not None and getattr(real, "message_id", None) is not None:
             self._id_map[message_id] = real.message_id
+            self._reverse_id_map[real.message_id] = message_id
+        download_url = None
+        if local_path is not None:
+            token = MEDIA_TOKEN_REGISTRY.register(local_path, os.path.basename(local_path))
+            download_url = f"/api/media/{token}"
         self._emit("photo", message_id=message_id,
-                   caption=str(caption) if caption else None)
+                   caption=str(caption) if caption else None,
+                   download_url=download_url)
         return WebMessage(self, message_id, target, str(caption or ""))
 
     async def get_file(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError("Web 端不支持下载 Telegram 文件")
+
+    async def forward_message(self, chat_id: Optional[int] = None,
+                              from_chat_id: Optional[int] = None,
+                              message_id: Optional[int] = None,
+                              **kwargs: Any) -> WebMessage:
+        # 同 WebBot.forward_message：无 real_bot（纯网页会话）时和 WebBot 行为
+        # 一致，返回空文本占位消息。有 real_bot 时才是真实场景——转发确实需要
+        # 发生在 Telegram 那一侧才能拉到内容，所以走 _tg_call 打到真实 bot；
+        # 但**不** _emit 网页帧：转发-读取-删除是纯粹的"取内容"手段，不是用户
+        # 可见的消息事件，镜像到网页只会凭空多出一条幽灵气泡。
+        target = int(chat_id) if chat_id is not None else self.chat_id
+        if self.real_bot is not None:
+            real = await self._tg_call(
+                "forward_message", chat_id=target,
+                from_chat_id=int(from_chat_id) if from_chat_id is not None else target,
+                message_id=message_id, **kwargs,
+            )
+            if real is not None:
+                text = getattr(real, "text", None) or getattr(real, "caption", None) or ""
+                wrapped = WebMessage(self, self._allocate_message_id(), target, str(text))
+                wrapped.text = text
+                wrapped.caption = getattr(real, "caption", None)
+                wrapped.message_id = getattr(real, "message_id", wrapped.message_id)
+                return wrapped
+        return WebMessage(self, self._allocate_message_id(), target, "")
 
 
 class MirrorMessage:
@@ -588,8 +774,12 @@ def build_web_command_objects(chat_id: int, outbox: WebOutbox, command_text: str
     """
     bot = MirrorBot(outbox, chat_id, real_bot)
     update = WebUpdate(bot, chat_id)
-    update.message.text = str(command_text or "")
-    return update, WebContext(bot), bot
+    text = str(command_text or "")
+    update.message.text = text
+    context = WebContext(bot)
+    # 与 PTB CommandHandler 对齐：命令名之后的空白分隔片段就是 context.args。
+    context.args = text.split()[1:]
+    return update, context, bot
 
 
 def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
@@ -719,9 +909,15 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
                     or getattr(doc, "filename", None)
                     or getattr(doc, "name", None)
                     or "file")
+            local_path = _local_path_from_send_arg(doc)
+            download_url = None
+            if local_path is not None:
+                token = MEDIA_TOKEN_REGISTRY.register(local_path, str(name))
+                download_url = f"/api/media/{token}"
             emit("document", message_id=getattr(result, "message_id", 0),
                  filename=str(name),
-                 caption=str(kwargs.get("caption")) if kwargs.get("caption") else None)
+                 caption=str(kwargs.get("caption")) if kwargs.get("caption") else None,
+                 download_url=download_url)
         except Exception:  # noqa: BLE001
             pass
         return result
@@ -731,8 +927,14 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
     async def send_photo(*args: Any, **kwargs: Any) -> Any:
         result = await saved["send_photo"](real_bot, *args, **kwargs)
         try:
+            local_path = _local_path_from_send_arg(kwargs.get("photo"))
+            download_url = None
+            if local_path is not None:
+                token = MEDIA_TOKEN_REGISTRY.register(local_path, os.path.basename(local_path))
+                download_url = f"/api/media/{token}"
             emit("photo", message_id=getattr(result, "message_id", 0),
-                 caption=str(kwargs.get("caption")) if kwargs.get("caption") else None)
+                 caption=str(kwargs.get("caption")) if kwargs.get("caption") else None,
+                 download_url=download_url)
         except Exception:  # noqa: BLE001
             pass
         return result

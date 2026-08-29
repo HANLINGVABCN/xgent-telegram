@@ -32,6 +32,11 @@ class AgentExecutor:
         '.sh', '.bash', '.ps1', '.bat', '.cmd', '.sql', '.xml', '.svg',
         '.java', '.c', '.h', '.cpp', '.hpp', '.cs', '.go', '.rs', '.php',
     }
+
+    # edit-x 在扩展名白名单没命中时改按内容嗅探，这是那次整份读入的大小上限。
+    # 4MB 足够覆盖任何要原地改的源码/配置；超过就维持原来的拒绝，免得为了判定
+    # 把一个大二进制整个读进内存。
+    EDIT_SNIFF_MAX_BYTES = 4 * 1024 * 1024
     
     @classmethod
     def get_timeout(cls) -> int:
@@ -927,8 +932,27 @@ class AgentExecutor:
 
         mime_type, _ = mimetypes.guess_type(target_path)
         if not cls.is_text_file(target_path, mime_type or 'application/octet-stream'):
-            msg = f"非文本文件，拒绝原地编辑: {to_display_path(target_path)}"
-            return {'success': False, 'error': msg, 'output': msg}
+            # 扩展名白名单认不出 Dockerfile / Makefile / LICENSE / .gitignore /
+            # .bashrc / systemd 的 .service 这类没后缀或后缀冷门的纯文本文件，
+            # 而它们恰恰是服务器运维最常改的东西——提示词第 5 条还专门教了
+            # "改 nginx、systemd 前先备份"，结果 edit 直接把 .service 挡在门外。
+            # 所以扩展名不认时再按**内容**判一次：decode_text_file 查 NUL 字节和
+            # 控制字符密度，真二进制照样拦得住（拿二进制当文本改会直接毁文件，
+            # 这道守卫不能撤）。read_path_for_model 早就是这么判的
+            # （looks_like_text or text_content is not None），edit 之前是三个
+            # 调用点里唯一还硬卡扩展名的那个。
+            #
+            # 整份读进来而不是只嗅前 4KB：截断会把末尾的多字节 UTF-8 字符切成
+            # 半个，解码失败又会被误判成二进制。要改的文件都不大，上限之外
+            # 保持原来的拒绝。
+            sample: Optional[bytes] = None
+            if os.path.getsize(target_path) <= cls.EDIT_SNIFF_MAX_BYTES:
+                sample = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: open(target_path, 'rb').read()
+                )
+            if sample is None or cls.decode_text_file(sample) is None:
+                msg = f"非文本文件，拒绝原地编辑: {to_display_path(target_path)}"
+                return {'success': False, 'error': msg, 'output': msg}
 
         def _read() -> str:
             with open(target_path, 'r', encoding='utf-8') as f:

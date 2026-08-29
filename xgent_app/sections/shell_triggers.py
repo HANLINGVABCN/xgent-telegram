@@ -1497,10 +1497,10 @@ class SelfTriggerManager:
         """处理 trigger-x 协议。
 
         支持三种形式：
-        1. trigger-x <<AGENT_BEGIN...   → 创建新任务
-        2. trigger-x:show <<AGENT_BEGIN... → 查看活跃任务
-        3. trigger-x:kill:<任务ID> <<AGENT_BEGIN... → 取消任务
-        4. trigger-x:kill:all <<AGENT_BEGIN... → 取消所有任务
+        1. trigger-x + <<BEGIN_...   → 创建新任务
+        2. trigger-x:show + <<BEGIN_... → 查看活跃任务
+        3. trigger-x:kill:<任务ID> + <<BEGIN_... → 取消任务
+        4. trigger-x:kill:all + <<BEGIN_... → 取消所有任务
         """
         normalized_target = (target or '').strip()
 

@@ -29,6 +29,7 @@ async def keep_typing_while_waiting(context: ContextTypes.DEFAULT_TYPE, chat_id:
         except asyncio.TimeoutError:
             continue
 
+
 # --- ☆ Rich Messages (Bot API 10.1) ☆ ---
 # Telegram Bot API 10.1 (2026-06-11) 原生支持表格、标题、引用块、分割线、嵌套列表等富文本。
 # 使用 sendRichMessage / sendRichMessageDraft 直接发送结构化 JSON，
@@ -507,6 +508,14 @@ def plain_text_from_html(text: str) -> str:
     cleaned = re.sub(r'</(p|div|br|pre|blockquote|li|h[1-6])\s*>', '\n', str(text), flags=re.I)
     cleaned = re.sub(r'<[^>]+>', '', cleaned)
     return html.unescape(cleaned)
+
+# 注：这里曾有一个 markdown_to_plain_text(text) = plain_text_from_html(
+# markdown_to_telegram_html(text))，本意是给 CLI 客户端做 Markdown->纯文本。
+# 但它是死代码，而且层级放错了：文本流到客户端垫片（CliBot.send_message）
+# 时早已不是 Markdown——finalize_text_response 在上游就调用过
+# markdown_to_telegram_html，客户端拿到的是 Telegram HTML + parse_mode=HTML。
+# 所以 CLI 需要的是"HTML->纯文本"（直接用上面的 plain_text_from_html，由
+# xgent_cli.py 注入给 CliBot），不是"Markdown->纯文本"。
 
 def _sanitize_telegram_html(text: str) -> str:
     """尝试修复无效的 Telegram HTML，而非直接降级到纯文本。
