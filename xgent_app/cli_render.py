@@ -756,6 +756,17 @@ class TerminalScreen:
     只有当目标消息**仍是屏幕上最后一个块**时才重绘；中间夹了别的输出（用户
     敲了回车、又发了一条新消息）就退化成追加打印一份，宁可多打一份也不能
     擦掉不属于自己的内容。
+
+    块比终端屏幕还高时分两档：
+
+    - **整块可见**（块高 + 1 < 屏高）：照旧上移到块顶、清屏、整块重画。
+      任意改写都能表达。
+    - **顶部已滚出可视区**：上移会越界，整块重画不可行。这时改走**增量
+      续写**（_append_delta）：流式编辑带的是累计全文，块的头尾（标题、
+      键位提示）稳定、正文在中部增长——按前缀和后缀双向 diff 找到发散
+      点，只重写发散点之后的几行；最后一行不收换行符（"开放行"），下次
+      编辑只需再擦这几行。每个字符在回卷里只出现一次，长回复流式生成
+      不再把终端刷成同一消息的 N 份递增拷贝。
     """
 
     def __init__(self, stream: Any = None, color: Optional[bool] = None,
@@ -768,6 +779,11 @@ class TerminalScreen:
         self._can_redraw = False
         # 上次 print_block 时的终端宽度：宽度一变账本作废（见 update_block）。
         self._last_printed_width = 0
+        # 增量续写的账本：最后一个块的行列表、最后一行是否还"开放"
+        # （没写换行符，光标停在它末尾，下次编辑可原地改写）。
+        self._last_lines: List[str] = []
+        self._open_line: Optional[str] = None
+        self._last_leading_blank = True
 
     # -- 基础 ------------------------------------------------------------
     @property
@@ -816,12 +832,22 @@ class TerminalScreen:
         return sum(visual_rows(line, width) for line in lines)
 
     # -- 打印 ------------------------------------------------------------
+    def _close_open_line(self) -> None:
+        """收掉开放行（补上欠的换行符），让后续输出从新的一行开始。"""
+        if self._open_line is not None:
+            self._write("\n")
+            self._open_line = None
+
     def print_block(self, lines: Sequence[str], message_id: Optional[int] = None,
                     leading_blank: bool = True) -> None:
         """打印一个新块，并记住它，以便后续原地重绘。"""
+        self._close_open_line()
         payload = ("\n" if leading_blank else "") + "\n".join(lines) + "\n"
         self._write(payload)
         self._last_message_id = message_id
+        self._last_lines = list(lines)
+        self._last_leading_blank = leading_blank
+        self._open_line = None
         # 记录的是"块在屏幕上占的行数"，重绘时要连同前置空行一起算。
         self._last_line_count = self._visual_rows(lines) + (1 if leading_blank else 0)
         self._can_redraw = message_id is not None and self.palette.enabled
@@ -840,19 +866,98 @@ class TerminalScreen:
         if self._last_printed_width != self.width:
             self.invalidate()
             return False
-        # 块比屏幕还高时，顶部已经滚出可视区，上移会越界擦到别的内容。
+        # 块比屏幕还高时，顶部已经滚出可视区，上移到块顶会越界擦到别的
+        # 内容——整块重画不可行，改走增量续写（只动尾部，光标不出可视区）。
         if self._last_line_count + 1 >= self.height:
-            return False
+            return self._append_delta(lines)
         # 上移到块的第一行，清掉从这里到屏幕末尾的所有内容，再重画。
-        self._write(f"\x1b[{self._last_line_count}A\x1b[J")
+        # 开放行时光标停在最后一行**末尾**（列不为 0，且比已收块少隔一行）：
+        # 上移距离少一行，还要用 \r 把列归零，否则整块会向右错半行。
+        if self._open_line is not None:
+            up = self._last_line_count - 1
+        else:
+            up = self._last_line_count
+        if up:
+            self._write(f"\x1b[{up}A")
+        self._write("\r\x1b[J")
         payload = "\n" + "\n".join(lines) + "\n"
         self._write(payload)
+        self._last_lines = list(lines)
+        self._open_line = None
         self._last_line_count = self._visual_rows(lines) + 1
         self._last_printed_width = self.width
         return True
 
+    def _append_delta(self, lines: Sequence[str]) -> bool:
+        """超高块的增量续写：只重写发散点之后的行，不整块重打。
+
+        流式编辑带的是累计全文，块的头（横线+标题）和尾（键位提示+横线）
+        在流式期间是稳定的，变化发生在中部。所以 diff 按前缀**和后缀**
+        双向找公共部分，真正的发散点通常就在当前正文的末尾——从那里到
+        块尾不过几行，上移擦掉重写的距离永远在可视区内，不会越界。
+
+        续不上的情况（发散点远到滚出屏幕、单行比屏幕还高）返回 False，
+        调用方退回整块追加。
+        """
+        old, new = self._last_lines, list(lines)
+        if not old or not new:
+            return False
+        if new == old:
+            return True
+        k = 0
+        while k < len(old) and k < len(new) and old[k] == new[k]:
+            k += 1
+        if k >= len(old):
+            # 纯追加：已有的行一个都没变（开放行原样定稿，后面接新行）。
+            # 不能擦任何东西——擦开放行会把上面的内容一起抹掉——只把
+            # 新增的行接上去。
+            if self._open_line is not None:
+                self._write("\n")  # 收掉开放行，新行另起一行
+            tail = new[k:]
+            if len(tail) > 1:
+                self._write("\n".join(tail[:-1]) + "\n")
+            self._write(tail[-1])  # 最后一行不收换行：下次增量还能原地改写
+            self._commit_delta_state(new, tail[-1])
+            return True
+        s = 0
+        while (s < len(old) - k and s < len(new) - k
+               and old[len(old) - 1 - s] == new[len(new) - 1 - s]):
+            s += 1
+        # 光标到发散行（块的第 k 行）隔了多少可视行。开放时光标停在最后
+        # 一行末尾，比"已收行"少移一行。
+        if self._open_line is not None:
+            distance = sum(visual_rows(line, self.width)
+                           for line in old[k:len(old) - 1])
+            distance += visual_rows(self._open_line, self.width) - 1
+        else:
+            distance = sum(visual_rows(line, self.width) for line in old[k:])
+        if distance >= self.height:
+            # 发散点已经滚出可视区（或单行软换行就比屏幕高），擦不到了。
+            return False
+        if distance:
+            self._write(f"\x1b[{distance}A")
+        self._write("\r\x1b[J")
+        tail = new[k:]
+        if not tail:
+            # 消息缩短了：擦掉之后没有要写的。
+            self._commit_delta_state(new, None)
+            return True
+        if len(tail) > 1:
+            self._write("\n".join(tail[:-1]) + "\n")
+        self._write(tail[-1])  # 最后一行不收换行：下次增量还能原地改写
+        self._commit_delta_state(new, tail[-1])
+        return True
+
+    def _commit_delta_state(self, new: List[str], open_line: Optional[str]) -> None:
+        """增量续写成功后更新账本。"""
+        self._last_lines = new
+        self._open_line = open_line
+        self._last_line_count = self._visual_rows(new) + (1 if self._last_leading_blank else 0)
+        self._last_printed_width = self.width
+
     def print_plain(self, text: str = "") -> None:
         """打印一行普通文本（提示、警告等），并让下一次原地重绘失效。"""
+        self._close_open_line()
         self._write(text + "\n")
         self.invalidate()
 

@@ -19,8 +19,10 @@ import io
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from xgent_app import cli_bridge
+import xgent_app.cli_render as cli_render
 from xgent_app.cli_render import (
     MessageRenderer,
     Palette,
@@ -179,6 +181,147 @@ class TerminalScreenTests(unittest.TestCase):
         stream.truncate(0), stream.seek(0)
         screen.update_block(["y"], 3)
         self.assertIn("\x1b[4A", stream.getvalue())
+
+    # -- 超高块的增量续写 ----------------------------------------------
+    # 复现"长回复刷屏"的形状：块比屏幕高时，流式编辑每 0.35 秒带累计全文
+    # 来一次，整块重画不可行（顶部已滚出可视区），也不能退化成整块追加
+    # （那就是同一条消息刷出 N 份递增拷贝）。期望的行为是只追加新增的行、
+    # 原地改写最后一行。
+
+    def make_tall_screen(self, height=8):
+        stream = io.StringIO()
+        stream.isatty = lambda: True  # type: ignore[attr-defined]
+        patcher = mock.patch.object(cli_render, "terminal_size",
+                                    return_value=(40, height))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return TerminalScreen(stream=stream, color=True, width=40), stream
+
+    def test_tall_block_streams_incrementally(self):
+        screen, stream = self.make_tall_screen()
+        first = [f"line{i}" for i in range(12)]  # 12 行 > 屏高 8
+        screen.print_block(first, message_id=7)
+        stream.truncate(0), stream.seek(0)
+
+        # 追加 3 行：只写新增部分，旧行一个字都不重打。
+        second = first + ["line12", "line13", "line14"]
+        self.assertTrue(screen.update_block(second, 7))
+        written = stream.getvalue()
+        self.assertIn("line14", written)
+        self.assertNotIn("line0", written)
+
+        # 最后一行被延长：擦掉这一行自身重写，前面的行不动。
+        stream.truncate(0), stream.seek(0)
+        third = second[:-1] + [second[-1] + " 续写"]
+        self.assertTrue(screen.update_block(third, 7))
+        written = stream.getvalue()
+        self.assertIn("line14 续写", written)
+        self.assertNotIn("line0", written)
+
+    def test_tall_block_grows_in_middle_with_stable_suffix(self):
+        """真实消息块的形状：头（横线标题）尾（键位提示+横线）稳定，正文
+        在中部末尾增长。纯前缀 diff 会把稳定尾行误判成"被改写"，必须双向
+        diff 才能把重写范围缩到发散点之后。
+        """
+        screen, stream = self.make_tall_screen(height=40)
+        head = ["── 标题", "正文一"]
+        suffix = ["", "⌃C  中断回答", "──"]
+        body = [f"内容行{i}" for i in range(45)]  # 整块远超屏高 40
+        screen.print_block(head + body + suffix, message_id=7)
+        stream.truncate(0), stream.seek(0)
+
+        # 正文末尾（后缀之前）新增一行：只重写发散点之后的几行。
+        grown = head + body + ["新内容行"] + suffix
+        self.assertTrue(screen.update_block(grown, 7))
+        written = stream.getvalue()
+        self.assertIn("新内容行", written)
+        self.assertIn("⌃C  中断回答", written)  # 后缀在发散区内，跟着重写一遍
+        self.assertNotIn("── 标题", written)    # 头部不重打
+        self.assertNotIn("内容行0", written)     # 已滚出屏幕的旧行不重打
+        # 上移距离只是发散区那几行（空行 + 提示 + 横线），不是整块；正文
+        # 最后一行是公共前缀，也不重写。
+        self.assertIn("\x1b[3A", written)
+        self.assertNotIn("内容行44", written)
+
+    def test_tall_block_update_leaves_line_open(self):
+        screen, stream = self.make_tall_screen()
+        screen.print_block([f"行{i}" for i in range(12)], message_id=7)
+        screen.update_block([f"行{i}" for i in range(12)] + ["新行"], 7)
+        # 最后一行保持"开放"（没写换行符），后续输出会先补上换行再起行。
+        self.assertEqual(screen._open_line, "新行")
+
+    def test_tall_block_open_line_closed_by_next_print(self):
+        screen, stream = self.make_tall_screen()
+        screen.print_block([f"行{i}" for i in range(12)], message_id=7)
+        screen.update_block([f"行{i}" for i in range(12)] + ["新行"], 7)
+        stream.truncate(0), stream.seek(0)
+
+        screen.print_plain("提示")
+        written = stream.getvalue()
+        # 先收掉开放行（补换行），提示才能从新的一行开始，不会粘在行尾。
+        self.assertTrue(written.startswith("\n"))
+        self.assertIn("\n提示\n", written)
+
+    def test_tall_block_revision_falls_back_to_full_append(self):
+        screen, _stream = self.make_tall_screen()
+        screen.print_block([f"旧{i}" for i in range(12)], message_id=7)
+        # 正文从中途改写（不只是尾部延长），增量接不上：让调用方整块追加。
+        self.assertFalse(screen.update_block([f"新{i}" for i in range(14)], 7))
+
+    def test_tall_block_single_overlong_line_falls_back(self):
+        screen, _stream = self.make_tall_screen(height=8)
+        # 单行软换行后就比屏幕高，擦除照样越界，只能整块追加。
+        screen.print_block(["x" * 400], message_id=7)
+        self.assertFalse(screen.update_block(["x" * 400 + "y"], 7))
+
+    def test_tall_block_shrink_by_one_line(self):
+        screen, stream = self.make_tall_screen()
+        old = [f"行{i}" for i in range(12)]
+        screen.print_block(old, message_id=7)
+        stream.truncate(0), stream.seek(0)
+        # 消息恰好缩短一行：擦掉旧行，没有新内容要写，也不崩。
+        self.assertTrue(screen.update_block(old[:-1], 7))
+
+    def test_tall_block_pure_append_keeps_open_line_content(self):
+        """开放行原样定稿、后面接新行：纯追加不能擦屏，否则开放行内容丢失。"""
+        screen, stream = self.make_tall_screen()
+        old = [f"行{i}" for i in range(12)]
+        screen.print_block(old, message_id=7)
+        screen.update_block(old + ["新行"], 7)  # 此后 "新行" 是开放行
+        stream.truncate(0), stream.seek(0)
+
+        newer = old + ["新行", "又一新行"]
+        self.assertTrue(screen.update_block(newer, 7))
+        written = stream.getvalue()
+        # 不擦不挪：只收掉开放行、接上新增的行。
+        self.assertEqual("\n又一新行", written)
+        self.assertNotIn("\x1b[", written)
+
+    def test_tall_block_shrunk_back_to_fit_redraws_aligned(self):
+        """块缩回屏幕内之后再整块重画：上移距离要按当前账本算，不能错位。"""
+        screen, stream = self.make_tall_screen(height=40)
+        old = [f"行{i}" for i in range(39)]  # 计 40 行 ≥ 屏高 40 → 增量模式
+        screen.print_block(old, message_id=7)
+        # 缩到 37 行（尾部擦 2 行），账本变成 38 行 < 屏高：下次走整块重画。
+        self.assertTrue(screen.update_block(old[:-2], 7))
+        stream.truncate(0), stream.seek(0)
+
+        self.assertTrue(screen.update_block(["新0", "新1", "新2"], 7))
+        written = stream.getvalue()
+        # 37 行正文 + 1 前置空行 = 上移 38 行到块顶，\r 归零列再清屏重画。
+        self.assertIn("\x1b[38A", written)
+        self.assertIn("\r\x1b[J", written)
+        self.assertIn("新0", written)
+
+    def test_fitting_block_still_redraws_in_place(self):
+        screen, stream = self.make_tall_screen(height=30)
+        screen.print_block(["a", "b"], message_id=7)
+        stream.truncate(0), stream.seek(0)
+        self.assertTrue(screen.update_block(["a", "b", "c"], 7))
+        # 整块可见时仍是上移整块重画（任意改写都能表达）。
+        written = stream.getvalue()
+        self.assertIn("\x1b[3A", written)
+        self.assertIn("\x1b[J", written)
 
 
 class CliBotRenderTests(unittest.TestCase):
