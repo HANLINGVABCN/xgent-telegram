@@ -49,16 +49,17 @@
     --warn:        #F59E0B;
     --warn-soft:   rgba(245, 158, 11, 0.10);
 
-    /* 代码与终端配色 */
-    --code-bg:     #0F172A;
+    /* 代码与终端配色 (亮色模式采用高质感深色代码工作台，永不发白消失) */
+    --code-bg:     #1E293B;
+    --code-header: #0F172A;
     --code-fg:     #F8FAFC;
-    --code-line:   rgba(255, 255, 255, 0.08);
-    --code-header: #1E293B;
+    --code-line:   rgba(255, 255, 255, 0.10);
+    --code-border: rgba(15, 23, 42, 0.15);
 
     /* 气泡样式 */
     --ai-bg:       #FFFFFF;
-    --ai-line:     rgba(15, 23, 42, 0.07);
-    --ai-shadow:   0 2px 8px rgba(15, 23, 42, 0.04), 0 1px 2px rgba(15, 23, 42, 0.02);
+    --ai-line:     rgba(15, 23, 42, 0.08);
+    --ai-shadow:   0 2px 10px rgba(15, 23, 42, 0.04), 0 1px 3px rgba(15, 23, 42, 0.02);
 
     --scroll:      rgba(15, 23, 42, 0.16);
     --scroll-h:    rgba(15, 23, 42, 0.32);
@@ -109,10 +110,11 @@
     --warn:        #FBBF24;
     --warn-soft:   rgba(251, 191, 36, 0.12);
 
-    --code-bg:     #0A0D14;
+    --code-bg:     #0B0E14;
+    --code-header: #141923;
     --code-fg:     #E2E8F0;
     --code-line:   rgba(255, 255, 255, 0.07);
-    --code-header: #141824;
+    --code-border: rgba(255, 255, 255, 0.08);
 
     --ai-bg:       #131622;
     --ai-line:     rgba(255, 255, 255, 0.065);
@@ -162,7 +164,7 @@
     padding: env(safe-area-inset-top) 12px 0 10px;
     flex-shrink: 0; z-index: 20;
     display: flex; align-items: center; gap: 6px;
-    background: color-mix(in srgb, var(--surface) 80%, transparent);
+    background: color-mix(in srgb, var(--surface) 82%, transparent);
     border-bottom: 1px solid var(--line);
     backdrop-filter: blur(24px) saturate(180%);
     -webkit-backdrop-filter: blur(24px) saturate(180%);
@@ -298,7 +300,7 @@
   .msg-row.sys { justify-content: center; margin: 16px auto; }
   .msg-row.token { justify-content: flex-start; margin: 6px auto 14px; }
 
-  /* 气泡通用 */
+  /* 气泡通用：必须 position: relative 以便动作栏精准定位在气泡上 */
   .bubble {
     position: relative; min-width: 0;
     word-wrap: break-word; overflow-wrap: anywhere;
@@ -322,14 +324,14 @@
 
   .bubble-header {
     display: flex; align-items: center; justify-content: space-between;
-    gap: 8px; margin-bottom: 6px; padding-bottom: 6px;
+    gap: 8px; margin-bottom: 8px; padding-bottom: 6px;
     border-bottom: 1px solid var(--line); font-size: 12px; color: var(--text-3);
   }
   .bubble.user .bubble-header { display: none; }
   .bubble-author { display: flex; align-items: center; gap: 6px; font-weight: 600; color: var(--text-2); }
   .bubble-author-icon {
     width: 16px; height: 16px; border-radius: 4px; background: var(--grad);
-    display: flex; align-items: center; justify-content: center; color: #fff; font-size: 10px;
+    display: flex; align-items: center; justify-content: center; color: #fff; font-size: 10px; font-weight: 700;
   }
 
   .bubble .ts {
@@ -341,34 +343,35 @@
   .bubble .body > :first-child { margin-top: 0 !important; }
   .bubble .body > :last-child { margin-bottom: 0 !important; }
 
-  /* 悬浮消息操作栏 */
-  .msg-actions {
-    position: absolute; right: 8px; top: -14px; z-index: 4;
+  /* 气泡专属悬浮操作栏（精确附着在气泡右上角，绝不串行错位） */
+  .bubble .msg-actions {
+    position: absolute; right: 8px; top: -12px; z-index: 8;
     display: flex; align-items: center; gap: 2px;
     background: var(--surface); border: 1px solid var(--line-2);
-    border-radius: var(--r-full); padding: 3px 5px;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+    border-radius: var(--r-full); padding: 2px 4px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.16);
     opacity: 0; transform: translateY(4px) scale(0.95); pointer-events: none;
     transition: opacity var(--t), transform var(--t);
   }
-  .msg-row.ai:hover .msg-actions, .msg-actions:focus-within {
+  .bubble:hover .msg-actions, .bubble .msg-actions:focus-within {
     opacity: 1; transform: translateY(0) scale(1); pointer-events: auto;
   }
   .act-btn {
-    width: 26px; height: 26px; border-radius: var(--r-full);
+    width: 24px; height: 24px; border-radius: var(--r-full);
     border: none; background: transparent; color: var(--text-3);
     display: flex; align-items: center; justify-content: center; cursor: pointer;
     transition: background var(--t), color var(--t);
   }
   .act-btn:hover { background: var(--surface-2); color: var(--accent); }
   .act-btn.done { color: var(--ok) !important; }
-  .act-btn .icon { width: 13.5px; height: 13.5px; }
+  .act-btn .icon { width: 13px; height: 13px; }
 
   /* ---- Markdown 排版引擎与增强 ---- */
   .bubble h1, .bubble h2, .bubble h3, .bubble h4 {
     color: var(--text); font-weight: 650; letter-spacing: -0.015em;
     margin: 14px 0 6px; line-height: 1.35;
   }
+  .bubble.user h1, .bubble.user h2, .bubble.user h3, .bubble.user h4 { color: #FFFFFF; }
   .bubble h1 { font-size: 18px; border-bottom: 1px solid var(--line); padding-bottom: 4px; }
   .bubble h2 { font-size: 16.5px; }
   .bubble h3 { font-size: 15px; }
@@ -377,23 +380,28 @@
   .bubble li { margin: 3px 0; }
   .bubble hr { border: none; border-top: 1px dashed var(--line-2); margin: 14px 0; }
 
-  /* 表格 */
+  /* 表格系统：自适应容器与高对比度配色 */
   .table-wrap {
-    width: 100%; overflow-x: auto; margin: 10px 0;
-    border: 1px solid var(--line); border-radius: var(--r-md);
+    width: 100%; overflow-x: auto; margin: 12px 0;
+    border: 1px solid var(--line-2); border-radius: var(--r-md);
+    background: var(--surface);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
   }
   .bubble table {
     width: 100%; border-collapse: collapse; font-size: 13.5px; text-align: left;
+    color: var(--text);
   }
   .bubble th {
-    background: var(--surface-2); color: var(--text-2); font-weight: 600;
-    padding: 8px 12px; border-bottom: 1px solid var(--line); white-space: nowrap;
+    background: var(--surface-2); color: var(--text); font-weight: 650;
+    padding: 9px 13px; border-bottom: 1.5px solid var(--line-2); white-space: nowrap;
   }
   .bubble td {
-    padding: 8px 12px; border-bottom: 1px solid var(--line); color: var(--text);
+    padding: 8px 13px; border-bottom: 1px solid var(--line); color: var(--text);
+  }
+  .bubble tr:nth-child(even) td {
+    background: color-mix(in srgb, var(--surface-2) 45%, transparent);
   }
   .bubble tr:last-child td { border-bottom: none; }
-  .bubble tr:nth-child(even) td { background: color-mix(in srgb, var(--surface-2) 40%, transparent); }
 
   /* 任务列表 */
   .task-item { list-style: none; margin-left: -18px; display: flex; align-items: baseline; gap: 7px; }
@@ -417,21 +425,23 @@
   }
 
   /* 行内代码 */
-  .bubble code {
+  .bubble :not(pre) > code {
     background: var(--surface-2); border: 1px solid var(--line);
     padding: 0.15em 0.45em; border-radius: var(--r-xs);
     font: 12.5px var(--mono); letter-spacing: 0; color: var(--accent);
   }
-  .bubble.user code { background: rgba(0, 0, 0, 0.24); border-color: rgba(255, 255, 255, 0.18); color: #FFF; }
+  .bubble.user :not(pre) > code {
+    background: rgba(0, 0, 0, 0.24); border-color: rgba(255, 255, 255, 0.18); color: #FFF;
+  }
   .bubble a { color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--accent-ring); transition: border-color var(--t); }
   .bubble a:hover { border-bottom-color: currentColor; }
   .bubble.user a { color: #fff; border-bottom-color: rgba(255, 255, 255, 0.5); }
 
-  /* ---- 专业代码块工作台 ---- */
+  /* ---- 专业代码块工作台（双模态统一沉浸深色卡片，永不隐形） ---- */
   .code-block-wrap {
-    margin: 10px 0; border-radius: var(--r-md); overflow: hidden;
-    background: var(--code-bg); border: 1px solid var(--code-line);
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+    margin: 12px 0; border-radius: var(--r-md); overflow: hidden;
+    background: var(--code-bg); border: 1px solid var(--code-border);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
   }
   .code-header {
     display: flex; align-items: center; justify-content: space-between;
@@ -449,20 +459,26 @@
   .code-actions { display: flex; align-items: center; gap: 6px; }
   .code-btn {
     display: inline-flex; align-items: center; gap: 4px;
-    background: rgba(255, 255, 255, 0.06); color: #CBD5E1;
-    border: 1px solid rgba(255, 255, 255, 0.1); border-radius: var(--r-xs);
+    background: rgba(255, 255, 255, 0.08); color: #CBD5E1;
+    border: 1px solid rgba(255, 255, 255, 0.12); border-radius: var(--r-xs);
     padding: 3px 8px; font: 500 11px var(--font); cursor: pointer;
     transition: background var(--t), color var(--t), border-color var(--t);
   }
-  .code-btn:hover { background: rgba(255, 255, 255, 0.14); color: #FFF; border-color: rgba(255, 255, 255, 0.2); }
+  .code-btn:hover { background: rgba(255, 255, 255, 0.18); color: #FFF; border-color: rgba(255, 255, 255, 0.25); }
   .code-btn.done { color: var(--ok); border-color: var(--ok); }
   .code-btn .icon { width: 12px; height: 12px; }
 
+  /* 独立 pre 标签样式（防止任何历史遗留或第三方 pre 丢失格式） */
   .bubble pre {
-    background: transparent; color: var(--code-fg);
-    padding: 12px 14px; margin: 0; overflow-x: auto;
+    background: var(--code-bg); color: var(--code-fg);
+    border: 1px solid var(--code-border); border-radius: var(--r-md);
+    padding: 12px 14px; margin: 10px 0; overflow-x: auto;
     font: 13px/1.65 var(--mono); letter-spacing: 0;
     white-space: pre; tab-size: 2;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+  }
+  .code-block-wrap pre {
+    margin: 0; border: none; border-radius: 0; box-shadow: none;
   }
   .bubble pre.wrapped { white-space: pre-wrap; word-break: break-all; }
   .bubble pre code { background: transparent; border: none; padding: 0; color: inherit; font-size: inherit; }
@@ -470,8 +486,8 @@
   /* 语法高亮 token */
   .hl-kwd { color: #C084FC; font-weight: 600; }
   .hl-str { color: #34D399; }
-  .hl-num { color: #F59E0B; }
-  .hl-cmt { color: #64748B; font-style: italic; }
+  .hl-num { color: #FBBF24; }
+  .hl-cmt { color: #94A3B8; font-style: italic; }
   .hl-fn  { color: #60A5FA; }
   .hl-typ { color: #38BDF8; font-weight: 550; }
   .hl-op  { color: #F472B6; }
@@ -1353,9 +1369,9 @@
     B:1, STRONG:1, I:1, EM:1, U:1, INS:1, S:1, STRIKE:1, DEL:1, CODE:1, PRE:1, BR:1, A:1, BLOCKQUOTE:1,
     TABLE:1, THEAD:1, TBODY:1, TR:1, TH:1, TD:1, DIV:1, SPAN:1, H1:1, H2:1, H3:1, H4:1, UL:1, OL:1, LI:1, HR:1
   };
-  function sanitizeHtml(html) {
+  function sanitizeHtml(htmlStr) {
     var tmp = document.createElement("div");
-    tmp.innerHTML = String(html);
+    tmp.innerHTML = String(htmlStr);
     (function clean(node) {
       Array.prototype.slice.call(node.childNodes).forEach(function (c) {
         if (c.nodeType === 3) return;
@@ -1383,34 +1399,66 @@
   }
 
   function renderMarkdownTable(text) {
-    return text.replace(/((?:^|\n)\|[^\n]+\|\r?\n\|[-: |]+\|\r?\n(?:\|[^\n]+\|\r?\n?)+)/g, function (match) {
-      var lines = match.trim().split("\n");
-      if (lines.length < 3) return match;
-      var headers = lines[0].split("|").slice(1, -1).map(function(s){ return s.trim(); });
-      var html = '<div class="table-wrap"><table><thead><tr>';
-      headers.forEach(function (h) { html += '<th>' + h + '</th>'; });
-      html += '</tr></thead><tbody>';
-      for (var i = 2; i < lines.length; i++) {
-        var cells = lines[i].split("|").slice(1, -1).map(function(s){ return s.trim(); });
-        html += '<tr>';
-        cells.forEach(function (c) { html += '<td>' + c + '</td>'; });
-        html += '</tr>';
+    var lines = text.split("\n");
+    var out = [];
+    var i = 0;
+    var n = lines.length;
+
+    function isTableRow(line) {
+      var trimmed = line.trim();
+      return trimmed.indexOf("|") >= 0 && trimmed.length > 2;
+    }
+    function isSepRow(line) {
+      var trimmed = line.trim();
+      var stripped = trimmed.replace(/[|:\-\s]/g, "");
+      return stripped === "" && trimmed.indexOf("-") >= 0 && trimmed.indexOf("|") >= 0;
+    }
+    function splitCells(line) {
+      var trimmed = line.trim();
+      if (trimmed.startsWith("|")) trimmed = trimmed.substring(1);
+      if (trimmed.endsWith("|")) trimmed = trimmed.substring(0, trimmed.length - 1);
+      return trimmed.split("|").map(function(s){ return s.trim(); });
+    }
+
+    while (i < n) {
+      if (isTableRow(lines[i]) && i + 1 < n && isSepRow(lines[i + 1])) {
+        var headerCells = splitCells(lines[i]);
+        var tableHtml = '<div class="table-wrap"><table><thead><tr>';
+        headerCells.forEach(function (h) { tableHtml += '<th>' + h + '</th>'; });
+        tableHtml += '</tr></thead><tbody>';
+        i += 2;
+        while (i < n && isTableRow(lines[i])) {
+          var rowCells = splitCells(lines[i]);
+          tableHtml += '<tr>';
+          for (var c = 0; c < headerCells.length; c++) {
+            tableHtml += '<td>' + (rowCells[c] != null ? rowCells[c] : '') + '</td>';
+          }
+          tableHtml += '</tr>';
+          i++;
+        }
+        tableHtml += '</tbody></table></div>';
+        out.push(tableHtml);
+      } else {
+        out.push(lines[i]);
+        i++;
       }
-      html += '</tbody></table></div>';
-      return html;
-    });
+    }
+    return out.join("\n");
   }
 
   function renderText(text, parseMode) {
     text = text == null ? "" : String(text);
     if (parseMode && String(parseMode).toUpperCase().indexOf("HTML") >= 0) {
-      return sanitizeHtml(text.replace(/\n/g, "<br>"));
+      var sanitized = sanitizeHtml(text);
+      sanitized = sanitized.replace(/(<\/blockquote>|<\/pre>|<\/div>|<\/table>)\n+/g, "$1");
+      sanitized = sanitized.replace(/\n(?![^<]*>)/g, "<br>");
+      return sanitized;
     }
 
     var codeBlocks = [];
     var processed = text.replace(/```([a-zA-Z0-9_+#.-]*)\n?([\s\S]*?)```/g, function (_, lang, code) {
       var id = "%%CODE_BLOCK_" + codeBlocks.length + "%%";
-      codeBlocks.push({ lang: lang || "text", code: code.replace(/^\n+/, "").replace(/\n+$/, "") });
+      codeBlocks.push({ lang: (lang || "text").trim(), code: code.replace(/^\n+/, "").replace(/\n+$/, "") });
       return id;
     });
 
@@ -1430,9 +1478,10 @@
     out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
     out = out.replace(/\n/g, "<br>");
     out = out.replace(/(?:<br>\s*)+<blockquote>/g, "<blockquote>").replace(/<\/blockquote>(?:\s*<br>)+/g, "</blockquote>");
+    out = out.replace(/(?:<br>\s*)+<div class="table-wrap">/g, '<div class="table-wrap">').replace(/<\/table><\/div>(?:\s*<br>)+/g, '</table></div>');
 
     codeBlocks.forEach(function (item, idx) {
-      var langLabel = item.lang.toUpperCase();
+      var langLabel = item.lang.toUpperCase() || "CODE";
       var highlighted = highlightCode(item.code, item.lang);
       var blockHtml = '<div class="code-block-wrap">' +
         '<div class="code-header">' +
@@ -1478,25 +1527,53 @@
     btn._t = setTimeout(function () { btn.innerHTML = old; btn.classList.remove("done"); }, 1400);
   }
 
-  function initCodeBlockFeatures(container) {
-    var wraps = container.querySelectorAll(".code-block-wrap");
-    Array.prototype.forEach.call(wraps, function (wrap) {
-      if (wrap._inited) return;
-      wrap._inited = true;
-      var pre = wrap.querySelector("pre");
-      var code = wrap.querySelector("code");
+  function enhanceBubbleContent(container) {
+    var pres = container.querySelectorAll("pre");
+    Array.prototype.forEach.call(pres, function (pre) {
+      if (pre.dataset.enhanced === "1") return;
+      pre.dataset.enhanced = "1";
+
+      var wrap = pre.closest(".code-block-wrap");
+      if (!wrap) {
+        wrap = document.createElement("div");
+        wrap.className = "code-block-wrap";
+        pre.parentNode.insertBefore(wrap, pre);
+
+        var codeTag = pre.querySelector("code");
+        var rawCode = codeTag ? codeTag.textContent : pre.textContent;
+        var lang = "CODE";
+        if (codeTag && codeTag.className) {
+          var lm = /language-([a-zA-Z0-9_+#.-]+)/.exec(codeTag.className);
+          if (lm) lang = lm[1];
+        }
+
+        var header = document.createElement("div");
+        header.className = "code-header";
+        header.innerHTML = '<span class="code-lang">' + escapeHtml(lang.toUpperCase()) + '</span>' +
+          '<div class="code-actions">' +
+            '<button class="code-btn btn-wrap" type="button" title="切换自动换行">' + svgIcon("wrap") + '<span>换行</span></button>' +
+            '<button class="code-btn btn-copy" type="button" title="复制代码">' + svgIcon("copy") + '<span>复制</span></button>' +
+          '</div>';
+
+        pre.innerHTML = '<code>' + highlightCode(rawCode, lang) + '</code>';
+        wrap.appendChild(header);
+        wrap.appendChild(pre);
+      }
+
+      var code = pre.querySelector("code") || pre;
       var btnCopy = wrap.querySelector(".btn-copy");
       var btnWrap = wrap.querySelector(".btn-wrap");
 
-      if (btnCopy) {
+      if (btnCopy && !btnCopy._bound) {
+        btnCopy._bound = true;
         btnCopy.addEventListener("click", function (e) {
           e.stopPropagation();
-          var text = code ? code.textContent : pre.textContent;
-          copyText(text).then(function () { flashCopied(btnCopy, true); })
-                        .catch(function () { toast("复制失败，请手动选中"); });
+          copyText(code.textContent).then(function () { flashCopied(btnCopy, true); })
+                                   .catch(function () { toast("复制失败，请手动选中"); });
         });
       }
-      if (btnWrap) {
+      if (btnWrap && !btnWrap._bound) {
+        btnWrap._bound = true;
         btnWrap.addEventListener("click", function (e) {
           e.stopPropagation();
           pre.classList.toggle("wrapped");
@@ -1564,7 +1641,7 @@
     var body = document.createElement("div");
     body.className = "body";
     body.innerHTML = renderText(text, parseMode);
-    initCodeBlockFeatures(body);
+    enhanceBubbleContent(body);
 
     var ts = document.createElement("span");
     ts.className = "ts";
@@ -1573,26 +1650,30 @@
     bubble.appendChild(body);
     bubble.appendChild(ts);
 
+    // 将快捷操作栏直接挂在气泡右上角，确保绝对对齐且目标精准
+    var actBar = document.createElement("div");
+    actBar.className = "msg-actions";
+
+    var btnCp = document.createElement("button");
+    btnCp.className = "act-btn";
+    btnCp.type = "button";
+    btnCp.title = "复制全文";
+    btnCp.innerHTML = svgIcon("copy");
+    btnCp.addEventListener("click", function (e) {
+      e.stopPropagation();
+      copyText(body.innerText).then(function () { flashCopied(btnCp, false); })
+                              .catch(function () { toast("复制失败"); });
+    });
+    actBar.appendChild(btnCp);
+
     if (role === "ai") {
-      var actBar = document.createElement("div");
-      actBar.className = "msg-actions";
-
-      var btnCp = document.createElement("button");
-      btnCp.className = "act-btn";
-      btnCp.type = "button";
-      btnCp.title = "复制全文";
-      btnCp.innerHTML = svgIcon("copy");
-      btnCp.addEventListener("click", function () {
-        copyText(body.innerText).then(function () { flashCopied(btnCp, false); })
-                                .catch(function () { toast("复制失败"); });
-      });
-
       var btnQt = document.createElement("button");
       btnQt.className = "act-btn";
       btnQt.type = "button";
       btnQt.title = "引用回复";
       btnQt.innerHTML = svgIcon("quote");
-      btnQt.addEventListener("click", function () {
+      btnQt.addEventListener("click", function (e) {
+        e.stopPropagation();
         var snippet = body.innerText.split("\n").slice(0, 3).join("\n");
         input.value = "> " + snippet + "\n\n" + input.value;
         input.focus();
@@ -1604,15 +1685,15 @@
       btnSpk.type = "button";
       btnSpk.title = "朗读消息";
       btnSpk.innerHTML = svgIcon("speaker");
-      btnSpk.addEventListener("click", function () {
+      btnSpk.addEventListener("click", function (e) {
+        e.stopPropagation();
         speakText(body.innerText, btnSpk);
       });
 
-      actBar.appendChild(btnCp);
       actBar.appendChild(btnQt);
       actBar.appendChild(btnSpk);
-      row.appendChild(actBar);
     }
+    bubble.appendChild(actBar);
 
     var btns = null;
     if (markup && markup.length) {
@@ -1624,7 +1705,7 @@
     log.appendChild(row);
     if (stick) scrollDown();
 
-    var entry = { row: row, body: body, btns: btns, rawText: text };
+    var entry = { row: row, body: body, bubble: bubble, btns: btns, rawText: text };
     if (messageId != null) byMessageId[messageId] = entry;
     if (role === "ai") lastStreamEntry = entry;
     return entry;
@@ -1769,7 +1850,7 @@
       row.appendChild(bubble);
       log.appendChild(row);
       if (stick) scrollDown();
-      entry = { row: row, body: bubble, btns: null };
+      entry = { row: row, body: bubble, bubble: bubble, btns: null };
     } else {
       row.className = "msg-row sys";
       var pill = document.createElement("div");
@@ -1781,7 +1862,7 @@
       row.appendChild(pill);
       log.appendChild(row);
       if (stick) scrollDown();
-      entry = { row: row, body: pill, btns: null };
+      entry = { row: row, body: pill, bubble: pill, btns: null };
     }
     if (messageId != null) byMessageId[messageId] = entry;
     return entry;
@@ -1848,7 +1929,7 @@
       if (!e && (frame.message_id == null)) e = lastStreamEntry;
       if (e) {
         e.body.innerHTML = renderText(frame.text, frame.parse_mode);
-        initCodeBlockFeatures(e.body);
+        enhanceBubbleContent(e.body);
         if (frame.reply_markup !== undefined) setButtons(e, frame.reply_markup, frame.message_id);
       } else {
         makeBubble("ai", frame.text, frame.message_id, frame.parse_mode, frame.reply_markup);
@@ -1946,7 +2027,8 @@
   function loadHistory() {
     historyGen++;
     var gen = historyGen;
-    return api("/api/history?limit=50").then(function (data) {
+    // 调大 limit 至后端支持的最大值 200，保证会话窗口内的完整历史不被截断
+    return api("/api/history?limit=200").then(function (data) {
       if (gen !== historyGen) return;
       log.innerHTML = "";
       byMessageId = {};
@@ -1966,11 +2048,11 @@
   }
 
   var MEDIA_PATH_PATTERNS = [
-    { re: /已保存到 (\/[^\s，。；)）]+)/, side: "user", replace: true, caption: /说明：([\s\S]*)$/ },
-    { re: /已自动存入 (\/[^\s，。；)）】]+)/, side: "ai", replace: true, caption: /^([\s\S]*)$/ },
-    { re: /已发送服务器文件给用户[:：]\s*(\/[^\s(（]+)\s*[(（]/, side: "ai", replace: true },
-    { re: /已写入服务器文件[:：]\s*(\/[^\s(（]+)\s*[(（]/, side: "ai", replace: true },
-    { re: /服务器文件路径[:：]\s*(\/[^\s(（]+)/, side: "ai", replace: true }
+    { re: /已保存到 (\/[^\s，。；)）]+)/, side: "user", replace: false, caption: /说明：([\s\S]*)$/ },
+    { re: /已自动存入 (\/[^\s，。；)）】]+)/, side: "ai", replace: false, caption: /^([\s\S]*)$/ },
+    { re: /已发送服务器文件给用户[:：]\s*(\/[^\s(（]+)\s*[(（]/, side: "ai", replace: false },
+    { re: /已写入服务器文件[:：]\s*(\/[^\s(（]+)\s*[(（]/, side: "ai", replace: false },
+    { re: /服务器文件路径[:：]\s*(\/[^\s(（]+)/, side: "ai", replace: false }
   ];
   function extractMediaFromText(text) {
     text = String(text == null ? "" : text);
@@ -2014,13 +2096,7 @@
   }
 
   function restoreMediaFromHistory(m, role, media) {
-    var target = null;
-    if (media.replace) {
-      target = makeBubble(role, m.content, null, m.parse_mode);
-    } else {
-      var stripped = String(m.content).replace(/【系统自动生成：[^】]+】/g, "").trim();
-      if (stripped) target = makeBubble(role, stripped, null, m.parse_mode);
-    }
+    var target = makeBubble(role, m.content, null, m.parse_mode);
     upgradeBubbleMedia(target, m.content);
   }
 
