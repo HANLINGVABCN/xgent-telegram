@@ -1792,7 +1792,11 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 if fetch_error:
                     await query.message.reply_text(f"⚠️ 模型列表获取失败。\n\n{fetch_error}")
                 else:
-                    await query.message.reply_text("⚠️ 接口请求成功，但没有返回可用的生成模型。")
+                    await query.message.reply_text(
+                        "⚠️ 接口请求成功，但提供商未返回任何模型。\n\n"
+                        "💡 提示：部分代理商/中继未开放 models 列表接口。\n"
+                        "您可以点击『➕ 手写』直接手动添加模型名称（如 gpt-4o / deepseek-chat / claude-3-5-sonnet）。"
+                    )
                 return
             UserDataManager.set('fetched_cache', models)
             UserDataManager.set('temp_page', 1)
