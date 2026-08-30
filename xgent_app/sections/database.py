@@ -410,10 +410,11 @@ class BotMemoryDB:
         同款的状态行"✅ Agent · N 个操作已完成"，刷新前后观感一致。
         """
         conn = await self._get_conn()
+        sql_limit = limit if limit > 0 else -1
         cursor = await conn.execute('''
             SELECT role, content, timestamp, msg_type FROM global_messages
             ORDER BY timestamp DESC LIMIT ?
-        ''', (limit,))
+        ''', (sql_limit,))
         rows = await cursor.fetchall()
 
         result = []

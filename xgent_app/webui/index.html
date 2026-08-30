@@ -2027,8 +2027,8 @@
   function loadHistory() {
     historyGen++;
     var gen = historyGen;
-    // 调大 limit 至后端支持的最大值 200，保证会话窗口内的完整历史不被截断
-    return api("/api/history?limit=200").then(function (data) {
+    // 请求全量历史消息（无条数上限，加载完整历史）
+    return api("/api/history?limit=0").then(function (data) {
       if (gen !== historyGen) return;
       log.innerHTML = "";
       byMessageId = {};
