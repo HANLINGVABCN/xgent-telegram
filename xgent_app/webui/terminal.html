@@ -29,28 +29,24 @@
     --warn:      #F0B429;
     --r-xs: 7px;  --r-sm: 10px; --r-md: 13px; --r-lg: 17px; --r-xl: 22px; --r-full: 999px;
     --header-h: 52px;
+    --keybar-h: 40px;
     --ease: cubic-bezier(.2, .8, .2, 1);
     --t: .16s var(--ease);
-    --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text",
-            "Segoe UI", Inter, "PingFang SC", "HarmonyOS Sans SC", "MiSans",
-            "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo,
-            Consolas, "Liberation Mono", monospace;
+    --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
+    --mono: "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
   }
-  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; margin: 0; padding: 0; }
   html, body {
-    margin: 0; height: 100%; overflow: hidden;
+    height: 100%; overflow: hidden; width: 100%;
     background: var(--bg); color: var(--text);
-    font-family: var(--font); font-size: 15px; letter-spacing: -.006em;
+    font-family: var(--font); font-size: 14px;
     -webkit-font-smoothing: antialiased;
   }
   ::selection { background: var(--accent-ring); }
 
-  /* 描边属性写在 <svg> 上：stroke / fill 可继承，能穿进 <use> 的影子树，
-     而 `.icon path {…}` 这类后代选择器选不到影子树里的节点。 */
   .icon {
-    width: 19px; height: 19px; display: block; flex-shrink: 0;
-    fill: none; stroke: currentColor; stroke-width: 1.7;
+    width: 18px; height: 18px; display: block; flex-shrink: 0;
+    fill: none; stroke: currentColor; stroke-width: 1.8;
     stroke-linecap: round; stroke-linejoin: round;
   }
 
@@ -58,154 +54,148 @@
   #bar {
     position: absolute; top: 0; left: 0; right: 0; z-index: 4;
     height: calc(var(--header-h) + env(safe-area-inset-top));
-    padding: env(safe-area-inset-top) 8px 0 6px;
-    display: flex; align-items: center; gap: 3px;
+    padding: env(safe-area-inset-top) 10px 0 8px;
+    display: flex; align-items: center; gap: 5px;
     background: var(--surface); border-bottom: 1px solid var(--line);
   }
   #bar .brand {
-    display: flex; align-items: center; gap: 9px; flex: 1; min-width: 0; margin-left: 2px;
+    display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; margin-left: 2px;
   }
   #bar .dot-mark {
-    width: 27px; height: 27px; border-radius: 9px; flex-shrink: 0;
+    width: 28px; height: 28px; border-radius: 8px; flex-shrink: 0;
     background: var(--grad); color: #fff;
     display: flex; align-items: center; justify-content: center;
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .16);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .2);
   }
   #bar .dot-mark .icon { width: 15px; height: 15px; }
   #bar .title {
-    font-size: 14.5px; font-weight: 620; letter-spacing: -.012em;
+    font-size: 14px; font-weight: 650; letter-spacing: -0.01em;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .icon-btn {
-    width: 34px; height: 34px; flex-shrink: 0;
+    width: 32px; height: 32px; flex-shrink: 0;
     display: flex; align-items: center; justify-content: center;
     border: none; background: transparent; color: var(--text-2);
-    border-radius: var(--r-sm); cursor: pointer;
+    border-radius: var(--r-xs); cursor: pointer;
     transition: background var(--t), color var(--t), transform .1s var(--ease);
   }
   .icon-btn:hover { background: var(--surface-2); color: var(--text); }
   .icon-btn:active { transform: scale(.92); }
-  .icon-btn.danger:hover { background: rgba(255, 107, 126, .12); color: var(--danger); }
+  .icon-btn.danger:hover { background: rgba(255, 107, 126, .14); color: var(--danger); }
   .icon-btn.done { color: var(--ok); }
 
-  /* ---- 终端 ---- */
+  /* ---- 虚拟按键快捷栏 ---- */
+  #keybar {
+    position: absolute; left: 0; right: 0; z-index: 3;
+    top: calc(var(--header-h) + env(safe-area-inset-top));
+    height: var(--keybar-h);
+    background: var(--surface-2); border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 4px; padding: 0 8px;
+    overflow-x: auto; scrollbar-width: none;
+  }
+  #keybar::-webkit-scrollbar { display: none; }
+  .vkey {
+    padding: 4px 8px; border-radius: 4px;
+    border: 1px solid var(--line); background: var(--surface);
+    color: var(--text); font: 600 11.5px var(--mono); cursor: pointer;
+    white-space: nowrap; flex-shrink: 0;
+    transition: background var(--t), color var(--t), transform 0.08s;
+  }
+  .vkey:hover { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-ring); }
+  .vkey:active { transform: scale(0.92); }
+
+  /* ---- 终端视窗 ---- */
   #term-wrap {
     position: absolute; left: 0; right: 0; bottom: 0;
-    top: calc(var(--header-h) + env(safe-area-inset-top));
-    padding: 10px 6px 6px 10px;
+    top: calc(var(--header-h) + var(--keybar-h) + env(safe-area-inset-top));
+    padding: 8px 6px 6px 8px;
     background: var(--bg);
   }
   #term { width: 100%; height: 100%; }
   .xterm .xterm-viewport { background: transparent !important; }
-  .xterm-viewport::-webkit-scrollbar { width: 10px; }
+  .xterm-viewport::-webkit-scrollbar { width: 8px; }
   .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
   .xterm-viewport::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, .14); border-radius: var(--r-full);
-    border: 3px solid transparent; background-clip: content-box;
+    background: rgba(255, 255, 255, .15); border-radius: var(--r-full);
+    border: 2px solid transparent; background-clip: content-box;
   }
-  .xterm-viewport::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, .26); background-clip: content-box; }
 
-  /* ---- 状态条 ---- */
+  /* ---- 状态指示浮条 ---- */
   #status {
-    position: absolute; bottom: 9px; right: 12px; z-index: 3;
+    position: absolute; bottom: 10px; right: 14px; z-index: 5;
     display: flex; align-items: center; gap: 7px;
     padding: 4px 10px; border-radius: var(--r-full);
-    background: rgba(16, 18, 24, .82); border: 1px solid var(--line);
+    background: rgba(16, 18, 24, .85); border: 1px solid var(--line);
     backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
     font-size: 11px; font-weight: 500; color: var(--text-3);
-    font-variant-numeric: tabular-nums; letter-spacing: 0;
-    pointer-events: none; transition: color var(--t);
+    font-variant-numeric: tabular-nums; pointer-events: none;
   }
   #status.flash { color: var(--ok); }
   #status .sep { color: var(--line-2); }
   .conn-dot {
     width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
-    background: var(--ok); box-shadow: 0 0 0 3px rgba(62, 207, 142, .18);
+    background: var(--ok); box-shadow: 0 0 0 3px rgba(62, 207, 142, .2);
   }
-  .conn-dot.disconnected { background: var(--danger); box-shadow: 0 0 0 3px rgba(255, 107, 126, .18); }
-  .conn-dot.connecting { background: var(--warn); box-shadow: 0 0 0 3px rgba(240, 180, 41, .2); animation: pulse 1.4s var(--ease) infinite; }
-  @keyframes pulse { 50% { opacity: .35; } }
+  .conn-dot.disconnected { background: var(--danger); box-shadow: 0 0 0 3px rgba(255, 107, 126, .2); }
+  .conn-dot.connecting { background: var(--warn); box-shadow: 0 0 0 3px rgba(240, 180, 41, .2); animation: pulse 1.3s infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
 
-  /* ---- 浮层 ---- */
+  /* ---- 模态浮层 ---- */
   .overlay {
     position: absolute; inset: 0; z-index: 10;
     display: flex; align-items: center; justify-content: center; padding: 20px;
-    background: rgba(4, 5, 8, .72);
+    background: rgba(4, 5, 8, .75);
     backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
-    animation: fade .2s var(--ease);
   }
-  @keyframes fade { from { opacity: 0; } }
   .card {
-    width: min(372px, 100%); padding: 30px 26px 26px;
+    width: min(380px, 100%); padding: 30px 26px 26px;
     background: var(--surface); border: 1px solid var(--line);
-    border-radius: var(--r-xl);
-    box-shadow: 0 28px 70px rgba(0, 0, 0, .5);
-    animation: rise .26s var(--ease);
+    border-radius: var(--r-xl); box-shadow: 0 28px 70px rgba(0, 0, 0, .6);
   }
-  @keyframes rise { from { opacity: 0; transform: translateY(12px) scale(.97); } }
   .card .mark {
-    width: 52px; height: 52px; border-radius: 16px; margin: 0 auto 18px;
+    width: 52px; height: 52px; border-radius: 16px; margin: 0 auto 16px;
     background: var(--grad); color: #fff;
     display: flex; align-items: center; justify-content: center;
-    box-shadow: 0 8px 26px var(--accent-ring), inset 0 0 0 1px rgba(255, 255, 255, .18);
+    box-shadow: 0 8px 26px var(--accent-ring);
   }
   .card .mark .icon { width: 25px; height: 25px; }
-  .card h2 { margin: 0 0 6px; font-size: 18px; font-weight: 640; letter-spacing: -.022em; text-align: center; }
-  .card .sub { margin: 0 0 20px; font-size: 13.5px; line-height: 1.55; color: var(--text-3); text-align: center; }
+  .card h2 { margin: 0 0 6px; font-size: 18px; font-weight: 700; text-align: center; }
+  .card .sub { margin: 0 0 18px; font-size: 13.5px; line-height: 1.55; color: var(--text-3); text-align: center; }
   .card input, .card textarea {
     width: 100%; padding: 12px 14px; margin-bottom: 12px;
     background: var(--surface-2); color: var(--text);
     border: 1px solid var(--line); border-radius: var(--r-sm);
-    font-family: var(--font); font-size: 15px; resize: none;
-    transition: border-color var(--t), box-shadow var(--t), background var(--t);
+    font-family: var(--font); font-size: 14.5px; resize: none;
   }
-  .card textarea { font-family: var(--mono); font-size: 13px; min-height: 108px; letter-spacing: 0; }
-  .card input::placeholder, .card textarea::placeholder { color: var(--text-3); }
+  .card textarea { font-family: var(--mono); font-size: 13px; min-height: 100px; }
   .card input:focus, .card textarea:focus {
-    outline: none; background: var(--bg);
-    border-color: var(--accent-ring); box-shadow: 0 0 0 3.5px var(--accent-ring);
+    outline: none; background: var(--bg); border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-ring);
   }
   .btn-primary {
     width: 100%; padding: 12px 14px; border: none; border-radius: var(--r-sm);
     background: var(--grad); color: #fff;
-    font-family: var(--font); font-size: 15px; font-weight: 560; cursor: pointer;
+    font-family: var(--font); font-size: 14.5px; font-weight: 600; cursor: pointer;
     box-shadow: 0 4px 16px var(--accent-ring);
-    transition: opacity var(--t), transform .1s var(--ease);
   }
-  .btn-primary:hover { opacity: .93; }
-  .btn-primary:active { transform: scale(.985); }
   .btn-ghost {
-    width: 100%; margin-top: 9px; padding: 11px 14px;
+    width: 100%; margin-top: 8px; padding: 10px 14px;
     background: transparent; color: var(--text-2);
     border: 1px solid var(--line); border-radius: var(--r-sm);
-    font-family: var(--font); font-size: 14px; font-weight: 500; cursor: pointer;
-    transition: background var(--t), color var(--t);
+    font-family: var(--font); font-size: 13.5px; font-weight: 550; cursor: pointer;
   }
   .btn-ghost:hover { background: var(--surface-2); color: var(--text); }
-  .muted { color: var(--text-3); font-size: 12.5px; line-height: 1.6; margin-top: 14px; text-align: center; }
-  .muted kbd {
-    display: inline-block; padding: 1px 5px; margin: 0 1px;
-    background: var(--surface-2); border: 1px solid var(--line); border-bottom-width: 2px;
-    border-radius: 5px; font: 500 11px var(--mono); color: var(--text-2); letter-spacing: 0;
-  }
-  #err { color: var(--danger); font-size: 13px; min-height: 19px; margin-bottom: 6px; line-height: 1.45; }
+  .muted { color: var(--text-3); font-size: 12.5px; margin-top: 14px; text-align: center; }
+  #err { color: var(--danger); font-size: 13px; min-height: 18px; margin-bottom: 6px; }
 
-  /* ---- toast ---- */
   #toast {
-    position: absolute; left: 50%; bottom: 46px; z-index: 20;
+    position: absolute; left: 50%; bottom: 50px; z-index: 20;
     transform: translate(-50%, 10px); max-width: 88vw;
     background: rgba(236, 238, 243, .95); color: #0B0D12;
-    padding: 9px 16px; border-radius: var(--r-full);
-    font-size: 13px; font-weight: 500;
-    box-shadow: 0 8px 28px rgba(0, 0, 0, .4);
-    opacity: 0; pointer-events: none;
-    transition: opacity .2s var(--ease), transform .2s var(--ease);
+    padding: 8px 16px; border-radius: var(--r-full);
+    font-size: 13px; font-weight: 550; box-shadow: 0 8px 28px rgba(0, 0, 0, .4);
+    opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s;
   }
   #toast.show { opacity: 1; transform: translate(-50%, 0); }
-
-  @media (max-width: 420px) {
-    #bar .title { display: none; }
-  }
 </style>
 </head>
 <body>
@@ -227,11 +217,29 @@
   <button class="icon-btn" id="backBtn" title="返回聊天" aria-label="返回聊天"><svg class="icon" viewBox="0 0 24 24"><use href="#i-back"/></svg></button>
   <div class="brand">
     <div class="dot-mark"><svg class="icon" viewBox="0 0 24 24"><use href="#i-terminal"/></svg></div>
-    <span class="title">终端</span>
+    <span class="title">XGent 终端</span>
   </div>
-  <button class="icon-btn" id="copyBtn" title="复制（有选区复制选区，否则复制全部输出）" aria-label="复制"><svg class="icon" viewBox="0 0 24 24"><use href="#i-copy"/></svg></button>
-  <button class="icon-btn" id="pasteBtn" title="粘贴" aria-label="粘贴"><svg class="icon" viewBox="0 0 24 24"><use href="#i-paste"/></svg></button>
+  <button class="icon-btn" id="fontMinusBtn" title="缩小字号" aria-label="缩小字号">A-</button>
+  <button class="icon-btn" id="fontPlusBtn" title="放大字号" aria-label="放大字号">A+</button>
+  <button class="icon-btn" id="copyBtn" title="复制终端内容" aria-label="复制"><svg class="icon" viewBox="0 0 24 24"><use href="#i-copy"/></svg></button>
+  <button class="icon-btn" id="pasteBtn" title="粘贴到终端" aria-label="粘贴"><svg class="icon" viewBox="0 0 24 24"><use href="#i-paste"/></svg></button>
   <button class="icon-btn danger" id="closeBtn" title="关闭会话" aria-label="关闭会话"><svg class="icon" viewBox="0 0 24 24"><use href="#i-power"/></svg></button>
+</div>
+
+<div id="keybar">
+  <button class="vkey" data-key="\x1b">ESC</button>
+  <button class="vkey" data-key="\t">TAB</button>
+  <button class="vkey" data-key="\x03">Ctrl+C</button>
+  <button class="vkey" data-key="\x04">Ctrl+D</button>
+  <button class="vkey" data-key="\x1a">Ctrl+Z</button>
+  <button class="vkey" data-key="\x1b[A">↑</button>
+  <button class="vkey" data-key="\x1b[B">↓</button>
+  <button class="vkey" data-key="\x1b[D">←</button>
+  <button class="vkey" data-key="\x1b[C">→</button>
+  <button class="vkey" data-key="|">|</button>
+  <button class="vkey" data-key="~">~</button>
+  <button class="vkey" data-key="/">/</button>
+  <button class="vkey" data-key="clear\r">clear</button>
 </div>
 
 <div id="term-wrap"><div id="term"></div></div>
@@ -241,12 +249,12 @@
 <div class="overlay" id="loginOverlay">
   <div class="card">
     <div class="mark"><svg class="icon" viewBox="0 0 24 24"><use href="#i-lock"/></svg></div>
-    <h2>终端登录</h2>
-    <p class="sub">终端可执行任意命令，仅授权用户可用。</p>
+    <h2>终端登录验证</h2>
+    <p class="sub">终端拥有系统级执行权限，仅授权用户可用。</p>
     <div id="err"></div>
     <input id="pw" type="password" placeholder="访问密码" autocomplete="current-password">
-    <button class="btn-primary" id="loginBtn">登录</button>
-    <div class="muted">在 Telegram 内打开时自动免密。</div>
+    <button class="btn-primary" id="loginBtn">登录终端</button>
+    <div class="muted">在 Telegram 菜单中打开时可自动免密。</div>
   </div>
 </div>
 
@@ -255,8 +263,8 @@
     <div class="mark"><svg class="icon" viewBox="0 0 24 24"><use href="#i-plug"/></svg></div>
     <h2>会话已结束</h2>
     <p class="sub" id="endReason"></p>
-    <button class="btn-primary" id="renewBtn">新建会话</button>
-    <button class="btn-ghost" id="endedBackBtn">返回聊天</button>
+    <button class="btn-primary" id="renewBtn">新建终端会话</button>
+    <button class="btn-ghost" id="endedBackBtn">返回聊天界面</button>
   </div>
 </div>
 
@@ -265,7 +273,7 @@
     <h2>粘贴到终端</h2>
     <p class="sub">当前环境不允许直接读取剪贴板，请在下方粘贴内容。</p>
     <textarea id="pasteBox" placeholder="在此长按粘贴，或按 Ctrl/⌘ + V"></textarea>
-    <button class="btn-primary" id="pasteSendBtn">发送到终端</button>
+    <button class="btn-primary" id="pasteSendBtn">发送至终端</button>
     <button class="btn-ghost" id="pasteCancelBtn">取消</button>
   </div>
 </div>
@@ -275,6 +283,7 @@ var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : nu
 if (tg) { try { tg.ready(); tg.expand(); } catch (e) {} }
 
 var term = null, fit = null, sessionId = null, currentPid = null, es = null;
+var currentFontSize = window.innerWidth < 520 ? 12 : 13.5;
 
 function $(id) { return document.getElementById(id); }
 
@@ -307,10 +316,6 @@ function toast(msg) {
   el._t = setTimeout(function () { el.classList.remove('show'); }, 1700);
 }
 
-// ---- 剪贴板 ----
-// navigator.clipboard 只在安全上下文（https / localhost）存在。本服务常以
-// http://ip:port 直连，此时必须回退到 execCommand('copy')，否则复制全线失效
-// ——这正是「终端不能复制」的根因。
 function copyText(text) {
   text = String(text == null ? '' : text);
   return new Promise(function (resolve, reject) {
@@ -323,7 +328,7 @@ function copyText(text) {
         document.body.appendChild(ta);
         ta.focus();
         ta.select();
-        ta.setSelectionRange(0, ta.value.length);   // iOS 需要显式 range
+        ta.setSelectionRange(0, ta.value.length);
         var ok = document.execCommand('copy');
         document.body.removeChild(ta);
         ok ? resolve() : reject(new Error('execCommand copy failed'));
@@ -337,7 +342,6 @@ function copyText(text) {
   });
 }
 
-// 整屏（含回滚缓冲）文本，用于「无选区时复制全部」。
 function bufferText() {
   if (!term) return '';
   var buf = term.buffer.active, lines = [], i, line;
@@ -379,7 +383,7 @@ function doCopy(text, quiet) {
 
 function sendToTerm(text) {
   if (!text || !sessionId || !term) return;
-  term.paste(text);          // 走 onData → POST /api/term/input
+  term.paste(text);
   term.focus();
 }
 
@@ -409,9 +413,7 @@ $('pasteSendBtn').onclick = function () {
 };
 $('pasteCancelBtn').onclick = closePasteSheet;
 
-// ---- 状态条 ----
 var connState = '';
-
 function updateStatus() {
   var el = $('status');
   var html = '<span class="conn-dot' + (connState ? ' ' + connState : '') + '"></span>';
@@ -431,7 +433,6 @@ function setConnState(state) {
   updateStatus();
 }
 
-// ---- 登录 ----
 function login() {
   return api('/api/session').then(function (d) {
     if (d.authenticated) return true;
@@ -463,7 +464,6 @@ $('loginBtn').onclick = function () {
 };
 $('pw').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('loginBtn').click(); });
 
-// ---- 输出流 ----
 function openStream() {
   if (es) es.close();
   setConnState('connecting');
@@ -476,14 +476,9 @@ function openStream() {
     } catch (e) {}
   };
   es.addEventListener('close', function () { showEnded('终端会话已退出'); });
-  es.onerror = function () {
-    setConnState('disconnected');
-    // EventSource 默认自动重连，但终端会话一旦断了重连也拿不到旧输出，
-    // 关掉由 close 事件 / 主动检测处理。
-  };
+  es.onerror = function () { setConnState('disconnected'); };
 }
 
-// ---- 终端 ----
 var THEME = {
   background: '#08090C', foreground: '#DDE1E9',
   cursor: '#8189FF', cursorAccent: '#08090C',
@@ -498,8 +493,8 @@ function initTerm() {
   if (term) { term.dispose(); term = null; }
   currentPid = null;
   term = new Terminal({
-    fontFamily: '"SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, "Liberation Mono", monospace',
-    fontSize: window.innerWidth < 520 ? 12 : 13.5,
+    fontFamily: '"SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace',
+    fontSize: currentFontSize,
     lineHeight: 1.25,
     letterSpacing: 0,
     cursorBlink: true,
@@ -515,12 +510,6 @@ function initTerm() {
   try { fit.fit(); } catch (e) {}
   updateStatus();
 
-  // 复制/粘贴键位：
-  // - Ctrl/⌘+C 有选区时复制（无选区仍然发 SIGINT，保留中断能力）
-  // - Ctrl/⌘+Shift+C 始终复制选区
-  // - Ctrl/⌘+Shift+A 全选
-  // Ctrl/⌘+V 不拦截：浏览器原生 paste 事件会落到 xterm 自己的 textarea 上，
-  // 那条路径不需要安全上下文，比 clipboard.readText() 可靠。
   term.attachCustomKeyEventHandler(function (e) {
     if (e.type !== 'keydown') return true;
     var mod = e.ctrlKey || e.metaKey;
@@ -565,9 +554,32 @@ function initTerm() {
   });
 }
 
-// 下面两个监听只在页面加载时挂一次：initTerm() 会因「新建会话」重复调用，
-// 挂在里面会越积越多（划一次选区触发 N 次复制）。
-// 鼠标划选即复制——终端里最常用的复制方式。
+var vkeys = document.querySelectorAll('.vkey');
+Array.prototype.forEach.call(vkeys, function (k) {
+  k.addEventListener('click', function () {
+    var val = k.dataset.key;
+    if (val && term) {
+      term.paste(val);
+      term.focus();
+    }
+  });
+});
+
+$('fontPlusBtn').onclick = function () {
+  if (!term || currentFontSize >= 24) return;
+  currentFontSize += 1.5;
+  term.options.fontSize = currentFontSize;
+  try { fit.fit(); } catch (e) {}
+  updateStatus();
+};
+$('fontMinusBtn').onclick = function () {
+  if (!term || currentFontSize <= 10) return;
+  currentFontSize -= 1.5;
+  term.options.fontSize = currentFontSize;
+  try { fit.fit(); } catch (e) {}
+  updateStatus();
+};
+
 $('term').addEventListener('mouseup', function () {
   if (!term || !term.hasSelection()) return;
   var sel = term.getSelection();
@@ -582,10 +594,6 @@ function showEnded(reason) {
   $('endedOverlay').style.display = 'flex';
 }
 
-// 返回聊天：
-// 1. 被 iframe 嵌入时（index.html 的终端模态层），postMessage 通知父窗口关闭模态层
-// 2. window.open 打开的新标签页，直接关闭
-// 3. 兜底跳转首页
 function goBackToChat() {
   if (window.parent && window.parent !== window) {
     window.parent.postMessage({ type: 'xgent-close-terminal' }, '*');
