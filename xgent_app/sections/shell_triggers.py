@@ -200,6 +200,38 @@ async def terminate_async_process(process: Any):
         logger.warning(f"终止命令进程失败: {e}")
 
 
+_SELF_MATCH_KILL_RE = re.compile(
+    r'\bpkill\b[^|;&\n]*\s-\w*f'
+    r'|\bpgrep\b[^|;&\n]*\s-\w*f'
+    r'|\bxargs\s+(?:-\w+\s+)*kill\b'
+)
+
+
+def diagnose_signal_death(command: str, return_code: int) -> str:
+    """进程被 SIGTERM/SIGKILL 终止时返回死因提示，供回传给模型。
+
+    信号本身不含凶手信息，因此只依据命令文本证据分层提示，措辞避免绝对化：
+    命令里有按命令行文本匹配的 kill 模式时给高置信提示，否则给开放性提示。
+    """
+    if return_code not in (-15, -9):
+        return ''
+    sig = 'SIGTERM(-15)' if return_code == -15 else 'SIGKILL(-9)'
+    if _SELF_MATCH_KILL_RE.search(command):
+        return (
+            f'🩺 诊断: 进程被 {sig} 终止，且命令里含按命令行文本匹配的 kill 模式'
+            '（pkill -f / pgrep -f / ps|grep|xargs kill 一类）。'
+            '整段脚本文本就是执行它的 shell 自己的 argv，这类模式极可能匹配到'
+            '执行命令的 shell 自身，相当于命令杀死了自己。'
+            '请改用 PID 文件管理后台进程: 启动 `nohup ... > xx.log 2>&1 & echo $! > xx.pid`，'
+            '停止 `kill "$(cat xx.pid)"`。'
+        )
+    return (
+        f'🩺 诊断: 进程被 {sig} 终止（非超时、非手动停止）。可能原因: 内存不足被 '
+        'OOM killer 杀掉(-9 常见)、其他会话或系统管理员的 kill、命令自身逻辑。'
+        "可用 `dmesg -T | grep -iE 'oom|killed process'` 查证是否 OOM。"
+    )
+
+
 class AgentShellSession:
     """一个可持续读写的 shell 进程；Linux/macOS 使用 PTY，Windows 使用管道降级。"""
 
@@ -646,6 +678,12 @@ class AgentShellSessionManager:
         rc = session.return_code()
         status = "running" if running else f"exited:{rc}"
         activity = session.output_activity_snapshot()
+        # action='kill' 是 shellkill-x 自身发的 SIGTERM/SIGKILL，属正常终止，不诊断
+        death_hint = ''
+        if action != 'kill' and not running and rc in (-15, -9):
+            death_hint = diagnose_signal_death(session.command, rc)
+        if death_hint:
+            output = (output + "\n" if output else "") + death_hint
         return {
             'success': True,
             'session_id': session.session_id,
