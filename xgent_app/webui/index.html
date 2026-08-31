@@ -297,8 +297,7 @@
   }
   @media (prefers-reduced-motion: reduce) { .msg-row { animation: none; } }
   .msg-row.user { justify-content: flex-end; }
-  .msg-row.ai, .msg-row.cmd { justify-content: flex-start; }
-  .msg-row.sys { justify-content: center; margin: 16px auto; }
+  .msg-row.ai, .msg-row.cmd, .msg-row.sys { justify-content: flex-start; }
   .msg-row.token { justify-content: flex-start; margin: 6px auto 14px; }
 
   /* 气泡通用：必须 position: relative 以便动作栏精准定位在气泡上 */
@@ -308,7 +307,7 @@
     font-size: 15px; line-height: 1.62;
     transition: box-shadow var(--t), border-color var(--t);
   }
-  .bubble.ai, .bubble.cmd {
+  .bubble.ai, .bubble.cmd, .bubble.sys {
     max-width: min(780px, 94%);
     background: var(--ai-bg); color: var(--text);
     border: 1px solid var(--ai-line); box-shadow: var(--ai-shadow);
@@ -317,6 +316,9 @@
   }
   .bubble.cmd {
     border-color: color-mix(in srgb, var(--accent) 30%, var(--ai-line));
+  }
+  .bubble.sys {
+    border-color: var(--line-2);
   }
   .bubble.user {
     max-width: min(600px, 86%);
@@ -339,6 +341,9 @@
   }
   .bubble-author-icon.cmd {
     background: var(--surface-2); border: 1px solid var(--line-2); color: var(--accent);
+  }
+  .bubble-author-icon.sys {
+    background: var(--surface-2); border: 1px solid var(--line-2); color: var(--text-2);
   }
 
   .bubble .ts {
@@ -1630,10 +1635,10 @@
 
   function classifyMessageText(role, text) {
     if (typeof text !== "string") return role;
-    if ((role === "ai" || role === "sys") && isTokenUsageText(text)) {
+    if (isTokenUsageText(text)) {
       return "token";
     }
-    if (role === "ai" || role === "sys") {
+    if (role === "ai" || role === "sys" || role === "cmd") {
       if (AGENT_RESULT_RE.test(text)) return "cmd";
       if (AGENT_STATUS_RE.test(text)) return "sys";
     }
@@ -1668,30 +1673,31 @@
     var row = document.createElement("div");
     row.className = "msg-row " + role;
 
-    if (role === "sys" || role === "token") {
+    if (role === "token") {
       var pill = document.createElement("div");
-      pill.className = role === "token" ? "token-pill" : "sys-pill";
+      pill.className = "token-pill";
       pill.innerHTML = renderText(text, parseMode);
       enhanceBubbleContent(pill);
       row.appendChild(pill);
       log.appendChild(row);
       if (stick) scrollDown();
-      return { row: row, body: pill, btns: null, rawText: text };
+      var tEntry = { row: row, body: pill, bubble: pill, head: null, btns: null, rawText: text };
+      if (messageId != null) byMessageId[messageId] = tEntry;
+      return tEntry;
     }
 
     var bubble = document.createElement("div");
     bubble.className = "bubble " + role;
 
-    if (role === "ai") {
-      var head = document.createElement("div");
+    var head = null;
+    if (role === "ai" || role === "cmd" || role === "sys") {
+      head = document.createElement("div");
       head.className = "bubble-header";
-      head.innerHTML = '<div class="bubble-author"><span class="bubble-author-icon">X</span> XGent</div>';
+      var iconCls = role === "ai" ? "" : (" " + role);
+      var iconText = role === "ai" ? "X" : "◇";
+      var authorName = role === "ai" ? "XGent" : (role === "cmd" ? "命令" : "系统");
+      head.innerHTML = '<div class="bubble-author"><span class="bubble-author-icon' + iconCls + '">' + iconText + '</span> ' + authorName + '</div>';
       bubble.appendChild(head);
-    } else if (role === "cmd") {
-      var cmdHead = document.createElement("div");
-      cmdHead.className = "bubble-header";
-      cmdHead.innerHTML = '<div class="bubble-author"><span class="bubble-author-icon cmd">◇</span> 命令</div>';
-      bubble.appendChild(cmdHead);
     }
 
     var body = document.createElement("div");
@@ -1722,7 +1728,7 @@
     });
     actBar.appendChild(btnCp);
 
-    if (role === "ai" || role === "cmd") {
+    if (role === "ai" || role === "cmd" || role === "sys") {
       var btnQt = document.createElement("button");
       btnQt.className = "act-btn";
       btnQt.type = "button";
@@ -1761,9 +1767,9 @@
     log.appendChild(row);
     if (stick) scrollDown();
 
-    var entry = { row: row, body: body, bubble: bubble, btns: btns, rawText: text };
+    var entry = { row: row, body: body, bubble: bubble, head: head, btns: btns, rawText: text };
     if (messageId != null) byMessageId[messageId] = entry;
-    if (role === "ai" || role === "cmd") lastStreamEntry = entry;
+    if (role === "ai" || role === "cmd" || role === "sys") lastStreamEntry = entry;
     return entry;
   }
 
@@ -1985,6 +1991,15 @@
       var e = byMessageId[frame.message_id];
       if (!e && (frame.message_id == null)) e = lastStreamEntry;
       if (e) {
+        var newRole = classifyMessageText("ai", frame.text);
+        if (e.row && e.bubble && e.head && newRole !== "token") {
+          e.row.className = "msg-row " + newRole;
+          e.bubble.className = "bubble " + newRole;
+          var iconCls = newRole === "ai" ? "" : (" " + newRole);
+          var iconText = newRole === "ai" ? "X" : "◇";
+          var authorName = newRole === "ai" ? "XGent" : (newRole === "cmd" ? "命令" : "系统");
+          e.head.innerHTML = '<div class="bubble-author"><span class="bubble-author-icon' + iconCls + '">' + iconText + '</span> ' + authorName + '</div>';
+        }
         e.body.innerHTML = renderText(frame.text, frame.parse_mode);
         enhanceBubbleContent(e.body);
         if (frame.reply_markup !== undefined) setButtons(e, frame.reply_markup, frame.message_id);
