@@ -297,7 +297,7 @@
   }
   @media (prefers-reduced-motion: reduce) { .msg-row { animation: none; } }
   .msg-row.user { justify-content: flex-end; }
-  .msg-row.ai { justify-content: flex-start; }
+  .msg-row.ai, .msg-row.cmd { justify-content: flex-start; }
   .msg-row.sys { justify-content: center; margin: 16px auto; }
   .msg-row.token { justify-content: flex-start; margin: 6px auto 14px; }
 
@@ -308,12 +308,15 @@
     font-size: 15px; line-height: 1.62;
     transition: box-shadow var(--t), border-color var(--t);
   }
-  .bubble.ai {
+  .bubble.ai, .bubble.cmd {
     max-width: min(780px, 94%);
     background: var(--ai-bg); color: var(--text);
     border: 1px solid var(--ai-line); box-shadow: var(--ai-shadow);
     border-radius: var(--r-lg) var(--r-lg) var(--r-lg) var(--r-xs);
     padding: 14px 16px 12px;
+  }
+  .bubble.cmd {
+    border-color: color-mix(in srgb, var(--accent) 30%, var(--ai-line));
   }
   .bubble.user {
     max-width: min(600px, 86%);
@@ -333,6 +336,9 @@
   .bubble-author-icon {
     width: 16px; height: 16px; border-radius: 4px; background: var(--grad);
     display: flex; align-items: center; justify-content: center; color: #fff; font-size: 10px; font-weight: 700;
+  }
+  .bubble-author-icon.cmd {
+    background: var(--surface-2); border: 1px solid var(--line-2); color: var(--accent);
   }
 
   .bubble .ts {
@@ -1619,6 +1625,21 @@
       text.indexOf("↑") >= 0 && text.indexOf("↓") >= 0;
   }
 
+  var AGENT_STATUS_RE = /Agent\s*第\s*\d+\s*轮/;
+  var AGENT_RESULT_RE = /<b>\s*Agent\s+\w+\s*<\/b>/i;
+
+  function classifyMessageText(role, text) {
+    if (typeof text !== "string") return role;
+    if ((role === "ai" || role === "sys") && isTokenUsageText(text)) {
+      return "token";
+    }
+    if (role === "ai" || role === "sys") {
+      if (AGENT_RESULT_RE.test(text)) return "cmd";
+      if (AGENT_STATUS_RE.test(text)) return "sys";
+    }
+    return role;
+  }
+
   function speakText(text, btn) {
     if (!window.speechSynthesis) { toast("当前浏览器不支持语音朗读"); return; }
     if (window.speechSynthesis.speaking) {
@@ -1642,9 +1663,7 @@
     msgCount++;
     updateEmptyState();
 
-    if ((role === "ai" || role === "sys") && isTokenUsageText(text)) {
-      role = "token";
-    }
+    role = classifyMessageText(role, text);
 
     var row = document.createElement("div");
     row.className = "msg-row " + role;
@@ -1668,6 +1687,11 @@
       head.className = "bubble-header";
       head.innerHTML = '<div class="bubble-author"><span class="bubble-author-icon">X</span> XGent</div>';
       bubble.appendChild(head);
+    } else if (role === "cmd") {
+      var cmdHead = document.createElement("div");
+      cmdHead.className = "bubble-header";
+      cmdHead.innerHTML = '<div class="bubble-author"><span class="bubble-author-icon cmd">◇</span> 命令</div>';
+      bubble.appendChild(cmdHead);
     }
 
     var body = document.createElement("div");
@@ -1698,7 +1722,7 @@
     });
     actBar.appendChild(btnCp);
 
-    if (role === "ai") {
+    if (role === "ai" || role === "cmd") {
       var btnQt = document.createElement("button");
       btnQt.className = "act-btn";
       btnQt.type = "button";
@@ -1739,7 +1763,7 @@
 
     var entry = { row: row, body: body, bubble: bubble, btns: btns, rawText: text };
     if (messageId != null) byMessageId[messageId] = entry;
-    if (role === "ai") lastStreamEntry = entry;
+    if (role === "ai" || role === "cmd") lastStreamEntry = entry;
     return entry;
   }
 
