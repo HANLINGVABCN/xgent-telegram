@@ -57,6 +57,7 @@ VENDOR_DIR = os.path.join(STATIC_DIR, "vendor")
 # 卡在资源加载上迟迟不能渲染——这就是"访问网页端慢死"的根因）。
 VENDOR_ASSETS: Dict[str, Any] = {
     "/vendor/telegram-web-app.js": ("telegram-web-app.js", "application/javascript; charset=utf-8"),
+    "/vendor/marked.umd.js": ("marked.umd.js", "application/javascript; charset=utf-8"),
     "/vendor/xterm.min.js": ("xterm.min.js", "application/javascript; charset=utf-8"),
     "/vendor/xterm.min.css": ("xterm.min.css", "text/css; charset=utf-8"),
     "/vendor/addon-fit.min.js": ("addon-fit.min.js", "application/javascript; charset=utf-8"),

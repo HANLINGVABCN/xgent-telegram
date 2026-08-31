@@ -579,6 +579,91 @@ class WebServerHttpTests(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/", timeout=10) as resp:
             self.assertIsNone(resp.headers.get("Access-Control-Allow-Origin"))
 
+    def test_vendor_marked_served(self):
+        """marked 是 Markdown 渲染的硬依赖，必须能免登录取到。
+
+        VENDOR_ASSETS 是硬编码白名单，不做目录遍历——文件放进 webui/vendor/
+        但忘了登记就是 404，页面上表现为整个 Markdown 退化成纯文本。
+        """
+        with urllib.request.urlopen(self.base + "/vendor/marked.umd.js", timeout=10) as resp:
+            self.assertEqual(200, resp.status)
+            self.assertIn("javascript", resp.headers.get("Content-Type", ""))
+            body = resp.read().decode("utf-8")
+        self.assertIn("marked", body)
+        # UMD wrapper 要挂到全局，否则页面里的 window.marked 拿不到
+        self.assertIn('g["marked"]', body)
+
+    def test_vendor_assets_exist_on_disk(self):
+        """白名单里登记的文件都得真的在磁盘上。"""
+        from xgent_app.web_server import VENDOR_ASSETS, VENDOR_DIR
+
+        for route, (filename, _ctype) in VENDOR_ASSETS.items():
+            path = os.path.join(VENDOR_DIR, filename)
+            self.assertTrue(os.path.isfile(path), f"{route} 指向的 {filename} 不存在")
+
+
+class WebOpenButtonTests(unittest.TestCase):
+    """没设密码时「打开网页」不能是个死链接。
+
+    start_web_chat_if_enabled 在没密码时直接跳过启动，地址上没有服务在监听。
+    而 url / web_app 按钮没有 callback_data，永远回不到 bot，也就没法解释原因,
+    用户看到的就是"点了毫无反应"。所以这种情况必须给回调按钮。
+    """
+
+    def _build(self, **state):
+        """在独立命名空间里跑 ui.py 里的按钮构建函数，避开 sections 全局加载。"""
+        import re
+
+        ui_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "xgent_app", "sections", "ui.py",
+        )
+        with open(ui_path, encoding="utf-8") as handle:
+            src = handle.read()
+        start = src.index("def _build_web_open_button():")
+        end = src.index("def get_web_menu():")
+        snippet = src[start:end]
+
+        from telegram import InlineKeyboardButton, WebAppInfo
+
+        ns = {
+            "InlineKeyboardButton": InlineKeyboardButton,
+            "WebAppInfo": WebAppInfo,
+            "normalize_bool": lambda v, d: bool(v) if v is not None else d,
+            "normalize_web_port": lambda v: int(v or 8790),
+            "DEFAULT_WEB_PORT": 8790,
+            "DEFAULT_WEB_HOST": "127.0.0.1",
+            "UserDataManager": type(
+                "UDM", (), {"get": staticmethod(lambda k, d=None: state.get(k, d))}
+            ),
+        }
+        exec(compile(snippet, "ui_snippet", "exec"), ns)
+        self.assertTrue(re.search(r"_web_has_password", snippet), "密码闸不在源码里")
+        return ns
+
+    def test_no_password_yields_callback_button(self):
+        ns = self._build(web_enabled=True, _web_has_password=False)
+        btn = ns["_build_web_open_button"]()
+        self.assertIsNotNone(btn, "开启状态下不该藏起按钮")
+        self.assertEqual("web_need_password", btn.callback_data)
+        self.assertIsNone(btn.url)
+        self.assertIsNone(btn.web_app)
+
+    def test_with_password_yields_openable_button(self):
+        ns = self._build(web_enabled=True, _web_has_password=True, web_port=8790)
+        btn = ns["_build_web_open_button"]()
+        self.assertIsNone(btn.callback_data)
+        self.assertEqual("http://127.0.0.1:8790", btn.url)
+
+    def test_disabled_still_hides_row(self):
+        ns = self._build(web_enabled=False, _web_has_password=False)
+        self.assertIsNone(ns["_build_web_open_button"]())
+
+    def test_terminal_button_same_guard(self):
+        ns = self._build(terminal_enabled=True, _web_has_password=False)
+        btn = ns["_build_terminal_open_button"]()
+        self.assertEqual("web_need_password", btn.callback_data)
+
 
 class WebServerStartupGuardTests(unittest.TestCase):
     def _config(self, **overrides):

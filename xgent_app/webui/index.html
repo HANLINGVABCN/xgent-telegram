@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
 <title>XGent Web Chat</title>
 <script src="/vendor/telegram-web-app.js"></script>
+<script src="/vendor/marked.umd.js"></script>
 <style>
   /* ============================================================
      XGent Web — 极致设计系统 (Design System 2.0)
@@ -367,18 +368,26 @@
   .act-btn .icon { width: 13px; height: 13px; }
 
   /* ---- Markdown 排版引擎与增强 ---- */
-  .bubble h1, .bubble h2, .bubble h3, .bubble h4 {
+  .bubble h1, .bubble h2, .bubble h3, .bubble h4, .bubble h5, .bubble h6 {
     color: var(--text); font-weight: 650; letter-spacing: -0.015em;
     margin: 14px 0 6px; line-height: 1.35;
   }
-  .bubble.user h1, .bubble.user h2, .bubble.user h3, .bubble.user h4 { color: #FFFFFF; }
+  .bubble.user h1, .bubble.user h2, .bubble.user h3,
+  .bubble.user h4, .bubble.user h5, .bubble.user h6 { color: #FFFFFF; }
   .bubble h1 { font-size: 18px; border-bottom: 1px solid var(--line); padding-bottom: 4px; }
   .bubble h2 { font-size: 16.5px; }
   .bubble h3 { font-size: 15px; }
+  .bubble h5 { font-size: 13.5px; }
+  .bubble h6 { font-size: 13px; color: var(--text-2); }
   .bubble p { margin: 8px 0; }
   .bubble ul, .bubble ol { margin: 8px 0 8px 20px; padding: 0; }
   .bubble li { margin: 3px 0; }
+  .bubble li > ul, .bubble li > ol { margin: 3px 0 3px 18px; }
+  .bubble li > p { margin: 0; }
   .bubble hr { border: none; border-top: 1px dashed var(--line-2); margin: 14px 0; }
+  /* 气泡自己有内边距，首尾块级元素再带 margin 就会多出一圈空白 */
+  .bubble > :first-child, .bubble .body > :first-child { margin-top: 0; }
+  .bubble > :last-child, .bubble .body > :last-child { margin-bottom: 0; }
 
   /* 表格系统：自适应容器与高对比度配色 */
   .table-wrap {
@@ -402,6 +411,11 @@
     background: color-mix(in srgb, var(--surface-2) 45%, transparent);
   }
   .bubble tr:last-child td { border-bottom: none; }
+  /* GFM 列对齐。属性在 sanitizeHtml 里被剥掉，改挂 class；
+     直接作用在 th/td 上，优先级高于 table 的 text-align 继承。 */
+  .bubble .ta-left { text-align: left; }
+  .bubble .ta-center { text-align: center; }
+  .bubble .ta-right { text-align: right; }
 
   /* 任务列表 */
   .task-item { list-style: none; margin-left: -18px; display: flex; align-items: baseline; gap: 7px; }
@@ -423,13 +437,22 @@
     background: rgba(0, 0, 0, 0.2); border-left-color: rgba(255, 255, 255, 0.6);
     color: rgba(255, 255, 255, 0.9);
   }
+  /* 引用块里现在会真的出 <p>，首尾不归零会顶出多余空白 */
+  .bubble blockquote > :first-child { margin-top: 0; }
+  .bubble blockquote > :last-child { margin-bottom: 0; }
 
   /* 行内代码 */
   .bubble :not(pre) > code {
     background: var(--surface-2); border: 1px solid var(--line);
     padding: 0.15em 0.45em; border-radius: var(--r-xs);
     font: 12.5px var(--mono); letter-spacing: 0; color: var(--accent);
+    cursor: pointer; transition: background var(--t), border-color var(--t);
   }
+  .bubble :not(pre) > code:hover { background: var(--surface); border-color: var(--accent-ring); }
+  .bubble :not(pre) > code.copied {
+    background: var(--accent); border-color: var(--accent); color: #FFF;
+  }
+  .bubble :not(pre) > code.copied::after { content: " 已复制"; font-size: 0.85em; opacity: 0.9; }
   .bubble.user :not(pre) > code {
     background: rgba(0, 0, 0, 0.24); border-color: rgba(255, 255, 255, 0.18); color: #FFF;
   }
@@ -1186,6 +1209,10 @@
   var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
   if (tg) { try { tg.ready(); tg.expand(); } catch (e) {} }
 
+  // 触屏判定用媒体查询，不用 UA 嗅探 / 屏宽：能正确区分"窄窗口的桌面浏览器"
+  // （仍然回车发送）和"接了实体键盘的平板"。触屏上回车一律换行，只有发送按钮能发。
+  var IS_TOUCH = !!(window.matchMedia && window.matchMedia("(hover: none) and (pointer: coarse)").matches);
+
   var log = document.getElementById("log");
   var input = document.getElementById("input");
   var btnSend = document.getElementById("btn-send");
@@ -1350,25 +1377,83 @@
     });
   }
 
+  // 高亮词法片段。用正则字面量 + .source 拼装，避免 new RegExp 里的双重转义。
+  var HL_STR_RE = /"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`/;
+  var HL_KWD_RE = /\b(?:def|class|return|import|from|if|elif|else|for|while|try|except|finally|async|await|with|as|lambda|yield|function|const|let|var|switch|case|break|continue|default|new|throw|typeof|instanceof|interface|type|enum|public|private|static|void|int|string|bool|SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|JOIN|GROUP|ORDER|BY|LIMIT|CREATE|TABLE)\b/;
+  var HL_NUM_RE = /\b\d+(?:\.\d+)?\b/;
+  var HL_HASH_LANGS = /^(?:py|python|bash|sh|shell|zsh|yaml|yml|rb|ruby|toml|ini|conf|dockerfile|makefile)$/;
+
+  function hlRegex(commentRe) {
+    return new RegExp(
+      "(" + HL_STR_RE.source + ")|(" + commentRe.source + ")|(" +
+      HL_KWD_RE.source + ")|(" + HL_NUM_RE.source + ")", "g");
+  }
+  var HL_RE_HASH = hlRegex(/#[^\n]*/);
+  var HL_RE_SLASH = hlRegex(/\/\/[^\n]*|\/\*[\s\S]*?\*\//);
+
+  // 单遍扫描"原始源码"，只在拼接时对叶子文本转义。
+  // 旧实现是先整体 escapeHtml、再对结果反复 replace，于是自己注入的
+  // <span class="hl-str"> 会被关键字表里的 class 再匹配一次（产出
+  // <span <span class="hl-kwd">class</span>="hl-str">），转义出来的 &#39;
+  // 里的 39 也会被数字规则吃掉。扫原文就没有这两类自噬。
   function highlightCode(code, lang) {
     lang = (lang || "").toLowerCase().trim();
-    var s = escapeHtml(code);
-    s = s.replace(/(&quot;[\s\S]*?&quot;|&#39;[\s\S]*?&#39;|`[\s\S]*?`)/g, '<span class="hl-str">$1</span>');
-    if (lang === "py" || lang === "python" || lang === "bash" || lang === "sh" || lang === "yaml" || lang === "yml") {
-      s = s.replace(/(#[^\n]*)/g, '<span class="hl-cmt">$1</span>');
-    } else {
-      s = s.replace(/(\/\/[^\n]*)/g, '<span class="hl-cmt">$1</span>');
+    var re = HL_HASH_LANGS.test(lang) ? HL_RE_HASH : HL_RE_SLASH;
+    var out = "", last = 0, m;
+    re.lastIndex = 0;   // 模块级 /g 正则跨调用复用，必须重置
+    while ((m = re.exec(code)) !== null) {
+      out += escapeHtml(code.slice(last, m.index));
+      var cls = m[1] ? "hl-str" : m[2] ? "hl-cmt" : m[3] ? "hl-kwd" : "hl-num";
+      out += '<span class="' + cls + '">' + escapeHtml(m[0]) + "</span>";
+      last = m.index + m[0].length;
     }
-    var kwds = /\b(def|class|return|import|from|if|elif|else|for|while|try|except|finally|async|await|with|as|lambda|yield|function|const|let|var|switch|case|break|continue|default|new|throw|typeof|instanceof|interface|type|enum|public|private|static|void|int|string|bool|SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|JOIN|GROUP|ORDER|BY|LIMIT|CREATE|TABLE)\b/g;
-    s = s.replace(kwds, '<span class="hl-kwd">$1</span>');
-    s = s.replace(/\b(\d+(?:\.\d+)?)\b/g, '<span class="hl-num">$1</span>');
-    return s;
+    return out + escapeHtml(code.slice(last));
   }
 
   var ALLOWED = {
     B:1, STRONG:1, I:1, EM:1, U:1, INS:1, S:1, STRIKE:1, DEL:1, CODE:1, PRE:1, BR:1, A:1, BLOCKQUOTE:1,
-    TABLE:1, THEAD:1, TBODY:1, TR:1, TH:1, TD:1, DIV:1, SPAN:1, H1:1, H2:1, H3:1, H4:1, UL:1, OL:1, LI:1, HR:1
+    TABLE:1, THEAD:1, TBODY:1, TR:1, TH:1, TD:1, DIV:1, SPAN:1, P:1,
+    H1:1, H2:1, H3:1, H4:1, H5:1, H6:1, UL:1, OL:1, LI:1, HR:1
   };
+
+  // 把 marked 的标准输出对齐到本项目既有的 CSS，省得为了一个解析器去改整套样式。
+  // 三件事都必须在"剥属性"之前做完——align / style / type 随后都会被清掉。
+  function normalizeMarkdownNode(c) {
+    // 1) GFM 任务列表：marked 出 <input type=checkbox disabled>，本项目是 .task-checkbox
+    if (c.tagName === "INPUT") {
+      if (c.getAttribute("type") !== "checkbox") return false;
+      // 用 hasAttribute 而不是 .checked：marked 出的是 checked 属性，
+      // 而 .checked 这个 IDL 属性在非浏览器 DOM 实现里不一定跟着属性走。
+      var checked = c.hasAttribute("checked");
+      var box = document.createElement("span");
+      box.className = "task-checkbox" + (checked ? " checked" : "");
+      if (checked) box.textContent = "✓";
+      var li = c.parentNode;
+      c.parentNode.replaceChild(box, c);
+      // 样式挂在 .task-item 上，而 marked 并不给 <li> 加 class（松散列表时
+      // checkbox 还会多包一层 <p>），所以往上找到 LI 自己补。
+      while (li && li.tagName !== "LI") li = li.parentNode;
+      if (li && li.classList) li.classList.add("task-item");
+      return true;   // 已替换，调用方不要再往下走
+    }
+    // 2) 任务项样式类对齐（部分 marked 版本会给 task-list-item）
+    if (c.tagName === "LI" && c.classList.contains("task-list-item")) c.classList.add("task-item");
+    // 3) 表格列对齐：属性会被剥掉，先落到 class 上
+    if (c.tagName === "TH" || c.tagName === "TD") {
+      var al = c.getAttribute("align") || (c.style && c.style.textAlign);
+      if (al) c.classList.add("ta-" + al);
+    }
+    // 4) 宽表格的横向滚动容器。marked 只出裸 <table>，而 overflow-x 挂在
+    //    .table-wrap 上，少了它宽表格会直接撑破气泡。
+    if (c.tagName === "TABLE" && !(c.parentNode && c.parentNode.className === "table-wrap")) {
+      var tw = document.createElement("div");
+      tw.className = "table-wrap";
+      c.parentNode.insertBefore(tw, c);
+      tw.appendChild(c);
+    }
+    return false;
+  }
+
   function sanitizeHtml(htmlStr) {
     var tmp = document.createElement("div");
     tmp.innerHTML = String(htmlStr);
@@ -1376,6 +1461,7 @@
       Array.prototype.slice.call(node.childNodes).forEach(function (c) {
         if (c.nodeType === 3) return;
         if (c.nodeType !== 1) { node.removeChild(c); return; }
+        if (normalizeMarkdownNode(c)) return;
         if (!ALLOWED[c.tagName]) {
           var frag = document.createDocumentFragment();
           while (c.firstChild) frag.appendChild(c.firstChild);
@@ -1398,52 +1484,18 @@
     return tmp.innerHTML;
   }
 
-  function renderMarkdownTable(text) {
-    var lines = text.split("\n");
-    var out = [];
-    var i = 0;
-    var n = lines.length;
+  // GFM 解析交给 marked（本地 vendor，不联网）。breaks:true 是必须的：
+  // Agent / 聊天输出严重依赖单换行可见，旧渲染器把每个 \n 都转成了 <br>，
+  // 用 GFM 默认的 breaks:false 会让大量既有输出塌成一段。
+  if (window.marked && marked.use) {
+    marked.use({ gfm: true, breaks: true });
+  }
 
-    function isTableRow(line) {
-      var trimmed = line.trim();
-      return trimmed.indexOf("|") >= 0 && trimmed.length > 2;
+  function renderMarkdown(src) {
+    if (window.marked && marked.parse) {
+      try { return marked.parse(src); } catch (e) { /* 落到下面的纯文本兜底 */ }
     }
-    function isSepRow(line) {
-      var trimmed = line.trim();
-      var stripped = trimmed.replace(/[|:\-\s]/g, "");
-      return stripped === "" && trimmed.indexOf("-") >= 0 && trimmed.indexOf("|") >= 0;
-    }
-    function splitCells(line) {
-      var trimmed = line.trim();
-      if (trimmed.startsWith("|")) trimmed = trimmed.substring(1);
-      if (trimmed.endsWith("|")) trimmed = trimmed.substring(0, trimmed.length - 1);
-      return trimmed.split("|").map(function(s){ return s.trim(); });
-    }
-
-    while (i < n) {
-      if (isTableRow(lines[i]) && i + 1 < n && isSepRow(lines[i + 1])) {
-        var headerCells = splitCells(lines[i]);
-        var tableHtml = '<div class="table-wrap"><table><thead><tr>';
-        headerCells.forEach(function (h) { tableHtml += '<th>' + h + '</th>'; });
-        tableHtml += '</tr></thead><tbody>';
-        i += 2;
-        while (i < n && isTableRow(lines[i])) {
-          var rowCells = splitCells(lines[i]);
-          tableHtml += '<tr>';
-          for (var c = 0; c < headerCells.length; c++) {
-            tableHtml += '<td>' + (rowCells[c] != null ? rowCells[c] : '') + '</td>';
-          }
-          tableHtml += '</tr>';
-          i++;
-        }
-        tableHtml += '</tbody></table></div>';
-        out.push(tableHtml);
-      } else {
-        out.push(lines[i]);
-        i++;
-      }
-    }
-    return out.join("\n");
+    return escapeHtml(src).replace(/\n/g, "<br>");
   }
 
   function renderText(text, parseMode) {
@@ -1455,48 +1507,11 @@
       return sanitized;
     }
 
-    var codeBlocks = [];
-    var processed = text.replace(/```([a-zA-Z0-9_+#.-]*)\n?([\s\S]*?)```/g, function (_, lang, code) {
-      var id = "%%CODE_BLOCK_" + codeBlocks.length + "%%";
-      codeBlocks.push({ lang: (lang || "text").trim(), code: code.replace(/^\n+/, "").replace(/\n+$/, "") });
-      return id;
-    });
-
-    var out = escapeHtml(processed);
-    out = renderMarkdownTable(out);
-    out = out.replace(/^#### (.*?)$/gm, "<h4>$1</h4>");
-    out = out.replace(/^### (.*?)$/gm, "<h3>$1</h3>");
-    out = out.replace(/^## (.*?)$/gm, "<h2>$1</h2>");
-    out = out.replace(/^# (.*?)$/gm, "<h1>$1</h1>");
-    out = out.replace(/^> (.*?)$/gm, "<blockquote>$1</blockquote>");
-    out = out.replace(/^- \[ \] (.*?)$/gm, '<li class="task-item"><span class="task-checkbox"></span><span>$1</span></li>');
-    out = out.replace(/^- \[x\] (.*?)$/gm, '<li class="task-item"><span class="task-checkbox checked">✓</span><span>$1</span></li>');
-    out = out.replace(/^[-*] (.*?)$/gm, "<li>$1</li>");
-    out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-    out = out.replace(/\*([^*]+)\*/g, "<em>$1</em>");
-    out = out.replace(/`([^`\n]+)`/g, "<code>$1</code>");
-    out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
-    out = out.replace(/\n/g, "<br>");
-    out = out.replace(/(?:<br>\s*)+<blockquote>/g, "<blockquote>").replace(/<\/blockquote>(?:\s*<br>)+/g, "</blockquote>");
-    out = out.replace(/(?:<br>\s*)+<div class="table-wrap">/g, '<div class="table-wrap">').replace(/<\/table><\/div>(?:\s*<br>)+/g, '</table></div>');
-
-    codeBlocks.forEach(function (item, idx) {
-      var langLabel = item.lang.toUpperCase() || "CODE";
-      var highlighted = highlightCode(item.code, item.lang);
-      var blockHtml = '<div class="code-block-wrap">' +
-        '<div class="code-header">' +
-          '<span class="code-lang">' + escapeHtml(langLabel) + '</span>' +
-          '<div class="code-actions">' +
-            '<button class="code-btn btn-wrap" type="button" title="切换自动换行"><svg class="icon" viewBox="0 0 24 24"><use href="#i-wrap"/></svg><span>换行</span></button>' +
-            '<button class="code-btn btn-copy" type="button" title="复制代码"><svg class="icon" viewBox="0 0 24 24"><use href="#i-copy"/></svg><span>复制</span></button>' +
-          '</div>' +
-        '</div>' +
-        '<pre data-lang="' + escapeHtml(item.lang) + '"><code>' + highlighted + '</code></pre>' +
-      '</div>';
-      out = out.replace("%%CODE_BLOCK_" + idx + "%%", blockHtml);
-    });
-
-    return out;
+    // marked 直接出 <pre><code class="language-xxx">，正好是 enhanceBubbleContent
+    // 期待的形状（它按 /language-(...)/ 读语言并补外壳），所以这里不再需要
+    // 旧的 %%CODE_BLOCK_n%% 占位符回填——那个用字符串做 replace 的 pattern，
+    // 代码里出现 $& / $` / $' / $$ 会被当成替换模式吃掉。
+    return sanitizeHtml(renderMarkdown(text));
   }
 
   function nowTime() {
@@ -1559,27 +1574,43 @@
         wrap.appendChild(header);
         wrap.appendChild(pre);
       }
+      // 点击行为统一走 log 上的事件委托（bindContentClicks），这里只负责建壳 +
+      // 高亮。旧实现每次渲染都重绑一遍，而流式 edit 帧每批 token 都重建整棵子树。
+    });
+  }
 
-      var code = pre.querySelector("code") || pre;
-      var btnCopy = wrap.querySelector(".btn-copy");
-      var btnWrap = wrap.querySelector(".btn-wrap");
+  // 代码块按钮 + 行内代码复制，统一委托到聊天容器上。
+  // 行内 <code>（含引用块 / 表格单元格里的）以前完全没有绑定，点了没反应。
+  function bindContentClicks(root) {
+    root.addEventListener("click", function (e) {
+      if (!e.target.closest) return;
 
-      if (btnCopy && !btnCopy._bound) {
-        btnCopy._bound = true;
-        btnCopy.addEventListener("click", function (e) {
-          e.stopPropagation();
-          copyText(code.textContent).then(function () { flashCopied(btnCopy, true); })
-                                   .catch(function () { toast("复制失败，请手动选中"); });
-        });
-      }
-      if (btnWrap && !btnWrap._bound) {
-        btnWrap._bound = true;
-        btnWrap.addEventListener("click", function (e) {
-          e.stopPropagation();
+      var btn = e.target.closest(".code-btn");
+      if (btn) {
+        var wrap = btn.closest(".code-block-wrap");
+        var pre = wrap && wrap.querySelector("pre");
+        if (!pre) return;
+        e.stopPropagation();
+        if (btn.classList.contains("btn-copy")) {
+          var codeEl = pre.querySelector("code") || pre;
+          copyText(codeEl.textContent).then(function () { flashCopied(btn, true); })
+                                      .catch(function () { toast("复制失败，请手动选中"); });
+        } else if (btn.classList.contains("btn-wrap")) {
           pre.classList.toggle("wrapped");
-          btnWrap.classList.toggle("done", pre.classList.contains("wrapped"));
-        });
+          btn.classList.toggle("done", pre.classList.contains("wrapped"));
+        }
+        return;
       }
+
+      var inline = e.target.closest("code");
+      if (!inline || inline.closest("pre")) return;           // 大代码块交给上面的按钮
+      if (String(window.getSelection() || "").length) return; // 用户在选词，不抢
+      copyText(inline.textContent).then(function () {
+        inline.classList.add("copied");
+        triggerHaptic("success");
+        clearTimeout(inline._t);
+        inline._t = setTimeout(function () { inline.classList.remove("copied"); }, 1200);
+      }).catch(function () { toast("复制失败，请手动选中"); });
     });
   }
 
@@ -1622,6 +1653,7 @@
       var pill = document.createElement("div");
       pill.className = role === "token" ? "token-pill" : "sys-pill";
       pill.innerHTML = renderText(text, parseMode);
+      enhanceBubbleContent(pill);
       row.appendChild(pill);
       log.appendChild(row);
       if (stick) scrollDown();
@@ -1859,6 +1891,7 @@
         (kind === "photo" ? "🖼️ " : "📎 ") + (filename || (kind === "photo" ? "图片" : "文件")) +
         (caption ? "\n" + caption : "")
       );
+      enhanceBubbleContent(pill);
       row.appendChild(pill);
       log.appendChild(row);
       if (stick) scrollDown();
@@ -2092,7 +2125,12 @@
           entry.row.parentNode.insertBefore(card.row, entry.row.nextSibling);
         }
       })
-      .catch(function () {});
+      .catch(function (err) {
+        // 解析失败时页面上只会剩下那行带路径的文本，看起来像"下载按钮消失了"。
+        // 静默吞掉会让这种情况完全无法排查，至少留个控制台线索：
+        // 403 = 路径不在 media_allowed_roots 内，404 = 文件已不存在。
+        console.warn("[media] 无法恢复媒体卡片:", media.path, err && err.message);
+      });
   }
 
   function restoreMediaFromHistory(m, role, media) {
@@ -2762,9 +2800,14 @@
   });
 
   btnSend.addEventListener("click", send);
+  bindContentClicks(log);
+  if (IS_TOUCH) {
+    input.setAttribute("enterkeyhint", "enter");   // 软键盘显示"换行"而不是"发送/前往"
+    btnSend.title = "发送消息";                     // 桌面文案是"发送消息 (Enter)"，触屏上不成立
+  }
   input.addEventListener("keydown", function (e) {
     if (suggest.classList.contains("hidden")) {
-      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+      if (e.key === "Enter" && !e.shiftKey && !IS_TOUCH) { e.preventDefault(); send(); }
       return;
     }
     var items = suggest.querySelectorAll(".cmd-item");
@@ -2774,6 +2817,9 @@
       e.preventDefault();
       if (suggestIndex >= 0 && items[suggestIndex]) items[suggestIndex].click();
     } else if (e.key === "Enter") {
+      // 触屏必须在 preventDefault 之前放行，否则换行还是会被吃掉。
+      // 手机上命令建议改用点选，回车只管换行。
+      if (IS_TOUCH) { hideSuggest(); return; }
       e.preventDefault();
       if (suggestIndex >= 0 && items[suggestIndex]) {
         var sel = suggestMatches[suggestIndex];

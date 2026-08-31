@@ -131,10 +131,20 @@ def _build_web_open_button():
       - 配了 HTTPS 公开地址 → WebApp 内嵌打开；
       - 否则 → 外部浏览器打开本地地址。
     未开启时返回 None，调用方据此决定是否显示该行。
+
+    没设密码时不能给 url / web_app 按钮：start_web_chat_if_enabled 在没密码时
+    直接跳过启动，地址上根本没有服务在监听，点下去就是"毫无反应"。而 url /
+    web_app 按钮没有 callback_data，永远回不到 bot，也就没机会弹提示。所以
+    这种情况下换成回调按钮，让 web_need_password 分支去说明原因。
     """
     enabled = normalize_bool(UserDataManager.get('web_enabled', False), False)
     if not enabled:
         return None
+
+    if not normalize_bool(UserDataManager.get('_web_has_password', False), False):
+        return InlineKeyboardButton(
+            "🌐 打开网页版（未设密码）", callback_data="web_need_password"
+        )
 
     public_url = str(UserDataManager.get('web_public_url', '') or '')
     if public_url.startswith("https://"):
@@ -149,10 +159,16 @@ def _build_terminal_open_button():
 
     终端与 Web 共享同一端口和认证，但开关独立。只要 terminal_enabled
     即返回按钮。终端是任意命令执行，默认关闭，必须显式开启。
+    密码缺失时同 _build_web_open_button：服务不会启动，给回调按钮而不是死链接。
     """
     term_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
     if not term_on:
         return None
+
+    if not normalize_bool(UserDataManager.get('_web_has_password', False), False):
+        return InlineKeyboardButton(
+            "🖥 打开终端（未设密码）", callback_data="web_need_password"
+        )
 
     public_url = str(UserDataManager.get('web_public_url', '') or '')
     if public_url.startswith("https://"):

@@ -680,6 +680,13 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode=constants.ParseMode.HTML
             )
 
+        elif data == "web_need_password":
+            # Web/终端已开启但没设密码：start_web_chat_if_enabled 直接跳过启动，
+            # 地址上没有服务在监听。_build_web_open_button 这时给的是回调按钮
+            # 而不是 url 按钮，就是为了能在这里说明原因——否则点了毫无反应。
+            await query.answer("请先设置访问密码：/web → 🔑 密码", show_alert=True)
+            return
+
         elif data == "toggle_web_enabled":
             enabled = not normalize_bool(UserDataManager.get('web_enabled', False), False)
             if enabled and not UserDataManager.get('_web_has_password', False):
