@@ -1292,17 +1292,25 @@
     {
       group: "🚀 核心常用",
       items: [
-        {cmd:"/start", desc:"打开主菜单"},
+        {cmd:"/start", desc:"打开主菜单与功能导航"},
+        {cmd:"/skills", desc:"查看与管理 Agent 技能"},
         {cmd:"/status", desc:"查看当前状态与运行环境"},
         {cmd:"/show_chat_info", desc:"状态与记忆统计"},
         {cmd:"/clear_memory", desc:"清空上下文会话记忆"}
       ]
     },
     {
+      group: "🧩 技能与智能体",
+      items: [
+        {cmd:"/skills", desc:"管理与开关 Skill 技能列表"},
+        {cmd:"/agent", desc:"开关 Agent 智能体自主模式"},
+        {cmd:"/prompts", desc:"管理全局与角色提示词"}
+      ]
+    },
+    {
       group: "⚙️ 对话参数",
       items: [
         {cmd:"/config", desc:"打开图形化设置面板"},
-        {cmd:"/agent", desc:"开关 Agent 智能体模式"},
         {cmd:"/stream", desc:"开关流式输出模式"},
         {cmd:"/thinking", desc:"设置思考深度与推理等级"},
         {cmd:"/depth", desc:"设置全局记忆深度"},
@@ -1322,7 +1330,6 @@
     {
       group: "📊 记忆与统计",
       items: [
-        {cmd:"/prompts", desc:"管理全局与角色提示词"},
         {cmd:"/export", desc:"导出完整记忆数据库"},
         {cmd:"/stats", desc:"Token 消耗与费用统计报表"}
       ]
@@ -2792,9 +2799,11 @@
 
   function buildMenu(filterText) {
     var list = document.getElementById("cmd-list");
+    if (!list) return;
     list.innerHTML = "";
     var q = (filterText || "").toLowerCase().trim();
 
+    var renderedCount = 0;
     COMMAND_GROUPS.forEach(function (g) {
       var filtered = g.items.filter(function (it) {
         return !q || it.cmd.toLowerCase().indexOf(q) >= 0 || it.desc.toLowerCase().indexOf(q) >= 0;
@@ -2806,6 +2815,7 @@
       list.appendChild(lbl);
 
       filtered.forEach(function (c) {
+        renderedCount++;
         var item = document.createElement("div");
         item.className = "menu-item";
         item.innerHTML = '<span class="m-cmd">' + escapeHtml(c.cmd) + '</span><span class="m-desc">' + escapeHtml(c.desc) + '</span>';
@@ -2820,11 +2830,31 @@
         list.appendChild(item);
       });
     });
+
+    if (renderedCount === 0) {
+      var emptyEl = document.createElement("div");
+      emptyEl.style.cssText = "color:var(--text-3);font-size:13px;text-align:center;padding:24px 10px;";
+      emptyEl.textContent = "未找到匹配的命令或技能";
+      list.appendChild(emptyEl);
+    }
   }
 
-  function openMenu() { menuPanel.classList.add("open"); overlay.classList.remove("hidden"); }
-  function closeMenu() { menuPanel.classList.remove("open"); overlay.classList.add("hidden"); }
+  function openMenu() {
+    var searchInput = document.getElementById("menu-search");
+    if (searchInput) searchInput.value = "";
+    buildMenu();
+    menuPanel.classList.add("open");
+    overlay.classList.remove("hidden");
+    if (searchInput) searchInput.focus();
+  }
+  function closeMenu() {
+    menuPanel.classList.remove("open");
+    overlay.classList.add("hidden");
+  }
   document.getElementById("menu-search").addEventListener("input", function (e) { buildMenu(e.target.value); });
+
+  // 页面加载时立即初始化菜单列表
+  buildMenu();
 
   function boot() {
     loginDlg.close();
