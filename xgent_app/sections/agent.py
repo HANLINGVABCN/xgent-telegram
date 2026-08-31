@@ -1555,6 +1555,7 @@ class AgentExecutor:
             kwargs: Dict[str, Any] = {}
             if os.name != 'nt':
                 kwargs['start_new_session'] = True
+                kwargs['executable'] = '/bin/bash'
             else:
                 kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
 

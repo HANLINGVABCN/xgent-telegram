@@ -236,6 +236,7 @@ class AgentShellSession:
             self.process = subprocess.Popen(
                 self.command,
                 shell=True,
+                executable='/bin/bash',
                 stdin=terminal_fd,
                 stdout=terminal_fd,
                 stderr=terminal_fd,
@@ -2112,6 +2113,7 @@ class SelfTriggerManager:
         kwargs: Dict[str, Any] = {}
         if os.name != 'nt':
             kwargs['start_new_session'] = True
+            kwargs['executable'] = '/bin/bash'
         else:
             kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
 
