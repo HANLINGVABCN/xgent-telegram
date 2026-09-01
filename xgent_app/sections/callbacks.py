@@ -2005,7 +2005,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"这会删除当前所有对话记忆。\n"
                 f"🌐 全局记忆记录: <b>{global_count}</b> 条\n"
                 f"🪞 内部镜像消息: <b>{mirror_count}</b> 条\n\n"
-                "不会删除 Provider 配置、.env、提示词文件。",
+                "不会删除 Provider 配置、.env、提示词文件，token 用量统计（/stats）也会保留。",
                 parse_mode=constants.ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🧹 确认清空", callback_data="confirm_clear_memory")],

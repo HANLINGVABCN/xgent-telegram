@@ -23,7 +23,7 @@ async def cmd_delete_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🌐 删除了 {deleted_total} 条全局记忆记录\n"
             f"🪞 删除了 {deleted_mirror} 条内部镜像消息\n"
             f"📦 清掉了 {deleted_sessions} 条内部索引记录\n\n"
-            "Provider 配置、提示词、.env 都还在。",
+            "Provider 配置、提示词、.env 都还在，token 用量统计（/stats）也保留了。",
             reply_markup=get_main_menu()
         )
     else:
@@ -32,7 +32,7 @@ async def cmd_delete_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🌐 删除了 {deleted_total} 条全局记忆记录\n"
             f"🪞 删除了 {deleted_mirror} 条内部镜像消息\n"
             f"📦 清掉了 {deleted_sessions} 条内部索引记录\n\n"
-            "Provider 配置、提示词、.env 都还在。",
+            "Provider 配置、提示词、.env 都还在，token 用量统计（/stats）也保留了。",
             reply_markup=get_main_menu()
         )
 

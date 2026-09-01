@@ -278,6 +278,27 @@ class BotMemoryDB:
             except Exception:
                 pass
         
+        # token 用量统计独立表：记账与对话分家——清空对话记忆（clear_all_conversation_memory
+        # 全表删 global_messages）不再波及 /stats 统计。global_messages 里的 token_usage
+        # 行只作聊天历史显示（每轮「↑ N tokens」），统计以本表为准。
+        # source_rowid = 对应 global_messages 行 id，UNIQUE + INSERT OR IGNORE 让
+        # 启动迁移和双写失败重试天然去重。
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS token_usage_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                model TEXT DEFAULT '',
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cached_tokens INTEGER DEFAULT 0,
+                reasoning_tokens INTEGER DEFAULT 0,
+                visible_output_tokens INTEGER DEFAULT 0,
+                total_tokens INTEGER DEFAULT 0,
+                source_rowid INTEGER,
+                UNIQUE(source_rowid)
+            )
+        ''')
+
         # 索引优化
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_global_timestamp ON global_messages(timestamp)')
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_global_session ON global_messages(session_id)')
@@ -289,21 +310,106 @@ class BotMemoryDB:
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_trigger_tasks_next_run ON trigger_tasks(next_run_at)')
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_trigger_runs_delivery ON trigger_runs(status, delivered_at)')
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_trigger_runs_task ON trigger_runs(task_id, created_at)')
-        
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_token_stats_ts ON token_usage_stats(ts)')
+
+        # 幂等迁移：历史用量行（存于 global_messages）搬入独立表。每次启动都跑，
+        # UNIQUE(source_rowid) 保证重启/恢复备份后重跑不产生重复行。
+        try:
+            cursor = await conn.execute(
+                'SELECT id, timestamp, metadata FROM global_messages WHERE msg_type = ?',
+                (MessageType.TOKEN_USAGE,)
+            )
+            rows = await cursor.fetchall()
+            pending = []
+            for row in rows:
+                meta = {}
+                if row['metadata']:
+                    try:
+                        meta = json.loads(row['metadata']) if isinstance(row['metadata'], str) else row['metadata']
+                    except Exception:
+                        meta = {}
+                model = meta.get('model') or ''
+                usage = meta.get('usage') or {}
+                if not model and not usage:
+                    continue  # 升级前旧记录无结构化数据，跳过（与 /stats 读路径语义一致）
+                pending.append((
+                    row['timestamp'], model,
+                    int(usage.get('input_tokens') or 0),
+                    int(usage.get('output_tokens') or 0),
+                    int(usage.get('cached_tokens') or 0),
+                    int(usage.get('reasoning_tokens') or 0),
+                    int(usage.get('visible_output_tokens') or 0),
+                    int(usage.get('total_tokens') or 0),
+                    row['id'],
+                ))
+            if pending:
+                await conn.executemany('''
+                    INSERT OR IGNORE INTO token_usage_stats
+                    (ts, model, input_tokens, output_tokens, cached_tokens,
+                     reasoning_tokens, visible_output_tokens, total_tokens, source_rowid)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', pending)
+        except Exception as e:
+            logger.warning(f"token 用量统计历史迁移失败（下次启动重试）: {e}")
+
         self._initialized = True
         logger.info("📚 系统记忆数据库初始化完成")
     
     # --- 全局消息记录（仅全局模式使用）---
     async def record_global_message(self, chat_id: int, user_id: int, msg_type: str,
                                      role: str, content: str, session_id: Optional[str] = None,
-                                     metadata: Optional[Dict[str, Any]] = None):
-        """记录一条全局消息"""
+                                     metadata: Optional[Dict[str, Any]] = None) -> Optional[int]:
+        """记录一条全局消息，返回新行 rowid（供 token 统计双写关联去重）。"""
         async with self._write() as conn:
-            await conn.execute('''
+            cursor = await conn.execute('''
                 INSERT INTO global_messages (chat_id, user_id, msg_type, role, content, timestamp, session_id, metadata)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ''', (chat_id, user_id, msg_type, role, content, time.time(), session_id,
                   json.dumps(metadata) if metadata else None))
+            return cursor.lastrowid
+
+    # --- token 用量统计（独立表，/stats 数据源）---
+    async def add_token_stat(self, model: str, usage: Dict[str, Any],
+                             ts: float, source_rowid: Optional[int] = None) -> None:
+        """写入一条 token 用量统计。INSERT OR IGNORE 靠 UNIQUE(source_rowid) 去重。"""
+        async with self._write() as conn:
+            await conn.execute('''
+                INSERT OR IGNORE INTO token_usage_stats
+                (ts, model, input_tokens, output_tokens, cached_tokens,
+                 reasoning_tokens, visible_output_tokens, total_tokens, source_rowid)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                ts, model or '',
+                int(usage.get('input_tokens') or 0),
+                int(usage.get('output_tokens') or 0),
+                int(usage.get('cached_tokens') or 0),
+                int(usage.get('reasoning_tokens') or 0),
+                int(usage.get('visible_output_tokens') or 0),
+                int(usage.get('total_tokens') or 0),
+                source_rowid,
+            ))
+
+    async def get_token_stats(self, start_ts: Optional[float] = None,
+                              end_ts: Optional[float] = None,
+                              limit: int = 200000) -> List[Dict]:
+        """读取 token 用量统计行（升序），字段与旧 /stats 记录结构一致。"""
+        conn = await self._get_conn()
+        conditions, params = [], []
+        if start_ts is not None:
+            conditions.append('ts >= ?')
+            params.append(start_ts)
+        if end_ts is not None:
+            conditions.append('ts <= ?')
+            params.append(end_ts)
+        where = f'WHERE {" AND ".join(conditions)}' if conditions else ''
+        cursor = await conn.execute(
+            f'SELECT ts, model, input_tokens, output_tokens, cached_tokens, '
+            f'reasoning_tokens, visible_output_tokens, total_tokens '
+            f'FROM token_usage_stats {where} ORDER BY ts LIMIT ?',
+            (*params, limit)
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
     
     async def get_global_messages(self, limit: int = 50,
                                    include_types: Optional[List[str]] = None) -> List[Dict]:
