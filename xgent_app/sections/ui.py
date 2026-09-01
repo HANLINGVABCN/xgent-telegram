@@ -30,7 +30,8 @@ class CallbackDataStore:
 def build_magic_keyboard(items: List[str], page: int, callback_prefix: str, back_callback: str,
                          search_callback: Optional[str] = None, filter_text: Optional[str] = None,
                          extra_buttons: Optional[List[InlineKeyboardButton]] = None,
-                         marker_fn: Optional[callable] = None):
+                         marker_fn: Optional[callable] = None,
+                         prefix_fn: Optional[callable] = None):
     PER_PAGE = 8
     display_list = [m for m in items if filter_text and filter_text.lower() in m.lower()] if filter_text else items
     total_pages = math.ceil(len(display_list) / PER_PAGE) or 1
@@ -41,6 +42,10 @@ def build_magic_keyboard(items: List[str], page: int, callback_prefix: str, back
     
     for m in current_items:
         display_name = pretty_model_name(m)
+        if prefix_fn:
+            prefix = prefix_fn(m)
+            if prefix:
+                display_name = f"{prefix} {display_name}"
         if marker_fn:
             marker = marker_fn(m)
             if marker:
@@ -848,6 +853,63 @@ def make_fetched_saved_marker_fn(prov_name: str):
     return marker_fn
 
 
+def get_provider_fetch_record(prov_name: str) -> Optional[dict]:
+    """读取某提供商最近一次联网拉取结果（{'models': [...], 'ts': 时间戳}），没有则返回 None。"""
+    status_map = UserDataManager.get('model_fetch_status', {})
+    if not isinstance(status_map, dict):
+        return None
+    record = status_map.get(prov_name)
+    return record if isinstance(record, dict) else None
+
+
+def make_model_status_fn(prov_name: str):
+    """已保存模型的状态前缀：最近联网拉取时存在返回 🟢，不存在返回 🔴；从未检测过则不显示。"""
+    record = get_provider_fetch_record(prov_name)
+    if not record:
+        return None
+    fetched_models = set(record.get('models') or [])
+
+    def prefix_fn(model_name: str) -> Optional[str]:
+        return "🟢" if model_name in fetched_models else "🔴"
+
+    return prefix_fn
+
+
+def format_fetch_time(ts) -> str:
+    """把联网检测时间戳格式化成 'YYYY-MM-DD HH:MM'，无法解析时返回空串。"""
+    try:
+        ts = int(ts or 0)
+    except (TypeError, ValueError):
+        return ""
+    if ts <= 0:
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+def format_fetch_status_note(prov_name: str, compact: bool = False) -> str:
+    """已保存模型列表的 🟢/🔴 图例说明；该提供商从未联网检测过时返回空串。"""
+    record = get_provider_fetch_record(prov_name)
+    if not record:
+        return ""
+    when = format_fetch_time(record.get('ts')) or "未知时间"
+    if compact:
+        return f"\n🟢 有效 · 🔴 已失效（检测于 {when}，点⚡联网获取刷新）"
+    return (
+        "\n\n🟢 有效：最近联网拉取时存在\n"
+        "🔴 失效：最近联网拉取时已不存在\n"
+        f"⏱️ 上次检测: {when}（点【⚡ 联网获取】刷新）"
+    )
+
+
+def get_saved_models_title(provider_name: str) -> str:
+    """已保存模型列表的标准标题：统一附带 🟢/🔴 图例，避免各处文案漂移。"""
+    return (
+        f"🧰 <b>{safe_text(provider_name)}</b> 已保存的模型\n\n"
+        "这里可以继续新增、联网获取、搜索，或点击模型进行设置。"
+        + format_fetch_status_note(provider_name)
+    )
+
+
 def build_fetched_models_view(provider_name: str):
     """根据缓存状态构建联网模型列表，并让搜索结果返回完整列表。"""
     models = UserDataManager.get('fetched_cache', [])
@@ -871,7 +933,10 @@ def build_fetched_models_view(provider_name: str):
     if filter_text:
         title = f"🔍 搜索 '{safe_text(filter_text)}'：找到 {visible_count} 个模型:"
     else:
-        title = f"🌐 找到了 {len(models)} 个模型:"
+        title = (
+            f"🌐 找到了 {len(models)} 个模型:\n"
+            "✅ 表示已保存 · 点击其它模型即可选用"
+        )
     return title, kb
 
 
@@ -893,7 +958,8 @@ def build_saved_models_view(provider_name: str):
             InlineKeyboardButton("➕ 手写", callback_data=f"act_manual_mod_{provider_name}"),
             InlineKeyboardButton("⚡ 联网获取", callback_data=f"fetch_market_{provider_name}"),
         ],
-        marker_fn=make_manage_marker_fn(provider_name)
+        marker_fn=make_manage_marker_fn(provider_name),
+        prefix_fn=make_model_status_fn(provider_name)
     )
     visible_count = sum(
         1 for model in models
@@ -903,12 +969,10 @@ def build_saved_models_view(provider_name: str):
         title = (
             f"🔍 <b>{safe_text(provider_name)}</b> 已保存的模型\n\n"
             f"搜索 '{safe_text(filter_text)}'：找到 {visible_count} 个模型:"
+            + format_fetch_status_note(provider_name, compact=True)
         )
     else:
-        title = (
-            f"🧰 <b>{safe_text(provider_name)}</b> 已保存的模型\n\n"
-            "这里可以继续新增、联网获取、搜索，或点击模型进行设置。"
-        )
+        title = get_saved_models_title(provider_name)
     return title, kb
 
 
@@ -943,6 +1007,16 @@ def build_model_detail_menu(prov_name: str, model_name: str, back_callback: Opti
         status_parts.append("🖼️ 当前媒体模型")
     status = "、".join(status_parts) if status_parts else "未设为默认"
 
+    fetch_record = get_provider_fetch_record(prov_name)
+    if fetch_record:
+        when = format_fetch_time(fetch_record.get('ts')) or "未知时间"
+        if model_name in (fetch_record.get('models') or []):
+            fetch_line = f"🟢 有效（检测于 {when}）"
+        else:
+            fetch_line = f"🔴 已失效（检测于 {when}，未出现在最近拉取结果中）"
+    else:
+        fetch_line = "⚪ 未检测（点【⚡ 联网获取】后显示）"
+
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("💬 设为对话模型", callback_data=set_chat_cb)],
         [InlineKeyboardButton("🖼️ 设为媒体模型", callback_data=set_media_cb)],
@@ -952,7 +1026,8 @@ def build_model_detail_menu(prov_name: str, model_name: str, back_callback: Opti
     text = (
         f"⚙️ <b>{safe_text(model_name)}</b>\n"
         f"提供商: {safe_text(prov_name)}\n"
-        f"状态: {status}"
+        f"状态: {status}\n"
+        f"联网检测: {fetch_line}"
     )
     return text, kb
 
@@ -971,7 +1046,8 @@ def build_model_selection_keyboard(provider_name: str, target: str, page: int = 
         page,
         "pick_default_",
         f"target_{target}_models",
-        marker_fn=make_select_marker_fn(target, provider_name)
+        marker_fn=make_select_marker_fn(target, provider_name),
+        prefix_fn=make_model_status_fn(provider_name)
     )
 
 # --- ☆ 核心：授权用户校验与未授权用户通报系统 ☆ ---

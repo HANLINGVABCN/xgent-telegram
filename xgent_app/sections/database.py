@@ -1251,6 +1251,7 @@ class UserDataManager:
     @classmethod
     async def _load_from_db(cls):
         """从数据库加载数据到内存"""
+        fetch_status_raw = await cls._require_db().get_config('model_fetch_status', {})
         cls._data = {
             'state': BotState.IDLE,
             'providers': await cls._require_db().get_providers(),
@@ -1299,6 +1300,11 @@ class UserDataManager:
                 str(s) for s in (await cls._require_db().get_config('disabled_skills', [])) or []
                 if isinstance(s, str)
             ],
+            # 各提供商最近一次联网拉取结果：{prov: {'models': [...], 'ts': int}}。
+            # 已保存模型列表据此显示 🟢 有效 / 🔴 失效 图标。
+            'model_fetch_status': (
+                fetch_status_raw if isinstance(fetch_status_raw, dict) else {}
+            ),
             # 临时数据（不需要持久化）
             'temp_viewing_prov': None,
             'temp_list_type': None,

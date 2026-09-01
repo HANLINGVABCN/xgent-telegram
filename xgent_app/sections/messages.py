@@ -1348,6 +1348,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     reply_text += f"\nℹ️ 已跳过 {len(skipped_models)} 个重复模型。"
             else:
                 reply_text = "ℹ️ 这些模型以前都保存过了。"
+            reply_text += format_fetch_status_note(p, compact=True)
             await update.message.reply_text(
                 reply_text,
                 reply_markup=kb,

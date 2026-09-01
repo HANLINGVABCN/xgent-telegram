@@ -1415,7 +1415,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"📚 <b>{safe_text(provider_name)}</b> 的{safe_text(get_model_target_label(target))}\n\n"
                 f"当前默认: <b>{safe_text(format_model_target_summary(target))}</b>\n"
                 "这里只能选择已保存模型。\n"
-                "如果要新增、删除或联网获取模型，请回【提供商】里管理。",
+                "如果要新增、删除或联网获取模型，请回【提供商】里管理。"
+                + format_fetch_status_note(provider_name, compact=True),
                 reply_markup=kb,
                 parse_mode=constants.ParseMode.HTML
             )
@@ -1429,7 +1430,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             kb = build_saved_models_keyboard(name)
             await query.message.edit_text(
                 f"🧰 <b>{safe_text(name)}</b> 的模型管理\n\n"
-                "这里可以手写新增、联网获取、搜索，或点击模型进行设置。",
+                "这里可以手写新增、联网获取、搜索，或点击模型进行设置。"
+                + format_fetch_status_note(name),
                 reply_markup=kb,
                 parse_mode=constants.ParseMode.HTML
             )
@@ -1565,6 +1567,11 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 db = await BotMemoryDB.get_instance()
                 await db.delete_provider(name)
                 PortalManager.remove_portal(name)
+                # 同步清掉该提供商的联网检测记录，避免日后同名新提供商继承旧状态。
+                status_map = UserDataManager.get('model_fetch_status', {})
+                if isinstance(status_map, dict) and name in status_map:
+                    status_map.pop(name, None)
+                    await UserDataManager.save_config('model_fetch_status', status_map)
                 await UserDataManager.reload_providers()
                 await GlobalRecorder.record_system_op(f"删除Provider: {name}")
             
@@ -1613,12 +1620,11 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return
             kb = build_saved_models_keyboard(name)
             await query.message.edit_text(
-                f"🧰 <b>{safe_text(name)}</b> 已保存的模型\n\n"
-                "这里可以继续新增、联网获取、搜索，或点击模型进行设置。",
+                get_saved_models_title(name),
                 reply_markup=kb,
                 parse_mode=constants.ParseMode.HTML
             )
-        
+
         elif data.startswith("act_manual_mod_"):
             UserDataManager.set('editing_provider', data.split("_", 3)[3])
             UserDataManager.set('state', BotState.ADD_MODEL_MANUAL)
@@ -1714,8 +1720,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 kb = build_saved_models_keyboard(prov_name)
                 await query.message.edit_text(
                     f"✅ <b>{safe_text(model_name)}</b> 已设为{target_label}！\n\n"
-                    f"🧰 <b>{safe_text(prov_name)}</b> 已保存的模型\n\n"
-                    "这里可以继续新增、联网获取、搜索，或点击模型进行设置。",
+                    + get_saved_models_title(prov_name),
                     reply_markup=kb,
                     parse_mode=constants.ParseMode.HTML
                 )
@@ -1773,8 +1778,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 kb = build_saved_models_keyboard(pname)
                 await query.message.edit_text(
                     f"🗑️ <b>{safe_text(mname)}</b> 已从模型列表中删除！\n\n"
-                    f"🧰 <b>{safe_text(pname)}</b> 已保存的模型\n\n"
-                    "这里可以继续新增、联网获取、搜索，或点击模型进行设置。",
+                    + get_saved_models_title(pname),
                     reply_markup=kb,
                     parse_mode=constants.ParseMode.HTML
                 )
@@ -1806,6 +1810,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                     )
                 return
             UserDataManager.set('fetched_cache', models)
+            # 记录本次拉取结果：已保存模型列表据此刷新 🟢 有效 / 🔴 失效 图标。
+            status_map = UserDataManager.get('model_fetch_status', {})
+            if not isinstance(status_map, dict):
+                status_map = {}
+            status_map[name] = {'models': models, 'ts': int(time.time())}
+            await UserDataManager.save_config('model_fetch_status', status_map)
             UserDataManager.set('temp_page', 1)
             UserDataManager.set('temp_filter', None)
             UserDataManager.set('temp_list_type', 'fetched')
@@ -1907,6 +1917,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                     fallback_text = (
                         f"🧰 <b>{safe_text(pname)}</b> 已保存的模型\n\n"
                         "⚠️ 获取结果已失效，请点击【⚡ 联网获取】重新拉取。"
+                        + format_fetch_status_note(pname, compact=True)
                     )
                 else:
                     kb = get_providers_menu()
@@ -1935,6 +1946,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                     fallback_text = (
                         f"🧰 <b>{safe_text(pname)}</b> 已保存的模型\n\n"
                         "⚠️ 获取结果已失效，请点击【⚡ 联网获取】重新拉取。"
+                        + format_fetch_status_note(pname, compact=True)
                     )
                 else:
                     kb = get_providers_menu()
@@ -1986,7 +1998,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                     back_callback = f"target_{target}_models"
                     kb = build_magic_keyboard(
                         items, page, prefix, back_callback,
-                        marker_fn=make_select_marker_fn(target, pname)
+                        marker_fn=make_select_marker_fn(target, pname),
+                        prefix_fn=make_model_status_fn(pname)
                     )
             else:
                 _, kb = build_fetched_models_view(pname)

@@ -437,8 +437,15 @@ async def _web_read_settings() -> Dict[str, Any]:
     prov_name = get_model_target_provider_name('chat')
     model_options = []
     for name, data in providers.items():
+        # 🟢 有效 / 🔴 失效：依据该提供商最近一次联网拉取结果（与 Telegram 端同一份数据）。
+        fetch_record = get_provider_fetch_record(name) or {}
+        fetched_models = set(fetch_record.get('models') or [])
         for model in (data.get('models') or []):
-            model_options.append({'value': f"{name}|{model}", 'label': f"{name} / {model}"})
+            if fetch_record:
+                status_icon = '🟢 ' if model in fetched_models else '🔴 '
+            else:
+                status_icon = ''
+            model_options.append({'value': f"{name}|{model}", 'label': f"{status_icon}{name} / {model}"})
 
     current_model = UserDataManager.get('default_model') or ''
     # skill 列表供前端渲染勾选项：每个 skill 的相对路径 + 显示名（stem）
