@@ -2919,6 +2919,14 @@ toggle_web_enabled() {
     if [ "$WEB_ENABLED" = "yes" ]; then
         set_web_enabled 0 && success "Web 功能已关闭"
     else
+        # 和电报端 toggle_web_enabled 的校验保持对称。没密码就开启会留下一个
+        # "开关是开的、服务却从没起来"的状态：菜单里照常显示打开按钮，点下去
+        # 那个地址上没人监听，用户看到的就是毫无反应。
+        if [ "$WEB_HAS_PASSWORD" != "yes" ]; then
+            warn "   [跳过] 还没有设置访问密码，Web 服务不会启动。"
+            warn "   请先用「设置访问密码」设好密码再开启。"
+            return 1
+        fi
         set_web_enabled 1 && success "Web 功能已开启"
     fi
     warn "   改动需要重启服务才生效（主菜单 3) 重启服务）。"

@@ -471,35 +471,78 @@ class ModelClient:
         return "".join(texts)
 
     @staticmethod
-    async def _fetch_openai_compatible_models(api_key: str, base_url: str) -> list:
+    async def _fetch_openai_compatible_models(api_key: str, base_url: str) -> Tuple[list, Optional[str]]:
         import httpx
-        url = f"{base_url.rstrip('/')}/models"
-        try:
-            async with ModelClient._http_client_context() as client:
-                resp = await client.get(
-                    url,
-                    headers=ModelClient._openai_compatible_headers(api_key),
-                    timeout=15.0,
-                )
-            if resp.status_code >= 400:
-                logger.error(f"OpenAI compatible models list error: {resp.status_code}: {redact_sensitive_text(resp.text or '')[:500]}")
-                return []
-            data = resp.json()
-            model_ids = []
-            for m in data.get("data") or data.get("models") or []:
-                if isinstance(m, dict):
-                    model_id = m.get("id") or m.get("name")
-                else:
-                    model_id = str(m)
-                if model_id and 'embedding' not in str(model_id).lower() and 'audio' not in str(model_id).lower():
-                    model_id_str = str(model_id)
-                    if model_id_str.startswith("models/"):
-                        model_id_str = model_id_str[len("models/"):]
-                    model_ids.append(model_id_str)
-            return sorted(model_ids)
-        except Exception as e:
-            logger.error(f"OpenAI compatible fetch error: {format_provider_exception(e)}")
-            return []
+        clean_url = (base_url or "").rstrip('/')
+        if not clean_url:
+            return [], "Base URL 为空，无法获取模型列表"
+
+        candidates = [f"{clean_url}/models"]
+        if clean_url.endswith('/v1'):
+            candidates.append(f"{clean_url[:-3].rstrip('/')}/models")
+        else:
+            candidates.append(f"{clean_url}/v1/models")
+        candidates.append(f"{clean_url}/api/tags")      # Ollama
+        candidates.append(f"{clean_url}/api/v1/models")  # OpenRouter / Proxies
+
+        last_error = None
+        headers = ModelClient._openai_compatible_headers(api_key)
+
+        async with ModelClient._http_client_context() as client:
+            for url in candidates:
+                try:
+                    resp = await client.get(url, headers=headers, timeout=12.0)
+                    if resp.status_code == 200:
+                        try:
+                            data = resp.json()
+                        except Exception:
+                            continue
+
+                        items = []
+                        if isinstance(data, list):
+                            items = data
+                        elif isinstance(data, dict):
+                            items = data.get("data") or data.get("models") or data.get("tags") or data.get("model_list") or []
+                            if isinstance(items, dict):
+                                items = list(items.values())
+
+                        model_ids = []
+                        for m in items:
+                            mid = None
+                            if isinstance(m, dict):
+                                mid = m.get("id") or m.get("name") or m.get("model")
+                            elif isinstance(m, str):
+                                mid = m
+                            else:
+                                mid = str(m)
+                            if mid:
+                                mid_str = str(mid).strip()
+                                if mid_str.startswith("models/"):
+                                    mid_str = mid_str[len("models/"):]
+                                if mid_str:
+                                    model_ids.append(mid_str)
+
+                        chat_models = [
+                            m for m in model_ids
+                            if 'embedding' not in m.lower() and 'rerank' not in m.lower() and 'bge-' not in m.lower()
+                        ]
+                        final_models = sorted(set(chat_models if chat_models else model_ids))
+                        if final_models:
+                            return final_models, None
+                    elif resp.status_code in {401, 403}:
+                        err_text = redact_sensitive_text(resp.text or "")[:400]
+                        last_error = f"HTTP {resp.status_code} 鉴权失败：{err_text or 'API Key 无效或未授权'}"
+                        break
+                    elif resp.status_code != 404:
+                        last_error = f"HTTP {resp.status_code}：{redact_sensitive_text(resp.text or '')[:400]}"
+                except httpx.TimeoutException:
+                    last_error = "请求超时，未能从提供商接口获取模型列表"
+                except Exception as e:
+                    last_error = format_provider_exception(e)
+
+        if last_error:
+            return [], last_error
+        return [], "未在提供商接口端点发现模型列表服务 (HTTP 404)。您可以点击『➕ 手写』直接手动添加模型名称。"
 
     @staticmethod
     async def _complete_openai_compatible_http(api_key: str, base_url: str, model: str,
@@ -972,28 +1015,38 @@ class ModelClient:
 
         try:
             if api_format in {'gemini', 'vertex'}:
-                return await ModelClient._fetch_gemini_models(selected_key, base_url), None
+                models = await ModelClient._fetch_gemini_models(selected_key, base_url)
+                return models, None
             if api_format == 'claude':
                 return await ModelClient._fetch_claude_models(), None
             if api_format == 'openai_compatible':
-                models = await ModelClient._fetch_openai_compatible_models(selected_key, base_url)
-                return models, None
+                return await ModelClient._fetch_openai_compatible_models(selected_key, base_url)
 
-            client = PortalManager.get_portal(prov_name, selected_key, base_url)
-            response = await client.models.list(timeout=MODEL_LIST_TIMEOUT_SECONDS)
-            model_ids = []
-            for m in response.data:
-                if hasattr(m, 'id'):
-                    model_ids.append(m.id)
-                elif isinstance(m, dict) and 'id' in m:
-                    model_ids.append(m['id'])
-                else:
-                    model_ids.append(str(m))
-            models = sorted([
-                m for m in model_ids
-                if 'embedding' not in m.lower() and 'audio' not in m.lower()
-            ])
-            return models, None
+            # 默认 openai 格式：先尝试通过 OpenAI SDK 获取
+            try:
+                client = PortalManager.get_portal(prov_name, selected_key, base_url)
+                response = await client.models.list(timeout=MODEL_LIST_TIMEOUT_SECONDS)
+                model_ids = []
+                for m in (getattr(response, 'data', None) or []):
+                    if hasattr(m, 'id'):
+                        model_ids.append(m.id)
+                    elif isinstance(m, dict) and 'id' in m:
+                        model_ids.append(m['id'])
+                    elif isinstance(m, str):
+                        model_ids.append(m)
+                    else:
+                        model_ids.append(str(m))
+                models = sorted([
+                    m for m in model_ids
+                    if 'embedding' not in m.lower() and 'audio' not in m.lower() and 'rerank' not in m.lower()
+                ])
+                if models:
+                    return models, None
+            except Exception as sdk_err:
+                logger.debug(f"OpenAI SDK models.list failed for {prov_name}, falling back to HTTP probe: {sdk_err}")
+
+            # 自动无缝降级：走多端点自适应 HTTP 获取
+            return await ModelClient._fetch_openai_compatible_models(selected_key, base_url)
         except Exception as e:
             error_text = format_provider_exception(e)
             logger.error(f"Fetch Error ({prov_name}/{api_format}): {error_text}")
@@ -1019,9 +1072,8 @@ class ModelClient:
         if status_code == 401 and reason == 'ACCESS_TOKEN_TYPE_UNSUPPORTED':
             return (
                 "Google Gemini 鉴权失败（401 / ACCESS_TOKEN_TYPE_UNSUPPORTED）。"
-                "这不是“没有模型”。该错误也会在 Key 被多出反斜杠、反引号或其他格式字符时出现。"
-                "旧版本读取配置输入时使用了 Telegram Markdown 序列化，可能改写包含连字符或其他特殊字符的 Key。"
-                "请更新并重启机器人，然后在“编辑 Key”中重新粘贴原始 Key。"
+                "这通常是因为该端点是原生 Gemini 接口，但 Key 包含了多余符号，或反向代理网关未正确放行。"
+                "请检查并重新粘贴原始 Key。"
             )
 
         detail = message or redacted[:800] or '响应正文为空'
@@ -1033,7 +1085,11 @@ class ModelClient:
         """获取 Google 原生 Gemini 模型列表，并处理分页及真实鉴权错误。"""
         import httpx
 
-        url = f"{base_url.rstrip('/')}/models"
+        clean_url = (base_url or "").rstrip('/')
+        if 'generativelanguage.googleapis.com' in clean_url:
+            if not clean_url.endswith('/v1beta') and not clean_url.endswith('/v1') and '/openai' not in clean_url:
+                clean_url = f"{clean_url}/v1beta"
+        url = f"{clean_url}/models"
         headers = {**PROVIDER_HTTP_HEADERS, "Accept": "application/json", "x-goog-api-key": api_key}
         models: List[str] = []
         page_token: Optional[str] = None
@@ -1045,13 +1101,21 @@ class ModelClient:
                     params["pageToken"] = page_token
                 resp = await client.get(url, headers=headers, params=params, timeout=15.0)
                 if resp.status_code != 200:
+                    # 尝试带 ?key= 查询参数
+                    resp = await client.get(url, headers={**PROVIDER_HTTP_HEADERS, "Accept": "application/json"}, params={**params, "key": api_key}, timeout=15.0)
+                if resp.status_code != 200:
                     error = ModelClient._format_gemini_models_error(resp.status_code, resp.text or '')
                     logger.error(error)
                     raise RuntimeError(error)
 
                 data = resp.json()
-                for model_data in data.get('models', []):
+                raw_models = data.get('models', []) if isinstance(data, dict) else []
+                for model_data in raw_models:
                     if not isinstance(model_data, dict):
+                        if isinstance(model_data, str):
+                            name = model_data.split('/')[-1]
+                            if name and 'embedding' not in name.lower():
+                                models.append(name)
                         continue
                     supported_methods = model_data.get('supportedGenerationMethods') or []
                     if supported_methods and not any(
@@ -1060,13 +1124,12 @@ class ModelClient:
                     ):
                         continue
                     name = str(model_data.get('name') or '')
-                    # name 格式: "models/gemini-2.5-flash" → 取 "gemini-2.5-flash"
                     if '/' in name:
                         name = name.split('/')[-1]
                     if name and 'embedding' not in name.lower():
                         models.append(name)
 
-                page_token = data.get('nextPageToken')
+                page_token = data.get('nextPageToken') if isinstance(data, dict) else None
                 if not page_token:
                     break
 

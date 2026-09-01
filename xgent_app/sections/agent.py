@@ -1555,6 +1555,7 @@ class AgentExecutor:
             kwargs: Dict[str, Any] = {}
             if os.name != 'nt':
                 kwargs['start_new_session'] = True
+                kwargs['executable'] = '/bin/bash'
             else:
                 kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
 
@@ -1613,6 +1614,10 @@ class AgentExecutor:
                 output = (output + "\n" if output else "") + "⏹️ 命令已被用户手动停止"
             elif timed_out:
                 output = (output + "\n" if output else "") + f"⏰ 命令超过等待窗口 ({timeout}秒)，已停止。需要长驻/日志/交互任务时请使用 shell。"
+            elif process is not None and process.returncode in (-15, -9):
+                hint = diagnose_signal_death(command, process.returncode)
+                if hint:
+                    output = (output + "\n" if output else "") + hint
             output = output or '(无输出)'
 
             elapsed_seconds = round(max(0.0, time.monotonic() - started_at), 2)

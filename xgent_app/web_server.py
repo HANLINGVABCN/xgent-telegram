@@ -57,6 +57,7 @@ VENDOR_DIR = os.path.join(STATIC_DIR, "vendor")
 # 卡在资源加载上迟迟不能渲染——这就是"访问网页端慢死"的根因）。
 VENDOR_ASSETS: Dict[str, Any] = {
     "/vendor/telegram-web-app.js": ("telegram-web-app.js", "application/javascript; charset=utf-8"),
+    "/vendor/marked.umd.js": ("marked.umd.js", "application/javascript; charset=utf-8"),
     "/vendor/xterm.min.js": ("xterm.min.js", "application/javascript; charset=utf-8"),
     "/vendor/xterm.min.css": ("xterm.min.css", "text/css; charset=utf-8"),
     "/vendor/addon-fit.min.js": ("addon-fit.min.js", "application/javascript; charset=utf-8"),
@@ -160,6 +161,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             self.wfile.write(raw)
+        if status != 200 and getattr(self, "command", "") == "POST":
+            with contextlib.suppress(Exception):
+                length = int(self.headers.get("Content-Length") or 0)
+                if 0 < length <= MAX_REQUEST_BODY:
+                    self.rfile.read(length)
 
     def _send_html(self, body: bytes, status: int = 200) -> None:
         self.send_response(status)
@@ -508,10 +514,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         try:
-            limit = int((query.get("limit") or ["50"])[0])
+            limit_val = int((query.get("limit") or ["0"])[0])
         except ValueError:
-            limit = 50
-        limit = max(1, min(limit, 200))
+            limit_val = 0
+        limit = limit_val if limit_val > 0 else 1000000
         messages = self._run_coro(self.config.read_history(limit))
         self._send_json({"messages": messages})
 

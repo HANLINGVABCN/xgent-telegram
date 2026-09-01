@@ -50,9 +50,10 @@ class GlobalRecorder:
         """
         stamped_metadata = dict(metadata or {})
         stamped_metadata.setdefault('src', _RECORDER_SOURCE_ID)
+        rowid = None
         try:
             db = await BotMemoryDB.get_instance()
-            await db.record_global_message(
+            rowid = await db.record_global_message(
                 chat_id=chat_id or BotConfig.AUTHORIZED_USER_ID,
                 user_id=user_id or 0,
                 msg_type=msg_type,
@@ -65,7 +66,7 @@ class GlobalRecorder:
             logger.error(f"全局消息记录失败（已忽略，不中断主流程）: {e}")
 
         if msg_type == MessageType.AI_REPLY:
-            return
+            return rowid
         try:
             write_model_trace("operation", {
                 "msg_type": msg_type,
@@ -78,7 +79,8 @@ class GlobalRecorder:
             })
         except Exception as e:
             logger.error(f"trace 记录失败（已忽略，不中断主流程）: {e}")
-    
+        return rowid
+
     @staticmethod
     async def record_user_message(content: str, msg_type: str = MessageType.USER_TEXT,
                                    chat_id: Optional[int] = None,
@@ -127,13 +129,26 @@ class GlobalRecorder:
                         meta_usage[_k] = _v
                 if meta_usage:
                     metadata['usage'] = meta_usage
-        await GlobalRecorder.record(
+        rowid = await GlobalRecorder.record(
             msg_type=MessageType.TOKEN_USAGE,
             role='assistant',
             content=content,
             chat_id=chat_id,
             metadata=metadata
         )
+        # 双写：global_messages 行只作聊天历史显示；统计以独立表为准，
+        # 清空对话记忆不会再丢用量数据。旁路失败只记日志，不中断对话。
+        if metadata and (metadata.get('model') or metadata.get('usage')):
+            try:
+                db = await BotMemoryDB.get_instance()
+                await db.add_token_stat(
+                    model=metadata.get('model') or '',
+                    usage=metadata.get('usage') or {},
+                    ts=time.time(),
+                    source_rowid=rowid,
+                )
+            except Exception as e:
+                logger.error(f"token 用量统计写入失败（已忽略，不中断主流程）: {e}")
 
     @staticmethod
     async def record_media_reply(content: str, chat_id: Optional[int] = None):

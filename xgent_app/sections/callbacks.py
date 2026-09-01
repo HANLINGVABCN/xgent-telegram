@@ -680,6 +680,13 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode=constants.ParseMode.HTML
             )
 
+        elif data == "web_need_password":
+            # Web/终端已开启但没设密码：start_web_chat_if_enabled 直接跳过启动，
+            # 地址上没有服务在监听。_build_web_open_button 这时给的是回调按钮
+            # 而不是 url 按钮，就是为了能在这里说明原因——否则点了毫无反应。
+            await query.answer("请先设置访问密码：/web → 🔑 密码", show_alert=True)
+            return
+
         elif data == "toggle_web_enabled":
             enabled = not normalize_bool(UserDataManager.get('web_enabled', False), False)
             if enabled and not UserDataManager.get('_web_has_password', False):
@@ -1792,7 +1799,11 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 if fetch_error:
                     await query.message.reply_text(f"⚠️ 模型列表获取失败。\n\n{fetch_error}")
                 else:
-                    await query.message.reply_text("⚠️ 接口请求成功，但没有返回可用的生成模型。")
+                    await query.message.reply_text(
+                        "⚠️ 接口请求成功，但提供商未返回任何模型。\n\n"
+                        "💡 提示：部分代理商/中继未开放 models 列表接口。\n"
+                        "您可以点击『➕ 手写』直接手动添加模型名称（如 gpt-4o / deepseek-chat / claude-3-5-sonnet）。"
+                    )
                 return
             UserDataManager.set('fetched_cache', models)
             UserDataManager.set('temp_page', 1)
@@ -1994,7 +2005,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"这会删除当前所有对话记忆。\n"
                 f"🌐 全局记忆记录: <b>{global_count}</b> 条\n"
                 f"🪞 内部镜像消息: <b>{mirror_count}</b> 条\n\n"
-                "不会删除 Provider 配置、.env、提示词文件。",
+                "不会删除 Provider 配置、.env、提示词文件，token 用量统计（/stats）也会保留。",
                 parse_mode=constants.ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🧹 确认清空", callback_data="confirm_clear_memory")],

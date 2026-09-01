@@ -92,36 +92,20 @@ def _resolve_name(name: str, merge_map: Dict[str, List[str]],
 
 async def _load_token_records(start_ts: Optional[float] = None,
                               end_ts: Optional[float] = None) -> List[Dict[str, Any]]:
-    """从 DB 读取 token_usage 行，解析 metadata，返回标量记录列表。
+    """从独立统计表读取 token 用量记录（清空对话不再波及 /stats）。
     不传 start/end 表示读全量（交互式报表在前端按时间段过滤）。"""
     db = await BotMemoryDB.get_instance()
-    rows = await db.get_global_messages(limit=200000, include_types=[MessageType.TOKEN_USAGE])
+    rows = await db.get_token_stats(start_ts=start_ts, end_ts=end_ts)
     records: List[Dict[str, Any]] = []
     for r in rows:
-        ts = r.get('timestamp') or 0
-        if start_ts is not None and ts < start_ts:
-            continue
-        if end_ts is not None and ts > end_ts:
-            continue
-        meta_raw = r.get('metadata')
-        meta = {}
-        if meta_raw:
-            try:
-                meta = json.loads(meta_raw) if isinstance(meta_raw, str) else meta_raw
-            except Exception:
-                meta = {}
-        model = meta.get('model') or ''
-        usage = meta.get('usage') or {}
-        if not model and not usage:
-            continue  # 升级前旧记录，无结构化数据，跳过
         records.append({
-            'ts': ts,
-            'model': model or '未知',
-            'input': int(usage.get('input_tokens') or 0),
-            'output': int(usage.get('output_tokens') or 0),
-            'cached': int(usage.get('cached_tokens') or 0),
-            'reasoning': int(usage.get('reasoning_tokens') or 0),
-            'total': int(usage.get('total_tokens') or 0),
+            'ts': r.get('ts') or 0,
+            'model': r.get('model') or '未知',
+            'input': int(r.get('input_tokens') or 0),
+            'output': int(r.get('output_tokens') or 0),
+            'cached': int(r.get('cached_tokens') or 0),
+            'reasoning': int(r.get('reasoning_tokens') or 0),
+            'total': int(r.get('total_tokens') or 0),
         })
     records.sort(key=lambda x: x['ts'])
     return records
