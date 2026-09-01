@@ -196,6 +196,21 @@ _relay_mirrors: "OrderedDict[str, Any]" = OrderedDict()
 _RELAY_MIRROR_MAX_SESSIONS = 8
 
 
+def build_trigger_delivery_bot(chat_id: int) -> Any:
+    """给 shell_triggers 投递用的双通道 bot（TG + Web SSE）。
+
+    MirrorBot（web_bridge）原生支持 real_bot=None：纯 Web 模式退化为纯网页
+    输出，正常部署则 TG/网页同时收到 trigger 结果——可见提醒此前只发
+    Telegram，网页要刷新才看得到；走这里之后网页是实时帧。
+    outbox/real_bot 走模块级引用而不在构造时固化：Web 服务与 bot 都可能
+    晚于第一个 trigger 就绪，投递发生在未来任意时刻，必须每次取最新值。
+    Telegram 通道随 CLI 镜像开关（XGENT_CLI_NO_TG_MIRROR）一起关：用户
+    显式要"不打扰 Telegram"时，trigger 结果不该破例往里发。
+    """
+    tg_bot = _web_real_bot if _web_external_tg_mirror_enabled() else None
+    return MirrorBot(_web_external_outbox, chat_id, real_bot=tg_bot)
+
+
 def _relay_mirror_for(session_id: str, chat_id: int) -> Any:
     # real_bot 按 Telegram 通道开关取：关掉（或纯 Web 模式没有真实 bot）时传
     # None，MirrorBot 原生退化成只推网页帧——网页那一路照常同步。

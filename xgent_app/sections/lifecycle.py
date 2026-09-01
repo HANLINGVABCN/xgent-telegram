@@ -193,14 +193,21 @@ async def on_shutdown_web_only():
     """纯 Web 模式（无 BOT_TOKEN、无 PTB Application）下的关闭清理。
 
     与 on_shutdown(app) 做同样的资源清理，但跳过所有 app.bot.* 调用——纯
-    Web 模式下没有 PTB Application，也没有 SelfTriggerManager（其调度器
-    挂在 application.job_queue.scheduler 上，见 run_web_only_main 的说明）。
+    Web 模式下没有 PTB Application。SelfTriggerManager 用自持调度器
+    （不依赖 PTB，见 run_web_only_main 的说明），同样需要在这里关闭，
+    否则退出时 APScheduler 的事件循环任务会随进程硬杀，未跑完的 run
+    全靠下次启动的恢复流程兜底。
     """
     logger.info("🛑 服务正在关闭...")
     try:
         await asyncio.to_thread(flush_model_trace)
     except Exception as e:
         logger.debug(f"刷新 trace 队列失败: {e}")
+    try:
+        await SelfTriggerManager.shutdown()
+        logger.info("✅ 后台触发任务已关闭")
+    except Exception as e:
+        logger.error(f"关闭后台触发任务失败: {e}")
     try:
         await stop_web_chat()
     except Exception as e:
@@ -234,10 +241,11 @@ async def run_web_only_main():
     对照 setup_bot_commands + app.run_polling 的职责，纯 Web 模式下：
     - 不跑 run_polling（没有 Telegram 连接）
     - 不注册 Telegram 命令菜单 / 不发启动菜单消息（没有 chat 可发）
-    - 跳过 SelfTriggerManager（后台定时/长驻触发任务）：其调度器依赖 PTB
-      的 application.job_queue.scheduler（APScheduler），纯 Web 模式没有
-      这个对象。这是 v1 的已知限制，已在 README 中说明；后续如需支持，
-      可以单独起一个 AsyncIOScheduler 并给 SelfTriggerManager 一个 shim。
+    - SelfTriggerManager 以 application=None 启动：调度走自持
+      AsyncIOScheduler（不再依赖 PTB job_queue），投递的 MirrorBot 在
+      real_bot=None 下退化为纯网页输出——纯 Web 模式与 PTB 模式同样
+      支持 trigger 任务（v1 的已知限制就此关闭）。放在 Web 服务起来
+      之后：startup 补投未送达结果时用的才是真实的网页 outbox。
     - Web 服务是唯一入口，强制启动（force=True，不受 web_enabled 开关影响）
     """
     await UserDataManager.init()
@@ -251,6 +259,8 @@ async def run_web_only_main():
         # 出去，PM2 也看不出异常，仍显示"online"）。必须先走一遍关闭清理。
         await on_shutdown_web_only()
         sys.exit(1)
+
+    await SelfTriggerManager.startup(None)
 
     port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
     logger.info("=" * 50)

@@ -382,8 +382,8 @@ Telegram 的内嵌网页按钮只接受 HTTPS 地址，因此：
 
 `.env` 不填 `BOT_TOKEN` 时，XGent 以纯 Web 模式运行：不连接 Telegram（不建 `Application`、不跑 `run_polling`），只启动 Web 服务，监听 `127.0.0.1:<端口>`（默认 `8790`），供你在本机或通过自建反向代理访问，不强制绑定域名。
 
-- **保留的功能**：对话、Agent 模式与全部协议执行（命令、文件读写、发文件、媒体生成）、流式/非流式回复、记忆（SQLite）、思考深度、Skill 开关、模型/提供商切换（提供商增删改仍需先在 `.env`/数据库里配置好，或通过 `/provider_config` 风格的导入——纯 Web 模式下暂无独立的提供商管理页面，需要先用 Telegram + Web 模式配置一次提供商，之后切回纯 Web 模式即可继续使用同一份数据库）、报错提示与系统提示、Web 设置面板里的全部选项。
-- **已知限制**：暂不支持后台定时/长驻触发任务（trigger 协议、cron 调度）——其调度器目前依赖 python-telegram-bot 的 `JobQueue`（底层是 APScheduler），纯 Web 模式下没有这个对象。此限制后续可能通过独立的 `AsyncIOScheduler` 解决。
+- **保留的功能**：对话、Agent 模式与全部协议执行（命令、文件读写、发文件、媒体生成）、流式/非流式回复、记忆（SQLite）、思考深度、Skill 开关、模型/提供商切换（提供商增删改仍需先在 `.env`/数据库里配置好，或通过 `/provider_config` 风格的导入——纯 Web 模式下暂无独立的提供商管理页面，需要先用 Telegram + Web 模式配置一次提供商，之后切回纯 Web 模式即可继续使用同一份数据库）、报错提示与系统提示、Web 设置面板里的全部选项、后台定时/长驻触发任务（trigger 协议——调度走自持 `AsyncIOScheduler`，不再依赖 PTB 的 `JobQueue`，结果投递到网页）。
+- **已知限制**：trigger 结果的 Telegram 通道自然不可用（没有 bot），只投递到网页。
 - **启动**：`install.sh` 的组件清单里只选 `2 web` 即可，会依次问你 Web 访问密码和端口；也可以手动在 `.env` 里只保留 `AUTHORIZED_USER_ID` 一项、不填 `BOT_TOKEN`，直接运行 `python xgent_server.py`。
 - **关闭**：Ctrl+C（或对进程发 SIGTERM）会走正常清理流程（数据库关闭、trace 落盘、Agent shell 会话清理），Windows 因不支持 `add_signal_handler` 会退化为 `KeyboardInterrupt`，Ctrl+C 依然有效。
 

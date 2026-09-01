@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from telegram.ext import Application
@@ -1294,7 +1295,15 @@ class SelfTriggerManager:
     # 和 _runtime_tasks 槽位，之后每次调度都只记录“上一次仍在运行，跳过”，
     # 这个任务到进程重启前都是死的，而且用户完全看不到任何提示。
     MAX_RUN_SECONDS = float(os.getenv('TRIGGER_MAX_RUN_SECONDS', '3600'))
+    # 跨进程拾取扫描周期：CLI/其他进程登记的任务由持有调度器的进程在此
+    # 周期内接手执行。对照 cli_relay_ops 的 0.3s 轮询，这里不需要亚秒级
+    # ——任务本身是分钟级的定时/监控语义。
+    PICKUP_SCAN_SECONDS = float(os.getenv('TRIGGER_PICKUP_SCAN_SECONDS', '20'))
     _application: Optional[Application] = None
+    # 自持调度器：不再寄生在 PTB 的 job_queue 上，纯 Web 模式（无 PTB
+    # Application）也能调度。PTB 的 job_queue 本来就是 AsyncIOScheduler 的
+    # 壳，直接持有等价对象。
+    _scheduler: Optional[AsyncIOScheduler] = None
     _runtime_tasks: Dict[str, asyncio.Task] = {}
     _processes: Dict[str, Any] = {}
     _task_locks: Dict[str, asyncio.Lock] = {}
@@ -1596,6 +1605,23 @@ class SelfTriggerManager:
         }
         db = await BotMemoryDB.get_instance()
         await db.create_trigger_task(task)
+
+        # 归属判断：只有持有自持调度器的进程（服务端：PTB / 纯 Web）才激活
+        # 任务。CLI 是独立进程、没有调度器，这里只落库登记——服务端的拾取
+        # 扫描（_pickup_scan）会在一个扫描周期内接手执行。若在这里激活，
+        # 定时任务直接 RuntimeError，条件任务更阴险：命令会真的在 CLI 进程
+        # 里跑，但结果投递拿不到 bot，静默烂在"未投递"状态。
+        if cls._scheduler is None:
+            schedule_text = cls._format_schedule(task)
+            condition_text = f"，条件: {definition['condition_expr']}" if definition.get('condition_expr') else ''
+            repeat_text = '，条件命中后自动重启监控' if definition.get('repeat') else ''
+            return (
+                f"✅ 已登记触发任务 {task_id}\n"
+                f"📝 任务: {definition['summary']}\n"
+                f"⏰ 计划: {schedule_text}{condition_text}{repeat_text}\n"
+                f"🖥️ 由 CLI 进程登记，服务端将在 {int(cls.PICKUP_SCAN_SECONDS)} 秒内接管执行"
+            )
+
         if cls._application is None:
             cls._application = getattr(bot, '_application', None)
         await cls._activate_task(task, recovery=False)
@@ -1662,6 +1688,11 @@ class SelfTriggerManager:
             delivery_task.cancel()
         if delivery_tasks:
             await asyncio.gather(*delivery_tasks, return_exceptions=True)
+        if cls._scheduler is not None:
+            with contextlib.suppress(Exception):
+                cls._scheduler.shutdown(wait=False)
+            cls._scheduler = None
+        cls._started = False
         cls._runtime_tasks.clear()
         cls._processes.clear()
         cls._delivery_run_ids.clear()
@@ -1723,11 +1754,11 @@ class SelfTriggerManager:
 
     @classmethod
     def _remove_scheduler_job(cls, task_id: str):
-        if cls._application is None or cls._application.job_queue is None:
+        if cls._scheduler is None:
             return
         job_id = f'self-trigger:{task_id}'
         with contextlib.suppress(Exception):
-            cls._application.job_queue.scheduler.remove_job(job_id)
+            cls._scheduler.remove_job(job_id)
 
     @staticmethod
     def _format_elapsed(seconds: float) -> str:
@@ -1739,12 +1770,37 @@ class SelfTriggerManager:
         return f"{seconds // 3600}小时{(seconds % 3600) // 60}分钟"
 
     @classmethod
-    async def startup(cls, application: Application):
-        if cls._started and cls._application is application and not cls._stopping:
+    async def startup(cls, application: Optional[Application] = None):
+        """启动 trigger 管理器。调度走自持 AsyncIOScheduler，与 PTB 解耦。
+
+        application 仅用于投递时拿真实 Telegram bot（可见提醒 + MirrorBot 的
+        TG 通道）；纯 Web 模式没有 PTB，传 None，投递退化为纯网页通道
+        （MirrorBot real_bot=None 的原生行为）。重复调用只刷新引用——
+        原先按 `_application is application` 判重会让同一进程里先 None 后
+        有 bot 的第二次 startup 重复跑整个恢复流程。
+        """
+        if cls._started and not cls._stopping:
+            if application is not None:
+                cls._application = application
             return
         cls._application = application
         cls._stopping = False
         cls._started = True
+        if cls._scheduler is None:
+            cls._scheduler = AsyncIOScheduler(
+                timezone=ZoneInfo(cls.DEFAULT_TIMEZONE))
+            cls._scheduler.start()
+            cls._scheduler.add_job(
+                cls._pickup_scan,
+                trigger='interval',
+                seconds=cls.PICKUP_SCAN_SECONDS,
+                id='self-trigger:pickup-scan',
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=30,
+            )
+            logger.info(
+                f'✅ trigger 自持调度器已启动（拾取扫描间隔 {cls.PICKUP_SCAN_SECONDS:g} 秒）')
         db = await BotMemoryDB.get_instance()
         interrupted_count = await db.interrupt_running_trigger_runs()
         if interrupted_count:
@@ -1907,6 +1963,62 @@ class SelfTriggerManager:
             )
 
     @classmethod
+    async def _pickup_scan(cls):
+        """跨进程对账扫描（cli_relay_ops 回放模式的同款思路）。
+
+        持有调度器的进程是唯一执行者。每个扫描周期把 DB 与调度器对一遍账：
+        - DB 活跃、本进程尚未接手的任务 → 激活（CLI 登记的任务在这里被拾取）
+        - DB 已取消/完成、调度器里还挂着的 job → 摘除（CLI 里 kill 的场景）
+
+        跳过 running/waiting_delivery：running 说明本进程（或重启前）正在跑，
+        waiting_delivery 说明结果还没投递完，两者都轮不到调度器插手。
+        """
+        if cls._stopping or cls._scheduler is None:
+            return
+        db = await BotMemoryDB.get_instance()
+        try:
+            tasks = await db.list_trigger_tasks(active_only=True)
+        except Exception:
+            logger.debug('trigger 拾取扫描读取任务失败', exc_info=True)
+            return
+
+        active_ids = set()
+        for task in tasks:
+            active_ids.add(task['id'])
+
+        for job in list(cls._scheduler.get_jobs()):
+            job_id = str(getattr(job, 'id', '') or '')
+            if not job_id.startswith('self-trigger:'):
+                continue
+            task_id = job_id[len('self-trigger:'):]
+            if task_id not in active_ids:
+                cls._remove_scheduler_job(task_id)
+                logger.info(f'trigger 任务 {task_id} 已在数据库中失效，移除调度 job')
+
+        scheduled_job_ids = {
+            str(getattr(job, 'id', '') or '')
+            for job in cls._scheduler.get_jobs()
+        }
+        for task in tasks:
+            if task['status'] in {'running', 'waiting_delivery'}:
+                continue
+            runtime_task = cls._runtime_tasks.get(task['id'])
+            if runtime_task and not runtime_task.done():
+                continue
+            if f"self-trigger:{task['id']}" in scheduled_job_ids:
+                continue
+            try:
+                logger.info(f'拾取外部进程登记的 trigger 任务 {task["id"]}')
+                await cls._activate_task(task, recovery=task['status'] == 'recovering')
+            except Exception as exc:
+                logger.error(f'拾取 trigger 任务 {task["id"]} 失败: {exc}', exc_info=True)
+                with contextlib.suppress(Exception):
+                    await db.update_trigger_task(
+                        task['id'], status='failed', last_error=str(exc)[:1000],
+                        failure_count=int(task['failure_count']) + 1,
+                    )
+
+    @classmethod
     async def _activate_task(cls, task: Dict[str, Any], recovery: bool):
         if cls._stopping or task['status'] in {'completed', 'cancelled', 'failed'}:
             return
@@ -1934,9 +2046,9 @@ class SelfTriggerManager:
 
     @classmethod
     def _add_date_job(cls, task_id: str, scheduled_at: float, reason: str):
-        if cls._application is None or cls._application.job_queue is None:
+        if cls._scheduler is None:
             raise RuntimeError('trigger 调度器尚未初始化')
-        cls._application.job_queue.scheduler.add_job(
+        cls._scheduler.add_job(
             cls._scheduled_job,
             trigger=DateTrigger(run_date=datetime.fromtimestamp(scheduled_at).astimezone()),
             args=[task_id, scheduled_at, reason],
@@ -1947,13 +2059,13 @@ class SelfTriggerManager:
 
     @classmethod
     def _add_cron_job(cls, task: Dict[str, Any]):
-        if cls._application is None or cls._application.job_queue is None:
+        if cls._scheduler is None:
             raise RuntimeError('trigger 调度器尚未初始化')
         cron_trigger = CronTrigger.from_crontab(
             task['schedule_expr'],
             timezone=ZoneInfo(task['timezone']),
         )
-        cls._application.job_queue.scheduler.add_job(
+        cls._scheduler.add_job(
             cls._cron_job,
             trigger=cron_trigger,
             args=[task['id']],
@@ -2275,9 +2387,6 @@ class SelfTriggerManager:
         if task['status'] == 'cancelled':
             await db.finish_trigger_run(run_id, delivered_at=time.time())
             return
-        if cls._application is None:
-            logger.warning(f'trigger run {run_id} 暂时无法投递：Application 未初始化')
-            return
         if not await db.claim_trigger_run_delivery(run_id, time.time()):
             logger.info(f'trigger run {run_id} 已由其他投递协程领取，跳过重复投递')
             return
@@ -2327,7 +2436,10 @@ class SelfTriggerManager:
             f"命令输出:\n{output_text}"
         )
 
-        bot = cls._application.bot
+        # 投递走 MirrorBot（idle.build_trigger_delivery_bot）：TG + 网页双通道。
+        # 不再取 cls._application.bot——那要求 PTB 存在，纯 Web 模式直接
+        # AttributeError；MirrorBot 的 real_bot=None 退化为纯网页输出。
+        bot = build_trigger_delivery_bot(int(task['chat_id']))
         update = _SelfTriggerUpdate(bot, int(task['chat_id']))
         context = _SelfTriggerContext(bot)
         lock_acquired = asyncio.Event()
