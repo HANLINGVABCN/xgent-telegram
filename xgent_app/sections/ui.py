@@ -317,6 +317,7 @@ def get_more_settings_menu():
          InlineKeyboardButton("🚫 Agent黑名单", callback_data="menu_command_blacklist")],
         [InlineKeyboardButton("🔐 凭据" + _credentials_badge(), callback_data="menu_credentials"),
          InlineKeyboardButton("🧹 清空上下文", callback_data="cmd_delete")],
+        [InlineKeyboardButton(f"🔇 静默未授权:{'🟢 开' if normalize_bool(UserDataManager.get('silent_unauthorized', False), False) else '🔴 关'}", callback_data="toggle_silent_unauthorized")],
         [InlineKeyboardButton("ℹ️ 状态", callback_data="cmd_info"),
          InlineKeyboardButton("🧩 Skill 管理", callback_data="menu_skills")],
         [InlineKeyboardButton("📤 导出", callback_data="cmd_export_all"),
@@ -725,10 +726,6 @@ def get_prompts_menu():
         [InlineKeyboardButton(f"📝 {PromptFileManager.get_label(key)}", callback_data=f"view_prompt:{key}")]
         for key in PromptFileManager.FILES
     ]
-    keyboard.append([InlineKeyboardButton(
-        f"🔇 未授权静默：{'🟢 开' if normalize_bool(UserDataManager.get('silent_unauthorized', False), False) else '🔴 关'}",
-        callback_data="toggle_silent_unauthorized"
-    )])
     keyboard.append([InlineKeyboardButton("🔄 从文件重载提示词", callback_data="act_reload_prompts")])
     keyboard.append([InlineKeyboardButton("🔙 返回主菜单", callback_data="act_main_menu")])
     return InlineKeyboardMarkup(keyboard)

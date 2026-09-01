@@ -1061,8 +1061,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             await query.answer(f"已{'开启' if on else '关闭'}静默", show_alert=False)
             await query.message.edit_text(
-                "📝 <b>提示词设置</b>\n\n选择要查看或修改的提示词。",
-                reply_markup=get_prompts_menu(),
+                build_settings_menu_text(),
+                reply_markup=get_more_settings_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
 
