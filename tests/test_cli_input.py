@@ -361,5 +361,43 @@ asyncio.run(main())
                        "纯文本输出后应退出菜单导航，提示符恢复绿色")
 
 
+class BusyGateProbeTests(CliProbeMixin, unittest.TestCase):
+    """常驻输入框的回车闸门：一轮进行中、或主循环还没回到等输入的位置时，
+    回车都不该提交——否则提交会落进没人等的 future 里丢掉，草稿却被清空。"""
+
+    def test_gate_opens_only_when_idle_and_waiting(self):
+        result = self.run_probe("""
+import asyncio
+
+async def main():
+    # 一轮进行中：闸门必须关着
+    xgent_cli._turn_active = True
+    busy_turn = xgent_cli._submit_blocked()
+
+    # 轮结束了、但主循环还没回到 read()：同样算忙
+    xgent_cli._turn_active = False
+    busy_between = xgent_cli._submit_blocked()
+
+    # 主循环挂上 read() 之后：闸门打开
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    xgent_cli._READER._pending = (future, loop, 1)
+    open_gate = not xgent_cli._submit_blocked()
+    future.set_result(None)
+
+    print(json.dumps({
+        "busy_turn": busy_turn,
+        "busy_between": busy_between,
+        "open_gate": open_gate,
+    }))
+
+asyncio.run(main())
+""")
+        self.assertTrue(result["busy_turn"], "一轮进行中回车不该提交")
+        self.assertTrue(result["busy_between"],
+                        "主循环没挂在 read() 上时提交会被丢掉，也算忙")
+        self.assertTrue(result["open_gate"], "空闲且等输入时闸门必须打开")
+
+
 if __name__ == "__main__":
     unittest.main()

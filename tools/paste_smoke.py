@@ -22,7 +22,7 @@ ONE_LINE = "只有一行但末尾带换行\n"
 
 
 def _pty_case(feed_fn, expect: str, name: str) -> bool:
-    """在真 pty 里跑一次 read_line：feed_fn 负责往终端里灌字节。"""
+    """在真 pty 里跑一次 await_line：feed_fn 负责往终端里灌字节。"""
     master, slave = pty.openpty()
     real_stdin, real_stdout = sys.stdin, sys.stdout
     sys.stdin = os.fdopen(slave, "r")
@@ -32,7 +32,12 @@ def _pty_case(feed_fn, expect: str, name: str) -> bool:
 
     threading.Thread(target=feed_fn, args=(master,), daemon=True).start()
     try:
-        line = SlashPalette("> ", lambda p: [], lambda n, s: []).read_line()
+        palette = SlashPalette("> ", lambda p: [], lambda n, s: [])
+        palette.open()
+        try:
+            line = palette.await_line()
+        finally:
+            palette.close()
     finally:
         sys.stdin, sys.stdout = real_stdin, real_stdout
         os.close(master)

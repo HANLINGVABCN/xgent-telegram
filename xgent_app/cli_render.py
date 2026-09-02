@@ -29,13 +29,40 @@ import re
 import shutil
 import sys
 import unicodedata
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 # --------------------------------------------------------------------------
 # 终端能力探测
 # --------------------------------------------------------------------------
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+# --------------------------------------------------------------------------
+# 常驻输入框挂载
+# --------------------------------------------------------------------------
+# CLI 的输入框（cli_palette.SlashPalette）在会话期间常驻屏幕底部：AI 流式
+# 输出时用户也能继续打字。屏幕每次打印必须先让框撤位（withdraw）、打完再
+# 复位（restore），否则输出会把框冲掉，框也会把屏幕的光标行数记账搅乱。
+# 这里持一个全局引用，xgent_cli 在面板启动/退役时挂载/摘除；未挂载时所有
+# 行为与从前完全一致（Windows / 非 TTY 的 input() 回退路径就不挂载）。
+_INPUT_BOX: Any = None
+
+
+def attach_input_box(box: Any) -> None:
+    """把常驻输入框挂上来：从此屏幕打印会让位/复位这个框。"""
+    global _INPUT_BOX
+    _INPUT_BOX = box
+
+
+def detach_input_box() -> None:
+    """摘除常驻输入框：打印回到从前的不让位行为。"""
+    global _INPUT_BOX
+    _INPUT_BOX = None
+
+
+def attached_input_box() -> Any:
+    """当前挂着的输入框（没挂就是 None）。"""
+    return _INPUT_BOX
 
 
 def enable_windows_vt() -> bool:
@@ -838,12 +865,35 @@ class TerminalScreen:
             self._write("\n")
             self._open_line = None
 
+    def _boxed(self, writes: Callable[[], Any]) -> Any:
+        """把一段屏幕写入包进"输入框让位 → 写 → 收开放行 → 框复位"的护栏。
+
+        为什么在方法级而不是 _write 级：update_block 内部是多段光标移动+
+        重写的序列，必须整段原子（框只让一次位、复位一次），中间复位会让
+        框画到还没擦干净的旧块上。为什么 finally 里要收开放行：增量续写
+        （_append_delta）刻意不写最后一个换行、把光标留在行尾，而框要画在
+        光标的下一行——withdraw 不知道光标列、还不回原位。收掉换行把光标
+        归到行首，让位/复位就只剩"框顶 = 输出流末行"一条记账。收行只发生
+        在挂了框的会话里，input() 回退路径零改动。
+        """
+        box = _INPUT_BOX
+        if box is None:
+            return writes()
+        box.withdraw()
+        try:
+            return writes()
+        finally:
+            self._close_open_line()
+            box.restore()
+
     def print_block(self, lines: Sequence[str], message_id: Optional[int] = None,
                     leading_blank: bool = True) -> None:
         """打印一个新块，并记住它，以便后续原地重绘。"""
-        self._close_open_line()
-        payload = ("\n" if leading_blank else "") + "\n".join(lines) + "\n"
-        self._write(payload)
+        def _writes() -> None:
+            self._close_open_line()
+            payload = ("\n" if leading_blank else "") + "\n".join(lines) + "\n"
+            self._write(payload)
+        self._boxed(_writes)
         self._last_message_id = message_id
         self._last_lines = list(lines)
         self._last_leading_blank = leading_blank
@@ -857,36 +907,38 @@ class TerminalScreen:
 
     def update_block(self, lines: Sequence[str], message_id: int) -> bool:
         """尝试原地重绘 message_id 对应的块。成功返回 True。"""
-        if not self._can_redraw or self._last_message_id != message_id:
-            return False
-        # 终端宽度变了（拖拽窗口）：旧块已被终端按新宽度折行重排，记账的
-        # 行数不再对应屏幕上的任何东西——照着上移会擦掉别人的内容，流式
-        # 更新期间拖窗口后的"满屏错位"正是从这儿来的。放弃原地重绘，退
-        # 化成追加打印：宁可同一条消息多打一份，也不能错位。
-        if self._last_printed_width != self.width:
-            self.invalidate()
-            return False
-        # 块比屏幕还高时，顶部已经滚出可视区，上移到块顶会越界擦到别的
-        # 内容——整块重画不可行，改走增量续写（只动尾部，光标不出可视区）。
-        if self._last_line_count + 1 >= self.height:
-            return self._append_delta(lines)
-        # 上移到块的第一行，清掉从这里到屏幕末尾的所有内容，再重画。
-        # 开放行时光标停在最后一行**末尾**（列不为 0，且比已收块少隔一行）：
-        # 上移距离少一行，还要用 \r 把列归零，否则整块会向右错半行。
-        if self._open_line is not None:
-            up = self._last_line_count - 1
-        else:
-            up = self._last_line_count
-        if up:
-            self._write(f"\x1b[{up}A")
-        self._write("\r\x1b[J")
-        payload = "\n" + "\n".join(lines) + "\n"
-        self._write(payload)
-        self._last_lines = list(lines)
-        self._open_line = None
-        self._last_line_count = self._visual_rows(lines) + 1
-        self._last_printed_width = self.width
-        return True
+        def _inner() -> bool:
+            if not self._can_redraw or self._last_message_id != message_id:
+                return False
+            # 终端宽度变了（拖拽窗口）：旧块已被终端按新宽度折行重排，记账的
+            # 行数不再对应屏幕上的任何东西——照着上移会擦掉别人的内容，流式
+            # 更新期间拖窗口后的"满屏错位"正是从这儿来的。放弃原地重绘，退
+            # 化成追加打印：宁可同一条消息多打一份，也不能错位。
+            if self._last_printed_width != self.width:
+                self.invalidate()
+                return False
+            # 块比屏幕还高时，顶部已经滚出可视区，上移到块顶会越界擦到别的
+            # 内容——整块重画不可行，改走增量续写（只动尾部，光标不出可视区）。
+            if self._last_line_count + 1 >= self.height:
+                return self._append_delta(lines)
+            # 上移到块的第一行，清掉从这里到屏幕末尾的所有内容，再重画。
+            # 开放行时光标停在最后一行**末尾**（列不为 0，且比已收块少隔一行）：
+            # 上移距离少一行，还要用 \r 把列归零，否则整块会向右错半行。
+            if self._open_line is not None:
+                up = self._last_line_count - 1
+            else:
+                up = self._last_line_count
+            if up:
+                self._write(f"\x1b[{up}A")
+            self._write("\r\x1b[J")
+            payload = "\n" + "\n".join(lines) + "\n"
+            self._write(payload)
+            self._last_lines = list(lines)
+            self._open_line = None
+            self._last_line_count = self._visual_rows(lines) + 1
+            self._last_printed_width = self.width
+            return True
+        return self._boxed(_inner)
 
     def _append_delta(self, lines: Sequence[str]) -> bool:
         """超高块的增量续写：只重写发散点之后的行，不整块重打。
@@ -957,8 +1009,10 @@ class TerminalScreen:
 
     def print_plain(self, text: str = "") -> None:
         """打印一行普通文本（提示、警告等），并让下一次原地重绘失效。"""
-        self._close_open_line()
-        self._write(text + "\n")
+        def _writes() -> None:
+            self._close_open_line()
+            self._write(text + "\n")
+        self._boxed(_writes)
         self.invalidate()
 
     def notice(self, text: str, level: str = "info") -> None:

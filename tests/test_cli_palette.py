@@ -19,6 +19,8 @@ from xgent_app.cli_palette import (
     SlashPalette,
     _normalize_paste,
     _PASTE_END,
+    _REVERSE_OFF,
+    _REVERSE_ON,
     select,
 )
 
@@ -370,6 +372,118 @@ class BoxWidthTests(unittest.TestCase):
         self.assertTrue(lines[0].startswith("╭"))
         self.assertTrue(lines[-1].startswith("╰"))
         self.assertIn("hi", "\n".join(lines))
+
+
+class ReverseCursorTests(unittest.TestCase):
+    """框内自绘反色光标：原生光标整个会话被 ?25l 藏掉，左右移动的落点全靠它。
+
+    反色块落在哪个字符上、宽字符是否整块反色、行尾怎么补块，这些差一点
+    用户就会看到光标"消失"在某个字符旁边。
+    """
+
+    def test_cursor_reverses_the_character_it_sits_on(self):
+        palette = make("hello")
+        rows = palette._overlay_reverse_cursor(["hello"], 0, 2)
+        self.assertEqual(["he" + _REVERSE_ON + "l" + _REVERSE_OFF + "lo"], rows)
+
+    def test_cursor_at_line_end_appends_a_reversed_space(self):
+        palette = make("hello")
+        rows = palette._overlay_reverse_cursor(["hello"], 0, 5)
+        self.assertEqual(["hello" + _REVERSE_ON + " " + _REVERSE_OFF], rows)
+
+    def test_wide_character_is_reversed_as_a_whole(self):
+        # 中日韩字符占两列，只反一半等于光标劈在字中间。
+        palette = make("中")
+        rows = palette._overlay_reverse_cursor(["ab中"], 0, 2)
+        self.assertEqual(["ab" + _REVERSE_ON + "中" + _REVERSE_OFF], rows)
+
+    def test_row_out_of_range_leaves_rows_alone(self):
+        palette = make("hi")
+        self.assertEqual(["hi"], palette._overlay_reverse_cursor(["hi"], 3, 0))
+
+
+class LifecycleTests(unittest.TestCase):
+    """常驻生命周期：withdraw 压制重画、restore 补画、close 后永久静音。
+
+    这是输入框和渲染层的配合协议——AI 流式输出时屏幕打印先撤框再复位，
+    撤框期间用户的按键照常进缓冲、只是不上屏。哪一环坏了，要么输出把框
+    冲掉，要么框把输出挡住。
+    """
+
+    def setUp(self):
+        os.environ["COLUMNS"], os.environ["LINES"] = "80", "24"
+
+    def _capture(self, action) -> str:
+        captured = io.StringIO()
+        real, sys.stdout = sys.stdout, captured
+        try:
+            action()
+        finally:
+            sys.stdout = real
+        return captured.getvalue()
+
+    def test_withdraw_suppresses_and_restore_repaints(self):
+        palette = make("草稿")
+        self.assertTrue(self._capture(palette._render), "正常状态下要画框")
+        palette.withdraw()
+        self.assertFalse(palette._shown)
+        self.assertEqual("", self._capture(palette._render),
+                         "撤框期间按键只进缓冲不上屏")
+        self.assertTrue(self._capture(palette.restore), "复位要把攒下的内容补画")
+        self.assertTrue(palette._shown)
+
+    def test_close_is_idempotent_and_silences_forever(self):
+        palette = make("bye")
+        self.assertTrue(self._capture(palette._render))
+        palette.close()
+        palette.close()  # 幂等：退出路径上会被多处调用
+        self.assertEqual("", self._capture(palette._render))
+        palette.withdraw()
+        palette.restore()  # 退役后也不复活
+        self.assertEqual("", self._capture(palette._render))
+
+
+@unittest.skipIf(select is None, "需要 POSIX select")
+class BusyGateTests(unittest.TestCase):
+    """忙闸门：上一轮还在跑时回车不提交，草稿留在输入行等下一次回车。
+
+    对齐 Telegram 端的忙语义（提示"仍在处理上一个请求"），不做排队。
+    用管道喂两次回车：第一次被闸门挡下，翻闸后第二次才提交。
+    """
+
+    def test_enter_while_busy_keeps_the_draft(self):
+        read_fd, write_fd = os.pipe()
+        busy = {"on": True}
+        noticed = []
+        palette = SlashPalette(
+            "> ", lambda p: [], lambda n, s: [],
+            busy_check=lambda: busy["on"],
+            on_busy_submit=lambda text: noticed.append(text),
+        )
+        palette.buffer = "提前打好的字"
+        palette.cursor = len(palette.buffer)
+
+        def feed() -> None:
+            os.write(write_fd, b"\r")  # 第一次回车：忙，被闸门挡下
+            time.sleep(0.3)            # 越过 5ms 的 burst 判定窗口
+            busy["on"] = False         # 上一轮结束
+            os.write(write_fd, b"\r")  # 第二次回车：提交
+
+        worker = threading.Thread(target=feed)
+        worker.start()
+        captured = io.StringIO()
+        real, sys.stdout = sys.stdout, captured
+        try:
+            line = palette._event_loop(read_fd)
+        finally:
+            sys.stdout = real
+            worker.join()
+            os.close(read_fd)
+            os.close(write_fd)
+        self.assertEqual("提前打好的字", line)
+        self.assertEqual(["提前打好的字"], noticed,
+                         "忙时回车要提示'仍在处理'，而不是静默吞掉")
+        self.assertEqual("", palette.buffer, "提交后草稿清空")
 
 
 if __name__ == "__main__":

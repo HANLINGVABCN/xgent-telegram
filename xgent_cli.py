@@ -64,7 +64,15 @@ from xgent_app.cli_bridge import (
     relay_user_message,
     set_turn_kind,
 )
-from xgent_app.cli_render import content_width, display_width, fill_line, rule_block
+from xgent_app.cli_render import (
+    attach_input_box,
+    attached_input_box,
+    content_width,
+    detach_input_box,
+    display_width,
+    fill_line,
+    rule_block,
+)
 from xgent_app.cli_palette import (
     SlashPalette,
     interactive_supported as palette_supported,
@@ -407,17 +415,11 @@ def _palette_enabled() -> bool:
     return palette_supported()
 
 
-def _history_entries() -> List[str]:
-    """把 readline 的历史交给面板，两边翻到的是同一份记录。"""
-    if _readline is None:
-        return []
-    try:
-        return [
-            _readline.get_history_item(i)
-            for i in range(1, _readline.get_current_history_length() + 1)
-        ]
-    except Exception:
-        return []
+# 常驻输入框的活历史：_remember_history 同时喂 readline（存盘用）和这份
+# 列表（面板 ↑ 翻用）。read_line 时代每次读取都从 readline 现拷一份快照；
+# 面板常驻后全程只有一个实例，历史必须跟着提交一起长，不然 ↑ 翻不到
+# 本次会话里发过的话。
+_LIVE_HISTORY: List[str] = []
 
 
 def _remember_history(line: str) -> None:
@@ -427,7 +429,11 @@ def _remember_history(line: str) -> None:
     读回来会碎成几十条假记录，↑ 翻历史时还会把带换行的串塞进输入行——面板
     的光标记账假设输入行没有换行，塞进去当场画歪。
     """
-    if not line.strip() or "\n" in line or _readline is None:
+    if not line.strip() or "\n" in line:
+        return
+    if not _LIVE_HISTORY or _LIVE_HISTORY[-1] != line:
+        _LIVE_HISTORY.append(line)
+    if _readline is None:
         return
     try:
         length = _readline.get_current_history_length()
@@ -875,7 +881,7 @@ _cancel_event = threading.Event()
 
 
 class _StdinReader:
-    """在守护线程里做阻塞式 input()，把结果交回事件循环。
+    """把终端输入交给主循环的事件循环。
 
     为什么不用 loop.run_in_executor(None, input)：默认执行器的工作线程是
     **非守护**线程。用户在提示符上按 Ctrl+C 时它还阻塞在 input() 里，而且
@@ -885,6 +891,15 @@ class _StdinReader:
     表现就是用户报的那个 bug：打印了"再见"却退不出去，再按一次 Ctrl+C 才
     退，还甩出一段 concurrent.futures/threading 的 traceback。守护线程不
     参与这两道等待，进程说走就走。
+
+    两种模式，线程起来之前定死、之后不再变卦（避免"请求派给了没人接的
+    队列"这类时序洞）：
+
+    - palette：常驻输入框（cli_palette.SlashPalette）。读线程持续收键，
+      AI 输出期间用户也能继续打字；提交经 _resolve 投回 read() 的 future。
+      面板永久退役（连续崩溃兜底/EOF）后 mode 翻成 legacy。
+    - legacy：input() 请求-应答，read() 把提示符派进队列、线程阻塞读。
+      Windows / 非 TTY / 面板退役后走这条路，行为与从前完全一致。
     """
 
     def __init__(self) -> None:
@@ -899,16 +914,34 @@ class _StdinReader:
         # 最近一次读取是否已由终端/系统回显（input() 路径会）。
         # 主循环据此决定要不要补打回显，避免同一条消息显示两遍。
         self.last_read_native_echo = False
+        self.mode = "palette" if _palette_enabled() else "legacy"
+        # 事件循环引用：面板线程要把"忙时回车"的提示投回循环线程打印
+        # （SCREEN 的记账非线程安全，跨线程只能投递、不能直写）。
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
 
     def _ensure_thread(self) -> None:
         if self._thread is not None:
             return
+        if self.mode == "palette":
+            # 必须先建好、挂上渲染层再起线程：主线程的 read() 要能立刻
+            # set_prompt，渲染层从这一刻起打印都会让位/复位这个框。
+            _start_input_box()
         self._thread = threading.Thread(
             target=self._serve, name="xgent-cli-stdin", daemon=True,
         )
         self._thread.start()
 
     def _serve(self) -> None:
+        if self.mode == "palette":
+            try:
+                self._serve_palette()
+            finally:
+                # 面板退场：摘挂载、还原终端，读线程落回 input() 请求-应答
+                # 老路，CLI 不因面板故障而不可用。
+                _retire_input_box()
+                # 主循环可能正挂在上一个 read() 的 future 上等提交——兑现
+                # 一条空行让它回到循环顶，下一个 read() 自然走 input()。
+                self._resolve("")
         while True:
             prompt, epoch = self._requests.get()
             try:
@@ -925,43 +958,53 @@ class _StdinReader:
                 value = _EOF
             self._resolve(value, epoch)
 
-    def _read_one(self, prompt: str) -> str:
-        """读一行。能画面板就画，不能就退回 input()。
+    def _serve_palette(self) -> None:
+        """常驻面板线程体：open 一次，一圈圈等提交，直到 EOF 或崩溃兜底。"""
+        box = attached_input_box()
+        if box is None:  # 理论不可达：_ensure_thread 先建后起线程
+            return
+        box.open()
+        failures = 0
+        while True:
+            try:
+                line = box.await_line()
+            except EOFError:
+                self._resolve(_EOF)
+                return
+            except KeyboardInterrupt:
+                # 状态输入/菜单导航中的 Ctrl+C：SIGINT 处理器那边可能已经
+                # 把等待中的读取兑现成 _CANCEL/_MENU_DISMISS（谁先到谁算）。
+                # 清掉唤醒信号再投一次——没人等就自然丢弃，上一轮的取消
+                # 不会错投给下一轮。
+                _cancel_event.clear()
+                self._resolve(_CANCEL)
+                continue
+            except Exception:
+                failures += 1
+                logger.debug("CLI 命令面板异常", exc_info=True)
+                if failures > 5:
+                    # 连续崩：面板内部状态已经不可信，退役换 input()，
+                    # 别把整个 CLI 拖死在渲染循环里。
+                    return
+                # 异常可能打断在半次重画里：撤一次再复位，框回到干净状态。
+                box.withdraw()
+                box.restore()
+                continue
+            failures = 0
+            _remember_history(line)
+            self._resolve(line)
 
-        面板要自己算光标列，所以拿的是没有 \\001..\\002 包裹的干净提示符——
-        那对标记是给 readline 看的，写进裸终端会变成两个不可见的垃圾字节，
-        把列数算歪。
-        """
-        if not _palette_enabled():
-            self.last_read_native_echo = True  # input() 自带终端回显
-            return input(prompt)
-        pal = PALETTE
-        self.last_read_native_echo = False
-        try:
-            line = SlashPalette(
-                _prompt_plain(),
-                _matching_commands,
-                _palette_rows,
-                history=_history_entries(),
-                abort_check=_cancel_event.is_set,
-                echo_ansi=pal.user if pal.enabled else "",
-                echo_on_submit=False,
-                box_ansi=getattr(pal, _prompt_color_name()) if pal.enabled else "",
-            ).read_line()
-        except (EOFError, KeyboardInterrupt):
-            raise
-        except Exception:
-            # 面板画崩了不能把 CLI 带走：退回 input()，下一轮还会再试。
-            logger.debug("CLI 命令面板异常，退回 input()", exc_info=True)
-            self.last_read_native_echo = True
-            return input(prompt)
-        _remember_history(line)
-        return line
+    def _read_one(self, prompt: str) -> str:
+        """input() 回退路径的阻塞读。面板路径在 _serve_palette，不走这里。"""
+        self.last_read_native_echo = True  # input() 自带终端回显
+        return input(prompt)
 
     def _resolve(self, value: Any, epoch: Optional[int] = None) -> None:
         """把结果投递回事件循环。先摘 pending，保证只兑现一次。
 
         epoch 不是 None 时只兑现同代次的读取——见 __init__ 里代次号的说明。
+        面板路径不传 epoch：它的每次投递都来自"当前这次等待"，不存在
+        input() 那种迟到的旧读取。
         """
         with self._lock:
             pending, self._pending = self._pending, None
@@ -983,14 +1026,27 @@ class _StdinReader:
 
     async def read(self, prompt: str) -> Any:
         loop = asyncio.get_running_loop()
+        self.loop = loop
         future = loop.create_future()
         with self._lock:
             self._epoch += 1
             epoch = self._epoch
             self._pending = (future, loop, epoch)
         self._ensure_thread()
-        self._requests.put((prompt, epoch))
+        if self.mode == "palette":
+            # 常驻面板：提示符/框色随状态换档（红=状态输入、黄=菜单、
+            # 绿=空闲），框原地重画；提交由面板线程投递到上面那个 future。
+            box = attached_input_box()
+            if box is not None:
+                box.set_prompt(_prompt_plain(), _input_box_ansi())
+        else:
+            self._requests.put((prompt, epoch))
         return await future
+
+    def waiting(self) -> bool:
+        """主循环当前是否正挂在 read() 上等提交（忙闸门用它判断）。"""
+        with self._lock:
+            return self._pending is not None
 
     def request_exit(self) -> bool:
         """空闲时的 Ctrl+C：把正等着的那次读取兑现成"退出"。
@@ -1018,6 +1074,76 @@ class _StdinReader:
 
 
 _READER = _StdinReader()
+
+
+# --------------------------------------------------------------------------
+# 常驻输入框：创建 / 退役，忙时回车的闸门与提示
+# --------------------------------------------------------------------------
+
+def _input_box_ansi() -> str:
+    """框线颜色跟提示符同档：红=状态输入中、黄=菜单导航中、绿=空闲。"""
+    pal = PALETTE
+    return getattr(pal, _prompt_color_name()) if pal.enabled else ""
+
+
+def _submit_blocked() -> bool:
+    """常驻面板的回车闸门：一轮进行中，或主循环还没回到等输入的位置。
+
+    对齐 Telegram 端忙闸门的语义——忙时回车不提交、草稿留在输入行，提示
+    用户稍候；主循环回到 read() 后再按一次回车即发送。不做排队：用户明确
+    不要"turn 结束后依次发送"。主循环还没回到 read() 的那几毫秒也算忙，
+    否则提交会落进没人等的 future 里被丢掉、草稿却被清空。
+    """
+    return _turn_active or not _READER.waiting()
+
+
+def _busy_notice(_text: str) -> None:
+    """面板在忙时收到回车：把提示投回事件循环线程打印。
+
+    直接在面板线程里调 SCREEN 会和主线程的流式重绘赛跑（SCREEN 的行数
+    记账非线程安全）；call_soon_threadsafe 让提示排在循环线程的两个
+    await 之间打出来，天然串行。
+    """
+    loop = _READER.loop
+    if loop is None:
+        return
+
+    def _show() -> None:
+        SCREEN.notice("⏳ 系统仍在处理上一个请求... 请稍后再发送新请求。", "warn")
+
+    try:
+        loop.call_soon_threadsafe(_show)
+    except RuntimeError:
+        pass
+
+
+def _start_input_box() -> None:
+    """创建常驻输入框并挂到渲染层。raw 模式由读线程 open()，这里只建对象。"""
+    box = SlashPalette(
+        _prompt_plain(),
+        _matching_commands,
+        _palette_rows,
+        history=_LIVE_HISTORY,
+        abort_check=_cancel_event.is_set,
+        busy_check=_submit_blocked,
+        on_busy_submit=_busy_notice,
+        box_ansi=_input_box_ansi(),
+    )
+    attach_input_box(box)
+
+
+def _retire_input_box() -> None:
+    """面板退役：从渲染层摘下来、还原终端，此后打印不再让位、read() 走 input()。
+
+    幂等且线程安全：读线程的兜底路径和主线程的退出路径都会调到，box.close
+    自带互斥和去重。
+    """
+    box = attached_input_box()
+    detach_input_box()
+    if box is not None:
+        box.close()
+    if _READER.mode == "palette":
+        _READER.mode = "legacy"
 
 
 def _prompt_text() -> str:
@@ -1300,6 +1426,10 @@ def main() -> None:
         asyncio.run(_run())
     except KeyboardInterrupt:
         pass
+    # 退役常驻输入框：抹框、还原终端光标和 raw 模式。不提前退役的话，
+    # 下面"再见"打印时渲染层还会把框撤位/复位一次，退出后框才被 atexit
+    # 擦掉——多闪一下还容易让人以为没退干净。
+    _retire_input_box()
     _restore_terminal_state()
     SCREEN.print_plain("")
     SCREEN.notice("再见。", "ok")
