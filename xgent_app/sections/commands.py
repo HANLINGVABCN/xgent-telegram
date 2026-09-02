@@ -489,6 +489,11 @@ async def apply_provider_config_import(
             UserDataManager.set(meta['model_state_key'], None)
             await UserDataManager.save_config(meta['provider_config_key'], None)
             await UserDataManager.save_config(meta['model_config_key'], None)
+        # 会话绑定一并清掉：replace 会删掉旧提供商，钉在会话上的旧模型名
+        # 立刻成为悬空引用（发消息优先读会话模型 → 拿已删通道去请求旧
+        # 模型，上游 502 unknown provider）。之后 restore_target 若恢复
+        # 成功会再同步成新模型。
+        await sync_chat_session_model(None)
 
     async def restore_target(target: str, provider_field: str, model_field: str, label: str):
         if provider_field not in defaults and model_field not in defaults:
@@ -499,12 +504,16 @@ async def apply_provider_config_import(
         meta = get_model_target_meta(target)
         if provider and isinstance(model_name, str) and model_name in provider.get('models', []):
             await save_model_target_selection(target, provider_name, model_name)
+            if target == 'chat':
+                await sync_chat_session_model(model_name)
             restored_defaults.append(label)
         elif provider_name is None and model_name is None:
             UserDataManager.set(meta['provider_state_key'], None)
             UserDataManager.set(meta['model_state_key'], None)
             await UserDataManager.save_config(meta['provider_config_key'], None)
             await UserDataManager.save_config(meta['model_config_key'], None)
+            if target == 'chat':
+                await sync_chat_session_model(None)
             restored_defaults.append(f'{label}（未设置）')
         else:
             skipped_defaults.append(label)

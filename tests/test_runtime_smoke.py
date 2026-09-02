@@ -251,6 +251,101 @@ asyncio.run(main())
         self.assertTrue(data["web_has_reply_text"], "网页 outbox 必须收到含回复正文的帧")
         self.assertTrue(data["tg_rich_called"], "原生 Telegram 仍应走 rich API")
 
+    def test_provider_import_syncs_chat_session_model(self):
+        """导入配置/Web 设置换默认模型后，会话绑定必须跟着换。
+
+        回归：模型取值是两层存储——发消息优先读 chat_sessions.model，没有
+        才回退全局 default_model。导入配置原本只更新全局层，会话里残留的
+        旧模型名配上换掉后的新提供商通道发出去，上游 502 unknown
+        provider；replace 导入还会删旧提供商，旧绑定直接悬空。前台显示
+        读全局（新模型），实际请求读会话（旧模型），两边对不上。
+        """
+        output = self.run_probe(r'''
+import asyncio
+import json
+import xgent_server as bot
+
+def _payload(defaults):
+    return {
+        "format": "xgent-telegram-provider-config",
+        "version": 1,
+        "providers": {
+            "newprov": {
+                "base_url": "https://example.com/v1",
+                "api_key": "secret",
+                "models": ["model-new"],
+                "api_format": "openai",
+            }
+        },
+        "defaults": defaults,
+    }
+
+async def main():
+    await bot.UserDataManager.init()
+    db = await bot.BotMemoryDB.get_instance()
+
+    # 预置"导入前"状态：旧提供商 + 会话钉着旧模型（正常使用中）
+    await db.import_providers({
+        "oldprov": {"base_url": "https://old.example.com/v1", "api_key": "k",
+                    "models": ["model-old"], "api_format": "openai"}
+    }, replace=False)
+    await bot.save_model_target_selection('chat', 'oldprov', 'model-old')
+    await db.create_session(bot.SINGLE_MEMORY_SESSION_ID, 'model-old')
+    bot.UserDataManager.set('current_chat_id', bot.SINGLE_MEMORY_SESSION_ID)
+
+    # replace 导入：defaults 指向新提供商的新模型 → 会话绑定同步
+    providers, defaults = bot.parse_provider_config_import(
+        json.dumps(_payload({"active_provider": "newprov",
+                             "default_model": "model-new"})).encode("utf-8"))
+    await bot.apply_provider_config_import(providers, defaults, mode='replace')
+    session = await db.get_session(bot.SINGLE_MEMORY_SESSION_ID)
+    replace_synced = session['model'] == 'model-new'
+
+    # replace 导入但 defaults 的模型无效 → 会话绑定清空，不留悬空引用
+    await db.create_session(bot.SINGLE_MEMORY_SESSION_ID, 'model-old')
+    providers, defaults = bot.parse_provider_config_import(
+        json.dumps(_payload({"active_provider": "newprov",
+                             "default_model": "model-gone"})).encode("utf-8"))
+    await bot.apply_provider_config_import(providers, defaults, mode='replace')
+    session = await db.get_session(bot.SINGLE_MEMORY_SESSION_ID)
+    replace_invalid_cleared = session['model'] is None
+
+    # merge 导入 + 有效 defaults：同样要同步
+    await db.create_session(bot.SINGLE_MEMORY_SESSION_ID, 'model-old')
+    providers, defaults = bot.parse_provider_config_import(
+        json.dumps(_payload({"active_provider": "newprov",
+                             "default_model": "model-new"})).encode("utf-8"))
+    await bot.apply_provider_config_import(providers, defaults, mode='merge')
+    session = await db.get_session(bot.SINGLE_MEMORY_SESSION_ID)
+    merge_synced = session['model'] == 'model-new'
+
+    # Web 设置 chat_model：会话绑定同步
+    await bot._web_write_setting('chat_model', 'newprov|model-new')
+    session = await db.get_session(bot.SINGLE_MEMORY_SESSION_ID)
+    web_synced = session['model'] == 'model-new'
+
+    # aiosqlite 的工作线程不是 daemon：不关连接的话探针进程退不出去
+    await db.close()
+
+    print(json.dumps({
+        "replace_synced": replace_synced,
+        "replace_invalid_cleared": replace_invalid_cleared,
+        "merge_synced": merge_synced,
+        "web_synced": web_synced,
+    }, ensure_ascii=False))
+
+asyncio.run(main())
+''')
+        data = json.loads(output.strip().splitlines()[-1])
+        self.assertTrue(data["replace_synced"],
+                        "replace 导入恢复默认模型后，会话绑定必须同步成新模型")
+        self.assertTrue(data["replace_invalid_cleared"],
+                        "replace 导入删掉旧提供商后，悬空的会话绑定必须清空")
+        self.assertTrue(data["merge_synced"],
+                        "merge 导入恢复默认模型后，会话绑定必须同步成新模型")
+        self.assertTrue(data["web_synced"],
+                        "Web 设置 chat_model 后，会话绑定必须同步")
+
     def test_protocol_and_normalization_behavior(self):
         output = self.run_probe(r'''
 import json

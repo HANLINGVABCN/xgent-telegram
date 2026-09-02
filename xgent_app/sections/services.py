@@ -724,6 +724,23 @@ async def save_model_target_selection(target: str, provider_name: str, model_nam
     await UserDataManager.save_config(meta['model_config_key'], model_name)
 
 
+async def sync_chat_session_model(model_name: Optional[str]) -> None:
+    """把当前会话的模型绑定同步成新值。target='chat' 变更时的**必需**配套动作。
+
+    模型取值是两层存储：发消息时优先读 chat_sessions.model，会话没绑定才
+    回退全局 default_model（messages.py 的取值顺序）。手动切模型的三条按钮
+    路径都做了"全局+会话"双写；历史上导入配置和 Web 设置两条路径只写了
+    全局层——前台显示的是新模型，实际请求却拿着会话里残留的旧模型名、
+    配上换掉后的新提供商通道发出去，上游直接 502 unknown provider。
+    收进一个函数，新路径不再容易漏。
+
+    UPDATE 对不存在的会话行是 no-op，早于首次对话调用也安全。
+    """
+    db = await BotMemoryDB.get_instance()
+    cid = UserDataManager.get('current_chat_id') or SINGLE_MEMORY_SESSION_ID
+    await db.update_session(cid, model=model_name)
+
+
 def classify_provider_mode(api_format: str, base_url: str) -> str:
     normalized_format = (api_format or 'openai').lower()
     normalized_url = (base_url or '').lower()

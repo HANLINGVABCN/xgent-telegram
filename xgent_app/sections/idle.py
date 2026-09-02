@@ -551,6 +551,9 @@ async def _web_write_setting(key: str, value: Any) -> Dict[str, Any]:
         if prov_name not in providers or model not in (providers[prov_name].get('models') or []):
             raise ValueError("提供商或模型不存在")
         await save_model_target_selection('chat', prov_name, model)
+        # 会话绑定要一起换：发消息优先读 chat_sessions.model，只改全局层
+        # 会出现"前台显示新模型、实际拿旧模型请求"的错配。
+        await sync_chat_session_model(model)
     elif key == 'thinking_level':
         level = normalize_thinking_level(value)
         UserDataManager.set(key, level)

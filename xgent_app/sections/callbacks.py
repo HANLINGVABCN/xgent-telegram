@@ -1671,10 +1671,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return
             await save_model_target_selection(target, prov_name, model_name)
 
-            cid = UserDataManager.get('current_chat_id')
-            if target == 'chat' and cid:
-                db = await BotMemoryDB.get_instance()
-                await db.update_session(cid, model=model_name)
+            if target == 'chat':
+                await sync_chat_session_model(model_name)
 
             await GlobalRecorder.record_system_op(
                 f"设置{get_model_target_label(target)}: {model_name}",
@@ -1686,15 +1684,13 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=get_default_model_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
-        
+
         elif data.startswith("set_mdl|"):
             _, target, prov_name, model_name = data.split("|", 3)
             await save_model_target_selection(target, prov_name, model_name)
 
-            cid = UserDataManager.get('current_chat_id')
-            if target == 'chat' and cid:
-                db = await BotMemoryDB.get_instance()
-                await db.update_session(cid, model=model_name)
+            if target == 'chat':
+                await sync_chat_session_model(model_name)
 
             await GlobalRecorder.record_system_op(
                 f"设置{get_model_target_label(target)}: {model_name}",
@@ -1732,23 +1728,21 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parts = data.split("_", 4)
                 target, prov_name, model_name = parts[2], parts[3], parts[4]
             await save_model_target_selection(target, prov_name, model_name)
-            
-            cid = UserDataManager.get('current_chat_id')
-            if target == 'chat' and cid:
-                db = await BotMemoryDB.get_instance()
-                await db.update_session(cid, model=model_name)
-            
+
+            if target == 'chat':
+                await sync_chat_session_model(model_name)
+
             await GlobalRecorder.record_system_op(
                 f"设置{get_model_target_label(target)}: {model_name}",
                 {"provider": prov_name, "target": target}
             )
-            
+
             await query.message.reply_text(
                 f"✅ {get_model_target_label(target)} 已切换为 <b>{safe_text(prov_name)} / {safe_text(model_name)}</b>。",
                 reply_markup=get_default_model_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
-        
+
         elif data.startswith("do_del|") or data.startswith("do_del_"):
             if data.startswith("do_del|"):
                 _, pname, mname = data.split("|", 2)
@@ -1856,10 +1850,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                     )
                 else:
                     await save_model_target_selection(target, pname, mname)
-                    cid = UserDataManager.get('current_chat_id')
-                    if target == 'chat' and cid:
-                        db = await BotMemoryDB.get_instance()
-                        await db.update_session(cid, model=mname)
+                    if target == 'chat':
+                        await sync_chat_session_model(mname)
                     await GlobalRecorder.record_system_op(
                         f"设置{get_model_target_label(target)}: {mname}",
                         {"provider": pname, "target": target}

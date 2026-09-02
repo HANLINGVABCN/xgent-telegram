@@ -1677,7 +1677,22 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             return
     model = cdata.get('model') or UserDataManager.get('default_model')
     prov_name, prov_data = get_current_provider()
-    
+
+    # 防御性回退：模型取值优先读会话绑定（chat_sessions.model），若某条
+    # 配置变更路径漏了会话同步（历史上导入配置和 Web 设置都漏过），会话
+    # 里残留的旧模型名会配着换掉后的新提供商通道发出去，上游 502
+    # unknown provider。模型不在当前提供商列表里时回退全局默认，与前台
+    # 显示一致。models 为空的提供商（通配转发型）不做此校验。
+    available_models = (prov_data or {}).get('models') or []
+    if available_models and model and model not in available_models:
+        fallback = UserDataManager.get('default_model')
+        if fallback in available_models:
+            logger.warning(
+                "会话绑定模型 %s 不在提供商 %s 的列表里，回退默认模型 %s",
+                model, prov_name, fallback,
+            )
+            model = fallback
+
     if not prov_data or not model:
         if trigger_status_msg is not None and trigger_status_iteration is not None:
             with contextlib.suppress(Exception):
