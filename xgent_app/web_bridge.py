@@ -13,6 +13,7 @@ shell_triggers.py 里的 _SelfTriggerUpdate / _SelfTriggerContext 已经用同�
 
 from __future__ import annotations
 
+import asyncio
 import collections
 import contextlib
 import logging
@@ -24,14 +25,37 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from xgent_app.fanout import (
+    ChannelWorker,
+    Op,
+    OP_CHAT_ACTION,
+    OP_DELETE,
+    OP_DOCUMENT,
+    OP_EDIT,
+    OP_EDIT_MARKUP,
+    OP_PHOTO,
+    OP_SEND,
+    OpNotDeliverable,
+    get_channel_registry,
+)
+
 logger = logging.getLogger(__name__)
+
+# 单次 Telegram 调用的上限。PTB 那层是 read/write 30s + connect 15s，但断连时
+# 一轮对话要打几百次，逐条等满 30s 累计是小时级——通道层收得更紧，靠熔断把
+# 后续调用变成 O(1) 跳过。上传类操作不套这个超时（见 fanout.UPLOAD_KINDS）。
+_MIRROR_TG_CALL_TIMEOUT = 15.0
+# 允许透传给底层 bot 方法的数值型 kwargs。白名单而不是全量透传：payload 要能
+# JSON 序列化落库，随手塞进来的对象会让整条操作变成不可持久化。
+_PASSTHROUGH_KWARGS = ("read_timeout", "write_timeout", "connect_timeout", "pool_timeout")
 
 # 网页侧假 message_id 全局计数器。起始放到 1,000,000 以上，刻意避开真实
 # Telegram message_id（通常是小整数），让前端 byMessageId 不会把 TG->Web 镜像
 # 帧和网页原生帧搞混。WebBot / MirrorBot 共用这一个计数器，保证命令、按钮、
 # 对话各自新建实例时 id 仍然唯一。
+_LOGICAL_ID_BASE = 1_000_000
 _WEB_MESSAGE_ID_LOCK = threading.Lock()
-_web_message_id_counter = 1_000_000
+_web_message_id_counter = _LOGICAL_ID_BASE
 
 
 def _allocate_web_message_id() -> int:
@@ -424,41 +448,140 @@ class WebContext:
         self.args: List[str] = []
 
 
+async def deliver_op_to_bot(bot: Any, op: Op, native_id: Optional[int], *,
+                            markup_builder: Optional[Any] = None) -> Any:
+    """把一个 Op 真的打到某个 PTB bot 上；创建类操作返回原生 message_id。
+
+    这是 Telegram 通道唯一的投递实现——实时投递和从待发库补投走的是同一段代码，
+    所以"补发过去的和当时发的长得不一样"这类偏差不会存在。
+
+    本函数仍然不 import telegram：reply_markup 首选 op.transient 里那个真的
+    InlineKeyboardMarkup；从待发库补投时 transient 已经没了，靠调用方注入的
+    markup_builder 从扁平结构还原（idle._relay_markup_to_telegram 正是
+    _markup_to_frame 的逆运算）——"带停止按钮的占位消息"补发过去还带不带按钮，
+    全看这一步。
+    """
+    if bot is None:
+        raise OpNotDeliverable("通道没有可用的 bot")
+    payload = op.payload or {}
+    extra = dict(payload.get("kwargs") or {})
+    kind = op.kind
+
+    def markup() -> Any:
+        if "reply_markup" in op.transient:
+            return op.transient.get("reply_markup")
+        flat = payload.get("reply_markup")
+        if flat and markup_builder is not None:
+            return markup_builder(flat)
+        return None
+
+    def method(name: str) -> Any:
+        fn = getattr(bot, name, None)
+        if fn is None:
+            # 垫片 bot 少一个方法不是网络故障，不该把整条通道判成断线。
+            raise OpNotDeliverable(f"bot 没有方法 {name}")
+        return fn
+
+    if kind == OP_SEND:
+        result = await method("send_message")(
+            chat_id=op.chat_id, text=str(payload.get("text") or ""),
+            reply_markup=markup(), parse_mode=payload.get("parse_mode"), **extra)
+        return getattr(result, "message_id", None)
+
+    if kind == OP_EDIT:
+        await method("edit_message_text")(
+            chat_id=op.chat_id, message_id=native_id,
+            text=str(payload.get("text") or ""), reply_markup=markup(),
+            parse_mode=payload.get("parse_mode"), **extra)
+        return None
+
+    if kind == OP_EDIT_MARKUP:
+        await method("edit_message_reply_markup")(
+            chat_id=op.chat_id, message_id=native_id, reply_markup=markup(), **extra)
+        return None
+
+    if kind == OP_DELETE:
+        await method("delete_message")(
+            chat_id=op.chat_id, message_id=native_id, **extra)
+        return None
+
+    if kind == OP_CHAT_ACTION:
+        await method("send_chat_action")(
+            chat_id=op.chat_id, action=payload.get("action") or "typing", **extra)
+        return None
+
+    if kind in (OP_DOCUMENT, OP_PHOTO):
+        arg_name = "document" if kind == OP_DOCUMENT else "photo"
+        handle = op.transient.get(arg_name)
+        opened = None
+        if handle is None:
+            path = payload.get("path")
+            if not path or not os.path.isfile(str(path)):
+                # 补投时文件已经没了。跳过——为一个临时文件卡住整条待发队列不值得，
+                # 与 _replay_relay_op 对同一情况的处理一致。
+                raise OpNotDeliverable(f"待发文件已不存在: {path}")
+            opened = open(str(path), "rb")
+            handle = opened
+        try:
+            if kind == OP_DOCUMENT:
+                result = await method("send_document")(
+                    chat_id=op.chat_id, document=handle,
+                    filename=payload.get("filename"),
+                    caption=payload.get("caption"), **extra)
+            else:
+                result = await method("send_photo")(
+                    chat_id=op.chat_id, photo=handle,
+                    caption=payload.get("caption"), **extra)
+        finally:
+            if opened is not None:
+                with contextlib.suppress(Exception):
+                    opened.close()
+        return getattr(result, "message_id", None)
+
+    raise OpNotDeliverable(f"未知的通道操作: {kind}")
+
+
 class MirrorBot:
-    """双通道输出 Bot：每次发送既推帧给网页（SSE），又发给真实 Telegram bot。
+    """双通道输出 Bot：帧立刻推给网页（SSE），Telegram 那一路交给通道异步投递。
 
-    网页版和 Telegram 共用同一套对话核心，但默认各走各的输出通道——网页发的
-    Telegram 看不到，反之亦然。MirrorBot 把两条通道并起来：对话核心调用
-    send_message / edit_message_text 等方法时，这里同时：
+    网页版和 Telegram 共用同一套对话核心，但默认各走各的输出通道。MirrorBot 把
+    两条并起来，关键在**顺序**：
 
-      1. 调真实 PTB bot 对应方法（消息进 Telegram 聊天）；
-      2. 推一帧到 WebOutbox（消息进网页 SSE）。
+      1. 先分配逻辑 message_id、先推网页帧；
+      2. 再把这次调用作为一个 Op 交给 Telegram 通道（fanout.ChannelWorker），
+         立即返回，不等网络。
 
-    real_bot 为 None 时退化为纯网页输出，行为等价于 WebBot。维护 fake_id ->
-    real_id 映射，让后续 edit/delete 能定位到 Telegram 里的真实消息。
+    此前是反过来的——`await 真实TG调用` 成功之后才推网页帧。于是"网页延迟"直接
+    等于"Telegram 延迟"：流式渲染每 0.35s 编辑一次，TG 断连时每次编辑都要等满
+    read_timeout（30s，上传路径上到 1800s），网页看起来就是卡死。这是"一个端出
+    问题就影响别的端"在输出路径上的具体形态。
 
-    Telegram 侧调用失败（消息超长、HTML 解析失败等）只记日志，不抛出——网页
-    那一帧照发，避免一边坏了把整轮对话拖崩。这会让两端偶尔不一致，但比直接
-    中断对话可控。
+    逻辑 id 由本类分配（1,000,000 起，避开真实 Telegram 的小整数），真实
+    message_id 由通道在投递成功时自己记住（fanout.ChannelWorker._native，即原来
+    的 _id_map 搬了个家）。这样"消息身份"归对话核心所有，不再依赖 Telegram 先
+    回一个 id——TG 不通时网页照样有完整、可编辑的消息流。
+
+    real_bot 为 None 时退化为纯网页输出，行为等价于 WebBot。
     """
 
     # 标记位：process_conversation 据此识别"本轮来自网页"，跳过 TG->Web 镜像安装。
     _is_xgent_web_bot = True
 
-    def __init__(self, outbox: WebOutbox, chat_id: int, real_bot: Any = None):
+    def __init__(self, outbox: WebOutbox, chat_id: int, real_bot: Any = None,
+                 channel: Any = None):
         self.outbox = outbox
         self.chat_id = chat_id
         self.real_bot = real_bot
         self._next_message_id = 1
         self._id_lock = threading.Lock()
-        self._id_map: Dict[int, int] = {}  # fake_id -> real Telegram message_id
-        self._reverse_id_map: Dict[int, int] = {}  # real_id -> fake_id（网端帧回发用）
+        self._channel = channel
+        self._local_channel: Optional[ChannelWorker] = None
 
     def _allocate_message_id(self) -> int:
         return _allocate_web_message_id()
 
     def _resolve_send_id(self, override: Any = None) -> int:
-        """本条消息在"帧侧"用的 id。
+        """本条消息在"帧侧"用的逻辑 id。
 
         override 给 CLI 中继回放用：CLI 进程里对话核心早就拿着自己分配的
         message_id 在后续 edit/delete 里引用它了，服务端回放时必须沿用同一个
@@ -478,40 +601,120 @@ class MirrorBot:
         frame.update(fields)
         self.outbox.put(frame)
 
-    def _resolve_real_id(self, message_id: Optional[int]) -> Optional[int]:
-        """fake_id -> real_id。没映射就当它本身就是真实 id（部分代码会直接传 real id）。"""
-        if message_id is None:
-            return None
+    # --- Telegram 通道 ---
+
+    def _tg_channel(self) -> ChannelWorker:
+        """本实例用的 Telegram 通道。优先用注册表里那个进程级共享的。
+
+        共享是重点：熔断状态描述的是"这台机器现在连不连得上 Telegram"，属于
+        进程级事实。每个 MirrorBot 各带一个熔断器的话，每轮对话都要重新花
+        3×15s 去发现一次 TG 断了，熔断等于没有。
+
+        拿不到共享通道时就地建一个只包 self.real_bot、没有持久层的 worker——
+        web_bridge 的契约是"能脱离 sections 命名空间单测"，而代码路径与生产
+        完全一致，区别只在是否共享、是否落库。
+        """
+        if self._channel is not None:
+            return self._channel
+        shared = get_channel_registry().get("telegram")
+        if shared is not None:
+            return shared
+        if self._local_channel is None:
+            self._local_channel = ChannelWorker(
+                "telegram-local", self._deliver_local,
+                is_configured=lambda: self.real_bot is not None,
+                timeout=_MIRROR_TG_CALL_TIMEOUT,
+            )
+        return self._local_channel
+
+    def _offer(self, kind: str, *, logical_id: Optional[int] = None,
+               chat_id: Optional[int] = None,
+               payload: Optional[Dict[str, Any]] = None,
+               transient: Optional[Dict[str, Any]] = None,
+               durable: bool = True) -> None:
+        """把一次 Telegram 调用交给通道。同步、非阻塞、永不抛。"""
+        if self.real_bot is None:
+            return
         try:
-            mid = int(message_id)
+            channel = self._tg_channel()
+            channel.ensure_started()
+            channel.offer(Op(
+                kind, logical_id=logical_id,
+                chat_id=int(chat_id) if chat_id is not None else self.chat_id,
+                payload=payload, transient=transient, durable=durable,
+            ))
+        except Exception:  # noqa: BLE001 —— 出站失败绝不能带走这一轮对话
+            logger.warning("MirrorBot 交付 Telegram 通道失败: %s", kind, exc_info=True)
+
+    async def _deliver_local(self, op: Op, native: Optional[int]) -> Any:
+        """无共享通道时的投递实现（单测路径）。生产走 sections 里注册的那个。"""
+        return await deliver_op_to_bot(self.real_bot, op, native)
+
+    async def flush_telegram(self, timeout: float = 5.0) -> bool:
+        """等 Telegram 通道把已交付的操作投完。
+
+        对话核心不需要它（出站本来就该是异步的），但有序停机和测试需要一个
+        确定的"都投完了"时刻。
+        """
+        if self.real_bot is None:
+            return True
+        try:
+            return await self._tg_channel().wait_idle(timeout=timeout)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _target_ids(self, message_id: Optional[int]) -> Tuple[Optional[int], Optional[int]]:
+        """把核心传进来的 message_id 拆成 (通道用的逻辑 id, 显式原生 id)。
+
+        三种来源：
+          1. 本类分配的逻辑 id（≥1,000,000）——最常见，直接用；
+          2. 真实 Telegram id，但这条消息是我们发的 —— 反查回逻辑 id；
+          3. 真实 Telegram id，且这条消息不是我们发的（转发-读取-删除那套取内容的
+             trick，被转发的是用户自己的消息）—— 通道里查不到，只能把它当原生 id
+             显式传下去。漏了这一路，那条临时转发消息就永远删不掉，聊天里留垃圾。
+        """
+        if message_id is None:
+            return None, None
+        logical = self._frame_id(message_id)
+        if logical != message_id:
+            return logical, None          # 情况 2：反查成功
+        try:
+            raw = int(message_id)
         except (TypeError, ValueError):
-            return None
-        return self._id_map.get(mid, mid)
+            return message_id, None
+        if self.real_bot is not None:
+            try:
+                if not self._tg_channel().knows_logical(raw):
+                    return raw, raw       # 情况 3：本通道没发过它，只能当原生 id
+            except Exception:  # noqa: BLE001
+                pass
+        return raw, None                  # 情况 1
 
-    def _web_frame_id(self, message_id: Optional[int]) -> Optional[int]:
-        """网端帧该用的 message_id：real -> fake 的反查。
+    def _frame_id(self, message_id: Optional[int]) -> Optional[int]:
+        """网页帧该用的 message_id。
 
-        MirrorMessage（包装真实 TG 消息）的 edit/delete 传的是 real id，而网页
-        首次收到这条消息的帧带的是 fake id——直接透传 real id 前端 byMessageId
-        查不到：流式编辑每 0.35s 一次，每次都新建气泡，就是"上一条消息无限
-        刷屏"的根源。反查回 fake id，前端就能原地更新。查不到就原样返回。
+        绝大多数情况下对话核心手上就是本类分配的逻辑 id，原样用即可——**消息身份
+        由对话核心拥有，不再依赖 Telegram 先回一个 id**，这是新旧设计最本质的差别。
+        少数调用点会拿着真实 Telegram id 回来（转发-读取-删除那套取内容的 trick、
+        MirrorMessage 包装真实消息），这时反查回逻辑 id，否则前端 byMessageId 落空、
+        每次编辑新建一个气泡（"上一条消息无限刷屏"）。
         """
         if message_id is None:
             return None
-        try:
-            mid = int(message_id)
-        except (TypeError, ValueError):
-            return message_id
-        return self._reverse_id_map.get(mid, mid)
-
-    async def _tg_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         if self.real_bot is None:
-            return None
+            return message_id
         try:
-            return await getattr(self.real_bot, method)(*args, **kwargs)
-        except Exception as exc:  # noqa: BLE001 —— 刻意宽，TG 失败不能拖垮网页
-            logger.warning("MirrorBot Telegram %s 失败: %s", method, exc)
-            return None
+            logical = self._tg_channel().logical_for_native(message_id)
+        except Exception:  # noqa: BLE001
+            return message_id
+        return logical if logical is not None else message_id
+
+    @staticmethod
+    def _passthrough(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            name: kwargs[name] for name in _PASSTHROUGH_KWARGS
+            if isinstance(kwargs.get(name), (int, float))
+        }
 
     async def send_message(self, chat_id: Optional[int] = None, text: str = "",
                            reply_markup: Any = None, parse_mode: Any = None,
@@ -519,68 +722,71 @@ class MirrorBot:
                            **kwargs: Any) -> WebMessage:
         target = int(chat_id) if chat_id is not None else self.chat_id
         message_id = self._resolve_send_id(relay_message_id)
-        real = await self._tg_call(
-            "send_message", chat_id=target, text=str(text),
-            reply_markup=reply_markup, parse_mode=parse_mode, **kwargs,
-        )
-        if real is not None and getattr(real, "message_id", None) is not None:
-            self._id_map[message_id] = real.message_id
-            self._reverse_id_map[real.message_id] = message_id
+        # 先推网页帧，再交给 Telegram 通道：网页不等 Telegram。
         self._emit(
             "message", message_id=message_id, text=str(text),
             parse_mode=str(parse_mode) if parse_mode else None,
             reply_markup=_markup_to_frame(reply_markup),
         )
+        self._offer(OP_SEND, logical_id=message_id, chat_id=target, payload={
+            "text": str(text),
+            "parse_mode": str(parse_mode) if parse_mode else None,
+            "reply_markup": _markup_to_frame(reply_markup),
+            "kwargs": self._passthrough(kwargs),
+        }, transient={"reply_markup": reply_markup})
         return WebMessage(self, message_id, target, str(text))
 
     async def edit_message_text(self, text: str, chat_id: Optional[int] = None,
                                 message_id: Optional[int] = None, reply_markup: Any = None,
                                 parse_mode: Any = None, **kwargs: Any) -> WebMessage:
         target = int(chat_id) if chat_id is not None else self.chat_id
-        real_id = self._resolve_real_id(message_id)
-        if real_id is not None:
-            await self._tg_call(
-                "edit_message_text", chat_id=target, message_id=real_id,
-                text=str(text), reply_markup=reply_markup, parse_mode=parse_mode, **kwargs,
-            )
+        logical, native = self._target_ids(message_id)
         self._emit(
-            "edit", message_id=self._web_frame_id(message_id), text=str(text),
+            "edit", message_id=logical, text=str(text),
             parse_mode=str(parse_mode) if parse_mode else None,
             reply_markup=_markup_to_frame(reply_markup),
         )
+        self._offer(OP_EDIT, logical_id=logical, chat_id=target, payload={
+            "text": str(text),
+            "parse_mode": str(parse_mode) if parse_mode else None,
+            "reply_markup": _markup_to_frame(reply_markup),
+            "native_id": native,
+            "kwargs": self._passthrough(kwargs),
+        }, transient={"reply_markup": reply_markup})
         return WebMessage(self, int(message_id or 0), target, str(text))
 
     async def edit_message_reply_markup(self, chat_id: Optional[int] = None,
                                         message_id: Optional[int] = None,
                                         reply_markup: Any = None, **kwargs: Any) -> bool:
         target = int(chat_id) if chat_id is not None else self.chat_id
-        real_id = self._resolve_real_id(message_id)
-        if real_id is not None:
-            await self._tg_call(
-                "edit_message_reply_markup", chat_id=target, message_id=real_id,
-                reply_markup=reply_markup, **kwargs,
-            )
-        self._emit("edit_markup", message_id=self._web_frame_id(message_id),
+        logical, native = self._target_ids(message_id)
+        self._emit("edit_markup", message_id=logical,
                    reply_markup=_markup_to_frame(reply_markup))
+        self._offer(OP_EDIT_MARKUP, logical_id=logical, chat_id=target, payload={
+            "reply_markup": _markup_to_frame(reply_markup),
+            "native_id": native,
+            "kwargs": self._passthrough(kwargs),
+        }, transient={"reply_markup": reply_markup})
         return True
 
     async def delete_message(self, chat_id: Optional[int] = None,
                              message_id: Optional[int] = None, **kwargs: Any) -> bool:
         target = int(chat_id) if chat_id is not None else self.chat_id
-        real_id = self._resolve_real_id(message_id)
-        if real_id is not None:
-            await self._tg_call("delete_message", chat_id=target, message_id=real_id, **kwargs)
-        self._emit("delete", message_id=self._web_frame_id(message_id))
+        logical, native = self._target_ids(message_id)
+        self._emit("delete", message_id=logical)
+        self._offer(OP_DELETE, logical_id=logical, chat_id=target,
+                    payload={"native_id": native,
+                             "kwargs": self._passthrough(kwargs)})
         return True
 
     async def send_chat_action(self, chat_id: Optional[int] = None,
                                action: Any = None, **kwargs: Any) -> bool:
-        if self.real_bot is not None:
-            await self._tg_call(
-                "send_chat_action", chat_id=int(chat_id) if chat_id is not None else self.chat_id,
-                action=action or "typing", **kwargs,
-            )
+        target = int(chat_id) if chat_id is not None else self.chat_id
         self._emit("chat_action", action=str(action) if action else "typing")
+        # "正在输入"是纯瞬时状态：补发一个三小时前的输入提示毫无意义，durable=False
+        # 让它在通道不通时直接丢掉而不占待发库。
+        self._offer(OP_CHAT_ACTION, chat_id=target, durable=False,
+                    payload={"action": str(action) if action else "typing"})
         return True
 
     async def send_document(self, chat_id: Optional[int] = None, document: Any = None,
@@ -590,18 +796,11 @@ class MirrorBot:
         target = int(chat_id) if chat_id is not None else self.chat_id
         name = filename or getattr(document, "filename", None) or getattr(document, "name", None)
         display_name = str(name) if name else "file"
-        # 在真实发送之前先取路径：send_document 内部会读取/上传文件对象，
-        # 部分实现读完后关闭文件，之后 getattr(obj, "name") 仍然可用（属性
-        # 不受读取位置影响），但提前取更保险，避免依赖未来实现细节。
+        # 提前取本地路径：一是文件对象读完可能被关闭，二是补发时 transient 已经
+        # 没了，只能靠路径重新打开——拿不到路径的（BytesIO、file:// 容器路径）
+        # 就是不可持久化的，durable=False。
         local_path = _local_path_from_send_arg(document)
         message_id = self._resolve_send_id(relay_message_id)
-        real = await self._tg_call(
-            "send_document", chat_id=target, document=document,
-            caption=caption, filename=filename, **kwargs,
-        )
-        if real is not None and getattr(real, "message_id", None) is not None:
-            self._id_map[message_id] = real.message_id
-            self._reverse_id_map[real.message_id] = message_id
         download_url = None
         if local_path is not None:
             token = MEDIA_TOKEN_REGISTRY.register(local_path, display_name)
@@ -610,6 +809,13 @@ class MirrorBot:
                    filename=display_name,
                    caption=str(caption) if caption else None,
                    download_url=download_url)
+        self._offer(OP_DOCUMENT, logical_id=message_id, chat_id=target,
+                    durable=local_path is not None, payload={
+                        "path": local_path,
+                        "filename": filename,
+                        "caption": caption,
+                        "kwargs": self._passthrough(kwargs),
+                    }, transient={"document": document})
         return WebMessage(self, message_id, target, str(caption or ""))
 
     async def send_photo(self, chat_id: Optional[int] = None, photo: Any = None,
@@ -618,12 +824,6 @@ class MirrorBot:
         target = int(chat_id) if chat_id is not None else self.chat_id
         local_path = _local_path_from_send_arg(photo)
         message_id = self._resolve_send_id(relay_message_id)
-        real = await self._tg_call(
-            "send_photo", chat_id=target, photo=photo, caption=caption, **kwargs,
-        )
-        if real is not None and getattr(real, "message_id", None) is not None:
-            self._id_map[message_id] = real.message_id
-            self._reverse_id_map[real.message_id] = message_id
         download_url = None
         if local_path is not None:
             token = MEDIA_TOKEN_REGISTRY.register(local_path, os.path.basename(local_path))
@@ -631,6 +831,12 @@ class MirrorBot:
         self._emit("photo", message_id=message_id,
                    caption=str(caption) if caption else None,
                    download_url=download_url)
+        self._offer(OP_PHOTO, logical_id=message_id, chat_id=target,
+                    durable=local_path is not None, payload={
+                        "path": local_path,
+                        "caption": caption,
+                        "kwargs": self._passthrough(kwargs),
+                    }, transient={"photo": photo})
         return WebMessage(self, message_id, target, str(caption or ""))
 
     async def get_file(self, *args: Any, **kwargs: Any) -> Any:
@@ -640,18 +846,24 @@ class MirrorBot:
                               from_chat_id: Optional[int] = None,
                               message_id: Optional[int] = None,
                               **kwargs: Any) -> WebMessage:
-        # 同 WebBot.forward_message：无 real_bot（纯网页会话）时和 WebBot 行为
-        # 一致，返回空文本占位消息。有 real_bot 时才是真实场景——转发确实需要
-        # 发生在 Telegram 那一侧才能拉到内容，所以走 _tg_call 打到真实 bot；
-        # 但**不** _emit 网页帧：转发-读取-删除是纯粹的"取内容"手段，不是用户
-        # 可见的消息事件，镜像到网页只会凭空多出一条幽灵气泡。
+        # 与其他方法不同，这个**必须**同步等 Telegram：它不是"发出去"，而是
+        # "读回来"——messages.py 用它做转发-读取-删除那套拉取完整内容的 trick，
+        # 调用方要用返回值里的 text/caption。所以只能直接 await，但套一个超时，
+        # 不让它无限期占住这一轮对话。拿不到就返回空占位，调用方的 try/except
+        # 会自然走向下一个 fallback 分支。
+        # 也**不** _emit 网页帧：转发-读取-删除是取内容的手段，不是用户可见的
+        # 消息事件，镜像到网页只会凭空多出一条幽灵气泡。
         target = int(chat_id) if chat_id is not None else self.chat_id
         if self.real_bot is not None:
-            real = await self._tg_call(
-                "forward_message", chat_id=target,
-                from_chat_id=int(from_chat_id) if from_chat_id is not None else target,
-                message_id=message_id, **kwargs,
-            )
+            try:
+                real = await asyncio.wait_for(self.real_bot.forward_message(
+                    chat_id=target,
+                    from_chat_id=int(from_chat_id) if from_chat_id is not None else target,
+                    message_id=message_id, **kwargs,
+                ), timeout=_MIRROR_TG_CALL_TIMEOUT)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("MirrorBot forward_message 失败: %s", exc)
+                real = None
             if real is not None:
                 text = getattr(real, "text", None) or getattr(real, "caption", None) or ""
                 wrapped = WebMessage(self, self._allocate_message_id(), target, str(text))
@@ -739,14 +951,15 @@ def build_web_conversation_objects(chat_id: int, outbox: WebOutbox):
     return WebUpdate(bot, chat_id), WebContext(bot), bot
 
 
-def build_web_mirror_objects(chat_id: int, outbox: WebOutbox, real_bot: Any):
+def build_web_mirror_objects(chat_id: int, outbox: WebOutbox, real_bot: Any,
+                             channel: Any = None):
     """带 Telegram 镜像的对话三件套：网页消息同时进 Telegram。
 
     用于网页发起的普通对话（非 /命令、非按钮）。/命令和按钮走
     build_web_command_objects / build_web_callback_objects（纯网页，不回灌 TG），
     避免在网页点菜单时往 Telegram 刷一堆菜单消息。
     """
-    bot = MirrorBot(outbox, chat_id, real_bot)
+    bot = MirrorBot(outbox, chat_id, real_bot, channel=channel)
     update = WebUpdate(bot, chat_id)
     return update, WebContext(bot), bot
 
@@ -764,15 +977,15 @@ def build_web_callback_objects(chat_id: int, outbox: WebOutbox,
 
 
 def build_web_command_objects(chat_id: int, outbox: WebOutbox, command_text: str,
-                              real_bot: Any = None):
+                              real_bot: Any = None, channel: Any = None):
     """网页 /命令三件套：复用 Telegram 的 cmd_* 命令处理函数。
 
     用 MirrorBot（传 real_bot 时）让命令输出既推网页帧又发 Telegram，实现
-    web→TG 同步。命令以 reply_text 新发消息为主，MirrorBot 的 _id_map 能把
-    web 假 id 映射到 TG 真实 id，后续 edit_text 也能正确更新 TG 端消息。
-    real_bot 为 None 时退化为纯网页输出（等价 WebBot）。
+    web→TG 同步。命令以 reply_text 新发消息为主，通道侧的逻辑 id → 真实 id
+    映射保证后续 edit_text 也能正确更新 TG 端消息。real_bot 为 None 时退化为
+    纯网页输出（等价 WebBot）。
     """
-    bot = MirrorBot(outbox, chat_id, real_bot)
+    bot = MirrorBot(outbox, chat_id, real_bot, channel=channel)
     update = WebUpdate(bot, chat_id)
     text = str(command_text or "")
     update.message.text = text
@@ -983,6 +1196,7 @@ __all__ = [
     "WebCallbackQuery",
     "MirrorBot",
     "MirrorMessage",
+    "deliver_op_to_bot",
     "install_tg_to_web_mirror",
     "build_web_conversation_objects",
     "build_web_mirror_objects",

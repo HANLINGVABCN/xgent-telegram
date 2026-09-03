@@ -861,18 +861,19 @@ class MediaResolveHttpTests(unittest.TestCase):
 
 
 class MirrorBotFrameIdTests(unittest.TestCase):
-    """MirrorBot 网端帧的 id 一致性：edit/delete 必须用网页见过的假 id。
+    """MirrorBot 网端帧的 id 一致性。
 
-    MirrorMessage（包装真实 TG 消息）传 real id，网页首帧却是 fake id——
-    直接透传 real id 会让前端 byMessageId 落空，流式编辑每次新建气泡，
-    表现为"上一条消息无限刷屏"。
+    消息身份归对话核心所有：send_message 立刻分配一个逻辑 id（≥1,000,000）并
+    推帧，真实 Telegram message_id 由出站通道在投递成功后自己记住。所以正常
+    路径上"网页帧的 id"天然就是网页见过的那个，不再依赖 Telegram 先回一个 id
+    ——TG 不通时网页照样有完整、可编辑的消息流。
+
+    仍然要钉住少数拿着真实 TG id 回来的调用点（转发-读取-删除那套取内容的
+    trick、MirrorMessage 包装真实消息）：那时必须反查回逻辑 id，否则前端
+    byMessageId 落空、流式编辑每次新建气泡——"上一条消息无限刷屏"。
     """
 
-    def _run(self, coro):
-        import asyncio
-        return asyncio.run(coro)
-
-    def test_edit_and_delete_frames_use_web_facing_fake_id(self):
+    def test_edit_and_delete_frames_use_web_facing_logical_id(self):
         import asyncio
         from xgent_app.web_bridge import MirrorBot
 
@@ -880,35 +881,54 @@ class MirrorBotFrameIdTests(unittest.TestCase):
         outbox = WebOutbox()
         outbox.put = lambda frame: frames.append(frame)  # 直接截获帧
 
+        tg_calls = []
+
         class FakeRealMessage:
             message_id = 777  # Telegram 真实 id
 
         class FakeRealBot:
             async def send_message(self, *args, **kwargs):
+                tg_calls.append(("send", kwargs.get("message_id")))
                 return FakeRealMessage()
             async def edit_message_text(self, *args, **kwargs):
+                tg_calls.append(("edit", kwargs.get("message_id")))
+                return FakeRealMessage()
+            async def edit_message_reply_markup(self, *args, **kwargs):
+                tg_calls.append(("edit_markup", kwargs.get("message_id")))
                 return FakeRealMessage()
             async def delete_message(self, *args, **kwargs):
+                tg_calls.append(("delete", kwargs.get("message_id")))
                 return True
 
         async def scenario():
             bot = MirrorBot(outbox, 42, FakeRealBot())
-            # 对话核心第一次发消息（流式首块）——网页收到 fake id 的 message 帧
-            await bot.send_message(chat_id=42, text="流式首块")
-            fake_id = frames[-1]["message_id"]
-            # MirrorMessage.edit_text 走 real id（包装的是真实 TG 消息）
-            await bot.edit_message_text(text="流式更新", chat_id=42, message_id=777)
+            # 对话核心第一次发消息（流式首块）——网页立刻收到逻辑 id 的 message 帧
+            returned = await bot.send_message(chat_id=42, text="流式首块")
+            logical = frames[-1]["message_id"]
+            # 出站是异步的：等通道把真实 id 记下来，才能测真实 id 的反查
+            await bot.flush_telegram(timeout=5.0)
+            # 正常路径：核心手上就是逻辑 id
+            await bot.edit_message_text(text="流式更新", chat_id=42, message_id=logical)
+            # 真实 id 路径（MirrorMessage 包装真实 TG 消息）：必须反查回逻辑 id
             await bot.edit_message_reply_markup(chat_id=42, message_id=777, reply_markup=None)
             await bot.delete_message(chat_id=42, message_id=777)
-            return fake_id
+            await bot.flush_telegram(timeout=5.0)
+            return logical, returned.message_id
 
-        fake_id = asyncio.run(scenario())
+        logical, returned_id = asyncio.run(scenario())
         kinds = [(f["type"], f.get("message_id")) for f in frames]
         self.assertEqual("message", kinds[0][0])
-        self.assertEqual(fake_id, kinds[1][1], "edit 帧必须用网页见过的 fake id")
-        self.assertEqual(fake_id, kinds[2][1], "edit_markup 帧同样")
-        self.assertEqual(fake_id, kinds[3][1], "delete 帧同样")
-        self.assertNotEqual(fake_id, 777)
+        self.assertGreaterEqual(logical, 1_000_000,
+                               "逻辑 id 必须落在避开真实 Telegram id 的区间")
+        self.assertEqual(logical, returned_id,
+                         "send_message 返回的消息要带逻辑 id——身份不许由 Telegram 决定")
+        self.assertEqual(logical, kinds[1][1], "edit 帧必须用网页见过的逻辑 id")
+        self.assertEqual(logical, kinds[2][1], "传真实 id 时也要反查回逻辑 id")
+        self.assertEqual(logical, kinds[3][1], "delete 帧同样")
+        self.assertNotEqual(logical, 777)
+        # Telegram 那一侧收到的必须是真实 id，不是逻辑 id
+        self.assertEqual([("send", None), ("edit", 777), ("edit_markup", 777),
+                          ("delete", 777)], tg_calls)
 
 
 if __name__ == "__main__":

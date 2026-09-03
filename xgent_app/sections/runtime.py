@@ -442,6 +442,9 @@ async def shutdown_components(app: Any = None) -> None:
     for state in _COMPONENT_STATES.values():
         if state.state in (COMPONENT_UP, COMPONENT_STARTING, COMPONENT_DEGRADED):
             state.set(COMPONENT_DOWN, reason="进程停机")
+    # 出站通道先停：还没投出去的操作已经落在 channel_outbox 里，下次启动补投。
+    with contextlib.suppress(Exception):
+        await get_channel_registry().aclose_all()
     if app is not None:
         await _teardown_telegram(app)
     await on_shutdown(app)
@@ -459,6 +462,11 @@ async def run_app() -> int:
     # 1) 公共地基：配置缓存 + 数据库。原先埋在 PTB 的 post_init 里，TG 连不上
     #    时连它都不会执行。
     await boot_core()
+
+    # 1.5) 抢在任何 MirrorBot 之前把共享 Telegram 通道注册好。晚了的话早期的
+    #      MirrorBot 会各自建一个没有持久层的本地通道——断连期间的消息不落库，
+    #      恢复后补不回来（表现是"网页上说过的话 Telegram 永远没有"）。
+    await telegram_channel().start()
 
     # 2) 先把 Application 建出来（纯本地操作，不发任何网络请求），这样 Web 组件
     #    能拿到 application 引用（网页里设密码/端口要用 context.application）。

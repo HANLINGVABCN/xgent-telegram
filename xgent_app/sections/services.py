@@ -26,7 +26,12 @@ from xgent_app.web_bridge import (
     build_web_command_objects,
     MirrorBot,
     MirrorMessage,
+    deliver_op_to_bot,
     install_tg_to_web_mirror,
+)
+from xgent_app.fanout import (
+    ChannelWorker,
+    get_channel_registry,
 )
 from xgent_app.web_server import WebChatConfig, WebChatServer
 # 记录来源标记：写进每条 global_messages 的 metadata.src。

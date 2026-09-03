@@ -188,6 +188,101 @@ def _relay_markup_to_telegram(rows: Any) -> Optional[Any]:
     return InlineKeyboardMarkup(keyboard) if keyboard else None
 
 
+# --- ☆ Telegram 出站通道 ☆ ---
+# 进程级共享一条通道：熔断状态描述的是"这台机器现在连不连得上 Telegram"，
+# 属于进程级事实。每个 MirrorBot 各带一个熔断器的话，每轮对话都要重新花
+# 3×15s 去发现一次 TG 断了，熔断等于没有。
+_TELEGRAM_CHANNEL_NAME = "telegram"
+# 待发库封顶：一台连不上 Telegram 好几天的机器不该把这张表涨到几十万行，
+# 而三天前某轮对话的流式编辑补发过去只是噪音。
+_CHANNEL_OUTBOX_MAX_AGE = 7 * 24 * 3600.0
+_CHANNEL_OUTBOX_MAX_ROWS = 20000
+_channel_outbox_writes = 0
+
+
+class _ChannelOutboxStore:
+    """fanout.ChannelWorker 的持久层适配：待发操作落在 channel_outbox 表。
+
+    单独一层是为了让 fanout.py 保持"只用标准库、不认识数据库"——它只知道
+    append/fetch/delete/count 四个 await。
+    """
+
+    async def append(self, channel: str, op: Any) -> int:
+        global _channel_outbox_writes
+        db = await BotMemoryDB.get_instance()
+        row_id = await db.append_channel_op(channel, op.to_row())
+        _channel_outbox_writes += 1
+        # 每 500 次写做一次封顶清理。不每次都清：断连期间写入很密集，每条都
+        # 跑一遍 DELETE 会把写锁占满。
+        if _channel_outbox_writes % 500 == 0:
+            with contextlib.suppress(Exception):
+                removed = await db.purge_stale_channel_ops(
+                    channel, max_age_seconds=_CHANNEL_OUTBOX_MAX_AGE,
+                    max_rows=_CHANNEL_OUTBOX_MAX_ROWS)
+                if removed:
+                    logger.warning("待发库封顶：通道 %s 丢弃了 %d 条过旧/超量的操作",
+                                   channel, removed)
+        return row_id
+
+    async def fetch(self, channel: str, limit: int = 1000) -> List[Dict[str, Any]]:
+        db = await BotMemoryDB.get_instance()
+        return await db.fetch_channel_ops(channel, limit)
+
+    async def delete(self, row_ids: List[int]) -> None:
+        db = await BotMemoryDB.get_instance()
+        await db.delete_channel_ops(row_ids)
+
+    async def count(self, channel: str) -> int:
+        db = await BotMemoryDB.get_instance()
+        return await db.count_channel_ops(channel)
+
+
+async def _telegram_channel_recovered(replayed: int, skipped: int) -> None:
+    """Telegram 通道恢复、待发操作补投完之后给用户一句交代。
+
+    不发这句的话，用户看到的是"消息突然一次性涌进来"，分不清是补发还是重复。
+    """
+    bot = _web_real_bot
+    if bot is None or not replayed:
+        return
+    with contextlib.suppress(Exception):
+        await bot.send_message(
+            chat_id=BotConfig.AUTHORIZED_USER_ID,
+            text=f"🔌 Telegram 连接已恢复，断连期间的 {replayed} 条消息已补发。",
+        )
+
+
+def telegram_channel() -> Any:
+    """进程级共享的 Telegram 出站通道（惰性创建 + 注册）。"""
+    registry = get_channel_registry()
+    existing = registry.get(_TELEGRAM_CHANNEL_NAME)
+    if existing is not None:
+        return existing
+
+    async def _deliver(op: Any, native_id: Optional[int]) -> Any:
+        # bot 引用每次取最新：Telegram 可能在通道创建之后才就绪
+        # （set_telegram_channel），也可能重连后换了对象。
+        return await deliver_op_to_bot(
+            _web_real_bot, op, native_id,
+            markup_builder=_relay_markup_to_telegram,
+        )
+
+    worker = ChannelWorker(
+        _TELEGRAM_CHANNEL_NAME, _deliver,
+        is_configured=_web_external_tg_mirror_enabled,
+        timeout=15.0, maxsize=4000,
+        store=_ChannelOutboxStore(),
+        on_recovered=_telegram_channel_recovered,
+    )
+    return registry.register(worker)
+
+
+def telegram_channel_stats() -> Dict[str, Any]:
+    """通道健康快照，供 /api/health 与 /status 读。"""
+    worker = get_channel_registry().get(_TELEGRAM_CHANNEL_NAME)
+    return worker.stats() if worker is not None else {"configured": False}
+
+
 # 每个 CLI 会话一个 MirrorBot。它持有 CLI 的 message_id -> 真实 Telegram
 # message_id 的映射，回放 edit/delete 时靠它定位目标消息；丢了映射，流式回复
 # 的每一次编辑都会变成新发一条消息（历史上的"无限刷屏"）。
@@ -208,7 +303,8 @@ def build_trigger_delivery_bot(chat_id: int) -> Any:
     显式要"不打扰 Telegram"时，trigger 结果不该破例往里发。
     """
     tg_bot = _web_real_bot if _web_external_tg_mirror_enabled() else None
-    return MirrorBot(_web_external_outbox, chat_id, real_bot=tg_bot)
+    return MirrorBot(_web_external_outbox, chat_id, real_bot=tg_bot,
+                     channel=telegram_channel())
 
 
 def _relay_mirror_for(session_id: str, chat_id: int) -> Any:
@@ -217,7 +313,8 @@ def _relay_mirror_for(session_id: str, chat_id: int) -> Any:
     tg_bot = _web_real_bot if _web_external_tg_mirror_enabled() else None
     mirror = _relay_mirrors.get(session_id)
     if mirror is None:
-        mirror = MirrorBot(_web_external_outbox, chat_id, real_bot=tg_bot)
+        mirror = MirrorBot(_web_external_outbox, chat_id, real_bot=tg_bot,
+                           channel=telegram_channel())
         while len(_relay_mirrors) >= _RELAY_MIRROR_MAX_SESSIONS:
             _relay_mirrors.popitem(last=False)
         _relay_mirrors[session_id] = mirror
@@ -698,6 +795,7 @@ async def _web_run_conversation(text: str, outbox: Any) -> None:
     """
     update, context, _bot = build_web_mirror_objects(
         BotConfig.AUTHORIZED_USER_ID, outbox, _web_real_bot,
+        channel=telegram_channel(),
     )
     # 配置状态（设置密码/端口/地址/提示词/Key 等）：走 Telegram 同款状态机，
     # 不要当 AI 对话。否则网页输入 cancel 或配置值会被发给 AI（既有 bug）。
@@ -760,6 +858,7 @@ async def _web_handle_command(command: str, outbox: Any) -> None:
     handler = _WEB_COMMAND_MAP.get(name)
     update, context, _bot = build_web_command_objects(
         BotConfig.AUTHORIZED_USER_ID, outbox, command, _web_real_bot,
+        channel=telegram_channel(),
     )
     # 命令可能触发 restart_web_chat（设端口/密码），状态处理器会取 context.application。
     context.application = _web_application
@@ -955,6 +1054,7 @@ async def _web_run_file_conversation(filename: str, content: bytes,
     try:
         update, context, _bot = build_web_mirror_objects(
             BotConfig.AUTHORIZED_USER_ID, outbox, _web_real_bot,
+            channel=telegram_channel(),
         )
 
         async def _sync_to_tg(abs_path: str, file_name: str, file_caption: str) -> None:
@@ -1000,6 +1100,7 @@ async def _web_run_photo_conversation(filename: str, content: bytes,
     try:
         update, context, _bot = build_web_mirror_objects(
             BotConfig.AUTHORIZED_USER_ID, outbox, _web_real_bot,
+            channel=telegram_channel(),
         )
 
         payload = build_photo_multimodal_payload(content, caption, filename)

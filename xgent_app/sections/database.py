@@ -137,6 +137,34 @@ class BotMemoryDB:
             )
         ''')
 
+        # 出站通道的待发库：某个通道（目前只有 telegram）打不通时，投递不出去的
+        # 操作按序落在这里，通道恢复后由 fanout.ChannelWorker 补投。
+        #
+        # 为什么需要它：TG 断连期间网页上照常在对话，如果这些操作只是被丢掉，
+        # Telegram 那一侧就永久缺失这段对话——"三端同步"直接失效。落库之后
+        # 断连多久都能补齐，进程重启也不丢（这是与"内存队列"的关键差别：
+        # PM2 重启一次内存里攒的全没了，而故障期恰恰最容易重启）。
+        #
+        # 与 cli_relay_ops 的分工：那张表跨的是**进程**边界（CLI 进程 → 服务端），
+        # 这张表跨的是**时间**边界（现在发不出去 → 以后补发）。刻意共用同一套
+        # op 名与 payload 形状，避免两处对同一件事有两种序列化格式。
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS channel_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                logical_id INTEGER,
+                chat_id INTEGER,
+                payload TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                created_at REAL NOT NULL
+            )
+        ''')
+        await conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_channel_outbox_channel
+            ON channel_outbox(channel, id)
+        ''')
+
         # 内部兼容索引表（当前单一全局记忆模式下仅保留一条固定记录）
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS chat_sessions (
@@ -609,6 +637,72 @@ class BotMemoryDB:
             return
         async with self._write() as conn:
             await conn.execute('DELETE FROM cli_relay_ops WHERE id <= ?', (int(upto_id),))
+
+    # --- ☆ 出站通道待发库（channel_outbox）☆ ---
+    # 通道打不通时投递不出去的操作落这里，恢复后按 id 升序补投。**必须按 id
+    # 升序取**：先 send_message 拿到 message_id，后续 edit/delete 才有目标，
+    # 乱序补投会让编辑落到不存在的消息上。
+
+    async def append_channel_op(self, channel: str, row: Dict[str, Any]) -> int:
+        async with self._write() as conn:
+            cursor = await conn.execute('''
+                INSERT INTO channel_outbox
+                    (channel, kind, logical_id, chat_id, payload, seq, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                str(channel), str(row.get('kind') or ''),
+                row.get('logical_id'), row.get('chat_id'),
+                str(row.get('payload') or '{}'),
+                int(row.get('seq') or 0), float(row.get('created_at') or time.time()),
+            ))
+            return int(cursor.lastrowid or 0)
+
+    async def fetch_channel_ops(self, channel: str, limit: int = 1000) -> List[Dict]:
+        conn = await self._get_conn()
+        cursor = await conn.execute('''
+            SELECT id, kind, logical_id, chat_id, payload, seq, created_at
+            FROM channel_outbox WHERE channel = ?
+            ORDER BY id ASC LIMIT ?
+        ''', (str(channel), int(limit)))
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def delete_channel_ops(self, row_ids: List[int]) -> None:
+        ids = [int(value) for value in (row_ids or []) if value]
+        if not ids:
+            return
+        async with self._write() as conn:
+            await conn.executemany(
+                'DELETE FROM channel_outbox WHERE id = ?', [(value,) for value in ids])
+
+    async def count_channel_ops(self, channel: str) -> int:
+        conn = await self._get_conn()
+        cursor = await conn.execute(
+            'SELECT COUNT(*) AS total FROM channel_outbox WHERE channel = ?', (str(channel),))
+        row = await cursor.fetchone()
+        return int(row['total'] or 0) if row else 0
+
+    async def purge_stale_channel_ops(self, channel: str, *, max_age_seconds: float,
+                                      max_rows: int) -> int:
+        """给待发库封顶：太旧的、超量的一律丢掉，并返回丢了多少条。
+
+        没有上限的话，一台长期连不上 Telegram 的机器会把这张表涨到几十万行，
+        而三天前某轮对话的流式编辑补发过去只是噪音。
+        """
+        removed = 0
+        async with self._write() as conn:
+            cutoff = time.time() - max(60.0, float(max_age_seconds))
+            cursor = await conn.execute(
+                'DELETE FROM channel_outbox WHERE channel = ? AND created_at < ?',
+                (str(channel), cutoff))
+            removed += int(cursor.rowcount or 0)
+            cursor = await conn.execute('''
+                DELETE FROM channel_outbox WHERE channel = ? AND id NOT IN (
+                    SELECT id FROM channel_outbox WHERE channel = ?
+                    ORDER BY id DESC LIMIT ?
+                )
+            ''', (str(channel), str(channel), max(1, int(max_rows))))
+            removed += int(cursor.rowcount or 0)
+        return removed
 
     async def get_max_global_rowid(self) -> int:
         """global_messages 的最大 rowid，作为增量游标的起点。"""
