@@ -1009,7 +1009,7 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 class WebChatServer:
-    """生命周期封装。start() 由 setup_bot_commands 调，stop() 由 on_shutdown 调。"""
+    """生命周期封装。start() 由 runtime 的 web 组件调，stop() 由 on_shutdown 调。"""
 
     def __init__(self, config: WebChatConfig):
         self.config = config

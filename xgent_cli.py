@@ -1,9 +1,8 @@
 """XGent CLI（本地终端）可执行入口。
 
 不需要 HTTP 服务器、不需要密码认证——本地终端场景下"能跑这个进程"本身就
-是权限凭证，和 xgent_server.py 里 run_web_only_main() 的定位不同（那个是
-给远程浏览器访问设计的，需要密码墙；这里是本地直接跑的进程，没有网络
-暴露面）。
+是权限凭证，和 xgent_server.py 起的 Web 服务定位不同（那个是给远程浏览器
+访问设计的，需要密码墙；这里是本地直接跑的进程，没有网络暴露面）。
 
 这是"验证 process_conversation 抽象接口是否真正解耦 Telegram"这项任务的
 第三个客户端样本：Telegram（真实平台）、Web（鸭子类型垫片，web_bridge.py）
