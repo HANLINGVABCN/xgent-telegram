@@ -410,20 +410,55 @@ async def _web_external_record_watcher() -> None:
             await db.purge_relay_ops(cursor_id)
 
 
+def set_telegram_channel(bot: Optional[Any]) -> None:
+    """登记（或清空）真实 PTB bot 引用——Telegram 通道的唯一开关点。
+
+    只由 runtime.telegram_supervisor 在长轮询真的起来之后调用。**刻意不再从
+    app.bot 顺手取**：Application 一建好 app.bot 就存在了，但那时 get_me() 还
+    没成功，网络可能整个不通。此时把它登记进来会让
+    _web_external_tg_mirror_enabled() 立刻变成 True，于是每一条 CLI 中继操作、
+    每一次 trigger 投递都会去打一个注定超时的 HTTP 请求——TG 断连时网页反而
+    被拖慢。用"通道已就绪"而不是"对象已存在"作为判据。
+
+    就绪之后不因偶发失败清空：那属于"暂时打不通"，由 MirrorBot 的超时+熔断
+    处理；清空会让上层误判成"这台机器没配 Telegram"。
+    """
+    global _web_real_bot
+    _web_real_bot = bot
+
+
+def _notify_owner_soon(text: str) -> None:
+    """尽力给主人发一条 Telegram 通知，但绝不阻塞调用方。
+
+    原先这些通知是 `await app.bot.send_message(...)` 包在 suppress 里——看着
+    无害，实际上 TG 不通时每条要卡满一个 read_timeout（30s）才抛，而调用点正在
+    启动流程中间。改成通道就绪才发、且丢进后台任务。
+    """
+    if _web_real_bot is None:
+        return
+    async def _send() -> None:
+        with contextlib.suppress(Exception):
+            await _web_real_bot.send_message(
+                chat_id=BotConfig.AUTHORIZED_USER_ID, text=text,
+            )
+    with contextlib.suppress(RuntimeError):
+        asyncio.get_running_loop().create_task(_send())
+
+
 async def start_external_sync_watcher(outbox: Any = None, app: Any = None) -> None:
     """启动/接线跨端回放器（CLI 的 bot 操作流 → Telegram + 网页）。
 
     与 Web 服务开关**解耦**：Web 关着时网页帧没有订阅者（put 落空，无害），
-    但 CLI→Telegram 同步仍然要工作，所以它跟随 bot 生命周期而不是 Web
+    但 CLI→Telegram 同步仍然要工作，所以它跟随进程生命周期而不是 Web
     服务生命周期——此前它挂在 start_web_chat_if_enabled 里，Web 一关 CLI 的
     跨端同步就整个停摆。（这也是中继走数据库而不是走 Web 服务 HTTP 接口的
     原因：走 HTTP 会让关掉 Web 的用户直接失去 CLI→Telegram 同步。）
-    outbox 给了就记住（Web 服务启动后把自己的 outbox 接进来），app 给了就
-    刷新真实 bot 引用。
+    outbox 给了就记住（Web 服务启动后把自己的 outbox 接进来）。
+
+    ``app`` 参数保留只为兼容历史调用点，**不再**从它身上取 bot 引用：
+    Telegram 通道由 set_telegram_channel 在真正就绪时单独登记。
     """
-    global _web_external_watch_task, _web_external_outbox, _web_real_bot
-    if app is not None:
-        _web_real_bot = getattr(app, "bot", None)
+    global _web_external_watch_task, _web_external_outbox
     if outbox is not None:
         _web_external_outbox = outbox
     if _web_external_watch_task is None or _web_external_watch_task.done():
@@ -1109,31 +1144,27 @@ def _web_is_busy() -> bool:
 
 
 async def start_web_chat_if_enabled(app: Optional[Any] = None, *, force: bool = False) -> None:
-    """按开关启动 Web 服务。失败只记日志，绝不影响 bot 主流程。
+    """按开关启动 Web 服务。失败只记日志，绝不影响任何其他组件。
 
-    ``app`` 为 None 时代表纯 Web 模式（未配置 BOT_TOKEN，没有 PTB
-    Application）：``_web_real_bot``/``_web_application`` 保持 None，
-    MirrorBot/_web_deliver_file_to_tg 等调用点已原生支持 real_bot=None
-    （纯网页输出，不回灌 Telegram）。
+    ``app`` 只用来记 ``_web_application``（网页里改密码/端口时状态处理器要取
+    ``context.application``）。**不**从它身上取 bot 引用——Telegram 通道由
+    ``set_telegram_channel`` 在真正就绪时登记，见那里的说明。所以本函数在
+    Telegram 完全不通时也能正常跑完。
 
-    ``force=True`` 时跳过 ``web_enabled`` 开关检查——纯 Web 模式下 Web 服务
-    本身就是唯一入口，不应该受“开关默认关闭”影响；密码缺失时也只记日志，
-    不尝试通过 Telegram 通知（可能没有 bot 可用）。
+    ``force=True`` 时跳过 ``web_enabled`` 开关检查——没有 BOT_TOKEN 的部署里
+    Web 本身就是唯一入口，不该受"开关默认关闭"影响。
     """
-    global _web_chat_server, _web_real_bot, _web_application
+    global _web_chat_server, _web_application
     if _web_chat_server is not None:
         return
-    # 跨端同步观察者无论 Web 开不开都要跑（它还承担 CLI→TG 镜像），先启动
-    # 并记下真实 bot；Web 开着时下面再把新服务器的 outbox 接给它。
-    await start_external_sync_watcher(app=app)
+    # 跨端同步观察者无论 Web 开不开都要跑（它还承担 CLI→TG 镜像），先启动；
+    # Web 开着时下面再把新服务器的 outbox 接给它。
+    await start_external_sync_watcher()
     web_on = normalize_bool(UserDataManager.get('web_enabled', False), False)
     term_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
     if not force and not (web_on or term_on):
         return
 
-    # 记下真实 bot，网页发起对话时 MirrorBot 用它把消息同步到 Telegram。
-    # app 为 None（纯 Web 模式）时保持 None，等价于纯网页输出。
-    _web_real_bot = getattr(app, "bot", None)
     # 记下 application：网页触发配置状态（设密码/端口需 restart_web_chat）时，
     # 状态处理器会取 context.application，mirror context 默认没有该属性。
     _web_application = app
@@ -1141,12 +1172,9 @@ async def start_web_chat_if_enabled(app: Optional[Any] = None, *, force: bool = 
     password_hash = await read_web_password_hash()
     if not password_hash:
         logger.warning("Web Chat 已开启但未设置密码，跳过启动")
-        if app is not None:
-            with contextlib.suppress(Exception):
-                await app.bot.send_message(
-                    chat_id=BotConfig.AUTHORIZED_USER_ID,
-                    text="⚠️ Web/终端服务已开启但没有设置密码，未启动。请在 /start → 🌐 Web 里设置密码。",
-                )
+        _notify_owner_soon(
+            "⚠️ Web/终端服务已开启但没有设置密码，未启动。请在 /start → 🌐 Web 里设置密码。"
+        )
         return
 
     config = WebChatConfig(
@@ -1193,12 +1221,7 @@ async def start_web_chat_if_enabled(app: Optional[Any] = None, *, force: bool = 
         await asyncio.to_thread(server.start)
     except Exception as e:
         logger.error(f"Web Chat 启动失败: {e}")
-        if app is not None:
-            with contextlib.suppress(Exception):
-                await app.bot.send_message(
-                    chat_id=BotConfig.AUTHORIZED_USER_ID,
-                    text=f"⚠️ Web Chat 启动失败：{safe_text(str(e)[:200])}",
-                )
+        _notify_owner_soon(f"⚠️ Web Chat 启动失败：{safe_text(str(e)[:200])}")
         return
     _web_chat_server = server
     # 跨端同步观察者已在函数开头启动，这里把新服务器的 outbox 接给它：

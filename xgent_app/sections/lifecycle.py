@@ -76,16 +76,25 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     except Exception:
         pass
 
-# --- ☆ 应用关闭处理 ☆ ---
-async def setup_bot_commands(app):
-    """同步 Telegram 命令菜单，并在启动后发送完整主菜单。"""
-    global _startup_commands_synced, _startup_menu_sent
+# --- ☆ 启动分层：公共地基 / Telegram 就绪之后 ☆ ---
+async def boot_core() -> None:
+    """所有组件共用的地基：配置缓存 + 数据库连接。刻意不碰任何 Telegram 调用。
 
+    这两行原先埋在 PTB 的 post_init（setup_bot_commands）里。post_init 排在
+    Bot.initialize() 的 get_me() 之后，于是 Telegram 不通时连数据库都不会打开，
+    网页、CLI 回放、trigger 全部跟着陪葬。完整因果链见 runtime.py 顶部。
+    """
     await UserDataManager.init()
     await BotMemoryDB.get_instance()
-    await SelfTriggerManager.startup(app)
-    # Web 服务按开关启动；失败只记日志并通知用户，不影响 bot 主流程。
-    await start_web_chat_if_enabled(app)
+
+
+async def telegram_ready(app) -> None:
+    """Telegram 通道真的就绪之后才做的事：同步 /命令 菜单 + 发启动主菜单。
+
+    由 telegram_supervisor 在长轮询起来之后调用。两段各自 try 住：菜单同步失败
+    不影响启动菜单，启动菜单失败也不影响任何别的组件。
+    """
+    global _startup_commands_synced, _startup_menu_sent
 
     if not _startup_commands_synced:
         try:
@@ -189,103 +198,22 @@ async def setup_bot_commands(app):
             # 发送失败也不回滚 flag：避免并发/重连再次触发导致重复发送
             logger.warning(f"启动主菜单发送失败（不再重试，用户可手动 /start）: {e}")
 
-async def on_shutdown_web_only():
-    """纯 Web 模式（无 BOT_TOKEN、无 PTB Application）下的关闭清理。
 
-    与 on_shutdown(app) 做同样的资源清理，但跳过所有 app.bot.* 调用——纯
-    Web 模式下没有 PTB Application。SelfTriggerManager 用自持调度器
-    （不依赖 PTB，见 run_web_only_main 的说明），同样需要在这里关闭，
-    否则退出时 APScheduler 的事件循环任务会随进程硬杀，未跑完的 run
-    全靠下次启动的恢复流程兜底。
+# 纯 Web 模式曾经有一条独立主循环 run_web_only_main()：自己起 Web、自己装信号
+# 处理、自己走一份关闭清理。它与 PTB 模式是两条并行的启动路径，"部署了哪些端"
+# 这件事因此散在两处，任何启停顺序的修改都要改两遍。现在两条路径合并成
+# runtime.run_app() 一条：Telegram 只是其中一个可选组件，没有 BOT_TOKEN 时它
+# 处于 disabled，Web 组件自动按 BotConfig.WEB_ONLY 强制启动，语义完全一致。
+
+
+async def on_shutdown(app: Optional[Any] = None):
+    """应用关闭时清理资源。唯一的停机清理路径。
+
+    ``app`` 只是为了兼容历史调用点，函数体本身不需要它——PTB 的拆卸由
+    runtime.shutdown_components 负责。原先还有一份 on_shutdown_web_only()，
+    与本函数的差别只有 TelegramRichAPI 客户端要不要关，而那个关闭本身是
+    幂等的（下面已判 is_closed）；两份几乎一样的清理代码，改动时必然漏一份。
     """
-    logger.info("🛑 服务正在关闭...")
-    try:
-        await asyncio.to_thread(flush_model_trace)
-    except Exception as e:
-        logger.debug(f"刷新 trace 队列失败: {e}")
-    try:
-        await SelfTriggerManager.shutdown()
-        logger.info("✅ 后台触发任务已关闭")
-    except Exception as e:
-        logger.error(f"关闭后台触发任务失败: {e}")
-    try:
-        await stop_web_chat()
-    except Exception as e:
-        logger.error(f"关闭 Web Chat 失败: {e}")
-    try:
-        AgentShellSessionManager.kill_all()
-        logger.info("✅ Agent shell 会话已关闭")
-    except Exception as e:
-        logger.error(f"关闭 Agent shell 会话失败: {e}")
-    try:
-        db = await BotMemoryDB.get_instance()
-        await db.close()
-        logger.info("✅ 数据库连接已关闭")
-    except Exception as e:
-        logger.error(f"关闭数据库失败: {e}")
-    try:
-        await PortalManager.close_all()
-        logger.info("✅ OpenAI SDK 客户端池已关闭")
-    except Exception as e:
-        logger.error(f"关闭 OpenAI SDK 客户端池失败: {e}")
-    try:
-        await ModelClient.close_http_client()
-        logger.info("✅ 模型 HTTP 连接池已关闭")
-    except Exception as e:
-        logger.error(f"关闭模型 HTTP 连接池失败: {e}")
-
-
-async def run_web_only_main():
-    """纯 Web 模式主循环：未配置 BOT_TOKEN 时的入口，不建 PTB Application。
-
-    对照 setup_bot_commands + app.run_polling 的职责，纯 Web 模式下：
-    - 不跑 run_polling（没有 Telegram 连接）
-    - 不注册 Telegram 命令菜单 / 不发启动菜单消息（没有 chat 可发）
-    - SelfTriggerManager 以 application=None 启动：调度走自持
-      AsyncIOScheduler（不再依赖 PTB job_queue），投递的 MirrorBot 在
-      real_bot=None 下退化为纯网页输出——纯 Web 模式与 PTB 模式同样
-      支持 trigger 任务（v1 的已知限制就此关闭）。放在 Web 服务起来
-      之后：startup 补投未送达结果时用的才是真实的网页 outbox。
-    - Web 服务是唯一入口，强制启动（force=True，不受 web_enabled 开关影响）
-    """
-    await UserDataManager.init()
-    await BotMemoryDB.get_instance()
-
-    await start_web_chat_if_enabled(None, force=True)
-    if not is_web_chat_running():
-        logger.critical("❌ 纯 Web 模式启动失败：请确认已设置 Web 访问密码后重试。")
-        # sys.exit() 只抛 SystemExit，不会关掉 aiosqlite 内部起的非 daemon
-        # 工作线程——不先清理就退出，进程会卡成僵尸（日志打完却真的退不
-        # 出去，PM2 也看不出异常，仍显示"online"）。必须先走一遍关闭清理。
-        await on_shutdown_web_only()
-        sys.exit(1)
-
-    await SelfTriggerManager.startup(None)
-
-    port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
-    logger.info("=" * 50)
-    logger.info("XGent Web (standalone) ready.")
-    logger.info(f"监听地址：http://{DEFAULT_WEB_HOST}:{port}")
-    logger.info("=" * 50)
-
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        with contextlib.suppress(NotImplementedError):
-            # Windows 的 ProactorEventLoop 不支持 add_signal_handler；
-            # 退化为 KeyboardInterrupt（Ctrl+C 仍能正常触发下面的 except 分支）。
-            loop.add_signal_handler(sig, stop_event.set)
-
-    try:
-        await stop_event.wait()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        await on_shutdown_web_only()
-
-
-async def on_shutdown(app):
-    """应用关闭时清理资源"""
     logger.info("🛑 服务正在关闭...")
     try:
         # trace 现在是后台线程异步落盘，退出前把队列里剩下的写完。
