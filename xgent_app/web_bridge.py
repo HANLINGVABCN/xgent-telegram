@@ -13,7 +13,6 @@ shell_triggers.py 里的 _SelfTriggerUpdate / _SelfTriggerContext 已经用同�
 
 from __future__ import annotations
 
-import asyncio
 import collections
 import contextlib
 import logging
@@ -425,79 +424,6 @@ class WebContext:
         self.args: List[str] = []
 
 
-class TgCircuitBreaker:
-    """进程级 Telegram 可达性熔断器。
-
-    为什么需要：MirrorBot 把每次输出都同步镜像给真实 Telegram（一轮流式回复
-    有几百次 edit）。TG 不可达时每次调用都要等满 read_timeout（30s），一轮
-    对话拖成小时级，_conversation_processing_lock 长期被占，网页端全部 409。
-
-    规则：连续 failure_threshold 次失败 → open，cooldown 秒内所有 TG 调用
-    直接跳过（网页帧照发，对话不被拖慢）；cooldown 过后 half-open 放一个
-    调用试探，成功则恢复（closed），失败则重新 open。所有 MirrorBot 实例
-    共享——TG 可达性是进程级状态。调用点都在事件循环线程，加锁是防御性的。
-    """
-
-    def __init__(self, failure_threshold: int = 3, cooldown: float = 60.0):
-        self.failure_threshold = failure_threshold
-        self.cooldown = cooldown
-        self._failure_count = 0
-        self._state = "closed"  # closed / half-open / open
-        self._last_failure_time = 0.0
-        self._skipped = 0
-        self._lock = threading.Lock()
-
-    def allow(self) -> bool:
-        """这次调用放不放行。open 且未到 cooldown 时拒绝并累计 skipped。"""
-        with self._lock:
-            if self._state == "open":
-                if time.time() - self._last_failure_time > self.cooldown:
-                    self._state = "half-open"
-                    return True
-                self._skipped += 1
-                return False
-            return True
-
-    def record_success(self) -> int:
-        """记一次成功。若这是断流后的首次成功，返回断连期间跳过的操作数（>0），
-        否则返回 0——调用方据此补发一条"连接恢复"汇总提示。"""
-        with self._lock:
-            self._failure_count = 0
-            if self._state == "half-open":
-                self._state = "closed"
-                skipped, self._skipped = self._skipped, 0
-                return skipped
-            return 0
-
-    def record_failure(self) -> None:
-        """记一次失败。连续达到阈值时 open 并告警一次。"""
-        with self._lock:
-            self._failure_count += 1
-            self._last_failure_time = time.time()
-            if self._state == "half-open" or self._failure_count >= self.failure_threshold:
-                self._state = "open"
-                self._failure_count = 0
-                logger.warning(
-                    "Telegram 连接熔断（连续 %d 次镜像失败），%.0fs 内跳过 TG 镜像，"
-                    "网页/CLI 对话不受影响",
-                    self.failure_threshold, self.cooldown,
-                )
-
-    def reset(self) -> None:
-        """测试用：回到全新 closed 状态。"""
-        with self._lock:
-            self._failure_count = 0
-            self._state = "closed"
-            self._last_failure_time = 0.0
-            self._skipped = 0
-
-
-_TG_CIRCUIT = TgCircuitBreaker()
-# 文本类镜像操作（send/edit/delete）的兜底超时：正常 RTT 0.1-0.3s，超过 15s
-# 基本就是网络不通，没必要陪它等满 PTB 默认的 30s read_timeout。
-_MIRROR_TG_CALL_TIMEOUT = 15.0
-
-
 class MirrorBot:
     """双通道输出 Bot：每次发送既推帧给网页（SSE），又发给真实 Telegram bot。
 
@@ -581,55 +507,11 @@ class MirrorBot:
     async def _tg_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         if self.real_bot is None:
             return None
-        # 熔断打开期间直接跳过：TG 不可达时每次镜像都要等满超时，一轮流式
-        # 回复几百次 edit 会把对话锁拖住数小时（网页端全部 409 的根因）。
-        if not _TG_CIRCUIT.allow():
-            return None
         try:
-            coro = getattr(self.real_bot, method)(*args, **kwargs)
-        except AttributeError:
-            # 方法本身不存在（垫片 bot 没实现全量 PTB 接口）：编程问题而非
-            # TG 不可达，不计入熔断——误开闸会让正常的镜像被跳过。
-            logger.warning("MirrorBot Telegram 缺少方法 %s", method)
-            return None
-        try:
-            if method in ("send_document", "send_photo"):
-                # 文件上传耗时与体积相关（idle.py 侧已传 read/write_timeout=120），
-                # 不套 wait_for，靠 PTB 自身超时 + 熔断计数兜底。
-                result = await coro
-            else:
-                result = await asyncio.wait_for(coro, timeout=_MIRROR_TG_CALL_TIMEOUT)
-            skipped = _TG_CIRCUIT.record_success()
-            if skipped:
-                asyncio.create_task(self._send_tg_recovery_notice(skipped))
-            return result
-        except asyncio.TimeoutError:
-            _TG_CIRCUIT.record_failure()
-            logger.warning("MirrorBot Telegram %s 超时(%.0fs)", method, _MIRROR_TG_CALL_TIMEOUT)
-            return None
+            return await getattr(self.real_bot, method)(*args, **kwargs)
         except Exception as exc:  # noqa: BLE001 —— 刻意宽，TG 失败不能拖垮网页
-            # PTB 的 TimedOut 是 TelegramError 子类，也走这里，同样计入熔断。
-            _TG_CIRCUIT.record_failure()
             logger.warning("MirrorBot Telegram %s 失败: %s", method, exc)
             return None
-
-    async def _send_tg_recovery_notice(self, skipped: int) -> None:
-        """熔断恢复后补发一条汇总提示。用 self.chat_id/self.real_bot，不 import
-        sections 的 BotConfig（本模块保持可独立 import 和单测）。
-
-        断连期间的操作流不重放：文件句柄早已关闭、流式中间帧无意义，补发必然
-        错乱——完整对话历史在数据库里，/getchat 或网页刷新可见。
-        """
-        if self.real_bot is None:
-            return
-        try:
-            await self.real_bot.send_message(
-                chat_id=self.chat_id,
-                text=(f"🔌 Telegram 连接恢复。断连期间约有 {skipped} 条消息未镜像，"
-                      f"完整记录见对话历史（/getchat 或网页端）。"),
-            )
-        except Exception:
-            logger.debug("发送 TG 恢复提示失败", exc_info=True)
 
     async def send_message(self, chat_id: Optional[int] = None, text: str = "",
                            reply_markup: Any = None, parse_mode: Any = None,

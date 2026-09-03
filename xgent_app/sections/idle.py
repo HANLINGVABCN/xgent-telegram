@@ -806,11 +806,6 @@ async def _web_deliver_file_to_tg(abs_path: str, filename: str, caption: str) ->
     """
     if _web_real_bot is None:
         return  # 纯网页模式，无 TG 可同步
-    # 熔断打开期间跳过：TG 不可达时别让这份同步去等满 120s 超时。跨端同步的
-    # 本体（网页对话）不受影响，TG 恢复后由 MirrorBot 的恢复提示兜底告知。
-    from xgent_app.web_bridge import _TG_CIRCUIT
-    if not _TG_CIRCUIT.allow():
-        return
 
     chat_id = BotConfig.AUTHORIZED_USER_ID
     # 发到 TG 的 caption 带 [网页] 标记，与网页文本消息的镜像标记一致，

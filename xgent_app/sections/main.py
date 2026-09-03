@@ -124,24 +124,7 @@ if __name__ == '__main__':
         logger.info("Features: Async SQLite | Fast Stream | Correct Storage")
         logger.info("=" * 50)
         
-        # Web 必须先于 Telegram 启动：post_init 要等 initialize()（连 TG）成功才跑，
-        # TG 不可达时 Web 若挂在 post_init 里就永远起不来（Nginx 502 的根因）。
-        # 这里用与 PTB __run（_application.py L1029-1036）完全相同的取 loop 方式，
-        # 保证 run_polling 复用同一个 loop —— bootstrap 无限重试期间事件循环正常
-        # 调度，Web 的 run_coroutine_threadsafe 投递不受影响，页面照常服务。
-        # post_init 里的 start_web_chat_if_enabled 有幂等保护，重复调用无害。
-        try:
-            _loop = asyncio.get_event_loop()
-        except RuntimeError:
-            _loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(_loop)
-        _loop.run_until_complete(start_web_chat_if_enabled(app))
-        try:
-            # bootstrap_retries=-1 = 无限重试（间隔 1s）：TG 恢复后自动继续，
-            # 进程不再因 initialize() 超时而崩溃-重启循环。
-            app.run_polling(bootstrap_retries=-1)
-        finally:
-            _loop.close()
+        app.run_polling()
 
     except InvalidToken:
         logger.critical("Telegram Bot Token 无效或已失效，请检查 .env 中的 BOT_TOKEN。")
