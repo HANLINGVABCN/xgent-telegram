@@ -396,6 +396,11 @@ class WebServerHttpTests(unittest.TestCase):
             write_setting=write_setting,
             request_stop=lambda: cls.stopped.append(True),
             is_busy=lambda: cls.busy["value"],
+            read_health=lambda: {
+                "components": {"telegram": {"state": "degraded"}},
+                "channels": {"telegram": {"queued": 3, "circuit": "open"}},
+                "version": "abc1234",
+            },
         )
         cls.server = WebChatServer(cls.config)
         cls.server.start()
@@ -443,9 +448,29 @@ class WebServerHttpTests(unittest.TestCase):
             self.assertIn(b"XGent Web Chat", resp.read())
 
     def test_api_requires_auth(self):
-        for path in ("/api/history", "/api/config", "/api/stream"):
+        for path in ("/api/history", "/api/config", "/api/stream", "/api/health"):
             status, _body, _h = self.request(path)
             self.assertEqual(401, status, path)
+
+    def test_liveness_probe_is_unauthenticated_and_leaks_nothing(self):
+        """/healthz 给 nginx/PM2 探活用：不鉴权，但也**只**回一个 ok。
+
+        有它才能一眼分清"进程死了"（连不上）和"进程活着但 Telegram 断了"
+        （200 + /api/health 里 telegram=degraded）——那次 502 缺的就是这个。
+        降级细节属于侦查情报，留在需要鉴权的 /api/health 里。
+        """
+        status, body, _h = self.request("/healthz")
+        self.assertEqual(200, status)
+        self.assertEqual({"ok": True}, body)
+
+    def test_health_details_require_auth_and_report_per_channel_state(self):
+        cookie = self.login()
+        status, body, _h = self.request("/api/health", cookie=cookie)
+        self.assertEqual(200, status)
+        self.assertEqual("degraded", body["components"]["telegram"]["state"])
+        self.assertEqual("open", body["channels"]["telegram"]["circuit"])
+        self.assertEqual(3, body["channels"]["telegram"]["queued"])
+        self.assertEqual("abc1234", body["version"])
 
     def test_chat_requires_auth(self):
         status, _body, _h = self.request("/api/chat", method="POST", body={"text": "x"})

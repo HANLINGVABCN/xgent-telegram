@@ -283,6 +283,25 @@ def telegram_channel_stats() -> Dict[str, Any]:
     return worker.stats() if worker is not None else {"configured": False}
 
 
+def mirror_user_line_to_telegram(text: str) -> None:
+    """把用户在网页/CLI 里说的那句话镜像到 Telegram。同步、非阻塞。
+
+    走出站通道而不是直接 await：原先两处都是 `await _web_real_bot.send_message(...)`
+    包在 suppress 里，TG 不通时每条要等满 read_timeout（30s）才继续——而这一步正好
+    在"发起一轮对话"的最前面，用户看到的就是点了发送之后半分钟毫无反应。
+    走通道之后它还顺便变成可持久重放的：断连期间说的话，恢复后照样补到 Telegram。
+
+    只发 Telegram，不推网页帧：用户自己那条气泡网页早就画出来了。
+    """
+    if _web_real_bot is None:
+        return
+    channel = telegram_channel()
+    channel.ensure_started()
+    for chunk in split_text_for_telegram(text):
+        channel.offer(Op(OP_SEND, chat_id=BotConfig.AUTHORIZED_USER_ID,
+                         payload={"text": chunk}))
+
+
 # 每个 CLI 会话一个 MirrorBot。它持有 CLI 的 message_id -> 真实 Telegram
 # message_id 的映射，回放 edit/delete 时靠它定位目标消息；丢了映射，流式回复
 # 的每一次编辑都会变成新发一条消息（历史上的"无限刷屏"）。
@@ -341,16 +360,10 @@ async def _replay_relay_op(mirror: Any, op: str, payload: Dict[str, Any]) -> Non
         text = str(payload.get('text') or '')
         if not text:
             return
-        # 唯一加来源标识的地方。走 mirror.real_bot 而不是模块级 _web_real_bot：
-        # 前者已经按 Telegram 通道开关取过值，关掉时这里自然跳过。
+        # 唯一加来源标识的地方。走出站通道（非阻塞 + 断连可补投），而不是直接
+        # await 真实 bot——那样 TG 不通时每条都要等满一个超时，把整条回放流拖住。
         if mirror.real_bot is not None:
-            for chunk in split_text_for_telegram(f"🖥 [CLI]\n{text}"):
-                try:
-                    await mirror.real_bot.send_message(
-                        chat_id=BotConfig.AUTHORIZED_USER_ID, text=chunk,
-                    )
-                except Exception:
-                    logger.warning("CLI 用户消息同步到 Telegram 失败", exc_info=True)
+            mirror_user_line_to_telegram(f"🖥 [CLI]\n{text}")
         outbox = _web_external_outbox
         if outbox is not None:
             # user_message 帧让网页渲染成用户气泡（右侧），而不是 AI 气泡。
@@ -817,13 +830,9 @@ async def _web_run_conversation(text: str, outbox: Any) -> None:
             outbox.put({"type": "turn_end"})
         return
     try:
-        # 先把用户消息镜像到 Telegram，再记录到记忆、跑对话。
-        if _web_real_bot is not None:
-            with contextlib.suppress(Exception):
-                await _web_real_bot.send_message(
-                    chat_id=BotConfig.AUTHORIZED_USER_ID,
-                    text=f"💬 [网页]\n{text}",
-                )
+        # 先把用户消息镜像到 Telegram，再记录到记忆、跑对话。走出站通道：非阻塞，
+        # 且 TG 断连期间说的话恢复后会补投过去。
+        mirror_user_line_to_telegram(f"💬 [网页]\n{text}")
         await GlobalRecorder.record_user_message(
             text, MessageType.USER_TEXT, BotConfig.AUTHORIZED_USER_ID
         )
@@ -940,6 +949,20 @@ async def _web_deliver_file_to_tg(abs_path: str, filename: str, caption: str) ->
     """
     if _web_real_bot is None:
         return  # 纯网页模式，无 TG 可同步
+
+    # 这条路径刻意绕过出站通道（要处理 file:// 容器路径与硬链清理），所以必须
+    # 自己看一眼熔断状态：这里的上传超时最高开到 1800s，通道明摆着不通时还硬试
+    # 一次，会把整轮网页对话拖住半小时。
+    if telegram_channel().is_open():
+        logger.info("Telegram 通道熔断中，跳过网页文件同步: %s", filename)
+        server_obj = _web_chat_server
+        if server_obj is not None:
+            server_obj.outbox.put({
+                "type": "message",
+                "text": f"⚠️ Telegram 暂时连不上，文件 {filename} 未同步到 Telegram（网页侧已正常处理）。",
+                "ts": time.time(),
+            })
+        return
 
     chat_id = BotConfig.AUTHORIZED_USER_ID
     # 发到 TG 的 caption 带 [网页] 标记，与网页文本消息的镜像标记一致，
@@ -1299,6 +1322,9 @@ async def start_web_chat_if_enabled(app: Optional[Any] = None, *, force: bool = 
         read_history=_web_read_history,
         read_settings=_web_read_settings,
         write_setting=_web_write_setting,
+        # 分通道健康详情。同步回调（runtime.runtime_health 不 await 任何东西）：
+        # 这个接口最需要被用到的时刻，正是事件循环或某个通道出问题的时刻。
+        read_health=runtime_health,
         request_stop=_web_request_stop,
         is_busy=_web_is_busy,
         is_terminal_enabled=lambda: normalize_bool(UserDataManager.get('terminal_enabled', False), False),

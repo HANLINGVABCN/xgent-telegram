@@ -96,6 +96,32 @@ def any_component_degraded() -> bool:
     )
 
 
+def runtime_health() -> Dict[str, Any]:
+    """GET /api/health 的载荷。**同步**，且刻意不 await 任何东西。
+
+    这个接口存在的全部意义是"事件循环忙住、某个通道断了的时候也能问出状态"。
+    如果它自己要 run_coroutine_threadsafe 回循环里排队，那正好在最需要它的时候
+    答不上话——那次 502 就是这样：没有任何接口能区分"进程死了"和"进程活着但
+    Telegram 断了"。
+    """
+    return {
+        "components": component_health(),
+        "channels": get_channel_registry().stats(),
+        "conversation": {
+            # 三端共用一个对话（这是逐条同步能成立的前提），所以"忙"是全局的。
+            "busy": _conversation_processing_lock.locked(),
+        },
+        "surfaces": {
+            "telegram_configured": bool(BotConfig.TOKEN),
+            "telegram_channel_open": _web_external_tg_mirror_enabled(),
+            "web_running": is_web_chat_running(),
+            "cli_relay_running": bool(
+                _web_external_watch_task is not None and not _web_external_watch_task.done()),
+        },
+        "version": runtime_code_version(),
+    }
+
+
 # 进程级停机信号。信号处理器、致命错误、组件内部的 sys.exit 需求全部收敛到
 # 这一个 Event 上——只有一条停机路径，就只有一份关闭清理代码。
 _app_stop_event: Optional[asyncio.Event] = None

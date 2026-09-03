@@ -31,6 +31,8 @@ from xgent_app.web_bridge import (
 )
 from xgent_app.fanout import (
     ChannelWorker,
+    Op,
+    OP_SEND,
     get_channel_registry,
 )
 from xgent_app.web_server import WebChatConfig, WebChatServer

@@ -102,6 +102,11 @@ async def main():
         "tg_mirror_gate_closed": ns["_web_external_tg_mirror_enabled"]() is False,
         "process_alive": not task.done(),
     }
+    health = ns["runtime_health"]()
+    payload["health_telegram"] = health["components"]["telegram"]["state"]
+    payload["health_web_running"] = health["surfaces"]["web_running"]
+    payload["health_relay_running"] = health["surfaces"]["cli_relay_running"]
+    payload["health_has_channel"] = "telegram" in health["channels"]
     ns["request_app_stop"]()
     payload["exit_code"] = await asyncio.wait_for(task, timeout=30)
     print(json.dumps(payload))
@@ -123,6 +128,12 @@ asyncio.run(main())
                         "注定超时的 TG 请求拖慢")
         self.assertTrue(result["tg_mirror_gate_closed"])
         self.assertTrue(result["process_alive"], "进程不许因为 TG 连不上而退出")
+        self.assertEqual("degraded", result["health_telegram"],
+                         "/api/health 必须能区分'进程死了'和'进程活着但 TG 断了'"
+                         "——那次 502 缺的正是这个可观测性")
+        self.assertTrue(result["health_web_running"])
+        self.assertTrue(result["health_relay_running"])
+        self.assertTrue(result["health_has_channel"], "出站通道要出现在健康快照里")
         self.assertEqual(0, result["exit_code"])
 
     def test_invalid_token_still_exits_78(self):

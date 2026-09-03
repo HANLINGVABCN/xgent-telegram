@@ -716,6 +716,15 @@ class ChannelWorker:
         if native is not None:
             self._logical.pop(native, None)
 
+    def is_open(self) -> bool:
+        """熔断是否处于开闸状态（只读，不像 allow() 那样有副作用）。
+
+        给"绕过通道、自己直接 await 一次 Telegram 调用"的少数路径用：
+        idle._web_deliver_file_to_tg 的上传超时最高开到 1800s，通道明摆着不通时
+        还硬试一次，会把整轮网页对话拖住半小时。
+        """
+        return self._breaker.state == CIRCUIT_OPEN
+
     def logical_for_native(self, native_id: Optional[int]) -> Optional[int]:
         """原生 id -> logical_id 的反查；没记录返回 None。"""
         if native_id is None:

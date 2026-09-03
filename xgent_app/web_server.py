@@ -95,6 +95,7 @@ class WebChatConfig:
         is_terminal_enabled: Optional[Callable[[], bool]] = None,
         is_web_enabled: Optional[Callable[[], bool]] = None,
         media_allowed_roots: Optional[List[str]] = None,
+        read_health: Optional[Callable[[], Any]] = None,
     ):
         self.host = host
         self.port = port
@@ -119,6 +120,10 @@ class WebChatConfig:
         # agent workspace 这类"本应用自己的数据目录"）。由 sections 侧组装
         # 传入：web_server 不 import sections，保持可独立单测的约定。
         self.media_allowed_roots = [str(r) for r in (media_allowed_roots or [])]
+        # 分通道健康快照（GET /api/health，需鉴权）。同步回调、不碰事件循环：
+        # 这个接口存在的意义就是"事件循环忙住时也能问出状态"，把它做成
+        # run_coroutine_threadsafe 就白搭了。
+        self.read_health = read_health or (lambda: {})
         self.read_history = read_history
         self.read_settings = read_settings
         self.write_setting = write_setting
@@ -338,6 +343,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._handle_media_download(path[len("/api/media/"):])
             elif path == "/api/session":
                 self._send_json({"authenticated": self._is_authenticated()})
+            elif path == "/healthz":
+                self._handle_liveness()
+            elif path == "/api/health":
+                self._handle_health()
             elif path == "/api/history":
                 self._handle_history()
             elif path == "/api/config":
@@ -506,6 +515,33 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def _handle_logout(self) -> None:
         self._send_json({"ok": True}, extra_headers={"Set-Cookie": web_auth.build_clear_cookie()})
+
+    def _handle_liveness(self) -> None:
+        """GET /healthz —— 不鉴权，只回 {"ok": true}。
+
+        给 nginx / PM2 / 外部探针用。**刻意什么都不暴露**：降级状态属于侦查
+        情报，探活只需要区分"端口通不通"。这个接口本身就是那次 502 缺失的东西
+        ——有它就能一眼分清"进程死了"和"进程活着但 TG 断了"。
+
+        必须是同步的、不碰事件循环：探活在循环忙住时也得能回答。
+        """
+        self._send_json({"ok": True})
+
+    def _handle_health(self) -> None:
+        """GET /api/health —— 需鉴权的分通道健康详情。
+
+        与 /healthz 分开是刻意的：队列深度、熔断状态、待发条数会告诉未登录的
+        探测者"这台机器正在瘸腿"，属于侦查情报。错误串在 sections 侧已过
+        redact_sensitive_text（provider 报错里带 key）。
+        """
+        if not self._require_auth():
+            return
+        try:
+            payload = self.config.read_health() or {}
+        except Exception:  # noqa: BLE001 —— 健康接口自己不能把 500 抛出去
+            logger.exception("读取健康状态失败")
+            payload = {"error": "health unavailable"}
+        self._send_json(payload)
 
     def _handle_history(self) -> None:
         if not self._require_auth():
