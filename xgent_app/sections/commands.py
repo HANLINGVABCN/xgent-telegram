@@ -481,6 +481,7 @@ async def apply_provider_config_import(
 
     restored_defaults: List[str] = []
     skipped_defaults: List[str] = []
+    cleared_dangling: List[str] = []
 
     if mode == 'replace':
         for target in ('chat', 'media'):
@@ -494,6 +495,30 @@ async def apply_provider_config_import(
         # 模型，上游 502 unknown provider）。之后 restore_target 若恢复
         # 成功会再同步成新模型。
         await sync_chat_session_model(None)
+    else:
+        # merge 不删提供商，但同名被覆盖后模型列表可能换血：钉在全局/会话
+        # 上的旧模型名立刻悬空（发消息 → 拿新通道请求一个不存在的模型，
+        # 上游 502）。清掉并汇报，让用户重选——自动挑新列表里的第一个
+        # 模型是替用户做主，不干。得在 restore_target 之前跑，导入包里
+        # 带有效 defaults 时可以立刻接上。models 为空的通配型提供商视为
+        # 始终有效，不清。
+        for target in ('chat', 'media'):
+            meta = get_model_target_meta(target)
+            provider_name = UserDataManager.get(meta['provider_state_key'])
+            if provider_name is None:
+                continue  # 本来就没选，无从悬空
+            model_name = UserDataManager.get(meta['model_state_key'])
+            provider = merged.get(provider_name)
+            models = (provider or {}).get('models') or []
+            if provider is not None and (not models or model_name in models):
+                continue  # 选择仍有效
+            UserDataManager.set(meta['provider_state_key'], None)
+            UserDataManager.set(meta['model_state_key'], None)
+            await UserDataManager.save_config(meta['provider_config_key'], None)
+            await UserDataManager.save_config(meta['model_config_key'], None)
+            if target == 'chat':
+                await sync_chat_session_model(None)
+            cleared_dangling.append(get_model_target_label(target))
 
     async def restore_target(target: str, provider_field: str, model_field: str, label: str):
         if provider_field not in defaults and model_field not in defaults:
@@ -529,7 +554,8 @@ async def apply_provider_config_import(
         'overwritten': overwritten,
         'removed': removed,
         'restored_defaults': restored_defaults,
-        'skipped_defaults': skipped_defaults
+        'skipped_defaults': skipped_defaults,
+        'cleared_dangling': cleared_dangling
     }
 
 

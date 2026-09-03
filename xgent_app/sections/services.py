@@ -741,6 +741,40 @@ async def sync_chat_session_model(model_name: Optional[str]) -> None:
     await db.update_session(cid, model=model_name)
 
 
+def resolve_effective_chat_model(
+        session_model: Optional[str], default_model: Optional[str],
+        provider_data: Optional[Dict]) -> Optional[str]:
+    """按发消息的取值顺序解析实际模型，并对悬空绑定做防御性回退。
+
+    取值顺序（messages.py 的契约）：会话绑定 chat_sessions.model 优先，
+    没有才回退全局 default_model。两层都可能因配置变更（导入/换线）残留
+    旧模型名，模型不在当前提供商列表时：
+
+    - 全局默认仍有效 → 回退全局默认（与前台显示一致），记 warning；
+    - 全局默认也失效 → 返回 None。调用方按"未配置模型"提示用户重选，
+      绝不能拿一个必然 502 的旧模型名发出去——那只会把错误藏进上游
+      日志，用户看到的是一段莫名其妙的失败。
+
+    models 为空的提供商（通配转发型）不做此校验，原样返回。
+    纯函数（不读全局状态），便于直接单测。
+    """
+    model = session_model or default_model
+    available_models = (provider_data or {}).get('models') or []
+    if available_models and model and model not in available_models:
+        if default_model in available_models:
+            logger.warning(
+                "会话绑定模型 %s 不在当前提供商的列表里，回退默认模型 %s",
+                model, default_model,
+            )
+            return default_model
+        logger.warning(
+            "会话绑定模型 %s 与默认模型 %s 均不在当前提供商的列表里，按未配置模型处理",
+            model, default_model,
+        )
+        return None
+    return model
+
+
 def classify_provider_mode(api_format: str, base_url: str) -> str:
     normalized_format = (api_format or 'openai').lower()
     normalized_url = (base_url or '').lower()
