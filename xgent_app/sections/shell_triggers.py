@@ -315,12 +315,21 @@ class AgentShellSession:
                 self.read_index = max(0, self.read_index - overflow)
 
     def _read_pty_loop(self):
-        if self.controller_fd is None:
+        # fd 只抓一次。原先每轮循环都重新读 self.controller_fd，而 close() 在
+        # 另一个线程上是"先 os.close、再把属性置 None"——只要 close() 插在
+        # "上一轮 read 返回数据"与"下一轮取属性"之间，这里就会拿到 None，
+        # os.read(None, 4096) 抛 TypeError，而它不是 OSError、接不住，异常直接
+        # 逃出守护线程，在 pm2 日志里留下一段假警报的 traceback。
+        # 更实际的隐患是 fd 复用：属性每轮重取，一旦 close() 关掉 fd N、内核随后
+        # 把 N 分给别的文件，下一轮就会去读一个毫不相干的 fd。抓成局部量之后，
+        # 关闭的失败模式固定成 os.read 抛 EBADF → break。
+        fd = self.controller_fd
+        if fd is None:
             raise RuntimeError("PTY 读取线程启动时 controller_fd 为空")
         while True:
             try:
-                chunk = os.read(self.controller_fd, 4096)
-            except OSError:
+                chunk = os.read(fd, 4096)
+            except (OSError, ValueError):
                 break
             if not chunk:
                 break
@@ -333,7 +342,7 @@ class AgentShellSession:
         while True:
             try:
                 chunk = os.read(fd, 4096)
-            except OSError:
+            except (OSError, ValueError):
                 break
             if not chunk:
                 break
