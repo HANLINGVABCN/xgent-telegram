@@ -20,10 +20,13 @@ LEGACY_PM2_APP_NAME="telegram-ai-bot"
 LEGACY_APP_ENTRY="bot_server.py"
 STATE_DIR="$SCRIPT_DIR/.install-state"
 APT_STATE_FILE="$STATE_DIR/apt-packages.txt"
-IP_MODE_FILE="$STATE_DIR/ip-mode"
 RUNTIME_MODE_FILE="$STATE_DIR/runtime-mode"
+# 上次装依赖时 requirements.txt 的原样副本。重启路径靠它判断还要不要再联网装一遍。
+REQUIREMENTS_SNAPSHOT="$STATE_DIR/requirements.installed"
 APT_UPDATED=0
 SKIP_CONFIRM=0
+# ensure_virtualenv 这一次有没有真的新建/重建 venv。
+VENV_CREATED=0
 
 # ensure_python 挑出来的解释器绝对路径。空串代表还没挑过。
 PYTHON_BIN=""
@@ -73,19 +76,15 @@ ensure_state_dir() {
 }
 
 migrate_env_key() {
-    local old_key="$1" new_key="$2" old_value="" new_value="" selected_value="" tmp_file
+    local old_key="$1" new_key="$2" old_value="" new_value=""
     [ -f ".env" ] || return 0
 
-    old_value="$(grep -E "^${old_key}=" .env 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+    old_value="$(env_get "$old_key")"
     [ -n "$old_value" ] || return 0
-    new_value="$(grep -E "^${new_key}=" .env 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
-    selected_value="${new_value:-$old_value}"
+    new_value="$(env_get "$new_key")"
 
-    tmp_file="$(mktemp)"
-    grep -vE "^(${old_key}|${new_key})=" .env > "$tmp_file" || true
-    printf '%s=%s\n' "$new_key" "$selected_value" >> "$tmp_file"
-    mv "$tmp_file" .env
-    chmod 600 .env 2>/dev/null || true
+    env_unset "$old_key"
+    env_set "$new_key" "${new_value:-$old_value}"
     success "已迁移 .env 配置: ${old_key} -> ${new_key}"
 }
 
@@ -107,9 +106,9 @@ migrate_legacy_installation() {
 get_ip_mode() {
     local mode=""
 
-    if [ -f ".env" ]; then
-        mode="$(grep -E "^(XGENT_IP_MODE|TELEGRAM_AI_BOT_IP_MODE)=" .env 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '[:space:]' || true)"
-    fi
+    mode="$(env_get XGENT_IP_MODE)"
+    [ -n "$mode" ] || mode="$(env_get TELEGRAM_AI_BOT_IP_MODE)"
+    mode="$(printf '%s' "$mode" | tr -d '[:space:]')"
 
     case "$mode" in
         ipv4|ipv6|sock5)
@@ -123,9 +122,10 @@ get_ip_mode() {
 
 # 读取 SOCKS5 代理地址（仅当 IP 模式为 sock5 时有效）
 get_socks5_proxy() {
-    if [ -f ".env" ]; then
-        grep -E "^(XGENT_SOCKS5_PROXY|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env 2>/dev/null | tail -n 1 | cut -d= -f2- || true
-    fi
+    local url
+    url="$(env_get XGENT_SOCKS5_PROXY)"
+    [ -n "$url" ] || url="$(env_get TELEGRAM_AI_BOT_SOCKS5_PROXY)"
+    printf '%s\n' "$url"
 }
 
 ip_mode_label() {
@@ -149,7 +149,7 @@ ip_mode_label() {
 # 不依赖 .install-state/deploy-mode——那个文件是同步出来的副本，单独读它会在
 # "刚手动往 .env 填了 Token 但还没跑过安装流程"时显示过期的模式。
 deploy_mode_label() {
-    if [ -f ".env" ] && [ -n "$(local_api_env_value BOT_TOKEN)" ]; then
+    if [ -f ".env" ] && [ -n "$(env_get BOT_TOKEN)" ]; then
         printf 'Telegram + Web'
     else
         printf '仅 Web'
@@ -162,39 +162,25 @@ deploy_mode_label() {
 set_ip_mode() {
     local mode="$1"
     local socks5_url="${2:-}"
-    local tmp_file
+    local ip_keys=(XGENT_IP_MODE XGENT_SOCKS5_PROXY
+                   TELEGRAM_AI_BOT_IP_MODE TELEGRAM_AI_BOT_SOCKS5_PROXY)
 
     case "$mode" in
         ipv4|ipv6)
-            tmp_file="$(mktemp)"
-            if [ -f ".env" ]; then
-                grep -vE "^(XGENT_IP_MODE|XGENT_SOCKS5_PROXY|TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env > "$tmp_file" || true
-            fi
-            printf 'XGENT_IP_MODE=%s\n' "$mode" >> "$tmp_file"
-            mv "$tmp_file" .env
-            chmod 600 .env 2>/dev/null || true
+            env_unset "${ip_keys[@]}"
+            env_set XGENT_IP_MODE "$mode"
             ;;
         sock5)
             if [ -z "$socks5_url" ]; then
                 error "[错误] SOCKS5 模式需要提供代理地址"
                 exit 1
             fi
-            tmp_file="$(mktemp)"
-            if [ -f ".env" ]; then
-                grep -vE "^(XGENT_IP_MODE|XGENT_SOCKS5_PROXY|TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env > "$tmp_file" || true
-            fi
-            printf 'XGENT_IP_MODE=%s\n' "$mode" >> "$tmp_file"
-            printf 'XGENT_SOCKS5_PROXY=%s\n' "$socks5_url" >> "$tmp_file"
-            mv "$tmp_file" .env
-            chmod 600 .env 2>/dev/null || true
+            env_unset "${ip_keys[@]}"
+            env_set XGENT_IP_MODE "$mode"
+            env_set XGENT_SOCKS5_PROXY "$socks5_url"
             ;;
         default)
-            if [ -f ".env" ]; then
-                tmp_file="$(mktemp)"
-                grep -vE "^(XGENT_IP_MODE|XGENT_SOCKS5_PROXY|TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env > "$tmp_file" || true
-                mv "$tmp_file" .env
-                chmod 600 .env 2>/dev/null || true
-            fi
+            env_unset "${ip_keys[@]}"
             ;;
         *)
             error "[错误] 无效 IP 模式: $mode"
@@ -519,10 +505,13 @@ python_search_dirs() {
 #
 # 只能比对原始路径，不能先 readlink -f：venv/bin/python3 通常就是指向
 # /usr/bin/pythonX.Y 的软链，解析完就认不出它来自 venv 了。
+#
+# `.venv` 也要认：uv / poetry 默认建的就是这个名字，在激活了 .venv 的 shell 里
+# 跑本脚本，会原样复现下面 discover_python 注释里描述的那个坑。
 is_project_venv_python() {
     case "$1" in
         "$VENV_DIR"/*) return 0 ;;
-        */venv/bin/python*) return 0 ;;
+        */venv/bin/python*|*/.venv/bin/python*) return 0 ;;
     esac
     return 1
 }
@@ -571,11 +560,11 @@ discover_python() {
 ensure_python() {
     info "[检查] 正在检查 Python 3..."
 
-    if ! command_exists python3 && ! command_exists python3.12 && ! command_exists python3.11; then
-        warn "   未检测到 Python 3，尝试自动安装..."
-        ensure_apt_packages python3 python3-pip python3-venv
-    fi
-
+    # 先探测，再谈补包。这里原来反着来：先用硬编码的 python3/python3.12/python3.11
+    # 判断"要不要 apt 补一遍"，之后才 discover_python。于是只装了 python3.13、
+    # 没有 python3 软链的机器会先进 apt 分支，而 ensure_apt_available 在非
+    # Debian 系统上直接 exit 1——明明有一个完全可用的解释器，连用户显式给的
+    # XGENT_PYTHON 都没机会生效。
     PYTHON_BIN="$(discover_python || true)"
 
     if [ -z "$PYTHON_BIN" ] && [ -z "${XGENT_PYTHON:-}" ]; then
@@ -617,12 +606,18 @@ resolve_path() {
     echo "$(cd "$(dirname "$target")" && pwd -P)/$(basename "$target")"
 }
 
+# 删 venv 前的最后一道闸。
+#
+# 原来这里比的是 resolve_path "$SCRIPT_DIR/venv" 和 resolve_path "$VENV_DIR"，
+# 而 VENV_DIR 就是 "$SCRIPT_DIR/venv"——两个操作数是同一个表达式，判据永远成立，
+# 等于给一句 rm -rf 装了个假的保险。改成校验解析后的真实路径本身：必须直接落在
+# $SCRIPT_DIR 下面，且目录名就叫 venv。
 safe_remove_venv() {
-    local expected resolved
-    expected="$(resolve_path "$SCRIPT_DIR/venv")"
+    local resolved script_root
     resolved="$(resolve_path "$VENV_DIR")"
+    script_root="$(cd "$SCRIPT_DIR" && pwd -P)"
 
-    if [ "$resolved" != "$expected" ]; then
+    if [ "$(basename "$resolved")" != "venv" ] || [ "$(dirname "$resolved")" != "$script_root" ]; then
         error "[错误] 安全保护触发，拒绝删除非预期目录: $resolved"
         exit 1
     fi
@@ -639,8 +634,12 @@ confirm_uninstall() {
 
     warn "即将卸载本安装脚本创建的运行环境和服务记录。"
     echo "   会清理: venv、本项目 nohup/PM2 进程、systemd 服务 (${SYSTEMD_SERVICE_NAME})、"
-    echo "           xgent.pid、xgent 命令链接、脚本记录的 apt 下载包、保活方式记录。"
-    echo "   会保留: 项目文件、.env、数据库、日志、skill-public/ 下脚本服务、PM2 程序本体。"
+    echo "           本地 API 容器 (${LOCAL_API_CONTAINER})、xgent.pid、xgent 命令链接、"
+    echo "           保活方式记录、IP 出站模式设置。"
+    echo "   会保留: 项目文件、.env、数据库、日志、${LOCAL_API_DATA_DIR##*/}/、"
+    echo "           skill-public/ 下脚本服务、PM2 程序本体。"
+    echo "   会单独再问一次: 本脚本装过的 apt 包要不要 purge（这一步不可逆，会连带"
+    echo "                   删掉依赖它们的包，届时会先把 apt 的完整清单摊开给你看）。"
     echo ""
     read -r -p "确认继续？输入 y 继续: " answer
     if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
@@ -668,7 +667,10 @@ stop_background_process() {
                 kill "$pid" 2>/dev/null || true
                 sleep 2
                 if ps -p "$pid" >/dev/null 2>&1; then
-                    kill -TERM "$pid" 2>/dev/null || true
+                    # kill 默认发的就是 TERM，这里再发一次 TERM 等于原地打转。
+                    # 卡住的进程只能靠 KILL 收掉——否则下面照样 rm 掉 pid 文件，
+                    # 那个进程就此失联，还占着端口和数据库。
+                    kill -9 "$pid" 2>/dev/null || true
                 fi
                 rm -f xgent.pid
                 success "nohup 后台进程已停止"
@@ -686,7 +688,13 @@ stop_background_process() {
             continue
         fi
 
-        if { [[ "$cmdline" == *"$APP_ENTRY"* ]] || [[ "$cmdline" == *"$LEGACY_APP_ENTRY"* ]]; } && { [[ "$cmdline" == *"$SCRIPT_DIR"* ]] || [[ "$cmdline" == *"$VENV_PYTHON"* ]] || { [[ "$cmdline" == *"XGENT_APP_ENTRY"* ]] || [[ "$cmdline" == *"TELEGRAM_AI_BOT_APP_ENTRY"* ]]; }; }; then
+        # 第二组判据必须是"这个进程属于本目录"。这里曾经还有一个 or 分支
+        # ——cmdline 含 XGENT_APP_ENTRY / TELEGRAM_AI_BOT_APP_ENTRY 就算命中，
+        # 而 bot_python_code 生成的内联 Python 本身就含这两个字面量，于是同机
+        # 每一份副本的 argv 都命中，$SCRIPT_DIR 这层限定被完全短路：在
+        # /tmp/xgt 里跑一次 stop，会顺手杀掉另一个目录下正在服务的进程。
+        if { [[ "$cmdline" == *"$APP_ENTRY"* ]] || [[ "$cmdline" == *"$LEGACY_APP_ENTRY"* ]]; } \
+            && { [[ "$cmdline" == *"$SCRIPT_DIR"* ]] || [[ "$cmdline" == *"$VENV_PYTHON"* ]]; }; then
             found_extra=1
             info "[卸载] 正在停止残留进程: $pid"
             kill "$pid" 2>/dev/null || true
@@ -760,6 +768,12 @@ remove_recorded_apt_packages() {
             pm2|nodejs|npm|node-*|libnode*|libuv*|libc-ares*)
                 kept_packages+=("$package")
                 ;;
+            # python3 系是系统基础包：Debian 上一大票东西依赖它，purge 掉会级联
+            # 把它们一起删走。我们"装过"它只是因为当时机器上没有，卸载时宁可留着
+            # ——留一个没人用的解释器，比拆掉别人正在用的依赖便宜得多。
+            python3|python3-*|python3.*|libpython3*)
+                kept_packages+=("$package")
+                ;;
             *)
                 packages+=("$package")
                 ;;
@@ -767,7 +781,7 @@ remove_recorded_apt_packages() {
     done < <(sort -u "$APT_STATE_FILE")
 
     if [ "${#kept_packages[@]}" -gt 0 ]; then
-        warn "   为保留 PM2，已跳过这些 Node/npm 相关包:"
+        warn "   以下包属于 PM2/Node 或 Python 基础环境，一律跳过不卸:"
         printf '   %s\n' "${kept_packages[@]}"
     fi
 
@@ -778,10 +792,51 @@ remove_recorded_apt_packages() {
         return
     fi
 
-    info "[卸载] 正在卸载本脚本记录的新装 apt 包:"
+    info "[卸载] 本脚本记录过的新装 apt 包:"
     printf '   %s\n' "${packages[@]}"
+
+    # 先 simulate 一遍。ensure_apt_packages 记的是 dpkg 全量列表的差集，里面混着
+    # apt 自己拉进来的传递依赖；purge 它们时 apt 又会把"现在依赖这些包的东西"
+    # 一起级联删掉。所以真正被删的往往远多于上面这几行——不摊开给人看就按 -y
+    # 冲下去，是这个脚本里最不可逆的一步。
+    local removal_preview=""
+    if removal_preview="$(apt-get -s purge "${packages[@]}" 2>/dev/null)"; then
+        removal_preview="$(printf '%s\n' "$removal_preview" | awk '/^Remv /{print $2}' | sort -u)"
+    else
+        removal_preview=""
+    fi
+    if [ -n "$removal_preview" ]; then
+        warn "   apt 实际会移除以下包（含被级联带走的依赖）:"
+        while IFS= read -r package; do
+            # 用 if 而不是 `[ -n "$package" ] && echo`：后者在最后一轮判据为假时
+            # 会把整个 while 的退出码带成 1，在 set -e 下当场中断卸载。
+            if [ -n "$package" ]; then
+                echo "   - $package"
+            fi
+        done <<< "$removal_preview"
+    else
+        warn "   无法预演 apt 的移除清单（apt-get -s 失败），下面这一步的影响面未知。"
+    fi
+
+    if [ "$SKIP_CONFIRM" -ne 1 ]; then
+        local answer=""
+        echo ""
+        read -r -p "   确认执行 apt-get purge？输入 y 继续，其它任意键跳过: " answer
+        if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
+            warn "   已跳过 apt 包卸载。记录留在 $APT_STATE_FILE，需要时可手动处理。"
+            return
+        fi
+    fi
+
     run_privileged apt-get purge -y "${packages[@]}" || warn "   部分 apt 包卸载失败，请根据上方输出手动检查。"
-    run_privileged apt-get autoremove --purge -y || true
+    # autoremove --purge 会清掉系统上**所有**它认为孤立的包，不限于我们装的那批。
+    # 默认不跑，交给知道自己在做什么的人显式开。
+    if [ "${XGENT_APT_AUTOREMOVE:-0}" = "1" ]; then
+        run_privileged apt-get autoremove --purge -y || true
+    else
+        warn "   已跳过 apt-get autoremove --purge（它会连带清掉系统上其它孤立包）。"
+        echo "   确实需要时手动执行，或用 XGENT_APT_AUTOREMOVE=1 重跑卸载。"
+    fi
     run_privileged apt-get clean || true
 
     rm -f "$APT_STATE_FILE"
@@ -790,24 +845,18 @@ remove_recorded_apt_packages() {
 }
 
 remove_ip_mode_state() {
-    local cleaned=0
-    if [ -f "$IP_MODE_FILE" ]; then
-        info "[卸载] 正在清理 IP 出站模式设置"
-        rm -f "$IP_MODE_FILE"
-        cleaned=1
-    fi
-    # 清理 .env 中的 IP 模式和 SOCKS5 代理设置
+    # 只清 .env 里那四个键。原来这里还删一个 .install-state/ip-mode 文件，
+    # 但全脚本没有任何地方写它——早期设计的残留。
     if [ -f ".env" ] && grep -qE "^(XGENT_IP_MODE|XGENT_SOCKS5_PROXY|TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env 2>/dev/null; then
         info "[卸载] 正在清理 .env 中的 IP 出站模式 / SOCKS5 代理设置"
-        local tmp_file
-        tmp_file="$(mktemp)"
-        grep -vE "^(XGENT_IP_MODE|XGENT_SOCKS5_PROXY|TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env > "$tmp_file" || true
-        mv "$tmp_file" .env
-        chmod 600 .env 2>/dev/null || true
-        cleaned=1
+        env_unset XGENT_IP_MODE XGENT_SOCKS5_PROXY \
+            TELEGRAM_AI_BOT_IP_MODE TELEGRAM_AI_BOT_SOCKS5_PROXY
+        success "IP 出站模式设置已清理"
     fi
+    # 末尾曾是 `[ "$cleaned" -eq 1 ] && success ...`：没清到东西时整个函数返回 1，
+    # 而 uninstall_app 在 set -e 下不带判据地调它——于是"本来就没设过 IP 模式"这种
+    # 最常见的情形会让卸载在这里静静中断，后面的 remove_xgent_command 压根没跑到。
     rmdir "$STATE_DIR" 2>/dev/null || true
-    [ "$cleaned" -eq 1 ] && success "IP 出站模式设置已清理"
 }
 
 remove_runtime_mode_state() {
@@ -823,6 +872,11 @@ uninstall_app() {
     fi
 
     confirm_uninstall
+
+    # 容器要第一个关。它是 --restart unless-stopped 起的，不关掉的话卸载完还在跑、
+    # 机器重启还会自己回来，端口一直占着，白名单里加过 0.0.0.0 就一直对公网开着。
+    # 顺带把 token 从本地 server 登出交还官方，这一步也只有现在做才有意义。
+    stop_local_api_container no-restart
 
     remove_pm2_process
     remove_systemd_service
@@ -874,6 +928,9 @@ ensure_virtualenv() {
         exit 1
     fi
 
+    # 让 install_requirements 知道这是个全新的 venv：里面什么都没有，
+    # 必须真的装一遍，不能走"依赖没变就跳过"那条快路。
+    VENV_CREATED=1
     success "虚拟环境创建完成（$("$VENV_PYTHON" --version 2>&1)）"
 }
 
@@ -887,23 +944,77 @@ activate_virtualenv() {
     source "$VENV_ACTIVATE"
 }
 
-install_requirements() {
-    info "[pip] 正在升级 pip..."
-    python -m pip install --upgrade pip -q
+# 依赖装过没有、而且装的是不是眼下这一份 requirements.txt。
+# 比对内容而不是 mtime：fix_line_endings 的 sed -i 每次都会把 mtime 刷新一遍。
+requirements_up_to_date() {
+    command_exists cmp || return 1
+    [ -f "$REQUIREMENTS_SNAPSHOT" ] || return 1
+    cmp -s requirements.txt "$REQUIREMENTS_SNAPSHOT"
+}
 
-    info "[pip] 正在安装 Python 依赖..."
-    python -m pip install -r requirements.txt -q
+core_imports_ok() {
+    python -c 'import aiosqlite, telegram, openai' >/dev/null 2>&1
+}
 
-    success "依赖安装完成"
+print_core_versions() {
     python -c "import aiosqlite; print('   aiosqlite 版本:', aiosqlite.__version__)"
     python -c "import telegram; print('   python-telegram-bot 版本:', telegram.__version__)"
     python -c "import openai; print('   openai 版本:', openai.__version__)"
 }
 
-upsert_env_value() {
+install_requirements() {
+    # 重启也会走到这里（restart → prepare_environment → 本函数）。而 pip 每次都
+    # 要联网——`--upgrade pip` 必然去问一次 PyPI——网络一断就被 set -e 掀掉整个
+    # 重启，可"重启一个已经装好的服务"跟装依赖本来是两件事。所以：requirements.txt
+    # 与上次装的那份一致、三个核心包又都 import 得动，就直接跳过。
+    # 两个条件都要满足，venv 被人删过半截时才还能自愈。
+    if [ "$VENV_CREATED" -eq 0 ] && requirements_up_to_date && core_imports_ok; then
+        info "[pip] 依赖与上次安装一致，跳过（重启路径不联网）。"
+        print_core_versions
+        return
+    fi
+
+    # pip 自身只在新建 venv 时升一次，失败也不致命：它是顺手做的好事，
+    # 不是装依赖的前提。
+    if [ "$VENV_CREATED" -eq 1 ]; then
+        info "[pip] 正在升级 pip..."
+        python -m pip install --upgrade pip -q || warn "   pip 自身升级失败，继续用现有版本。"
+    fi
+
+    info "[pip] 正在安装 Python 依赖..."
+    python -m pip install -r requirements.txt -q
+
+    ensure_state_dir
+    cp -f requirements.txt "$REQUIREMENTS_SNAPSHOT" 2>/dev/null || true
+    success "依赖安装完成"
+    print_core_versions
+}
+
+# ==========================================================================
+# .env 读写：只走 env_get / env_set / env_unset
+# ==========================================================================
+# 以前这里有七份各写一遍的实现，踩过的坑各修在其中一两份里：行首没锚定会顺手
+# 删掉 XGENT_BOT_TOKEN（grep -vF "BOT_TOKEN=" 匹配行内任意位置）、值末尾的 \r
+# 会让 AUTHORIZED_USER_ID 被判成非数字、临时文件落在 /tmp 时跨文件系统 mv 会
+# 退化成复制+删除并可能截断整个 .env。三条一次性钉在这里，别再另写第八份。
+
+# 读一个键的值，不存在则输出空。
+#
+# 末尾的 \r 必须去掉：用户在 Windows 上编辑过 .env 再传到服务器是很常见的，
+# 那样每个值都会多带一个回车符。fix_line_endings 只在安装流程里跑，而
+# `install.sh status`、组件清单这些路径会先读 .env——不去掉的话
+# AUTHORIZED_USER_ID 会被判成"不是合法数字"，BOT_TOKEN 则会带着 \r 发给
+# Telegram 直接鉴权失败，两种症状都完全看不出根因在换行符上。
+env_get() {
     local key="$1"
-    local value="$2"
-    local tmp_file
+    [ -f ".env" ] || return 0
+    awk -F= -v k="$key" '$1==k{print substr($0,length(k)+2)}' .env 2>/dev/null \
+        | tail -n 1 | tr -d '\r' || true
+}
+
+# 写入/覆盖一个键。
+env_set() {
+    local key="$1" value="$2" tmp_file
 
     # 临时文件建在 .env 同目录：mktemp 默认落在 /tmp，跨文件系统时 mv 会退化成
     # 复制+删除，复制中途失败会把含 BOT_TOKEN 和全部 api_key 的 .env 截断且无备份。
@@ -920,34 +1031,20 @@ upsert_env_value() {
     chmod 600 .env
 }
 
-remove_env_value() {
-    local key="$1"
+# 删掉一个或多个键。
+env_unset() {
+    local pattern tmp_file
+    [ -f ".env" ] || return 0
+    [ "$#" -gt 0 ] || return 0
 
-    if [ ! -f ".env" ]; then
-        return
-    fi
+    pattern="$(printf '%s|' "$@")"
+    pattern="^(${pattern%|})="
 
-    local tmp_file
     tmp_file="$(mktemp ./.env.XXXXXX)"
     chmod 600 "$tmp_file"
-    grep -v "^${key}=" .env > "$tmp_file" || true
+    grep -vE "$pattern" .env > "$tmp_file" || true
     mv "$tmp_file" .env
     chmod 600 .env
-}
-
-# 读取 .env 中某个键的值（不存在则空）
-#
-# 末尾的 \r 必须去掉：用户在 Windows 上编辑过 .env 再传到服务器是很常见的，
-# 那样每个值都会多带一个回车符。fix_line_endings 只在安装流程里跑，而
-# `install.sh status`、组件清单这些路径会先读 .env——不去掉的话
-# AUTHORIZED_USER_ID 会被判成"不是合法数字"，BOT_TOKEN 则会带着 \r 发给
-# Telegram 直接鉴权失败，两种症状都完全看不出根因在换行符上。
-local_api_env_value() {
-    local key="$1"
-    if [ -f ".env" ]; then
-        awk -F= -v k="$key" '$1==k{print substr($0,length(k)+2)}' .env 2>/dev/null \
-            | tail -n 1 | tr -d '\r' || true
-    fi
 }
 
 # 容器运行状态：running / exited / missing / docker-unavailable
@@ -977,7 +1074,7 @@ local_api_container_status() {
 # bot 是否走本地 API：enabled / disabled（依据 .env 中 TELEGRAM_API_URL 非空）
 local_api_enabled_for_bot() {
     local url
-    url="$(local_api_env_value TELEGRAM_API_URL)"
+    url="$(env_get TELEGRAM_API_URL)"
     if [ -n "$url" ]; then
         printf 'enabled\n'
     else
@@ -998,23 +1095,6 @@ get_allowed_ips() {
         fi
     fi
     printf '127.0.0.1\n'
-}
-
-# 把白名单 IP 列表转成 docker run 的端口映射参数（每个 IP 一条 -p）。
-# 输出形如：-p 127.0.0.1:8081:8081 -p 1.2.3.4:8081:8081
-build_local_api_port_args() {
-    local ip args=""
-    while IFS= read -r ip; do
-        [ -z "$ip" ] && continue
-        # 简单格式校验：只允许 IPv4/IPv6/主机名常见字符
-        if [[ "$ip" =~ ^[A-Za-z0-9._:-]+$ ]]; then
-            args="${args} -p ${ip}:${LOCAL_API_PORT}:8081"
-        fi
-    done < <(get_allowed_ips)
-    if [ -z "$args" ]; then
-        args="-p 127.0.0.1:${LOCAL_API_PORT}:8081"
-    fi
-    printf '%s' "${args# }"
 }
 
 # 简单 IPv4 校验（4 段 0-255）。IPv6 不做严格校验，交给 docker 判断。
@@ -1166,7 +1246,7 @@ telegram_log_out() {
     local base="$1"
     local token log_out_url
 
-    token="$(local_api_env_value BOT_TOKEN)"
+    token="$(env_get BOT_TOKEN)"
     if [ -z "$token" ]; then
         warn "   .env 中没有 BOT_TOKEN，跳过 logOut。"
         return 1
@@ -1226,9 +1306,7 @@ ensure_env_value() {
     local current_value=""
     local new_value=""
 
-    if [ -f ".env" ]; then
-        current_value="$(awk -F= -v k="$key" '$1==k && length($0)>length(k)+1{print substr($0,length(k)+2)}' .env | tail -n 1 || true)"
-    fi
+    current_value="$(env_get "$key")"
 
     if [ "$mode" = "int" ] && [ -n "$current_value" ]; then
         case "$current_value" in
@@ -1261,7 +1339,7 @@ ensure_env_value() {
             esac
         fi
     done
-    upsert_env_value "$key" "$new_value"
+    env_set "$key" "$new_value"
 }
 
 # 「切换部署模式」的入口（install.sh switch-mode）。真正的改法已经收进
@@ -1288,6 +1366,16 @@ switch_deploy_mode() {
     esac
 }
 
+# install.sh 侧读写 Web 配置的唯一通道。
+#
+# 这里以前是五段各自抄了一遍 bootstrap 的内联 Python（set_web_password、
+# set_web_port 的读和写、load_web_state、set_web_enabled），连"把加载期日志丢进
+# 黑洞"那段注释都抄了五遍，约 120 行重复。现在统一交给 tools/xgent_config.py，
+# 一个子命令对应一件事。
+run_config_py() {
+    run_bot_python "$VENV_PYTHON" tools/xgent_config.py "$@"
+}
+
 set_web_password() {
     # Web 服务没有密码就不会启动（start_web_chat_if_enabled 直接跳过），
     # 仅 Web 模式下这等于装完连不上。所以密码是 web 组件的安装步骤本身，
@@ -1312,40 +1400,8 @@ set_web_password() {
     done
 
     set +e
-    XGENT_WEB_PASSWORD="$password" run_bot_python "$VENV_PYTHON" - <<'PY'
-import asyncio
-import os
-import sys
-
-sys.path.insert(0, os.path.abspath("."))
-os.environ.setdefault("AUTHORIZED_USER_ID", "1")
-
-import contextlib
-import io
-
-from xgent_app.bootstrap import load_sections
-
-ns = {"__file__": os.path.abspath("xgent_server.py")}
-# load_sections() 触发 core.py 顶层日志（"加载提示词: ..." 等），会直接写
-# 到 stdout——这段安装期一次性脚本靠 stdout 传回结果给 shell 的 $(...)，
-# 日志噪音混进去会让 shell 变量捕获到脏值（这条 bug 已经在人工测试里现形：
-# 端口检查捕获出一整段日志 + 数字粘在一起）。用 redirect_stdout 把加载期
-# 输出丢进黑洞，只留下面显式 print() 的那一行给 shell。
-with contextlib.redirect_stdout(io.StringIO()):
-    load_sections(ns)
-
-
-async def main():
-    await ns["UserDataManager"].init()
-    password = os.environ.get("XGENT_WEB_PASSWORD", "")
-    await ns["persist_web_password"](password)
-    print("ok")
-    # 同上：显式关闭数据库连接，避免非 daemon 工作线程卡住脚本退出。
-    await (await ns["BotMemoryDB"].get_instance()).close()
-
-
-asyncio.run(main())
-PY
+    # 密码走环境变量传给子进程，不进 argv——argv 在同机任何用户的 ps 里都看得见。
+    XGENT_WEB_PASSWORD="$password" run_config_py set-password >/dev/null
     exit_code=$?
     set -euo pipefail
     # 密码变量只在子进程环境里短暂存在，这里主动清掉，避免残留在当前 shell。
@@ -1367,41 +1423,7 @@ set_web_port() {
     info "[web] 设置监听端口"
 
     set +e
-    current_from_db=$(run_bot_python "$VENV_PYTHON" - <<'PY'
-import asyncio
-import os
-import sys
-
-sys.path.insert(0, os.path.abspath("."))
-os.environ.setdefault("AUTHORIZED_USER_ID", "1")
-
-import contextlib
-import io
-
-from xgent_app.bootstrap import load_sections
-
-ns = {"__file__": os.path.abspath("xgent_server.py")}
-# load_sections() 触发 core.py 顶层日志（"加载提示词: ..." 等），会直接写
-# 到 stdout——这段安装期一次性脚本靠 stdout 传回结果给 shell 的 $(...)，
-# 日志噪音混进去会让 shell 变量捕获到脏值（这条 bug 已经在人工测试里现形：
-# 端口检查捕获出一整段日志 + 数字粘在一起）。用 redirect_stdout 把加载期
-# 输出丢进黑洞，只留下面显式 print() 的那一行给 shell。
-with contextlib.redirect_stdout(io.StringIO()):
-    load_sections(ns)
-
-
-async def main():
-    await ns["UserDataManager"].init()
-    port = ns["normalize_web_port"](
-        ns["UserDataManager"].get("web_port", ns["DEFAULT_WEB_PORT"])
-    )
-    print(port)
-    await (await ns["BotMemoryDB"].get_instance()).close()
-
-
-asyncio.run(main())
-PY
-)
+    current_from_db=$(run_config_py get-port)
     exit_code=$?
     set -euo pipefail
 
@@ -1421,47 +1443,7 @@ PY
 
     local set_output
     set +e
-    set_output=$(XGENT_WEB_PORT_INPUT="$port_input" run_bot_python "$VENV_PYTHON" - <<'PY'
-import asyncio
-import os
-import sys
-
-sys.path.insert(0, os.path.abspath("."))
-os.environ.setdefault("AUTHORIZED_USER_ID", "1")
-
-import contextlib
-import io
-
-from xgent_app.bootstrap import load_sections
-
-ns = {"__file__": os.path.abspath("xgent_server.py")}
-# load_sections() 触发 core.py 顶层日志（"加载提示词: ..." 等），会直接写
-# 到 stdout——这段安装期一次性脚本靠 stdout 传回结果给 shell 的 $(...)，
-# 日志噪音混进去会让 shell 变量捕获到脏值（这条 bug 已经在人工测试里现形：
-# 端口检查捕获出一整段日志 + 数字粘在一起）。用 redirect_stdout 把加载期
-# 输出丢进黑洞，只留下面显式 print() 的那一行给 shell。
-with contextlib.redirect_stdout(io.StringIO()):
-    load_sections(ns)
-
-
-async def main():
-    await ns["UserDataManager"].init()
-    raw = os.environ.get("XGENT_WEB_PORT_INPUT", "")
-    try:
-        port = ns["parse_web_port"](raw)
-    except ValueError:
-        print(f"端口必须是 {ns['MIN_WEB_PORT']}-{ns['MAX_WEB_PORT']} 之间的整数")
-        await (await ns["BotMemoryDB"].get_instance()).close()
-        raise SystemExit(1)
-    ns["UserDataManager"].set("web_port", port)
-    await ns["UserDataManager"].save_config("web_port", port)
-    print(f"{port}")
-    await (await ns["BotMemoryDB"].get_instance()).close()
-
-
-asyncio.run(main())
-PY
-)
+    set_output=$(run_config_py set-port "$port_input")
     exit_code=$?
     set -euo pipefail
 
@@ -1470,7 +1452,9 @@ PY
         exit 1
     fi
     reset_web_state_cache
-    success "Web 端口已设置为 ${port_input}。"
+    # 报 set_output（Python 规范化后的端口）而不是 port_input：万一 parse_web_port
+    # 做了修正，照着原始输入喊一句"已设置为 xxx"就是在骗人。
+    success "Web 端口已设置为 ${set_output}。"
 }
 
 validate_telegram_token() {
@@ -1486,20 +1470,20 @@ validate_telegram_token() {
 
     local status
     set +e
-    status=$(run_bot_python "$VENV_PYTHON" - <<PY
+    status=$(XGENT_VALIDATE_TOKEN="$(env_get BOT_TOKEN)" run_bot_python "$VENV_PYTHON" - <<PY
 $(ip_family_restrictor_python)
 import asyncio
-import sys
-from pathlib import Path
+import os
 
 from telegram import Bot
 from telegram.error import InvalidToken, TelegramError
 
-token = ""
-for line in Path(".env").read_text(encoding="utf-8").splitlines():
-    if line.startswith("BOT_TOKEN="):
-        token = line.split("=", 1)[1].strip()
-        break
+# Token 由 shell 侧的 env_get 读好后经环境变量传进来。以前这里自己
+# 按 startswith("BOT_TOKEN=") 扒一遍 .env——多一份读法就多一种和
+# env_get 不一致的可能（尤其是值末尾的 \r），判断"有没有配 Token"这件事
+# 必须只有一个答案。
+token = (os.environ.get("XGENT_VALIDATE_TOKEN") or "").strip()
+
 
 async def main():
     if not token:
@@ -1531,12 +1515,13 @@ PY
             echo "请先到 BotFather 重新生成 Token，更新 .env 后再启动。"
             exit 78
             ;;
-        2)
-            warn "   无法完成在线校验，可能是网络问题；将继续后续步骤。"
-            ;;
         *)
-            error "[错误] Telegram Bot Token 校验失败，请检查 .env 内容。"
-            exit 1
+            # 除了 78（Token 明确无效）之外，其它都只说明"校验本身没跑成"：
+            # 网络不通、依赖半坏、临时故障都会落到这里。为此中断启动的代价比
+            # 放它过去大得多——restart 路径也走这个函数，而真的 Token 有问题时
+            # 应用自己会以 78 退出，PM2 的 --stop-exit-codes 和 systemd 的
+            # RestartPreventExitStatus 都认这个码，不会陷入重启死循环。
+            warn "   Token 在线校验未能完成（退出码 ${exit_code}，标记: ${status:-无}），将继续启动。"
             ;;
     esac
 }
@@ -1914,44 +1899,57 @@ start_with_pm2() {
 
 restart_pm2_detached() {
     local helper log_file mode socks5_url
-    helper="$(mktemp /tmp/${PM2_APP_NAME}-restart.XXXXXX.sh)"
-    log_file="/tmp/${PM2_APP_NAME}-restart.log"
-    mode="$(get_ip_mode)"
-    [ "$mode" = "sock5" ] && socks5_url="$(get_socks5_proxy)" || socks5_url=""
 
-    cat > "$helper" <<EOF
+    ensure_state_dir
+    log_file="$STATE_DIR/pm2-restart.log"
+    helper="$(mktemp "$STATE_DIR/pm2-restart.XXXXXX.sh")"
+    mode="$(get_ip_mode)"
+    if [ "$mode" = "sock5" ]; then
+        socks5_url="$(get_socks5_proxy)"
+    else
+        socks5_url=""
+    fi
+
+    # helper 用 <<'EOF' 写，正文里一个变量都不插值。原来用的是不加引号的 <<EOF，
+    # 把 $socks5_url 直接拼进脚本正文——代理密码里一个反引号或 $( 就成了在 helper
+    # 里执行的代码，而那个值只过了 "^socks5://" 前缀检查。要带进去的东西一律走
+    # 环境变量，顺带也不再怕 SCRIPT_DIR 里有引号或空格。
+    cat > "$helper" <<'EOF'
 #!/usr/bin/env bash
 set -u
-{
-  echo "===== $PM2_APP_NAME detached restart started at \$(date '+%F %T') ====="
-  cd "$SCRIPT_DIR" || exit 1
+# 用完自删。否则每次重启都在磁盘上多留一个文件，而 sock5 模式下它带着代理凭据。
+trap 'rm -f -- "$0"' EXIT
 
-  # 不再 pm2 delete：由 start_with_pm2 对已存在的进程做原地 restart，
-  # 复用原 pm_id，避免进程 ID 不断增加。
+echo "===== detached restart started at $(date '+%F %T') ====="
+cd "$XGENT_RESTART_DIR" || exit 1
 
-  # 设置 IP 模式环境变量（ipv4 / ipv6 / sock5 互斥）
-  unset XGENT_SOCKS5_PROXY TELEGRAM_AI_BOT_IP_MODE TELEGRAM_AI_BOT_SOCKS5_PROXY || true
-  unset XGENT_APP_ENTRY TELEGRAM_AI_BOT_APP_ENTRY || true
-  if [ "$mode" = "default" ]; then
-    unset XGENT_IP_MODE || true
-  elif [ "$mode" = "sock5" ]; then
-    export XGENT_IP_MODE="$mode"
-    export XGENT_SOCKS5_PROXY="$socks5_url"
-  else
-    export XGENT_IP_MODE="$mode"
-  fi
+# 设置 IP 模式环境变量（ipv4 / ipv6 / sock5 互斥）
+unset XGENT_SOCKS5_PROXY TELEGRAM_AI_BOT_IP_MODE TELEGRAM_AI_BOT_SOCKS5_PROXY || true
+unset XGENT_APP_ENTRY TELEGRAM_AI_BOT_APP_ENTRY || true
+case "$XGENT_RESTART_MODE" in
+    default) unset XGENT_IP_MODE || true ;;
+    sock5)
+        export XGENT_IP_MODE="$XGENT_RESTART_MODE"
+        export XGENT_SOCKS5_PROXY="$XGENT_RESTART_SOCKS5"
+        ;;
+    *) export XGENT_IP_MODE="$XGENT_RESTART_MODE" ;;
+esac
 
-  # 彻底重启：重新准备环境并启动
-  bash "$SCRIPT_DIR/install.sh" pm2-start-internal
-  status=\$?
-  pm2 save || true
-  echo "===== $PM2_APP_NAME detached restart finished with status \$status at \$(date '+%F %T') ====="
-  exit \$status
-} >> "$log_file" 2>&1
+# 不做 pm2 delete：由 start_with_pm2 对已存在的进程做原地 restart，
+# 复用原 pm_id，避免进程 ID 不断增加。
+bash "$XGENT_RESTART_DIR/install.sh" pm2-start-internal
+status=$?
+pm2 save || true
+echo "===== detached restart finished with status $status at $(date '+%F %T') ====="
+exit $status
 EOF
     chmod +x "$helper"
 
-    nohup bash -c "sleep 2; '$helper'" >/dev/null 2>&1 &
+    # bash -c '... "$0"' <helper> 里 $0 就是 helper 路径，不必把它拼进命令字符串。
+    nohup env XGENT_RESTART_DIR="$SCRIPT_DIR" \
+        XGENT_RESTART_MODE="$mode" \
+        XGENT_RESTART_SOCKS5="$socks5_url" \
+        bash -c 'sleep 2; exec "$0"' "$helper" >> "$log_file" 2>&1 &
     echo "   已启动脱离当前会话的 PM2 彻底重启任务。"
     echo "   日志文件: $log_file"
     echo "   如果当前 Bot 短暂断开，请等待 5-10 秒后重新 /start。"
@@ -1973,29 +1971,41 @@ rebuild_pm2_app() {
 restart_app() {
     info "[重启] 正在彻底重启 XGent for Telegram..."
 
-    if [ "$(get_runtime_mode)" = "systemd" ] && systemd_unit_installed; then
-        echo "   检测到 systemd 服务，将重写 unit 并重启（IP 模式等改动一并生效）。"
-        start_with_systemd
-        return
-    fi
-
-    if command_exists pm2 && { pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1 || pm2 describe "$LEGACY_PM2_APP_NAME" >/dev/null 2>&1; }; then
-        echo "   检测到 PM2 进程，将原地重启并刷新环境变量（进程 ID 保持不变）。"
-        restart_pm2_detached
-        return
-    fi
-
-    if [ -f "xgent.pid" ]; then
-        echo "   检测到 nohup 进程，将彻底停止并重新启动以确保加载最新配置。"
-        stop_background_process
-        sleep 1
-        start_background
-        return
-    fi
-
-    warn "   未检测到正在运行的服务进程。"
-    echo "   将按当前保活方式（$(runtime_mode_label)）直接启动一次。"
-    start_service
+    # 分发依据必须和 start_service / stop_service 一致——都只看 runtime mode。
+    # 以前这里第二步是"**存在** PM2 进程就走 PM2"：把保活方式改成 nohup 之后，
+    # 只要那条 PM2 记录还在，restart 就又从 PM2 起来，和用户刚选的方式正好相反。
+    case "$(get_runtime_mode)" in
+        systemd)
+            echo "   保活方式 systemd：将重写 unit 并重启（IP 模式等改动一并生效）。"
+            start_with_systemd
+            ;;
+        pm2)
+            # 统一走 detached：install.sh restart 有可能是被 PM2 自己管着的进程
+            # 调起来的（Bot 里的重启入口就是），在自己的进程里 pm2 restart 会把
+            # 调用方一起杀掉，重启就半途而废。start_with_pm2 内部已经区分了
+            # "进程已存在→原地 restart" 和 "不存在→新建"。
+            echo "   保活方式 PM2：脱离当前会话重启（进程已存在则原地重启，ID 不变）。"
+            restart_pm2_detached
+            ;;
+        nohup)
+            if [ -f "xgent.pid" ]; then
+                echo "   将彻底停止后台进程再重新启动，确保加载最新配置。"
+                stop_background_process
+                sleep 1
+            fi
+            start_background
+            ;;
+        *)
+            # foreground 的"重启"就是在当前终端重新跑一次；mode 还是 none 时由
+            # start_service 去问一次保活方式（只有交互式菜单会走到这条）。
+            if [ -f "xgent.pid" ]; then
+                stop_background_process
+                sleep 1
+            fi
+            echo "   将按当前保活方式（$(runtime_mode_label)）启动一次。"
+            start_service
+            ;;
+    esac
 }
 
 # 收集本地 API 所需 .env 变量；已有值则显示并允许回车保留
@@ -2003,9 +2013,9 @@ prompt_local_api_env() {
     local current_url current_id current_hash
     local input_url input_id input_hash
 
-    current_url="$(local_api_env_value TELEGRAM_API_URL)"
-    current_id="$(local_api_env_value TELEGRAM_API_ID)"
-    current_hash="$(local_api_env_value TELEGRAM_API_HASH)"
+    current_url="$(env_get TELEGRAM_API_URL)"
+    current_id="$(env_get TELEGRAM_API_ID)"
+    current_hash="$(env_get TELEGRAM_API_HASH)"
 
     echo ""
     warn "本地 Telegram Bot API server 需要 api_id 和 api_hash。"
@@ -2046,9 +2056,9 @@ prompt_local_api_env() {
         done
     fi
 
-    upsert_env_value "TELEGRAM_API_URL" "$input_url"
-    upsert_env_value "TELEGRAM_API_ID" "$input_id"
-    upsert_env_value "TELEGRAM_API_HASH" "$input_hash"
+    env_set "TELEGRAM_API_URL" "$input_url"
+    env_set "TELEGRAM_API_ID" "$input_id"
+    env_set "TELEGRAM_API_HASH" "$input_hash"
     success ".env 已写入 TELEGRAM_API_URL / TELEGRAM_API_ID / TELEGRAM_API_HASH"
 }
 
@@ -2063,8 +2073,8 @@ start_local_api_container() {
         return 1
     fi
 
-    api_id="$(local_api_env_value TELEGRAM_API_ID)"
-    api_hash="$(local_api_env_value TELEGRAM_API_HASH)"
+    api_id="$(env_get TELEGRAM_API_ID)"
+    api_hash="$(env_get TELEGRAM_API_HASH)"
     port="$LOCAL_API_PORT"
 
     info "[本地 API] 正在准备容器..."
@@ -2086,11 +2096,17 @@ start_local_api_container() {
     fi
 
     info "[本地 API] 正在启动容器..."
-    # 按白名单 IP 生成端口绑定参数（默认仅 127.0.0.1，可随时加白名单）
+    # 按白名单 IP 生成端口绑定参数（默认仅 127.0.0.1，可随时加白名单）。
+    # 白名单文件是纯文本、可能被手工编辑过，所以这里再过一遍格式：不合法的行
+    # 直接跳掉，而不是拼进 docker run 让它报一句难懂的参数错误。
     local -a port_args=()
     local ip
     while IFS= read -r ip; do
         [ -z "$ip" ] && continue
+        if ! [[ "$ip" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+            warn "   白名单里这一行不像 IP，已跳过: $ip"
+            continue
+        fi
         port_args+=("-p" "${ip}:${LOCAL_API_PORT}:8081")
     done < <(get_allowed_ips)
     if [ "${#port_args[@]}" -eq 0 ]; then
@@ -2142,28 +2158,35 @@ start_local_api_container() {
 # 采用 detached 子进程方式：不阻塞当前交互菜单，避免 nohup/PM2 路径对 venv 状态的依赖。
 restart_bot_after_api_switch() {
     local helper log_file
-    helper="$(mktemp /tmp/${PM2_APP_NAME}-api-switch-restart.XXXXXX.sh)"
-    log_file="/tmp/${PM2_APP_NAME}-api-switch-restart.log"
 
-    cat > "$helper" <<EOF
+    ensure_state_dir
+    log_file="$STATE_DIR/api-switch-restart.log"
+    helper="$(mktemp "$STATE_DIR/api-switch-restart.XXXXXX.sh")"
+
+    # 同 restart_pm2_detached：正文不插值，路径走环境变量，用完自删。
+    cat > "$helper" <<'EOF'
 #!/usr/bin/env bash
 set -u
-{
-  echo "===== $PM2_APP_NAME api-switch restart at \$(date '+%F %T') ====="
-  cd "$SCRIPT_DIR" || exit 1
-  bash "$SCRIPT_DIR/install.sh" restart
-  echo "===== finished at \$(date '+%F %T') ====="
-} >> "$log_file" 2>&1
+trap 'rm -f -- "$0"' EXIT
+
+echo "===== api-switch restart at $(date '+%F %T') ====="
+cd "$XGENT_RESTART_DIR" || exit 1
+bash "$XGENT_RESTART_DIR/install.sh" restart
+echo "===== finished at $(date '+%F %T') ====="
 EOF
     chmod +x "$helper"
 
-    nohup bash -c "sleep 2; '$helper'" >/dev/null 2>&1 &
+    nohup env XGENT_RESTART_DIR="$SCRIPT_DIR" \
+        bash -c 'sleep 2; exec "$0"' "$helper" >> "$log_file" 2>&1 &
     echo "   已在后台启动 bot 重启任务（独立进程，不阻塞当前菜单）。"
     echo "   日志文件: $log_file"
     echo "   如果当前 Bot 短暂断开，请等待 5-10 秒后重新 /start。"
 }
 
 stop_local_api_container() {
+    # restart_after=no-restart 时不拉重启任务。卸载流程要用这个：那时正在把服务
+    # 一件件拆掉，再顺手起一个 detached 重启就是在跟自己打架。
+    local restart_after="${1:-restart}"
     local local_base changed=0
 
     if ! command_exists docker; then
@@ -2171,7 +2194,7 @@ stop_local_api_container() {
     else
         if docker inspect "$LOCAL_API_CONTAINER" >/dev/null 2>&1; then
             # 容器还在运行时，先把 token 从本地 server 登出，让它回到官方
-            local_base="$(local_api_env_value TELEGRAM_API_URL)"
+            local_base="$(env_get TELEGRAM_API_URL)"
             local_base="${local_base%%/}"
             if [ -n "$local_base" ]; then
                 echo ""
@@ -2191,8 +2214,8 @@ stop_local_api_container() {
 
     # 清除 TELEGRAM_API_URL，让 bot 回连官方 api.telegram.org；
     # 保留 TELEGRAM_API_ID / TELEGRAM_API_HASH，下次启用可直接复用。
-    if [ -n "$(local_api_env_value TELEGRAM_API_URL)" ]; then
-        remove_env_value "TELEGRAM_API_URL"
+    if [ -n "$(env_get TELEGRAM_API_URL)" ]; then
+        env_unset "TELEGRAM_API_URL"
         success ".env 中 TELEGRAM_API_URL 已清除，bot 重启后将回连官方 api.telegram.org。"
         echo "   TELEGRAM_API_ID / TELEGRAM_API_HASH 已保留，下次启用可直接复用。"
         changed=1
@@ -2201,7 +2224,7 @@ stop_local_api_container() {
     fi
 
     # 只有发生过实际变更（关了容器或清了配置）才重启 bot
-    if [ "$changed" -eq 1 ]; then
+    if [ "$changed" -eq 1 ] && [ "$restart_after" = "restart" ]; then
         echo ""
         success "本地 API 已关闭，正在自动重启 bot 以回连官方 api.telegram.org..."
         restart_bot_after_api_switch
@@ -2354,7 +2377,8 @@ set_runtime_mode() {
 }
 
 choose_runtime_mode() {
-    local choice=""
+    local choice="" previous_mode
+    previous_mode="$(get_runtime_mode)"
 
     echo ""
     echo "请选择保活方式（决定服务以什么方式常驻，之后可以随时改）:"
@@ -2387,6 +2411,14 @@ choose_runtime_mode() {
             return
             ;;
     esac
+
+    # 换了保活方式，就得先把原来那套停掉。以前这里改完记录就直接返回，调用方紧接着
+    # start_service——于是 PM2 里的旧进程还 online，systemd 又拉起一个新的：同一个
+    # SQLite、同一个 Web 端口、同一个 token 长轮询（Telegram 直接回 409 Conflict），
+    # 而两边看起来都"启动成功了"，最难查的那种。
+    if [ "$previous_mode" != "none" ] && [ "$previous_mode" != "$(get_runtime_mode)" ]; then
+        stop_service_in_mode "$previous_mode"
+    fi
     success "保活方式: $(runtime_mode_label)"
 }
 
@@ -2536,6 +2568,34 @@ stop_service() {
     esac
 }
 
+# 按**指定**的保活方式停一次服务。
+#
+# stop_service 停的是"当前记录的那一套"，而切换保活方式时要停的恰好是切换前那套，
+# 记录已经改掉了，所以单独抽一个按参数停的版本。没有对应进程就静静返回。
+stop_service_in_mode() {
+    case "$1" in
+        systemd)
+            systemd_unit_installed || return 0
+            info "[切换] 正在停止原来的 systemd 服务..."
+            stop_systemd_service
+            ;;
+        pm2)
+            command_exists pm2 || return 0
+            pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1 || return 0
+            info "[切换] 正在移除原来的 PM2 进程..."
+            # 用 delete 而不是 stop：用户已经不用 PM2 了，留一条 stopped 记录只会
+            # 让 service_running / pm2 save 继续把它当自己人。
+            pm2 delete "$PM2_APP_NAME" >/dev/null 2>&1 || true
+            pm2 save >/dev/null 2>&1 || true
+            ;;
+        nohup|foreground)
+            [ -f "xgent.pid" ] || return 0
+            info "[切换] 正在停止原来的后台进程..."
+            stop_background_process
+            ;;
+    esac
+}
+
 service_running() {
     local pid
     case "$(get_runtime_mode)" in
@@ -2599,9 +2659,11 @@ WEB_PORT=""
 
 reset_web_state_cache() {
     WEB_STATE_LOADED=0
-    # 只清 LOADED 标志不够：load_web_state 失败时会提前 return，把上一次的
-    # WEB_ENABLED 留在原地，组件清单就会拿旧值画一个错的状态。
+    # 只清 LOADED 标志不够：load_web_state 失败时会提前 return，把上一次的值
+    # 留在原地，读到的就是过期状态。四个一起清，谁都别想读到脏值。
     WEB_ENABLED="no"
+    WEB_HAS_PASSWORD="no"
+    WEB_PORT=""
 }
 
 # Web 配置探测。跑一次要加载全部 section（约一两秒），所以结果缓存起来，
@@ -2613,44 +2675,7 @@ load_web_state() {
     venv_ready || return 1
 
     set +e
-    output=$(run_bot_python "$VENV_PYTHON" - <<'PY' 2>/dev/null
-import asyncio
-import contextlib
-import io
-import os
-import sys
-
-sys.path.insert(0, os.path.abspath("."))
-os.environ.setdefault("AUTHORIZED_USER_ID", "1")
-
-from xgent_app.bootstrap import load_sections
-
-ns = {"__file__": os.path.abspath("xgent_server.py")}
-# load_sections() 会往 stdout 打加载日志，而 shell 靠 stdout 取结果，
-# 混进去就是脏值。丢进黑洞，只留下面显式 print 的两行。
-with contextlib.redirect_stdout(io.StringIO()):
-    load_sections(ns)
-
-
-async def main():
-    await ns["UserDataManager"].init()
-    digest = await ns["read_web_password_hash"]()
-    port = ns["normalize_web_port"](
-        ns["UserDataManager"].get("web_port", ns["DEFAULT_WEB_PORT"])
-    )
-    enabled = ns["normalize_bool"](
-        ns["UserDataManager"].get("web_enabled", False), False
-    )
-    print(f"password={'yes' if digest else 'no'}")
-    print(f"port={port}")
-    print(f"enabled={'yes' if enabled else 'no'}")
-    # aiosqlite 起了非 daemon 工作线程，不显式关掉这段一次性脚本不会退出。
-    await (await ns["BotMemoryDB"].get_instance()).close()
-
-
-asyncio.run(main())
-PY
-)
+    output=$(run_config_py get-web-state 2>/dev/null)
     exit_code=$?
     set -euo pipefail
 
@@ -2719,8 +2744,8 @@ component_state_web() {
 component_state_bot() {
     local token id
 
-    token="$(local_api_env_value BOT_TOKEN)"
-    id="$(local_api_env_value AUTHORIZED_USER_ID)"
+    token="$(env_get BOT_TOKEN)"
+    id="$(env_get AUTHORIZED_USER_ID)"
 
     if [ -z "$token" ]; then
         printf 'missing|未配置 Bot Token，当前是仅 Web 模式\n'
@@ -2772,7 +2797,7 @@ render_component_board() {
 }
 
 deployment_configured() {
-    [ -n "$(local_api_env_value BOT_TOKEN)" ] && return 0
+    [ -n "$(env_get BOT_TOKEN)" ] && return 0
     load_web_state || return 1
     [ "$WEB_HAS_PASSWORD" = "yes" ]
 }
@@ -2786,7 +2811,7 @@ require_deployment() {
 
 sync_deploy_mode_state() {
     ensure_state_dir
-    if [ -n "$(local_api_env_value BOT_TOKEN)" ]; then
+    if [ -n "$(env_get BOT_TOKEN)" ]; then
         DEPLOY_MODE="telegram"
     else
         DEPLOY_MODE="web-only"
@@ -2836,6 +2861,12 @@ deploy_web() {
     echo ""
     info "── 2  web · 浏览器网页访问 ──────────────────────────"
     ensure_identity_placeholder
+    # 必须在当前 shell 里先加载一次。下面 component_state_web 是在 $(...) 里跑的，
+    # 那是子 shell——它内部 load_web_state 对 WEB_ENABLED / WEB_HAS_PASSWORD 的
+    # 赋值随子 shell 一起消失，父 shell 读到的永远是初值 no。后果是本页第 3 项
+    # 恒显示"开启 Web 功能（当前: 已关闭）"，点下去 toggle_web_enabled 又以为没设
+    # 过密码——装好之后没有任何路径能把 Web 关掉。
+    load_web_state || true
     row="$(component_state_web)"
     state="${row%%|*}"
 
@@ -2878,35 +2909,7 @@ set_web_enabled() {
     local want="$1"
 
     venv_ready || { error "   [错误] 运行环境未就绪，无法修改。"; return 1; }
-    if ! run_bot_python "$VENV_PYTHON" - "$want" <<'WEBTOGGLE' >/dev/null 2>&1
-import asyncio
-import contextlib
-import io
-import os
-import sys
-
-sys.path.insert(0, os.path.abspath("."))
-os.environ.setdefault("AUTHORIZED_USER_ID", "1")
-
-from xgent_app.bootstrap import load_sections
-
-ns = {"__file__": os.path.abspath("xgent_server.py")}
-with contextlib.redirect_stdout(io.StringIO()):
-    load_sections(ns)
-
-want = sys.argv[1] == "1"
-
-
-async def main():
-    await ns["UserDataManager"].init()
-    ns["UserDataManager"].set("web_enabled", want)
-    await ns["UserDataManager"].save_config("web_enabled", want)
-    await (await ns["BotMemoryDB"].get_instance()).close()
-
-
-asyncio.run(main())
-WEBTOGGLE
-    then
+    if ! run_config_py set-web-enabled "$want" >/dev/null 2>&1; then
         error "   [错误] 写入配置失败。"
         return 1
     fi
@@ -2916,6 +2919,10 @@ WEBTOGGLE
 }
 
 toggle_web_enabled() {
+    # 自己先确保状态是新鲜的，不依赖调用方替我们加载过——这个函数读的两个变量
+    # 都是全局缓存，而缓存最容易在 $(...) 子shell 里被填成"看起来有值"的旧值。
+    load_web_state || true
+
     if [ "$WEB_ENABLED" = "yes" ]; then
         set_web_enabled 0 && success "Web 功能已关闭"
     else
@@ -2950,7 +2957,7 @@ deploy_bot() {
         read -r -p "   请选择 [1-4，默认 4]: " choice
         case "$choice" in
             1)
-                remove_env_value "BOT_TOKEN"
+                env_unset "BOT_TOKEN"
                 ensure_env_value "BOT_TOKEN" "   请输入 Telegram Bot Token（输入时不显示）" secret
                 sync_deploy_mode_state
                 validate_telegram_token
@@ -2962,7 +2969,7 @@ deploy_bot() {
                 read -r -p "   确认移除 Bot Token、切换为仅 Web 模式？[y/N]: " confirm
                 case "$confirm" in
                     y|Y)
-                        remove_env_value "BOT_TOKEN"
+                        env_unset "BOT_TOKEN"
                         sync_deploy_mode_state
                         success "已切换为仅 Web 模式（历史记录和模型配置都保留）。"
                         ;;
@@ -2990,16 +2997,16 @@ deploy_bot() {
 # 没必要专门问用户一次。缺了才补，已有真实 ID 时绝不覆盖。
 ensure_identity_placeholder() {
     local current
-    current="$(local_api_env_value AUTHORIZED_USER_ID)"
+    current="$(env_get AUTHORIZED_USER_ID)"
     is_number "$current" && return 0
-    upsert_env_value "AUTHORIZED_USER_ID" "1"
+    env_set "AUTHORIZED_USER_ID" "1"
     info "   已把 AUTHORIZED_USER_ID 设为占位值 1（仅 Web 模式下它只是身份标识）。"
 }
 
 prompt_authorized_user_id() {
     local force="${1:-}" current="" new_value=""
 
-    current="$(local_api_env_value AUTHORIZED_USER_ID)"
+    current="$(env_get AUTHORIZED_USER_ID)"
     if [ "$force" != "force" ] && is_number "$current" && [ "$current" != "1" ]; then
         return 0
     fi
@@ -3017,7 +3024,7 @@ prompt_authorized_user_id() {
         read -r -p "   请输入 Telegram 用户 ID（纯数字，在 @userinfobot 里查看）: " new_value
         is_number "$new_value" || warn "   请只输入数字。"
     done
-    upsert_env_value "AUTHORIZED_USER_ID" "$new_value"
+    env_set "AUTHORIZED_USER_ID" "$new_value"
     success "授权用户 ID 已设置为 $new_value"
 }
 

@@ -452,7 +452,7 @@ class ComponentBoardTests(InstallScriptLibraryMixin, unittest.TestCase):
             write_lf(root / ".env", "BOT_TOKEN=1:abc\n")
             result = self.run_lib(
                 'sync_deploy_mode_state; echo "a=$DEPLOY_MODE"\n'
-                'remove_env_value BOT_TOKEN\n'
+                'env_unset BOT_TOKEN\n'
                 'sync_deploy_mode_state; echo "b=$DEPLOY_MODE"\n'
                 'echo "file=$(cat "$STATE_DIR/deploy-mode")"\n',
                 root,
@@ -558,11 +558,126 @@ class KeepAliveTests(InstallScriptLibraryMixin, unittest.TestCase):
 
     def test_web_toggle_writes_the_same_key_as_the_bot_menu(self):
         # 装置页和 Telegram 菜单必须写同一个 key，否则两边显示会打架。
-        self.assertIn('"web_enabled"', INSTALL_SCRIPT)
-        self.assertIn("save_config", INSTALL_SCRIPT)
+        # 具体读写已经收进 tools/xgent_config.py，install.sh 只负责调子命令。
+        config_py = (ROOT / "tools" / "xgent_config.py").read_text(encoding="utf-8")
+        self.assertIn('"web_enabled"', config_py)
+        self.assertIn("save_config", config_py)
         toggle = INSTALL_SCRIPT[INSTALL_SCRIPT.index("toggle_web_enabled() {"):]
         self.assertIn("set_web_enabled 0", toggle)
         self.assertIn("set_web_enabled 1", toggle)
+        self.assertIn("run_config_py set-web-enabled", INSTALL_SCRIPT)
+
+    def test_web_config_bootstrap_lives_in_exactly_one_place(self):
+        # 曾经有五段内联 Python 各抄一遍 load_sections 的 15 行 preamble。
+        self.assertNotIn("from xgent_app.bootstrap import load_sections", INSTALL_SCRIPT)
+        self.assertIn("run_config_py() {", INSTALL_SCRIPT)
+
+    def test_deploy_web_reads_a_freshly_loaded_state(self):
+        """deploy_web 必须在**当前 shell** 里加载一次 Web 状态。
+
+        component_state_web 是在 $(...) 里跑的，它内部 load_web_state 对
+        WEB_ENABLED / WEB_HAS_PASSWORD 的赋值随子 shell 一起消失。少了这次显式加载，
+        本页第 3 项就恒显示"开启 Web 功能（当前: 已关闭）"，点下去 toggle_web_enabled
+        又以为没设过密码——装好之后没有任何路径能把 Web 关掉。
+        """
+        with self.temp_dir() as temp_dir:
+            root = self.sandbox(temp_dir)
+            result = self.run_lib(
+                # 真的 load_web_state 要建 venv、开数据库；这个桩只做它成功时
+                # 该做的事——把四个全局变量填好。
+                'load_web_state() { WEB_STATE_LOADED=1; WEB_HAS_PASSWORD=yes;'
+                ' WEB_ENABLED=yes; WEB_PORT=8790; return 0; }\n'
+                'ensure_identity_placeholder() { :; }\n'
+                'venv_ready() { return 0; }\n'
+                'service_running() { return 0; }\n'
+                'port_is_listening() { return 0; }\n'
+                'deploy_web <<< ""\n',
+                root,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("关闭 Web 功能", result.stdout)
+            self.assertNotIn("开启 Web 功能", result.stdout)
+
+    def test_detached_restart_helper_never_interpolates_the_proxy_url(self):
+        # 生成 helper 用的是不加引号的 <<EOF 时，代理地址会被拼进脚本正文——
+        # 密码里一个反引号或 $( 就成了在 helper 里执行的代码，而那个值只过了
+        # "^socks5://" 前缀检查。值必须走环境变量。
+        with self.temp_dir() as temp_dir:
+            root = self.sandbox(temp_dir)
+            write_lf(
+                root / ".env",
+                "XGENT_IP_MODE=sock5\n"
+                "XGENT_SOCKS5_PROXY=socks5://u:$(touch pwned)@h:1080\n",
+            )
+            result = self.run_lib(
+                # 只要生成出来的 helper，不真的把它跑起来。
+                'nohup() { :; }\n'
+                'restart_pm2_detached >/dev/null\n'
+                'cat "$STATE_DIR"/pm2-restart.*.sh\n',
+                root,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertNotIn("touch pwned", result.stdout)
+            self.assertIn("XGENT_RESTART_SOCKS5", result.stdout)
+            self.assertFalse((root / "pwned").exists())
+
+    def test_restart_dispatches_on_the_recorded_mode_not_on_leftovers(self):
+        # start_service / stop_service 都按 runtime mode 分发，restart 必须一致。
+        # 以前它第二步看的是"存在 PM2 进程就走 PM2"：把保活方式改成 nohup 之后，
+        # 只要那条 PM2 记录还在，restart 就又从 PM2 起，和用户刚选的方式正好相反。
+        stubs = (
+            'start_background() { echo TOOK_NOHUP; }\n'
+            'restart_pm2_detached() { echo TOOK_PM2; }\n'
+            'start_with_systemd() { echo TOOK_SYSTEMD; }\n'
+            'start_service() { echo TOOK_FALLBACK; }\n'
+            'stop_background_process() { :; }\n'
+        )
+        with self.temp_dir() as temp_dir:
+            root = self.sandbox(temp_dir)
+            # 记录是 nohup，但 PM2 看起来装着、进程也还在。
+            result = self.run_lib(
+                'set_runtime_mode nohup\n'
+                'command_exists() { return 0; }\n'
+                'pm2() { return 0; }\n'
+                + stubs + 'restart_app\n',
+                root,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("TOOK_NOHUP", result.stdout)
+            self.assertNotIn("TOOK_PM2", result.stdout)
+
+            # 反过来：记录是 pm2 就走 pm2，哪怕 xgent.pid 还躺在目录里。
+            write_lf(root / "xgent.pid", "1\n")
+            result = self.run_lib(
+                'set_runtime_mode pm2\n' + stubs + 'restart_app\n',
+                root,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("TOOK_PM2", result.stdout)
+            self.assertNotIn("TOOK_NOHUP", result.stdout)
+
+    def test_switching_keepalive_mode_stops_the_previous_one(self):
+        # 不停旧的那套，两套会同时跑：同一个 SQLite、同一个 Web 端口、同一个
+        # token 长轮询（Telegram 直接回 409），而两边看起来都"启动成功了"。
+        with self.temp_dir() as temp_dir:
+            root = self.sandbox(temp_dir)
+            probe = 'stop_service_in_mode() { echo "STOPPED=$1"; }\n'
+            result = self.run_lib(
+                'set_runtime_mode pm2\n' + probe
+                + 'systemd_available() { return 0; }\n'
+                + 'choose_runtime_mode <<< "1"\n',
+                root,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("STOPPED=pm2", result.stdout)
+
+            # 选的还是原来那个，就不该去停任何东西。
+            result = self.run_lib(
+                'set_runtime_mode pm2\n' + probe + 'choose_runtime_mode <<< "2"\n',
+                root,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertNotIn("STOPPED=", result.stdout)
 
     def test_uninstall_removes_the_systemd_unit(self):
         uninstall = INSTALL_SCRIPT[
@@ -594,6 +709,163 @@ class NonInteractivePathTests(unittest.TestCase):
         self.assertNotIn("read -r", prepare)
         # 缺配置时要明确报错，而不是把 pm2/systemd 拉起一个连不上的空服务。
         self.assertIn("require_deployment", prepare)
+
+
+@requires_bash_harness
+class EnvFileTests(InstallScriptLibraryMixin, unittest.TestCase):
+    """.env 的读写只有 env_get / env_set / env_unset 三个入口。
+
+    这里以前有七份各写一遍的实现，踩过的坑各修在其中一两份里。三条一起钉住。
+    """
+
+    def test_reads_are_anchored_and_strip_carriage_returns(self):
+        with self.temp_dir() as temp_dir:
+            root = self.sandbox(temp_dir)
+            write_lf(
+                root / ".env",
+                "BOT_TOKEN=abc\r\nXGENT_BOT_TOKEN=keepme\r\nA=1\r\nB=2\r\n",
+            )
+            result = self.run_lib(
+                'echo "token=[$(env_get BOT_TOKEN)]"\n'
+                'env_unset A B\n'
+                'echo "--- env ---"\n'
+                'cat .env\n',
+                root,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            # 值末尾的 \r 必须吃掉：带着它发给 Telegram 会直接鉴权失败，
+            # 而 AUTHORIZED_USER_ID 会被判成"不是合法数字"。
+            self.assertIn("token=[abc]", result.stdout)
+            # 行首锚定：动 BOT_TOKEN 不能连带碰到 XGENT_BOT_TOKEN。
+            self.assertIn("XGENT_BOT_TOKEN=keepme", result.stdout)
+            # env_unset 支持一次删多个键。
+            self.assertNotIn("A=1", result.stdout)
+            self.assertNotIn("B=2", result.stdout)
+
+    def test_writes_stage_the_temp_file_next_to_the_env(self):
+        # mktemp 默认落在 /tmp，跨文件系统时 mv 会退化成复制+删除，复制中途失败
+        # 就把含 BOT_TOKEN 和全部 api_key 的 .env 截断且无备份。同目录才是原子
+        # rename。set_ip_mode / migrate_env_key 以前各自违反过这条。
+        for name in ("env_set", "env_unset"):
+            block = INSTALL_SCRIPT[INSTALL_SCRIPT.index(f"{name}() {{"):]
+            block = block[:block.index("\n}\n")]
+            self.assertIn("mktemp ./.env.XXXXXX", block, name)
+        # 恰好两处，说明没有第三个函数又自己拼了一遍 .env 的写入。
+        self.assertEqual(2, INSTALL_SCRIPT.count("mktemp ./.env.XXXXXX"))
+
+    def test_socks5_proxy_value_is_cleaned_like_every_other_value(self):
+        # 这个读法以前是唯一没去 \r 的：代理地址带个回车符传给 httpx，
+        # 报出来的错和换行符八竿子打不着。
+        with self.temp_dir() as temp_dir:
+            root = self.sandbox(temp_dir)
+            write_lf(root / ".env",
+                     "XGENT_IP_MODE=sock5\r\nXGENT_SOCKS5_PROXY=socks5://1.2.3.4:1080\r\n")
+            result = self.run_lib(
+                'echo "mode=[$(get_ip_mode)]"\n'
+                'echo "proxy=[$(get_socks5_proxy)]"\n',
+                root,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("mode=[sock5]", result.stdout)
+            self.assertIn("proxy=[socks5://1.2.3.4:1080]", result.stdout)
+
+
+@requires_bash_harness
+class DependencyInstallTests(InstallScriptLibraryMixin, unittest.TestCase):
+    """重启不该被 pip 的联网需求绑住。"""
+
+    def test_pip_is_skipped_when_requirements_did_not_change(self):
+        # restart / start / 菜单 2·3·9 全都经过 install_requirements，而 pip 每次
+        # 都要联网（--upgrade pip 必然去问一次 PyPI），一断网就被 set -e 掀掉整个
+        # 重启。可"重启一个已经装好的服务"跟装依赖本来是两件事。
+        stubs = (
+            'core_imports_ok() { return 0; }\n'
+            'print_core_versions() { :; }\n'
+            'python() { echo "PIP_RAN $*"; }\n'
+        )
+        with self.temp_dir() as temp_dir:
+            root = self.sandbox(temp_dir)
+            write_lf(root / "requirements.txt", "aiosqlite\n")
+            result = self.run_lib(
+                'ensure_state_dir\n'
+                'cp requirements.txt "$REQUIREMENTS_SNAPSHOT"\n'
+                + stubs + 'install_requirements\n',
+                root,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertNotIn("PIP_RAN", result.stdout)
+
+            # requirements.txt 变了就必须真的装一遍——快路不能变成"永远不装"。
+            write_lf(root / "requirements.txt", "aiosqlite\nopenai\n")
+            result = self.run_lib(stubs + 'install_requirements\n', root)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("PIP_RAN", result.stdout)
+
+    def test_a_half_broken_venv_still_gets_repaired(self):
+        # 快路的两个条件必须同时满足：requirements 没变**且**核心包真的 import 得动。
+        # 只看前者的话，被人删掉半截的 venv 就再也自愈不了。
+        with self.temp_dir() as temp_dir:
+            root = self.sandbox(temp_dir)
+            write_lf(root / "requirements.txt", "aiosqlite\n")
+            result = self.run_lib(
+                'ensure_state_dir\n'
+                'cp requirements.txt "$REQUIREMENTS_SNAPSHOT"\n'
+                'core_imports_ok() { return 1; }\n'
+                'print_core_versions() { :; }\n'
+                'python() { echo "PIP_RAN $*"; }\n'
+                'install_requirements\n',
+                root,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("PIP_RAN", result.stdout)
+
+
+class UninstallSafetyTests(unittest.TestCase):
+    """卸载是最不可逆的一步，几条底线用正文断言钉住。"""
+
+    def test_process_sweep_is_scoped_to_this_checkout(self):
+        # bot_python_code 生成的内联 Python 本身就含 XGENT_APP_ENTRY 字面量，
+        # 拿它当判据等于每份副本都命中——在 /tmp/xgt 里 stop 一下，会顺手杀掉
+        # /home/... 那份正在服务的进程。
+        sweep = INSTALL_SCRIPT[
+            INSTALL_SCRIPT.index('stop_background_process() {'):
+            INSTALL_SCRIPT.index('remove_pm2_process() {')
+        ]
+        self.assertNotIn('*"XGENT_APP_ENTRY"*', sweep)
+        self.assertIn('*"$SCRIPT_DIR"*', sweep)
+        # 卡住的进程要真的收掉：kill 默认就是 TERM，第二发不能又是 TERM。
+        self.assertIn('kill -9 "$pid"', sweep)
+
+    def test_apt_purge_is_previewed_and_spares_the_python_base(self):
+        block = INSTALL_SCRIPT[
+            INSTALL_SCRIPT.index('remove_recorded_apt_packages() {'):
+            INSTALL_SCRIPT.index('remove_ip_mode_state() {')
+        ]
+        # 记的是 dpkg 全量差集，purge 时 apt 还会级联带走别的包——先预演给人看。
+        self.assertIn("apt-get -s purge", block)
+        # python3 系是系统基础包，一律不动。
+        self.assertIn("python3|python3-*", block)
+        # autoremove --purge 会清掉系统上所有孤立包，默认不能跑。
+        self.assertIn("XGENT_APT_AUTOREMOVE", block)
+
+    def test_uninstall_shuts_down_the_local_api_container(self):
+        # 容器是 --restart unless-stopped 起的：不关掉，卸载完还在跑，
+        # 机器重启还会自己回来，端口一直占着。
+        uninstall = INSTALL_SCRIPT[
+            INSTALL_SCRIPT.index('uninstall_app() {'):
+            INSTALL_SCRIPT.index('ensure_virtualenv() {')
+        ]
+        self.assertIn("stop_local_api_container no-restart", uninstall)
+
+    def test_venv_guard_actually_checks_something(self):
+        # 原来比的是 resolve_path "$SCRIPT_DIR/venv" 和 resolve_path "$VENV_DIR"，
+        # 而 VENV_DIR 就是前者——判据永远成立，等于给 rm -rf 装了个假保险。
+        guard = INSTALL_SCRIPT[
+            INSTALL_SCRIPT.index('safe_remove_venv() {'):
+            INSTALL_SCRIPT.index('confirm_uninstall() {')
+        ]
+        self.assertNotIn('resolve_path "$SCRIPT_DIR/venv"', guard)
+        self.assertIn('basename "$resolved"', guard)
 
 
 if __name__ == "__main__":
