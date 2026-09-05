@@ -2638,17 +2638,47 @@ venv_ready() {
     [ -x "$VENV_PYTHON" ] && [ -f "$VENV_ACTIVATE" ]
 }
 
+# 端口上有没有人在听。0 = 在听，或者查不出来（不敢下结论）；1 = 确定没人在听。
+#
+# 判据顺序是刻意的：先直连一次端口，这是唯一不依赖 /proc/net 的判据，也正好就是
+# 我们真想知道的那件事。Android 不给普通应用（含 Termux）读 /proc/net/tcp，ss 和
+# netstat 在那儿要么 Permission denied、要么只吐一行表头；原来只看 grep 有没有命中，
+# 于是"查不了"被当成了"没监听"，装好的机器固定报一句黄色的"端口没有监听"，而服务
+# 其实好得很。连接是内核层面的事，那条限制管不着它。
 port_is_listening() {
-    local port="$1"
+    local port="$1" probe_rc=0 out=""
+
+    if venv_ready; then
+        run_config_py probe-port "$port" >/dev/null 2>&1 || probe_rc=$?
+        case "$probe_rc" in
+            0) return 0 ;;   # 连上了
+            1) return 1 ;;   # ECONNREFUSED，确定没人在听
+        esac                 # 2 或其它：探测本身没跑成，往下退
+    fi
+
+    # 退回 ss / netstat，但只在它们**真的答上话**时才采信否定结论：退出码为 0 且
+    # 有输出，才算"查到了、里面没这个端口"。原来的写法把 ss 的退出码丢进管道，
+    # "被拒"和"没命中"塌成了同一个 1，那正是这个 bug 的根。
     if command_exists ss; then
-        ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"
-        return $?
+        out="$(ss -ltn 2>/dev/null)" || out=""
+        if [ -n "$out" ]; then
+            if printf '%s\n' "$out" | awk '{print $4}' | grep -qE "[:.]${port}\$"; then
+                return 0
+            fi
+            return 1
+        fi
     fi
     if command_exists netstat; then
-        netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"
-        return $?
+        out="$(netstat -ltn 2>/dev/null)" || out=""
+        if [ -n "$out" ]; then
+            if printf '%s\n' "$out" | awk '{print $4}' | grep -qE "[:.]${port}\$"; then
+                return 0
+            fi
+            return 1
+        fi
     fi
-    # 两个工具都没有就别下"异常"的结论——查不到不等于没监听。
+
+    # 谁都没答上话就别下"异常"的结论——查不到不等于没监听。
     return 0
 }
 

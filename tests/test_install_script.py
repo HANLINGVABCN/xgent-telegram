@@ -3,7 +3,9 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import socket
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -512,6 +514,36 @@ class KeepAliveTests(InstallScriptLibraryMixin, unittest.TestCase):
             )
             self.assertIn("OK", result.stdout)
 
+    def test_port_check_does_not_trust_an_ss_that_could_not_answer(self):
+        # Android/Termux 上 ss 装着、但读不了 /proc/net/tcp：退出码非零、stdout 空。
+        # "查不了"绝不能塌成"没监听"——那正是那句黄色误报的来源。
+        with self.temp_dir() as temp_dir:
+            root = self.sandbox(temp_dir)
+            result = self.run_lib(
+                'venv_ready() { return 1; }\n'
+                'command_exists() { [ "$1" = ss ]; }\n'
+                'ss() { echo "ss: Permission denied" >&2; return 1; }\n'
+                'if port_is_listening 8790; then echo OK; else echo CLAIMS_DOWN; fi\n',
+                root,
+            )
+            self.assertIn("OK", result.stdout)
+
+    def test_port_check_still_trusts_an_ss_that_did_answer(self):
+        # 反面：ss 正常答话、里面确实没有这个端口，这才是"确定没监听"。
+        with self.temp_dir() as temp_dir:
+            root = self.sandbox(temp_dir)
+            listing = 'State  Recv-Q Send-Q Local Address:Port\\nLISTEN 0 128 127.0.0.1:22'
+            result = self.run_lib(
+                'venv_ready() { return 1; }\n'
+                'command_exists() { [ "$1" = ss ]; }\n'
+                f'ss() {{ printf "%b\\n" "{listing}"; }}\n'
+                'if port_is_listening 8790; then echo OK; else echo CLAIMS_DOWN; fi\n'
+                'if port_is_listening 22; then echo FOUND22; fi\n',
+                root,
+            )
+            self.assertIn("CLAIMS_DOWN", result.stdout)
+            self.assertIn("FOUND22", result.stdout)
+
     def web_state(self, root, *, password="yes", enabled="yes",
                   running="0", listening="0") -> str:
         """跑 component_state_web，但把"要有 venv 和数据库"那两步换成桩。
@@ -686,6 +718,36 @@ class KeepAliveTests(InstallScriptLibraryMixin, unittest.TestCase):
         ]
         self.assertIn("remove_systemd_service", uninstall)
         self.assertIn("remove_runtime_mode_state", uninstall)
+
+
+class PortProbeTests(unittest.TestCase):
+    """probe-port 是端口检测的主判据：Android 上 ss/netstat 全失灵时只剩它。
+
+    不需要 bash，也不需要 venv——它只用 stdlib 的 socket，刻意不走 xgent_config
+    的 _load()。
+    """
+
+    @staticmethod
+    def _probe(port) -> int:
+        return subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "xgent_config.py"),
+             "probe-port", str(port)],
+            cwd=ROOT, text=True, capture_output=True, timeout=60,
+        ).returncode
+
+    def test_listening_port_is_found_and_closed_port_is_refused(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            port = server.getsockname()[1]
+            self.assertEqual(0, self._probe(port))
+        # 出了 with 端口就没人听了，同一个端口现在必须给出确定的否定结论。
+        self.assertEqual(1, self._probe(port))
+
+    def test_unusable_port_value_is_inconclusive_not_down(self):
+        # 2 = 没探成。调用方会把它当"查不出来"往下退，而不是据此报异常。
+        self.assertEqual(2, self._probe("不是端口"))
+        self.assertEqual(2, self._probe(0))
 
 
 class NonInteractivePathTests(unittest.TestCase):

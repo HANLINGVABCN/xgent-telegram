@@ -1914,6 +1914,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         break
                     smart_notice = _smart_match_notice(block)
                     block_type = block['type']
+                    round_state.note_over_eligibility(block_type)
 
                     # 智能匹配时，先把"系统提示"发到聊天，放在执行结果前面，让用户也能看到
                     if smart_notice:
@@ -1932,6 +1933,21 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             notice=sys_notice,
                         )
 
+                    # over 协议：模型声明"这一轮不必把结果回灌给我"，并把收尾语预先写在
+                    # 块里。这里只发出去，不执行、不进回灌载荷。拦不拦得住由循环末尾的
+                    # apply_over 定——白名单外的协议或任何一个失败都会作废它。
+                    # 收尾语无条件发出：即便 over 随后作废，模型改口的话会跟在它后面。
+                    # 不单独落库：这段文字本来就在助手回复里，再记一份等于给下一轮添噪音。
+                    if block_type == 'over':
+                        round_state.over_text = str(block.get('body') or '').strip()
+                        if round_state.over_text:
+                            await safe_send_message(
+                                context,
+                                update.effective_chat.id,
+                                round_state.over_text,
+                            )
+                        continue
+
                     standard_operation = await dispatch_standard_protocol(
                         block,
                         executor=AgentExecutor,
@@ -1941,6 +1957,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         search_api_key=BotConfig.TAVILY_API_KEY,
                     )
                     if standard_operation is not None:
+                        if not standard_operation.get('success'):
+                            round_state.over_blocked = True
                         operation_notice = standard_operation['notice']
                         operation_presentation = build_standard_operation_presentation(
                             standard_operation
@@ -2016,6 +2034,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             )
                         except Exception as e:
                             logger.error(f"Agent写入文件失败: {e}")
+                            round_state.over_blocked = True
                             file_notice = f"[file结果] 写入失败: {filename}。错误: {str(e)[:200]}"
                             await safe_send_message(
                                 context,
@@ -2057,6 +2076,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             )
                         except Exception as e:
                             logger.error(f"Agent base64 写入文件失败: {e}")
+                            round_state.over_blocked = True
                             file_notice = f"[file:base64结果] 写入失败: {filename}。错误: {str(e)[:200]}"
                             await safe_send_message(
                                 context,
@@ -2112,6 +2132,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             stop_requested=is_stop_requested,
                         )
                         shell_result = shell_execution['result']
+                        if not shell_result.get('success'):
+                            round_state.over_blocked = True
                         session_id = shell_execution['session_id']
                         command = shell_execution['command']
                         output = shell_execution['output']
@@ -2231,6 +2253,11 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 # typing 状态会空转到 max_duration 才停。
                 typing_stop.set()
                 await cancel_task_quietly(typing_task)
+
+            # over 协议的拦截点，全局就这一处：模型说了不必回灌，且这一轮每个操作都成功，
+            # 就把回灌载荷丢掉，让下面的协调器落到"没有新上下文"那条既有分支——正常收尾、
+            # 不再叫一次模型。该发的结果已经发了，该落库的也已经落库了。
+            round_state.apply_over()
 
             round_decision = plan_agent_round_transition(
                 round_state,

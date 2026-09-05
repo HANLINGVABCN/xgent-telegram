@@ -12,8 +12,47 @@ import asyncio
 import contextlib
 import io
 import os
+import socket
 import sys
+import time
 from typing import Any, Dict
+
+
+def _probe_port(raw: str) -> int:
+    """127.0.0.1 的这个端口上有没有人在听。0=在听 1=确定没人听 2=没探成。
+
+    刻意不走 _load()：这里只要 stdlib 的 socket，用不着数据库和 section，也就没
+    机会让加载期日志污染 stdout（见下面 _load 的注释），顺带省掉一两秒。
+
+    为什么用连接而不是 ss / netstat：Android 不给普通应用（含 Termux）读
+    /proc/net/tcp，那两个工具在那儿要么 Permission denied、要么只吐一行表头，
+    于是"查不了"会被误读成"没监听"。连接是内核层面的事，那条限制管不着它——
+    connect 拿到 ECONNREFUSED 才是"确实没人在听"的铁证，而这个证据在 Android
+    上同样成立。ECONNREFUSED 单独接、其余 OSError 一律归 2：按 errno 判，不去
+    嗅错误文案，也就不吃语言环境的亏。
+
+    只探 127.0.0.1：Web 服务固定绑 DEFAULT_WEB_HOST，不会只监听 ::1。
+    """
+    try:
+        port = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 2
+    if not 1 <= port <= 65535:
+        return 2
+
+    # 连不上时重试两次。刚重启完会有零点几秒的空窗：进程已经在跑、端口还没 bind
+    # 上，那正是黄色误报最爱的地方。
+    for attempt in range(3):
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                return 0
+        except ConnectionRefusedError:
+            pass
+        except OSError:
+            return 2
+        if attempt < 2:
+            time.sleep(0.2)
+    return 1
 
 
 def _load() -> Dict[str, Any]:
@@ -118,10 +157,14 @@ def main(argv: list) -> int:
         print(__doc__, file=sys.stderr)
         print(
             "用法: xgent_config.py "
-            "{get-web-state|set-password|get-port|set-port <值>|set-web-enabled 0|1}",
+            "{get-web-state|set-password|get-port|set-port <值>|set-web-enabled 0|1"
+            "|probe-port <端口>}",
             file=sys.stderr,
         )
         return 2
+    # probe-port 不读配置、不碰数据库，走一条不经过 _load() 的短路径。
+    if argv[0] == "probe-port":
+        return _probe_port(argv[1] if len(argv) > 1 else "")
     return asyncio.run(_dispatch(argv[0], argv[1:]))
 
 
