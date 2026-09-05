@@ -113,6 +113,17 @@ _web_external_outbox: Any = WebOutbox()
 # 真实 PTB bot 引用。网页发起对话时，MirrorBot 用它把消息同时投递到 Telegram。
 _web_real_bot: Optional[Any] = None
 _web_application: Optional[Any] = None
+# 本进程是否**托管** Web 服务器。只有服务进程（runtime._start_web_component）会
+# 置位；CLI（xgent）和 tools/xgent_config.py 是另外的进程，它们不该去起停监听。
+#
+# 不置位的后果实测过：CLI 里改一次 Web 密码，messages.py 会调
+# restart_web_chat(None)，stop_web_chat 因为本进程 _web_chat_server 是 None 而空转
+# （服务器在服务进程里，停不掉），紧接着 start 去 bind 服务进程占着的端口，
+# 拿一个 [Errno 98] Address already in use，被 logger.error 吞掉。用户那边表现为
+# "密码怎么改都不生效"，日志里一行提示都不给他。
+_web_managed_here: bool = False
+# 配置对账任务。见 _web_config_reconciler。
+_web_config_watch_task: Optional[asyncio.Task] = None
 
 # 网页可改的参数白名单。刻意不含提供商增删改和 API Key——那些留在 Telegram 里。
 WEB_EDITABLE_SETTINGS = {
@@ -818,8 +829,8 @@ async def _web_run_conversation(text: str, outbox: Any) -> None:
             update.message.text = text
         except Exception:
             pass
-        # 状态处理器（设密码/端口）会调 restart_web_chat(context.application)，
-        # mirror context 默认无该属性，这里补上真实 application。
+        # 状态处理器（设密码/端口）会读 context.application（apply_web_config_change
+        # 要用它记 _web_application），mirror context 默认无该属性，这里补上。
         context.application = _web_application
         try:
             await handle_text_message(update, context)
@@ -1267,7 +1278,8 @@ def _web_is_busy() -> bool:
     return _conversation_processing_lock.locked()
 
 
-async def start_web_chat_if_enabled(app: Optional[Any] = None, *, force: bool = False) -> None:
+async def start_web_chat_if_enabled(app: Optional[Any] = None, *,
+                                    force: bool = False) -> Optional[str]:
     """按开关启动 Web 服务。失败只记日志，绝不影响任何其他组件。
 
     ``app`` 只用来记 ``_web_application``（网页里改密码/端口时状态处理器要取
@@ -1275,31 +1287,36 @@ async def start_web_chat_if_enabled(app: Optional[Any] = None, *, force: bool = 
     ``set_telegram_channel`` 在真正就绪时登记，见那里的说明。所以本函数在
     Telegram 完全不通时也能正常跑完。
 
-    ``force=True`` 时跳过 ``web_enabled`` 开关检查——没有 BOT_TOKEN 的部署里
-    Web 本身就是唯一入口，不该受"开关默认关闭"影响。
+    ``force=True`` 时跳过 ``web_enabled`` 开关检查。**只**给"库里从没写过这个
+    开关"的迁移路径用（见 runtime._start_web_component）——以前这里是"没有
+    BOT_TOKEN 就一律强制启动"，于是用户显式关掉 Web 之后一重启就被无声打开。
+
+    返回 ``None`` 表示起来了、或按开关本就不该起；返回字符串表示**想起却没起
+    成**的原因，调用方可以直接把它显示给用户。以前这条路径全静音：网页/CLI 里
+    改完配置看不到任何反馈，日志里那行 error 只有翻日志的人才看得见。
     """
     global _web_chat_server, _web_application
     if _web_chat_server is not None:
-        return
+        return None
     # 跨端同步观察者无论 Web 开不开都要跑（它还承担 CLI→TG 镜像），先启动；
     # Web 开着时下面再把新服务器的 outbox 接给它。
     await start_external_sync_watcher()
     web_on = normalize_bool(UserDataManager.get('web_enabled', False), False)
     term_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
     if not force and not (web_on or term_on):
-        return
+        return None
 
     # 记下 application：网页触发配置状态（设密码/端口需 restart_web_chat）时，
     # 状态处理器会取 context.application，mirror context 默认没有该属性。
     _web_application = app
 
-    password_hash = await read_web_password_hash()
+    password_hash = await read_web_password_hash(fresh=True)
     if not password_hash:
         logger.warning("Web Chat 已开启但未设置密码，跳过启动")
         _notify_owner_soon(
             "⚠️ Web/终端服务已开启但没有设置密码，未启动。请在 /start → 🌐 Web 里设置密码。"
         )
-        return
+        return "没有设置访问密码，Web 服务不会启动"
 
     config = WebChatConfig(
         host=DEFAULT_WEB_HOST,
@@ -1338,6 +1355,9 @@ async def start_web_chat_if_enabled(app: Optional[Any] = None, *, force: bool = 
         ],
         # 纯 Web 模式（force=True）下 Web 服务本身就是唯一入口，不受
         # web_enabled 开关影响，始终视为已开启。
+        # force=True 是"无视开关强行起"，那时把 is_web_enabled 也接成常真——
+        # 否则监听起来了、每个请求又被 _require_web_enabled 403 掉，等于起了一个
+        # 没用的服务。正常路径不再走 force，见 runtime._start_web_component。
         is_web_enabled=(
             (lambda: True) if force
             else (lambda: normalize_bool(UserDataManager.get('web_enabled', False), False))
@@ -1349,11 +1369,12 @@ async def start_web_chat_if_enabled(app: Optional[Any] = None, *, force: bool = 
     except Exception as e:
         logger.error(f"Web Chat 启动失败: {e}")
         _notify_owner_soon(f"⚠️ Web Chat 启动失败：{safe_text(str(e)[:200])}")
-        return
+        return f"启动失败：{str(e)[:200]}"
     _web_chat_server = server
     # 跨端同步观察者已在函数开头启动，这里把新服务器的 outbox 接给它：
     # 此后 CLI 写库的实时帧直达当前在线的网页订阅者。
     await start_external_sync_watcher(server.outbox)
+    return None
 
 
 async def stop_web_chat() -> None:
@@ -1369,20 +1390,169 @@ async def stop_web_chat() -> None:
     _web_external_outbox = WebOutbox()
 
 
-async def restart_web_chat(app: Optional[Any] = None, *, force: Optional[bool] = None) -> None:
-    """改端口/密码后重启，让新配置立即生效。
+async def restart_web_chat(app: Optional[Any] = None, *,
+                           force: bool = False) -> Optional[str]:
+    """改端口后重启，让新配置立即生效。返回值同 start_web_chat_if_enabled。
 
-    ``force`` 省略时按 ``app is None`` 自动判断：纯 Web 模式（app 为 None，
-    没有 PTB Application 可传）下重启也应强制起服务，不受 web_enabled 开关
-    影响，语义与 start_web_chat_if_enabled 的初次启动保持一致。
+    以前 ``force`` 省略时按 ``app is None`` 推断，意思是"没有 PTB Application 就
+    当纯 Web 模式，强制起服务"。但 ``app is None`` 同样成立于 **CLI 进程**（见
+    cli_bridge.CliContext.application），于是在 CLI 里改一次密码就会让 CLI 自己去
+    抢服务进程占着的端口。判据换成显式传参，不再猜。
     """
-    if force is None:
-        force = app is None
     await stop_web_chat()
-    await start_web_chat_if_enabled(app, force=force)
+    return await start_web_chat_if_enabled(app, force=force)
 
 
 def is_web_chat_running() -> bool:
     return _web_chat_server is not None and _web_chat_server.running
+
+
+def set_web_managed_here(managed: bool = True) -> None:
+    """标记"本进程托管 Web 服务器"。只由服务进程的组件启动流程调用。"""
+    global _web_managed_here
+    _web_managed_here = managed
+
+
+def web_managed_here() -> bool:
+    """本进程是不是那个持有监听 socket 的进程。
+
+    CLI（xgent）里改 Web 配置时用它决定是"自己起停服务器"还是"只写库，交给
+    服务进程去对账"。CLI 自己起停的后果见 _web_managed_here 的注释。
+    """
+    return _web_managed_here
+
+
+def web_service_reachable(port: Optional[int] = None) -> bool:
+    """Web 端口上有没有人在听——跨进程的、可信的那个答案。
+
+    is_web_chat_running() 只知道**本进程**有没有服务器对象，在 CLI 里永远是
+    False。拿它当"Web 在不在跑"显示给用户，cli+web 部署下就固定显示"🟡 已开启
+    但未运行"，而网页明明好得很。跨进程的事实只能问端口。
+
+    用连接而不是 ss/netstat：Android（含 Termux）不给普通应用读 /proc/net/tcp，
+    那两个工具在那儿答不上话，理由同 tools/xgent_config.py 的 _probe_port。
+    超时 0.3s——127.0.0.1 上连不上是立刻 ECONNREFUSED，慢就是别的问题。
+    """
+    if _web_managed_here:
+        return is_web_chat_running()
+    if port is None:
+        port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
+    try:
+        with socket.create_connection((DEFAULT_WEB_HOST, int(port)), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+# 配置对账间隔。用户在 CLI/install.sh 里按下开关之后最多等这么久看到效果。
+_WEB_CONFIG_POLL_SECONDS = 3.0
+
+
+async def reconcile_web_config_once() -> None:
+    """把库里的 Web 配置对到本进程的运行状态上。
+
+    这里存在的理由：Web 配置有三个写入方（服务进程自己、xgent CLI、install.sh），
+    但每个进程读到的都是**自己启动时**那份快照——UserDataManager._data 和
+    BotMemoryDB._config_cache 都是进程内的。于是"在 CLI 里把密码改了、网页登录
+    还是报认证失败"，而 CLI 那边看着一切正常（哈希确实写进库了）。以前 CLI 试图
+    自己 restart_web_chat 来解决，结果是去抢服务进程占着的端口、拿一个
+    EADDRINUSE、被日志吞掉。
+
+    只在托管 Web 的进程里跑（由 runtime 拉起），所以不会有两个进程抢端口。
+    """
+    db = await BotMemoryDB.get_instance()
+    web_on = normalize_bool(await db.get_config_fresh('web_enabled', False), False)
+    term_on = normalize_bool(await db.get_config_fresh('terminal_enabled', False), False)
+    port = normalize_web_port(await db.get_config_fresh('web_port', DEFAULT_WEB_PORT))
+    password_hash = await read_web_password_hash(fresh=True)
+
+    # 1) 先对齐内存快照。菜单文案、/api/health、传给 WebChatServer 的
+    #    is_web_enabled / is_terminal_enabled 回调读的都是它——单这一步就修好了
+    #    "别的进程改完，这边还在报旧值"。
+    UserDataManager.set('web_enabled', web_on)
+    UserDataManager.set('terminal_enabled', term_on)
+    UserDataManager.set('web_port', port)
+    UserDataManager.set('_web_has_password', bool(password_hash))
+
+    state = component_state("web")
+    should_run = bool((web_on or term_on) and password_hash)
+
+    # 2) 该开没开 / 该停还在跑。
+    if should_run and not is_web_chat_running():
+        error = await start_web_chat_if_enabled(_web_application)
+        if error:
+            state.set(COMPONENT_DOWN, error=error)
+        else:
+            state.set(COMPONENT_UP, host=DEFAULT_WEB_HOST, port=port)
+        return
+    if not should_run:
+        if is_web_chat_running():
+            await stop_web_chat()
+            logger.info("Web 服务已按配置关闭（web_enabled=%s terminal_enabled=%s）",
+                        web_on, term_on)
+        state.set(COMPONENT_DISABLED, reason="未开启或未设置访问密码")
+        return
+
+    # 3) 在跑着：只有端口变了才值得重启——重启会换掉 session_key，把所有已登录的
+    #    浏览器踢下线。密码变了就地换哈希：它只在登录那一刻被读（web_server
+    #    _handle_login），没必要为此断开在线连接。
+    server = _web_chat_server
+    if server is None:
+        return
+    if int(getattr(server.config, 'port', port) or port) != int(port):
+        logger.info("Web 端口已改为 %s，重启服务生效", port)
+        error = await restart_web_chat(_web_application)
+        if error:
+            state.set(COMPONENT_DOWN, error=error)
+        else:
+            state.set(COMPONENT_UP, host=DEFAULT_WEB_HOST, port=port)
+        return
+    if str(getattr(server.config, 'password_hash', '') or '') != password_hash:
+        server.config.password_hash = password_hash
+        logger.info("Web 访问密码已更新，就地生效（未重启，在线会话不受影响）")
+
+
+async def apply_web_config_change(app: Optional[Any] = None) -> str:
+    """刚把 Web 配置写进库之后调它。返回一句给用户看的说明（不需要说就是空串）。
+
+    托管 Web 的进程立刻对账一次：该起就起、该停就停、端口变了才重启、密码就地换。
+    非托管进程（xgent CLI）什么都不做——服务进程的对账任务几秒内会做同样的事，而
+    CLI 自己动手只会去抢服务进程占着的端口。
+    """
+    global _web_application
+    if not web_managed_here():
+        return "已保存。后台服务几秒内自动生效，不用重启。"
+    if app is not None:
+        _web_application = app
+    await reconcile_web_config_once()
+    return ""
+
+
+async def _web_config_reconciler() -> None:
+    while True:
+        await asyncio.sleep(_WEB_CONFIG_POLL_SECONDS)
+        try:
+            await reconcile_web_config_once()
+        except Exception:
+            # 单轮失败不能带走这个任务：下一轮照旧。取舍同
+            # _web_external_record_watcher 的轮询。
+            logger.debug("Web 配置对账失败", exc_info=True)
+
+
+async def start_web_config_reconciler() -> None:
+    global _web_config_watch_task
+    if _web_config_watch_task is None or _web_config_watch_task.done():
+        _web_config_watch_task = asyncio.create_task(
+            _web_config_reconciler(), name="xgent-web-config-reconciler")
+
+
+async def stop_web_config_reconciler() -> None:
+    global _web_config_watch_task
+    task, _web_config_watch_task = _web_config_watch_task, None
+    if task is None or task.done():
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await task
 
 # --- ☆ 其他类型消息处理 ☆ ---

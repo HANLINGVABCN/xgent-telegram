@@ -93,9 +93,15 @@ async def _get_web_state(ns: Dict[str, Any]) -> None:
     enabled = ns["normalize_bool"](
         ns["UserDataManager"].get("web_enabled", False), False
     )
+    # 网页终端与网页对话是两个独立开关，共用同一个服务器和同一份密码。
+    # install.sh 侧要能同时显示和切换两者，所以一并吐出来。
+    terminal = ns["normalize_bool"](
+        ns["UserDataManager"].get("terminal_enabled", False), False
+    )
     print(f"password={'yes' if digest else 'no'}")
     print(f"port={port}")
     print(f"enabled={'yes' if enabled else 'no'}")
+    print(f"terminal={'yes' if terminal else 'no'}")
 
 
 async def _set_password(ns: Dict[str, Any]) -> None:
@@ -131,6 +137,12 @@ async def _set_web_enabled(ns: Dict[str, Any], want: bool) -> None:
     await ns["UserDataManager"].save_config("web_enabled", want)
 
 
+async def _set_terminal_enabled(ns: Dict[str, Any], want: bool) -> None:
+    await ns["UserDataManager"].init()
+    ns["UserDataManager"].set("terminal_enabled", want)
+    await ns["UserDataManager"].save_config("terminal_enabled", want)
+
+
 async def _dispatch(command: str, args: list) -> int:
     ns = _load()
     try:
@@ -144,6 +156,8 @@ async def _dispatch(command: str, args: list) -> int:
             return await _set_port(ns, args[0] if args else "")
         elif command == "set-web-enabled":
             await _set_web_enabled(ns, bool(args) and args[0] == "1")
+        elif command == "set-terminal-enabled":
+            await _set_terminal_enabled(ns, bool(args) and args[0] == "1")
         else:
             print(f"未知子命令: {command}", file=sys.stderr)
             return 2
@@ -158,7 +172,7 @@ def main(argv: list) -> int:
         print(
             "用法: xgent_config.py "
             "{get-web-state|set-password|get-port|set-port <值>|set-web-enabled 0|1"
-            "|probe-port <端口>}",
+            "|set-terminal-enabled 0|1|probe-port <端口>}",
             file=sys.stderr,
         )
         return 2

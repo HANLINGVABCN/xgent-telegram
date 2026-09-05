@@ -197,11 +197,16 @@ def get_web_menu():
     open_button = _build_web_open_button()
     if open_button is not None:
         rows.append([open_button])
+    # 两个开关一律是真开关。这里以前会在"没有 BOT_TOKEN 且 Web 开着"时把它们换成
+    # callback_data="noop" 的死按钮、写上"不可关闭"——判据只是"有没有 Telegram"，
+    # 看不见 CLI 这个同样真实的入口。于是 cli+web 部署的用户在 xgent 里点开关，只
+    # 拿到一句"这是你唯一的入口"。会不会真把自己关在外面，改由 handler 按**点击来
+    # 源**判断（callbacks.py 的 _would_lock_out_caller）：网页里点才拦，CLI 和
+    # Telegram 里点直接生效。
     rows.extend([
         [InlineKeyboardButton(
-            f"{'🟢 已开启' if enabled else '🔴 已关闭'}　点击{'关闭' if enabled else '开启'}"
-            if not (enabled and BotConfig.WEB_ONLY) else "🟢 已开启（纯 Web 模式常开，不可关闭）",
-            callback_data="toggle_web_enabled" if not (enabled and BotConfig.WEB_ONLY) else "noop"
+            f"{'🟢 已开启' if enabled else '🔴 已关闭'}　点击{'关闭' if enabled else '开启'}",
+            callback_data="toggle_web_enabled"
         )],
         [InlineKeyboardButton(
             f"🔑 密码：{'已设置' if has_password else '未设置'}",
@@ -213,7 +218,7 @@ def get_web_menu():
             callback_data="act_set_web_public_url"
         )],
     ])
-    if has_password and not BotConfig.WEB_ONLY:
+    if has_password:
         rows.append([InlineKeyboardButton("🗑️ 清除密码", callback_data="confirm_clear_web_password")])
     if public_url:
         rows.append([InlineKeyboardButton("🧹 清除公开地址", callback_data="do_clear_web_public_url")])
@@ -222,13 +227,9 @@ def get_web_menu():
     term_button = _build_terminal_open_button()
     if term_button is not None:
         rows.append([term_button])
-    # 纯 Web 模式下，关闭终端可能连带关掉唯一的 Web 入口（当 web_enabled 本身
-    # 未被显式打开时），所以这里也锁住，与上面 toggle_web_enabled 的拦截对称。
-    term_locked = BotConfig.WEB_ONLY and term_on and not enabled
     rows.append([InlineKeyboardButton(
-        f"🖥 终端：{'🟢 开' if term_on else '🔴 关'}　点击{'关闭' if term_on else '开启'}"
-        if not term_locked else "🖥 终端：🟢 开（纯 Web 模式下是唯一入口，不可关闭）",
-        callback_data="toggle_terminal_enabled" if not term_locked else "noop"
+        f"🖥 终端：{'🟢 开' if term_on else '🔴 关'}　点击{'关闭' if term_on else '开启'}",
+        callback_data="toggle_terminal_enabled"
     )])
     rows.append([InlineKeyboardButton("🔙 返回", callback_data="act_main_menu")])
     return InlineKeyboardMarkup(rows)
@@ -239,12 +240,18 @@ def build_web_text() -> str:
     port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
     public_url = str(UserDataManager.get('web_public_url', '') or '')
     has_password = bool(UserDataManager.get('_web_has_password', False))
-    running = is_web_chat_running()
     term_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
+    # 问端口，不问本进程有没有服务器对象：这个菜单在 xgent 终端里渲染得最多，而
+    # 服务器跑在另一个进程，is_web_chat_running() 在这儿永远是 False——以前 cli+web
+    # 部署固定显示"🟡 已开启但未运行"，而网页明明打得开。
+    running = web_service_reachable(port)
 
-    status = "🟢 运行中" if running else ("🟡 已开启但未运行" if enabled else "🔴 已关闭")
-    if BotConfig.WEB_ONLY:
-        status += "（纯 Web 模式常开）"
+    if running:
+        status = "🟢 运行中"
+    elif enabled or term_on:
+        status = "🟡 已开启但未运行" + ("（未设置访问密码）" if not has_password else "")
+    else:
+        status = "🔴 已关闭"
     password_line = "✅ 已设置" if has_password else "⚠️ 未设置（未设置时拒绝启动）"
     public_line = (
         f"✅ <code>{safe_text(public_url)}</code>"

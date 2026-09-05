@@ -544,18 +544,19 @@ class KeepAliveTests(InstallScriptLibraryMixin, unittest.TestCase):
             self.assertIn("CLAIMS_DOWN", result.stdout)
             self.assertIn("FOUND22", result.stdout)
 
-    def web_state(self, root, *, password="yes", enabled="yes",
+    def web_state(self, root, *, password="yes", enabled="yes", terminal="no",
                   running="0", listening="0") -> str:
         """跑 component_state_web，但把"要有 venv 和数据库"那两步换成桩。
 
         真去读配置得先建 venv、装依赖、开数据库，那是集成测试的活；这里要钉的
-        是判定顺序本身——尤其是"开关关着"必须排在"端口没监听"前面。
+        是判定本身——尤其是"开关关着"不算故障，只是说明文本不一样。
         """
         result = self.run_lib(
             'venv_ready() { return 0; }\n'
             'load_web_state() { return 0; }\n'
             f'WEB_HAS_PASSWORD={password}\n'
             f'WEB_ENABLED={enabled}\n'
+            f'WEB_TERMINAL={terminal}\n'
             'WEB_PORT=8790\n'
             f'service_running() {{ return {running}; }}\n'
             f'port_is_listening() {{ return {listening}; }}\n'
@@ -565,39 +566,61 @@ class KeepAliveTests(InstallScriptLibraryMixin, unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         return result.stdout.strip()
 
-    def test_web_disabled_in_bot_is_reported_instead_of_bare_port_failure(self):
+    def test_web_switches_are_reported_in_detail_not_as_a_fault(self):
         with self.temp_dir() as temp_dir:
             root = self.sandbox(temp_dir)
 
-            # 从老版本升上来的典型现场：装了 web 组件、密码也设了，但 bot 菜单里
-            # 的 web 开关还是关的。以前这里只说"端口没监听"，用户根本不知道去
-            # 哪儿开——必须把真正的原因说出来。
+            # 装好了、密码也设了，只是用户自己把网页对话关着——这不是故障。以前这
+            # 里返回 error，组件清单上就固定挂一个黄色的"状态异常"，用户以为自己装
+            # 错了什么。绿色只表示"装好且没坏"，开关状态放进说明文本里。
             state = self.web_state(root, enabled="no", running="0", listening="1")
-            self.assertTrue(state.startswith("error|"), state)
-            self.assertIn("已在 bot 内关闭 Web 功能", state)
+            self.assertTrue(state.startswith("installed|"), state)
+            self.assertIn("🔴 网页 关", state)
+            self.assertIn("🔴 终端 关", state)
 
-            # 开关开着、端口确实不监听，才是"去看日志"那种异常。
+            # 两个开关都要出现在说明里，无论开还是关。
+            state = self.web_state(root, enabled="yes", terminal="yes")
+            self.assertTrue(state.startswith("installed|"), state)
+            self.assertIn("🟢 网页 开", state)
+            self.assertIn("🟢 终端 开", state)
+
+            # 开关开着、服务在跑、端口确实不监听，才是"去看日志"那种异常。
             state = self.web_state(root, enabled="yes", running="0", listening="1")
             self.assertTrue(state.startswith("error|"), state)
-            self.assertNotIn("已在 bot 内关闭", state)
+            self.assertIn("没有监听", state)
+
+            # 开关关着时不做端口判断：本来就不该有人在听。
+            state = self.web_state(root, enabled="no", running="0", listening="1")
+            self.assertTrue(state.startswith("installed|"), state)
 
             # 没密码的优先级最高：开关再开也起不来。
-            state = self.web_state(root, password="no", enabled="no")
+            state = self.web_state(root, password="no", enabled="yes")
             self.assertTrue(state.startswith("missing|"), state)
 
             state = self.web_state(root, enabled="yes", running="0", listening="0")
             self.assertTrue(state.startswith("installed|"), state)
 
     def test_web_toggle_writes_the_same_key_as_the_bot_menu(self):
-        # 装置页和 Telegram 菜单必须写同一个 key，否则两边显示会打架。
+        # 装置页和应用内菜单必须写同一个 key，否则两边显示会打架。
         # 具体读写已经收进 tools/xgent_config.py，install.sh 只负责调子命令。
         config_py = (ROOT / "tools" / "xgent_config.py").read_text(encoding="utf-8")
         self.assertIn('"web_enabled"', config_py)
+        self.assertIn('"terminal_enabled"', config_py)
         self.assertIn("save_config", config_py)
         toggle = INSTALL_SCRIPT[INSTALL_SCRIPT.index("toggle_web_enabled() {"):]
         self.assertIn("set_web_enabled 0", toggle)
         self.assertIn("set_web_enabled 1", toggle)
-        self.assertIn("run_config_py set-web-enabled", INSTALL_SCRIPT)
+        # 两个开关都经 set_web_switch 落到 xgent_config.py 的子命令上。
+        self.assertIn("set_web_switch set-web-enabled", INSTALL_SCRIPT)
+        self.assertIn('run_config_py "$subcommand" "$want"', INSTALL_SCRIPT)
+        self.assertIn("set-web-enabled", config_py)
+        # 网页终端以前在安装器里根本没有入口，只能进应用内 /web 菜单开关——
+        # 同一件事在两个界面上长得不一样。
+        term_toggle = INSTALL_SCRIPT[INSTALL_SCRIPT.index("toggle_terminal_enabled() {"):]
+        self.assertIn("set_terminal_enabled 0", term_toggle)
+        self.assertIn("set_terminal_enabled 1", term_toggle)
+        self.assertIn("set_web_switch set-terminal-enabled", INSTALL_SCRIPT)
+        self.assertIn("set-terminal-enabled", config_py)
 
     def test_web_config_bootstrap_lives_in_exactly_one_place(self):
         # 曾经有五段内联 Python 各抄一遍 load_sections 的 15 行 preamble。
@@ -608,17 +631,17 @@ class KeepAliveTests(InstallScriptLibraryMixin, unittest.TestCase):
         """deploy_web 必须在**当前 shell** 里加载一次 Web 状态。
 
         component_state_web 是在 $(...) 里跑的，它内部 load_web_state 对
-        WEB_ENABLED / WEB_HAS_PASSWORD 的赋值随子 shell 一起消失。少了这次显式加载，
-        本页第 3 项就恒显示"开启 Web 功能（当前: 已关闭）"，点下去 toggle_web_enabled
-        又以为没设过密码——装好之后没有任何路径能把 Web 关掉。
+        WEB_ENABLED / WEB_HAS_PASSWORD / WEB_TERMINAL 的赋值随子 shell 一起消失。少了
+        这次显式加载，下面两个开关项就恒显示"（当前: 🔴 关）"，点下去 toggle_* 又以为
+        没设过密码——装好之后没有任何路径能把它们关掉。
         """
         with self.temp_dir() as temp_dir:
             root = self.sandbox(temp_dir)
             result = self.run_lib(
                 # 真的 load_web_state 要建 venv、开数据库；这个桩只做它成功时
-                # 该做的事——把四个全局变量填好。
+                # 该做的事——把五个全局变量填好。
                 'load_web_state() { WEB_STATE_LOADED=1; WEB_HAS_PASSWORD=yes;'
-                ' WEB_ENABLED=yes; WEB_PORT=8790; return 0; }\n'
+                ' WEB_ENABLED=yes; WEB_TERMINAL=yes; WEB_PORT=8790; return 0; }\n'
                 'ensure_identity_placeholder() { :; }\n'
                 'venv_ready() { return 0; }\n'
                 'service_running() { return 0; }\n'
@@ -627,8 +650,11 @@ class KeepAliveTests(InstallScriptLibraryMixin, unittest.TestCase):
                 root,
             )
             self.assertEqual(0, result.returncode, result.stderr)
-            self.assertIn("关闭 Web 功能", result.stdout)
-            self.assertNotIn("开启 Web 功能", result.stdout)
+            self.assertIn("关闭网页对话", result.stdout)
+            self.assertNotIn("开启网页对话", result.stdout)
+            # 网页终端开关必须就在同一页上，不用去别的界面找。
+            self.assertIn("关闭网页终端", result.stdout)
+            self.assertNotIn("开启网页终端", result.stdout)
 
     def test_detached_restart_helper_never_interpolates_the_proxy_url(self):
         # 生成 helper 用的是不加引号的 <<EOF 时，代理地址会被拼进脚本正文——

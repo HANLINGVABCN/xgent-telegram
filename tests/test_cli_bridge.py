@@ -410,8 +410,9 @@ class CliObjectContractTests(unittest.TestCase):
 
     def test_context_has_application_and_args(self):
         _update, context, _bot = cli_bridge.build_cli_conversation_objects(1, self.screen)
-        # messages.py:880 的 restart_web_chat(context.application) 会读它；
-        # None 正是 idle.py 里"纯 Web 模式没有 PTB Application"的合法取值。
+        # 配置状态机（设 Web 密码/端口）会读它；不补这个属性会直接 AttributeError。
+        # None 只表示"CLI 没有 PTB Application"，不再被下游当成"纯 Web 模式"——
+        # 起停 Web 服务器现在只看 idle.web_managed_here()。
         self.assertIsNone(context.application)
         # token_stats.cmd_token_stats 读 context.args。
         self.assertEqual(context.args, [])

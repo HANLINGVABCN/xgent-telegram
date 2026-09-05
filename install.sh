@@ -2686,18 +2686,20 @@ WEB_STATE_LOADED=0
 WEB_ENABLED="no"
 WEB_HAS_PASSWORD="no"
 WEB_PORT=""
+WEB_TERMINAL="no"
 
 reset_web_state_cache() {
     WEB_STATE_LOADED=0
     # 只清 LOADED 标志不够：load_web_state 失败时会提前 return，把上一次的值
-    # 留在原地，读到的就是过期状态。四个一起清，谁都别想读到脏值。
+    # 留在原地，读到的就是过期状态。五个一起清，谁都别想读到脏值。
     WEB_ENABLED="no"
     WEB_HAS_PASSWORD="no"
     WEB_PORT=""
+    WEB_TERMINAL="no"
 }
 
 # Web 配置探测。跑一次要加载全部 section（约一两秒），所以结果缓存起来，
-# 只有改过密码/端口之后才 reset。
+# 只有改过密码/端口/开关之后才 reset。
 load_web_state() {
     local output exit_code
 
@@ -2714,6 +2716,7 @@ load_web_state() {
     WEB_HAS_PASSWORD="$(printf '%s\n' "$output" | grep '^password=' | tail -n 1 | cut -d= -f2)"
     WEB_PORT="$(printf '%s\n' "$output" | grep '^port=' | tail -n 1 | cut -d= -f2)"
     WEB_ENABLED="$(printf '%s\n' "$output" | grep '^enabled=' | tail -n 1 | cut -d= -f2)"
+    WEB_TERMINAL="$(printf '%s\n' "$output" | grep '^terminal=' | tail -n 1 | cut -d= -f2)"
     [ -n "$WEB_PORT" ] || return 1
     WEB_STATE_LOADED=1
     return 0
@@ -2744,6 +2747,16 @@ component_state_cli() {
     printf 'missing|终端命令 xgent 尚未注册\n'
 }
 
+# 「网页对话」和「网页终端」两个开关的一行摘要。组件板和 web 配置页共用，
+# 保证两处说的是同一句话。调用前 load_web_state 必须已经跑过。
+web_switch_summary() {
+    local web_txt term_txt
+
+    if [ "$WEB_ENABLED" = "yes" ]; then web_txt="🟢 网页 开"; else web_txt="🔴 网页 关"; fi
+    if [ "$WEB_TERMINAL" = "yes" ]; then term_txt="🟢 终端 开"; else term_txt="🔴 终端 关"; fi
+    printf '%s · %s' "$web_txt" "$term_txt"
+}
+
 component_state_web() {
     if ! venv_ready; then
         printf 'missing|尚未创建运行环境（venv）\n'
@@ -2757,18 +2770,20 @@ component_state_web() {
         printf 'missing|尚未设置访问密码，Web 服务不会启动\n'
         return
     fi
-    # 开关关着是"密码设了但端口不监听"最常见的原因，尤其是从老版本升上来的：
-    # 那会儿 web 是 bot 菜单里的一个开关，默认关着，装了 web 组件也不会自动开。
-    # 必须排在端口检查前面——否则用户只看到"端口未监听"，根本不知道去哪儿开。
-    if [ "$WEB_ENABLED" != "yes" ]; then
-        printf 'error|已在 bot 内关闭 Web 功能，端口 %s 未监听（本页第 3 项可开启）\n' "$WEB_PORT"
-        return
-    fi
-    if service_running && ! port_is_listening "$WEB_PORT"; then
+    # 「装好了」和「开着」是两件事：开关是用户自己按下去的，关着不是故障。这里
+    # 以前在 WEB_ENABLED != yes 时返回 error，于是一台装得好好的机器固定挂着一个
+    # 黄色的"状态异常"——用户看到的是"我装错了什么"，其实只是开关关着。开关状态
+    # 现在放进说明文本里（两个开关都显示），绿色只表示"装好且没坏"。
+    if [ "$WEB_ENABLED" = "yes" ] && service_running && ! port_is_listening "$WEB_PORT"; then
         printf 'error|Web 已开启，但服务在运行、端口 %s 没有监听（查日志排查）\n' "$WEB_PORT"
         return
     fi
-    printf 'installed|http://127.0.0.1:%s（密码已设置，Web 已开启）\n' "$WEB_PORT"
+    if [ "$WEB_ENABLED" = "yes" ]; then
+        printf 'installed|%s · http://127.0.0.1:%s\n' "$(web_switch_summary)" "$WEB_PORT"
+    else
+        printf 'installed|%s · 端口 %s 未监听（进本组件可开启）\n' \
+            "$(web_switch_summary)" "$WEB_PORT"
+    fi
 }
 
 component_state_bot() {
@@ -2892,10 +2907,10 @@ deploy_web() {
     info "── 2  web · 浏览器网页访问 ──────────────────────────"
     ensure_identity_placeholder
     # 必须在当前 shell 里先加载一次。下面 component_state_web 是在 $(...) 里跑的，
-    # 那是子 shell——它内部 load_web_state 对 WEB_ENABLED / WEB_HAS_PASSWORD 的
-    # 赋值随子 shell 一起消失，父 shell 读到的永远是初值 no。后果是本页第 3 项
-    # 恒显示"开启 Web 功能（当前: 已关闭）"，点下去 toggle_web_enabled 又以为没设
-    # 过密码——装好之后没有任何路径能把 Web 关掉。
+    # 那是子 shell——它内部 load_web_state 对 WEB_ENABLED / WEB_HAS_PASSWORD /
+    # WEB_TERMINAL 的赋值随子 shell 一起消失，父 shell 读到的永远是初值 no。后果是
+    # 下面第 3、4 两项恒显示"（当前: 🔴 关）"，点下去 toggle_* 又以为没设过密码
+    # ——装好之后没有任何路径能把这两个开关关掉。
     load_web_state || true
     row="$(component_state_web)"
     state="${row%%|*}"
@@ -2905,17 +2920,28 @@ deploy_web() {
         echo ""
         echo "   1) 修改访问密码"
         echo "   2) 修改监听端口"
+        # 网页对话和网页终端是两个独立开关，共用同一个服务器和同一份密码。应用内
+        # /web 菜单一直是两个都给，安装器这边以前只给了 web 那一个——同一件事在两
+        # 个界面上长得不一样，用户翻遍安装器也找不到终端开关。
         if [ "$WEB_ENABLED" = "yes" ]; then
-            echo "   3) 关闭 Web 功能（当前: 已开启）"
+            echo "   3) 关闭网页对话（当前: 🟢 开）"
         else
-            echo "   3) 开启 Web 功能（当前: 已关闭）"
+            echo "   3) 开启网页对话（当前: 🔴 关）"
         fi
-        echo "   4) 返回"
-        read -r -p "   请选择 [1-4，默认 4]: " choice
+        if [ "$WEB_TERMINAL" = "yes" ]; then
+            echo "   4) 关闭网页终端（当前: 🟢 开）"
+        else
+            echo "   4) 开启网页终端（当前: 🔴 关；开了等于放开任意命令执行）"
+        fi
+        echo "   5) 返回"
+        read -r -p "   请选择 [1-5，默认 5]: " choice
         case "$choice" in
-            1) set_web_password ;;
-            2) set_web_port ;;
+            # 改密码/改端口同样是"服务在跑就几秒内自动生效"，说一句免得用户
+            # 以为还得自己去重启。两个 toggle 自己会说，不在这里重复。
+            1) set_web_password && web_switch_effect_note ;;
+            2) set_web_port && web_switch_effect_note ;;
             3) toggle_web_enabled ;;
+            4) toggle_terminal_enabled ;;
             *) : ;;
         esac
         return
@@ -2925,21 +2951,22 @@ deploy_web() {
     set_web_password
     set_web_port
     # 装完就打开：用户在组件清单里选了 web，意思就是"我要用网页"，没道理让他
-    # 装完再去 bot 菜单里手动开一次。从老版本升上来的人最容易踩这个——那时
+    # 装完再去应用内菜单里手动开一次。从老版本升上来的人最容易踩这个——那时
     # web 是 bot 菜单里的一个开关，默认关着。
+    # 网页终端不跟着开：它是任意命令执行，必须由用户显式按下（本页第 4 项）。
     if [ "$WEB_ENABLED" != "yes" ]; then
-        set_web_enabled 1 && success "Web 功能已开启"
+        set_web_enabled 1 && success "网页对话已开启"
     fi
 }
 
-# 读写的是 bot 菜单里那个开关的同一个 key：UserDataManager 的 web_enabled，
-# callbacks.py:683 的 toggle_web_enabled 写的也是它。两边共用一份配置，
-# 在哪边改都一样。
-set_web_enabled() {
-    local want="$1"
+# 读写的是应用内 /web 菜单里那两个开关的同一个 key：UserDataManager 的
+# web_enabled / terminal_enabled，callbacks.py 的 toggle_web_enabled /
+# toggle_terminal_enabled 写的也是它们。两边共用一份配置，在哪边改都一样。
+set_web_switch() {
+    local subcommand="$1" want="$2"
 
     venv_ready || { error "   [错误] 运行环境未就绪，无法修改。"; return 1; }
-    if ! run_config_py set-web-enabled "$want" >/dev/null 2>&1; then
+    if ! run_config_py "$subcommand" "$want" >/dev/null 2>&1; then
         error "   [错误] 写入配置失败。"
         return 1
     fi
@@ -2948,25 +2975,60 @@ set_web_enabled() {
     return 0
 }
 
+set_web_enabled() { set_web_switch set-web-enabled "$1"; }
+
+set_terminal_enabled() { set_web_switch set-terminal-enabled "$1"; }
+
+# 开关改完什么时候生效。服务端有一个配置对账任务（idle.py 的
+# _web_config_reconciler）盯着这几个 key，服务在跑就几秒内自己把监听状态调过来。
+# 以前这里一律让用户去重启服务——而重启会打断正在进行的对话。
+web_switch_effect_note() {
+    if service_running; then
+        info "   服务正在运行，几秒内自动生效（不用重启）。"
+    else
+        warn "   服务当前没在运行，下次启动时生效（主菜单 2) 启动服务）。"
+    fi
+}
+
 toggle_web_enabled() {
     # 自己先确保状态是新鲜的，不依赖调用方替我们加载过——这个函数读的两个变量
     # 都是全局缓存，而缓存最容易在 $(...) 子shell 里被填成"看起来有值"的旧值。
     load_web_state || true
 
     if [ "$WEB_ENABLED" = "yes" ]; then
-        set_web_enabled 0 && success "Web 功能已关闭"
+        set_web_enabled 0 && success "网页对话已关闭"
     else
-        # 和电报端 toggle_web_enabled 的校验保持对称。没密码就开启会留下一个
+        # 和应用内 toggle_web_enabled 的校验保持对称。没密码就开启会留下一个
         # "开关是开的、服务却从没起来"的状态：菜单里照常显示打开按钮，点下去
         # 那个地址上没人监听，用户看到的就是毫无反应。
         if [ "$WEB_HAS_PASSWORD" != "yes" ]; then
             warn "   [跳过] 还没有设置访问密码，Web 服务不会启动。"
-            warn "   请先用「设置访问密码」设好密码再开启。"
+            warn "   请先用「修改访问密码」设好密码再开启。"
             return 1
         fi
-        set_web_enabled 1 && success "Web 功能已开启"
+        set_web_enabled 1 && success "网页对话已开启"
     fi
-    warn "   改动需要重启服务才生效（主菜单 3) 重启服务）。"
+    web_switch_effect_note
+}
+
+toggle_terminal_enabled() {
+    load_web_state || true
+
+    if [ "$WEB_TERMINAL" = "yes" ]; then
+        set_terminal_enabled 0 && success "网页终端已关闭"
+    else
+        if [ "$WEB_HAS_PASSWORD" != "yes" ]; then
+            warn "   [跳过] 还没有设置访问密码，Web 服务不会启动。"
+            warn "   请先用「修改访问密码」设好密码再开启。"
+            return 1
+        fi
+        # 开之前说清代价：这个开关放开的是「在这台机器上执行任意命令」，而它
+        # 和网页对话共用同一个端口、同一份密码，没有第二道门。
+        warn "   网页终端 = 在这台机器上执行任意命令，权限与运行本服务的用户相同。"
+        warn "   它与网页对话共用同一个端口和同一份访问密码。"
+        set_terminal_enabled 1 && success "网页终端已开启"
+    fi
+    web_switch_effect_note
 }
 
 deploy_bot() {

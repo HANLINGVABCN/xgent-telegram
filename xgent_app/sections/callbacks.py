@@ -1,6 +1,59 @@
 # This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
+# --- ☆ 点击来源 ☆ ---
+# 三个入口（Telegram / 网页 / CLI）共用同一套回调 handler。绝大多数按钮不关心自己
+# 是从哪儿被点的，但"关掉 Web / 清掉密码"这类会切断入口的操作必须关心：在网页里点
+# 等于当场把自己锁在外面，在 CLI 里点则完全安全——人就在这台机器的 shell 前，随时
+# 能开回来。
+CLICK_ORIGIN_TELEGRAM = "telegram"
+CLICK_ORIGIN_WEB = "web"
+CLICK_ORIGIN_CLI = "cli"
+
+# 拦下来之后要告诉用户去哪儿关，别只说"不能"。
+WEB_LOCKOUT_HINT = (
+    "网页是这台机器当前唯一的远程入口，在网页里关掉就只能回服务器上开回来。"
+    "要关请在服务器上运行 xgent → /web，或 ./install.sh → 1 → 2。"
+)
+
+
+def click_origin(update: Any) -> str:
+    """这次点击来自哪个入口。
+
+    标记由各自的桥挂在 update / callback_query 上（cli_bridge、web_bridge）；
+    没有标记的就是真正的 Telegram 更新。
+    """
+    query = getattr(update, "callback_query", None)
+    return str(
+        getattr(query, "xgent_origin", "")
+        or getattr(update, "xgent_origin", "")
+        or CLICK_ORIGIN_TELEGRAM
+    )
+
+
+def _would_lock_out_caller(update: Any) -> bool:
+    """关掉之后，点这一下的人自己还有路进来吗？
+
+    只有"从网页点、且没有 Telegram 兜底"这一种组合会失联。以前的判据是
+    ``BotConfig.WEB_ONLY``（即"没有 BOT_TOKEN"）一个布尔，它看不见 CLI——于是
+    cli+web 部署的用户在 xgent 里点关闭，只拿到一句"这是你唯一的入口"，而他明明
+    正坐在那台机器的终端前。
+    """
+    return bool(BotConfig.WEB_ONLY) and click_origin(update) == CLICK_ORIGIN_WEB
+
+
+async def _sync_web_switches(query: Any, app: Any = None) -> None:
+    """开关写库之后，让监听状态跟上，并在需要时给用户一句说明。
+
+    真正的活儿交给 idle.apply_web_config_change：托管进程立刻对账一次，CLI 只写库
+    （由服务进程的对账任务几秒内跟上）。CLI 自己去起停的后果是抢服务进程的端口拿
+    EADDRINUSE，而且失败是静音的，见 idle._web_managed_here。
+    """
+    note = await apply_web_config_change(app)
+    if note:
+        await query.answer(note)
+
+
 async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await check_authorized_user_middleware(update, context):
@@ -33,12 +86,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await cancel_text_conversation(update)
         return
 
-    if data == "noop":
-        # 纯 Web 模式下被锁定的按钮（关闭 Web/终端会导致失联）用这个
-        # callback_data 占位，点击只提示原因，不做任何操作。
-        await query.answer("纯 Web 模式下这是你唯一的入口，不能关闭", show_alert=True)
-        return
-    
     await UserDataManager.init()
     await query.answer()
     
@@ -692,22 +739,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             if enabled and not UserDataManager.get('_web_has_password', False):
                 await query.answer("请先设置访问密码", show_alert=True)
                 return
-            if not enabled and BotConfig.WEB_ONLY:
-                # 纯 Web 模式下 Web 服务是唯一入口，没有 Telegram 兜底。真的
-                # 关掉会让用户失联，只能物理重启进程才能恢复，所以拦截。
-                await query.answer("纯 Web 模式下这是你唯一的入口，不能关闭", show_alert=True)
+            if not enabled and _would_lock_out_caller(update):
+                await query.answer(WEB_LOCKOUT_HINT, show_alert=True)
                 return
             UserDataManager.set('web_enabled', enabled)
             await UserDataManager.save_config('web_enabled', enabled)
-            # 解耦: 只在服务器运行状态需要改变时才 start/stop, 不无谓 restart
-            running = is_web_chat_running()
-            term_still_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
-            if enabled or term_still_on:
-                if not running:
-                    await start_web_chat_if_enabled(context.application)
-            else:
-                if running:
-                    await stop_web_chat()
+            await _sync_web_switches(query, context.application)
             await GlobalRecorder.record_system_op(
                 f"Web Chat {'开启' if enabled else '关闭'}",
                 {"web_enabled": enabled}
@@ -754,8 +791,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
         elif data == "confirm_clear_web_password":
-            if BotConfig.WEB_ONLY:
-                await query.answer("纯 Web 模式下这是你唯一的入口，不能清除密码", show_alert=True)
+            if _would_lock_out_caller(update):
+                await query.answer(WEB_LOCKOUT_HINT, show_alert=True)
                 return
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ 确认清除", callback_data="do_clear_web_password")],
@@ -769,16 +806,17 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
         elif data == "do_clear_web_password":
-            if BotConfig.WEB_ONLY:
+            if _would_lock_out_caller(update):
                 # 防御性拦截：正常入口已经在 confirm 步骤挡住了，这里防止有人
                 # 直接拼 callback_data 绕过确认步骤。
-                await query.answer("纯 Web 模式下这是你唯一的入口，不能清除密码", show_alert=True)
+                await query.answer(WEB_LOCKOUT_HINT, show_alert=True)
                 return
             await clear_web_password()
             # 没有密码就不能继续对外服务，连同开关一起关掉。
             UserDataManager.set('web_enabled', False)
             await UserDataManager.save_config('web_enabled', False)
-            await stop_web_chat()
+            if web_managed_here():
+                await stop_web_chat()
             await GlobalRecorder.record_system_op("清除 Web 访问密码并停止服务")
             await query.message.edit_text(
                 build_web_text(),
@@ -802,22 +840,14 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.answer("请先设置访问密码", show_alert=True)
                 return
             web_still_on = normalize_bool(UserDataManager.get('web_enabled', False), False)
-            if not term_on and not web_still_on and BotConfig.WEB_ONLY:
-                # 纯 Web 模式下，关闭终端时如果 web_enabled 也是关的（常见——
-                # 该开关默认关闭，纯 Web 模式只是绕过了它，未必被显式打开过），
-                # 会导致下面的逻辑真的停掉唯一的服务入口，必须拦截。
-                await query.answer("纯 Web 模式下这是你唯一的入口，不能关闭", show_alert=True)
+            if not term_on and not web_still_on and _would_lock_out_caller(update):
+                # 关终端时 web_enabled 也是关的，说明这一下会真的停掉唯一的服务
+                # 入口——而点它的人此刻正从网页进来。
+                await query.answer(WEB_LOCKOUT_HINT, show_alert=True)
                 return
             UserDataManager.set('terminal_enabled', term_on)
             await UserDataManager.save_config('terminal_enabled', term_on)
-            # 解耦: 终端与 Web 共享服务器但独立开关
-            running = is_web_chat_running()
-            if term_on or web_still_on:
-                if not running:
-                    await start_web_chat_if_enabled(context.application)
-            else:
-                if running:
-                    await stop_web_chat()
+            await _sync_web_switches(query, context.application)
             await GlobalRecorder.record_system_op(
                 f"终端{'开启' if term_on else '关闭'}",
                 {"terminal_enabled": term_on}

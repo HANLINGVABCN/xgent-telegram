@@ -388,13 +388,28 @@ async def _start_component(name: str, starter: Callable[[], Awaitable[Any]], *,
 
 
 async def _start_web_component(app: Any) -> None:
-    # 纯 Web 部署（没有 BOT_TOKEN）时 Web 是唯一入口，强制启动、不受
-    # web_enabled 开关影响——否则用户会把自己锁在外面。
-    force = bool(BotConfig.WEB_ONLY)
+    # 本进程就是托管 Web 服务器的那个进程。CLI 里也会加载同一套 section，靠这个
+    # 标记区分"自己起停服务器"和"只写库、交给这里对账"——见 idle.web_managed_here。
+    set_web_managed_here(True)
+
+    # 迁移兜底：库里从来没写过 web_enabled，而 Web 又是唯一入口时，写一次 True。
+    # 以前这里是无条件 force=WEB_ONLY（"没有 BOT_TOKEN 就强制启动，不看开关"），
+    # 结果用户显式把 Web 关掉之后，一重启就被无声打开——那等于这个开关不存在。
+    # 现在库里的值就是权威，只补"从没表态过"这一种情况。
+    if BotConfig.WEB_ONLY:
+        db = await BotMemoryDB.get_instance()
+        if (await db.get_config_fresh('web_enabled', None)) is None:
+            await UserDataManager.save_config('web_enabled', True)
+            logger.info("没有 BOT_TOKEN 且从未设置过 Web 开关，已默认开启 Web。")
+
     state = component_state("web")
     ok = await _start_component(
-        "web", lambda: start_web_chat_if_enabled(app, force=force), label="Web 服务",
+        "web", lambda: start_web_chat_if_enabled(app), label="Web 服务",
     )
+    # 配置对账任务：CLI / install.sh 改了密码、端口、开关之后，由它把运行状态
+    # 对过去（几秒内），不需要用户手动重启服务。Web 没起来也要跑——"现在把密码
+    # 设上"正是它要能接住的场景。
+    await start_web_config_reconciler()
     if not ok:
         return
     if is_web_chat_running():
@@ -468,6 +483,9 @@ async def shutdown_components(app: Any = None) -> None:
     for state in _COMPONENT_STATES.values():
         if state.state in (COMPONENT_UP, COMPONENT_STARTING, COMPONENT_DEGRADED):
             state.set(COMPONENT_DOWN, reason="进程停机")
+    # 配置对账任务先停：它会 start/stop Web 服务器，停机途中被它抢着重启就乱了。
+    with contextlib.suppress(Exception):
+        await stop_web_config_reconciler()
     # 出站通道先停：还没投出去的操作已经落在 channel_outbox 里，下次启动补投。
     with contextlib.suppress(Exception):
         await get_channel_registry().aclose_all()
@@ -514,14 +532,17 @@ async def run_app() -> int:
     await _start_cli_relay_component()
     await _start_triggers_component()
 
-    # 4) 一个入口都没有时别硬撑：PM2 会把这种进程显示成 online，用户以为在跑。
+    # 4) 一个对话入口都没有时说清楚，但**不退出**：trigger 调度器和 CLI 跨端回放
+    #    器还在，定时任务照跑，xgent 终端照用。以前这里 return 1，而 PM2 会立刻
+    #    把进程拉起来再撞一次同一堵墙——实测每 1.5~3 秒一轮、100% CPU、pm2 list
+    #    里还显示 online，正是那句"别硬撑"想避免的情形，只是更糟。谁挂了、为什么
+    #    挂，由组件健康（/api/health）、/healthz 和 install.sh 的组件清单去讲。
     if app is None and not is_web_chat_running():
         logger.critical(
-            "❌ 启动失败：没有 BOT_TOKEN，Web 服务也没起来"
-            "（请先在 /start → 🌐 Web 里设置访问密码，或配置 BOT_TOKEN）。"
+            "❌ 没有可用的对话入口：没有 BOT_TOKEN，Web 服务也没起来"
+            "（请先设置 Web 访问密码，或配置 BOT_TOKEN）。"
+            "定时任务与 CLI 同步继续运行；设好密码后几秒内会自动起来，不用重启。"
         )
-        await shutdown_components(None)
-        return 1
 
     # 5) Telegram 交给监督任务。
     tg_task = None

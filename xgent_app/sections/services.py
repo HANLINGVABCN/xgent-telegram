@@ -361,9 +361,16 @@ async def persist_web_password(password: str) -> str:
     return digest
 
 
-async def read_web_password_hash() -> str:
-    """按需读库。哈希不进 UserDataManager 内存快照，避免被顺手打进日志。"""
+async def read_web_password_hash(fresh: bool = False) -> str:
+    """按需读库。哈希不进 UserDataManager 内存快照，避免被顺手打进日志。
+
+    ``fresh=True`` 时绕过 BotMemoryDB 的进程内配置缓存。默认那条路径只在第一次
+    调用时真的读库，之后拿的是缓存——跨进程改密码（CLI / install.sh 写库）在本
+    进程看不见，正是"密码改了但网页还认旧密码"的那半个根因。
+    """
     db = await BotMemoryDB.get_instance()
+    if fresh:
+        return str(await db.get_config_fresh(WEB_PASSWORD_CONFIG_KEY, '') or '')
     return str(await db.get_config(WEB_PASSWORD_CONFIG_KEY, '') or '')
 
 

@@ -203,7 +203,9 @@ async def telegram_ready(app) -> None:
 # 处理、自己走一份关闭清理。它与 PTB 模式是两条并行的启动路径，"部署了哪些端"
 # 这件事因此散在两处，任何启停顺序的修改都要改两遍。现在两条路径合并成
 # runtime.run_app() 一条：Telegram 只是其中一个可选组件，没有 BOT_TOKEN 时它
-# 处于 disabled，Web 组件自动按 BotConfig.WEB_ONLY 强制启动，语义完全一致。
+# 处于 disabled，Web 组件按库里存的 web_enabled 开关启动——没有 token 且从没设过
+# 这个开关时，_start_web_component 会写一次 True 当默认值（一次性迁移），此后
+# 库里的值就是权威，用户显式关掉的 Web 不会在重启后被偷偷打开。
 
 
 async def on_shutdown(app: Optional[Any] = None):

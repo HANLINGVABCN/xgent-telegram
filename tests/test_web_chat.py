@@ -690,6 +690,92 @@ class WebOpenButtonTests(unittest.TestCase):
         self.assertEqual("web_need_password", btn.callback_data)
 
 
+class WebSwitchLockoutTests(unittest.TestCase):
+    """"会把自己关在外面吗"要按**点击来源**判断，不能按"有没有 BOT_TOKEN"。
+
+    cli+web 部署（没有 token）里，用户在 xgent 终端里点「关闭 Web」以前会被
+    "纯 Web 模式下这是你唯一的入口，不能关闭"拦下——而他正坐在那台机器的 shell 前，
+    关掉毫无风险，还能随时开回来。旧判据是 BotConfig.WEB_ONLY 一个布尔，它看不见
+    CLI 这个同样真实的入口。
+    """
+
+    SECTIONS = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "xgent_app", "sections",
+    )
+
+    def _load(self, web_only):
+        """只 exec callbacks.py 顶部那段来源判定，避开 sections 全局加载。"""
+        from typing import Any
+
+        with open(os.path.join(self.SECTIONS, "callbacks.py"), encoding="utf-8") as handle:
+            src = handle.read()
+        snippet = src[src.index("CLICK_ORIGIN_TELEGRAM"):src.index("async def _sync_web_switches")]
+        ns = {"Any": Any, "BotConfig": type("BotConfig", (), {"WEB_ONLY": web_only})}
+        exec(compile(snippet, "callbacks_snippet", "exec"), ns)
+        return ns
+
+    @staticmethod
+    def _update(origin):
+        query = type("Q", (), {"xgent_origin": origin} if origin else {})()
+        return type("U", (), {"callback_query": query})()
+
+    def test_cli_click_is_never_blocked(self):
+        ns = self._load(web_only=True)
+        self.assertEqual("cli", ns["click_origin"](self._update("cli")))
+        self.assertFalse(
+            ns["_would_lock_out_caller"](self._update("cli")),
+            "从终端点关闭不会失联——人就在这台机器上",
+        )
+
+    def test_web_click_without_telegram_is_blocked(self):
+        ns = self._load(web_only=True)
+        self.assertTrue(ns["_would_lock_out_caller"](self._update("web")))
+        # 拦下来要说清去哪儿关，不能只说"不能"。
+        self.assertIn("xgent", ns["WEB_LOCKOUT_HINT"])
+        self.assertIn("install.sh", ns["WEB_LOCKOUT_HINT"])
+
+    def test_web_click_with_telegram_fallback_is_allowed(self):
+        ns = self._load(web_only=False)
+        self.assertFalse(ns["_would_lock_out_caller"](self._update("web")),
+                         "还有 Telegram 兜底就不算失联")
+
+    def test_untagged_update_counts_as_telegram(self):
+        ns = self._load(web_only=True)
+        self.assertEqual("telegram", ns["click_origin"](self._update(None)))
+        self.assertFalse(ns["_would_lock_out_caller"](self._update(None)))
+
+    def test_web_menu_has_no_dead_switches(self):
+        """两个开关必须是真开关，不能再是 callback_data="noop" 的死按钮。"""
+        with open(os.path.join(self.SECTIONS, "ui.py"), encoding="utf-8") as handle:
+            src = handle.read()
+        menu = src[src.index("def get_web_menu():"):src.index("def build_web_text()")]
+        self.assertIn('callback_data="toggle_web_enabled"', menu)
+        self.assertIn('callback_data="toggle_terminal_enabled"', menu)
+        code = "\n".join(
+            line for line in menu.splitlines() if not line.strip().startswith("#")
+        )
+        self.assertNotIn("noop", code, "死按钮应该已经删掉，只在注释里留下由来")
+        self.assertNotIn("不可关闭", code)
+
+    def test_web_status_line_asks_the_port(self):
+        """状态行要问端口，不能问"本进程有没有服务器对象"。
+
+        /web 面板在 xgent 终端里渲染得最多，而服务器跑在另一个进程——
+        is_web_chat_running() 在那儿永远是 False，于是固定显示"🟡 已开启但未运行"。
+        """
+        with open(os.path.join(self.SECTIONS, "ui.py"), encoding="utf-8") as handle:
+            src = handle.read()
+        body = src[src.index("def build_web_text()"):]
+        body = body[:body.index("\ndef ", 1)]
+        code = "\n".join(
+            line for line in body.splitlines() if not line.strip().startswith("#")
+        )
+        self.assertIn("web_service_reachable(port)", code)
+        self.assertNotIn("is_web_chat_running()", code)
+        self.assertNotIn("纯 Web 模式常开", code)
+
+
 class WebServerStartupGuardTests(unittest.TestCase):
     def _config(self, **overrides):
         base = dict(

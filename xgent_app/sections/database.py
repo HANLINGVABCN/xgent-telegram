@@ -893,6 +893,30 @@ class BotMemoryDB:
             self._config_cache[key] = value
             return value
         return default
+
+    async def get_config_fresh(self, key: str, default: Any = None) -> Any:
+        """绕过内存缓存直接读库，并把读到的值回填缓存。
+
+        _config_cache 是**进程内**的。CLI（xgent）和 install.sh 是另外的进程，
+        它们改完配置之后本进程的缓存还是启动时那一份——"在 CLI 里改了 Web 密码，
+        网页登录仍然报认证失败"就是这么来的。需要看到别的进程写进去的值时走这个
+        方法，不要走 get_config。
+
+        键不存在时同时把缓存里的旧值清掉：否则下一次 get_config 又会把它当真
+        （比如另一个进程刚把密码清空）。
+        """
+        conn = await self._get_conn()
+        cursor = await conn.execute('SELECT value FROM config WHERE key = ?', (key,))
+        row = await cursor.fetchone()
+        if not row:
+            self._config_cache.pop(key, None)
+            return default
+        try:
+            value = json.loads(row['value'])
+        except (json.JSONDecodeError, TypeError):
+            value = row['value']
+        self._config_cache[key] = value
+        return value
     
     async def set_config(self, key: str, value: Any):
         """设置配置"""

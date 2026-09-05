@@ -884,10 +884,14 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         UserDataManager.set('state', BotState.IDLE)
         await GlobalRecorder.record_system_op("设置 Web 访问密码")
-        # 密码变了要重启服务，否则旧进程还在用旧哈希校验。
-        await restart_web_chat(context.application)
+        # 密码变了要让在跑的服务用上新哈希。托管进程立刻就地换掉；CLI 只写库，由
+        # 服务进程的对账任务几秒内换过去。以前这里无条件 restart_web_chat(
+        # context.application)，而 CLI 的 application 是 None——于是 CLI 去 bind
+        # 服务进程占着的端口，拿一个 EADDRINUSE 被日志吞掉，用户那边看到的就是
+        # "密码怎么改都不生效"。
+        note = await apply_web_config_change(context.application)
         await update.message.reply_text(
-            build_web_text(),
+            build_web_text() + (f"\n\n{note}" if note else ""),
             reply_markup=get_web_menu(),
             parse_mode=constants.ParseMode.HTML
         )
@@ -905,9 +909,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         UserDataManager.set('state', BotState.IDLE)
         await UserDataManager.save_config('web_port', port)
         await GlobalRecorder.record_system_op(f"设置 Web 端口: {port}")
-        await restart_web_chat(context.application)
+        note = await apply_web_config_change(context.application)
         await update.message.reply_text(
-            build_web_text(),
+            build_web_text() + (f"\n\n{note}" if note else ""),
             reply_markup=get_web_menu(),
             parse_mode=constants.ParseMode.HTML
         )

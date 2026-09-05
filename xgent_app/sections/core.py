@@ -37,6 +37,7 @@ import threading
 import contextlib
 import copy
 import shutil
+import socket
 import tempfile
 import fnmatch
 import urllib.error

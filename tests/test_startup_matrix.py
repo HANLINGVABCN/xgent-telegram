@@ -39,12 +39,20 @@ def free_port():
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
 
-async def prepare_web():
-    \"\"\"给探针备好"Web 能起来"的最小条件：密码 + 开关 + 空闲端口。\"\"\"
+async def prepare_web(enabled=True):
+    \"\"\"给探针备好"Web 能起来"的最小条件：密码 + 开关 + 空闲端口。
+
+    一律走 save_config **落库**，不只是 set 进内存快照：配置对账任务
+    （reconcile_web_config_once）以库为准，快照里的孤值会被它对掉——那正是它存在
+    的意义（CLI / install.sh 是另外的进程，只能通过库说话）。
+
+    enabled=None 表示"库里根本没有 web_enabled 这一行"，用来测迁移分支。
+    \"\"\"
     await ns["UserDataManager"].init()
     await ns["persist_web_password"]("probe-password-123")
-    ns["UserDataManager"].set("web_enabled", True)
-    ns["UserDataManager"].set("web_port", free_port())
+    await ns["UserDataManager"].save_config("web_port", free_port())
+    if enabled is not None:
+        await ns["UserDataManager"].save_config("web_enabled", enabled)
 """ % str(ROOT)
 
 
@@ -162,21 +170,26 @@ asyncio.run(main())
         self.assertEqual(78, result["exit_code"])
 
     def test_no_token_uses_the_same_startup_path(self):
-        """没有 BOT_TOKEN：走同一条 run_app，不再有第二条 run_web_only_main。"""
+        """没有 BOT_TOKEN：走同一条 run_app，不再有第二条 run_web_only_main。
+
+        顺带钉住迁移分支：库里从没写过 web_enabled 而 Web 又是唯一入口时，写一次
+        True 并启动。以前这里是无条件 force（"没 token 就不看开关"），代价是用户
+        显式关掉 Web 之后一重启又被无声打开——那等于这个开关不存在。
+        """
         result = self.run_probe("""
 import asyncio
 
 async def main():
-    await prepare_web()
-    # 没有 token 时 Web 是唯一入口，应被强制启动（不看 web_enabled 开关）
-    ns["UserDataManager"].set("web_enabled", False)
+    await prepare_web(enabled=None)          # 库里没有 web_enabled 这一行
     task = asyncio.get_running_loop().create_task(ns["run_app"]())
     await asyncio.sleep(3.0)
     health = ns["component_health"]()
+    db = await ns["BotMemoryDB"].get_instance()
     payload = {
         "telegram_state": health.get("telegram", {}).get("state"),
         "web_state": health.get("web", {}).get("state"),
         "web_running": ns["is_web_chat_running"](),
+        "persisted_enabled": await db.get_config_fresh("web_enabled", None),
         "legacy_entry_gone": "run_web_only_main" not in ns,
         "legacy_shutdown_gone": "on_shutdown_web_only" not in ns,
         "legacy_post_init_gone": "setup_bot_commands" not in ns,
@@ -190,30 +203,127 @@ asyncio.run(main())
         self.assertEqual("disabled", result["telegram_state"])
         self.assertEqual("up", result["web_state"])
         self.assertTrue(result["web_running"],
-                        "纯 Web 部署里 Web 是唯一入口，必须强制启动")
+                        "从没表态过、且 Web 是唯一入口时要默认开起来")
+        self.assertTrue(result["persisted_enabled"],
+                        "迁移要把这次默认落库，之后库里的值就是权威")
         self.assertTrue(result["legacy_entry_gone"],
                         "run_web_only_main 应已被合并进 run_app，不留第二条启动路径")
         self.assertTrue(result["legacy_shutdown_gone"])
         self.assertTrue(result["legacy_post_init_gone"])
         self.assertEqual(0, result["exit_code"])
 
-    def test_no_entrypoint_at_all_fails_loudly(self):
-        """既没有 token、Web 也起不来（没设密码）：直接以 1 退出。
+    def test_explicit_web_off_survives_a_restart(self):
+        """用户显式关掉 Web：没有 token 也不许偷偷打开，进程也不许因此退出。
 
-        不能留一个什么都不做的进程——PM2 会把它显示成 online，用户以为在跑。
+        cli+web 部署里"把网页关掉、只用 xgent 终端"是完全正当的诉求。以前
+        _start_web_component 里 force=WEB_ONLY 会无声地把它打开回来。
+        """
+        result = self.run_probe("""
+import asyncio
+
+async def main():
+    await prepare_web(enabled=False)
+    task = asyncio.get_running_loop().create_task(ns["run_app"]())
+    await asyncio.sleep(5.0)                  # 跨过一轮配置对账（3s）
+    health = ns["component_health"]()
+    db = await ns["BotMemoryDB"].get_instance()
+    payload = {
+        "web_running": ns["is_web_chat_running"](),
+        "web_state": health.get("web", {}).get("state"),
+        "still_off": await db.get_config_fresh("web_enabled", None),
+        "triggers_state": health.get("triggers", {}).get("state"),
+        "process_alive": not task.done(),
+    }
+    ns["request_app_stop"]()
+    payload["exit_code"] = await asyncio.wait_for(task, timeout=30)
+    print(json.dumps(payload))
+
+asyncio.run(main())
+""", extra_env={"BOT_TOKEN": ""})
+        self.assertFalse(result["web_running"], "显式关掉就是关掉，不许被强制启动")
+        self.assertEqual("disabled", result["web_state"])
+        self.assertFalse(result["still_off"], "对账任务不许把开关改回去")
+        self.assertEqual("up", result["triggers_state"],
+                         "没有对话入口也要继续跑定时任务")
+        self.assertTrue(result["process_alive"],
+                        "进程不许因为'没有对话入口'而退出——PM2 会把它拖进重启循环")
+        self.assertEqual(0, result["exit_code"])
+
+    def test_password_set_later_brings_web_up_without_a_restart(self):
+        """另一个进程写进库的密码，服务端必须自己发现并起来。
+
+        这是"在 xgent CLI 里改 Web 密码，网页登录一直认证失败"的回归测试。以前
+        每个进程只认自己启动时那份配置快照，CLI 写库之后服务端一无所知，而 CLI 自己
+        去 restart_web_chat 又只会撞上服务端占着的端口（EADDRINUSE，且被日志吞掉）。
+        """
+        result = self.run_probe("""
+import asyncio
+
+async def main():
+    await ns["UserDataManager"].init()        # 刻意先不设密码
+    await ns["UserDataManager"].save_config("web_port", free_port())
+    await ns["UserDataManager"].save_config("web_enabled", True)
+    task = asyncio.get_running_loop().create_task(ns["run_app"]())
+    await asyncio.sleep(1.0)
+    before = ns["is_web_chat_running"]()
+
+    # 模拟"另一个进程"（xgent CLI / install.sh）写库：只落库，不碰本进程的
+    # 内存快照，也不碰服务器对象。
+    db = await ns["BotMemoryDB"].get_instance()
+    digest = ns["web_auth"].hash_password("set-from-another-process")
+    await db.set_config(ns["WEB_PASSWORD_CONFIG_KEY"], digest)
+    db._config_cache.pop(ns["WEB_PASSWORD_CONFIG_KEY"], None)
+
+    await asyncio.sleep(5.0)                  # 跨过一轮对账
+    payload = {
+        "before": before,
+        "after": ns["is_web_chat_running"](),
+        "hash_in_use": (ns["_web_chat_server"].config.password_hash == digest
+                        if ns["_web_chat_server"] is not None else None),
+    }
+    ns["request_app_stop"]()
+    payload["exit_code"] = await asyncio.wait_for(task, timeout=30)
+    print(json.dumps(payload))
+
+asyncio.run(main())
+""", extra_env={"BOT_TOKEN": ""})
+        self.assertFalse(result["before"], "没密码时不该启动")
+        self.assertTrue(result["after"], "密码落库后要自己起来，不需要重启服务")
+        self.assertTrue(result["hash_in_use"], "服务端必须换用新哈希，否则登录照样失败")
+        self.assertEqual(0, result["exit_code"])
+
+    def test_no_entrypoint_stays_up_instead_of_crashlooping(self):
+        """既没有 token、Web 也起不来（没设密码）：说清楚，但**不退出**。
+
+        以前这里 return 1，而 PM2 立刻把它拉起来再撞同一堵墙——实测每 1.5~3 秒一轮、
+        100% CPU、pm2 list 里还显示 online，正是那句"别硬撑"想避免的情形，只是更糟。
+        定时任务和 CLI 同步还在，进程留着有意义；谁挂了由 /api/health 讲。
         """
         result = self.run_probe("""
 import asyncio
 
 async def main():
     await ns["UserDataManager"].init()          # 刻意不设密码
-    code = await asyncio.wait_for(ns["run_app"](), timeout=60)
-    print(json.dumps({"exit_code": code, "web_running": ns["is_web_chat_running"]()}))
+    task = asyncio.get_running_loop().create_task(ns["run_app"]())
+    await asyncio.sleep(2.0)
+    health = ns["component_health"]()
+    payload = {
+        "web_running": ns["is_web_chat_running"](),
+        "web_state": health.get("web", {}).get("state"),
+        "triggers_state": health.get("triggers", {}).get("state"),
+        "process_alive": not task.done(),
+    }
+    ns["request_app_stop"]()
+    payload["exit_code"] = await asyncio.wait_for(task, timeout=30)
+    print(json.dumps(payload))
 
 asyncio.run(main())
 """, extra_env={"BOT_TOKEN": ""})
-        self.assertEqual(1, result["exit_code"])
         self.assertFalse(result["web_running"])
+        self.assertEqual("disabled", result["web_state"])
+        self.assertEqual("up", result["triggers_state"])
+        self.assertTrue(result["process_alive"], "不许自己退出，否则 PM2 会无限重启")
+        self.assertEqual(0, result["exit_code"])
 
     def test_shutdown_closes_database_exactly_once(self):
         """只有一条停机路径：数据库连接关一次，不多不少。"""

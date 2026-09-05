@@ -426,6 +426,11 @@ class WebBot:
 class WebUpdate:
     """对照 shell_triggers.py 的 _SelfTriggerUpdate。"""
 
+    # 点击来源标记。会切断入口的按钮（关 Web / 关终端 / 清密码）靠它判断"关掉之后
+    # 点的人自己还进不进得来"——从网页点且没有 Telegram 兜底时才拦，见
+    # callbacks._would_lock_out_caller。
+    xgent_origin = "web"
+
     def __init__(self, bot: WebBot, chat_id: int):
         self.effective_chat = type("WebChat", (), {"id": chat_id})()
         self.effective_user = type("WebUser", (), {
@@ -928,6 +933,8 @@ class WebCallbackQuery:
     answer() 把提示文本作为 callback_answer 帧推给网页，由前端弹 toast/弹窗。
     message 用 WebMessage（绑定 WebBot），edit_text/reply_text 走网页帧。
     """
+
+    xgent_origin = "web"  # 见 WebUpdate.xgent_origin
 
     def __init__(self, bot: WebBot, message: WebMessage, data: str, user_id: int):
         self.bot = bot
