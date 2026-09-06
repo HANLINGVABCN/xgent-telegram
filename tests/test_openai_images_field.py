@@ -106,6 +106,13 @@ class MessageImagesExtractionTests(unittest.TestCase):
             # 6. 没有 images、content 也为空：行为保持原样（空串），不能崩
             "empty = {'choices': [{'message': {'content': None}}]}\n"
             "out['empty'] = bot.ModelClient._extract_openai_compatible_text(empty)\n"
+            # 7. 跨 mime 的同图：content 里 png、images 里 jpeg，base64 一样。
+            #    按 data URL 比较漏过去重，必须按 base64 内容比，只留一份。
+            "cross_b64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='\n"
+            "cross = {'choices': [{'message': {'content': 'data:image/png;base64,' + cross_b64, "
+            "'images': [{'image_url': {'url': 'data:image/jpeg;base64,' + cross_b64}}]}}]}\n"
+            "cross_text = bot.ModelClient._extract_openai_compatible_text(cross)\n"
+            "out['cross_data_url_count'] = cross_text.count('data:')\n"
             "print(json.dumps(out))"
         )
 
@@ -140,6 +147,10 @@ class MessageImagesExtractionTests(unittest.TestCase):
     def test_duplicate_url_not_duplicated(self):
         """同一张图不能存两份。"""
         self.assertEqual(1, self.result["dup_count"])
+
+    def test_cross_mime_duplicate_deduped(self):
+        """同一张图以不同 mime（png/jpeg）出现时也只留一份。"""
+        self.assertEqual(1, self.result["cross_data_url_count"])
 
     def test_empty_response_stays_empty(self):
         """老行为不能被破坏：空响应返回空串。"""
@@ -243,6 +254,118 @@ class MediaGenerationFlowTests(unittest.TestCase):
         self.assertTrue(self.result["has_path"])
         self.assertEqual("image/png", self.result["mime"])
         self.assertTrue(self.result["saved_ok"])
+
+
+class InlineMediaSaveBoundaryDedupTests(unittest.TestCase):
+    """落盘总关口 extract_inline_generated_media 必须按图像内容去重。
+
+    网关（vertex906-gemini 画图系）会把同一张图在一条 response 里重复返回两份
+    PNG：像素完全相同，但 C2PA 来源水印每次编码字节不同，base64/整字节/md5
+    都合并不了。这里断言落盘这道关口按 IDAT 图像数据指纹去重，只存一份。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.result = run_in_app(
+            "import os, tempfile, struct, zlib, base64\n"
+            "import xgent_server as bot\n"
+            "\n"
+            # 造两张像素相同、C2PA 水印元数据字节不同的 PNG（复刻网关真实行为）\n"
+            "def make_png(c2pa_meta):\n"
+            "    ihdr = struct.pack('>IIBBBBB', 2, 2, 8, 2, 0, 0, 0)\n"
+            "    raw = b'\\x00\\xff\\x00\\x00\\xff\\x00\\x00\\xff\\x00\\xff\\x00\\x00' * 2\n"
+            "    idat = zlib.compress(raw)\n"
+            "    def chunk(t, d):\n"
+            "        c = struct.pack('>I', len(d)) + t + d\n"
+            "        return c + struct.pack('>I', zlib.crc32(t+d) & 0xffffffff)\n"
+            "    out = b'\\x89PNG\\r\\n\\x1a\\n' + chunk(b'IHDR', ihdr)\n"
+            "    if c2pa_meta:\n"
+            "        out += chunk(b'tEXt', c2pa_meta)\n"
+            "    return out + chunk(b'IDAT', idat) + chunk(b'IEND', b'')\n"
+            "\n"
+            "a_b64 = base64.b64encode(make_png(b'C2PA-v1-ts-194816')).decode()\n"
+            "b_b64 = base64.b64encode(make_png(b'C2PA-v2-ts-194817')).decode()\n"
+            "# 两份字节不同、md5 不同，但 IDAT 图像数据一致\n"
+            "text = 'data:image/png;base64,' + a_b64 + '\\n' + 'data:image/png;base64,' + b_b64\n"
+            "\n"
+            "tmp = tempfile.mkdtemp(prefix='xgent_boundary_')\n"
+            "bot.ArtifactManager.ROOT_DIR = tmp\n"
+            "bot.ArtifactManager.GENERATED_MEDIA_DIR = os.path.join(tmp, 'gm')\n"
+            "bot.ArtifactManager.UPLOAD_DIR = os.path.join(tmp, 'up')\n"
+            "\n"
+            "processed, artifacts = bot.extract_inline_generated_media(text, append_notices=False)\n"
+            "print(json.dumps({'artifact_count': len(artifacts),\n"
+            "                  'data_url_left': 'data:' in processed}))\n"
+        )
+
+    def test_watermarked_duplicate_saves_once(self):
+        """同图不同水印（字节不同、IDAT 相同）落盘只存一份文件。"""
+        self.assertEqual(1, self.result["artifact_count"])
+
+    def test_data_urls_stripped_from_text(self):
+        """存盘后正文里不能再残留裸 data URL。"""
+        self.assertFalse(self.result["data_url_left"])
+
+
+class PerArtifactCaptionTests(unittest.TestCase):
+    """多张图时每条消息 caption 只挂自己的存盘路径，不挂全部路径。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.result = run_in_app(
+            "import os, tempfile, asyncio\n"
+            "from unittest.mock import AsyncMock, patch\n"
+            "import xgent_server as bot\n"
+            "\n"
+            "tmp = tempfile.mkdtemp(prefix='xgent_cap_')\n"
+            "bot.ArtifactManager.ROOT_DIR = os.path.join(tmp, 'xs')\n"
+            "bot.ArtifactManager.GENERATED_MEDIA_DIR = os.path.join(tmp, 'xs', 'gm')\n"
+            "bot.ArtifactManager.UPLOAD_DIR = os.path.join(tmp, 'xs', 'up')\n"
+            "\n"
+            "# 两个真实落盘的 artifact（两张不同的图）\n"
+            "png_b64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='\n"
+            "a1 = bot._save_inline_generated_media('image/png', png_b64)\n"
+            "a2 = bot._save_inline_generated_media('image/png', png_b64)\n"
+            "# 故意给两个不同路径\n"
+            "artifacts = [a1, a2]\n"
+            "\n"
+            "captured = []\n"
+            "async def fake_send_photo(chat_id, photo, caption=None, **k):\n"
+            "    captured.append(caption)\n"
+            "context = type('C', (), {'bot': type('B', (), {'send_photo': staticmethod(fake_send_photo)})()})()\n"
+            "\n"
+            "# caption 含正文 + 两个路径说明\n"
+            "d1 = bot.to_display_path(a1['path'])\n"
+            "d2 = bot.to_display_path(a2['path'])\n"
+            "caption = ('这里是根据您的描述生成的图片：\\n\\n'\n"
+            "           '【系统自动生成：本图片已自动存入 ' + d1 + '，需要时请read以返回上下文，无识图能力时请勿read以免报错】\\n'\n"
+            "           '【系统自动生成：本图片已自动存入 ' + d2 + '，需要时请read以返回上下文，无识图能力时请勿read以免报错】')\n"
+            "\n"
+            "async def main():\n"
+            "    await bot.send_generated_media_artifacts(context, 1, artifacts, caption=caption)\n"
+            "    return captured\n"
+            "caps = asyncio.run(main())\n"
+            "print(json.dumps({'count': len(caps),\n"
+            "                  'cap0_has_a1': d1 in (caps[0] or ''),\n"
+            "                  'cap0_has_a2': d2 in (caps[0] or ''),\n"
+            "                  'cap1_has_a1': d1 in (caps[1] or '') if len(caps) > 1 else None,\n"
+            "                  'cap1_has_a2': d2 in (caps[1] or '') if len(caps) > 1 else None,\n"
+            "                  'cap0_has_body': '这里是根据' in (caps[0] or ''),\n"
+            "                  'cap1_has_body': '这里是根据' in (caps[1] or '') if len(caps) > 1 else None}))\n"
+        )
+
+    def test_each_caption_only_own_path(self):
+        """每张图 caption 只含自己的路径，不挂另一张的路径。"""
+        self.assertEqual(2, self.result["count"])
+        self.assertTrue(self.result["cap0_has_a1"])   # 第一张带自己路径
+        self.assertFalse(self.result["cap0_has_a2"])   # 第一张不带第二张路径
+        self.assertFalse(self.result["cap1_has_a1"])  # 第二张不带第一张路径
+        self.assertTrue(self.result["cap1_has_a2"])   # 第二张带自己路径
+
+    def test_body_text_only_on_first(self):
+        """正文只在第一张图上，后续图不重复刷正文。"""
+        self.assertTrue(self.result["cap0_has_body"])
+        self.assertFalse(self.result["cap1_has_body"])
 
 
 if __name__ == "__main__":

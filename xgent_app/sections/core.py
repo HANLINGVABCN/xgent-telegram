@@ -35,6 +35,9 @@ import re
 import queue
 import threading
 import contextlib
+import struct
+import zlib
+import hashlib
 import copy
 import shutil
 import socket

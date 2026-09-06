@@ -491,8 +491,18 @@ class ModelClient:
                         _seen_b64.add(b64_key)
                         media_urls.append(data_url)
         combined_text = "".join(texts)
-        # 同一张图可能同时出现在 content 和 images 里，别重复拼两份。
-        deduped_urls = [u for u in media_urls if u not in combined_text]
+        # 同一张图可能同时出现在 content 和 images 里，别重复拼两份。按完整
+        # data URL 比较会漏掉跨 mime 的同图（content 里 png、images 里 jpeg），
+        # 所以改比 base64 内容：content 里出现的 base64，images 里就别再拼了。
+        content_b64_keys = {
+            part.split(';base64,', 1)[-1]
+            for part in combined_text.split('\n')
+            if ';base64,' in part
+        }
+        deduped_urls = [
+            u for u in media_urls
+            if (u.split(';base64,', 1)[-1] if ';base64,' in u else u) not in content_b64_keys
+        ]
         if not deduped_urls:
             return combined_text
         # 多个 data URL 必须用换行分隔：''.join 会让下游正则贪婪吃掉下一个
