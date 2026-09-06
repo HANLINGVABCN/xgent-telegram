@@ -503,6 +503,14 @@ async def run_app() -> int:
     """
     stop_event = get_app_stop_event()
 
+    # 游离 task（create_task）抛的未捕获异常，PTB 的 add_error_handler 接不到。
+    # 在事件循环一拿到就注册崩溃捕获器，写进 xgent_crash.log，下次「无声无息
+    # 死掉」就有完整栈。handler 定义在 main.py（模块层能被这里引用到）。
+    loop = asyncio.get_running_loop()
+    _handler = globals().get('_crash_asyncio_handler')
+    if _handler is not None:
+        loop.set_exception_handler(_handler)
+
     # 1) 公共地基：配置缓存 + 数据库。原先埋在 PTB 的 post_init 里，TG 连不上
     #    时连它都不会执行。
     await boot_core()
