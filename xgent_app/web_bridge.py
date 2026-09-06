@@ -507,6 +507,8 @@ async def deliver_op_to_bot(bot: Any, op: Op, native_id: Optional[int], *,
         "bot was blocked by the user",
         "message_id_invalid",
         "message identifier is not specified",
+        "can't parse entities",
+        "cant parse entities",
     )
 
     try:
