@@ -469,6 +469,7 @@ class ModelClient:
     def _extract_openai_compatible_text(data: Dict[str, Any]) -> str:
         texts: List[str] = []
         media_urls: List[str] = []
+        _seen_b64 = set()
         for choice in data.get("choices") or []:
             if not isinstance(choice, dict):
                 continue
@@ -480,9 +481,14 @@ class ModelClient:
                     texts.append(text)
             # 画图网关把生成图放在 message/delta 顶层的 images 数组里，
             # content 留空；只读 content 会把整份 JSON 当错误文本吐出去。
+            # 按 base64 内容去重：同一张图可能以不同 mime（image/png vs
+            # image/jpeg）出现两份，按完整 data URL 比较会漏过去重，
+            # 导致同一张图存盘/发送两次。
             for entry in (message, delta):
                 for data_url in ModelClient._openai_message_media_data_urls(entry):
-                    if data_url not in media_urls:
+                    b64_key = data_url.split(';base64,', 1)[-1] if ';base64,' in data_url else data_url
+                    if b64_key not in _seen_b64:
+                        _seen_b64.add(b64_key)
                         media_urls.append(data_url)
         combined_text = "".join(texts)
         # 同一张图可能同时出现在 content 和 images 里，别重复拼两份。
