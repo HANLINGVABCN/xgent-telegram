@@ -691,9 +691,12 @@ class ChannelWorker:
         explicit = (op.payload or {}).get("native_id")
         if explicit is not None:
             try:
-                return int(explicit)
+                val = int(explicit)
             except (TypeError, ValueError):
                 return None
+            # Telegram 原生消息 ID 从 1 起；0 或负值是无效占位（典型来源：
+            # 网页端虚拟 message_id 被误写入待发库），视同目标不存在。
+            return val if val > 0 else None
         try:
             return self._native.get(int(op.logical_id or 0))
         except (TypeError, ValueError):

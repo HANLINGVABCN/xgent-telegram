@@ -39,6 +39,14 @@ from xgent_app.fanout import (
     get_channel_registry,
 )
 
+# deliver_op_to_bot 需要把 Telegram 永久性 BadRequest 翻译成 OpNotDeliverable，
+# 否则不可恢复的 400 错误会被 fanout 当作临时网络故障无限重试，卡死整条队列。
+# 保持可选导入：模块其余部分仍然不硬依赖 telegram 包。
+try:
+    from telegram.error import BadRequest as _TgBadRequest
+except ImportError:  # pragma: no cover
+    _TgBadRequest = type(None)  # 永远不会 isinstance 命中
+
 logger = logging.getLogger(__name__)
 
 # 单次 Telegram 调用的上限。PTB 那层是 read/write 30s + connect 15s，但断连时
@@ -487,63 +495,88 @@ async def deliver_op_to_bot(bot: Any, op: Op, native_id: Optional[int], *,
             raise OpNotDeliverable(f"bot 没有方法 {name}")
         return fn
 
-    if kind == OP_SEND:
-        result = await method("send_message")(
-            chat_id=op.chat_id, text=str(payload.get("text") or ""),
-            reply_markup=markup(), parse_mode=payload.get("parse_mode"), **extra)
-        return getattr(result, "message_id", None)
+    # Telegram 永久性 BadRequest（"Message to edit not found" 等）不是网络故障，
+    # 重试永远不会成功。必须在这里翻译成 OpNotDeliverable，让 fanout 安全丢弃
+    # 并继续处理后续消息——否则一条毒药操作就能卡死整条待发队列。
+    _PERM_PATTERNS = (
+        "message to edit not found",
+        "message is not modified",
+        "message can't be deleted",
+        "message to delete not found",
+        "chat not found",
+        "bot was blocked by the user",
+        "message_id_invalid",
+        "message identifier is not specified",
+    )
 
-    if kind == OP_EDIT:
-        await method("edit_message_text")(
-            chat_id=op.chat_id, message_id=native_id,
-            text=str(payload.get("text") or ""), reply_markup=markup(),
-            parse_mode=payload.get("parse_mode"), **extra)
-        return None
+    try:
+        if kind == OP_SEND:
+            result = await method("send_message")(
+                chat_id=op.chat_id, text=str(payload.get("text") or ""),
+                reply_markup=markup(), parse_mode=payload.get("parse_mode"), **extra)
+            return getattr(result, "message_id", None)
 
-    if kind == OP_EDIT_MARKUP:
-        await method("edit_message_reply_markup")(
-            chat_id=op.chat_id, message_id=native_id, reply_markup=markup(), **extra)
-        return None
+        if kind == OP_EDIT:
+            await method("edit_message_text")(
+                chat_id=op.chat_id, message_id=native_id,
+                text=str(payload.get("text") or ""), reply_markup=markup(),
+                parse_mode=payload.get("parse_mode"), **extra)
+            return None
 
-    if kind == OP_DELETE:
-        await method("delete_message")(
-            chat_id=op.chat_id, message_id=native_id, **extra)
-        return None
+        if kind == OP_EDIT_MARKUP:
+            await method("edit_message_reply_markup")(
+                chat_id=op.chat_id, message_id=native_id, reply_markup=markup(), **extra)
+            return None
 
-    if kind == OP_CHAT_ACTION:
-        await method("send_chat_action")(
-            chat_id=op.chat_id, action=payload.get("action") or "typing", **extra)
-        return None
+        if kind == OP_DELETE:
+            await method("delete_message")(
+                chat_id=op.chat_id, message_id=native_id, **extra)
+            return None
 
-    if kind in (OP_DOCUMENT, OP_PHOTO):
-        arg_name = "document" if kind == OP_DOCUMENT else "photo"
-        handle = op.transient.get(arg_name)
-        opened = None
-        if handle is None:
-            path = payload.get("path")
-            if not path or not os.path.isfile(str(path)):
-                # 补投时文件已经没了。跳过——为一个临时文件卡住整条待发队列不值得，
-                # 与 _replay_relay_op 对同一情况的处理一致。
-                raise OpNotDeliverable(f"待发文件已不存在: {path}")
-            opened = open(str(path), "rb")
-            handle = opened
-        try:
-            if kind == OP_DOCUMENT:
-                result = await method("send_document")(
-                    chat_id=op.chat_id, document=handle,
-                    filename=payload.get("filename"),
-                    caption=payload.get("caption"), **extra)
-            else:
-                result = await method("send_photo")(
-                    chat_id=op.chat_id, photo=handle,
-                    caption=payload.get("caption"), **extra)
-        finally:
-            if opened is not None:
-                with contextlib.suppress(Exception):
-                    opened.close()
-        return getattr(result, "message_id", None)
+        if kind == OP_CHAT_ACTION:
+            await method("send_chat_action")(
+                chat_id=op.chat_id, action=payload.get("action") or "typing", **extra)
+            return None
 
-    raise OpNotDeliverable(f"未知的通道操作: {kind}")
+        if kind in (OP_DOCUMENT, OP_PHOTO):
+            arg_name = "document" if kind == OP_DOCUMENT else "photo"
+            handle = op.transient.get(arg_name)
+            opened = None
+            if handle is None:
+                path = payload.get("path")
+                if not path or not os.path.isfile(str(path)):
+                    # 补投时文件已经没了。跳过——为一个临时文件卡住整条待发队列不值得，
+                    # 与 _replay_relay_op 对同一情况的处理一致。
+                    raise OpNotDeliverable(f"待发文件已不存在: {path}")
+                opened = open(str(path), "rb")
+                handle = opened
+            try:
+                if kind == OP_DOCUMENT:
+                    result = await method("send_document")(
+                        chat_id=op.chat_id, document=handle,
+                        filename=payload.get("filename"),
+                        caption=payload.get("caption"), **extra)
+                else:
+                    result = await method("send_photo")(
+                        chat_id=op.chat_id, photo=handle,
+                        caption=payload.get("caption"), **extra)
+            finally:
+                if opened is not None:
+                    with contextlib.suppress(Exception):
+                        opened.close()
+            return getattr(result, "message_id", None)
+
+        raise OpNotDeliverable(f"未知的通道操作: {kind}")
+
+    except OpNotDeliverable:
+        raise  # OpNotDeliverable 已经是正确分类，直接上抛
+    except Exception as exc:
+        if isinstance(exc, _TgBadRequest):
+            msg = str(exc).lower()
+            if any(p in msg for p in _PERM_PATTERNS):
+                raise OpNotDeliverable(
+                    f"Telegram 永久拒绝: {exc}") from exc
+        raise  # 其他错误（网络超时、限流等）原样上抛，走熔断路径
 
 
 class MirrorBot:
@@ -687,6 +720,11 @@ class MirrorBot:
             raw = int(message_id)
         except (TypeError, ValueError):
             return message_id, None
+        # Telegram 消息 ID 从 1 起，0 和负数是无效占位值（典型来源：网页端的
+        # 虚拟 message_id）。绝不能当作原生 ID 传下去——否则会生成永远不可能
+        # 成功的 edit/delete 请求，卡死整条待发队列。
+        if raw <= 0:
+            return raw, None
         if self.real_bot is not None:
             try:
                 if not self._tg_channel().knows_logical(raw):
