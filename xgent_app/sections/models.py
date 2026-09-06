@@ -489,9 +489,13 @@ class ModelClient:
         deduped_urls = [u for u in media_urls if u not in combined_text]
         if not deduped_urls:
             return combined_text
+        # 多个 data URL 必须用换行分隔：''.join 会让下游正则贪婪吃掉下一个
+        # data URL 的 "data" 前缀、在 ":" 处断裂，残留整段 base64 进 text，
+        # 撑爆对话上下文（实测 4.6MB 图残留 230 万字符 base64）。
+        media_text = "\n".join(deduped_urls)
         if combined_text:
-            return f"{combined_text}\n{''.join(deduped_urls)}"
-        return "".join(deduped_urls)
+            return f"{combined_text}\n{media_text}"
+        return media_text
 
     @staticmethod
     def _extract_openai_compatible_sse_text(text: str, usage_sink: Optional[List[Dict[str, int]]] = None) -> str:
