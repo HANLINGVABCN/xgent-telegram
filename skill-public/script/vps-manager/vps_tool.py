@@ -50,13 +50,12 @@ PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
 WORKSPACE_DIR = PROJECT_ROOT / "workspace"
 CONFIG_FILE = WORKSPACE_DIR / "vps_servers.json"
 
-# SSH 通用选项
+# SSH 通用选项（不含 BatchMode，由 _build_ssh_cmd 按认证方式动态决定）
 SSH_COMMON_OPTS = [
     "-o", "StrictHostKeyChecking=accept-new",
     "-o", "ConnectTimeout=10",
     "-o", "ServerAliveInterval=30",
     "-o", "ServerAliveCountMax=3",
-    "-o", "BatchMode=yes",  # 非交互模式，密码认证时由 sshpass 注入
 ]
 
 
@@ -163,27 +162,12 @@ class SSHExecutor:
             cmd.extend(["sshpass", "-p", server["password"]])
 
         cmd.append("ssh")
+        cmd.extend(SSH_COMMON_OPTS)
 
-        # 交互模式不使用 BatchMode
-        if for_interactive:
-            opts = [o for o in SSH_COMMON_OPTS if o != "BatchMode=yes"]
-            # 也移除 BatchMode=yes 前面的 -o
-            cleaned = []
-            skip_next = False
-            for item in opts:
-                if skip_next:
-                    skip_next = False
-                    continue
-                if item == "-o":
-                    # 检查下一个是否是 BatchMode=yes
-                    idx = opts.index(item)
-                    if idx + 1 < len(opts) and opts[idx + 1] == "BatchMode=yes":
-                        skip_next = True
-                        continue
-                cleaned.append(item)
-            cmd.extend(cleaned)
-        else:
-            cmd.extend(SSH_COMMON_OPTS)
+        # 密钥认证 + 非交互模式：加 BatchMode=yes 防止意外弹密码提示卡住
+        # 密码认证绝对不能加 BatchMode=yes，否则 sshpass 无法注入密码
+        if auth_type == "key" and not for_interactive:
+            cmd.extend(["-o", "BatchMode=yes"])
 
         # 端口
         port = server.get("port", 22)
