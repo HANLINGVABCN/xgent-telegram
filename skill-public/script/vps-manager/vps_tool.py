@@ -26,7 +26,10 @@ import argparse
 import io
 import json
 import os
+import platform
+import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -278,24 +281,94 @@ class SSHExecutor:
             }
 
     @staticmethod
+    def measure_ping(host: str, port: int = 22, timeout: float = 1.0) -> float | None:
+        """
+        测量真实网络物理延迟（只测 1 次，快速返回）
+        优先 ICMP Ping，被禁 ping 时自动退化为单次 TCP 握手 Ping
+        返回毫秒数 (float)，失败返回 None
+        """
+        is_win = platform.system() == "Windows"
+        # 单次 ping，硬超时 1 秒，不耽搁时间
+        cmd = (
+            ["ping", "-n", "1", "-w", str(int(timeout * 1000)), host]
+            if is_win
+            else ["ping", "-c", "1", "-W", str(int(timeout)), host]
+        )
+        try:
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=timeout + 0.5,
+            )
+            raw_out = res.stdout
+            out = raw_out.decode("gbk" if is_win else "utf-8", errors="ignore")
+
+            # 排除丢包或不可达
+            is_loss = (
+                "100% packet loss" in out
+                or "100% loss" in out
+                or "100% 丢失" in out
+                or "unreachable" in out.lower()
+                or "无法访问" in out
+                or "timed out" in out.lower()
+                or "超时" in out
+            )
+
+            if not is_loss:
+                # 1. Linux rtt 统计: rtt min/avg/max/mdev = 1.234/1.567/1.890/0.123 ms
+                m = re.search(r"rtt min/avg/max/mdev = [\d\.]+/([\d\.]+)/", out)
+                if m:
+                    return round(float(m.group(1)), 1)
+
+                # 2. Linux/通用单次: time=1.52 ms 或 time<1ms
+                m = re.search(r"time[=<]([\d\.]+)\s*ms", out, re.IGNORECASE)
+                if m:
+                    return round(float(m.group(1)), 1)
+
+                # 3. Windows 平均/单次: 平均 = 1ms 或 Average = 1ms
+                m = re.search(r"(?:平均|Average)\s*=\s*(\d+)ms", out, re.IGNORECASE)
+                if m:
+                    return round(float(m.group(1)), 1)
+
+                # 4. Windows 单次: 时间=1ms 或 时间<1ms
+                m = re.search(r"时间[=<](\d+)ms", out)
+                if m:
+                    return round(float(m.group(1)), 1)
+        except Exception:
+            pass
+
+        # 兜底：单次 TCP 握手 RTT（只握手不发包，耗时极短，应对禁 ICMP ping）
+        try:
+            start = time.monotonic()
+            with socket.create_connection((host, port), timeout=timeout):
+                return round((time.monotonic() - start) * 1000, 1)
+        except Exception:
+            return None
+
+    @staticmethod
     def test_connection(server: dict) -> dict:
-        """测试 SSH 连通性"""
-        start = time.monotonic()
-        result = SSHExecutor.execute(server, "echo pong && uname -r", timeout=15)
-        elapsed = round((time.monotonic() - start) * 1000)
+        """测试 SSH 连通性与真实网络延迟"""
+        host = server["host"]
+        port = server.get("port", 22)
+
+        # 测量真实网络物理延迟（单次快速测试）
+        ping_ms = SSHExecutor.measure_ping(host, port, timeout=1.0)
+
+        # 测试 SSH 连通性与内核版本
+        result = SSHExecutor.execute(server, "echo pong && uname -r", timeout=8)
 
         if result["success"]:
             lines = result["stdout"].strip().split("\n")
             kernel = lines[1] if len(lines) > 1 else "unknown"
             return {
                 "online": True,
-                "latency_ms": elapsed,
+                "ping_ms": ping_ms,
                 "kernel": kernel,
             }
         else:
             return {
                 "online": False,
-                "latency_ms": elapsed,
+                "ping_ms": ping_ms,
                 "error": result["stderr"].strip() or "连接失败",
             }
 
@@ -545,12 +618,14 @@ def cmd_test(args, config: VPSConfig):
     headers = ["别名", "主机", "状态", "延迟", "内核/错误"]
     rows = []
     for server, result in results:
+        ping_val = result.get("ping_ms")
+        ping_str = f"{ping_val}ms" if ping_val is not None else "-"
         if result["online"]:
             rows.append([
                 server["name"],
                 f"{server['host']}:{server.get('port', 22)}",
                 "✓ 在线",
-                f"{result['latency_ms']}ms",
+                ping_str,
                 result.get("kernel", ""),
             ])
         else:
@@ -558,7 +633,7 @@ def cmd_test(args, config: VPSConfig):
                 server["name"],
                 f"{server['host']}:{server.get('port', 22)}",
                 "✗ 离线",
-                f"{result['latency_ms']}ms",
+                ping_str,
                 result.get("error", "连接失败"),
             ])
 
