@@ -1,7 +1,7 @@
 ```!
 VPS 多服务器管理技能：通过 SSH 管理多台远程服务器资产。
 核心工具：python3 skill-public/script/vps-manager/vps_tool.py <子命令>
-配置文件：workspace/vps_servers.json（首次使用自动创建）
+配置文件：~/.config/vps-manager/servers.json（首次使用自动创建）
 
 子命令速查：
 - init：环境检查与初始化（检查 ssh/scp/sshpass 依赖，创建配置文件）
@@ -46,7 +46,7 @@ python3 skill-public/script/vps-manager/vps_tool.py init
 
 ## 配置文件格式
 
-配置存储在 `workspace/vps_servers.json`，结构如下：
+配置存储在 `~/.config/vps-manager/servers.json`，结构如下：
 
 ```json
 {
@@ -182,7 +182,7 @@ python3 skill-public/script/vps-manager/vps_tool.py ssh-cmd --name hk-1
 
 ## 安全注意事项
 
-- 密码以明文存储在 `workspace/vps_servers.json`，确保该文件权限为 `600`
+- 密码以明文存储在 `~/.config/vps-manager/servers.json`，确保该文件权限为 `600`
 - 推荐使用 SSH 密钥认证替代密码认证
 - `exec` 和 `batch` 命令在远程执行前应确认用户已授权（遵循 Agent 执行原则第 2 条）
 - 破坏性操作（重启、删除、配置变更）必须获得用户明确授权后才能执行

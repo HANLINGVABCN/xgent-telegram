@@ -51,7 +51,9 @@ if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
 WORKSPACE_DIR = PROJECT_ROOT / "workspace"
-CONFIG_FILE = WORKSPACE_DIR / "vps_servers.json"
+CONFIG_DIR = Path.home() / ".config" / "vps-manager"
+CONFIG_FILE = CONFIG_DIR / "servers.json"
+OLD_WORKSPACE_CONFIG = PROJECT_ROOT / "workspace" / "vps_servers.json"
 
 # SSH 通用选项（不含 BatchMode，由 _build_ssh_cmd 按认证方式动态决定）
 SSH_COMMON_OPTS = [
@@ -76,6 +78,12 @@ class VPSConfig:
     def _ensure_config(self):
         """确保配置文件和目录存在"""
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.config_path.exists() and OLD_WORKSPACE_CONFIG.exists():
+            try:
+                import shutil
+                shutil.copy2(OLD_WORKSPACE_CONFIG, self.config_path)
+            except Exception:
+                pass
         if not self.config_path.exists():
             self._write({"servers": []})
             # 设置文件权限为 600 (仅 owner 读写)
