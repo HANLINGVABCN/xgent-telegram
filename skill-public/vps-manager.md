@@ -4,6 +4,7 @@ VPS 多服务器管理技能：通过 SSH 管理多台远程服务器资产。
 配置文件：workspace/vps_servers.json（首次使用自动创建）
 
 子命令速查：
+- init：环境检查与初始化（检查 ssh/scp/sshpass 依赖，创建配置文件）
 - list：列出所有已配置服务器（别名、IP、端口、用户、认证方式、描述）
 - add --name <别名> --host <IP> --port <端口> --user <用户> [--password <密码>] [--key <密钥路径>] [--desc <描述>] [--tags <标签,逗号分隔>]：添加服务器
 - remove --name <别名> [--yes]：删除服务器（--yes 跳过确认）
@@ -18,7 +19,7 @@ VPS 多服务器管理技能：通过 SSH 管理多台远程服务器资产。
 
 交互式 SSH 排查：先 exec ssh-cmd 获取连接命令，再用 shell-x 启动该命令建立交互会话，然后通过 stdin-x 操作。
 密码认证方式需要宿主机安装 sshpass：apt install sshpass -y。
-首次使用前运行安装检查：bash skill-public/script/vps-manager/install.sh。
+首次使用前运行初始化检查：python3 skill-public/script/vps-manager/vps_tool.py init。
 ```
 
 # VPS 多服务器管理技能 — 详细使用指南
@@ -31,13 +32,13 @@ VPS 多服务器管理技能：通过 SSH 管理多台远程服务器资产。
 
 ## 安装与初始化
 
-首次使用前执行安装检查：
+首次使用前执行初始化检查：
 
 ```bash
-bash skill-public/script/vps-manager/install.sh
+python3 skill-public/script/vps-manager/vps_tool.py init
 ```
 
-该脚本检查：
+该命令检查：
 - `ssh` 客户端是否可用
 - `scp` 是否可用
 - `sshpass` 是否已安装（密码认证所需）

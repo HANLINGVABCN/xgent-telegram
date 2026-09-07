@@ -817,6 +817,55 @@ def cmd_ssh_cmd(args, config: VPSConfig):
     print(ssh_cmd)
 
 
+def cmd_init(args, config: VPSConfig):
+    """环境检查与初始化"""
+    print("VPS Manager 环境检查与初始化")
+    print("=" * 40)
+    print()
+
+    errors = 0
+
+    # ssh
+    if shutil.which("ssh"):
+        try:
+            ver = subprocess.run(["ssh", "-V"], capture_output=True, text=True, timeout=5)
+            ver_str = (ver.stderr or ver.stdout).strip()
+            print(f"✓ ssh 已安装: {ver_str}")
+        except Exception:
+            print("✓ ssh 已安装")
+    else:
+        print("✗ ssh 未安装 → apt install openssh-client -y")
+        errors += 1
+
+    # scp
+    if shutil.which("scp"):
+        print("✓ scp 已安装")
+    else:
+        print("✗ scp 未安装 → apt install openssh-client -y")
+        errors += 1
+
+    # sshpass (可选)
+    if shutil.which("sshpass"):
+        print("✓ sshpass 已安装 (支持密码认证)")
+    else:
+        print("! sshpass 未安装 (密码认证不可用，密钥认证不受影响) → apt install sshpass -y")
+
+    # 配置文件
+    if config.config_path.exists():
+        servers = config.list_servers()
+        print(f"✓ 配置文件已存在: {config.config_path} ({len(servers)} 台服务器)")
+    else:
+        config._ensure_config()
+        print(f"✓ 已创建配置文件: {config.config_path}")
+
+    print()
+    if errors > 0:
+        print(f"✗ 发现 {errors} 个问题，请先修复")
+        sys.exit(1)
+    else:
+        print("✓ 环境就绪")
+
+
 # ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
@@ -841,6 +890,9 @@ def main():
 
     # list
     subparsers.add_parser("list", help="列出所有已配置服务器")
+
+    # init
+    subparsers.add_parser("init", help="环境检查与初始化 (检查 ssh/scp/sshpass 依赖)")
 
     # add
     p_add = subparsers.add_parser("add", help="添加服务器")
@@ -915,6 +967,7 @@ def main():
 
     cmd_map = {
         "list": cmd_list,
+        "init": cmd_init,
         "add": cmd_add,
         "remove": cmd_remove,
         "test": cmd_test,
