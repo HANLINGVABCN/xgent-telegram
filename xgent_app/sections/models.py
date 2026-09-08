@@ -437,8 +437,39 @@ class ModelClient:
         return messages
 
     @staticmethod
+    def _openai_message_media_data_urls(message: Any) -> List[str]:
+        """提取 message/delta 顶层的 images 数组（画图网关的常见返回形状）。
+
+        OpenAI 官方 chat.completion 没有 images 字段；new-api 系、vertex
+        中转等画图网关会把生成图放在 message.images[].image_url.url 里，
+        正文 content 留空。不提取就会把含整张图 base64 的 JSON 当错误
+        文本吐给用户，媒体生成必然失败。
+        """
+        if not isinstance(message, dict):
+            return []
+        images = message.get('images')
+        if not isinstance(images, list):
+            return []
+
+        urls: List[str] = []
+        for part in images:
+            if not isinstance(part, dict):
+                continue
+            data_url = ModelClient._media_part_to_data_url(part)
+            if not data_url:
+                # OpenAI Images API 惯例：b64_json 裸数据不带 mime，按 png。
+                b64 = part.get('b64_json')
+                if isinstance(b64, str) and b64:
+                    data_url = f"data:image/png;base64,{b64}"
+            if data_url and data_url not in urls:
+                urls.append(data_url)
+        return urls
+
+    @staticmethod
     def _extract_openai_compatible_text(data: Dict[str, Any]) -> str:
         texts: List[str] = []
+        media_urls: List[str] = []
+        _seen_b64 = set()
         for choice in data.get("choices") or []:
             if not isinstance(choice, dict):
                 continue
@@ -448,7 +479,39 @@ class ModelClient:
                 text = ModelClient._model_content_to_text(value)
                 if text:
                     texts.append(text)
-        return "".join(texts)
+            # 画图网关把生成图放在 message/delta 顶层的 images 数组里，
+            # content 留空；只读 content 会把整份 JSON 当错误文本吐出去。
+            # 按 base64 内容去重：同一张图可能以不同 mime（image/png vs
+            # image/jpeg）出现两份，按完整 data URL 比较会漏过去重，
+            # 导致同一张图存盘/发送两次。
+            for entry in (message, delta):
+                for data_url in ModelClient._openai_message_media_data_urls(entry):
+                    b64_key = data_url.split(';base64,', 1)[-1] if ';base64,' in data_url else data_url
+                    if b64_key not in _seen_b64:
+                        _seen_b64.add(b64_key)
+                        media_urls.append(data_url)
+        combined_text = "".join(texts)
+        # 同一张图可能同时出现在 content 和 images 里，别重复拼两份。按完整
+        # data URL 比较会漏掉跨 mime 的同图（content 里 png、images 里 jpeg），
+        # 所以改比 base64 内容：content 里出现的 base64，images 里就别再拼了。
+        content_b64_keys = {
+            part.split(';base64,', 1)[-1]
+            for part in combined_text.split('\n')
+            if ';base64,' in part
+        }
+        deduped_urls = [
+            u for u in media_urls
+            if (u.split(';base64,', 1)[-1] if ';base64,' in u else u) not in content_b64_keys
+        ]
+        if not deduped_urls:
+            return combined_text
+        # 多个 data URL 必须用换行分隔：''.join 会让下游正则贪婪吃掉下一个
+        # data URL 的 "data" 前缀、在 ":" 处断裂，残留整段 base64 进 text，
+        # 撑爆对话上下文（实测 4.6MB 图残留 230 万字符 base64）。
+        media_text = "\n".join(deduped_urls)
+        if combined_text:
+            return f"{combined_text}\n{media_text}"
+        return media_text
 
     @staticmethod
     def _extract_openai_compatible_sse_text(text: str, usage_sink: Optional[List[Dict[str, int]]] = None) -> str:
@@ -1589,6 +1652,15 @@ class ModelClient:
                     message_dump = {}
                 if isinstance(message_dump, dict):
                     content = ModelClient._model_content_to_text(message_dump.get('content'))
+                    # 画图网关把生成图放在 message 顶层 images 数组（content 留空），
+                    # SDK 会把非标准字段收进 dump 的 extras；补一份提取。
+                    media_urls = [
+                        url for url in ModelClient._openai_message_media_data_urls(message_dump)
+                        if not content or url not in content
+                    ]
+                    if media_urls:
+                        media_text = "\n".join(media_urls)
+                        content = f"{content}\n{media_text}" if content else media_text
             if not content:
                 return None, "对方暂时没反应，用户稍后再试试？"
 

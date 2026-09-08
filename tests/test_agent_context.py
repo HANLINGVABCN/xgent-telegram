@@ -84,13 +84,14 @@ class AgentContextTests(unittest.TestCase):
                     "mime_type": "image/png",
                     "file_path": str(image_path),
                 },
-                "媒体结果",
+                "媒体已生成\n【系统自动生成：本图片已自动存入 /tmp/large.png，需要时请read以返回上下文】",
                 max_inline_bytes=1,
             )
 
         self.assertIsInstance(message["content"], str)
         self.assertIn("媒体已生成", message["content"])
         self.assertIn("媒体过大", message["content"])
+        self.assertIn("系统自动生成", message["content"])
 
     def test_context_builders_are_side_effect_free(self):
         message = build_edit_context_message("notice")

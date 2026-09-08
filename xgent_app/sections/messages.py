@@ -97,6 +97,10 @@ async def process_incoming_document(
                 f"\n⚠️ 未恢复：{'、'.join(result['skipped_defaults'])}（提供商或模型不存在）"
                 if result['skipped_defaults'] else ''
             )
+            dangling = (
+                f"\n🧹 已清空失效选择：{'、'.join(result['cleared_dangling'])}（原模型已不在新配置中，请重新选择）"
+                if result.get('cleared_dangling') else ''
+            )
             await GlobalRecorder.record_system_op(
                 "导入提供商配置",
                 {
@@ -116,7 +120,7 @@ async def process_incoming_document(
                 f"新增：{result['added']} 个\n"
                 f"更新同名：{result['overwritten']} 个\n"
                 f"{removed_line}"
-                f"默认项：{safe_text(restored)}{safe_text(skipped)}",
+                f"默认项：{safe_text(restored)}{safe_text(skipped)}{safe_text(dangling)}",
                 reply_markup=get_providers_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
@@ -733,6 +737,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"\n⚠️ 未恢复：{'、'.join(result['skipped_defaults'])}（提供商或模型不存在）"
                 if result['skipped_defaults'] else ''
             )
+            dangling = (
+                f"\n🧹 已清空失效选择：{'、'.join(result['cleared_dangling'])}（原模型已不在新配置中，请重新选择）"
+                if result.get('cleared_dangling') else ''
+            )
             await GlobalRecorder.record_system_op(
                 "通过文本导入提供商配置",
                 {
@@ -751,7 +759,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"新增：{result['added']} 个\n"
                 f"更新同名：{result['overwritten']} 个\n"
                 f"{removed_line}"
-                f"默认项：{safe_text(restored)}{safe_text(skipped)}",
+                f"默认项：{safe_text(restored)}{safe_text(skipped)}{safe_text(dangling)}",
                 reply_markup=get_providers_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
@@ -876,10 +884,14 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         UserDataManager.set('state', BotState.IDLE)
         await GlobalRecorder.record_system_op("设置 Web 访问密码")
-        # 密码变了要重启服务，否则旧进程还在用旧哈希校验。
-        await restart_web_chat(context.application)
+        # 密码变了要让在跑的服务用上新哈希。托管进程立刻就地换掉；CLI 只写库，由
+        # 服务进程的对账任务几秒内换过去。以前这里无条件 restart_web_chat(
+        # context.application)，而 CLI 的 application 是 None——于是 CLI 去 bind
+        # 服务进程占着的端口，拿一个 EADDRINUSE 被日志吞掉，用户那边看到的就是
+        # "密码怎么改都不生效"。
+        note = await apply_web_config_change(context.application)
         await update.message.reply_text(
-            build_web_text(),
+            build_web_text() + (f"\n\n{note}" if note else ""),
             reply_markup=get_web_menu(),
             parse_mode=constants.ParseMode.HTML
         )
@@ -897,9 +909,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         UserDataManager.set('state', BotState.IDLE)
         await UserDataManager.save_config('web_port', port)
         await GlobalRecorder.record_system_op(f"设置 Web 端口: {port}")
-        await restart_web_chat(context.application)
+        note = await apply_web_config_change(context.application)
         await update.message.reply_text(
-            build_web_text(),
+            build_web_text() + (f"\n\n{note}" if note else ""),
             reply_markup=get_web_menu(),
             parse_mode=constants.ParseMode.HTML
         )
@@ -1348,6 +1360,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     reply_text += f"\nℹ️ 已跳过 {len(skipped_models)} 个重复模型。"
             else:
                 reply_text = "ℹ️ 这些模型以前都保存过了。"
+            reply_text += format_fetch_status_note(p, compact=True)
             await update.message.reply_text(
                 reply_text,
                 reply_markup=kb,
@@ -1674,9 +1687,18 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
         trigger_status_iteration = agent_iteration
         if agent_iteration > max_agent_iterations:
             return
-    model = cdata.get('model') or UserDataManager.get('default_model')
     prov_name, prov_data = get_current_provider()
-    
+    # 防御性回退：模型取值优先读会话绑定（chat_sessions.model），若某条
+    # 配置变更路径漏了会话同步（历史上导入配置和 Web 设置都漏过），会话
+    # 里残留的旧模型名会配着换掉后的新提供商通道发出去，上游 502
+    # unknown provider。解析收进 resolve_effective_chat_model：全局默认
+    # 仍有效就回退；两层都失效则返回 None，走下面"未配置模型"的提示——
+    # 不拿一个必然 502 的旧模型名发出去。三端（TG/Web/CLI）都走
+    # process_conversation，全覆盖。
+    model = resolve_effective_chat_model(
+        cdata.get('model'), UserDataManager.get('default_model'), prov_data
+    )
+
     if not prov_data or not model:
         if trigger_status_msg is not None and trigger_status_iteration is not None:
             with contextlib.suppress(Exception):
@@ -1896,6 +1918,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         break
                     smart_notice = _smart_match_notice(block)
                     block_type = block['type']
+                    round_state.note_over_eligibility(block_type)
 
                     # 智能匹配时，先把"系统提示"发到聊天，放在执行结果前面，让用户也能看到
                     if smart_notice:
@@ -1914,6 +1937,21 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             notice=sys_notice,
                         )
 
+                    # over 协议：模型声明"这一轮不必把结果回灌给我"，并把收尾语预先写在
+                    # 块里。这里只发出去，不执行、不进回灌载荷。拦不拦得住由循环末尾的
+                    # apply_over 定——白名单外的协议或任何一个失败都会作废它。
+                    # 收尾语无条件发出：即便 over 随后作废，模型改口的话会跟在它后面。
+                    # 不单独落库：这段文字本来就在助手回复里，再记一份等于给下一轮添噪音。
+                    if block_type == 'over':
+                        round_state.over_text = str(block.get('body') or '').strip()
+                        if round_state.over_text:
+                            await safe_send_message(
+                                context,
+                                update.effective_chat.id,
+                                round_state.over_text,
+                            )
+                        continue
+
                     standard_operation = await dispatch_standard_protocol(
                         block,
                         executor=AgentExecutor,
@@ -1923,6 +1961,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         search_api_key=BotConfig.TAVILY_API_KEY,
                     )
                     if standard_operation is not None:
+                        if not standard_operation.get('success'):
+                            round_state.over_blocked = True
                         operation_notice = standard_operation['notice']
                         operation_presentation = build_standard_operation_presentation(
                             standard_operation
@@ -1998,6 +2038,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             )
                         except Exception as e:
                             logger.error(f"Agent写入文件失败: {e}")
+                            round_state.over_blocked = True
                             file_notice = f"[file结果] 写入失败: {filename}。错误: {str(e)[:200]}"
                             await safe_send_message(
                                 context,
@@ -2039,6 +2080,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             )
                         except Exception as e:
                             logger.error(f"Agent base64 写入文件失败: {e}")
+                            round_state.over_blocked = True
                             file_notice = f"[file:base64结果] 写入失败: {filename}。错误: {str(e)[:200]}"
                             await safe_send_message(
                                 context,
@@ -2094,6 +2136,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             stop_requested=is_stop_requested,
                         )
                         shell_result = shell_execution['result']
+                        if not shell_result.get('success'):
+                            round_state.over_blocked = True
                         session_id = shell_execution['session_id']
                         command = shell_execution['command']
                         output = shell_execution['output']
@@ -2213,6 +2257,11 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 # typing 状态会空转到 max_duration 才停。
                 typing_stop.set()
                 await cancel_task_quietly(typing_task)
+
+            # over 协议的拦截点，全局就这一处：模型说了不必回灌，且这一轮每个操作都成功，
+            # 就把回灌载荷丢掉，让下面的协调器落到"没有新上下文"那条既有分支——正常收尾、
+            # 不再叫一次模型。该发的结果已经发了，该落库的也已经落库了。
+            round_state.apply_over()
 
             round_decision = plan_agent_round_transition(
                 round_state,

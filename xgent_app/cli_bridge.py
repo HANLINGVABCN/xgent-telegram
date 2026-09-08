@@ -746,6 +746,11 @@ class CliBot:
 class CliUpdate:
     """对照 web_bridge.WebUpdate / shell_triggers._SelfTriggerUpdate。"""
 
+    # 点击来源标记。会切断入口的按钮（关 Web / 关终端 / 清密码）靠它区分"从网页
+    # 点"和"从终端点"：前者关掉就当场失联，后者人就在这台机器的 shell 前。判据以前
+    # 是"有没有 BOT_TOKEN"，那个布尔看不见 CLI，见 callbacks._would_lock_out_caller。
+    xgent_origin = "cli"
+
     def __init__(self, bot: CliBot, chat_id: int):
         self.effective_chat = type("CliChat", (), {"id": chat_id})()
         self.effective_user = type("CliUser", (), {
@@ -760,13 +765,13 @@ class CliContext:
 
     def __init__(self, bot: CliBot):
         self.bot = bot
-        # 配置状态机会调 restart_web_chat(context.application)（messages.py:880/900）、
-        # /web 菜单会调 start_web_chat_if_enabled(context.application)
-        # （callbacks.py:700/810）。CLI 进程根本没有 PTB Application，而 None
-        # 恰好就是这两个函数明确支持的取值——idle.py:826-832 的 docstring 写死了
-        # "app 为 None 时代表纯 Web 模式（未配置 BOT_TOKEN，没有 PTB Application）"，
-        # 下游 _web_real_bot=getattr(app,"bot",None) 也原生容忍 None。
-        # 不补这个属性的话，CLI 里设 Web 密码/端口会直接 AttributeError（实测过）。
+        # 配置状态机（设 Web 密码/端口）和 /web 菜单都会读 context.application；
+        # 不补这个属性的话，CLI 里改 Web 密码/端口会直接 AttributeError（实测过）。
+        #
+        # None 在这里的含义只是"CLI 进程没有 PTB Application"，**不**代表"纯 Web
+        # 模式"——曾经下游按 app is None 推断出后者，于是 CLI 里改一次密码就去抢服务
+        # 进程占着的端口。现在起停 Web 服务器只看 idle.web_managed_here()（由服务
+        # 进程置位），CLI 只写库，由服务进程的配置对账任务几秒内跟上。
         self.application = None
         # token_stats.cmd_token_stats 会读 context.args（/stats 7 的过滤条件）。
         # 空列表等价于"不带参数的命令"；带参数时由 build_cli_command_objects 覆盖。
@@ -780,6 +785,8 @@ class CliCallbackQuery:
     的输入循环）把编号翻译成 callback_data 字符串后，构造这个对象。
     answer() 把提示文本打印出来，等价于 Web/Telegram 端弹 toast。
     """
+
+    xgent_origin = "cli"  # 见 CliUpdate.xgent_origin
 
     def __init__(self, bot: CliBot, message: CliMessage, data: str, user_id: int):
         self.bot = bot

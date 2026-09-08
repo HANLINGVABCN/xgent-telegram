@@ -30,7 +30,8 @@ class CallbackDataStore:
 def build_magic_keyboard(items: List[str], page: int, callback_prefix: str, back_callback: str,
                          search_callback: Optional[str] = None, filter_text: Optional[str] = None,
                          extra_buttons: Optional[List[InlineKeyboardButton]] = None,
-                         marker_fn: Optional[callable] = None):
+                         marker_fn: Optional[callable] = None,
+                         prefix_fn: Optional[callable] = None):
     PER_PAGE = 8
     display_list = [m for m in items if filter_text and filter_text.lower() in m.lower()] if filter_text else items
     total_pages = math.ceil(len(display_list) / PER_PAGE) or 1
@@ -41,6 +42,10 @@ def build_magic_keyboard(items: List[str], page: int, callback_prefix: str, back
     
     for m in current_items:
         display_name = pretty_model_name(m)
+        if prefix_fn:
+            prefix = prefix_fn(m)
+            if prefix:
+                display_name = f"{prefix} {display_name}"
         if marker_fn:
             marker = marker_fn(m)
             if marker:
@@ -192,11 +197,16 @@ def get_web_menu():
     open_button = _build_web_open_button()
     if open_button is not None:
         rows.append([open_button])
+    # 两个开关一律是真开关。这里以前会在"没有 BOT_TOKEN 且 Web 开着"时把它们换成
+    # callback_data="noop" 的死按钮、写上"不可关闭"——判据只是"有没有 Telegram"，
+    # 看不见 CLI 这个同样真实的入口。于是 cli+web 部署的用户在 xgent 里点开关，只
+    # 拿到一句"这是你唯一的入口"。会不会真把自己关在外面，改由 handler 按**点击来
+    # 源**判断（callbacks.py 的 _would_lock_out_caller）：网页里点才拦，CLI 和
+    # Telegram 里点直接生效。
     rows.extend([
         [InlineKeyboardButton(
-            f"{'🟢 已开启' if enabled else '🔴 已关闭'}　点击{'关闭' if enabled else '开启'}"
-            if not (enabled and BotConfig.WEB_ONLY) else "🟢 已开启（纯 Web 模式常开，不可关闭）",
-            callback_data="toggle_web_enabled" if not (enabled and BotConfig.WEB_ONLY) else "noop"
+            f"{'🟢 已开启' if enabled else '🔴 已关闭'}　点击{'关闭' if enabled else '开启'}",
+            callback_data="toggle_web_enabled"
         )],
         [InlineKeyboardButton(
             f"🔑 密码：{'已设置' if has_password else '未设置'}",
@@ -208,7 +218,7 @@ def get_web_menu():
             callback_data="act_set_web_public_url"
         )],
     ])
-    if has_password and not BotConfig.WEB_ONLY:
+    if has_password:
         rows.append([InlineKeyboardButton("🗑️ 清除密码", callback_data="confirm_clear_web_password")])
     if public_url:
         rows.append([InlineKeyboardButton("🧹 清除公开地址", callback_data="do_clear_web_public_url")])
@@ -217,13 +227,9 @@ def get_web_menu():
     term_button = _build_terminal_open_button()
     if term_button is not None:
         rows.append([term_button])
-    # 纯 Web 模式下，关闭终端可能连带关掉唯一的 Web 入口（当 web_enabled 本身
-    # 未被显式打开时），所以这里也锁住，与上面 toggle_web_enabled 的拦截对称。
-    term_locked = BotConfig.WEB_ONLY and term_on and not enabled
     rows.append([InlineKeyboardButton(
-        f"🖥 终端：{'🟢 开' if term_on else '🔴 关'}　点击{'关闭' if term_on else '开启'}"
-        if not term_locked else "🖥 终端：🟢 开（纯 Web 模式下是唯一入口，不可关闭）",
-        callback_data="toggle_terminal_enabled" if not term_locked else "noop"
+        f"🖥 终端：{'🟢 开' if term_on else '🔴 关'}　点击{'关闭' if term_on else '开启'}",
+        callback_data="toggle_terminal_enabled"
     )])
     rows.append([InlineKeyboardButton("🔙 返回", callback_data="act_main_menu")])
     return InlineKeyboardMarkup(rows)
@@ -234,12 +240,18 @@ def build_web_text() -> str:
     port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
     public_url = str(UserDataManager.get('web_public_url', '') or '')
     has_password = bool(UserDataManager.get('_web_has_password', False))
-    running = is_web_chat_running()
     term_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
+    # 问端口，不问本进程有没有服务器对象：这个菜单在 xgent 终端里渲染得最多，而
+    # 服务器跑在另一个进程，is_web_chat_running() 在这儿永远是 False——以前 cli+web
+    # 部署固定显示"🟡 已开启但未运行"，而网页明明打得开。
+    running = web_service_reachable(port)
 
-    status = "🟢 运行中" if running else ("🟡 已开启但未运行" if enabled else "🔴 已关闭")
-    if BotConfig.WEB_ONLY:
-        status += "（纯 Web 模式常开）"
+    if running:
+        status = "🟢 运行中"
+    elif enabled or term_on:
+        status = "🟡 已开启但未运行" + ("（未设置访问密码）" if not has_password else "")
+    else:
+        status = "🔴 已关闭"
     password_line = "✅ 已设置" if has_password else "⚠️ 未设置（未设置时拒绝启动）"
     public_line = (
         f"✅ <code>{safe_text(public_url)}</code>"
@@ -317,6 +329,7 @@ def get_more_settings_menu():
          InlineKeyboardButton("🚫 Agent黑名单", callback_data="menu_command_blacklist")],
         [InlineKeyboardButton("🔐 凭据" + _credentials_badge(), callback_data="menu_credentials"),
          InlineKeyboardButton("🧹 清空上下文", callback_data="cmd_delete")],
+        [InlineKeyboardButton(f"🔇 静默未授权:{'🟢 开' if normalize_bool(UserDataManager.get('silent_unauthorized', False), False) else '🔴 关'}", callback_data="toggle_silent_unauthorized")],
         [InlineKeyboardButton("ℹ️ 状态", callback_data="cmd_info"),
          InlineKeyboardButton("🧩 Skill 管理", callback_data="menu_skills")],
         [InlineKeyboardButton("📤 导出", callback_data="cmd_export_all"),
@@ -725,10 +738,6 @@ def get_prompts_menu():
         [InlineKeyboardButton(f"📝 {PromptFileManager.get_label(key)}", callback_data=f"view_prompt:{key}")]
         for key in PromptFileManager.FILES
     ]
-    keyboard.append([InlineKeyboardButton(
-        f"🔇 未授权静默：{'🟢 开' if normalize_bool(UserDataManager.get('silent_unauthorized', False), False) else '🔴 关'}",
-        callback_data="toggle_silent_unauthorized"
-    )])
     keyboard.append([InlineKeyboardButton("🔄 从文件重载提示词", callback_data="act_reload_prompts")])
     keyboard.append([InlineKeyboardButton("🔙 返回主菜单", callback_data="act_main_menu")])
     return InlineKeyboardMarkup(keyboard)
@@ -851,6 +860,63 @@ def make_fetched_saved_marker_fn(prov_name: str):
     return marker_fn
 
 
+def get_provider_fetch_record(prov_name: str) -> Optional[dict]:
+    """读取某提供商最近一次联网拉取结果（{'models': [...], 'ts': 时间戳}），没有则返回 None。"""
+    status_map = UserDataManager.get('model_fetch_status', {})
+    if not isinstance(status_map, dict):
+        return None
+    record = status_map.get(prov_name)
+    return record if isinstance(record, dict) else None
+
+
+def make_model_status_fn(prov_name: str):
+    """已保存模型的状态前缀：最近联网拉取时存在返回 🟢，不存在返回 🔴；从未检测过则不显示。"""
+    record = get_provider_fetch_record(prov_name)
+    if not record:
+        return None
+    fetched_models = set(record.get('models') or [])
+
+    def prefix_fn(model_name: str) -> Optional[str]:
+        return "🟢" if model_name in fetched_models else "🔴"
+
+    return prefix_fn
+
+
+def format_fetch_time(ts) -> str:
+    """把联网检测时间戳格式化成 'YYYY-MM-DD HH:MM'，无法解析时返回空串。"""
+    try:
+        ts = int(ts or 0)
+    except (TypeError, ValueError):
+        return ""
+    if ts <= 0:
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+def format_fetch_status_note(prov_name: str, compact: bool = False) -> str:
+    """已保存模型列表的 🟢/🔴 图例说明；该提供商从未联网检测过时返回空串。"""
+    record = get_provider_fetch_record(prov_name)
+    if not record:
+        return ""
+    when = format_fetch_time(record.get('ts')) or "未知时间"
+    if compact:
+        return f"\n🟢 有效 · 🔴 已失效（检测于 {when}，点⚡联网获取刷新）"
+    return (
+        "\n\n🟢 有效：最近联网拉取时存在\n"
+        "🔴 失效：最近联网拉取时已不存在\n"
+        f"⏱️ 上次检测: {when}（点【⚡ 联网获取】刷新）"
+    )
+
+
+def get_saved_models_title(provider_name: str) -> str:
+    """已保存模型列表的标准标题：统一附带 🟢/🔴 图例，避免各处文案漂移。"""
+    return (
+        f"🧰 <b>{safe_text(provider_name)}</b> 已保存的模型\n\n"
+        "这里可以继续新增、联网获取、搜索，或点击模型进行设置。"
+        + format_fetch_status_note(provider_name)
+    )
+
+
 def build_fetched_models_view(provider_name: str):
     """根据缓存状态构建联网模型列表，并让搜索结果返回完整列表。"""
     models = UserDataManager.get('fetched_cache', [])
@@ -874,7 +940,10 @@ def build_fetched_models_view(provider_name: str):
     if filter_text:
         title = f"🔍 搜索 '{safe_text(filter_text)}'：找到 {visible_count} 个模型:"
     else:
-        title = f"🌐 找到了 {len(models)} 个模型:"
+        title = (
+            f"🌐 找到了 {len(models)} 个模型:\n"
+            "✅ 表示已保存 · 点击其它模型即可选用"
+        )
     return title, kb
 
 
@@ -896,7 +965,8 @@ def build_saved_models_view(provider_name: str):
             InlineKeyboardButton("➕ 手写", callback_data=f"act_manual_mod_{provider_name}"),
             InlineKeyboardButton("⚡ 联网获取", callback_data=f"fetch_market_{provider_name}"),
         ],
-        marker_fn=make_manage_marker_fn(provider_name)
+        marker_fn=make_manage_marker_fn(provider_name),
+        prefix_fn=make_model_status_fn(provider_name)
     )
     visible_count = sum(
         1 for model in models
@@ -906,12 +976,10 @@ def build_saved_models_view(provider_name: str):
         title = (
             f"🔍 <b>{safe_text(provider_name)}</b> 已保存的模型\n\n"
             f"搜索 '{safe_text(filter_text)}'：找到 {visible_count} 个模型:"
+            + format_fetch_status_note(provider_name, compact=True)
         )
     else:
-        title = (
-            f"🧰 <b>{safe_text(provider_name)}</b> 已保存的模型\n\n"
-            "这里可以继续新增、联网获取、搜索，或点击模型进行设置。"
-        )
+        title = get_saved_models_title(provider_name)
     return title, kb
 
 
@@ -946,6 +1014,16 @@ def build_model_detail_menu(prov_name: str, model_name: str, back_callback: Opti
         status_parts.append("🖼️ 当前媒体模型")
     status = "、".join(status_parts) if status_parts else "未设为默认"
 
+    fetch_record = get_provider_fetch_record(prov_name)
+    if fetch_record:
+        when = format_fetch_time(fetch_record.get('ts')) or "未知时间"
+        if model_name in (fetch_record.get('models') or []):
+            fetch_line = f"🟢 有效（检测于 {when}）"
+        else:
+            fetch_line = f"🔴 已失效（检测于 {when}，未出现在最近拉取结果中）"
+    else:
+        fetch_line = "⚪ 未检测（点【⚡ 联网获取】后显示）"
+
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("💬 设为对话模型", callback_data=set_chat_cb)],
         [InlineKeyboardButton("🖼️ 设为媒体模型", callback_data=set_media_cb)],
@@ -955,7 +1033,8 @@ def build_model_detail_menu(prov_name: str, model_name: str, back_callback: Opti
     text = (
         f"⚙️ <b>{safe_text(model_name)}</b>\n"
         f"提供商: {safe_text(prov_name)}\n"
-        f"状态: {status}"
+        f"状态: {status}\n"
+        f"联网检测: {fetch_line}"
     )
     return text, kb
 
@@ -974,7 +1053,8 @@ def build_model_selection_keyboard(provider_name: str, target: str, page: int = 
         page,
         "pick_default_",
         f"target_{target}_models",
-        marker_fn=make_select_marker_fn(target, provider_name)
+        marker_fn=make_select_marker_fn(target, provider_name),
+        prefix_fn=make_model_status_fn(provider_name)
     )
 
 # --- ☆ 核心：授权用户校验与未授权用户通报系统 ☆ ---

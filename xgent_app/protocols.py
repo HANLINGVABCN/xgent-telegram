@@ -47,7 +47,7 @@ class ProtocolParser:
         r"run-x|shell-x|stdin-x:[^\n]+|shellread-x:[^\n]+|shellkill-x:[^\n]+|"
         r"trigger-x(?::[^\n]+)?|sendfile-x|read-x:[^\n]+|read-x|edit-x(?::[^\n]+)?|grep-x|"
         r"search-x|fetch-x|"
-        r"media-x|file-x(?::[^\n]+)?"
+        r"media-x|file-x(?::[^\n]+)?|over-x"
         r")\s*$"
     )
 

@@ -251,6 +251,153 @@ asyncio.run(main())
         self.assertTrue(data["web_has_reply_text"], "网页 outbox 必须收到含回复正文的帧")
         self.assertTrue(data["tg_rich_called"], "原生 Telegram 仍应走 rich API")
 
+    def test_provider_import_syncs_chat_session_model(self):
+        """导入配置/Web 设置换默认模型后，会话绑定必须跟着换。
+
+        回归：模型取值是两层存储——发消息优先读 chat_sessions.model，没有
+        才回退全局 default_model。导入配置原本只更新全局层，会话里残留的
+        旧模型名配上换掉后的新提供商通道发出去，上游 502 unknown
+        provider；replace 导入还会删旧提供商，旧绑定直接悬空。前台显示
+        读全局（新模型），实际请求读会话（旧模型），两边对不上。
+        """
+        output = self.run_probe(r'''
+import asyncio
+import json
+import xgent_server as bot
+
+def _payload(defaults):
+    return {
+        "format": "xgent-telegram-provider-config",
+        "version": 1,
+        "providers": {
+            "newprov": {
+                "base_url": "https://example.com/v1",
+                "api_key": "secret",
+                "models": ["model-new"],
+                "api_format": "openai",
+            }
+        },
+        "defaults": defaults,
+    }
+
+async def main():
+    await bot.UserDataManager.init()
+    db = await bot.BotMemoryDB.get_instance()
+
+    # 预置"导入前"状态：旧提供商 + 会话钉着旧模型（正常使用中）
+    await db.import_providers({
+        "oldprov": {"base_url": "https://old.example.com/v1", "api_key": "k",
+                    "models": ["model-old"], "api_format": "openai"}
+    }, replace=False)
+    await bot.save_model_target_selection('chat', 'oldprov', 'model-old')
+    await db.create_session(bot.SINGLE_MEMORY_SESSION_ID, 'model-old')
+    bot.UserDataManager.set('current_chat_id', bot.SINGLE_MEMORY_SESSION_ID)
+
+    # replace 导入：defaults 指向新提供商的新模型 → 会话绑定同步
+    providers, defaults = bot.parse_provider_config_import(
+        json.dumps(_payload({"active_provider": "newprov",
+                             "default_model": "model-new"})).encode("utf-8"))
+    await bot.apply_provider_config_import(providers, defaults, mode='replace')
+    session = await db.get_session(bot.SINGLE_MEMORY_SESSION_ID)
+    replace_synced = session['model'] == 'model-new'
+
+    # replace 导入但 defaults 的模型无效 → 会话绑定清空，不留悬空引用
+    await db.create_session(bot.SINGLE_MEMORY_SESSION_ID, 'model-old')
+    providers, defaults = bot.parse_provider_config_import(
+        json.dumps(_payload({"active_provider": "newprov",
+                             "default_model": "model-gone"})).encode("utf-8"))
+    await bot.apply_provider_config_import(providers, defaults, mode='replace')
+    session = await db.get_session(bot.SINGLE_MEMORY_SESSION_ID)
+    replace_invalid_cleared = session['model'] is None
+
+    # merge 导入 + 有效 defaults：同样要同步
+    await db.create_session(bot.SINGLE_MEMORY_SESSION_ID, 'model-old')
+    providers, defaults = bot.parse_provider_config_import(
+        json.dumps(_payload({"active_provider": "newprov",
+                             "default_model": "model-new"})).encode("utf-8"))
+    await bot.apply_provider_config_import(providers, defaults, mode='merge')
+    session = await db.get_session(bot.SINGLE_MEMORY_SESSION_ID)
+    merge_synced = session['model'] == 'model-new'
+
+    # Web 设置 chat_model：会话绑定同步
+    await bot._web_write_setting('chat_model', 'newprov|model-new')
+    session = await db.get_session(bot.SINGLE_MEMORY_SESSION_ID)
+    web_synced = session['model'] == 'model-new'
+
+    # merge 导入覆盖同名提供商、新模型列表不含当前模型、defaults 为空：
+    # 悬空的全局选择连同会话绑定必须一起清掉，并在结果里汇报。这是上一轮
+    # 修复漏掉的路径——merge 不删提供商，但同名覆盖同样换血模型列表。
+    await db.import_providers({
+        "p2": {"base_url": "https://p2.example.com/v1", "api_key": "k",
+               "models": ["m2-old"], "api_format": "openai"}
+    }, replace=False)
+    await bot.save_model_target_selection('chat', 'p2', 'm2-old')
+    await db.create_session(bot.SINGLE_MEMORY_SESSION_ID, 'm2-old')
+    payload = {
+        "format": "xgent-telegram-provider-config", "version": 1,
+        "providers": {"p2": {"base_url": "https://p2.example.com/v1",
+                             "api_key": "k", "models": ["m2-new"],
+                             "api_format": "openai"}},
+        "defaults": {},
+    }
+    providers, defaults = bot.parse_provider_config_import(json.dumps(payload).encode("utf-8"))
+    result = await bot.apply_provider_config_import(providers, defaults, mode='merge')
+    session = await db.get_session(bot.SINGLE_MEMORY_SESSION_ID)
+    merge_dangling_cleared = session['model'] is None
+    merge_dangling_global_cleared = bot.UserDataManager.get('default_model') is None
+    merge_dangling_reported = result.get('cleared_dangling') == ['对话模型']
+
+    # resolve_effective_chat_model：发消息前的最终防线，纯函数直接断言。
+    resolved = {
+        "valid": bot.resolve_effective_chat_model("m2-new", "m2-old", {"models": ["m2-new"]}),
+        "fallback": bot.resolve_effective_chat_model("m2-gone", "m2-new", {"models": ["m2-new"]}),
+        "both_stale": bot.resolve_effective_chat_model("m2-gone", "m2-old", {"models": ["m2-new"]}),
+        "wildcard": bot.resolve_effective_chat_model("anything", None, {"models": []}),
+        "unset": bot.resolve_effective_chat_model(None, None, {"models": ["m2-new"]}),
+    }
+
+    # aiosqlite 的工作线程不是 daemon：不关连接的话探针进程退不出去
+    await db.close()
+
+    print(json.dumps({
+        "replace_synced": replace_synced,
+        "replace_invalid_cleared": replace_invalid_cleared,
+        "merge_synced": merge_synced,
+        "web_synced": web_synced,
+        "merge_dangling_cleared": merge_dangling_cleared,
+        "merge_dangling_global_cleared": merge_dangling_global_cleared,
+        "merge_dangling_reported": merge_dangling_reported,
+        "resolved": resolved,
+    }, ensure_ascii=False))
+
+asyncio.run(main())
+''')
+        data = json.loads(output.strip().splitlines()[-1])
+        self.assertTrue(data["replace_synced"],
+                        "replace 导入恢复默认模型后，会话绑定必须同步成新模型")
+        self.assertTrue(data["replace_invalid_cleared"],
+                        "replace 导入删掉旧提供商后，悬空的会话绑定必须清空")
+        self.assertTrue(data["merge_synced"],
+                        "merge 导入恢复默认模型后，会话绑定必须同步成新模型")
+        self.assertTrue(data["web_synced"],
+                        "Web 设置 chat_model 后，会话绑定必须同步")
+        self.assertTrue(data["merge_dangling_cleared"],
+                        "merge 覆盖同名提供商后，悬空的会话绑定必须清空")
+        self.assertTrue(data["merge_dangling_global_cleared"],
+                        "merge 覆盖同名提供商后，悬空的全局默认必须清空")
+        self.assertTrue(data["merge_dangling_reported"],
+                        "清空的悬空选择必须在导入结果里汇报给用户")
+        resolved = data["resolved"]
+        self.assertEqual("m2-new", resolved["valid"],
+                         "会话模型有效时原样返回")
+        self.assertEqual("m2-new", resolved["fallback"],
+                         "会话模型悬空、全局默认有效时回退全局默认")
+        self.assertIsNone(resolved["both_stale"],
+                          "两层都悬空时必须返回 None（按未配置处理），绝不能拿旧模型名发请求")
+        self.assertEqual("anything", resolved["wildcard"],
+                         "models 为空的通配型提供商不做校验")
+        self.assertIsNone(resolved["unset"], "两层都没设置时返回 None")
+
     def test_protocol_and_normalization_behavior(self):
         output = self.run_probe(r'''
 import json

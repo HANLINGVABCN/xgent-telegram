@@ -297,7 +297,7 @@ def _inline_markdown_to_html(text: str) -> str:
             continue
         else:
             if blockquote_buffer:
-                processed.append(f'<blockquote>{"<br>".join(blockquote_buffer)}</blockquote>')
+                processed.append(f'<blockquote>{chr(10).join(blockquote_buffer)}</blockquote>')
                 blockquote_buffer = []
 
         # 标题：# ## ### 等 → 粗体
@@ -319,7 +319,7 @@ def _inline_markdown_to_html(text: str) -> str:
         processed.append(line)
 
     if blockquote_buffer:
-        processed.append(f'<blockquote>{"<br>".join(blockquote_buffer)}</blockquote>')
+        processed.append(f'<blockquote>{chr(10).join(blockquote_buffer)}</blockquote>')
 
     text = '\n'.join(processed)
 
@@ -535,6 +535,10 @@ def _sanitize_telegram_html(text: str) -> str:
         if tag_name in ALLOWED_TAGS:
             return full  # 保留合法标签
         return html.escape(full)  # 转义非法标签
+
+    # Telegram 不支持 <br> 标签，换行必须用普通 \n。在标签清洗之前先统一替换，
+    # 防止第三方内容或残留的 <br> 漏网打到 API 触发 "Can't parse entities"。
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
 
     result = re.sub(r'<[^>]+>', _replace_tag, text)
 

@@ -1,6 +1,59 @@
 # This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
+# --- ☆ 点击来源 ☆ ---
+# 三个入口（Telegram / 网页 / CLI）共用同一套回调 handler。绝大多数按钮不关心自己
+# 是从哪儿被点的，但"关掉 Web / 清掉密码"这类会切断入口的操作必须关心：在网页里点
+# 等于当场把自己锁在外面，在 CLI 里点则完全安全——人就在这台机器的 shell 前，随时
+# 能开回来。
+CLICK_ORIGIN_TELEGRAM = "telegram"
+CLICK_ORIGIN_WEB = "web"
+CLICK_ORIGIN_CLI = "cli"
+
+# 拦下来之后要告诉用户去哪儿关，别只说"不能"。
+WEB_LOCKOUT_HINT = (
+    "网页是这台机器当前唯一的远程入口，在网页里关掉就只能回服务器上开回来。"
+    "要关请在服务器上运行 xgent → /web，或 ./install.sh → 1 → 2。"
+)
+
+
+def click_origin(update: Any) -> str:
+    """这次点击来自哪个入口。
+
+    标记由各自的桥挂在 update / callback_query 上（cli_bridge、web_bridge）；
+    没有标记的就是真正的 Telegram 更新。
+    """
+    query = getattr(update, "callback_query", None)
+    return str(
+        getattr(query, "xgent_origin", "")
+        or getattr(update, "xgent_origin", "")
+        or CLICK_ORIGIN_TELEGRAM
+    )
+
+
+def _would_lock_out_caller(update: Any) -> bool:
+    """关掉之后，点这一下的人自己还有路进来吗？
+
+    只有"从网页点、且没有 Telegram 兜底"这一种组合会失联。以前的判据是
+    ``BotConfig.WEB_ONLY``（即"没有 BOT_TOKEN"）一个布尔，它看不见 CLI——于是
+    cli+web 部署的用户在 xgent 里点关闭，只拿到一句"这是你唯一的入口"，而他明明
+    正坐在那台机器的终端前。
+    """
+    return bool(BotConfig.WEB_ONLY) and click_origin(update) == CLICK_ORIGIN_WEB
+
+
+async def _sync_web_switches(query: Any, app: Any = None) -> None:
+    """开关写库之后，让监听状态跟上，并在需要时给用户一句说明。
+
+    真正的活儿交给 idle.apply_web_config_change：托管进程立刻对账一次，CLI 只写库
+    （由服务进程的对账任务几秒内跟上）。CLI 自己去起停的后果是抢服务进程的端口拿
+    EADDRINUSE，而且失败是静音的，见 idle._web_managed_here。
+    """
+    note = await apply_web_config_change(app)
+    if note:
+        await query.answer(note)
+
+
 async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await check_authorized_user_middleware(update, context):
@@ -33,12 +86,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await cancel_text_conversation(update)
         return
 
-    if data == "noop":
-        # 纯 Web 模式下被锁定的按钮（关闭 Web/终端会导致失联）用这个
-        # callback_data 占位，点击只提示原因，不做任何操作。
-        await query.answer("纯 Web 模式下这是你唯一的入口，不能关闭", show_alert=True)
-        return
-    
     await UserDataManager.init()
     await query.answer()
     
@@ -692,22 +739,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             if enabled and not UserDataManager.get('_web_has_password', False):
                 await query.answer("请先设置访问密码", show_alert=True)
                 return
-            if not enabled and BotConfig.WEB_ONLY:
-                # 纯 Web 模式下 Web 服务是唯一入口，没有 Telegram 兜底。真的
-                # 关掉会让用户失联，只能物理重启进程才能恢复，所以拦截。
-                await query.answer("纯 Web 模式下这是你唯一的入口，不能关闭", show_alert=True)
+            if not enabled and _would_lock_out_caller(update):
+                await query.answer(WEB_LOCKOUT_HINT, show_alert=True)
                 return
             UserDataManager.set('web_enabled', enabled)
             await UserDataManager.save_config('web_enabled', enabled)
-            # 解耦: 只在服务器运行状态需要改变时才 start/stop, 不无谓 restart
-            running = is_web_chat_running()
-            term_still_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
-            if enabled or term_still_on:
-                if not running:
-                    await start_web_chat_if_enabled(context.application)
-            else:
-                if running:
-                    await stop_web_chat()
+            await _sync_web_switches(query, context.application)
             await GlobalRecorder.record_system_op(
                 f"Web Chat {'开启' if enabled else '关闭'}",
                 {"web_enabled": enabled}
@@ -754,8 +791,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
         elif data == "confirm_clear_web_password":
-            if BotConfig.WEB_ONLY:
-                await query.answer("纯 Web 模式下这是你唯一的入口，不能清除密码", show_alert=True)
+            if _would_lock_out_caller(update):
+                await query.answer(WEB_LOCKOUT_HINT, show_alert=True)
                 return
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ 确认清除", callback_data="do_clear_web_password")],
@@ -769,16 +806,17 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
         elif data == "do_clear_web_password":
-            if BotConfig.WEB_ONLY:
+            if _would_lock_out_caller(update):
                 # 防御性拦截：正常入口已经在 confirm 步骤挡住了，这里防止有人
                 # 直接拼 callback_data 绕过确认步骤。
-                await query.answer("纯 Web 模式下这是你唯一的入口，不能清除密码", show_alert=True)
+                await query.answer(WEB_LOCKOUT_HINT, show_alert=True)
                 return
             await clear_web_password()
             # 没有密码就不能继续对外服务，连同开关一起关掉。
             UserDataManager.set('web_enabled', False)
             await UserDataManager.save_config('web_enabled', False)
-            await stop_web_chat()
+            if web_managed_here():
+                await stop_web_chat()
             await GlobalRecorder.record_system_op("清除 Web 访问密码并停止服务")
             await query.message.edit_text(
                 build_web_text(),
@@ -802,22 +840,14 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.answer("请先设置访问密码", show_alert=True)
                 return
             web_still_on = normalize_bool(UserDataManager.get('web_enabled', False), False)
-            if not term_on and not web_still_on and BotConfig.WEB_ONLY:
-                # 纯 Web 模式下，关闭终端时如果 web_enabled 也是关的（常见——
-                # 该开关默认关闭，纯 Web 模式只是绕过了它，未必被显式打开过），
-                # 会导致下面的逻辑真的停掉唯一的服务入口，必须拦截。
-                await query.answer("纯 Web 模式下这是你唯一的入口，不能关闭", show_alert=True)
+            if not term_on and not web_still_on and _would_lock_out_caller(update):
+                # 关终端时 web_enabled 也是关的，说明这一下会真的停掉唯一的服务
+                # 入口——而点它的人此刻正从网页进来。
+                await query.answer(WEB_LOCKOUT_HINT, show_alert=True)
                 return
             UserDataManager.set('terminal_enabled', term_on)
             await UserDataManager.save_config('terminal_enabled', term_on)
-            # 解耦: 终端与 Web 共享服务器但独立开关
-            running = is_web_chat_running()
-            if term_on or web_still_on:
-                if not running:
-                    await start_web_chat_if_enabled(context.application)
-            else:
-                if running:
-                    await stop_web_chat()
+            await _sync_web_switches(query, context.application)
             await GlobalRecorder.record_system_op(
                 f"终端{'开启' if term_on else '关闭'}",
                 {"terminal_enabled": term_on}
@@ -1061,8 +1091,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             await query.answer(f"已{'开启' if on else '关闭'}静默", show_alert=False)
             await query.message.edit_text(
-                "📝 <b>提示词设置</b>\n\n选择要查看或修改的提示词。",
-                reply_markup=get_prompts_menu(),
+                build_settings_menu_text(),
+                reply_markup=get_more_settings_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
 
@@ -1415,7 +1445,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"📚 <b>{safe_text(provider_name)}</b> 的{safe_text(get_model_target_label(target))}\n\n"
                 f"当前默认: <b>{safe_text(format_model_target_summary(target))}</b>\n"
                 "这里只能选择已保存模型。\n"
-                "如果要新增、删除或联网获取模型，请回【提供商】里管理。",
+                "如果要新增、删除或联网获取模型，请回【提供商】里管理。"
+                + format_fetch_status_note(provider_name, compact=True),
                 reply_markup=kb,
                 parse_mode=constants.ParseMode.HTML
             )
@@ -1429,7 +1460,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             kb = build_saved_models_keyboard(name)
             await query.message.edit_text(
                 f"🧰 <b>{safe_text(name)}</b> 的模型管理\n\n"
-                "这里可以手写新增、联网获取、搜索，或点击模型进行设置。",
+                "这里可以手写新增、联网获取、搜索，或点击模型进行设置。"
+                + format_fetch_status_note(name),
                 reply_markup=kb,
                 parse_mode=constants.ParseMode.HTML
             )
@@ -1565,6 +1597,11 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 db = await BotMemoryDB.get_instance()
                 await db.delete_provider(name)
                 PortalManager.remove_portal(name)
+                # 同步清掉该提供商的联网检测记录，避免日后同名新提供商继承旧状态。
+                status_map = UserDataManager.get('model_fetch_status', {})
+                if isinstance(status_map, dict) and name in status_map:
+                    status_map.pop(name, None)
+                    await UserDataManager.save_config('model_fetch_status', status_map)
                 await UserDataManager.reload_providers()
                 await GlobalRecorder.record_system_op(f"删除Provider: {name}")
             
@@ -1613,12 +1650,11 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return
             kb = build_saved_models_keyboard(name)
             await query.message.edit_text(
-                f"🧰 <b>{safe_text(name)}</b> 已保存的模型\n\n"
-                "这里可以继续新增、联网获取、搜索，或点击模型进行设置。",
+                get_saved_models_title(name),
                 reply_markup=kb,
                 parse_mode=constants.ParseMode.HTML
             )
-        
+
         elif data.startswith("act_manual_mod_"):
             UserDataManager.set('editing_provider', data.split("_", 3)[3])
             UserDataManager.set('state', BotState.ADD_MODEL_MANUAL)
@@ -1665,10 +1701,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return
             await save_model_target_selection(target, prov_name, model_name)
 
-            cid = UserDataManager.get('current_chat_id')
-            if target == 'chat' and cid:
-                db = await BotMemoryDB.get_instance()
-                await db.update_session(cid, model=model_name)
+            if target == 'chat':
+                await sync_chat_session_model(model_name)
 
             await GlobalRecorder.record_system_op(
                 f"设置{get_model_target_label(target)}: {model_name}",
@@ -1680,15 +1714,13 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 reply_markup=get_default_model_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
-        
+
         elif data.startswith("set_mdl|"):
             _, target, prov_name, model_name = data.split("|", 3)
             await save_model_target_selection(target, prov_name, model_name)
 
-            cid = UserDataManager.get('current_chat_id')
-            if target == 'chat' and cid:
-                db = await BotMemoryDB.get_instance()
-                await db.update_session(cid, model=model_name)
+            if target == 'chat':
+                await sync_chat_session_model(model_name)
 
             await GlobalRecorder.record_system_op(
                 f"设置{get_model_target_label(target)}: {model_name}",
@@ -1714,8 +1746,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 kb = build_saved_models_keyboard(prov_name)
                 await query.message.edit_text(
                     f"✅ <b>{safe_text(model_name)}</b> 已设为{target_label}！\n\n"
-                    f"🧰 <b>{safe_text(prov_name)}</b> 已保存的模型\n\n"
-                    "这里可以继续新增、联网获取、搜索，或点击模型进行设置。",
+                    + get_saved_models_title(prov_name),
                     reply_markup=kb,
                     parse_mode=constants.ParseMode.HTML
                 )
@@ -1727,23 +1758,21 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parts = data.split("_", 4)
                 target, prov_name, model_name = parts[2], parts[3], parts[4]
             await save_model_target_selection(target, prov_name, model_name)
-            
-            cid = UserDataManager.get('current_chat_id')
-            if target == 'chat' and cid:
-                db = await BotMemoryDB.get_instance()
-                await db.update_session(cid, model=model_name)
-            
+
+            if target == 'chat':
+                await sync_chat_session_model(model_name)
+
             await GlobalRecorder.record_system_op(
                 f"设置{get_model_target_label(target)}: {model_name}",
                 {"provider": prov_name, "target": target}
             )
-            
+
             await query.message.reply_text(
                 f"✅ {get_model_target_label(target)} 已切换为 <b>{safe_text(prov_name)} / {safe_text(model_name)}</b>。",
                 reply_markup=get_default_model_menu(),
                 parse_mode=constants.ParseMode.HTML
             )
-        
+
         elif data.startswith("do_del|") or data.startswith("do_del_"):
             if data.startswith("do_del|"):
                 _, pname, mname = data.split("|", 2)
@@ -1773,8 +1802,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 kb = build_saved_models_keyboard(pname)
                 await query.message.edit_text(
                     f"🗑️ <b>{safe_text(mname)}</b> 已从模型列表中删除！\n\n"
-                    f"🧰 <b>{safe_text(pname)}</b> 已保存的模型\n\n"
-                    "这里可以继续新增、联网获取、搜索，或点击模型进行设置。",
+                    + get_saved_models_title(pname),
                     reply_markup=kb,
                     parse_mode=constants.ParseMode.HTML
                 )
@@ -1806,6 +1834,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                     )
                 return
             UserDataManager.set('fetched_cache', models)
+            # 记录本次拉取结果：已保存模型列表据此刷新 🟢 有效 / 🔴 失效 图标。
+            status_map = UserDataManager.get('model_fetch_status', {})
+            if not isinstance(status_map, dict):
+                status_map = {}
+            status_map[name] = {'models': models, 'ts': int(time.time())}
+            await UserDataManager.save_config('model_fetch_status', status_map)
             UserDataManager.set('temp_page', 1)
             UserDataManager.set('temp_filter', None)
             UserDataManager.set('temp_list_type', 'fetched')
@@ -1846,10 +1880,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                     )
                 else:
                     await save_model_target_selection(target, pname, mname)
-                    cid = UserDataManager.get('current_chat_id')
-                    if target == 'chat' and cid:
-                        db = await BotMemoryDB.get_instance()
-                        await db.update_session(cid, model=mname)
+                    if target == 'chat':
+                        await sync_chat_session_model(mname)
                     await GlobalRecorder.record_system_op(
                         f"设置{get_model_target_label(target)}: {mname}",
                         {"provider": pname, "target": target}
@@ -1907,6 +1939,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                     fallback_text = (
                         f"🧰 <b>{safe_text(pname)}</b> 已保存的模型\n\n"
                         "⚠️ 获取结果已失效，请点击【⚡ 联网获取】重新拉取。"
+                        + format_fetch_status_note(pname, compact=True)
                     )
                 else:
                     kb = get_providers_menu()
@@ -1935,6 +1968,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                     fallback_text = (
                         f"🧰 <b>{safe_text(pname)}</b> 已保存的模型\n\n"
                         "⚠️ 获取结果已失效，请点击【⚡ 联网获取】重新拉取。"
+                        + format_fetch_status_note(pname, compact=True)
                     )
                 else:
                     kb = get_providers_menu()
@@ -1986,7 +2020,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                     back_callback = f"target_{target}_models"
                     kb = build_magic_keyboard(
                         items, page, prefix, back_callback,
-                        marker_fn=make_select_marker_fn(target, pname)
+                        marker_fn=make_select_marker_fn(target, pname),
+                        prefix_fn=make_model_status_fn(pname)
                     )
             else:
                 _, kb = build_fetched_models_view(pname)

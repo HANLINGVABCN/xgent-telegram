@@ -28,14 +28,33 @@ readline 能做的只有"按 Tab 把候选**打印**出来"——列表打完就
 不是 TTY（管道、重定向）、平台没有 termios（Windows）、或者用户设了
 XGENT_CLI_NO_SLASH_HINT 时，``interactive_supported()`` 返回 False，调用方
 退回原来的 input() + readline，一切照旧。
+
+常驻模式
+--------
+CLI 主循环（xgent_cli）以"会话"为单位使用本类：open() 进 raw 并藏掉终端
+光标，之后 await_line() 一圈一圈地跑，AI 输出期间也不停——用户可以边看流式
+回复边把下一句话打好。为此本类和渲染层（cli_render.TerminalScreen）按如下
+协议配合：
+
+  - 挂载到渲染层后，屏幕每次打印前调 withdraw() 撤框（光标精确回到输出流
+    末行行首），打印后调 restore() 把框画回输出下方；
+  - 撤框期间按键照常进缓冲，只是不上屏（_suppressed），restore 时一次性
+    补画；
+  - 忙时（上一轮还在跑）回车不提交：调 on_busy_submit 让调用方提示"系统
+    仍在处理上一个请求"，草稿留在输入行，等空闲后再按一次回车发送。
+
+框内光标是自绘的反色块（终端原生光标整个会话被 ?25l 藏掉，免得它在重绘
+间隙闪到框外），左右移动的落点始终可见——这是"光标看不见"问题的修复。
 """
 
 from __future__ import annotations
 
 import atexit
+import contextlib
 import os
 import re
 import sys
+import threading
 from collections import OrderedDict
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -76,6 +95,12 @@ _BRACKETED_ON = "\x1b[?2004h"
 _BRACKETED_OFF = "\x1b[?2004l"
 _PASTE_START = "\x1b[200~"
 _PASTE_END = "\x1b[201~"
+# 终端光标的藏/还。常驻模式下框每次重画之间原生光标会闪到框外，干脆整个
+# 会话藏掉，框内光标用反色块自绘（_overlay_reverse_cursor）。
+_CURSOR_HIDE = "\x1b[?25l"
+_CURSOR_SHOW = "\x1b[?25h"
+_REVERSE_ON = "\x1b[7m"
+_REVERSE_OFF = "\x1b[27m"
 # 结束标记迟迟不来（终端只发了开始标记就断了）时，等这么久就认栽收工。
 _PASTE_IDLE_TIMEOUT = 1.0
 # 没有括号粘贴的终端（老 conhost、部分 SSH 客户端）靠"回车后面还紧跟着字节"
@@ -199,13 +224,25 @@ def _write_raw(text: str) -> None:
         pass
 
 
+# open() 被调用过 = 本进程真正接管过终端（进 raw / 藏光标）。探针和子进程
+# 只 import 本模块、从不 open()，退出时绝不能往它们捕获的 stdout 里写
+# 转义码——test_cli_input 的探针靠"stdout 最后一行是 JSON"传结果，尾巴上
+# 多一段 ?25h 就全线解析失败。
+_TERMINAL_TAKEN_OVER = False
+
+
 @atexit.register
 def _restore_terminal_on_exit() -> None:  # pragma: no cover - 退出路径
+    if not _TERMINAL_TAKEN_OVER:
+        return
+    # 光标还原是无条件的：raw 哪怕没进成（_restore 为空），?25l 也可能
+    # 已经发出去了（open 的写序），退出后 shell 里没有光标比没有回显更难受。
+    _write_raw(_CURSOR_SHOW)
+    _write_raw(_BRACKETED_OFF)
     pending = _RawMode._restore
     if not pending:
         return
     fd, saved = pending
-    _write_raw(_BRACKETED_OFF)
     try:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
     except Exception:
@@ -213,10 +250,16 @@ def _restore_terminal_on_exit() -> None:  # pragma: no cover - 退出路径
 
 
 class SlashPalette:
-    """一次 read_line() = 读一行，期间自己画屏。
+    """常驻输入框：会话期间挂在屏幕底部，读键 + 画屏 + 提交。
 
     调用方给三样东西：提示符、候选来源、渲染候选行的函数。面板不关心命令
     从哪来，也不关心行长什么样——那是 xgent_cli 的排版职责。
+
+    生命周期：open() 进 raw 藏光标 → await_line() 一圈圈跑（忙时回车被
+    busy_check 挡下、草稿保留）→ close() 退 raw 还光标抹框。_render 可能
+    同时被读线程（按键）和主线程（restore/set_prompt）调用，_io_lock 把
+    画屏串行化；渲染层打印输出前 withdraw()、打完 restore()，框永远不会
+    被输出冲掉，输出也永远不会被框挡住。
     """
 
     def __init__(
@@ -226,9 +269,9 @@ class SlashPalette:
         render_rows: Callable[[Sequence[str], int], List[str]],
         history: Optional[List[str]] = None,
         abort_check: Optional[Callable[[], bool]] = None,
-        echo_ansi: str = "",
-        echo_on_submit: bool = True,
         box_ansi: str = "",
+        busy_check: Optional[Callable[[], bool]] = None,
+        on_busy_submit: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.prompt = prompt
         self.list_commands = list_commands
@@ -239,12 +282,12 @@ class SlashPalette:
         # 永远醒不过来；没有这个轮询，"状态输入中 Ctrl+C 取消"就得等用户
         # 再敲一个键才生效。
         self.abort_check = abort_check
-        # echo_ansi：回车提交后回显那一行用的 ANSI 前缀（用户输入淡蓝着色）。
-        self.echo_ansi = echo_ansi
-        # echo_on_submit=False：提交后不回显，由调用方按消息类型自己打印
-        # （对话给完整用户块、命令给单行）——避免"打完的字在 AI 回复刷屏后
-        # 找不到"，也避免同一条消息显示两遍。
-        self.echo_on_submit = echo_on_submit
+        # busy_check / on_busy_submit：忙时（上一轮对话还在跑）回车的去处——
+        # 不提交、不清输入行，调 on_busy_submit 让调用方提示"仍在处理上一
+        # 个请求"，草稿留着等空闲后再按一次回车。对齐 Telegram 端忙闸门
+        # 的语义，不做排队。
+        self.busy_check = busy_check
+        self.on_busy_submit = on_busy_submit
         # box_ansi：输入框框线的颜色。用的是提示符那一档的颜色（红=状态输入中、
         # 黄=菜单导航中、绿=空闲），框线跟着提示符一起变，"这行字会去哪"这个
         # 信号就从一个字符扩大成整个框。
@@ -255,7 +298,6 @@ class SlashPalette:
         self.cursor = 0
         self.matches: List[str] = []
         self.selected = 0
-        self.drawn_rows = 0
         # 上次画屏后光标停在输入行的第几个可视行。输入超宽折行后光标不在
         # 首行，重画前必须先上移回来，这是长输入"疯狂复制"bug 的账本。
         self._cursor_row = 0
@@ -279,6 +321,16 @@ class SlashPalette:
         # （os.read 一次拿一大片），结束标记后面可能还粘着用户随后敲的键；
         # 丢掉它们等于吞掉用户的按键，所以退回这里，下一次读键先吃它。
         self._pending = bytearray()
+        # ---- 常驻模式的状态 ----
+        # 画屏互斥锁：_render/withdraw/restore/set_prompt 可能同时来自读线程
+        # （按键）和主线程（渲染层复位、提示符换档），RLock 允许同线程重入
+        # （restore → _render）。
+        self._io_lock = threading.RLock()
+        self._opened = False   # open() 进过 raw：会话级开关
+        self._closed = False   # close() 之后永久拒绝再画（退出/退役路径）
+        self._shown = False    # 框此刻在屏幕上（withdraw 会撤掉、_render 会画上）
+        self._suppressed = False  # 渲染层正在打印输出：按键进缓冲但不上屏
+        self._raw: Optional[_RawMode] = None
 
     # ---------------- 输入 ----------------
 
@@ -580,6 +632,33 @@ class SlashPalette:
         start = min(max(0, cur_row - budget + 1), len(rows) - budget)
         return rows[start:start + budget], cur_row - start
 
+    def _overlay_reverse_cursor(self, rows: List[str], cur_row: int,
+                                cur_col: int) -> List[str]:
+        """把框内光标位置的字符换成反色块（行尾补一个反色空格）。
+
+        终端原生光标在常驻会话里被 ?25l 藏掉了——它在整块重画的间隙会闪到
+        框外、还会停在框线上，视觉上比没有光标更乱。反色块跟着内容一起
+        重画，光标落在哪个字符上一目了然，左右移动有明确落点。
+
+        按显示宽度走到 cur_col 拿到字符偏移（cur_col 永远落在字符边界上，
+        这是 _layout 的保证）；宽字符整体反色，占两列的块不会只黑一半。
+        """
+        if not 0 <= cur_row < len(rows):
+            return rows
+        row = rows[cur_row]
+        col = 0
+        for offset, ch in enumerate(row):
+            if col == cur_col:
+                return (rows[:cur_row]
+                        + [row[:offset] + _REVERSE_ON + ch + _REVERSE_OFF
+                           + row[offset + len(ch):]]
+                        + rows[cur_row + 1:])
+            col += char_width(ch)
+        # 走到行尾都没对上列号：光标在行尾，补一个反色空格当块。
+        return (rows[:cur_row]
+                + [row + _REVERSE_ON + " " + _REVERSE_OFF]
+                + rows[cur_row + 1:])
+
     def _render(self) -> None:
         """整块重画：输入框 + 候选面板，然后把光标放回框内。
 
@@ -588,110 +667,207 @@ class SlashPalette:
             每敲一个键就在下面多叠一份；
           - 画完之后用 CSI A + CSI G 把光标精确放回框内的逻辑位置，列号
             要加上左框线占的两列（"│ "），并按 CJK 双宽折算。
+
+        常驻模式：持 _io_lock 串行化（读线程按键 / 主线程 restore 都会进
+        这里）；被 withdraw 压制或已 close 时直接跳过，内容等 restore 时
+        一次性补画。
         """
-        width, height = terminal_size()
-        width = max(20, width)
-        inner = width - BOX_CHROME
-        prompt_width = display_width(self.prompt)
-        avail = max(4, inner - prompt_width)
+        with self._io_lock:
+            if self._closed or self._suppressed:
+                return
+            width, height = terminal_size()
+            width = max(20, width)
+            inner = width - BOX_CHROME
+            prompt_width = display_width(self.prompt)
+            avail = max(4, inner - prompt_width)
 
-        rows, cur_row, cur_col = self._layout(avail)
-        # 候选面板挂在框下面，缩进 2 格对齐框内文字——不缩进的话它贴着屏幕
-        # 左边，和框里的输入错开一格，看起来像两个不相干的东西。
-        candidates = [" " * 2 + row for row in self._candidate_rows(width - 2)]
-        # 高度预算：整块（上下框线 + 输入行 + 候选）不能顶满屏幕。先砍候选，
-        # 再对输入行开窗口——候选是辅助信息，正在编辑的那一行不能不见。
-        budget = max(3, height - 1)
-        room = budget - 2 - len(candidates)
-        if room < 1:
-            candidates = []
-            room = budget - 2
-        rows, cur_row = self._fit_rows(rows, cur_row, max(1, room))
+            rows, cur_row, cur_col = self._layout(avail)
+            # 候选面板挂在框下面，缩进 2 格对齐框内文字——不缩进的话它贴着屏幕
+            # 左边，和框里的输入错开一格，看起来像两个不相干的东西。
+            candidates = [" " * 2 + row for row in self._candidate_rows(width - 2)]
+            # 高度预算：整块（上下框线 + 输入行 + 候选）不能顶满屏幕。先砍候选，
+            # 再对输入行开窗口——候选是辅助信息，正在编辑的那一行不能不见。
+            budget = max(3, height - 1)
+            room = budget - 2 - len(candidates)
+            if room < 1:
+                candidates = []
+                room = budget - 2
+            rows, cur_row = self._fit_rows(rows, cur_row, max(1, room))
+            rows = self._overlay_reverse_cursor(rows, cur_row, cur_col)
 
-        body = [
-            (self.prompt if index == 0 else " " * prompt_width) + row
-            for index, row in enumerate(rows)
-        ]
-        lines = box_block(body, width, "", self._box_palette, self.box_ansi)
-        lines.extend(candidates)
+            body = [
+                (self.prompt if index == 0 else " " * prompt_width) + row
+                for index, row in enumerate(rows)
+            ]
+            lines = box_block(body, width, "", self._box_palette, self.box_ansi)
+            lines.extend(candidates)
 
-        out: List[str] = []
-        # 终端被拖宽/拖窄之后，上一次画的那块已经被终端按新宽度重排过，
-        # _cursor_row 记的"第几个可视行"不再对应任何东西。终端折行时光标
-        # 锚定在文本位置，所以旧框顶部到光标的行数可以按新宽度重算：光标
-        # 之前每一行折成几行（visual_rows 精确模拟终端折行，宽字符不跨行
-        # ——ceil 除法在这种边界会少算 1 行，上移不到位留下残骸），加上
-        # 光标在自己那行内掉到第几个折行段。上移这个行数就回到旧框顶部，
-        # 清屏后旧框被整块擦掉重画。
-        if (self._last_width and self._last_width != width
-                and self._drawn_lines
-                and self._drawn_row < len(self._drawn_lines)):
-            up = sum(visual_rows(line, width)
-                     for line in self._drawn_lines[:self._drawn_row])
-            up += visual_row_of_col(self._drawn_lines[self._drawn_row],
-                                    width, self._drawn_col)
-            if up:
-                out.append(f"\x1b[{up}A")
-        elif self._cursor_row:
-            out.append(f"\x1b[{self._cursor_row}A")
-        out.append("\r\x1b[J")
-        out.append("\n".join(lines))
-
-        target_row = 1 + cur_row  # 1 = 上边框
-        up = (len(lines) - 1) - target_row
-        if up > 0:
-            out.append(f"\x1b[{up}A")
-        out.append("\r")
-        # 左框线 "│ " 占两列，行首还有提示符（续行是等宽空格）。
-        cursor_col = 2 + prompt_width + cur_col
-        out.append(f"\x1b[{min(cursor_col, width - 1) + 1}G")
-        self._cursor_row = target_row
-        self._last_width = width
-        # 记下这次画的内容和光标位置，宽度再变时按当时的宽度重算框高。
-        self._drawn_lines = list(lines)
-        self._drawn_row = target_row
-        self._drawn_col = cursor_col
-        self.drawn_rows = len(candidates)
-        sys.stdout.write("".join(out))
-        sys.stdout.flush()
-
-    def _finish(self) -> None:
-        """收尾：抹掉输入框和候选面板，把光标留在下一行。
-
-        echo_on_submit=True（默认）时把提交的那一行按 echo_ansi 着色回显；
-        False 时只清面板不回显——调用方（xgent_cli 主循环）会把用户这句话
-        当成一条正式消息、连同框一起打进回卷。
-        """
-        out: List[str] = []
-        # 提交前终端宽度又变了（粘贴那一瞬拖了窗口）：账本失效，按新宽度
-        # 精确重算上移（同 _render），否则擦错行、把旧框残骸留给回卷。
-        width_now = terminal_size()[0]
-        if (self._last_width and self._last_width != width_now
-                and self._drawn_lines
-                and self._drawn_row < len(self._drawn_lines)):
-            up = sum(visual_rows(line, width_now)
-                     for line in self._drawn_lines[:self._drawn_row])
-            up += visual_row_of_col(self._drawn_lines[self._drawn_row],
-                                    width_now, self._drawn_col)
-            if up:
-                out.append(f"\x1b[{up}A")
-        elif self._cursor_row:
-            out.append(f"\x1b[{self._cursor_row}A")
-        if not self.echo_on_submit:
+            out: List[str] = []
+            # 终端被拖宽/拖窄之后，上一次画的那块已经被终端按新宽度重排过，
+            # _cursor_row 记的"第几个可视行"不再对应任何东西。终端折行时光标
+            # 锚定在文本位置，所以旧框顶部到光标的行数可以按新宽度重算：光标
+            # 之前每一行折成几行（visual_rows 精确模拟终端折行，宽字符不跨行
+            # ——ceil 除法在这种边界会少算 1 行，上移不到位留下残骸），加上
+            # 光标在自己那行内掉到第几个折行段。上移这个行数就回到旧框顶部，
+            # 清屏后旧框被整块擦掉重画。
+            if (self._last_width and self._last_width != width
+                    and self._drawn_lines
+                    and self._drawn_row < len(self._drawn_lines)):
+                up = sum(visual_rows(line, width)
+                         for line in self._drawn_lines[:self._drawn_row])
+                up += visual_row_of_col(self._drawn_lines[self._drawn_row],
+                                        width, self._drawn_col)
+                if up:
+                    out.append(f"\x1b[{up}A")
+            elif self._cursor_row:
+                out.append(f"\x1b[{self._cursor_row}A")
             out.append("\r\x1b[J")
+            out.append("\n".join(lines))
+
+            target_row = 1 + cur_row  # 1 = 上边框
+            up = (len(lines) - 1) - target_row
+            if up > 0:
+                out.append(f"\x1b[{up}A")
+            out.append("\r")
+            # 左框线 "│ " 占两列，行首还有提示符（续行是等宽空格）。
+            cursor_col = 2 + prompt_width + cur_col
+            out.append(f"\x1b[{min(cursor_col, width - 1) + 1}G")
+            self._cursor_row = target_row
+            self._last_width = width
+            # 记下这次画的内容和光标位置，宽度再变时按当时的宽度重算框高。
+            self._drawn_lines = list(lines)
+            self._drawn_row = target_row
+            self._drawn_col = cursor_col
+            self._shown = True
             sys.stdout.write("".join(out))
             sys.stdout.flush()
-            self.drawn_rows = 0
-            self._cursor_row = 0
-            return
-        body = self.buffer
-        if body and self.echo_ansi:
-            body = f"{self.echo_ansi}{body}\x1b[0m"
-        out.append("\r\x1b[J" + self.prompt + body + "\n")
-        sys.stdout.write("".join(out))
-        sys.stdout.flush()
-        self.drawn_rows = 0
-        self._cursor_row = 0
+
+    # ---------------- 常驻生命周期 ----------------
+
+    def open(self) -> None:
+        """进 raw 模式并藏掉终端光标，整个 CLI 会话只做一次。
+
+        read_line 时代每次读一行都进出一次 raw；常驻输入框要求会话期间
+        一直处于 raw（AI 输出时也要继续收按键），模式开关收进这里和
+        close()。终端光标随之隐藏：框内光标改由反色块自绘，免得原生光标
+        在整块重画的间隙闪到框外。atexit 兜底——主线程退出时读线程可能
+        还阻塞在 os.read 上，close() 不一定跑得到。
+        """
+        global _TERMINAL_TAKEN_OVER
+        with self._io_lock:
+            if self._opened or self._closed:
+                return
+            _TERMINAL_TAKEN_OVER = True
+            self._raw = _RawMode(sys.stdin.fileno())
+            self._raw.__enter__()
+            self._opened = True
+        _write_raw(_CURSOR_HIDE)
+        try:
+            atexit.register(self.close)
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        """抹框、还终端光标、退 raw。幂等：退出路径上会被多处调用。"""
+        with self._io_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._opened = False
+            self._suppressed = False
+            if self._shown:
+                out = f"\x1b[{self._cursor_row}A" if self._cursor_row else ""
+                _write_raw(out + "\r\x1b[J")
+                self._shown = False
+                self._cursor_row = 0
+        _write_raw(_CURSOR_SHOW)
+        raw, self._raw = self._raw, None
+        if raw is not None:
+            raw.__exit__(None, None, None)
+        try:
+            atexit.unregister(self.close)
+        except Exception:
+            pass
+
+    def await_line(self) -> str:
+        """等一行提交（常驻模式）：画框 → 按键循环 → 回车提交。
+
+        与 read_line 时代的区别：raw 模式由 open()/close() 管理会话级开关，
+        这里只负责画和读；提交后框原地清空保留（不擦不回显），主循环把
+        用户这句话打成正式消息块，渲染层会在打印前让位、打印后复位框。
+        Ctrl+C/EOF 走 abort 轮询抛上来，草稿作废、框保留。
+        """
+        self._render()
+        try:
+            return self._event_loop(sys.stdin.fileno())
+        except (EOFError, KeyboardInterrupt):
+            self._discard_draft()
+            raise
+
+    def set_prompt(self, prompt: str, box_ansi: str = "") -> None:
+        """换提示符/框线颜色（红=状态输入、黄=菜单、绿=空闲），框原地重画。
+
+        主循环每次回到 read() 时调用——状态机进出的档位变化通过框色告诉
+        用户"这行字会去哪"。内容不变时跳过重画，避免每轮空刷一次屏。
+        """
+        with self._io_lock:
+            if self.prompt == prompt and self.box_ansi == box_ansi:
+                return
+            self.prompt = prompt
+            self.box_ansi = box_ansi
+            self._box_palette = Palette(bool(box_ansi))
+            self._render()
+
+    def withdraw(self) -> None:
+        """把框从屏幕上撤掉，光标落回框顶行行首（= 输出流的当前位置）。
+
+        给渲染层（cli_render.TerminalScreen）让位：打印输出前调用，打完
+        调 restore() 复位。撤框后按键照常进缓冲、只是不上屏，内容在
+        restore 时一次性补画——打字手感不受打印节奏影响。
+
+        光标记账（_cursor_row/_drawn_lines）一并清零：宽度重算的账本只在
+        "框还在屏幕上"时有效，撤掉的框没有"旧框顶"可言。
+        """
+        with self._io_lock:
+            self._suppressed = True
+            if self._shown:
+                out = f"\x1b[{self._cursor_row}A" if self._cursor_row else ""
+                _write_raw(out + "\r\x1b[J")
+                self._shown = False
+                self._cursor_row = 0
+                self._drawn_lines = []
+                self._drawn_row = 0
+
+    def restore(self) -> None:
+        """把框画回输出流末尾下方（withdraw 的对侧）。"""
+        with self._io_lock:
+            self._suppressed = False
+            if self._closed:
+                return
+            self._render()
+
+    def _reset_line(self) -> None:
+        """清空输入行状态（提交后/取消后共用）。"""
+        self.buffer = ""
+        self.cursor = 0
+        self.matches = []
+        self.selected = 0
+        self._history_index = None
+        # 占位符映射一并清掉：正文已经随提交展开，留着只会让用户手打出的
+        # 同形文本被错误还原成上一段粘贴。
+        self._pastes.clear()
+
+    def _submit(self) -> str:
+        """回车提交：展开粘贴占位符，框原地清空保留，返回这一行。"""
+        line = self._expand_pastes(self.buffer)
+        self._reset_line()
+        self._render()
+        return line
+
+    def _discard_draft(self) -> None:
+        """作废草稿（Ctrl+C 取消 / EOF）：清缓冲，框保留。"""
+        self._reset_line()
+        self._render()
 
     # ---------------- 编辑动作 ----------------
 
@@ -756,23 +932,6 @@ class SlashPalette:
 
     # ---------------- 主循环 ----------------
 
-    def read_line(self) -> str:
-        fd = sys.stdin.fileno()
-        self._cursor_row = 0
-        with _RawMode(fd):
-            self._render()
-            try:
-                result = self._event_loop(fd)
-            except (EOFError, KeyboardInterrupt):
-                # 中断/EOF 也要把面板收干净再走：光标留在半行上，下一条
-                # 输出会直接糊在候选列表中间。
-                self._finish()
-                raise
-            # 正常提交同样要收尾：擦掉输入行/候选面板。漏了这步的话输入行
-            # 留在屏上，主循环再打印用户块，同一条消息就显示两遍。
-            self._finish()
-            return self._expand_pastes(result)
-
     def _event_loop(self, fd: int) -> str:
         while True:
             key = self._read_key(fd)
@@ -791,7 +950,19 @@ class SlashPalette:
                 # 这是"数字/方向键选菜单"在命令面板上的等价物。
                 if self.matches and self.buffer[1:] != self.matches[self.selected]:
                     self._accept_selection()
-                return self.buffer
+                    self._refresh_matches()
+                # 忙闸门：上一轮还在跑（或主循环还没回到等输入的位置）时，
+                # 回车不提交——草稿留在输入行，提示用户稍候，对齐 Telegram
+                # 端的忙语义；不做排队，等空闲后再按一次回车即发送。
+                if self.busy_check is not None and self.busy_check():
+                    if self.buffer and self.on_busy_submit is not None:
+                        try:
+                            self.on_busy_submit(self.buffer)
+                        except Exception:
+                            pass
+                    self._render()
+                    continue
+                return self._submit()
 
             if key == "\t":
                 # Tab = 只填进输入行、不执行，方便接着写参数。

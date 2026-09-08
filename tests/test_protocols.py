@@ -179,6 +179,7 @@ class ProtocolParserTests(unittest.TestCase):
             ("media-x", "draw image", "media", "", "draw image"),
             ("file-x:/tmp/demo.txt", "file body", "file", "/tmp/demo.txt", "file body"),
             ("file-x:base64:/tmp/demo.bin", "SGVsbG8=", "file_base64", "/tmp/demo.bin", "SGVsbG8="),
+            ("over-x", "任务完成楼，主人~", "over", "", "任务完成楼，主人~"),
         ]
         for index, (tag, body, expected_type, expected_path, expected_body) in enumerate(cases):
             nonce = f"{index:012X}"

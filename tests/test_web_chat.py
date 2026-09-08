@@ -396,6 +396,11 @@ class WebServerHttpTests(unittest.TestCase):
             write_setting=write_setting,
             request_stop=lambda: cls.stopped.append(True),
             is_busy=lambda: cls.busy["value"],
+            read_health=lambda: {
+                "components": {"telegram": {"state": "degraded"}},
+                "channels": {"telegram": {"queued": 3, "circuit": "open"}},
+                "version": "abc1234",
+            },
         )
         cls.server = WebChatServer(cls.config)
         cls.server.start()
@@ -443,9 +448,29 @@ class WebServerHttpTests(unittest.TestCase):
             self.assertIn(b"XGent Web Chat", resp.read())
 
     def test_api_requires_auth(self):
-        for path in ("/api/history", "/api/config", "/api/stream"):
+        for path in ("/api/history", "/api/config", "/api/stream", "/api/health"):
             status, _body, _h = self.request(path)
             self.assertEqual(401, status, path)
+
+    def test_liveness_probe_is_unauthenticated_and_leaks_nothing(self):
+        """/healthz 给 nginx/PM2 探活用：不鉴权，但也**只**回一个 ok。
+
+        有它才能一眼分清"进程死了"（连不上）和"进程活着但 Telegram 断了"
+        （200 + /api/health 里 telegram=degraded）——那次 502 缺的就是这个。
+        降级细节属于侦查情报，留在需要鉴权的 /api/health 里。
+        """
+        status, body, _h = self.request("/healthz")
+        self.assertEqual(200, status)
+        self.assertEqual({"ok": True}, body)
+
+    def test_health_details_require_auth_and_report_per_channel_state(self):
+        cookie = self.login()
+        status, body, _h = self.request("/api/health", cookie=cookie)
+        self.assertEqual(200, status)
+        self.assertEqual("degraded", body["components"]["telegram"]["state"])
+        self.assertEqual("open", body["channels"]["telegram"]["circuit"])
+        self.assertEqual(3, body["channels"]["telegram"]["queued"])
+        self.assertEqual("abc1234", body["version"])
 
     def test_chat_requires_auth(self):
         status, _body, _h = self.request("/api/chat", method="POST", body={"text": "x"})
@@ -665,6 +690,92 @@ class WebOpenButtonTests(unittest.TestCase):
         self.assertEqual("web_need_password", btn.callback_data)
 
 
+class WebSwitchLockoutTests(unittest.TestCase):
+    """"会把自己关在外面吗"要按**点击来源**判断，不能按"有没有 BOT_TOKEN"。
+
+    cli+web 部署（没有 token）里，用户在 xgent 终端里点「关闭 Web」以前会被
+    "纯 Web 模式下这是你唯一的入口，不能关闭"拦下——而他正坐在那台机器的 shell 前，
+    关掉毫无风险，还能随时开回来。旧判据是 BotConfig.WEB_ONLY 一个布尔，它看不见
+    CLI 这个同样真实的入口。
+    """
+
+    SECTIONS = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "xgent_app", "sections",
+    )
+
+    def _load(self, web_only):
+        """只 exec callbacks.py 顶部那段来源判定，避开 sections 全局加载。"""
+        from typing import Any
+
+        with open(os.path.join(self.SECTIONS, "callbacks.py"), encoding="utf-8") as handle:
+            src = handle.read()
+        snippet = src[src.index("CLICK_ORIGIN_TELEGRAM"):src.index("async def _sync_web_switches")]
+        ns = {"Any": Any, "BotConfig": type("BotConfig", (), {"WEB_ONLY": web_only})}
+        exec(compile(snippet, "callbacks_snippet", "exec"), ns)
+        return ns
+
+    @staticmethod
+    def _update(origin):
+        query = type("Q", (), {"xgent_origin": origin} if origin else {})()
+        return type("U", (), {"callback_query": query})()
+
+    def test_cli_click_is_never_blocked(self):
+        ns = self._load(web_only=True)
+        self.assertEqual("cli", ns["click_origin"](self._update("cli")))
+        self.assertFalse(
+            ns["_would_lock_out_caller"](self._update("cli")),
+            "从终端点关闭不会失联——人就在这台机器上",
+        )
+
+    def test_web_click_without_telegram_is_blocked(self):
+        ns = self._load(web_only=True)
+        self.assertTrue(ns["_would_lock_out_caller"](self._update("web")))
+        # 拦下来要说清去哪儿关，不能只说"不能"。
+        self.assertIn("xgent", ns["WEB_LOCKOUT_HINT"])
+        self.assertIn("install.sh", ns["WEB_LOCKOUT_HINT"])
+
+    def test_web_click_with_telegram_fallback_is_allowed(self):
+        ns = self._load(web_only=False)
+        self.assertFalse(ns["_would_lock_out_caller"](self._update("web")),
+                         "还有 Telegram 兜底就不算失联")
+
+    def test_untagged_update_counts_as_telegram(self):
+        ns = self._load(web_only=True)
+        self.assertEqual("telegram", ns["click_origin"](self._update(None)))
+        self.assertFalse(ns["_would_lock_out_caller"](self._update(None)))
+
+    def test_web_menu_has_no_dead_switches(self):
+        """两个开关必须是真开关，不能再是 callback_data="noop" 的死按钮。"""
+        with open(os.path.join(self.SECTIONS, "ui.py"), encoding="utf-8") as handle:
+            src = handle.read()
+        menu = src[src.index("def get_web_menu():"):src.index("def build_web_text()")]
+        self.assertIn('callback_data="toggle_web_enabled"', menu)
+        self.assertIn('callback_data="toggle_terminal_enabled"', menu)
+        code = "\n".join(
+            line for line in menu.splitlines() if not line.strip().startswith("#")
+        )
+        self.assertNotIn("noop", code, "死按钮应该已经删掉，只在注释里留下由来")
+        self.assertNotIn("不可关闭", code)
+
+    def test_web_status_line_asks_the_port(self):
+        """状态行要问端口，不能问"本进程有没有服务器对象"。
+
+        /web 面板在 xgent 终端里渲染得最多，而服务器跑在另一个进程——
+        is_web_chat_running() 在那儿永远是 False，于是固定显示"🟡 已开启但未运行"。
+        """
+        with open(os.path.join(self.SECTIONS, "ui.py"), encoding="utf-8") as handle:
+            src = handle.read()
+        body = src[src.index("def build_web_text()"):]
+        body = body[:body.index("\ndef ", 1)]
+        code = "\n".join(
+            line for line in body.splitlines() if not line.strip().startswith("#")
+        )
+        self.assertIn("web_service_reachable(port)", code)
+        self.assertNotIn("is_web_chat_running()", code)
+        self.assertNotIn("纯 Web 模式常开", code)
+
+
 class WebServerStartupGuardTests(unittest.TestCase):
     def _config(self, **overrides):
         base = dict(
@@ -861,18 +972,19 @@ class MediaResolveHttpTests(unittest.TestCase):
 
 
 class MirrorBotFrameIdTests(unittest.TestCase):
-    """MirrorBot 网端帧的 id 一致性：edit/delete 必须用网页见过的假 id。
+    """MirrorBot 网端帧的 id 一致性。
 
-    MirrorMessage（包装真实 TG 消息）传 real id，网页首帧却是 fake id——
-    直接透传 real id 会让前端 byMessageId 落空，流式编辑每次新建气泡，
-    表现为"上一条消息无限刷屏"。
+    消息身份归对话核心所有：send_message 立刻分配一个逻辑 id（≥1,000,000）并
+    推帧，真实 Telegram message_id 由出站通道在投递成功后自己记住。所以正常
+    路径上"网页帧的 id"天然就是网页见过的那个，不再依赖 Telegram 先回一个 id
+    ——TG 不通时网页照样有完整、可编辑的消息流。
+
+    仍然要钉住少数拿着真实 TG id 回来的调用点（转发-读取-删除那套取内容的
+    trick、MirrorMessage 包装真实消息）：那时必须反查回逻辑 id，否则前端
+    byMessageId 落空、流式编辑每次新建气泡——"上一条消息无限刷屏"。
     """
 
-    def _run(self, coro):
-        import asyncio
-        return asyncio.run(coro)
-
-    def test_edit_and_delete_frames_use_web_facing_fake_id(self):
+    def test_edit_and_delete_frames_use_web_facing_logical_id(self):
         import asyncio
         from xgent_app.web_bridge import MirrorBot
 
@@ -880,35 +992,54 @@ class MirrorBotFrameIdTests(unittest.TestCase):
         outbox = WebOutbox()
         outbox.put = lambda frame: frames.append(frame)  # 直接截获帧
 
+        tg_calls = []
+
         class FakeRealMessage:
             message_id = 777  # Telegram 真实 id
 
         class FakeRealBot:
             async def send_message(self, *args, **kwargs):
+                tg_calls.append(("send", kwargs.get("message_id")))
                 return FakeRealMessage()
             async def edit_message_text(self, *args, **kwargs):
+                tg_calls.append(("edit", kwargs.get("message_id")))
+                return FakeRealMessage()
+            async def edit_message_reply_markup(self, *args, **kwargs):
+                tg_calls.append(("edit_markup", kwargs.get("message_id")))
                 return FakeRealMessage()
             async def delete_message(self, *args, **kwargs):
+                tg_calls.append(("delete", kwargs.get("message_id")))
                 return True
 
         async def scenario():
             bot = MirrorBot(outbox, 42, FakeRealBot())
-            # 对话核心第一次发消息（流式首块）——网页收到 fake id 的 message 帧
-            await bot.send_message(chat_id=42, text="流式首块")
-            fake_id = frames[-1]["message_id"]
-            # MirrorMessage.edit_text 走 real id（包装的是真实 TG 消息）
-            await bot.edit_message_text(text="流式更新", chat_id=42, message_id=777)
+            # 对话核心第一次发消息（流式首块）——网页立刻收到逻辑 id 的 message 帧
+            returned = await bot.send_message(chat_id=42, text="流式首块")
+            logical = frames[-1]["message_id"]
+            # 出站是异步的：等通道把真实 id 记下来，才能测真实 id 的反查
+            await bot.flush_telegram(timeout=5.0)
+            # 正常路径：核心手上就是逻辑 id
+            await bot.edit_message_text(text="流式更新", chat_id=42, message_id=logical)
+            # 真实 id 路径（MirrorMessage 包装真实 TG 消息）：必须反查回逻辑 id
             await bot.edit_message_reply_markup(chat_id=42, message_id=777, reply_markup=None)
             await bot.delete_message(chat_id=42, message_id=777)
-            return fake_id
+            await bot.flush_telegram(timeout=5.0)
+            return logical, returned.message_id
 
-        fake_id = asyncio.run(scenario())
+        logical, returned_id = asyncio.run(scenario())
         kinds = [(f["type"], f.get("message_id")) for f in frames]
         self.assertEqual("message", kinds[0][0])
-        self.assertEqual(fake_id, kinds[1][1], "edit 帧必须用网页见过的 fake id")
-        self.assertEqual(fake_id, kinds[2][1], "edit_markup 帧同样")
-        self.assertEqual(fake_id, kinds[3][1], "delete 帧同样")
-        self.assertNotEqual(fake_id, 777)
+        self.assertGreaterEqual(logical, 1_000_000,
+                               "逻辑 id 必须落在避开真实 Telegram id 的区间")
+        self.assertEqual(logical, returned_id,
+                         "send_message 返回的消息要带逻辑 id——身份不许由 Telegram 决定")
+        self.assertEqual(logical, kinds[1][1], "edit 帧必须用网页见过的逻辑 id")
+        self.assertEqual(logical, kinds[2][1], "传真实 id 时也要反查回逻辑 id")
+        self.assertEqual(logical, kinds[3][1], "delete 帧同样")
+        self.assertNotEqual(logical, 777)
+        # Telegram 那一侧收到的必须是真实 id，不是逻辑 id
+        self.assertEqual([("send", None), ("edit", 777), ("edit_markup", 777),
+                          ("delete", 777)], tg_calls)
 
 
 if __name__ == "__main__":

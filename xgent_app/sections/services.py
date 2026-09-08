@@ -26,7 +26,14 @@ from xgent_app.web_bridge import (
     build_web_command_objects,
     MirrorBot,
     MirrorMessage,
+    deliver_op_to_bot,
     install_tg_to_web_mirror,
+)
+from xgent_app.fanout import (
+    ChannelWorker,
+    Op,
+    OP_SEND,
+    get_channel_registry,
 )
 from xgent_app.web_server import WebChatConfig, WebChatServer
 # 记录来源标记：写进每条 global_messages 的 metadata.src。
@@ -354,9 +361,16 @@ async def persist_web_password(password: str) -> str:
     return digest
 
 
-async def read_web_password_hash() -> str:
-    """按需读库。哈希不进 UserDataManager 内存快照，避免被顺手打进日志。"""
+async def read_web_password_hash(fresh: bool = False) -> str:
+    """按需读库。哈希不进 UserDataManager 内存快照，避免被顺手打进日志。
+
+    ``fresh=True`` 时绕过 BotMemoryDB 的进程内配置缓存。默认那条路径只在第一次
+    调用时真的读库，之后拿的是缓存——跨进程改密码（CLI / install.sh 写库）在本
+    进程看不见，正是"密码改了但网页还认旧密码"的那半个根因。
+    """
     db = await BotMemoryDB.get_instance()
+    if fresh:
+        return str(await db.get_config_fresh(WEB_PASSWORD_CONFIG_KEY, '') or '')
     return str(await db.get_config(WEB_PASSWORD_CONFIG_KEY, '') or '')
 
 
@@ -722,6 +736,57 @@ async def save_model_target_selection(target: str, provider_name: str, model_nam
     UserDataManager.set(meta['model_state_key'], model_name)
     await UserDataManager.save_config(meta['provider_config_key'], provider_name)
     await UserDataManager.save_config(meta['model_config_key'], model_name)
+
+
+async def sync_chat_session_model(model_name: Optional[str]) -> None:
+    """把当前会话的模型绑定同步成新值。target='chat' 变更时的**必需**配套动作。
+
+    模型取值是两层存储：发消息时优先读 chat_sessions.model，会话没绑定才
+    回退全局 default_model（messages.py 的取值顺序）。手动切模型的三条按钮
+    路径都做了"全局+会话"双写；历史上导入配置和 Web 设置两条路径只写了
+    全局层——前台显示的是新模型，实际请求却拿着会话里残留的旧模型名、
+    配上换掉后的新提供商通道发出去，上游直接 502 unknown provider。
+    收进一个函数，新路径不再容易漏。
+
+    UPDATE 对不存在的会话行是 no-op，早于首次对话调用也安全。
+    """
+    db = await BotMemoryDB.get_instance()
+    cid = UserDataManager.get('current_chat_id') or SINGLE_MEMORY_SESSION_ID
+    await db.update_session(cid, model=model_name)
+
+
+def resolve_effective_chat_model(
+        session_model: Optional[str], default_model: Optional[str],
+        provider_data: Optional[Dict]) -> Optional[str]:
+    """按发消息的取值顺序解析实际模型，并对悬空绑定做防御性回退。
+
+    取值顺序（messages.py 的契约）：会话绑定 chat_sessions.model 优先，
+    没有才回退全局 default_model。两层都可能因配置变更（导入/换线）残留
+    旧模型名，模型不在当前提供商列表时：
+
+    - 全局默认仍有效 → 回退全局默认（与前台显示一致），记 warning；
+    - 全局默认也失效 → 返回 None。调用方按"未配置模型"提示用户重选，
+      绝不能拿一个必然 502 的旧模型名发出去——那只会把错误藏进上游
+      日志，用户看到的是一段莫名其妙的失败。
+
+    models 为空的提供商（通配转发型）不做此校验，原样返回。
+    纯函数（不读全局状态），便于直接单测。
+    """
+    model = session_model or default_model
+    available_models = (provider_data or {}).get('models') or []
+    if available_models and model and model not in available_models:
+        if default_model in available_models:
+            logger.warning(
+                "会话绑定模型 %s 不在当前提供商的列表里，回退默认模型 %s",
+                model, default_model,
+            )
+            return default_model
+        logger.warning(
+            "会话绑定模型 %s 与默认模型 %s 均不在当前提供商的列表里，按未配置模型处理",
+            model, default_model,
+        )
+        return None
+    return model
 
 
 def classify_provider_mode(api_format: str, base_url: str) -> str:
@@ -1397,6 +1462,36 @@ def _extension_for_mime(mime_type: str) -> str:
     return ext or '.bin'
 
 
+def _image_content_fingerprint(media_bytes: bytes, mime_type: str) -> str:
+    """同一张图可能被网关重编码两遍、字节不同（C2PA 来源水印含时间戳/签名，
+    每次编码都变），但图像像素完全一样。按整字节或 base64 去重合并不了它们。
+
+    PNG：跳过所有元数据 chunk（C2PA 塞在 tEXt/itxt/匿名 chunk 里），只取 IDAT
+    解压后的图像数据做哈希——同图不同水印的 IDAT 一致，能合并；真不同图
+    的 IDAT 不同，不误杀。
+    其他格式（JPEG 等）退化成整字节哈希：这些网关目前不带可变水印。
+    解析失败也退化成整字节哈希，保证绝不误合并。
+    """
+    if mime_type == 'image/png' and media_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+        try:
+            idat = bytearray()
+            pos = 8
+            while pos + 8 <= len(media_bytes):
+                length = struct.unpack('>I', media_bytes[pos:pos + 4])[0]
+                ctype = media_bytes[pos + 4:pos + 8]
+                if ctype == b'IDAT':
+                    idat.extend(media_bytes[pos + 8:pos + 8 + length])
+                pos += 12 + length
+                if ctype == b'IEND':
+                    break
+            if idat:
+                raw = zlib.decompress(bytes(idat))
+                return 'png:' + hashlib.sha256(raw).hexdigest()
+        except Exception:
+            pass
+    return 'raw:' + hashlib.sha256(media_bytes).hexdigest()
+
+
 def _save_inline_generated_media(mime_type: str, data_b64: str) -> Dict[str, Any]:
     compact_b64 = ''.join((data_b64 or '').split())
     padding = '=' * (-len(compact_b64) % 4)
@@ -1428,11 +1523,24 @@ def extract_inline_generated_media(response: str, append_notices: bool = True) -
         return response, []
 
     artifacts: List[Dict[str, Any]] = []
+    # 网关（vertex906-gemini 画图系）会把同一张图在一条 response 里重复返回两份
+    # PNG：像素完全相同，但 C2PA 来源水印每次编码字节不同，base64/整字节去重
+    # 都合并不了。这里在落盘这道总关口按「图像内容指纹」去重——PNG 取 IDAT 解压
+    # 后的图像数据哈希（跳过水印元数据），同图不同水印能合并；其他格式退化成整
+    # 字节哈希。保证同一张图只存盘、只回灌、只发一次，与上游提取路径解耦。
+    seen_fingerprints: set = set()
 
     def replace_match(match: re.Match) -> str:
         mime_type = match.group(1)
         data_b64 = match.group(2)
         try:
+            compact_b64 = ''.join((data_b64 or '').split())
+            padding = '=' * (-len(compact_b64) % 4)
+            media_bytes = base64.b64decode(compact_b64 + padding)
+            fingerprint = _image_content_fingerprint(media_bytes, mime_type)
+            if fingerprint in seen_fingerprints:
+                return ""
+            seen_fingerprints.add(fingerprint)
             artifact = _save_inline_generated_media(mime_type, data_b64)
             artifacts.append(artifact)
             return ""
@@ -1448,15 +1556,43 @@ def extract_inline_generated_media(response: str, append_notices: bool = True) -
     return processed.strip(), artifacts
 
 
+_MEDIA_AUTOSAVE_NOTICE_RE = re.compile(r'【系统自动生成：本(?:图片|视频|音频|媒体).*?】')
+
+
+def _media_caption_body(caption: Optional[str]) -> str:
+    """从 caption 里剥掉所有存盘路径说明，只留正文（模型回复/状态信息）。"""
+    if not caption:
+        return ""
+    body = _MEDIA_AUTOSAVE_NOTICE_RE.sub('', caption or '')
+    return re.sub(r'\n{3,}', '\n\n', body).strip()
+
+
+def _artifact_caption(body_text: str, artifact: Dict[str, Any], *, first: bool) -> str:
+    """给单张图拼 caption：第一张带正文 + 自己路径，后续图只带自己路径。"""
+    notice = build_media_autosave_notice(
+        str(artifact.get('kind') or media_kind_from_mime(str(artifact.get('mime_type') or ''))),
+        to_display_path(str(artifact.get('path') or artifact.get('rel_path') or ''))
+    ) if (artifact.get('path') or artifact.get('rel_path')) else ''
+    if first:
+        base = body_text or ''
+        return f"{base}\n\n{notice}".strip() if notice else base
+    return notice
+
+
 async def send_generated_media_artifacts(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
                                          artifacts: List[Dict[str, Any]],
                                          caption: Optional[str] = None):
-    for artifact in artifacts:
+    # 多张图时每张图只挂它自己的存盘路径说明，而不是全部图的全套路径——
+    # 否则两张图每条消息下面都列两个路径，看着像重复。正文（"这里是根据
+    # 您的描述生成的图片："之类）只在第一张上保留，避免后续图重复刷正文。
+    body_text = _media_caption_body(caption)
+    for index, artifact in enumerate(artifacts):
         path = str(artifact.get('path') or '')
         mime_type = str(artifact.get('mime_type') or 'application/octet-stream')
         if not path or not os.path.exists(path):
             continue
-        media_caption = fit_media_caption(caption)
+        per_caption = _artifact_caption(body_text, artifact, first=(index == 0))
+        media_caption = fit_media_caption(per_caption)
         if mime_type.startswith('image/'):
             await send_generated_media_file_to_user(context, chat_id, path, mime_type, media_caption)
         else:

@@ -189,9 +189,11 @@ def build_media_context_message(
     if not result.get("success"):
         return build_context_message(notice)
 
-    module_text = str(result.get("text") or "").strip() or "外部媒体模块刚生成了一份媒体。"
+    # notice 含存盘路径说明（build_external_media_output 拼的）；success 分支也要
+    # 带上，否则模型这一轮看不到图存哪了，要等下一轮从 DB 读。
+    base_notice = notice or str(result.get("text") or "").strip() or "外部媒体模块刚生成了一份媒体。"
     continuation_text = (
-        f"{module_text}\n"
+        f"{base_notice}\n"
         "这是外部媒体模块刚生成的完整媒体回复，媒体本体已返回给你，请直接基于它继续回复用户。"
     )
 

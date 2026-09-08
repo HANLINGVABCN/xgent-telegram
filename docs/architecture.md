@@ -32,6 +32,7 @@ components. The first extracted components are:
 | `xgent_app/web_auth.py` | Web Chat password hashing, signed session cookies, login rate limiting, and Telegram `initData` verification; no HTTP or Telegram concerns |
 | `xgent_app/web_bridge.py` | Duck-typed `Update`/`Context`/`Bot` shims that let the Web UI drive `process_conversation` unchanged, plus the thread-safe outbound frame queue |
 | `xgent_app/web_server.py` | Zero-dependency threaded HTTP/SSE server for the Web Chat UI; receives all application behavior through injected callbacks |
+| `xgent_app/fanout.py` | Per-channel outbound isolation: bounded queue + single worker + circuit breaker + durable pending store, so one unreachable surface cannot slow another; stdlib only, no `telegram` import |
 
 Legacy names remain available through thin imports/wrappers in the sections so
 existing handlers keep working while the internal boundaries become explicit.
@@ -56,8 +57,34 @@ reviewable units:
 | `command_handlers.py` | remaining command functions |
 | `idle.py` | idle reminder scheduling |
 | `other_messages.py` | fallback message handling |
-| `lifecycle.py` | errors, startup and shutdown hooks |
-| `main.py` | application construction and polling entrypoint |
+| `lifecycle.py` | errors, `boot_core()`, `telegram_ready()`, and the single shutdown path |
+| `runtime.py` | component registry, per-component health, the supervised Telegram component, and the single process entrypoint `run_app()` |
+| `main.py` | `sys.exit(asyncio.run(run_app()))` and nothing else |
+
+## Surface isolation
+
+Telegram, Web and CLI are independently deployable and cannot drag each other
+down. Two mechanisms carry that guarantee:
+
+**Startup** — `runtime.run_app()` owns the event loop. `boot_core()` (config +
+database) runs first, then every non-Telegram component, and only then is
+Telegram started as a supervised task that retries forever. Telegram being
+unreachable leaves that one component in `degraded`; nothing else notices.
+This replaces `app.run_polling()`, whose `__run` performs `Bot.initialize()`
+(a live `get_me()` call, `bootstrap_retries=0` by default) *before* `post_init`
+— so a network failure killed the process before the Web listener ever bound.
+
+**Output** — every outbound Telegram call goes through a `fanout.ChannelWorker`:
+the conversation core emits the Web frame first and hands Telegram an `Op`
+(synchronous, non-blocking, never raises). Web latency is therefore independent
+of Telegram latency. Message identity belongs to the core (logical ids from
+1,000,000 up); each channel maps logical → native id itself. Undeliverable ops
+land in `channel_outbox` and replay in order when the channel recovers, with
+superseded intermediate edits collapsed.
+
+`GET /healthz` (unauthenticated, `{"ok": true}` only) separates "process dead"
+from "process alive, one surface degraded"; `GET /api/health` (authenticated)
+reports per-component and per-channel detail.
 
 ## Bootstrap contract
 
