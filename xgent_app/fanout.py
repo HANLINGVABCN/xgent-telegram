@@ -51,6 +51,31 @@ class OpNotDeliverable(Exception):
     """
 
 
+class OpTransientError(Exception):
+    """通道整体暂时不通（超时、断网、限流）：错在通道，不在这条操作。
+
+    与"这条操作自己有问题"必须分开计账：通道不通要推熔断器、要停下整轮补投
+    等恢复；而某一条操作反复失败（未知的 400、序列化坏了……）只该把**它自己**
+    的重试次数加一，到上限就进死信，绝不能让它挡在队头拖住后面几百条。
+
+    deliver 回调可以直接抛它；此外 asyncio.TimeoutError / OSError 一族天然
+    视同暂时性故障（见 is_transient_error），不必包装。
+    """
+
+
+# 一条操作累计投递失败这么多次仍然不成功，就进死信。次数跨进程重启持久
+# （落在待发库的 attempts 列），否则每次重启都从零算起、毒药永远清不掉。
+MAX_OP_ATTEMPTS = 3
+# 一轮补投里连续撞到这么多条"操作自身错误"就先停：大概率不是巧合而是某种
+# 没识别出来的通道级故障，继续往下扫只会把整批都记上一次失败。
+MAX_BAD_STREAK_PER_DRAIN = 5
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """这个异常是"通道暂时不通"还是"这条操作自己有问题"。"""
+    return isinstance(exc, (OpTransientError, asyncio.TimeoutError, TimeoutError, OSError))
+
+
 class CircuitBreaker:
     """连续失败到阈值就开闸，冷却后放一次探针。线程安全。
 
@@ -191,6 +216,7 @@ class Op:
             "payload": json.dumps(self.payload, ensure_ascii=False),
             "created_at": self.created_at,
             "seq": self.seq,
+            "attempts": int(self.attempts or 0),
         }
 
     @classmethod
@@ -201,6 +227,10 @@ class Op:
                 payload = json.loads(payload)
             except (TypeError, ValueError):
                 payload = {}
+        try:
+            attempts = int(row.get("attempts") or 0)
+        except (TypeError, ValueError):
+            attempts = 0
         return cls(
             str(row.get("kind") or ""),
             logical_id=row.get("logical_id"),
@@ -209,7 +239,7 @@ class Op:
             seq=int(row.get("seq") or 0),
             created_at=row.get("created_at"),
             row_id=row.get("id"),
-            attempts=1,
+            attempts=attempts,
         )
 
     def __repr__(self) -> str:  # pragma: no cover —— 只为调试日志好看
@@ -481,6 +511,11 @@ class ChannelWorker:
             return
 
         if not self._breaker.allow():
+            if op.kind == OP_CHAT_ACTION:
+                # "正在输入"迟到几分钟再补发只是噪音，还会在断网期间每 0.35s
+                # 往库里塞一行。不落库，直接丢。
+                self._dropped += 1
+                return
             await self._defer(op)
             return
 
@@ -501,11 +536,23 @@ class ChannelWorker:
             await self._forget(op)
             return
         except Exception as exc:  # noqa: BLE001
-            self._breaker.record_failure()
             self._failures += 1
             self._last_error = str(exc)[:200]
-            logger.warning("通道 %s 投递 %s 失败（转入待发）: %s",
-                           self.name, op.kind, self._last_error)
+            if is_transient_error(exc):
+                self._breaker.record_failure()
+                logger.warning("通道 %s 投递 %s 失败（转入待发）: %s",
+                               self.name, op.kind, self._last_error)
+                await self._defer(op)
+                return
+            # 操作自身的问题（没被识别出来的 400 一类）：不推熔断器——通道是
+            # 通的，别让一条坏消息把整条通道判成断线。记一次尝试后落库，补投
+            # 时到上限自然进死信。
+            if op.kind == OP_CHAT_ACTION:
+                self._dropped += 1
+                return
+            op.attempts = int(op.attempts or 0) + 1
+            logger.warning("通道 %s 投递 %s 出错（第 %d 次，转入待发）: %s",
+                           self.name, op.kind, op.attempts, self._last_error)
             await self._defer(op)
             return
 
@@ -528,6 +575,33 @@ class ChannelWorker:
             await self._store.delete([op.row_id])
         except Exception:  # noqa: BLE001
             logger.debug("通道 %s 删除待发行失败", self.name, exc_info=True)
+
+    async def _record_attempt(self, op: Op, error: str) -> None:
+        """这条操作又失败了一次：计数 +1 并写回待发库，重启后不归零。"""
+        op.attempts = int(op.attempts or 0) + 1
+        if op.row_id is None or self._store is None:
+            return
+        record = getattr(self._store, "record_attempt", None)
+        if record is None:
+            return
+        try:
+            await record(op.row_id, op.attempts, error)
+        except Exception:  # noqa: BLE001
+            logger.debug("通道 %s 写回重试计数失败", self.name, exc_info=True)
+
+    async def _deadletter(self, op: Op, error: str) -> None:
+        """重试到上限：搬进死信（有持久层的话），从待发库摘掉，后续同目标操作丢弃。"""
+        self._orphaned += 1
+        if op.kind in CREATING_KINDS and op.logical_id is not None:
+            self._failed.add(int(op.logical_id))
+        logger.error("通道 %s 的 %s 重试 %d 次仍失败，进死信: %s",
+                     self.name, op.kind, int(op.attempts or 0), (error or "")[:200])
+        if self._store is not None:
+            dead = getattr(self._store, "deadletter", None)
+            if dead is not None:
+                with contextlib.suppress(Exception):
+                    await dead(self.name, op, error)
+        await self._forget(op)
 
     async def _defer(self, op: Op) -> None:
         """投不出去：落库等通道恢复后重放。
@@ -601,9 +675,14 @@ class ChannelWorker:
                         self.name, len(keep), collapsed)
 
             replayed = 0
+            bad_streak = 0
             for op in keep:
                 if self._closing or not self._breaker.allow():
                     break
+                if int(op.attempts or 0) >= MAX_OP_ATTEMPTS:
+                    # 上次进程留下的、早已到上限的行（比如升级前积压的）。
+                    await self._deadletter(op, self._last_error or "重试次数已达上限")
+                    continue
                 native: Optional[int] = None
                 if op.kind in TARGETING_KINDS:
                     native = self._resolve_native(op)
@@ -622,15 +701,35 @@ class ChannelWorker:
                     self._last_error = str(exc)[:200]
                     if op.kind in CREATING_KINDS and op.logical_id is not None:
                         self._failed.add(int(op.logical_id))
+                    logger.info("通道 %s 补投时跳过不可投递的 %s: %s",
+                                self.name, op.kind, self._last_error)
                     await self._forget(op)
                     continue
                 except Exception as exc:  # noqa: BLE001
-                    self._breaker.record_failure()
                     self._failures += 1
                     self._last_error = str(exc)[:200]
-                    logger.warning("通道 %s 补投中断，剩余留在待发库: %s",
-                                   self.name, self._last_error)
-                    break
+                    if is_transient_error(exc):
+                        # 通道整体不通：停下等恢复，这条留在原位，不算它的账。
+                        self._breaker.record_failure()
+                        logger.warning("通道 %s 补投中断，剩余留在待发库: %s",
+                                       self.name, self._last_error)
+                        break
+                    # 这条操作自己的问题：记一次失败、跳过它继续往后投。
+                    # 以前这里是 break——一条坏消息就把队头堵死，后面几百条
+                    # 永远轮不到，每次冷却结束再撞一次，无限循环。
+                    await self._record_attempt(op, self._last_error)
+                    bad_streak += 1
+                    if int(op.attempts or 0) >= MAX_OP_ATTEMPTS:
+                        await self._deadletter(op, self._last_error)
+                    else:
+                        logger.warning("通道 %s 补投 %s 出错（第 %d 次，跳过）: %s",
+                                       self.name, op.kind, op.attempts, self._last_error)
+                    if bad_streak >= MAX_BAD_STREAK_PER_DRAIN:
+                        logger.warning("通道 %s 补投连续 %d 条出错，本轮先停",
+                                       self.name, bad_streak)
+                        break
+                    continue
+                bad_streak = 0
                 if op.kind in CREATING_KINDS and op.logical_id is not None and result is not None:
                     self._remember(op.logical_id, result)
                 elif op.kind == OP_DELETE and op.logical_id is not None:
@@ -833,6 +932,7 @@ __all__ = [
     "ChannelRegistry",
     "ChannelWorker",
     "CircuitBreaker",
+    "MAX_OP_ATTEMPTS",
     "Op",
     "OP_CHAT_ACTION",
     "OP_DELETE",
@@ -842,9 +942,11 @@ __all__ = [
     "OP_PHOTO",
     "OP_SEND",
     "OpNotDeliverable",
+    "OpTransientError",
     "SUPERSEDABLE_KINDS",
     "TARGETING_KINDS",
     "UPLOAD_KINDS",
     "collapse_ops",
     "get_channel_registry",
+    "is_transient_error",
 ]

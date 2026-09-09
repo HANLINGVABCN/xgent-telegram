@@ -36,16 +36,30 @@ from xgent_app.fanout import (
     OP_PHOTO,
     OP_SEND,
     OpNotDeliverable,
+    OpTransientError,
     get_channel_registry,
 )
 
-# deliver_op_to_bot 需要把 Telegram 永久性 BadRequest 翻译成 OpNotDeliverable，
-# 否则不可恢复的 400 错误会被 fanout 当作临时网络故障无限重试，卡死整条队列。
+# deliver_op_to_bot 要把 Telegram 的异常分成两类交给 fanout：
+#   永久性（BadRequest / Forbidden）-> OpNotDeliverable，直接丢；
+#   暂时性（TimedOut / NetworkError / RetryAfter）-> OpTransientError，走熔断。
+# 分类必须按**异常类型**而不是按报错文案：文案白名单漏掉哪一种，那一种就会
+# 被当成"网络故障"无限重试、卡死整条待发队列（历史上已经复发过多次）。
 # 保持可选导入：模块其余部分仍然不硬依赖 telegram 包。
 try:
-    from telegram.error import BadRequest as _TgBadRequest
+    from telegram.error import (
+        BadRequest as _TgBadRequest,
+        Forbidden as _TgForbidden,
+        NetworkError as _TgNetworkError,
+        RetryAfter as _TgRetryAfter,
+        TimedOut as _TgTimedOut,
+    )
 except ImportError:  # pragma: no cover
     _TgBadRequest = type(None)  # 永远不会 isinstance 命中
+    _TgForbidden = type(None)
+    _TgNetworkError = type(None)
+    _TgRetryAfter = type(None)
+    _TgTimedOut = type(None)
 
 logger = logging.getLogger(__name__)
 
@@ -292,7 +306,10 @@ class WebMessage:
 def _markup_to_frame(reply_markup: Any) -> Optional[List[List[Dict[str, str]]]]:
     """把 InlineKeyboardMarkup 拍平成可 JSON 化的结构。
 
-    只取 text 和 callback_data——网页端唯一需要的按钮是"停止"。
+    保留 text + callback_data + url。Telegram 要求每个内联按钮必须带一个目标
+    （callback_data / url / ...），只拍平 text 与 callback_data 的话，url 按钮
+    还原回去就成了"纯文本按钮"，Telegram 报 "text buttons are not allowed"，
+    这条消息在待发库里永远投不出去。
     """
     if reply_markup is None:
         return None
@@ -303,13 +320,48 @@ def _markup_to_frame(reply_markup: Any) -> Optional[List[List[Dict[str, str]]]]:
     for row in keyboard:
         buttons: List[Dict[str, str]] = []
         for button in row:
-            buttons.append({
+            item = {
                 "text": str(getattr(button, "text", "")),
                 "callback_data": str(getattr(button, "callback_data", "") or ""),
-            })
+            }
+            url = getattr(button, "url", None)
+            if url:
+                item["url"] = str(url)
+            buttons.append(item)
         if buttons:
             rows.append(buttons)
     return rows or None
+
+
+def markup_from_frame(rows: Any) -> Optional[Any]:
+    """_markup_to_frame 的逆运算：扁平按钮结构 -> InlineKeyboardMarkup。
+
+    Telegram 拒绝没有目标的内联按钮（"text buttons are not allowed"），而且是
+    400——这样的按钮进了待发库就永远投不出去。所以 url / callback_data 都没有
+    的按钮直接剔除，宁可少一个按钮。没装 telegram 包时返回 None。
+    """
+    if not rows:
+        return None
+    try:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    except ImportError:  # pragma: no cover
+        return None
+    keyboard = []
+    for row in rows:
+        buttons = []
+        for btn in row or []:
+            if not isinstance(btn, dict):
+                continue
+            text = str(btn.get("text") or "")
+            callback_data = str(btn.get("callback_data") or "")
+            url = str(btn.get("url") or "")
+            if url:
+                buttons.append(InlineKeyboardButton(text, url=url))
+            elif callback_data:
+                buttons.append(InlineKeyboardButton(text, callback_data=callback_data))
+        if buttons:
+            keyboard.append(buttons)
+    return InlineKeyboardMarkup(keyboard) if keyboard else None
 
 
 class WebBot:
@@ -495,22 +547,6 @@ async def deliver_op_to_bot(bot: Any, op: Op, native_id: Optional[int], *,
             raise OpNotDeliverable(f"bot 没有方法 {name}")
         return fn
 
-    # Telegram 永久性 BadRequest（"Message to edit not found" 等）不是网络故障，
-    # 重试永远不会成功。必须在这里翻译成 OpNotDeliverable，让 fanout 安全丢弃
-    # 并继续处理后续消息——否则一条毒药操作就能卡死整条待发队列。
-    _PERM_PATTERNS = (
-        "message to edit not found",
-        "message is not modified",
-        "message can't be deleted",
-        "message to delete not found",
-        "chat not found",
-        "bot was blocked by the user",
-        "message_id_invalid",
-        "message identifier is not specified",
-        "can't parse entities",
-        "cant parse entities",
-    )
-
     try:
         if kind == OP_SEND:
             result = await method("send_message")(
@@ -572,13 +608,33 @@ async def deliver_op_to_bot(bot: Any, op: Op, native_id: Optional[int], *,
 
     except OpNotDeliverable:
         raise  # OpNotDeliverable 已经是正确分类，直接上抛
+    except OpTransientError:
+        raise
     except Exception as exc:
-        if isinstance(exc, _TgBadRequest):
-            msg = str(exc).lower()
-            if any(p in msg for p in _PERM_PATTERNS):
-                raise OpNotDeliverable(
-                    f"Telegram 永久拒绝: {exc}") from exc
-        raise  # 其他错误（网络超时、限流等）原样上抛，走熔断路径
+        raise classify_telegram_error(exc) from exc
+
+
+def classify_telegram_error(exc: BaseException) -> BaseException:
+    """把 Telegram 异常归成 fanout 认识的两类；认不出的原样返回。
+
+    PTB 的继承关系是 NetworkError -> (BadRequest, TimedOut)，所以先判具体的
+    BadRequest / TimedOut，再判笼统的 NetworkError。RetryAfter 与 Forbidden 是
+    TelegramError 的直接子类。
+    """
+    if isinstance(exc, _TgRetryAfter):
+        return OpTransientError(f"Telegram 限流: {exc}")
+    if isinstance(exc, _TgTimedOut):
+        return OpTransientError(f"Telegram 超时: {exc}")
+    if isinstance(exc, _TgBadRequest):
+        msg = str(exc).lower()
+        if any(p in msg for p in ("too many requests", "retry after", "flood")):
+            return OpTransientError(f"Telegram 限流: {exc}")
+        return OpNotDeliverable(f"Telegram 永久拒绝: {exc}")
+    if isinstance(exc, _TgForbidden):
+        return OpNotDeliverable(f"Telegram 拒绝访问: {exc}")
+    if isinstance(exc, _TgNetworkError):
+        return OpTransientError(f"Telegram 网络故障: {exc}")
+    return exc
 
 
 class MirrorBot:

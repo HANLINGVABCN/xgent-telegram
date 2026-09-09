@@ -164,6 +164,32 @@ class BotMemoryDB:
             CREATE INDEX IF NOT EXISTS idx_channel_outbox_channel
             ON channel_outbox(channel, id)
         ''')
+        # 每条待发操作的累计失败次数要持久：进程重启就归零的话，一条毒药
+        # 永远攒不到上限，每次重启都重新在队头堵一遍。
+        for migration in (
+            'ALTER TABLE channel_outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0',
+            'ALTER TABLE channel_outbox ADD COLUMN last_error TEXT',
+        ):
+            try:
+                await conn.execute(migration)
+            except Exception:
+                pass
+        # 死信：重试到上限仍失败的操作搬到这里留档，不再占待发队列。
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS channel_deadletter (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                logical_id INTEGER,
+                chat_id INTEGER,
+                payload TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                dead_at REAL NOT NULL
+            )
+        ''')
 
         # 内部兼容索引表（当前单一全局记忆模式下仅保留一条固定记录）
         await conn.execute('''
@@ -647,24 +673,75 @@ class BotMemoryDB:
         async with self._write() as conn:
             cursor = await conn.execute('''
                 INSERT INTO channel_outbox
-                    (channel, kind, logical_id, chat_id, payload, seq, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (channel, kind, logical_id, chat_id, payload, seq, created_at, attempts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 str(channel), str(row.get('kind') or ''),
                 row.get('logical_id'), row.get('chat_id'),
                 str(row.get('payload') or '{}'),
                 int(row.get('seq') or 0), float(row.get('created_at') or time.time()),
+                int(row.get('attempts') or 0),
             ))
             return int(cursor.lastrowid or 0)
 
     async def fetch_channel_ops(self, channel: str, limit: int = 1000) -> List[Dict]:
         conn = await self._get_conn()
         cursor = await conn.execute('''
-            SELECT id, kind, logical_id, chat_id, payload, seq, created_at
+            SELECT id, kind, logical_id, chat_id, payload, seq, created_at, attempts, last_error
             FROM channel_outbox WHERE channel = ?
             ORDER BY id ASC LIMIT ?
         ''', (str(channel), int(limit)))
         return [dict(row) for row in await cursor.fetchall()]
+
+    async def record_channel_op_attempt(self, row_id: int, attempts: int, error: str) -> None:
+        async with self._write() as conn:
+            await conn.execute(
+                'UPDATE channel_outbox SET attempts = ?, last_error = ? WHERE id = ?',
+                (int(attempts), str(error or '')[:500], int(row_id)))
+
+    async def deadletter_channel_op(self, channel: str, row: Dict[str, Any], error: str) -> None:
+        """把一条待发操作搬进死信表。调用方随后删待发行；这里只负责留档。"""
+        async with self._write() as conn:
+            await conn.execute('''
+                INSERT INTO channel_deadletter
+                    (channel, kind, logical_id, chat_id, payload, seq, created_at,
+                     attempts, last_error, dead_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                str(channel), str(row.get('kind') or ''),
+                row.get('logical_id'), row.get('chat_id'),
+                str(row.get('payload') or '{}'),
+                int(row.get('seq') or 0), float(row.get('created_at') or time.time()),
+                int(row.get('attempts') or 0), str(error or '')[:500], time.time(),
+            ))
+            # 死信只为事后排查，封顶 2000 行，别让它自己变成第二个无限增长的表。
+            await conn.execute('''
+                DELETE FROM channel_deadletter WHERE id NOT IN (
+                    SELECT id FROM channel_deadletter ORDER BY id DESC LIMIT 2000
+                )
+            ''')
+
+    async def fetch_channel_deadletters(self, channel: Optional[str] = None,
+                                        limit: int = 100) -> List[Dict]:
+        conn = await self._get_conn()
+        if channel:
+            cursor = await conn.execute('''
+                SELECT * FROM channel_deadletter WHERE channel = ?
+                ORDER BY id DESC LIMIT ?
+            ''', (str(channel), int(limit)))
+        else:
+            cursor = await conn.execute(
+                'SELECT * FROM channel_deadletter ORDER BY id DESC LIMIT ?', (int(limit),))
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def clear_channel_deadletters(self, channel: Optional[str] = None) -> int:
+        async with self._write() as conn:
+            if channel:
+                cursor = await conn.execute(
+                    'DELETE FROM channel_deadletter WHERE channel = ?', (str(channel),))
+            else:
+                cursor = await conn.execute('DELETE FROM channel_deadletter')
+            return int(cursor.rowcount or 0)
 
     async def delete_channel_ops(self, row_ids: List[int]) -> None:
         ids = [int(value) for value in (row_ids or []) if value]

@@ -28,6 +28,7 @@ from xgent_app.web_bridge import (
     MirrorMessage,
     deliver_op_to_bot,
     install_tg_to_web_mirror,
+    markup_from_frame,
 )
 from xgent_app.fanout import (
     ChannelWorker,

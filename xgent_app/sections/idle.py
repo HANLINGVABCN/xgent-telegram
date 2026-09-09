@@ -184,19 +184,7 @@ def _relay_markup_to_telegram(rows: Any) -> Optional[Any]:
     """
     if not rows:
         return None
-    keyboard = []
-    for row in rows:
-        buttons = []
-        for btn in row or []:
-            if not isinstance(btn, dict):
-                continue
-            buttons.append(InlineKeyboardButton(
-                str(btn.get('text') or ''),
-                callback_data=str(btn.get('callback_data') or ''),
-            ))
-        if buttons:
-            keyboard.append(buttons)
-    return InlineKeyboardMarkup(keyboard) if keyboard else None
+    return markup_from_frame(rows)
 
 
 # --- ☆ Telegram 出站通道 ☆ ---
@@ -246,6 +234,14 @@ class _ChannelOutboxStore:
     async def count(self, channel: str) -> int:
         db = await BotMemoryDB.get_instance()
         return await db.count_channel_ops(channel)
+
+    async def record_attempt(self, row_id: int, attempts: int, error: str) -> None:
+        db = await BotMemoryDB.get_instance()
+        await db.record_channel_op_attempt(row_id, attempts, error)
+
+    async def deadletter(self, channel: str, op: Any, error: str) -> None:
+        db = await BotMemoryDB.get_instance()
+        await db.deadletter_channel_op(channel, op.to_row(), error)
 
 
 async def _telegram_channel_recovered(replayed: int, skipped: int) -> None:

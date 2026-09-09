@@ -253,7 +253,7 @@ class DurableReplayTests(unittest.TestCase):
 
             async def deliver(op, native):
                 if down["value"]:
-                    raise RuntimeError("Telegram unreachable")
+                    raise ConnectionError("Telegram unreachable")
                 delivered.append((op.kind, op.logical_id, native, op.payload.get("text")))
                 return 6001 if op.kind == OP_SEND else None
 
