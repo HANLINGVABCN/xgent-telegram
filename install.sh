@@ -1835,41 +1835,70 @@ migrate_legacy_pm2_process() {
     fi
 }
 
+resolve_pm2_memory_restart() {
+    if [ -n "${PM2_MAX_MEMORY_RESTART:-}" ]; then
+        PM2_MEMORY_RESTART="$PM2_MAX_MEMORY_RESTART"
+        PM2_MEMORY_RESTART_SOURCE="环境变量 PM2_MAX_MEMORY_RESTART（固定覆盖）"
+        PM2_MEMORY_RESTART_ENABLED=1
+    else
+        # PM2 的 max-memory-restart 只能保存静态值，无法表达运行中的动态上限。
+        # 自动模式不向 PM2 写静态阈值，由 Python 进程每秒读取 /proc 实时执行 95% 上限。
+        PM2_MEMORY_RESTART=""
+        PM2_MEMORY_RESTART_SOURCE="进程内实时监控：每秒读取 MemAvailable 与进程 RSS，动态保留 5%"
+        PM2_MEMORY_RESTART_ENABLED=0
+    fi
+}
+
 start_with_pm2() {
-    local code mode env_mode socks5_url
+    local code mode env_mode socks5_url pm2_memory_limit
+    local -a pm2_memory_args=()
+
+    resolve_pm2_memory_restart
+    pm2_memory_limit="$PM2_MEMORY_RESTART"
+    if [ "$PM2_MEMORY_RESTART_ENABLED" -eq 1 ]; then
+        pm2_memory_args=(--max-memory-restart "$pm2_memory_limit")
+    fi
 
     ensure_pm2
     migrate_legacy_pm2_process
 
     info "[运行] 正在使用 PM2 启动 XGent for Telegram..."
     echo "   IP 出站模式: $(ip_mode_label)"
+    if [ "$PM2_MEMORY_RESTART_ENABLED" -eq 1 ]; then
+        echo "   PM2 固定内存重启阈值: $pm2_memory_limit（$PM2_MEMORY_RESTART_SOURCE）"
+    else
+        echo "   实时内存重启阈值: 可用内存池的 95%（$PM2_MEMORY_RESTART_SOURCE）"
+    fi
 
-    # 进程已存在时原地重启（pm_id 不变），并用 --update-env 刷新环境变量。
-    # 变量设为空串而不是 unset：Bot 侧把空串视为默认模式，
-    # 这样 --update-env 才能覆盖掉旧进程里残留的模式设置。
+    # 固定覆盖模式可以原地更新 PM2。自动模式必须重建一次进程，才能可靠清除
+    # 旧版本持久化在 PM2 里的 1G/max_memory_restart 静态阈值。
     if pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
-        mode="$(get_ip_mode)"
-        env_mode="$mode"
-        [ "$mode" = "default" ] && env_mode=""
-        socks5_url=""
-        [ "$mode" = "sock5" ] && socks5_url="$(get_socks5_proxy)"
-        if env XGENT_IP_MODE="$env_mode" XGENT_SOCKS5_PROXY="$socks5_url" \
-            TELEGRAM_AI_BOT_IP_MODE="" TELEGRAM_AI_BOT_SOCKS5_PROXY="" \
-            TELEGRAM_AI_BOT_APP_ENTRY="" XGENT_APP_ENTRY="$APP_ENTRY" \
-            PYTHONPATH="$(pythonpath_with_project)" \
-            pm2 restart "$PM2_APP_NAME" --update-env; then
-            echo "   PM2 原地重启成功（进程 ID 保持不变）。"
-            echo "   查看日志: pm2 logs $PM2_APP_NAME"
-            if pm2 save >/dev/null; then
-                echo "   PM2 进程列表已保存。"
+        if [ "$PM2_MEMORY_RESTART_ENABLED" -eq 0 ]; then
+            info "   正在清除 PM2 中旧的静态内存阈值并启用实时监控..."
+            pm2 delete "$PM2_APP_NAME" >/dev/null 2>&1 || true
+            sleep 1
+        else
+            mode="$(get_ip_mode)"
+            env_mode="$mode"
+            [ "$mode" = "default" ] && env_mode=""
+            socks5_url=""
+            [ "$mode" = "sock5" ] && socks5_url="$(get_socks5_proxy)"
+            if env XGENT_IP_MODE="$env_mode" XGENT_SOCKS5_PROXY="$socks5_url" \
+                TELEGRAM_AI_BOT_IP_MODE="" TELEGRAM_AI_BOT_SOCKS5_PROXY="" \
+                TELEGRAM_AI_BOT_APP_ENTRY="" XGENT_APP_ENTRY="$APP_ENTRY" \
+                PYTHONPATH="$(pythonpath_with_project)" \
+                pm2 restart "$PM2_APP_NAME" --update-env "${pm2_memory_args[@]}"; then
+                echo "   PM2 原地重启成功（进程 ID 保持不变）。"
+                echo "   查看日志: pm2 logs $PM2_APP_NAME"
+                if pm2 save >/dev/null; then
+                    echo "   PM2 进程列表已保存。"
+                fi
+                return
             fi
-            return
+            warn "   PM2 restart 失败（进程状态不一致），正在清理残留并重新启动..."
+            pm2 delete "$PM2_APP_NAME" 2>/dev/null || true
+            sleep 1
         fi
-        # restart 失败通常是 PM2 状态不一致（dump 记录了进程但实际不存在）。
-        # 清理残留记录后 fallback 到 start 分支重新创建。
-        warn "   PM2 restart 失败（进程状态不一致），正在清理残留并重新启动..."
-        pm2 delete "$PM2_APP_NAME" 2>/dev/null || true
-        sleep 1
     fi
 
     code="$(bot_python_code)"
@@ -1879,7 +1908,7 @@ start_with_pm2() {
         --cwd "$SCRIPT_DIR" \
         --interpreter none \
         --stop-exit-codes 78 \
-        --max-memory-restart 1G \
+        "${pm2_memory_args[@]}" \
         --exp-backoff-restart-delay=100 \
         -- -c "$code"
 

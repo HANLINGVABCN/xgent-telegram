@@ -956,5 +956,60 @@ class UninstallSafetyTests(unittest.TestCase):
         self.assertIn('basename "$resolved"', guard)
 
 
+@requires_bash_harness
+class PM2AdaptiveMemoryTests(InstallScriptLibraryMixin, unittest.TestCase):
+    def resolve(self, override=None):
+        with self.temp_dir() as temp_dir:
+            root = self.sandbox(temp_dir)
+            env = {} if override is None else {"PM2_MAX_MEMORY_RESTART": override}
+            result = self.run_lib(
+                'resolve_pm2_memory_restart\n'
+                + 'printf "%s|%s|%s\\n" "$PM2_MEMORY_RESTART" '
+                  '"$PM2_MEMORY_RESTART_SOURCE" "$PM2_MEMORY_RESTART_ENABLED"\n',
+                root,
+                env_extra=env,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            return result.stdout.strip(), result.stderr
+
+    def test_environment_override_is_preserved(self):
+        value, stderr = self.resolve("768M")
+        self.assertEqual(
+            "768M|环境变量 PM2_MAX_MEMORY_RESTART（固定覆盖）|1",
+            value,
+        )
+        self.assertEqual("", stderr)
+
+    def test_automatic_mode_uses_in_process_realtime_monitor(self):
+        value, stderr = self.resolve()
+        self.assertEqual(
+            "|进程内实时监控：每秒读取 MemAvailable 与进程 RSS，动态保留 5%|0",
+            value,
+        )
+        self.assertEqual("", stderr)
+
+    def test_automatic_mode_does_not_write_a_static_pm2_limit(self):
+        block = INSTALL_SCRIPT[
+            INSTALL_SCRIPT.index('start_with_pm2() {'):
+            INSTALL_SCRIPT.index('restart_pm2_detached() {')
+        ]
+        self.assertIn('pm2_memory_args=()', block)
+        self.assertIn('pm2 delete "$PM2_APP_NAME"', block)
+        self.assertIn('"${pm2_memory_args[@]}"', block)
+        self.assertNotIn('--max-memory-restart 1G', block)
+        self.assertNotIn('PM2_MEMORY_RESTART="0"', block)
+        self.assertIn('pm2 save', block)
+
+    def test_explicit_override_adds_pm2_static_limit(self):
+        block = INSTALL_SCRIPT[
+            INSTALL_SCRIPT.index('start_with_pm2() {'):
+            INSTALL_SCRIPT.index('restart_pm2_detached() {')
+        ]
+        self.assertIn(
+            'pm2_memory_args=(--max-memory-restart "$pm2_memory_limit")',
+            block,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

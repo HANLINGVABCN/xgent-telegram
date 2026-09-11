@@ -476,10 +476,50 @@ def _log_ready_banner() -> None:
     logger.info("=" * 50)
 
 
+_memory_maintenance_task: Optional[asyncio.Task] = None
+_memory_limit_task: Optional[asyncio.Task] = None
+
+
+def start_memory_maintenance() -> None:
+    global _memory_maintenance_task, _memory_limit_task
+    if _memory_maintenance_task is None or _memory_maintenance_task.done():
+        _memory_maintenance_task = asyncio.create_task(
+            memory_maintenance.periodic_memory_maintenance(),
+            name="xgent-memory-maintenance",
+        )
+    if not os.getenv("PM2_MAX_MEMORY_RESTART", "").strip() and (
+        _memory_limit_task is None or _memory_limit_task.done()
+    ):
+        def memory_limit_reached(limit_mb: int, available_mb: int, rss_mb: int) -> None:
+            logger.warning(
+                "实时内存上限触发：RSS=%dMB，上限=%dMB，MemAvailable=%dMB；正在交给 PM2 重启。",
+                rss_mb, limit_mb, available_mb,
+            )
+            request_app_stop(75)
+
+        _memory_limit_task = asyncio.create_task(
+            memory_maintenance.realtime_memory_limit_monitor(memory_limit_reached),
+            name="xgent-realtime-memory-limit",
+        )
+
+
+async def stop_memory_maintenance() -> None:
+    global _memory_maintenance_task, _memory_limit_task
+    tasks = [task for task in (_memory_maintenance_task, _memory_limit_task) if task is not None]
+    _memory_maintenance_task = None
+    _memory_limit_task = None
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+
 async def shutdown_components(app: Any = None) -> None:
     """唯一的停机路径。曾经有两份（on_shutdown / on_shutdown_web_only），
     差别只有一个 TelegramRichAPI 客户端要不要关——那个关闭本身是幂等的，
     于是两份代码里必然有一份会在改动时被忘掉。现在只有这一条。"""
+    await stop_memory_maintenance()
     for state in _COMPONENT_STATES.values():
         if state.state in (COMPONENT_UP, COMPONENT_STARTING, COMPONENT_DEGRADED):
             state.set(COMPONENT_DOWN, reason="进程停机")
@@ -514,6 +554,7 @@ async def run_app() -> int:
     # 1) 公共地基：配置缓存 + 数据库。原先埋在 PTB 的 post_init 里，TG 连不上
     #    时连它都不会执行。
     await boot_core()
+    start_memory_maintenance()
 
     # 1.5) 抢在任何 MirrorBot 之前把共享 Telegram 通道注册好。晚了的话早期的
     #      MirrorBot 会各自建一个没有持久层的本地通道——断连期间的消息不落库，

@@ -1315,6 +1315,7 @@ class SelfTriggerManager:
     _scheduler: Optional[AsyncIOScheduler] = None
     _runtime_tasks: Dict[str, asyncio.Task] = {}
     _processes: Dict[str, Any] = {}
+    _process_output_paths: Dict[str, str] = {}
     _task_locks: Dict[str, asyncio.Lock] = {}
     _lock = asyncio.Lock()
     _execution_tasks: set = set()
@@ -2128,6 +2129,7 @@ class SelfTriggerManager:
                 task_id, status='running', last_started_at=time.time(), last_error=None,
             )
 
+            command_started_at = time.monotonic()
             try:
                 result = await cls._run_trigger_command(task, run_id)
             except asyncio.CancelledError:
@@ -2144,6 +2146,9 @@ class SelfTriggerManager:
                     await db.update_trigger_task(task_id, status='recovering')
                 raise
             except Exception as exc:
+                process = cls._processes.get(task_id)
+                if process is not None:
+                    await terminate_async_process(process)
                 logger.error(f'trigger 任务 {task_id} 执行失败: {exc}', exc_info=True)
                 result = {
                     'status': 'failed', 'trigger_reason': 'execution_error',
@@ -2151,6 +2156,15 @@ class SelfTriggerManager:
                     'output_path': None, 'error': str(exc)[:2000],
                 }
             finally:
+                output_path = cls._process_output_paths.pop(task_id, None)
+                output_bytes = 0
+                if output_path:
+                    with contextlib.suppress(OSError):
+                        output_bytes = os.path.getsize(output_path)
+                elapsed_seconds = max(0.0, time.monotonic() - command_started_at)
+                await memory_maintenance.trim_after_large_command(
+                    elapsed_seconds, output_bytes
+                )
                 cls._processes.pop(task_id, None)
 
             finished_at = time.time()
@@ -2263,6 +2277,7 @@ class SelfTriggerManager:
         output_dir = os.path.join(COMMAND_OUTPUT_DIR, now.strftime('%Y-%m-%d'))
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"trigger_{task['id']}_{run_id}.txt")
+        cls._process_output_paths[task['id']] = output_path
         captured_parts: List[str] = []
         captured_length = 0
         output_truncated = False

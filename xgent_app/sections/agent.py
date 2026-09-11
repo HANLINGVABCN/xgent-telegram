@@ -7,6 +7,7 @@ from xgent_app.agent_context import (
     build_read_text_context_message,
 )
 from xgent_app.protocols import ProtocolParser
+from xgent_app import memory_maintenance
 class AgentExecutor:
     """安全地执行 AI 请求的 shell 命令"""
     
@@ -1622,6 +1623,7 @@ class AgentExecutor:
 
             elapsed_seconds = round(max(0.0, time.monotonic() - started_at), 2)
             saved = await save_command_output_async(command, output)
+            await memory_maintenance.trim_after_large_command(elapsed_seconds, saved['bytes'])
             rc = process.returncode if process else -1
             return {
                 'success': bool(not stopped and not timed_out and rc == 0),
@@ -1642,6 +1644,7 @@ class AgentExecutor:
             output = f"执行异常: {str(e)[:200]}"
             elapsed_seconds = round(max(0.0, time.monotonic() - started_at), 2)
             saved = await save_command_output_async(command, output)
+            await memory_maintenance.trim_after_large_command(elapsed_seconds, saved['bytes'])
             return {
                 'success': False,
                 'command': command,
