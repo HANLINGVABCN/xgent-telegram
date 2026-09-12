@@ -1,10 +1,73 @@
 # This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
+from xgent_app.context_limits import (
+    ConversationRequest,
+    limits_from_model_metadata,
+    reserved_output_tokens,
+    validate_limits,
+    validate_request_body,
+)
+
 class ModelClient:
     _VALID_ROLES = {'user', 'assistant', 'system'}
     _http_client: Optional[Any] = None
     _http_client_lock = None  # 延迟创建，避免在导入阶段绑定事件循环
+    _discovered_model_limits: Dict[str, Dict[str, Any]] = {}
+
+    @staticmethod
+    async def _remember_model_limits(base_url: str, models: list) -> None:
+        updates = {}
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get('id') or item.get('name') or item.get('model') or '')
+            if name.startswith('models/'):
+                name = name[len('models/'):]
+            limits = limits_from_model_metadata(item)
+            if name and limits:
+                updates[f"{base_url.rstrip('/')}|{name}"] = limits
+        if not updates:
+            return
+        ModelClient._discovered_model_limits.update(updates)
+        if UserDataManager._initialized:
+            stored = dict(UserDataManager.get('discovered_model_limits', {}))
+            stored.update(updates)
+            await UserDataManager.save_config('discovered_model_limits', stored)
+
+    @staticmethod
+    async def _prepare_conversation_request(prov_name: str, base_url: str, model: str,
+                                            system_prompt: str, history: list,
+                                            max_tokens: Optional[int]) -> Tuple[list, Optional[int]]:
+        history = await build_model_conversation_history(history)
+        key = f"{base_url.rstrip('/')}|{model}"
+        discovered = UserDataManager.get('discovered_model_limits', {})
+        configured = UserDataManager.get('model_request_limits', {})
+        if not isinstance(discovered, dict) or not isinstance(configured, dict):
+            raise AttachmentContextError("模型容量配置必须是 JSON 对象，未调用模型。")
+        limits = validate_limits(discovered.get(key, {}))
+        limits.update(ModelClient._discovered_model_limits.get(key, {}))
+        limits.update(validate_limits(configured.get(f"{prov_name}/{model}", {})))
+        limits = validate_limits(limits)
+        return ConversationRequest(history, limits, system_prompt), reserved_output_tokens(limits, max_tokens)
+
+    @staticmethod
+    def _validate_conversation_request(body: Dict[str, Any], history: list) -> None:
+        try:
+            validate_request_body(body, history)
+        except AttachmentContextError as exc:
+            raise AttachmentContextError(
+                f"完整上下文检查未通过，未调用模型，也没有自动减少附件：\n{exc}"
+            ) from exc
+
+    @staticmethod
+    def _raise_conversation_request_error(history: list, error: Any) -> None:
+        if isinstance(history, ConversationRequest):
+            detail = error if isinstance(error, str) else json.dumps(error, ensure_ascii=False)
+            raise AttachmentContextError(
+                "完整上下文请求失败，未获得有效回复，也没有自动减少附件：\n"
+                + redact_sensitive_text(detail)
+            )
 
     @classmethod
     async def _get_http_client(cls) -> Any:
@@ -514,7 +577,8 @@ class ModelClient:
         return media_text
 
     @staticmethod
-    def _extract_openai_compatible_sse_text(text: str, usage_sink: Optional[List[Dict[str, int]]] = None) -> str:
+    def _extract_openai_compatible_sse_text(text: str, usage_sink: Optional[List[Dict[str, int]]] = None,
+                                           history: Optional[list] = None) -> str:
         texts: List[str] = []
         for raw_line in (text or "").splitlines():
             line = raw_line.strip()
@@ -527,6 +591,8 @@ class ModelClient:
                 data = json.loads(payload)
             except json.JSONDecodeError:
                 continue
+            if data.get("error"):
+                ModelClient._raise_conversation_request_error(history, data["error"])
             record_token_usage(usage_sink, data.get("usage"))
             chunk_text = ModelClient._extract_openai_compatible_text(data)
             if chunk_text:
@@ -591,6 +657,7 @@ class ModelClient:
                         ]
                         final_models = sorted(set(chat_models if chat_models else model_ids))
                         if final_models:
+                            await ModelClient._remember_model_limits(base_url, items)
                             return final_models, None
                     elif resp.status_code in {401, 403}:
                         err_text = redact_sensitive_text(resp.text or "")[:400]
@@ -629,6 +696,7 @@ class ModelClient:
         )
         ModelClient._merge_thinking_params(body, thinking_params)
 
+        ModelClient._validate_conversation_request(body, history)
         write_model_trace("model_request", {
             "trace_id": trace_id,
             "provider": prov_name,
@@ -666,11 +734,14 @@ class ModelClient:
                     "status_code": resp.status_code,
                     "error": error_text,
                 })
+                ModelClient._raise_conversation_request_error(
+                    history, f"OpenAI compatible API error ({resp.status_code}): {error_text}",
+                )
                 return None, f"OpenAI compatible API error ({resp.status_code}): {error_text}"
 
             raw_text = resp.text or ""
             if raw_text.lstrip().startswith("data:"):
-                text = ModelClient._extract_openai_compatible_sse_text(raw_text, usage_sink)
+                text = ModelClient._extract_openai_compatible_sse_text(raw_text, usage_sink, history)
                 if text:
                     write_model_trace("model_response", {
                         "trace_id": trace_id,
@@ -682,9 +753,13 @@ class ModelClient:
                         "usage": usage_sink[0] if usage_sink else None,
                     })
                     return text, None
-                return None, raw_text[:2000] or "对方暂时没反应，用户稍后再试试？"
+                error = raw_text[:2000] or "对方暂时没反应，用户稍后再试试？"
+                ModelClient._raise_conversation_request_error(history, error)
+                return None, error
 
             data = resp.json()
+            if data.get("error"):
+                ModelClient._raise_conversation_request_error(history, data["error"])
             record_token_usage(usage_sink, data.get("usage"))
             text = ModelClient._extract_openai_compatible_text(data)
             if text:
@@ -698,8 +773,13 @@ class ModelClient:
                     "usage": usage_sink[0] if usage_sink else None,
                 })
                 return text, None
-            return None, json.dumps(data, ensure_ascii=False)[:2000] or "对方暂时没反应，用户稍后再试试？"
+            error = json.dumps(data, ensure_ascii=False)[:2000] or "对方暂时没反应，用户稍后再试试？"
+            ModelClient._raise_conversation_request_error(history, error)
+            return None, error
+        except AttachmentContextError:
+            raise
         except httpx.ReadTimeout:
+            ModelClient._raise_conversation_request_error(history, "网络超时了，用户稍后再试试")
             return None, "网络超时了，用户稍后再试试"
         except Exception as e:
             write_model_trace("model_error", {
@@ -710,6 +790,7 @@ class ModelClient:
                 "stream": False,
                 "error": format_provider_exception(e),
             })
+            ModelClient._raise_conversation_request_error(history, format_provider_exception(e))
             return None, format_provider_exception(e)
 
     @staticmethod
@@ -734,6 +815,7 @@ class ModelClient:
         )
         ModelClient._merge_thinking_params(body, thinking_params)
 
+        ModelClient._validate_conversation_request(body, history)
         write_model_trace("model_request", {
             "trace_id": trace_id,
             "provider": prov_name,
@@ -773,6 +855,10 @@ class ModelClient:
                                 "status_code": resp.status_code,
                                 "error": error_text,
                             })
+                            ModelClient._raise_conversation_request_error(
+                                history,
+                                f"OpenAI compatible API error ({resp.status_code}): {error_text}",
+                            )
                             yield f"OpenAI compatible API error ({resp.status_code}): {error_text}"
                             return
 
@@ -784,6 +870,8 @@ class ModelClient:
                             except json.JSONDecodeError:
                                 logger.debug(f"OpenAI compatible SSE parse failed: {payload[:200]}")
                                 continue
+                            if data.get("error"):
+                                ModelClient._raise_conversation_request_error(history, data["error"])
                             record_token_usage(usage_sink, data.get("usage"))
                             text = ModelClient._extract_openai_compatible_text(data)
                             if text:
@@ -793,14 +881,19 @@ class ModelClient:
                     break
 
             if not yielded_any_text:
+                ModelClient._raise_conversation_request_error(history, "模型未返回有效内容。")
                 text, error = await ModelClient._complete_openai_compatible_http(
                     api_key, base_url, model, system_prompt, history, max_tokens, usage_sink, trace_id, prov_name
                 )
                 if text:
                     yield text
                 elif error:
+                    ModelClient._raise_conversation_request_error(history, error)
                     yield error
+        except AttachmentContextError:
+            raise
         except httpx.ReadTimeout:
+            ModelClient._raise_conversation_request_error(history, "网络超时了，用户稍后再试试")
             yield "网络超时了，用户稍后再试试"
         except Exception as e:
             write_model_trace("model_error", {
@@ -811,6 +904,7 @@ class ModelClient:
                 "stream": True,
                 "error": format_provider_exception(e),
             })
+            ModelClient._raise_conversation_request_error(history, format_provider_exception(e))
             yield format_provider_exception(e)
 
     @staticmethod
@@ -875,6 +969,7 @@ class ModelClient:
                     'gemini', model, base_url, prov_name
                 )
                 ModelClient._merge_thinking_params(body, thinking_params)
+                ModelClient._validate_conversation_request(body, history)
                 write_model_trace("model_request", {
                     "trace_id": trace_id,
                     "provider_format": "gemini",
@@ -906,9 +1001,14 @@ class ModelClient:
                         "status_code": resp.status_code,
                         "error": error_text,
                     })
+                    ModelClient._raise_conversation_request_error(
+                        history, f"Gemini API error ({resp.status_code}): {error_text}",
+                    )
                     return None, f"Gemini API error ({resp.status_code}): {error_text}"
 
                 data = resp.json()
+                if data.get("error"):
+                    ModelClient._raise_conversation_request_error(history, data["error"])
                 record_token_usage(usage_sink, data.get('usageMetadata'))
                 candidates = data.get('candidates', [])
                 finish_reason = candidates[0].get('finishReason') if candidates else None
@@ -934,10 +1034,15 @@ class ModelClient:
                     f"Gemini non-stream returned no text; finishReason={finish_reason}, keys={list(data.keys())[:5]}"
                 )
                 if finish_reason and finish_reason != 'STOP':
+                    ModelClient._raise_conversation_request_error(history, data)
                     return None, json.dumps(data, ensure_ascii=False)
+                ModelClient._raise_conversation_request_error(history, "模型未返回有效内容。")
                 return None, "对方暂时没反应，用户稍后再试试？"
+        except AttachmentContextError:
+            raise
         except httpx.ReadTimeout as e:
             logger.error(f"Gemini Non-Stream Read Timeout: {e}")
+            ModelClient._raise_conversation_request_error(history, "网络超时了，用户稍后再试试")
             return None, "网络超时了，用户稍后再试试"
         except Exception as e:
             err_msg = str(e)
@@ -948,6 +1053,7 @@ class ModelClient:
                 "model": model,
                 "error": format_provider_exception(e),
             })
+            ModelClient._raise_conversation_request_error(history, format_provider_exception(e))
             return None, format_provider_exception(e)
 
     @staticmethod
@@ -984,6 +1090,7 @@ class ModelClient:
                     budget = thinking_params["thinking"]["budget_tokens"]
                     thinking_params["max_tokens"] = max(max_tokens, budget + CLAUDE_THINKING_ANSWER_HEADROOM)
                 ModelClient._merge_thinking_params(body, thinking_params)
+                ModelClient._validate_conversation_request(body, history)
                 write_model_trace("model_request", {
                     "trace_id": trace_id,
                     "provider_format": "claude",
@@ -1017,9 +1124,14 @@ class ModelClient:
                         "status_code": resp.status_code,
                         "error": error_text,
                     })
+                    ModelClient._raise_conversation_request_error(
+                        history, f"Claude API error ({resp.status_code}): {error_text}",
+                    )
                     return None, f"Claude API error ({resp.status_code}): {error_text}"
 
                 data = resp.json()
+                if data.get("error"):
+                    ModelClient._raise_conversation_request_error(history, data["error"])
                 record_token_usage(usage_sink, data.get('usage'))
                 stop_reason = data.get('stop_reason')
                 text = ModelClient._extract_claude_text_response(data)
@@ -1044,10 +1156,15 @@ class ModelClient:
                     f"Claude non-stream returned no text; stop_reason={stop_reason}, keys={list(data.keys())[:5]}"
                 )
                 if stop_reason:
+                    ModelClient._raise_conversation_request_error(history, data)
                     return None, json.dumps(data, ensure_ascii=False)
+                ModelClient._raise_conversation_request_error(history, "模型未返回有效内容。")
                 return None, "对方暂时没反应，用户稍后再试试？"
+        except AttachmentContextError:
+            raise
         except httpx.ReadTimeout as e:
             logger.error(f"Claude Non-Stream Read Timeout: {e}")
+            ModelClient._raise_conversation_request_error(history, "网络超时了，用户稍后再试试")
             return None, "网络超时了，用户稍后再试试"
         except Exception as e:
             err_msg = str(e)
@@ -1058,6 +1175,7 @@ class ModelClient:
                 "model": model,
                 "error": format_provider_exception(e),
             })
+            ModelClient._raise_conversation_request_error(history, format_provider_exception(e))
             return None, format_provider_exception(e)
 
     @staticmethod
@@ -1104,6 +1222,12 @@ class ModelClient:
                     if 'embedding' not in m.lower() and 'audio' not in m.lower() and 'rerank' not in m.lower()
                 ])
                 if models:
+                    await ModelClient._remember_model_limits(
+                        base_url, [
+                            item.model_dump() if hasattr(item, 'model_dump') else item
+                            for item in (getattr(response, 'data', None) or [])
+                        ],
+                    )
                     return models, None
             except Exception as sdk_err:
                 logger.debug(f"OpenAI SDK models.list failed for {prov_name}, falling back to HTTP probe: {sdk_err}")
@@ -1173,6 +1297,7 @@ class ModelClient:
 
                 data = resp.json()
                 raw_models = data.get('models', []) if isinstance(data, dict) else []
+                await ModelClient._remember_model_limits(base_url, raw_models)
                 for model_data in raw_models:
                     if not isinstance(model_data, dict):
                         if isinstance(model_data, str):
@@ -1216,8 +1341,13 @@ class ModelClient:
                                       model: str, system_prompt: str, history: list,
                                       max_tokens: Optional[int] = None, api_format: str = 'openai',
                                       usage_sink: Optional[List[Dict[str, int]]] = None,
-                                      trace_id: Optional[str] = None):
+                                      trace_id: Optional[str] = None,
+                                      conversation_context: bool = False):
         """流式回复生成器 - 支持多种 API 格式"""
+        if conversation_context:
+            history, max_tokens = await ModelClient._prepare_conversation_request(
+                prov_name, base_url, model, system_prompt, history, max_tokens,
+            )
         if api_format in {'gemini', 'vertex'}:
             async for chunk in ModelClient._stream_gemini(api_key, base_url, model, system_prompt, history, max_tokens, usage_sink, trace_id, prov_name):
                 yield chunk
@@ -1240,6 +1370,7 @@ class ModelClient:
                 "content": ModelClient._to_openai_content(msg['content'])
             })
 
+        yielded_any_text = False
         try:
             request_kwargs = {
                 "model": model,
@@ -1253,6 +1384,9 @@ class ModelClient:
                 api_format, model, base_url, prov_name
             )
             ModelClient._merge_thinking_params(request_kwargs, thinking_params)
+            ModelClient._validate_conversation_request(
+                {**request_kwargs, "stream_options": {"include_usage": True}}, history,
+            )
             write_model_trace("model_request", {
                 "trace_id": trace_id,
                 "provider": prov_name,
@@ -1293,8 +1427,13 @@ class ModelClient:
                     if chunk.choices and chunk.choices[0].delta.content:
                         chunk_text = ModelClient._model_content_to_text(chunk.choices[0].delta.content)
                         if chunk_text:
+                            yielded_any_text = True
                             yield chunk_text
-                    
+            if not yielded_any_text:
+                ModelClient._raise_conversation_request_error(history, "模型未返回有效内容。")
+
+        except AttachmentContextError:
+            raise
         except Exception as e:
             err_msg = str(e)
             logger.error(f"Stream Think Error: {err_msg}")
@@ -1306,6 +1445,7 @@ class ModelClient:
                 "stream": True,
                 "error": format_provider_exception(e),
             })
+            ModelClient._raise_conversation_request_error(history, format_provider_exception(e))
             yield format_provider_exception(e)
     
     @staticmethod
@@ -1347,6 +1487,7 @@ class ModelClient:
             'gemini', model, base_url, prov_name
         )
         ModelClient._merge_thinking_params(body, thinking_params)
+        ModelClient._validate_conversation_request(body, history)
         write_model_trace("model_request", {
             "trace_id": trace_id,
             "provider_format": "gemini",
@@ -1386,6 +1527,9 @@ class ModelClient:
                             "status_code": resp.status_code,
                             "error": error_text,
                         })
+                        ModelClient._raise_conversation_request_error(
+                            history, f"Gemini API error ({resp.status_code}): {error_text}",
+                        )
                         yield f"Gemini API error ({resp.status_code}): {error_text}"
                         return
                     
@@ -1407,6 +1551,8 @@ class ModelClient:
                             logger.debug(f"Gemini SSE parse failed: {payload[:200]}")
                             continue
 
+                        if data.get("error"):
+                            ModelClient._raise_conversation_request_error(history, data["error"])
                         record_token_usage(usage_sink, data.get('usageMetadata'))
 
                         candidates = data.get('candidates', [])
@@ -1429,8 +1575,13 @@ class ModelClient:
                             logger.warning(f"Gemini event #{event_count} had no candidates: {payload[:200]}")
                 # 流正常跑完，不要进入第二轮重试。
                 break
+            if not text_event_count:
+                ModelClient._raise_conversation_request_error(history, "Gemini 未返回有效内容。")
+        except AttachmentContextError:
+            raise
         except httpx.ReadTimeout as e:
             logger.error(f"Gemini Stream Read Timeout: {e}")
+            ModelClient._raise_conversation_request_error(history, "Gemini 流式连接超时。")
             yield "📖 Gemini 流式连接超时，像是线路在回复途中被中断了，请稍后再试试"
         except Exception as e:
             logger.error(f"Gemini Stream Error: {e}")
@@ -1441,6 +1592,7 @@ class ModelClient:
                 "stream": True,
                 "error": format_provider_exception(e),
             })
+            ModelClient._raise_conversation_request_error(history, format_provider_exception(e))
             yield f"Gemini 连接失败: {str(e)[:150]}"
     
     @staticmethod
@@ -1485,6 +1637,7 @@ class ModelClient:
             budget = thinking_params["thinking"]["budget_tokens"]
             thinking_params["max_tokens"] = max(max_tokens, budget + CLAUDE_THINKING_ANSWER_HEADROOM)
         ModelClient._merge_thinking_params(body, thinking_params)
+        ModelClient._validate_conversation_request(body, history)
         write_model_trace("model_request", {
             "trace_id": trace_id,
             "provider_format": "claude",
@@ -1493,6 +1646,7 @@ class ModelClient:
             "request_body": body,
         })
 
+        yielded_any_text = False
         try:
             async with ModelClient._http_client_context() as client:
               # 最多两轮：第一轮带思考参数，被拒时去掉参数重开一次流。
@@ -1523,6 +1677,9 @@ class ModelClient:
                             "status_code": resp.status_code,
                             "error": error_text,
                         })
+                        ModelClient._raise_conversation_request_error(
+                            history, f"Claude API error ({resp.status_code}): {error_text}",
+                        )
                         yield f"Claude API error ({resp.status_code}): {error_text}"
                         return
                     
@@ -1536,6 +1693,8 @@ class ModelClient:
                             logger.debug(f"Claude SSE parse failed: {payload[:200]}")
                             continue
 
+                        if data.get("error"):
+                            ModelClient._raise_conversation_request_error(history, data["error"])
                         if data.get('type') == 'message_start':
                             message = data.get('message') or {}
                             record_token_usage(usage_sink, message.get('usage'))
@@ -1550,11 +1709,17 @@ class ModelClient:
                                 continue
                             text = delta.get('text', '')
                             if text:
+                                yielded_any_text = True
                                 yield text
                 # 流正常跑完，不要进入第二轮重试。
                 break
+            if not yielded_any_text:
+                ModelClient._raise_conversation_request_error(history, "Claude 未返回有效内容。")
+        except AttachmentContextError:
+            raise
         except httpx.ReadTimeout as e:
             logger.error(f"Claude Stream Read Timeout: {e}")
+            ModelClient._raise_conversation_request_error(history, "Claude 流式连接超时。")
             yield "📖 Claude 流式连接超时，线路可能在回复途中被打断了，请稍后再试试"
         except Exception as e:
             logger.error(f"Claude Stream Error: {e}")
@@ -1565,6 +1730,7 @@ class ModelClient:
                 "stream": True,
                 "error": format_provider_exception(e),
             })
+            ModelClient._raise_conversation_request_error(history, format_provider_exception(e))
             yield f"Claude 连接失败: {str(e)[:150]}"
 
     @staticmethod
@@ -1573,8 +1739,13 @@ class ModelClient:
                               max_tokens: Optional[int] = None,
                               api_format: str = 'openai',
                               usage_sink: Optional[List[Dict[str, int]]] = None,
-                              trace_id: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+                              trace_id: Optional[str] = None,
+                              conversation_context: bool = False) -> Tuple[Optional[str], Optional[str]]:
         """非流式回复（备用）"""
+        if conversation_context:
+            history, max_tokens = await ModelClient._prepare_conversation_request(
+                prov_name, base_url, model, system_prompt, history, max_tokens,
+            )
         if api_format in {'gemini', 'vertex'}:
             return await ModelClient._complete_gemini(
                 api_key, base_url, model, system_prompt, history, max_tokens, usage_sink, trace_id, prov_name
@@ -1609,6 +1780,7 @@ class ModelClient:
                 api_format, model, base_url, prov_name
             )
             ModelClient._merge_thinking_params(request_kwargs, thinking_params)
+            ModelClient._validate_conversation_request(request_kwargs, history)
             write_model_trace("model_request", {
                 "trace_id": trace_id,
                 "provider": prov_name,
@@ -1638,6 +1810,7 @@ class ModelClient:
                     timeout=ModelClient._build_stream_timeout(),
                 )
             if not completion or not completion.choices:
+                ModelClient._raise_conversation_request_error(history, "模型未返回有效内容。")
                 return None, "对方暂时没反应，用户稍后再试试？"
             record_token_usage(usage_sink, _value_from_obj(completion, 'usage'))
 
@@ -1662,6 +1835,7 @@ class ModelClient:
                         media_text = "\n".join(media_urls)
                         content = f"{content}\n{media_text}" if content else media_text
             if not content:
+                ModelClient._raise_conversation_request_error(history, "模型未返回有效内容。")
                 return None, "对方暂时没反应，用户稍后再试试？"
 
             finish_reason = getattr(choice, 'finish_reason', None)
@@ -1683,6 +1857,8 @@ class ModelClient:
                 "usage": usage_sink[0] if usage_sink else None,
             })
             return content, None
+        except AttachmentContextError:
+            raise
         except Exception as e:
             err_msg = str(e)
             logger.error(
@@ -1697,6 +1873,7 @@ class ModelClient:
                 "stream": False,
                 "error": format_provider_exception(e),
             })
+            ModelClient._raise_conversation_request_error(history, format_provider_exception(e))
             return None, format_provider_exception(e)
 
 # --- ☆ 全局消息记录器 ☆ ---

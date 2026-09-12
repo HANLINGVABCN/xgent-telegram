@@ -9,6 +9,7 @@ async def cmd_delete_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     db = await BotMemoryDB.get_instance()
     counts = await db.clear_all_conversation_memory()
+    cancel_pending_album_conversations()
     UserDataManager.set('current_chat_id', SINGLE_MEMORY_SESSION_ID)
     await UserDataManager.save_config('current_chat_id', SINGLE_MEMORY_SESSION_ID)
 
@@ -128,7 +129,8 @@ async def cmd_export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "说明:\n"
                 "这是一份导出时按当前配置拼出来的 AI 历史上下文视图，便于核对 AI 大概看到了哪些历史消息。\n"
                 f"当前历史深度: {global_depth} 条。\n"
-                "不同接口会再转换成各自 JSON/parts 格式；临时文件/图片本体和过长命令原文可能只保留索引或截断结果。\n\n"
+                "模型请求会额外携带当前对话全部图片原件和文本全文，不受上述历史深度限制。\n"
+                "本导出只展示聊天索引，不嵌入附件全文或图片 Base64；过长命令原文仍可能截断。\n\n"
                 "================ HISTORY ================\n"
                 f"{_format_ai_context(messages)}"
             )

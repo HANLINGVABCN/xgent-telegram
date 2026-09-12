@@ -31,6 +31,26 @@ from xgent_app.agent_presenter import (
     build_standard_operation_presentation,
 )
 
+def build_document_attachment_payload(doc_name: str, content_bytes: bytes, caption: str,
+                                      context_prefix: str = "", mime_type: Optional[str] = None,
+                                      source_message_id: Optional[int] = None) -> Dict[str, Any]:
+    saved_file = ArtifactManager.save_binary_upload(doc_name, content_bytes)
+    reference = ArtifactManager.attachment_reference(
+        saved_file, doc_name, content_bytes, caption, context_prefix,
+        mime_type=mime_type, source_message_id=source_message_id,
+    )
+    kind = "图片" if reference['kind'] == 'image' else "文件"
+    note = ArtifactManager.shorten_text(caption, 80) if caption else ""
+    return {
+        "saved_file": saved_file,
+        "attachment": reference,
+        "caption": caption,
+        "saved_notice": ArtifactManager.build_saved_notice(kind, saved_file['rel_path']),
+        "index_text": ArtifactManager.build_index_message(kind, doc_name, saved_file['rel_path'], note),
+        "is_document": True,
+    }
+
+
 async def process_incoming_document(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -41,6 +61,8 @@ async def process_incoming_document(
     file_size: Optional[int] = None,
     mime_type: Optional[str] = None,
     sync_to_telegram: Optional[Callable[[str, str, str], Awaitable[None]]] = None,
+    attachment_generation: Optional[int] = None,
+    attachment_received_at_ns: Optional[int] = None,
 ) -> None:
     """处理一份已经拿到字节的文档，按当前状态机分流。
 
@@ -73,7 +95,8 @@ async def process_incoming_document(
         await GlobalRecorder.record_user_message(
             f"[提供商配置文件] {doc_name}",
             MessageType.USER_FILE,
-            update.effective_chat.id
+            update.effective_chat.id,
+            metadata={'attachment_purpose': 'configuration'},
         )
         if not doc_name.lower().endswith('.json'):
             await update.message.reply_text("⚠️ 请发送 JSON 配置文件，或发送 cancel 取消。")
@@ -147,7 +170,8 @@ async def process_incoming_document(
         await GlobalRecorder.record_user_message(
             f"[黑名单文件] {doc_name}",
             MessageType.USER_FILE,
-            update.effective_chat.id
+            update.effective_chat.id,
+            metadata={'attachment_purpose': 'configuration'},
         )
         if not _looks_like_text_file(doc_name):
             await update.message.reply_text("🫠 黑名单批量导入只接受 txt / md / text 文件。")
@@ -178,7 +202,8 @@ async def process_incoming_document(
         await GlobalRecorder.record_user_message(
             f"[记忆文件] {doc_name}",
             MessageType.USER_FILE,
-            update.effective_chat.id
+            update.effective_chat.id,
+            metadata={'attachment_purpose': 'configuration'},
         )
         if not _looks_like_text_file(doc_name):
             await update.message.reply_text("🫠 记忆导入只接受 txt / md / text 文件。")
@@ -208,7 +233,8 @@ async def process_incoming_document(
         await GlobalRecorder.record_user_message(
             f"[文件] {doc_name}",
             MessageType.USER_FILE,
-            update.effective_chat.id
+            update.effective_chat.id,
+            metadata={'attachment_purpose': 'configuration'},
         )
 
         if not _looks_like_text_file(doc_name):
@@ -250,76 +276,51 @@ async def process_incoming_document(
     # 注意：save_binary_upload 必须只调用一次——sync_to_telegram 和下面的
     # 记忆/AI 上下文必须引用同一份落盘文件，不能各存一份产生两个路径。
     try:
-        saved_file = ArtifactManager.save_binary_upload(doc_name, content_bytes)
-        if sync_to_telegram is not None:
-            await sync_to_telegram(saved_file['abs_path'], doc_name, caption)
-
-        note = ArtifactManager.shorten_text(caption, 80) if caption else ""
-        memory_text = ArtifactManager.build_index_message("文件", doc_name, saved_file['rel_path'], note)
-
-        await GlobalRecorder.record_user_message(
-            memory_text,
-            MessageType.USER_FILE,
-            update.effective_chat.id
-        )
-
-        turn_parts: List[Dict[str, str]] = []
-        if caption:
-            turn_parts.append({"type": "text", "text": f"用户附言：{caption}"})
-        turn_parts.append({
-            "type": "text",
-            "text": ArtifactManager.build_saved_notice("文件", saved_file['rel_path'], f"原文件名：{doc_name}")
-        })
-
-        inline_text = ArtifactManager.try_decode_text(content_bytes)
-        if inline_text is not None:
-            clipped_text, was_clipped = ArtifactManager.clip_inline_text(inline_text)
-            clip_note = (
-                "\n[系统提示] 文件内容过长，本轮只内联了前半部分，完整内容仍可通过保存路径重新读取。"
-                if was_clipped else ""
-            )
-            turn_parts.append({
-                "type": "text",
-                "text": (
-                    f"[文件内容开始]\n{clipped_text}{clip_note}\n[文件内容结束]\n"
-                    "请直接基于文件内容回答，并说明文件保存路径。"
-                )
-            })
-        else:
-            turn_parts.append({
-                "type": "text",
-                "text": (
-                    "这份文件已经保存到路径里了，但不会把全文长期塞在上下文里。"
-                    "如果后面还要继续分析，请优先按保存路径重新读取。"
-                )
-            })
-
+        if attachment_received_at_ns is None:
+            attachment_received_at_ns = time.time_ns()
+        if attachment_generation is None:
+            db = await BotMemoryDB.get_instance()
+            attachment_generation = await db.get_attachment_generation()
         context_prefix = build_incoming_context_prefix(update.message)
+        payload = await asyncio.to_thread(
+            build_document_attachment_payload,
+            doc_name, content_bytes, caption, context_prefix, mime_type,
+            source_message_id=getattr(update.message, 'message_id', None),
+        )
+        saved_file = payload["saved_file"]
+        memory_text = payload["index_text"]
         if context_prefix:
             memory_text = f"{context_prefix}\n{memory_text}"
 
-        await process_conversation(
-            update,
-            context,
-            memory_text,
-            content_override=turn_parts
+        await GlobalRecorder.record_attachment_message(
+            memory_text, MessageType.USER_FILE, update.effective_chat.id, [payload["attachment"]],
+            attachment_generation,
+            metadata={'attachment_received_at_ns': attachment_received_at_ns},
         )
+        if sync_to_telegram is not None:
+            await sync_to_telegram(saved_file['abs_path'], doc_name, caption)
+
+        await process_conversation(update, context, memory_text)
     except Exception as e:
         logger.error(f"File save/process error: {e}")
-        await update.message.reply_text(f"文件 {safe_text(doc_name)} 已收到，但保存或转交模型失败。")
+        await update.message.reply_text(
+            f"文件 {safe_text(doc_name)} 未能完整交给模型：{safe_text(str(e))}"
+        )
 
 
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    received_at_ns = time.time_ns()
     if not await check_authorized_user_middleware(update, context):
         return
 
     # 处理中锁（仅对非提示词编辑状态生效）
     await UserDataManager.init()
     state = UserDataManager.get('state')
-    if (not is_prompt_edit_state(state)
-            and state != BotState.SET_COMMAND_BLACKLIST
-            and state != BotState.SET_MEMORY
-            and state != BotState.IMPORT_PROVIDER_CONFIG):
+    configuration_upload = is_prompt_edit_state(state) or state in {
+        BotState.SET_COMMAND_BLACKLIST, BotState.SET_MEMORY, BotState.IMPORT_PROVIDER_CONFIG,
+    }
+    media_group_id = getattr(update.message, "media_group_id", None)
+    if not configuration_upload:
         if _conversation_processing_lock.locked():
             await update.message.reply_text(
                 "⏳ 系统仍在处理上一个请求... 请稍等。"
@@ -329,13 +330,30 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     doc = update.message.document
     doc_name = doc.file_name or f"document_{uuid.uuid4().hex[:8]}.bin"
     # caption 同样只取原文：格式属性丢弃，字符一字不差。
-    caption = (update.message.caption or "").strip()
+    caption = update.message.caption or ""
     # 转发的富文本消息：caption 可能为空，文字在 rich_message.blocks 里
     if not caption:
-        caption = _extract_rich_message_text(update.message).strip()
+        caption = _extract_rich_message_text(update.message)
         if caption:
             logger.warning(f"handle_document_message: extracted caption via rich_message, len={len(caption)}: {caption[:200]}")
 
+    if media_group_id and not configuration_upload:
+        async def prepare_document():
+            data = bytes(await download_telegram_file(doc))
+            return await asyncio.to_thread(
+                build_document_attachment_payload, doc_name, data, caption,
+                build_incoming_context_prefix(update.message), doc.mime_type,
+                update.message.message_id,
+            )
+
+        await _handle_album_attachment(
+            update, context, media_group_id, prepare_document, MessageType.USER_FILE,
+            received_at_ns=received_at_ns,
+        )
+        return
+
+    db = await BotMemoryDB.get_instance()
+    attachment_generation = await db.get_attachment_generation()
     content_bytes = bytes(await download_telegram_file(doc))
     await process_incoming_document(
         update, context,
@@ -344,6 +362,8 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         caption=caption,
         file_size=doc.file_size,
         mime_type=doc.mime_type,
+        attachment_generation=attachment_generation,
+        attachment_received_at_ns=received_at_ns,
     )
 
 
@@ -1725,15 +1745,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
 
     global_depth = max(1, int(UserDataManager.get('global_depth', 30)))
     system_prompt = build_conversation_system_prompt(agent_mode)
-    history = await db.get_conversation_messages(global_depth)
-    if content_override is not None:
-        # 文件/图片本体只在本轮临时喂给模型；长期记忆和导出仍只保留路径索引。
-        for msg in reversed(history):
-            if msg.get('role') == 'user':
-                msg['content'] = content_override
-                break
-        else:
-            history.append({'role': 'user', 'content': content_override})
+    history = with_current_question(
+        await db.get_conversation_messages(global_depth), text, content_override,
+    )
     
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,

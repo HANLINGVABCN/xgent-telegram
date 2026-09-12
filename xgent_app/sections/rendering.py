@@ -1064,7 +1064,8 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             model, system_prompt, history,
             api_format=prov_data.get('api_format', 'openai'),
             usage_sink=usage_sink,
-            trace_id=trace_id
+            trace_id=trace_id,
+            conversation_context=True,
         ).__aiter__()
         stop_task = asyncio.create_task(stop_event.wait())
         stream_timed_out = False
@@ -1308,7 +1309,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
                 await context.bot.send_message(chat_id=chat_id, text=fallback_text[:4000])
             except Exception as last_err:
                 logger.error(f"连 send_message 都失败了，UI 可能卡住: {last_err}")
-        return error_text
+        return None if isinstance(e, AttachmentContextError) else error_text
     finally:
         if typing_stop:
             typing_stop.set()
@@ -1377,7 +1378,8 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
             model, system_prompt, history,
             api_format=prov_data.get('api_format', 'openai'),
             usage_sink=usage_sink,
-            trace_id=trace_id
+            trace_id=trace_id,
+            conversation_context=True,
         ).__aiter__()
         stop_task = asyncio.create_task(stop_event.wait())
         try:
@@ -1597,7 +1599,7 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
                 await context.bot.send_message(chat_id=chat_id, text=fallback_text[:4000])
             except Exception as last_err:
                 logger.error(f"连 send_message 都失败了，UI 可能卡住: {last_err}")
-        return error_text
+        return None if isinstance(e, AttachmentContextError) else error_text
     finally:
         if typing_stop:
             typing_stop.set()
@@ -1668,7 +1670,8 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
             model, system_prompt, history,
             api_format=prov_data.get('api_format', 'openai'),
             usage_sink=usage_sink,
-            trace_id=trace_id
+            trace_id=trace_id,
+            conversation_context=True,
         ))
         stop_task = asyncio.create_task(stop_event.wait())
         # 兜底硬上限必须加在这个 wait 上：模型无响应时 response_task 和
@@ -1838,7 +1841,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
                 await context.bot.send_message(chat_id=chat_id, text=error_text)
         except Exception:
             pass
-        return error_text
+        return None if isinstance(e, AttachmentContextError) else error_text
     finally:
         if typing_stop:
             typing_stop.set()

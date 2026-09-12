@@ -415,6 +415,14 @@ class BotMemoryDB:
                                      metadata: Optional[Dict[str, Any]] = None) -> Optional[int]:
         """记录一条全局消息，返回新行 rowid（供 token 统计双写关联去重）。"""
         async with self._write() as conn:
+            if metadata and 'attachments' in metadata:
+                cursor = await conn.execute(
+                    "SELECT value FROM config WHERE key = 'attachment_generation'"
+                )
+                row = await cursor.fetchone()
+                generation = int(json.loads(row['value'])) if row else 0
+                if metadata.get('attachment_generation', generation) != generation:
+                    raise ValueError("对话已在上传期间清空，请重新上传附件。")
             cursor = await conn.execute('''
                 INSERT INTO global_messages (chat_id, user_id, msg_type, role, content, timestamp, session_id, metadata)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -559,6 +567,29 @@ class BotMemoryDB:
                 })
         
         return result
+
+    async def get_attachment_records(self) -> List[Dict]:
+        """所有未清空的上传关联，不受普通对话窗口限制。"""
+        conn = await self._get_conn()
+        cursor = await conn.execute('''
+            SELECT id, chat_id, msg_type, role, content, timestamp, metadata FROM global_messages
+            WHERE role = 'user' AND msg_type IN (?, ?)
+            ORDER BY id
+        ''', (MessageType.USER_FILE, MessageType.USER_PHOTO))
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_attachment_generation(self) -> int:
+        return int(await self.get_config_fresh('attachment_generation', 0))
+
+    async def backfill_attachment_metadata(self, row_id: int, previous: Optional[str],
+                                           metadata: Dict[str, Any]) -> bool:
+        """只更新仍存在且未被其他协程修改的记录，绝不复活已清空的关联。"""
+        async with self._write() as conn:
+            cursor = await conn.execute('''
+                UPDATE global_messages SET metadata = ?
+                WHERE id = ? AND metadata IS ?
+            ''', (json.dumps(metadata, ensure_ascii=False), row_id, previous))
+            return cursor.rowcount == 1
 
     async def get_display_history(self, limit: int = 50) -> List[Dict]:
         """供 web 前端显示用的历史。与 get_conversation_messages（给模型上下文）解耦：
@@ -912,6 +943,10 @@ class BotMemoryDB:
             await conn.execute('DELETE FROM global_messages')
             await conn.execute('DELETE FROM chat_messages')
             await conn.execute('DELETE FROM chat_sessions')
+            await conn.execute('''
+                INSERT INTO config (key, value) VALUES ('attachment_generation', '1')
+                ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1
+            ''')
         return counts
 
     # --- 内部兼容镜像消息 ---
@@ -1458,6 +1493,8 @@ class UserDataManager:
             'assistant_prompt': await cls._require_db().get_config('assistant_prompt', PromptFileManager.get('assistant_prompt')),
             'global_prompt_addon': await cls._require_db().get_config('global_prompt_addon', PromptFileManager.get('global_prompt_addon')),
             'global_depth': await cls._require_db().get_config('global_depth', 30),
+            'model_request_limits': await cls._require_db().get_config('model_request_limits', {}),
+            'discovered_model_limits': await cls._require_db().get_config('discovered_model_limits', {}),
             'agent_mode': await cls._require_db().get_config('agent_mode', False),
             'agent_confirm': await cls._require_db().get_config('agent_confirm', False),
             'stream_mode': normalize_bool(await cls._require_db().get_config('stream_mode', True), True),

@@ -58,7 +58,8 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
                 ModelClient.think_and_reply(
                     prov_name, get_next_api_key(prov_name, prov_data['api_key']), prov_data['base_url'],
                     model, idle_prompt, global_history,
-                    api_format=prov_data.get('api_format', 'openai')
+                    api_format=prov_data.get('api_format', 'openai'),
+                    conversation_context=True,
                 ),
                 timeout=IDLE_MESSAGE_TIMEOUT_SECONDS,
             )
@@ -67,6 +68,13 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
                 f"空闲提醒生成超时（>{int(IDLE_MESSAGE_TIMEOUT_SECONDS)}s）: "
                 f"provider={prov_name}, model={model}"
             )
+            return
+        except AttachmentContextError as exc:
+            await context.bot.send_message(
+                chat_id=BotConfig.AUTHORIZED_USER_ID,
+                text=f"空闲提醒失败：{exc}",
+            )
+            await db.set_config('last_idle_notice_time', time.time())
             return
 
         response_text = (response or "").strip()
@@ -1110,63 +1118,36 @@ async def _web_run_file_conversation(filename: str, content: bytes,
 
 async def _web_run_photo_conversation(filename: str, content: bytes,
                                       caption: str, outbox: Any) -> None:
-    """网页上传图片后跑一轮对话，让 AI 真正"看懂"图片内容。
-
-    历史 bug：网页上传的图片此前统一走 _web_run_file_conversation（文档
-    语义），只存盘、记路径索引，从不构造 multimodal image content——AI
-    完全看不到图里画的是什么，只知道"有个文件"。这与 Telegram 端
-    handle_photo_message（other_messages.py）把图片 base64 编码后塞进
-    content_override 的行为不对等。
-
-    现在改为调用 build_photo_multimodal_payload（other_messages.py 里从
-    _prepare_photo_payload 抽取的纯函数），构造与 Telegram 端完全一致的
-    multimodal content，让 Web 上传图片时 AI 的识图能力和 Telegram 对齐。
-
-    图片本体仍同步到 Telegram（与文件上传路径一致），但图片是纯二进制，
-    不存在提供商配置/黑名单等需要按状态机分流的场景，所以不需要复用
-    process_incoming_document——这与 Telegram 端 handle_photo_message
-    不检查文档状态机、直接处理的行为一致。
-    """
+    """网页图片与 Telegram 图片共用原件保存、附件关联和每轮组装逻辑。"""
+    received_at_ns = time.time_ns()
     try:
         update, context, _bot = build_web_mirror_objects(
             BotConfig.AUTHORIZED_USER_ID, outbox, _web_real_bot,
             channel=telegram_channel(),
         )
 
-        payload = build_photo_multimodal_payload(content, caption, filename)
+        db = await BotMemoryDB.get_instance()
+        generation = await db.get_attachment_generation()
+        payload = await asyncio.to_thread(build_photo_multimodal_payload, content, caption, filename)
         saved_photo = payload["saved_photo"]
         memory_text = payload["index_text"]
 
-        # 图片本体同步到 Telegram，对齐 _web_run_file_conversation 的现状行为。
-        await _web_deliver_file_to_tg(saved_photo['abs_path'], filename, caption)
-
-        await GlobalRecorder.record_user_message(
-            memory_text, MessageType.USER_PHOTO, BotConfig.AUTHORIZED_USER_ID
+        await GlobalRecorder.record_attachment_message(
+            memory_text, MessageType.USER_PHOTO, BotConfig.AUTHORIZED_USER_ID,
+            [payload["attachment"]], generation,
+            metadata={'attachment_received_at_ns': received_at_ns},
         )
 
-        multimodal_content: List[Dict[str, str]] = []
-        if payload["caption"]:
-            multimodal_content.append({"type": "text", "text": f"用户附言：{payload['caption']}"})
-        multimodal_content.append({"type": "text", "text": payload["saved_notice"]})
-        multimodal_content.append({
-            "type": "image",
-            "mime_type": "image/jpeg",
-            "data": payload["image_b64"],
-        })
-
-        await process_conversation(update, context, memory_text, content_override=multimodal_content)
+        # 同步和模型请求都使用已持久化的同一份原件。
+        await _web_deliver_file_to_tg(saved_photo['abs_path'], filename, caption)
+        await process_conversation(update, context, memory_text)
         outbox.put({"type": "turn_end"})
     except Exception as e:
         logger.exception("Web 图片对话失败")
         outbox.put({"type": "turn_error", "text": redact_sensitive_text(str(e))[:300]})
 
 
-# 图片文件后缀白名单，用于网页上传时区分"图片"（走 multimodal，AI 能看懂）
-# 和"普通文件"（走 process_incoming_document，只是路径索引）。与
-# Telegram 端 filters.PHOTO 依赖 Telegram 自己的媒体分类不同，网页上传
-# 只能拿到文件名，所以退化成按后缀判断——覆盖常见格式即可，不追求完备
-# （不在名单里的图片格式，比如小众的 .heic，会走普通文件路径，只是
-# AI 看不懂内容，不影响文件本身正常存盘和发送）。
+# 此白名单只决定入口；文档入口也会按原始字节识别图片并持久化。
 _WEB_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
 

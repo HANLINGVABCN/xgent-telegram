@@ -1154,7 +1154,6 @@ def has_pending_text_conversation(update: Update) -> bool:
 # ---------------------------------------------------------------------------
 
 ALBUM_FLUSH_QUIET_SECONDS = 3.0
-ALBUM_MAX_PHOTOS = 10  # Telegram album hard cap; defensive truncation.
 
 
 class PendingAlbumConversation:
@@ -1164,18 +1163,22 @@ class PendingAlbumConversation:
         self.update = update  # representative update (caption-bearing, falls back to first)
         self.context = context
         self.media_group_id = media_group_id
-        self.photos: List[Dict[str, str]] = []  # each: {image_b64, saved_notice, index_text}
+        self.photos: List[Dict[str, Any]] = []
         self.caption: str = ""
         self.flush_task: Optional[Any] = None
         self.closed: bool = False
+        self.downloading: int = 0
+        self.received_message_ids: set = set()
+        self.failed: bool = False
 
-    def add_photo(self, image_b64: str, saved_notice: str, index_text: str,
-                  caption: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        self.photos.append({
-            "image_b64": image_b64,
-            "saved_notice": saved_notice,
-            "index_text": index_text,
-        })
+    def add_photo(self, payload: Dict[str, Any], update: Update,
+                  context: ContextTypes.DEFAULT_TYPE):
+        message_id = update.message.message_id
+        if any(p.get("source_message_id") == message_id for p in self.photos):
+            return
+        self.photos.append({**payload, "source_message_id": message_id})
+        self.photos.sort(key=lambda p: p["source_message_id"])
+        caption = payload.get("caption", "")
         if caption and not self.caption:
             self.caption = caption
             self.update = update
@@ -1184,6 +1187,14 @@ class PendingAlbumConversation:
 
 _pending_album_conversations: Dict[Tuple[int, str], "PendingAlbumConversation"] = {}
 _pending_album_conversations_lock = threading.RLock()
+
+def cancel_pending_album_conversations() -> None:
+    with _pending_album_conversations_lock:
+        for pending in _pending_album_conversations.values():
+            pending.closed = True
+            if pending.flush_task is not None:
+                pending.flush_task.cancel()
+        _pending_album_conversations.clear()
 
 
 REDUNDANT_AGENT_COMMAND_PREFIXES: Tuple[str, ...] = ()

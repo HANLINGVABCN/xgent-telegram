@@ -2,92 +2,27 @@
 # Keep cross-section names available through the loader until the next decoupling phase.
 
 async def handle_photo_message_legacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_authorized_user_middleware(update, context):
-        return
-    
-    await UserDataManager.init()
-    
-    caption = update.message.caption or ""
-    photo_desc = f"[图片]{': ' + caption if caption else ''}"
-    
-    await GlobalRecorder.record_user_message(
-        photo_desc,
-        MessageType.USER_PHOTO,
-        update.effective_chat.id
-    )
-    
-    # 如果有文字说明，转发给AI处理
-    if caption:
-        prov_name, prov_data = get_current_provider()
-        model = UserDataManager.get('default_model')
-        if prov_data and model:
-            await process_conversation(update, context, f"[用户发送了一张图片，附言: {caption}]")
-            return
-    
-    await update.message.reply_text("📷 图片已收到。如需模型处理，请发送图片时附带文字说明。")
+    await handle_photo_message(update, context)
 
 async def handle_photo_message_indexed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_authorized_user_middleware(update, context):
-        return
-
-    await UserDataManager.init()
-
-    caption = update.message.caption or ""
-    photo_desc = f"[图片]{': ' + caption if caption else ''}"
-
-    await GlobalRecorder.record_user_message(
-        photo_desc,
-        MessageType.USER_PHOTO,
-        update.effective_chat.id
-    )
-
-    prov_name, prov_data = get_current_provider()
-    model = UserDataManager.get('default_model')
-    if not prov_data or not model:
-        await update.message.reply_text("📷 图片已收到。请先配置提供商和默认对话模型，系统才能处理图片。")
-        return
-
-    try:
-        largest_photo = update.message.photo[-1]
-        photo_bytes = await download_telegram_file(largest_photo)
-        image_b64 = base64.b64encode(bytes(photo_bytes)).decode('ascii')
-
-        multimodal_content: List[Dict[str, str]] = []
-        if caption.strip():
-            multimodal_content.append({"type": "text", "text": caption.strip()})
-        multimodal_content.append({
-            "type": "image",
-            "mime_type": "image/jpeg",
-            "data": image_b64
-        })
-
-        await process_conversation(
-            update,
-            context,
-            photo_desc,
-            content_override=multimodal_content
-        )
-        return
-    except Exception as e:
-        logger.error(f"Photo multimodal processing error: {e}")
-        await update.message.reply_text("图片已收到，但转给模型时失败。请稍后重试。")
+    await handle_photo_message(update, context)
 
 def build_photo_multimodal_payload(photo_bytes: bytes, caption: str,
-                                   filename: str = "photo.jpg") -> Dict[str, Any]:
-    """Save one photo's bytes and build the artifacts shared by every photo
-    entry point (Telegram single photo / album, and Web upload).
-
-    Pure function (no Telegram Update object) so it can be reused by the Web
-    upload path without depending on update.message — this is the same
-    extraction pattern used for process_incoming_document: take the bytes,
-    build everything downstream identically regardless of where the bytes
-    came from.
-    """
+                                   filename: str = "photo.jpg",
+                                   context_prefix: str = "",
+                                   source_message_id: Optional[int] = None) -> Dict[str, Any]:
+    """Save the original and build the same reference for Telegram and Web."""
     saved_photo = ArtifactManager.save_binary_upload(filename, photo_bytes)
     image_b64 = base64.b64encode(photo_bytes).decode('ascii')
-    caption = (caption or "").strip()
+    caption = caption or ""
+    reference = ArtifactManager.attachment_reference(
+        saved_photo, filename, photo_bytes, caption, context_prefix,
+        expected_image=True, source_message_id=source_message_id,
+    )
     return {
         "image_b64": image_b64,
+        "mime_type": reference["mime_type"],
+        "attachment": reference,
         "saved_photo": saved_photo,
         "saved_notice": ArtifactManager.build_saved_notice("图片", saved_photo['rel_path']),
         "index_text": ArtifactManager.build_index_message(
@@ -105,55 +40,98 @@ async def _prepare_photo_payload(update: Update) -> Dict[str, Any]:
     the single-photo path and the album buffering path."""
     largest_photo = update.message.photo[-1]
     photo_bytes = await download_telegram_file(largest_photo)
-    caption = (update.message.caption or "").strip()
+    caption = update.message.caption or ""
     # 转发的富文本消息：caption 可能为空，文字在 rich_message.blocks 里
     if not caption:
-        caption = _extract_rich_message_text(update.message).strip()
+        caption = _extract_rich_message_text(update.message)
         if caption:
             logger.warning(f"handle_photo_message: extracted caption via rich_message, len={len(caption)}: {caption[:200]}")
-    return build_photo_multimodal_payload(bytes(photo_bytes), caption, "telegram_photo.jpg")
+    return await asyncio.to_thread(
+        build_photo_multimodal_payload, bytes(photo_bytes), caption, "telegram_photo.jpg",
+        build_incoming_context_prefix(update.message), update.message.message_id,
+    )
 
 
-def build_album_message(photos: List[Dict[str, str]], caption: str,
-                        context_prefix: str = "") -> tuple:
+def build_album_message(photos: List[Dict[str, Any]], caption: str,
+                        context_prefix: str = "", *, include_media: bool = True) -> tuple:
     """Build the merged memory text + multimodal content for a buffered album.
 
     Pure function (no Telegram objects) so it can be unit-tested directly.
     """
-    index_lines = [f"第{i + 1}张: {p['index_text']}" for i, p in enumerate(photos)]
-    memory_text = f"[相册] 共{len(photos)}张图片\n" + "\n".join(index_lines)
+    has_documents = any(p.get("is_document") for p in photos)
+    unit = "份" if has_documents else "张"
+    index_lines = [f"第{i + 1}{unit}: {p['index_text']}" for i, p in enumerate(photos)]
+    label = f"[文件组] 共{len(photos)}份附件" if has_documents else f"[相册] 共{len(photos)}张图片"
+    memory_text = label + "\n" + "\n".join(index_lines)
     multimodal: List[Dict[str, str]] = []
     if context_prefix:
         memory_text = f"{context_prefix}\n{memory_text}"
         multimodal.append({"type": "text", "text": context_prefix})
     if caption:
         multimodal.append({"type": "text", "text": f"用户附言：{caption}"})
-    for p in photos:
+    for p in photos if include_media else []:
+        if p.get("caption") and p["caption"] != caption:
+            multimodal.append({"type": "text", "text": f"用户附言：{p['caption']}"})
         multimodal.append({"type": "text", "text": p["saved_notice"]})
-        multimodal.append({"type": "image", "mime_type": "image/jpeg", "data": p["image_b64"]})
+        if p.get("image_b64"):
+            multimodal.append({
+                "type": "image", "mime_type": p.get("mime_type", "image/jpeg"),
+                "data": p["image_b64"],
+            })
     return memory_text, multimodal
 
 
-async def _handle_album_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, media_group_id: str):
-    """Buffer one photo of an album and (re)schedule the quiet-window flush."""
+async def _handle_album_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                    media_group_id: str,
+                                    prepare_payload: Optional[Callable[[], Awaitable[Dict]]] = None,
+                                    msg_type: str = MessageType.USER_PHOTO,
+                                    *, received_at_ns: Optional[int] = None):
+    """Persist one photo/document in a media group, then schedule its reply."""
+    if received_at_ns is None:
+        received_at_ns = time.time_ns()
     chat_id = update.effective_chat.id
     key = (chat_id, media_group_id)
-    payload = await _prepare_photo_payload(update)
+    db = await BotMemoryDB.get_instance()
+    generation = await db.get_attachment_generation()
+    message_id = update.message.message_id
     with _pending_album_conversations_lock:
         pending = _pending_album_conversations.get(key)
         if pending is None:
             pending = PendingAlbumConversation(update, context, media_group_id)
             _pending_album_conversations[key] = pending
-        pending.add_photo(
-            payload["image_b64"], payload["saved_notice"],
-            payload["index_text"], payload["caption"], update, context,
-        )
-        if len(pending.photos) > ALBUM_MAX_PHOTOS:
-            pending.photos = pending.photos[:ALBUM_MAX_PHOTOS]
-        # 每来一张就重置倒计时：只要图还在陆续到，就一直等；最后一张到后再等 N 秒无新图才发。
+        if message_id in pending.received_message_ids:
+            return
+        pending.received_message_ids.add(message_id)
+        pending.downloading += 1
         if pending.flush_task is not None and not pending.flush_task.done():
             pending.flush_task.cancel()
-        pending.flush_task = asyncio.create_task(_flush_album_after(key, ALBUM_FLUSH_QUIET_SECONDS))
+    try:
+        payload = await prepare_payload() if prepare_payload else await _prepare_photo_payload(update)
+        if pending.closed:
+            return
+        await GlobalRecorder.record_attachment_message(
+            payload["index_text"], msg_type, chat_id,
+            [payload["attachment"]], generation,
+            metadata={
+                'attachment_group': f"telegram:{chat_id}:{media_group_id}",
+                'attachment_order': message_id,
+                'attachment_received_at_ns': received_at_ns,
+            },
+        )
+        with _pending_album_conversations_lock:
+            if not pending.closed:
+                pending.add_photo(payload, update, context)
+    except Exception as exc:
+        pending.failed = True
+        logger.exception("Album attachment persistence failed")
+        await update.message.reply_text(f"相册附件未能完整保存：{safe_text(str(exc))}")
+    finally:
+        with _pending_album_conversations_lock:
+            pending.downloading -= 1
+            if not pending.closed and pending.downloading == 0:
+                pending.flush_task = asyncio.create_task(
+                    _flush_album_after(key, ALBUM_FLUSH_QUIET_SECONDS)
+                )
 
 
 async def _flush_album_after(key: Tuple[int, str], delay: float):
@@ -167,79 +145,60 @@ async def _flush_album_after(key: Tuple[int, str], delay: float):
 async def flush_album_conversation(key: Tuple[int, str]):
     """Pop the buffered album for ``key`` and hand the whole group to the AI once."""
     with _pending_album_conversations_lock:
-        pending = _pending_album_conversations.pop(key, None)
-        if pending is None or pending.closed:
+        pending = _pending_album_conversations.get(key)
+        if pending is None or pending.closed or pending.downloading:
             return
+        _pending_album_conversations.pop(key, None)
         pending.closed = True
-    if not pending.photos:
+        if pending.flush_task is not None and pending.flush_task is not asyncio.current_task():
+            pending.flush_task.cancel()
+    if not pending.photos or pending.failed:
         return
     context_prefix = build_incoming_context_prefix(pending.update.message)
-    memory_text, multimodal_content = build_album_message(
-        pending.photos, pending.caption, context_prefix,
+    memory_text, _multimodal_content = build_album_message(
+        pending.photos, pending.caption, context_prefix, include_media=False,
     )
-    await GlobalRecorder.record_user_message(
-        memory_text, MessageType.USER_PHOTO, pending.update.effective_chat.id,
-    )
-    logger.info(f"Flushed album: photos={len(pending.photos)}, chat_id={key[0]}")
-    await process_conversation(
-        pending.update, pending.context, memory_text, content_override=multimodal_content,
-    )
+    try:
+        logger.info(f"Flushed album: photos={len(pending.photos)}, chat_id={key[0]}")
+        await process_conversation(pending.update, pending.context, memory_text)
+    except Exception as exc:
+        logger.exception("Album persistence/processing failed")
+        await pending.update.message.reply_text(f"相册未能完整交给模型：{safe_text(str(exc))}")
 
 
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    received_at_ns = time.time_ns()
     if not await check_authorized_user_middleware(update, context):
         return
 
     await UserDataManager.init()
 
-    prov_name, prov_data = get_current_provider()
-    model = UserDataManager.get('default_model')
-    if not prov_data or not model:
-        await update.message.reply_text("📷 图片已收到。请先配置提供商和默认对话模型，系统才能处理图片。")
-        return
-
     # 相册：同组图先攒，到齐后一次性整组交给 AI，只回一次。
     media_group_id = getattr(update.message, "media_group_id", None)
     if media_group_id:
-        await _handle_album_photo(update, context, media_group_id)
+        await _handle_album_attachment(
+            update, context, media_group_id, received_at_ns=received_at_ns,
+        )
         return
 
     try:
+        db = await BotMemoryDB.get_instance()
+        generation = await db.get_attachment_generation()
         payload = await _prepare_photo_payload(update)
         memory_text = payload["index_text"]
-        caption = payload["caption"]
-        image_b64 = payload["image_b64"]
-
-        await GlobalRecorder.record_user_message(
-            memory_text,
-            MessageType.USER_PHOTO,
-            update.effective_chat.id
-        )
-
-        multimodal_content: List[Dict[str, str]] = []
-        if caption:
-            multimodal_content.append({"type": "text", "text": f"用户附言：{caption}"})
-        multimodal_content.append({"type": "text", "text": payload["saved_notice"]})
-        multimodal_content.append({
-            "type": "image",
-            "mime_type": "image/jpeg",
-            "data": image_b64
-        })
-
         context_prefix = build_incoming_context_prefix(update.message)
         if context_prefix:
             memory_text = f"{context_prefix}\n{memory_text}"
-            multimodal_content.insert(0, {"type": "text", "text": context_prefix})
 
-        await process_conversation(
-            update,
-            context,
-            memory_text,
-            content_override=multimodal_content
+        await GlobalRecorder.record_attachment_message(
+            memory_text, MessageType.USER_PHOTO, update.effective_chat.id,
+            [payload["attachment"]], generation,
+            metadata={'attachment_received_at_ns': received_at_ns},
         )
+        await process_conversation(update, context, memory_text)
     except Exception as e:
         logger.error(f"Photo multimodal processing error: {e}")
-        await update.message.reply_text("图片已收到，但保存或转给模型时失败。")
+        await update.message.reply_text(f"图片未能完整交给模型：{safe_text(str(e))}")
 
 async def handle_sticker_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
