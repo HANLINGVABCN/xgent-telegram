@@ -711,14 +711,24 @@ async def cmd_token_stats(update, context):
         fname = f"token_stats{period}.html"
         first = datetime.fromtimestamp(info['first']).strftime('%Y-%m-%d')
         last = datetime.fromtimestamp(info['last']).strftime('%Y-%m-%d')
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=io.BytesIO(data),
-            filename=fname,
-            caption=(f"📊 Token 统计报表（交互式）\n"
-                     f"共 {info['count']} 条记录 · 时间跨度 {first} ~ {last}\n"
-                     f"打开网页后可在页面内调整时间段/合并/指标/价格表"),
+        export_info = ArtifactManager.save_export(fname, data)
+        await GlobalRecorder.record_system_message(
+            f"已生成 Token 统计报表（{info['count']} 条记录，{first} ~ {last}）。\n"
+            f"服务器文件路径：{export_info['abs_path']}（{export_info['size']} bytes）",
+            update.effective_chat.id,
+            metadata={'display_media': [
+                display_media_reference(export_info['abs_path'], fname),
+            ]},
         )
+        with open(export_info['abs_path'], 'rb') as export_file:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=export_file,
+                filename=fname,
+                caption=(f"📊 Token 统计报表（交互式）\n"
+                         f"共 {info['count']} 条记录 · 时间跨度 {first} ~ {last}\n"
+                         f"打开网页后可在页面内调整时间段/合并/指标/价格表"),
+            )
         await status.delete()
         await GlobalRecorder.record_system_op(f"导出 Token 统计报表 ({info['count']} 条)")
     except Exception as e:

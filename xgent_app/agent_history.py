@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from xgent_app.attachments import AttachmentContextError
+from xgent_app.web_history import delivered_file_reference
 
 
 async def persist_agent_result(
@@ -20,6 +21,7 @@ async def persist_agent_result(
     chat_id: Any,
     notice: str,
     display_content: Optional[str] = None,
+    display_metadata: Optional[dict[str, Any]] = None,
 ) -> None:
     """Record an Agent result in both global and conversation history.
 
@@ -31,11 +33,16 @@ async def persist_agent_result(
     already saw live instead of falling back to bare notice text. Defaults to
     ``notice`` when the caller has no separate presentation.
     """
+    metadata = dict(display_metadata or {})
+    media = delivered_file_reference(notice)
+    if media:
+        metadata["display_media"] = media
     await recorder.record(
         msg_type=message_type,
         role="system",
         content=notice if display_content is None else display_content,
         chat_id=chat_id,
+        **({"metadata": metadata} if metadata else {}),
     )
     await database.add_chat_message(conversation_id, "user", notice)
 

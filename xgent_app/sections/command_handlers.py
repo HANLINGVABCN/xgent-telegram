@@ -9,6 +9,9 @@ async def cmd_delete_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     db = await BotMemoryDB.get_instance()
     counts = await db.clear_all_conversation_memory()
+    outbox = get_web_outbox()
+    if outbox is not None:
+        outbox.put({"type": "history_reset"})
     cancel_pending_album_conversations()
     UserDataManager.set('current_chat_id', SINGLE_MEMORY_SESSION_ID)
     await UserDataManager.save_config('current_chat_id', SINGLE_MEMORY_SESSION_ID)
@@ -157,6 +160,14 @@ async def cmd_export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     #   进程重启后路径仍在磁盘上，用户和 AI 都还能回取。
     export_info = ArtifactManager.save_export("系统记忆.zip", zip_buffer.getvalue())
     await GlobalRecorder.record_system_op("导出全部数据")
+    await GlobalRecorder.record_system_message(
+        "已生成全部数据导出文件（包括提示词、全局记忆、陌生人拦截记录）。"
+        f"服务器文件路径：{export_info['abs_path']}（{export_info['size']} bytes）",
+        update.effective_chat.id,
+        metadata={'display_media': [
+            display_media_reference(export_info['abs_path'], "系统记忆.zip"),
+        ]},
+    )
     try:
         with open(export_info['abs_path'], 'rb') as export_file:
             await context.bot.send_document(
@@ -172,14 +183,5 @@ async def cmd_export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"服务器文件路径：{export_info['abs_path']}"
         )
     await status_msg.delete()
-
-    # 记录导出成功到上下文。路径必须写进去：这条以 system 角色进 AI 上下文，
-    # 让 AI 知道"文件已导出并发送、服务器目录在哪"，后续对话里用户问
-    # "刚才导出的文件在哪"时能直接答出来，而不是只看到一句"导出成功"。
-    await GlobalRecorder.record_system_message(
-        f"✅ 已成功导出全部数据（包括提示词、全局记忆、陌生人拦截记录）到压缩文件并发送给用户，"
-        f"服务器文件路径：{export_info['abs_path']}（{export_info['size']} bytes）",
-        update.effective_chat.id
-    )
 
 # --- ☆ 空闲提醒系统（仅全局模式下工作）☆ ---

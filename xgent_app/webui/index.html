@@ -209,6 +209,7 @@
   }
 
   .header-text { min-width: 0; display: flex; flex-direction: column; }
+  @media (max-width: 360px) { .header-info .bot-avatar { display: none; } }
   .bot-name-row { display: flex; align-items: center; gap: 6px; }
   .bot-name {
     font-weight: 650; font-size: 15px; line-height: 1.25;
@@ -253,12 +254,12 @@
   }
   #search-bar.open { transform: translateY(0); opacity: 1; pointer-events: auto; }
   .search-input-wrap {
-    flex: 1; display: flex; align-items: center; gap: 8px;
+    flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px;
     background: var(--surface-2); border: 1px solid var(--line);
     border-radius: var(--r-sm); padding: 5px 10px;
   }
   .search-input-wrap input {
-    flex: 1; border: none; background: transparent; outline: none;
+    flex: 1; min-width: 0; width: 100%; border: none; background: transparent; outline: none;
     color: var(--text); font-family: var(--font); font-size: 13.5px;
   }
   .search-count { font-size: 11.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
@@ -478,21 +479,22 @@
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
   }
   .code-header {
-    display: flex; align-items: center; justify-content: space-between;
+    display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px 10px;
     padding: 7px 12px; background: var(--code-header);
     border-bottom: 1px solid var(--code-line);
     user-select: none;
   }
   .code-lang {
     font: 600 11px var(--mono); color: #94A3B8; text-transform: uppercase;
-    letter-spacing: 0.05em; display: flex; align-items: center; gap: 5px;
+    letter-spacing: 0; display: flex; align-items: center; gap: 5px;
+    min-width: 0; overflow-wrap: anywhere;
   }
   .code-lang::before {
-    content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
+    content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex-shrink: 0;
   }
-  .code-actions { display: flex; align-items: center; gap: 6px; }
+  .code-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-left: auto; max-width: 100%; }
   .code-btn {
-    display: inline-flex; align-items: center; gap: 4px;
+    display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0;
     background: rgba(255, 255, 255, 0.08); color: #CBD5E1;
     border: 1px solid rgba(255, 255, 255, 0.12); border-radius: var(--r-xs);
     padding: 3px 8px; font: 500 11px var(--font); cursor: pointer;
@@ -565,7 +567,8 @@
     border-radius: var(--r-md); background: #000; border: 1px solid var(--line);
   }
   .media-audio { display: block; width: min(340px, 74vw); margin: 4px 0; }
-  .media-cap { font-size: 13.5px; color: var(--text-2); padding: 2px 6px 4px; }
+  .media-cap { font-size: 13.5px; color: var(--text-2); padding: 2px 6px 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .media-error { color: var(--danger); white-space: pre-wrap; overflow-wrap: anywhere; max-width: 100%; }
 
   .media-dl {
     position: absolute; right: 12px; top: 12px; z-index: 2;
@@ -589,7 +592,7 @@
   }
 
   .file-card {
-    display: flex; align-items: center; gap: 12px; min-width: 260px; max-width: 400px;
+    display: flex; align-items: center; gap: 12px; width: 400px; max-width: 100%; min-width: 0;
     background: var(--surface-2); border: 1px solid var(--line);
     border-radius: var(--r-md); padding: 10px 12px; cursor: pointer;
     transition: border-color var(--t), background var(--t), transform 0.12s var(--ease);
@@ -604,30 +607,36 @@
   .fc-body { flex: 1; min-width: 0; }
   .fc-name {
     font-size: 14px; font-weight: 600; color: var(--text);
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    overflow-wrap: anywhere;
   }
   .fc-cap {
     font-size: 12px; color: var(--text-3); margin-top: 2px;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    overflow-wrap: anywhere;
   }
-  .fc-dl {
+  .bubble a.fc-dl {
     flex-shrink: 0; display: inline-flex; align-items: center; gap: 5px;
     padding: 7px 12px; border-radius: var(--r-sm); text-decoration: none;
-    background: var(--grad); color: #fff;
+    background: var(--grad); color: #fff; border: none;
     font: 600 12px var(--font);
     box-shadow: 0 2px 8px var(--accent-ring);
     transition: opacity var(--t), transform 0.1s var(--ease);
   }
-  .fc-dl:hover { opacity: 0.92; color: #fff; }
-  .fc-dl:active { transform: scale(0.95); }
+  .bubble a.fc-dl:hover { opacity: 0.92; color: #fff; }
+  .bubble a.fc-dl:active { transform: scale(0.95); }
   .fc-dl .icon { width: 13px; height: 13px; }
+
+  @media (max-width: 480px) {
+    .file-card { display: grid; grid-template-columns: 32px minmax(0, 1fr); gap: 8px 10px; align-items: start; }
+    .fc-icon { width: 32px; height: 32px; }
+    .bubble a.fc-dl { grid-column: 2; justify-self: start; }
+  }
 
   /* 内联按钮 */
   .inline-keyboard { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
   .ik-row { display: flex; gap: 6px; }
   .ik-btn {
-    flex: 1; padding: 9px 10px;
-    font: 550 13px/1.3 var(--font); letter-spacing: -0.005em;
+    flex: 1; min-width: 0; padding: 9px 10px; text-align: center; text-decoration: none; overflow-wrap: anywhere;
+    font: 550 13px/1.3 var(--font); letter-spacing: 0;
     background: var(--surface-2); color: var(--accent);
     border: 1px solid var(--line); border-radius: var(--r-sm);
     cursor: pointer; transition: background var(--t), border-color var(--t), transform 0.1s var(--ease);
@@ -1152,7 +1161,7 @@
         <input type="file" id="file-input" class="hidden" multiple>
         <button id="btn-attach" class="icon-btn" title="添加附件或拖入文件" aria-label="附件"><svg class="icon" viewBox="0 0 24 24"><use href="#i-attach"/></svg></button>
         <div class="input-wrap">
-          <textarea id="input" rows="1" placeholder="发送消息给 XGent，输入 / 查看命令…"></textarea>
+          <textarea id="input" rows="1" placeholder="发送消息…"></textarea>
         </div>
         <button id="btn-send" class="send-btn" title="发送消息 (Enter)" aria-label="发送"><svg class="icon" viewBox="0 0 24 24"><use href="#i-send"/></svg></button>
         <button id="btn-stop" class="stop-btn hidden" title="停止生成" aria-label="停止"><svg class="icon" viewBox="0 0 24 24"><use href="#i-stop"/></svg></button>
@@ -1254,6 +1263,7 @@
   var reconnectDelay = 1000;
   var msgCount = 0;
   var pendingFiles = [];
+  var uploadQueue = null;
 
   function svgIcon(name, cls) {
     return '<svg class="icon' + (cls ? " " + cls : "") + '" viewBox="0 0 24 24"><use href="#i-' + name + '"/></svg>';
@@ -1479,8 +1489,13 @@
       Array.prototype.slice.call(node.childNodes).forEach(function (c) {
         if (c.nodeType === 3) return;
         if (c.nodeType !== 1) { node.removeChild(c); return; }
+        if (/^(SCRIPT|STYLE|IFRAME|OBJECT|EMBED|SVG|MATH|TEMPLATE|LINK|META)$/.test(c.tagName)) {
+          node.removeChild(c);
+          return;
+        }
         if (normalizeMarkdownNode(c)) return;
         if (!ALLOWED[c.tagName]) {
+          clean(c);
           var frag = document.createDocumentFragment();
           while (c.firstChild) frag.appendChild(c.firstChild);
           c.parentNode.replaceChild(frag, c);
@@ -1490,13 +1505,40 @@
           if (c.tagName === "A" && a.name === "href") {
             if (!/^(https?:|mailto:)/i.test(a.value)) c.removeAttribute(a.name);
           } else if (c.tagName === "A" && (a.name === "target" || a.name === "rel")) {
-          } else if (a.name === "class" || a.name === "data-lang") {
+          } else if (a.name === "class") {
+            var classes = a.value.split(/\s+/).filter(function (name) {
+              return /^(language-[a-zA-Z0-9_+#.-]+|ta-(left|center|right)|task-item|task-checkbox|checked|table-wrap)$/.test(name);
+            });
+            if (classes.length) c.setAttribute("class", classes.join(" "));
+            else c.removeAttribute("class");
           } else {
             c.removeAttribute(a.name);
           }
         });
         if (c.tagName === "A") { c.target = "_blank"; c.rel = "noopener noreferrer"; }
         clean(c);
+      });
+    })(tmp);
+    return tmp.innerHTML;
+  }
+
+  function htmlWithLineBreaks(htmlStr) {
+    var tmp = document.createElement("div");
+    tmp.innerHTML = htmlStr;
+    (function visit(node) {
+      if (/^(PRE|CODE)$/.test(node.tagName)) return;
+      Array.prototype.slice.call(node.childNodes).forEach(function (c) {
+        if (c.nodeType === 1) { visit(c); return; }
+        if (c.nodeType !== 3 || c.nodeValue.indexOf("\n") < 0) return;
+        if (/^(TABLE|THEAD|TBODY|TR|UL|OL)$/.test(node.tagName)) return;
+        if (/^\s*$/.test(c.nodeValue) && c.previousSibling &&
+            /^(PRE|BLOCKQUOTE|DIV|TABLE|UL|OL|P)$/.test(c.previousSibling.tagName)) return;
+        var frag = document.createDocumentFragment();
+        c.nodeValue.split("\n").forEach(function (line, i) {
+          if (i) frag.appendChild(document.createElement("br"));
+          frag.appendChild(document.createTextNode(line));
+        });
+        c.parentNode.replaceChild(frag, c);
       });
     })(tmp);
     return tmp.innerHTML;
@@ -1519,10 +1561,7 @@
   function renderText(text, parseMode) {
     text = text == null ? "" : String(text);
     if (parseMode && String(parseMode).toUpperCase().indexOf("HTML") >= 0) {
-      var sanitized = sanitizeHtml(text);
-      sanitized = sanitized.replace(/(<\/blockquote>|<\/pre>|<\/div>|<\/table>)\n+/g, "$1");
-      sanitized = sanitized.replace(/\n(?![^<]*>)/g, "<br>");
-      return sanitized;
+      return htmlWithLineBreaks(sanitizeHtml(text));
     }
 
     // marked 直接出 <pre><code class="language-xxx">，正好是 enhanceBubbleContent
@@ -1532,8 +1571,9 @@
     return sanitizeHtml(renderMarkdown(text));
   }
 
-  function nowTime() {
-    var d = new Date();
+  function nowTime(timestamp) {
+    var d = timestamp == null ? new Date() : new Date(Number(timestamp) * 1000);
+    if (isNaN(d.getTime())) d = new Date();
     return (d.getHours() < 10 ? "0" : "") + d.getHours() + ":" + (d.getMinutes() < 10 ? "0" : "") + d.getMinutes();
   }
 
@@ -1640,7 +1680,11 @@
   var AGENT_STATUS_RE = /Agent\s*第\s*\d+\s*轮/;
   var AGENT_RESULT_RE = /<b>\s*Agent\s+\w+\s*<\/b>/i;
 
-  function classifyMessageText(role, text) {
+  function classifyMessageText(role, text, messageType) {
+    if (messageType === "token_usage") return "token";
+    if (messageType === "agent_status" || messageType === "system_op") return "sys";
+    if (messageType === "agent_result") return "cmd";
+    if (messageType || role === "user") return role;
     if (typeof text !== "string") return role;
     if (isTokenUsageText(text)) {
       return "token";
@@ -1670,12 +1714,12 @@
   }
 
   var lastStreamEntry = null;
-  function makeBubble(role, text, messageId, parseMode, markup) {
+  function makeBubble(role, text, messageId, parseMode, markup, messageType, timestamp) {
     var stick = isNearBottom();
     msgCount++;
     updateEmptyState();
 
-    role = classifyMessageText(role, text);
+    role = classifyMessageText(role, text, messageType);
 
     var row = document.createElement("div");
     row.className = "msg-row " + role;
@@ -1688,7 +1732,7 @@
       row.appendChild(pill);
       log.appendChild(row);
       if (stick) scrollDown();
-      var tEntry = { row: row, body: pill, bubble: pill, head: null, btns: null, rawText: text };
+      var tEntry = { row: row, body: pill, bubble: pill, head: null, btns: null, rawText: text, role: role };
       if (messageId != null) byMessageId[messageId] = tEntry;
       return tEntry;
     }
@@ -1714,7 +1758,8 @@
 
     var ts = document.createElement("span");
     ts.className = "ts";
-    ts.textContent = nowTime();
+    ts.textContent = nowTime(timestamp);
+    if (timestamp != null) ts.title = new Date(Number(timestamp) * 1000).toLocaleString();
 
     bubble.appendChild(body);
     bubble.appendChild(ts);
@@ -1774,13 +1819,13 @@
     log.appendChild(row);
     if (stick) scrollDown();
 
-    var entry = { row: row, body: body, bubble: bubble, head: head, btns: btns, rawText: text };
+    var entry = { row: row, body: body, bubble: bubble, head: head, btns: btns, rawText: text, role: role };
     if (messageId != null) byMessageId[messageId] = entry;
     if (role === "ai" || role === "cmd" || role === "sys") lastStreamEntry = entry;
     return entry;
   }
 
-  var IMG_EXT = { jpg: 1, jpeg: 1, png: 1, gif: 1, webp: 1, bmp: 1, svg: 1 };
+  var IMG_EXT = { jpg: 1, jpeg: 1, png: 1, gif: 1, webp: 1, bmp: 1, avif: 1 };
   var VIDEO_EXT = { mp4: 1, webm: 1, mov: 1, m4v: 1, mkv: 1 };
   var AUDIO_EXT = { mp3: 1, wav: 1, ogg: 1, m4a: 1, flac: 1, aac: 1 };
   function mediaKindFromName(filename) {
@@ -1822,7 +1867,7 @@
     if (e.target === lightbox || e.target.classList.contains("lightbox-img-wrap")) closeLightbox();
   });
 
-  function makeMediaBubble(kind, filename, caption, downloadUrl, messageId, side) {
+  function makeMediaBubble(kind, filename, caption, downloadUrl, messageId, side, timestamp, error) {
     side = side || "ai";
     var stick = isNearBottom();
     msgCount++;
@@ -1910,11 +1955,12 @@
       dlBtn.download = filename || "file";
       dlBtn.title = "下载文件";
       dlBtn.innerHTML = svgIcon("down");
-      bubble.appendChild(dlBtn);
+      if (media) bubble.appendChild(dlBtn);
 
       var ts = document.createElement("span");
       ts.className = "ts";
-      ts.textContent = nowTime();
+      ts.textContent = nowTime(timestamp);
+      if (timestamp != null) ts.title = new Date(Number(timestamp) * 1000).toLocaleString();
       bubble.appendChild(ts);
       row.appendChild(bubble);
       log.appendChild(row);
@@ -1924,10 +1970,9 @@
       row.className = "msg-row sys";
       var pill = document.createElement("div");
       pill.className = "sys-pill";
-      pill.innerHTML = renderText(
-        (kind === "photo" ? "🖼️ " : "📎 ") + (filename || (kind === "photo" ? "图片" : "文件")) +
-        (caption ? "\n" + caption : "")
-      );
+      pill.textContent = (filename || (kind === "photo" ? "图片" : "文件")) +
+        (caption ? "\n" + caption : "") + "\n" + (error || "文件暂不可下载");
+      pill.classList.add("media-error");
       enhanceBubbleContent(pill);
       row.appendChild(pill);
       log.appendChild(row);
@@ -1945,6 +1990,16 @@
       var rowEl = document.createElement("div");
       rowEl.className = "ik-row";
       row.forEach(function (btn) {
+        if (btn.url && /^(https?:|tg:)/i.test(btn.url)) {
+          var link = document.createElement("a");
+          link.className = "ik-btn";
+          link.textContent = btn.text;
+          link.href = btn.url;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          rowEl.appendChild(link);
+          return;
+        }
         if (!btn.callback_data) return;
         var b = document.createElement("button");
         b.className = "ik-btn";
@@ -1969,90 +2024,115 @@
     entry.btns = null;
     if (markup && markup.length) {
       entry.btns = renderButtons(markup, messageId);
-      if (entry.btns) entry.row.querySelector(".bubble").appendChild(entry.btns);
+      if (entry.btns && entry.bubble) entry.bubble.appendChild(entry.btns);
     }
   }
 
+  var conversationBusy = false;
   function setBusy(busy) {
-    btnSend.disabled = busy;
+    conversationBusy = !!busy;
+    btnSend.disabled = busy || !!uploadQueue || !historyReady || !!currentConnState;
     btnSend.classList.toggle("hidden", busy);
     btnStop.classList.toggle("hidden", !busy);
     botAvatar.classList.toggle("pulsing", busy);
-    if (busy) {
-      statusText.innerHTML = '<span class="conn-dot"></span> 思考与生成中…';
-    } else {
-      setConnState(currentConnState);
-    }
-    statusText.classList.toggle("busy", busy);
+    setConnState(currentConnState);
     if (busy) showTyping(); else hideTyping();
   }
   function showTyping() { typing.classList.remove("hidden"); if (isNearBottom()) scrollDown(); }
   function hideTyping() { typing.classList.add("hidden"); }
 
+  function removeEntry(entry) {
+    if (!entry) return;
+    (entry.mediaEntries || []).forEach(removeEntry);
+    (entry.objectUrls || []).forEach(function (url) { URL.revokeObjectURL(url); });
+    if (entry.row && entry.row.parentNode) {
+      entry.row.parentNode.removeChild(entry.row);
+      msgCount = Math.max(0, msgCount - 1);
+    }
+    if (lastStreamEntry === entry) lastStreamEntry = null;
+    updateEmptyState();
+  }
+
+  function putTextFrame(role, frame) {
+    var id = frame.record_id != null ? "history:" + frame.record_id : frame.message_id;
+    var entry = id != null ? byMessageId[id] : null;
+    if (!entry && frame.type === "edit" && id == null) entry = lastStreamEntry;
+    var newRole = classifyMessageText(role, frame.text, frame.msg_type);
+    if (entry && entry.rawText !== undefined && entry.role === newRole) {
+      entry.rawText = frame.text;
+      entry.body.innerHTML = renderText(frame.text, frame.parse_mode);
+      enhanceBubbleContent(entry.body);
+      if (frame.reply_markup !== undefined) setButtons(entry, frame.reply_markup, id);
+    } else {
+      var next = entry && entry.row.nextSibling;
+      removeEntry(entry);
+      entry = makeBubble(role, frame.text, id, frame.parse_mode, frame.reply_markup, frame.msg_type, frame.timestamp || frame.ts);
+      if (next && next.parentNode === log) log.insertBefore(entry.row, next);
+    }
+    if (frame.media) appendHistoryMedia(entry, frame, role);
+    return entry;
+  }
+
   function handleFrame(frame) {
     if (frame.type === "message") {
-      var mEntry = makeBubble("ai", frame.text, frame.message_id, frame.parse_mode, frame.reply_markup);
-      if (frame.external) upgradeBubbleMedia(mEntry, frame.text);
+      putTextFrame("ai", frame);
       hideTyping();
     } else if (frame.type === "edit") {
-      var e = byMessageId[frame.message_id];
-      if (!e && (frame.message_id == null)) e = lastStreamEntry;
-      if (e) {
-        var newRole = classifyMessageText("ai", frame.text);
-        if (e.row && e.bubble && e.head && newRole !== "token") {
-          e.row.className = "msg-row " + newRole;
-          e.bubble.className = "bubble " + newRole;
-          var iconCls = newRole === "ai" ? "" : (" " + newRole);
-          var iconText = newRole === "ai" ? "X" : "◇";
-          var authorName = newRole === "ai" ? "XGent" : (newRole === "cmd" ? "命令" : "系统");
-          e.head.innerHTML = '<div class="bubble-author"><span class="bubble-author-icon' + iconCls + '">' + iconText + '</span> ' + authorName + '</div>';
-        }
-        e.body.innerHTML = renderText(frame.text, frame.parse_mode);
-        enhanceBubbleContent(e.body);
-        if (frame.reply_markup !== undefined) setButtons(e, frame.reply_markup, frame.message_id);
-      } else {
-        makeBubble("ai", frame.text, frame.message_id, frame.parse_mode, frame.reply_markup);
-      }
+      putTextFrame("ai", frame);
     } else if (frame.type === "edit_markup") {
       var em = byMessageId[frame.message_id];
       if (em) setButtons(em, frame.reply_markup, frame.message_id);
     } else if (frame.type === "delete") {
       var d = byMessageId[frame.message_id];
-      if (d && d.row && d.row.parentNode) d.row.parentNode.removeChild(d.row);
+      removeEntry(d);
       delete byMessageId[frame.message_id];
-      msgCount = Math.max(0, msgCount - 1);
-      updateEmptyState();
     } else if (frame.type === "user_message") {
-      var uEntry = makeBubble("user", frame.text, null, null, null);
-      if (frame.external) upgradeBubbleMedia(uEntry, frame.text);
+      putTextFrame("user", frame);
       hideTyping();
     } else if (frame.type === "notice") {
-      var nEntry = makeBubble("sys", frame.text, null, frame.parse_mode);
-      if (frame.external) upgradeBubbleMedia(nEntry, frame.text);
+      putTextFrame("sys", frame);
     } else if (frame.type === "document" || frame.type === "photo") {
+      var oldMedia = byMessageId[frame.message_id];
+      var nextMedia = oldMedia && oldMedia.row.nextSibling;
+      removeEntry(oldMedia);
       var mediaKind = frame.type === "photo" ? "photo" : mediaKindFromName(frame.filename);
-      makeMediaBubble(mediaKind, frame.filename, frame.caption, frame.download_url, frame.message_id, "ai");
+      var mediaEntry = makeMediaBubble(mediaKind, frame.filename, frame.caption, frame.download_url, frame.message_id, "ai", frame.timestamp || frame.ts);
+      if (nextMedia && nextMedia.parentNode === log) log.insertBefore(mediaEntry.row, nextMedia);
     } else if (frame.type === "chat_action") {
       if (frame.action === "typing") showTyping(); else hideTyping();
     } else if (frame.type === "callback_answer") {
       toast(frame.text, frame.show_alert);
-    } else if (frame.type === "turn_end") {
+    } else if (frame.type === "turn_end" || frame.type === "turn_error") {
       setBusy(false);
-    } else if (frame.type === "turn_error") {
-      makeBubble("sys", "⚠️ " + (frame.text || "处理失败"));
-      setBusy(false);
+      var error = frame.type === "turn_error" ? (frame.text || "处理失败") : null;
+      var queuedTurn = uploadQueue;
+      if (queuedTurn && queuedTurn.finish) {
+        if (error) queuedTurn.error = error;
+        queuedTurn.finish(error);
+      }
+      var completed = Promise.resolve();
+      if (reconcileAfterTurn && !queuedTurn) {
+        reconcileAfterTurn = false;
+        completed = resync();
+      }
+      if (error && !queuedTurn) completed.then(function () { makeBubble("sys", "⚠️ " + error); });
+    } else if (frame.type === "history_reset") {
+      cancelUploads("记忆已清空");
+      pendingFrames = [];
+      resync();
     }
   }
 
   var currentConnState = "";
   var historyReady = false;
   var pendingFrames = [];
-  var everOpened = false;
   var historyGen = 0;
+  var reconcileAfterTurn = false;
 
   function applyFrame(frame) {
     if (!historyReady) {
-      if (pendingFrames.length < 500) pendingFrames.push(frame);
+      pendingFrames.push(frame);
+      if (frame.type === "turn_end" || frame.type === "turn_error") reconcileAfterTurn = true;
       return;
     }
     handleFrame(frame);
@@ -2062,12 +2142,21 @@
     historyReady = true;
     var queued = pendingFrames;
     pendingFrames = [];
-    queued.forEach(function (f) { try { handleFrame(f); } catch (e) {} });
+    queued.forEach(function (f) {
+      try { handleFrame(f); } catch (e) { console.error("消息渲染失败", e); }
+    });
+    btnSend.disabled = conversationBusy || !!uploadQueue || !historyReady || !!currentConnState;
   }
 
   function resync() {
     historyReady = false;
-    return loadHistory().then(flushPending, flushPending);
+    btnSend.disabled = true;
+    var expected = historyGen + 1;
+    return loadHistory().catch(function (err) {
+      if (expected === historyGen) toast("历史加载失败：" + err.message, true);
+    }).then(function () {
+      if (expected === historyGen) flushPending();
+    });
   }
 
   function setConnState(state) {
@@ -2075,7 +2164,10 @@
     var cls = "conn-dot" + (state ? " " + state : "");
     if (state === "connecting") statusText.innerHTML = '<span class="' + cls + '"></span> 连接中…';
     else if (state === "disconnected") statusText.innerHTML = '<span class="' + cls + '"></span> 已断开，重连中…';
+    else if (conversationBusy) statusText.innerHTML = '<span class="conn-dot"></span> 思考与生成中…';
     else statusText.innerHTML = '<span class="' + cls + '"></span> 在线';
+    statusText.classList.toggle("busy", conversationBusy && !state);
+    btnSend.disabled = conversationBusy || !!uploadQueue || !historyReady || !!state;
   }
 
   function connectStream() {
@@ -2086,22 +2178,30 @@
     evtSource.onopen = function () {
       setConnState();
       reconnectDelay = 1000;
-      if (everOpened) resync();
-      everOpened = true;
+      resync();
     };
     evtSource.onmessage = function (e) {
       try { applyFrame(JSON.parse(e.data)); } catch (err) {}
     };
-    evtSource.onerror = function () {
-      setBusy(false);
-      setConnState("disconnected");
-      evtSource.close();
+    evtSource.onerror = disconnectStream;
+  }
+
+  function disconnectStream() {
+    historyReady = false;
+    cancelUploads("连接中断");
+    setConnState("disconnected");
+    if (evtSource) evtSource.close();
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (navigator.onLine !== false) {
       reconnectTimer = setTimeout(function () {
         reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
         connectStream();
       }, reconnectDelay);
-    };
+    }
   }
+
+  window.addEventListener("offline", function () { if (evtSource) disconnectStream(); });
+  window.addEventListener("online", function () { if (evtSource) connectStream(); });
 
   function loadHistory() {
     historyGen++;
@@ -2109,97 +2209,45 @@
     // 请求全量历史消息（无条数上限，加载完整历史）
     return api("/api/history?limit=0").then(function (data) {
       if (gen !== historyGen) return;
+      Array.prototype.forEach.call(log.querySelectorAll("img[src^='blob:']"), function (image) {
+        URL.revokeObjectURL(image.src);
+      });
       log.innerHTML = "";
       byMessageId = {};
+      lastStreamEntry = null;
       msgCount = 0;
       (data.messages || []).forEach(function (m) {
         var role = m.role === "user" ? "user" : (m.role === "assistant" ? "ai" : "sys");
-        var media = extractMediaFromText(m.content);
-        if (!media) {
-          makeBubble(role, m.content, null, m.parse_mode);
-          return;
-        }
-        restoreMediaFromHistory(m, role, media);
+        var entry = makeBubble(role, m.content, m.id == null ? null : "history:" + m.id,
+          m.parse_mode, null, m.msg_type, m.timestamp);
+        appendHistoryMedia(entry, m, role);
       });
+      // 刷新途中接上的流式帧与落库记录可能交叠，轮次结束后用完整记录收敛。
+      reconcileAfterTurn = reconcileAfterTurn || !!data.busy;
+      if (typeof data.busy === "boolean") setBusy(data.busy);
       updateEmptyState();
+      if (searchBar.classList.contains("open")) runSearch();
       scrollDown();
     });
   }
 
-  var MEDIA_PATH_PATTERNS = [
-    { re: /已保存到 (\/[^\s，。；)）]+)/, side: "user", replace: false, caption: /说明：([\s\S]*)$/ },
-    { re: /已自动存入 (\/[^\s，。；)）】]+)/, side: "ai", replace: false, caption: /^([\s\S]*)$/ },
-    { re: /已发送服务器文件给用户[:：]\s*(\/[^\s(（]+)\s*[(（]/, side: "ai", replace: false },
-    { re: /已写入服务器文件[:：]\s*(\/[^\s(（]+)\s*[(（]/, side: "ai", replace: false },
-    { re: /服务器文件路径[:：]\s*(\/[^\s(（]+)/, side: "ai", replace: false }
-  ];
-  function extractMediaFromText(text) {
-    text = String(text == null ? "" : text);
-    for (var i = 0; i < MEDIA_PATH_PATTERNS.length; i++) {
-      var p = MEDIA_PATH_PATTERNS[i];
-      var m = p.re.exec(text);
-      if (!m) continue;
-      var path = m[1];
-      if (!/\.[a-zA-Z0-9]{1,8}$/.test(path)) continue;
-      var caption = null;
-      if (p.caption) {
-        var cm = p.caption.exec(text);
-        if (cm && cm[1].trim()) caption = cm[1].trim();
-      }
-      return { path: path, side: p.side, replace: p.replace, caption: caption };
+  function appendHistoryMedia(entry, message, role) {
+    (entry.mediaEntries || []).forEach(removeEntry);
+    entry.mediaEntries = [];
+    var after = entry.row;
+    (message.media || []).forEach(function (item) {
+      var card = makeMediaBubble(item.kind, item.filename, item.path, item.download_url,
+        null, role === "user" ? "user" : "ai", message.timestamp, item.error);
+      log.insertBefore(card.row, after.nextSibling);
+      after = card.row;
+      entry.mediaEntries.push(card);
+    });
+    if (message.media_error) {
+      var warning = document.createElement("div");
+      warning.className = "media-error";
+      warning.textContent = message.media_error;
+      entry.body.appendChild(warning);
     }
-    return null;
-  }
-
-  function upgradeBubbleMedia(entry, text) {
-    var media = extractMediaFromText(text);
-    if (!media) return;
-    var gen = historyGen;
-    api("/api/media/resolve", { method: "POST", body: JSON.stringify({ path: media.path }) })
-      .then(function (res) {
-        if (gen !== historyGen && !entry) return;
-        var card = makeMediaBubble(
-          mediaKindFromName(res.filename), res.filename, media.caption, res.url, null, media.side
-        );
-        if (!entry || !entry.row || !entry.row.parentNode) {
-          log.appendChild(card.row);
-          return;
-        }
-        if (media.replace) {
-          entry.row.parentNode.replaceChild(card.row, entry.row);
-        } else {
-          entry.row.parentNode.insertBefore(card.row, entry.row.nextSibling);
-        }
-      })
-      .catch(function (err) {
-        // 解析失败时页面上只会剩下那行带路径的文本，看起来像"下载按钮消失了"。
-        // 静默吞掉会让这种情况完全无法排查，至少留个控制台线索：
-        // 403 = 路径不在 media_allowed_roots 内，404 = 文件已不存在。
-        console.warn("[media] 无法恢复媒体卡片:", media.path, err && err.message);
-      });
-  }
-
-  function restoreMediaFromHistory(m, role, media) {
-    // 先创建文字气泡占位（保持消息顺序），然后解析媒体路径后用媒体气泡替换。
-    // 这样刷新后的显示与实时流一致：图片+文字在同一个气泡里。
-    var target = makeBubble(role, m.content, null, m.parse_mode);
-    var gen = historyGen;
-    api("/api/media/resolve", { method: "POST", body: JSON.stringify({ path: media.path }) })
-      .then(function (res) {
-        if (gen !== historyGen) return;
-        var card = makeMediaBubble(
-          mediaKindFromName(res.filename), res.filename, media.caption, res.url, null, media.side
-        );
-        // 用媒体气泡替换文字气泡（而非在后面追加），合并为一个气泡
-        if (target && target.row && target.row.parentNode) {
-          target.row.parentNode.replaceChild(card.row, target.row);
-          msgCount--;  // makeMediaBubble 已经 msgCount++，替换掉旧的所以减 1
-        }
-      })
-      .catch(function (err) {
-        // 解析失败时保留原始文字气泡作为降级显示
-        console.warn("[media] 无法恢复媒体卡片:", media.path, err && err.message);
-      });
   }
 
   function syncSendState() {
@@ -2211,22 +2259,7 @@
     var hasFiles = pendingFiles.length > 0;
     if ((!text && !hasFiles) || btnSend.disabled) return;
 
-    var preview = text;
-    if (hasFiles) {
-      var names = pendingFiles.map(function (f) { return "📎 " + f.name; }).join("\n");
-      preview = text ? (names + "\n" + text) : names;
-    }
-    var sentEntry = makeBubble("user", preview);
-    if (hasFiles) {
-      pendingFiles.forEach(function (f) {
-        if (mediaKindFromName(f.name) !== "photo") return;
-        var thumb = document.createElement("img");
-        thumb.src = URL.createObjectURL(f);
-        thumb.className = "user-thumb";
-        thumb.addEventListener("click", function () { openLightbox(thumb.src, f.name); });
-        sentEntry.body.appendChild(thumb);
-      });
-    }
+    if (!hasFiles) makeBubble("user", text);
     input.value = "";
     input.style.height = "auto";
     syncSendState();
@@ -2248,34 +2281,69 @@
     });
   }
 
-  function sendFiles(text) {
-    var files = pendingFiles.slice();
+  function cancelUploads(reason) {
+    if (!uploadQueue) return;
+    uploadQueue.cancelled = true;
+    if (reason && uploadQueue.finish) uploadQueue.finish(reason);
+  }
+
+  async function sendFiles(text) {
+    var batch = { files: pendingFiles.slice(), next: 0, cancelled: false, finish: null };
+    uploadQueue = batch;
     clearPendingFiles();
-    var i = 0;
-    function next() {
-      if (i >= files.length) return;
-      var f = files[i];
-      var caption = (i === 0 ? text : "");
-      i += 1;
-      var fd = new FormData();
-      fd.append("file", f, f.name);
-      fd.append("text", caption);
-      fetch("/api/upload", { method: "POST", credentials: "same-origin", body: fd })
-        .then(function (r) {
-          return r.json().catch(function () { return {}; }).then(function (body) {
-            if (!r.ok) throw new Error(body.error || ("HTTP " + r.status));
-            return body;
+    try {
+      for (var i = 0; i < batch.files.length && !batch.cancelled; i++) {
+        var f = batch.files[i];
+        var caption = i === 0 ? text : "";
+        var entry = makeBubble("user", "📎 " + f.name + (caption ? "\n" + caption : ""));
+        if (mediaKindFromName(f.name) === "photo") {
+          var url = URL.createObjectURL(f);
+          entry.objectUrls = [url];
+          var thumb = document.createElement("img");
+          thumb.src = url;
+          thumb.className = "user-thumb";
+          thumb.addEventListener("click", (function (src, name) {
+            return function () { openLightbox(src, name); };
+          })(url, f.name));
+          entry.body.appendChild(thumb);
+        }
+        setBusy(true);
+        // HTTP 只确认接收，turn_end 才允许下一份上传进入对话核心。
+        var turnDone = new Promise(function (resolve) { batch.finish = resolve; });
+        var fd = new FormData();
+        fd.append("file", f, f.name);
+        fd.append("text", caption);
+        try {
+          var response = await fetch("/api/upload", {
+            method: "POST", credentials: "same-origin", body: fd
           });
-        })
-        .then(function () {
-          if (i < files.length) next();
-        })
-        .catch(function (err) {
-          makeBubble("sys", "⚠️ " + f.name + " 上传失败：" + err.message);
-          setBusy(false);
-        });
+          var body = await response.json().catch(function () { return {}; });
+          if (!response.ok) throw new Error(body.error || ("HTTP " + response.status));
+        } catch (err) {
+          removeEntry(entry);
+          batch.error = f.name + " 上传失败：" + err.message;
+          break;
+        }
+        batch.next = i + 1;
+        if (await turnDone) break;
+        batch.finish = null;
+      }
+    } finally {
+      var remaining = batch.files.slice(batch.next);
+      pendingFiles = remaining.concat(pendingFiles);
+      if (remaining.length) {
+        if (batch.next === 0 && !input.value) input.value = text;
+      }
+      uploadQueue = null;
+      renderPendingFiles();
+      setBusy(false);
+      if ((remaining.length || batch.error || reconcileAfterTurn) && !currentConnState) {
+        reconcileAfterTurn = false;
+        await resync();
+      }
+      if (batch.error) makeBubble("sys", "⚠️ " + batch.error);
+      if (remaining.length) toast("尚未发送的 " + remaining.length + " 个文件已保留在输入区", true);
     }
-    next();
   }
 
   var suggestMatches = [];
@@ -2370,11 +2438,22 @@
 
     var regex = new RegExp("(" + q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ")", "gi");
     textNodes.forEach(function (node) {
+      regex.lastIndex = 0;
       if (!node.nodeValue || !regex.test(node.nodeValue)) return;
       if (node.parentNode && (node.parentNode.classList.contains("ts") || node.parentNode.tagName === "BUTTON")) return;
-      var span = document.createElement("span");
-      span.innerHTML = node.nodeValue.replace(regex, '<mark class="highlight-match">$1</mark>');
-      node.parentNode.replaceChild(span, node);
+      var frag = document.createDocumentFragment();
+      var last = 0, match;
+      regex.lastIndex = 0;
+      while ((match = regex.exec(node.nodeValue)) !== null) {
+        frag.appendChild(document.createTextNode(node.nodeValue.slice(last, match.index)));
+        var mark = document.createElement("mark");
+        mark.className = "highlight-match";
+        mark.textContent = match[0];
+        frag.appendChild(mark);
+        last = match.index + match[0].length;
+      }
+      frag.appendChild(document.createTextNode(node.nodeValue.slice(last)));
+      node.parentNode.replaceChild(frag, node);
     });
 
     searchMatches = Array.prototype.slice.call(log.querySelectorAll(".highlight-match"));
@@ -2860,7 +2939,6 @@
     loginDlg.close();
     buildMenu();
     connectStream();
-    resync();
   }
   function tryLogin(payload) { return api("/api/login", { method: "POST", body: JSON.stringify(payload) }); }
 
@@ -2933,7 +3011,13 @@
 
   btnStop.addEventListener("click", function () {
     triggerHaptic("warning");
-    api("/api/stop", { method: "POST" }).catch(function () {});
+    cancelUploads();
+    api("/api/stop", { method: "POST" }).catch(function (err) { toast("停止失败：" + err.message, true); });
+  });
+  window.addEventListener("beforeunload", function (event) {
+    if (!uploadQueue) return;
+    event.preventDefault();
+    event.returnValue = "";
   });
   btnAttach.addEventListener("click", function () { fileInput.click(); });
 

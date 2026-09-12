@@ -161,41 +161,21 @@ WEB_EDITABLE_SETTINGS = {
 
 async def _web_read_history(limit: int) -> List[Dict[str, Any]]:
     db = await BotMemoryDB.get_instance()
-    # 用显示专用查询：执行结果/媒体回复显示在 AI 侧，不沿用模型上下文的 user 映射。
     rows = await db.get_display_history(limit)
-    result = []
-    for row in rows:
-        msg_type = row.get('msg_type')
-        content = str(row.get('content') or '')
-        # AI_REPLY 存的是 Markdown 原文：转成 Telegram HTML 再返回，前端 sanitizeHtml
-        # 即可正常渲染粗体/标题/列表/引用/代码等。刷新后格式不再丢失。
-        # TOKEN_USAGE/AGENT_RESULT/AGENT_CMD/MEDIA_REPLY 已是 HTML，不再二次转换，
-        # 但要带 parse_mode=HTML 让前端走 sanitizeHtml 而非纯文本分支（否则 <i>/<pre>
-        # 等标签被 escapeHtml 转义成字面文本）。
-        if msg_type == MessageType.AI_REPLY:
-            try:
-                content = markdown_to_telegram_html(content)
-            except Exception:
-                pass  # 转换失败退回原文，总比报错好
-            result.append({'role': 'assistant', 'content': content, 'parse_mode': 'HTML'})
-        elif msg_type in (MessageType.TOKEN_USAGE, MessageType.AGENT_RESULT,
-                          MessageType.AGENT_CMD, MessageType.AGENT_STATUS,
-                          MessageType.MEDIA_REPLY, MessageType.SYSTEM_OP):
-            # 这些类型存库时已是 Telegram HTML，直接带 parse_mode 让前端渲染。
-            # token 统计行是元信息不是正文：降级成 system 角色，前端渲染成居中
-            # 灰条，不再混在 AI 气泡流里（对齐实时流的观感）。
-            result.append({
-                'role': 'system' if msg_type == MessageType.TOKEN_USAGE
-                        else str(row.get('role') or 'user'),
-                'content': content,
-                'parse_mode': 'HTML',
-            })
-        else:
-            result.append({
-                'role': str(row.get('role') or 'user'),
-                'content': content,
-            })
-    return result
+    return await asyncio.to_thread(
+        lambda: [build_history_message(row, ArtifactManager.ROOT_DIR, os.path.join(AgentExecutor.WORK_DIR, 'workspace'))
+                 for row in rows]
+    )
+
+
+async def _web_read_history_message(row_id: int) -> Optional[Dict[str, Any]]:
+    db = await BotMemoryDB.get_instance()
+    row = await db.get_display_message(row_id)
+    if row is None:
+        return None
+    return await asyncio.to_thread(
+        build_history_message, row, ArtifactManager.ROOT_DIR, os.path.join(AgentExecutor.WORK_DIR, 'workspace'),
+    )
 
 
 def _relay_markup_to_telegram(rows: Any) -> Optional[Any]:
@@ -1329,6 +1309,7 @@ async def start_web_chat_if_enabled(app: Optional[Any] = None, *,
             else 50 * 1024 * 1024
         ),
         read_history=_web_read_history,
+        read_history_message=_web_read_history_message,
         read_settings=_web_read_settings,
         write_setting=_web_write_setting,
         # 分通道健康详情。同步回调（runtime.runtime_health 不 await 任何东西）：

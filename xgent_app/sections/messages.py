@@ -1830,7 +1830,10 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     
     # 保存 AI 回复。
     if not generated_reply.recorded:
-        await GlobalRecorder.record_ai_reply(response, update.effective_chat.id)
+        await GlobalRecorder.record_ai_reply(
+            response, update.effective_chat.id,
+            metadata=await generated_image_metadata(generated_reply.artifacts, attachment_generation),
+        )
         await db.add_chat_message(cid, 'assistant', response)
     # token 用量在正文落库之后落库，保证 timestamp 晚于正文，刷新后顺序为「输出 + tokens」。
     if token_text:
@@ -2182,16 +2185,17 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         if shell_result.get('running'):
                             pause_note = "\n" + pause_display_text
 
+                        shell_presentation = build_shell_presentation(
+                            action_label=action_label,
+                            shell_result=shell_result,
+                            session_id=session_id,
+                            display_output=display_output,
+                            pause_note=pause_note,
+                        )
                         await safe_send_message(
                             context,
                             update.effective_chat.id,
-                            build_shell_presentation(
-                                action_label=action_label,
-                                shell_result=shell_result,
-                                session_id=session_id,
-                                display_output=display_output,
-                                pause_note=pause_note,
-                            ),
+                            shell_presentation,
                             parse_mode=constants.ParseMode.HTML
                         )
 
@@ -2209,6 +2213,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             conversation_id=cid,
                             chat_id=update.effective_chat.id,
                             notice=shell_notice,
+                            display_metadata={"display": {
+                                "content": shell_presentation, "parse_mode": "HTML",
+                            }},
                         )
                         if shell_result.get('running'):
                             round_state.add_context(
@@ -2465,7 +2472,10 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 break
 
             if not generated_reply.recorded:
-                await GlobalRecorder.record_ai_reply(response, update.effective_chat.id)
+                await GlobalRecorder.record_ai_reply(
+                    response, update.effective_chat.id,
+                    metadata=await generated_image_metadata(generated_reply.artifacts, attachment_generation),
+                )
                 await db.add_chat_message(cid, 'assistant', response)
             if token_text:
                 _entry = token_text[0]

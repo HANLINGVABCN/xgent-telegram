@@ -530,7 +530,7 @@ async def main():
     web = await ns["_web_read_history"](10)
     ctx = await db.get_conversation_messages(50)
     status_rows = [r for r in rows if r["msg_type"] == MT.AGENT_STATUS]
-    token_web = [r for r in web if r.get("parse_mode") and "21825" in r["content"]]
+    token_web = [r for r in web if r.get("msg_type") == MT.TOKEN_USAGE and "21825" in r["content"]]
     all_display = " ".join(r["content"] for r in rows)
     all_ctx = " ".join(str(m.get("content") or "") for m in ctx)
     print(json.dumps({
@@ -539,7 +539,9 @@ async def main():
         "no_raw_fence": "```" not in all_display,
         "no_media_prompt": "Please generate" not in all_display,
         "token_gray": token_web and token_web[0]["role"] == "system",
-        "ai_reply_html": any("<b>" in r["content"] for r in web if r.get("parse_mode") == "HTML"),
+        "ai_reply_markdown": any(r["content"] == "正文回复 **加粗**"
+                                 and r.get("parse_mode") != "HTML" for r in web),
+        "display_ids": all(r.get("id") and r.get("timestamp") for r in web),
         "status_not_in_ctx": "Agent 第 1 轮" not in all_ctx,
         "cmd_prefixed_in_ctx": "[命令] /restart" in all_ctx or "[命令]" in all_ctx,
     }))
@@ -554,7 +556,8 @@ asyncio.run(main())
         self.assertTrue(result["no_raw_fence"], "刷新后的显示里不允许出现协议围栏原文")
         self.assertTrue(result["no_media_prompt"], "媒体生成的完整提示词不该出现在显示里")
         self.assertTrue(result["token_gray"], "token 统计行要降级成 system 灰条")
-        self.assertTrue(result["ai_reply_html"], "AI 正文仍走 Markdown->HTML，不受影响")
+        self.assertTrue(result["ai_reply_markdown"], "历史必须保留 Markdown 原文，由网页统一渲染")
+        self.assertTrue(result["display_ids"], "历史必须保留原始记录 ID 和时间")
 
 
 class CliUserEchoTests(ProbeMixin, unittest.TestCase):

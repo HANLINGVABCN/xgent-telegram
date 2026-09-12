@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+import tempfile
 from unittest.mock import AsyncMock
 
 from xgent_app.agent_history import (
@@ -125,6 +127,35 @@ class AgentHistoryTests(unittest.IsolatedAsyncioTestCase):
             content="read notice",
             chat_id=9,
         )
+
+    async def test_display_metadata_does_not_change_shell_notice(self):
+        recorder, database = AsyncMock(), AsyncMock()
+        metadata = {"display": {"content": "<b>Shell</b>\n<pre>a\nb</pre>", "parse_mode": "HTML"}}
+        await persist_agent_result(
+            recorder=recorder, message_type="agent_result", database=database,
+            conversation_id=7, chat_id=9, notice="shell notice", display_metadata=metadata,
+        )
+        self.assertEqual("shell notice", recorder.record.await_args.kwargs["content"])
+        self.assertEqual(metadata, recorder.record.await_args.kwargs["metadata"])
+        database.add_chat_message.assert_awaited_once_with(7, "user", "shell notice")
+
+    async def test_sent_file_reference_survives_html_presentation(self):
+        recorder, database = AsyncMock(), AsyncMock()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder).resolve() / "report without extension"
+            path.write_bytes(b"report")
+            notice = (
+                "[sendfile\u7ed3\u679c] \u5df2\u53d1\u9001\u670d\u52a1\u5668\u6587\u4ef6"
+                f"\u7ed9\u7528\u6237: {path} (6 bytes)"
+            )
+            await persist_agent_result(
+                recorder=recorder, message_type="agent_result", database=database,
+                conversation_id=7, chat_id=9, notice=notice, display_content="<b>Sent</b>",
+            )
+            recorded = recorder.record.await_args.kwargs
+            self.assertEqual("<b>Sent</b>", recorded["content"])
+            self.assertEqual(str(path), recorded["metadata"]["display_media"][0]["path"])
+            database.add_chat_message.assert_awaited_once_with(7, "user", notice)
 
     async def test_media_persistence_keeps_special_history_prefix(self):
         recorder = AsyncMock()

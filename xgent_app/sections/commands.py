@@ -570,24 +570,33 @@ async def send_provider_config_export(update: Update, context: ContextTypes.DEFA
 
     payload = build_provider_config_export()
     content = json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
-    buffer = io.BytesIO(content)
     filename = f"提供商配置-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
-    await context.bot.send_document(
-        chat_id=update.effective_chat.id,
-        document=InputFile(buffer, filename),
-        caption=(
-            f'✅ 已导出 {len(providers)} 个提供商。\n'
-            '⚠️ 文件包含完整 API Key，请妥善保管，不要转发给他人。\n'
-            'ℹ️ Telegram 聊天默认不是端到端加密；用完建议删除这条消息。'
-        )
-    )
+    export_info = ArtifactManager.save_export(filename, content)
+    os.chmod(export_info['abs_path'], 0o600)
     await GlobalRecorder.record_system_op('导出提供商配置', {'count': len(providers)})
-
-    # 记录导出成功到上下文
     await GlobalRecorder.record_system_message(
-        f"✅ 已成功导出 {len(providers)} 个提供商配置到 JSON 文件。文件包含完整 API Key。",
-        update.effective_chat.id
+        f"已生成 {len(providers)} 个提供商配置的 JSON 导出文件。文件包含完整 API Key。\n"
+        f"服务器文件路径：{export_info['abs_path']}（{export_info['size']} bytes）",
+        update.effective_chat.id,
+        metadata={'display_media': [display_media_reference(export_info['abs_path'], filename)]},
     )
+    try:
+        with open(export_info['abs_path'], 'rb') as export_file:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=export_file,
+                filename=filename,
+                caption=(
+                    f'✅ 已导出 {len(providers)} 个提供商。\n'
+                    '⚠️ 文件包含完整 API Key，并已保存在服务器，请妥善保管，不要转发给他人。\n'
+                    'ℹ️ Telegram 聊天默认不是端到端加密；用完建议删除这条消息。'
+                )
+            )
+    except Exception as exc:
+        await message.reply_text(
+            f"导出文件已生成，但发送失败：{redact_sensitive_text(str(exc))[:120]}\n"
+            f"服务器文件路径：{export_info['abs_path']}"
+        )
 
 
 async def cmd_provider_config(update: Update, context: ContextTypes.DEFAULT_TYPE):

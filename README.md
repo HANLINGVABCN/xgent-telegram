@@ -411,6 +411,12 @@ Telegram 的内嵌网页按钮只接受 HTTPS 地址，因此：
 
 在 Telegram 内打开时会通过 `initData` 签名自动登录，无需输入密码；用浏览器直接访问则需要密码。
 
+刷新或服务重启后，网页从数据库恢复 Markdown 正文、原始时间、附件顺序与下载入口；不再把 Markdown 先转换成 Telegram 格式，也不依赖进程内的临时下载链接。上传文件、生成媒体、Agent 发出的文件以及新导出的记忆 ZIP、配置 JSON、Token 报表都保留文件关联。
+
+- 下载仍需登录。历史原件缺失、旧记录无法验证时明确提示，不把普通聊天里的任意路径当作下载授权。
+- 清空记忆会解除历史文件关联，使对应的历史下载地址失效；不会删除磁盘原件。导出的提供商配置包含 API Key，服务器上的原件也需妥善保管。
+- 一次选择多个文件时，网页等待当前文件对应的对话轮次结束再提交下一份；暂停、断网或失败后，未继续提交的文件保留在当前页面的输入区。
+
 ### 浏览器终端
 
 网页版还内置一个真终端（xterm.js + 服务器侧 pty）：在网页里点开终端就能得到一个跑在服务器上的完整 shell，和聊天界面共用同一套登录。适合偶尔需要手动敲命令、又懒得开 SSH 的场景。会话数上限 3 个、空闲 30 分钟自动回收；仅在 Linux/macOS 等 posix 平台可用，Windows 服务端不提供。
@@ -569,6 +575,17 @@ python3 xgent_server.py
 python tools/check_split_integrity.py
 python -m unittest discover -s tests -v
 ```
+
+Web 渲染与真实浏览器回归可单独运行：
+
+```bash
+npm install --no-save linkedom playwright
+npx playwright install chromium
+node tools/render_smoke.mjs
+node tools/web_history_smoke.mjs
+```
+
+浏览器回归使用隔离的临时数据，不读取实际数据库、不连接 Telegram 或模型；桌面与手机截图写入 `workspace/web-history-qa/`。手动预览可运行 `python tools/web_history_fixture.py --serve`，地址和测试密码会打印在终端。
 
 GitHub Actions 会在 Python 3.10、3.11 和 3.12 上执行完整性检查、编译检查、单元测试及 Shell 语法检查。
 

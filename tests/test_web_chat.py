@@ -273,6 +273,25 @@ class WebBridgeTests(unittest.IsolatedAsyncioTestCase):
         types = [f["type"] for f in self.drain()]
         self.assertEqual(["chat_action", "document"], types)
 
+    async def test_media_frames_keep_basename_for_files_and_photos(self):
+        from xgent_app.web_bridge import MirrorBot
+
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "picture with spaces.png")
+            with open(path, "wb") as handle:
+                handle.write(b"picture")
+            for bot in (self.bot, MirrorBot(self.outbox, 7, real_bot=None)):
+                with open(path, "rb") as handle:
+                    await bot.send_document(chat_id=7, document=handle)
+                    await bot.send_photo(chat_id=7, photo=handle)
+                await bot.send_document(chat_id=7, document=path, filename="friendly.png")
+                frames = self.drain()
+                self.assertEqual(
+                    ["picture with spaces.png", "picture with spaces.png", "friendly.png"],
+                    [frame["filename"] for frame in frames],
+                )
+                self.assertTrue(all(frame["download_url"] for frame in frames))
+
     async def test_update_shape_matches_conversation_core(self):
         update, context, bot = build_web_conversation_objects(99, self.outbox)
         self.assertEqual(99, update.effective_chat.id)

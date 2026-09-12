@@ -18,6 +18,7 @@ import collections
 import contextlib
 import logging
 import mimetypes
+import ntpath
 import os
 import queue
 import secrets
@@ -109,8 +110,8 @@ class MediaTokenRegistry:
 
     token 用 secrets.token_urlsafe 生成，猜测空间足够大；注册表本身只是
     进程内存里的一个有界字典（FIFO 淘汰最旧的），长时间运行也不会无限
-    增长。进程重启后 token 全部失效——这是预期行为，历史消息里的图片/
-    文件链接只在当前进程生命周期内有效，与 Telegram 侧消息互不影响。
+    增长。这里只服务实时帧；历史消息通过数据库附件关联获得稳定下载地址，
+    不依赖这些进程内 token。
     """
 
     def __init__(self, max_entries: int = 500):
@@ -151,6 +152,13 @@ def _local_path_from_send_arg(obj):
     if isinstance(name, str) and os.path.isfile(name):
         return os.path.abspath(name)
     return None
+
+
+def _media_filename(obj: Any, filename: Optional[str] = None, fallback: str = "file") -> str:
+    name = filename or getattr(obj, "filename", None) or getattr(obj, "name", None)
+    if not name and isinstance(obj, str) and _local_path_from_send_arg(obj):
+        name = obj
+    return ntpath.basename(str(name)) if name else fallback
 
 
 # 进程级单例：Web 服务器路由（web_server.py 的 GET /api/media/<token>）与
@@ -437,8 +445,7 @@ class WebBot:
         # 文件本体不走 SSE：二进制塞进 JSON 帧会把内存和带宽打爆。改为注册一个
         # 下载 token，前端拿 /api/media/<token> 去拉——能拿到本地路径时才注册
         # （_local_path_from_send_arg 拿不到就是 None，前端据此不渲染下载入口）。
-        name = filename or getattr(document, "filename", None) or getattr(document, "name", None)
-        display_name = str(name) if name else "file"
+        display_name = _media_filename(document, filename)
         local_path = _local_path_from_send_arg(document)
         download_url = None
         if local_path is not None:
@@ -454,12 +461,14 @@ class WebBot:
     async def send_photo(self, chat_id: Optional[int] = None, photo: Any = None,
                          caption: Optional[str] = None, **kwargs: Any) -> WebMessage:
         local_path = _local_path_from_send_arg(photo)
+        display_name = _media_filename(photo, fallback="image")
         download_url = None
         if local_path is not None:
-            token = MEDIA_TOKEN_REGISTRY.register(local_path, os.path.basename(local_path))
+            token = MEDIA_TOKEN_REGISTRY.register(local_path, display_name)
             download_url = f"/api/media/{token}"
         message_id = self._allocate_message_id()
         self._emit("photo", message_id=message_id,
+                   filename=display_name,
                    caption=str(caption) if caption else None,
                    download_url=download_url)
         return WebMessage(self, message_id, int(chat_id or self.chat_id), str(caption or ""))
@@ -895,8 +904,7 @@ class MirrorBot:
                             relay_message_id: Any = None,
                             **kwargs: Any) -> WebMessage:
         target = int(chat_id) if chat_id is not None else self.chat_id
-        name = filename or getattr(document, "filename", None) or getattr(document, "name", None)
-        display_name = str(name) if name else "file"
+        display_name = _media_filename(document, filename)
         # 提前取本地路径：一是文件对象读完可能被关闭，二是补发时 transient 已经
         # 没了，只能靠路径重新打开——拿不到路径的（BytesIO、file:// 容器路径）
         # 就是不可持久化的，durable=False。
@@ -924,12 +932,14 @@ class MirrorBot:
                          relay_message_id: Any = None, **kwargs: Any) -> WebMessage:
         target = int(chat_id) if chat_id is not None else self.chat_id
         local_path = _local_path_from_send_arg(photo)
+        display_name = _media_filename(photo, fallback="image")
         message_id = self._resolve_send_id(relay_message_id)
         download_url = None
         if local_path is not None:
-            token = MEDIA_TOKEN_REGISTRY.register(local_path, os.path.basename(local_path))
+            token = MEDIA_TOKEN_REGISTRY.register(local_path, display_name)
             download_url = f"/api/media/{token}"
         self._emit("photo", message_id=message_id,
+                   filename=display_name,
                    caption=str(caption) if caption else None,
                    download_url=download_url)
         self._offer(OP_PHOTO, logical_id=message_id, chat_id=target,
@@ -1220,11 +1230,8 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
     async def send_document(*args: Any, **kwargs: Any) -> Any:
         result = await saved["send_document"](real_bot, *args, **kwargs)
         try:
-            doc = kwargs.get("document")
-            name = (kwargs.get("filename")
-                    or getattr(doc, "filename", None)
-                    or getattr(doc, "name", None)
-                    or "file")
+            doc = kwargs.get("document", args[1] if len(args) > 1 else None)
+            name = _media_filename(doc, kwargs.get("filename"))
             local_path = _local_path_from_send_arg(doc)
             download_url = None
             if local_path is not None:
@@ -1243,12 +1250,15 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
     async def send_photo(*args: Any, **kwargs: Any) -> Any:
         result = await saved["send_photo"](real_bot, *args, **kwargs)
         try:
-            local_path = _local_path_from_send_arg(kwargs.get("photo"))
+            photo = kwargs.get("photo", args[1] if len(args) > 1 else None)
+            local_path = _local_path_from_send_arg(photo)
+            name = _media_filename(photo, fallback="image")
             download_url = None
             if local_path is not None:
-                token = MEDIA_TOKEN_REGISTRY.register(local_path, os.path.basename(local_path))
+                token = MEDIA_TOKEN_REGISTRY.register(local_path, name)
                 download_url = f"/api/media/{token}"
             emit("photo", message_id=getattr(result, "message_id", 0),
+                 filename=name,
                  caption=str(kwargs.get("caption")) if kwargs.get("caption") else None,
                  download_url=download_url)
         except Exception:  # noqa: BLE001

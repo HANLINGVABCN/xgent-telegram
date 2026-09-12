@@ -47,6 +47,7 @@ from xgent_app.fanout import (
     get_channel_registry,
 )
 from xgent_app.web_server import WebChatConfig, WebChatServer
+from xgent_app.web_history import build_history_message, display_media_reference
 # 记录来源标记：写进每条 global_messages 的 metadata.src。
 # CLI 与服务端是两个进程、只共享数据库；服务端的网页观察者（idle.py 的
 # _web_external_record_watcher）靠它区分"本进程写的（SSE 已直发，跳过）"和
@@ -215,7 +216,8 @@ class GlobalRecorder:
         )
 
     @staticmethod
-    async def record_system_message(content: str, chat_id: Optional[int] = None):
+    async def record_system_message(content: str, chat_id: Optional[int] = None,
+                                     metadata: Optional[Dict[str, Any]] = None):
         """记录系统消息到 AI 可见的上下文（操作结果/确认信息）。
 
         与 record_system_op 的区别：record_system_op 记录操作本身（如"导出全部数据"），
@@ -227,6 +229,7 @@ class GlobalRecorder:
             role='system',
             content=content,
             chat_id=chat_id,
+            metadata=metadata,
         )
     
     @staticmethod
@@ -1793,13 +1796,20 @@ async def generated_image_metadata(artifacts: List[Dict[str, Any]],
     references = await asyncio.to_thread(
         create_generated_image_references, artifacts, ArtifactManager.GENERATED_MEDIA_DIR,
     )
-    if not references:
+    display_media = [
+        display_media_reference(str(artifact['path']), mime_type=artifact.get('mime_type'))
+        for artifact in artifacts if artifact.get('path')
+    ]
+    if not references and not display_media:
         return None
-    return {
-        'attachments': references,
+    metadata = {
+        'display_media': display_media,
         'attachment_generation': generation,
         'attachment_received_at_ns': received_at,
     }
+    if references:
+        metadata['attachments'] = references
+    return metadata
 
 
 def make_generated_reply_persistence(db, conversation_id, chat_id: int,

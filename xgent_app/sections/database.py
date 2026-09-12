@@ -415,7 +415,7 @@ class BotMemoryDB:
                                      metadata: Optional[Dict[str, Any]] = None) -> Optional[int]:
         """记录一条全局消息，返回新行 rowid（供 token 统计双写关联去重）。"""
         async with self._write() as conn:
-            if metadata and 'attachments' in metadata:
+            if metadata and ('attachments' in metadata or 'attachment_generation' in metadata):
                 cursor = await conn.execute(
                     "SELECT value FROM config WHERE key = 'attachment_generation'"
                 )
@@ -603,14 +603,14 @@ class BotMemoryDB:
         模型上下文里执行结果要当 user 喂给 AI；但前端显示时这些是「AI/系统侧产出的结果」，
         应显示在 AI 一侧。这里把 AGENT_RESULT/MEDIA_REPLY 映射成 assistant，其余按真实
         role。冗余记录过滤与 get_conversation_messages 保持一致。
-        AGENT_CMD 不显示原文（协议块/媒体提示词），连续的合并成一条与实时流
-        同款的状态行"✅ Agent · N 个操作已完成"，刷新前后观感一致。
+        AGENT_CMD 不显示协议原文，轮次状态使用单独保存的 AGENT_STATUS。
+        保留记录 ID、时间和元数据，供显示层恢复原始格式与附件。
         """
         conn = await self._get_conn()
         sql_limit = limit if limit > 0 else -1
         cursor = await conn.execute('''
-            SELECT role, content, timestamp, msg_type FROM global_messages
-            ORDER BY timestamp DESC LIMIT ?
+            SELECT id, role, content, timestamp, msg_type, metadata FROM global_messages
+            ORDER BY timestamp DESC, id DESC LIMIT ?
         ''', (sql_limit,))
         rows = await cursor.fetchall()
 
@@ -625,18 +625,21 @@ class BotMemoryDB:
                 # 消息显示（用户看到的是 AI 正文 + 每轮的 AGENT_STATUS 状态行），
                 # 刷新后的历史同样不显示。
                 continue
-            # 执行结果 / 媒体回复：AI 侧产出 → 显示到对面（assistant）。
-            # msg_type 一并返回，供 _web_read_history 决定哪些消息需 Markdown→HTML 转换
-            # （AI_REPLY 存的是 Markdown 原文，TOKEN_USAGE/AGENT_RESULT 已是 HTML）。
-            display_role = 'assistant' if msg_type in (
+            msg['role'] = 'assistant' if msg_type in (
                 MessageType.AGENT_RESULT, MessageType.MEDIA_REPLY, MessageType.AGENT_STATUS,
             ) else msg['role']
-            result.append({
-                'role': display_role,
-                'content': msg['content'],
-                'msg_type': msg_type,
-            })
+            result.append(msg)
         return result
+
+    async def get_display_message(self, row_id: int) -> Optional[Dict]:
+        """下载历史附件时重新读取关联；清空后旧地址立即失效。"""
+        conn = await self._get_conn()
+        cursor = await conn.execute('''
+            SELECT id, role, content, timestamp, msg_type, metadata FROM global_messages
+            WHERE id = ?
+        ''', (row_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
 
     async def get_max_relay_op_id(self) -> int:
         """cli_relay_ops 的最大 id。"""
