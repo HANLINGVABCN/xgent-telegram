@@ -422,7 +422,7 @@ class BotMemoryDB:
                 row = await cursor.fetchone()
                 generation = int(json.loads(row['value'])) if row else 0
                 if metadata.get('attachment_generation', generation) != generation:
-                    raise ValueError("对话已在上传期间清空，请重新上传附件。")
+                    raise ValueError("对话已在附件处理期间清空，旧附件未关联到新对话。")
             cursor = await conn.execute('''
                 INSERT INTO global_messages (chat_id, user_id, msg_type, role, content, timestamp, session_id, metadata)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -569,14 +569,20 @@ class BotMemoryDB:
         return result
 
     async def get_attachment_records(self) -> List[Dict]:
-        """所有未清空的上传关联，不受普通对话窗口限制。"""
+        """所有未清空的上传和生成图片记录，不受普通对话窗口限制。"""
+        from xgent_app.attachments import is_attachment_record
+
         conn = await self._get_conn()
         cursor = await conn.execute('''
             SELECT id, chat_id, msg_type, role, content, timestamp, metadata FROM global_messages
-            WHERE role = 'user' AND msg_type IN (?, ?)
+            WHERE (role = 'user' AND msg_type IN (?, ?))
+               OR (role = 'assistant' AND msg_type = ?)
+               OR (role = 'media_module' AND msg_type = ?)
             ORDER BY id
-        ''', (MessageType.USER_FILE, MessageType.USER_PHOTO))
-        return [dict(row) for row in await cursor.fetchall()]
+        ''', (MessageType.USER_FILE, MessageType.USER_PHOTO,
+              MessageType.AI_REPLY, MessageType.MEDIA_REPLY))
+        return [record for row in await cursor.fetchall()
+                if is_attachment_record(record := dict(row))]
 
     async def get_attachment_generation(self) -> int:
         return int(await self.get_config_fresh('attachment_generation', 0))
@@ -950,9 +956,18 @@ class BotMemoryDB:
         return counts
 
     # --- 内部兼容镜像消息 ---
-    async def add_chat_message(self, session_id: str, role: str, content: str):
+    async def add_chat_message(self, session_id: str, role: str, content: str,
+                               *, attachment_generation: Optional[int] = None):
         """添加消息到内部兼容镜像"""
         async with self._transaction() as conn:
+            if attachment_generation is not None:
+                cursor = await conn.execute(
+                    "SELECT value FROM config WHERE key = 'attachment_generation'"
+                )
+                row = await cursor.fetchone()
+                generation = int(json.loads(row['value'])) if row else 0
+                if attachment_generation != generation:
+                    raise ValueError("对话已在附件处理期间清空，旧回复未写回新对话。")
             await conn.execute('''
                 INSERT INTO chat_messages (session_id, role, content, timestamp)
                 VALUES (?, ?, ?, ?)

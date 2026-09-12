@@ -11,9 +11,6 @@ send Telegram messages, write to the database, or record history.
 
 from __future__ import annotations
 
-import asyncio
-import base64
-import os
 from typing import Any, Dict, Mapping, Optional
 
 
@@ -177,92 +174,28 @@ def build_read_context_message(result: Mapping[str, Any]) -> AgentMessage:
 def build_media_context_message(
     result: Mapping[str, Any],
     notice: str,
-    *,
-    max_inline_bytes: int = 8 * 1024 * 1024,
 ) -> AgentMessage:
-    """Build the next-turn context for an external media result.
-
-    Telegram delivery is intentionally handled elsewhere.  This function only
-    decides which text and optional generated image should be fed back to the
-    model.
-    """
+    """Keep only the result notice; durable images are assembled per request."""
     if not result.get("success"):
         return build_context_message(notice)
 
-    # notice 含存盘路径说明（build_external_media_output 拼的）；success 分支也要
-    # 带上，否则模型这一轮看不到图存哪了，要等下一轮从 DB 读。
     base_notice = notice or str(result.get("text") or "").strip() or "外部媒体模块刚生成了一份媒体。"
-    continuation_text = (
-        f"{base_notice}\n"
-        "这是外部媒体模块刚生成的完整媒体回复，媒体本体已返回给你，请直接基于它继续回复用户。"
-    )
-
-    raw_artifacts = result.get("artifacts")
-    artifacts = (
-        [artifact for artifact in raw_artifacts if isinstance(artifact, dict)]
-        if isinstance(raw_artifacts, list)
-        else []
-    )
-    image_artifact = next(
-        (
-            artifact
-            for artifact in artifacts
-            if str(artifact.get("mime_type") or "").startswith("image/")
-            or str(artifact.get("kind") or "") == "图片"
-        ),
-        None,
-    )
-
-    fallback_path = (
-        result.get("file_path")
-        if str(result.get("mime_type") or "").startswith("image/")
-        else None
-    )
-    image_path = (image_artifact or {}).get("path") or fallback_path
-    mime_type = str(
-        (image_artifact or {}).get("mime_type")
-        or result.get("mime_type")
-        or "image/png"
-    )
-    if not image_path or not os.path.exists(image_path):
-        return build_context_message(continuation_text)
-
-    file_size = os.path.getsize(image_path)
-    if file_size > max_inline_bytes:
+    if result.get("image_attachment_ids"):
         return build_context_message(
-            continuation_text + "\n说明: 可回灌媒体过大，本轮未把媒体本体再次塞进上下文。"
+            base_notice,
+            "本次生成的全部图片已持久关联到当前对话，每轮请求的 Conversation attachments "
+            "区段都直接包含原图，请直接基于图片回复，不需要再次 read。",
         )
-
-    with open(image_path, "rb") as file_obj:
-        image_b64 = base64.b64encode(file_obj.read()).decode("ascii")
-
-    return {
-        "role": "user",
-        "content": [
-            {"type": "text", "text": continuation_text},
-            {"type": "image", "mime_type": mime_type, "data": image_b64},
-        ],
-    }
+    return build_context_message(
+        base_notice, "这里是媒体执行说明，没有已持久关联的图片；说明本身不包含媒体本体。",
+    )
 
 
 async def build_media_context_message_async(
     result: Mapping[str, Any],
     notice: str,
-    *,
-    max_inline_bytes: int = 8 * 1024 * 1024,
 ) -> AgentMessage:
-    """Async wrapper that keeps the up-to-8MB read and base64 encode off the loop.
-
-    ``build_media_context_message`` does blocking file IO plus base64 encoding.
-    Running that inline on the event loop stalls every other handler while the
-    global conversation lock is held, so production callers should use this.
-    """
-    return await asyncio.to_thread(
-        build_media_context_message,
-        result,
-        notice,
-        max_inline_bytes=max_inline_bytes,
-    )
+    return build_media_context_message(result, notice)
 
 
 def build_shell_context_message(notice: str, running: bool) -> AgentMessage:

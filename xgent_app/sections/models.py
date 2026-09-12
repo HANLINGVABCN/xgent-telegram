@@ -529,9 +529,10 @@ class ModelClient:
         return urls
 
     @staticmethod
-    def _extract_openai_compatible_text(data: Dict[str, Any]) -> str:
+    def _extract_openai_compatible_text(data: Dict[str, Any], *, stream: bool = False) -> str:
         texts: List[str] = []
         media_urls: List[str] = []
+        structured_media = False
         _seen_b64 = set()
         for choice in data.get("choices") or []:
             if not isinstance(choice, dict):
@@ -542,6 +543,8 @@ class ModelClient:
                 text = ModelClient._model_content_to_text(value)
                 if text:
                     texts.append(text)
+                    if not isinstance(value, str) and contains_inline_generated_media(text):
+                        structured_media = True
             # 画图网关把生成图放在 message/delta 顶层的 images 数组里，
             # content 留空；只读 content 会把整份 JSON 当错误文本吐出去。
             # 按 base64 内容去重：同一张图可能以不同 mime（image/png vs
@@ -566,15 +569,31 @@ class ModelClient:
             u for u in media_urls
             if (u.split(';base64,', 1)[-1] if ';base64,' in u else u) not in content_b64_keys
         ]
-        if not deduped_urls:
-            return combined_text
         # 多个 data URL 必须用换行分隔：''.join 会让下游正则贪婪吃掉下一个
         # data URL 的 "data" 前缀、在 ":" 处断裂，残留整段 base64 进 text，
         # 撑爆对话上下文（实测 4.6MB 图残留 230 万字符 base64）。
-        media_text = "\n".join(deduped_urls)
-        if combined_text:
-            return f"{combined_text}\n{media_text}"
-        return media_text
+        if deduped_urls:
+            media_text = "\n".join(deduped_urls)
+            combined_text = f"{combined_text}\n{media_text}" if combined_text else media_text
+        if stream and (media_urls or structured_media):
+            return f"\n{combined_text}\n"
+        return combined_text
+
+    @staticmethod
+    def _openai_sdk_message_text(message: Any, *, stream: bool = False) -> str:
+        try:
+            dumped = message.model_dump()
+        except Exception:
+            dumped = {}
+        if not isinstance(dumped, dict):
+            dumped = {}
+        content = _value_from_obj(message, 'content')
+        if content is not None:
+            dumped['content'] = content
+        # Use the same content/images extraction for SDK replies and deltas.
+        return ModelClient._extract_openai_compatible_text(
+            {"choices": [{"message": dumped}]}, stream=stream,
+        )
 
     @staticmethod
     def _extract_openai_compatible_sse_text(text: str, usage_sink: Optional[List[Dict[str, int]]] = None,
@@ -594,7 +613,7 @@ class ModelClient:
             if data.get("error"):
                 ModelClient._raise_conversation_request_error(history, data["error"])
             record_token_usage(usage_sink, data.get("usage"))
-            chunk_text = ModelClient._extract_openai_compatible_text(data)
+            chunk_text = ModelClient._extract_openai_compatible_text(data, stream=True)
             if chunk_text:
                 texts.append(chunk_text)
         return "".join(texts)
@@ -873,7 +892,7 @@ class ModelClient:
                             if data.get("error"):
                                 ModelClient._raise_conversation_request_error(history, data["error"])
                             record_token_usage(usage_sink, data.get("usage"))
-                            text = ModelClient._extract_openai_compatible_text(data)
+                            text = ModelClient._extract_openai_compatible_text(data, stream=True)
                             if text:
                                 yielded_any_text = True
                                 yield text
@@ -1424,8 +1443,10 @@ class ModelClient:
             async with stream:
                 async for chunk in stream:
                     record_token_usage(usage_sink, _value_from_obj(chunk, 'usage'))
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        chunk_text = ModelClient._model_content_to_text(chunk.choices[0].delta.content)
+                    if chunk.choices:
+                        chunk_text = ModelClient._openai_sdk_message_text(
+                            chunk.choices[0].delta, stream=True,
+                        )
                         if chunk_text:
                             yielded_any_text = True
                             yield chunk_text
@@ -1564,6 +1585,8 @@ class ModelClient:
                                 if text:
                                     yielded_any_text = True
                                     text_event_count += 1
+                                    if isinstance(part, dict) and ModelClient._media_part_to_data_url(part):
+                                        text = f"\n{text}\n"
                                     yield text
                             if not yielded_any_text:
                                 finish_reason = candidates[0].get('finishReason')
@@ -1815,25 +1838,7 @@ class ModelClient:
             record_token_usage(usage_sink, _value_from_obj(completion, 'usage'))
 
             choice = completion.choices[0]
-            content = ModelClient._model_content_to_text(choice.message.content)
-            if not content:
-                # 兜底只看 dump 的 content 字段：整份 dump 里还有 reasoning_content
-                # 之类的思考字段，直接喂给 _model_content_to_text 会把思考当成答案返回。
-                try:
-                    message_dump = choice.message.model_dump()
-                except Exception:
-                    message_dump = {}
-                if isinstance(message_dump, dict):
-                    content = ModelClient._model_content_to_text(message_dump.get('content'))
-                    # 画图网关把生成图放在 message 顶层 images 数组（content 留空），
-                    # SDK 会把非标准字段收进 dump 的 extras；补一份提取。
-                    media_urls = [
-                        url for url in ModelClient._openai_message_media_data_urls(message_dump)
-                        if not content or url not in content
-                    ]
-                    if media_urls:
-                        media_text = "\n".join(media_urls)
-                        content = f"{content}\n{media_text}" if content else media_text
+            content = ModelClient._openai_sdk_message_text(choice.message)
             if not content:
                 ModelClient._raise_conversation_request_error(history, "模型未返回有效内容。")
                 return None, "对方暂时没反应，用户稍后再试试？"

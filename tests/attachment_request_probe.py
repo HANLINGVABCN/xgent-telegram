@@ -736,8 +736,8 @@ async def check_clear_races(bot, root):
         started, release = asyncio.Event(), threading.Event()
         loop = asyncio.get_running_loop()
 
-        def assemble(records, upload_root):
-            assembled = prepare_attachment_context(records, upload_root)
+        def assemble(records, upload_root, generated_root=None):
+            assembled = prepare_attachment_context(records, upload_root, generated_root)
             loop.call_soon_threadsafe(started.set)
             assert release.wait(10), "test did not release assembly"
             return assembled

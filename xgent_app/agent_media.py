@@ -8,7 +8,10 @@ history; those remain separate responsibilities.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any, Awaitable, Callable, Optional, TypedDict
+
+from xgent_app.generated_media import await_media_handoff
 
 
 class MediaGenerationExecution(TypedDict):
@@ -28,6 +31,7 @@ async def execute_media_generation(
     build_stop_keyboard: Callable[[], Any],
     safe_edit_text: Callable[..., Awaitable[Any]],
     cancel_task_quietly: Callable[..., Awaitable[Any]],
+    finalize_result: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None,
 ) -> MediaGenerationExecution:
     """Generate media while preserving the existing Telegram stop behavior."""
     typing_stop = asyncio.Event()
@@ -36,6 +40,15 @@ async def execute_media_generation(
     media_task = None
     stop_task = None
     stopped = False
+    result = None
+    finalizer = None
+
+    async def finalize_completed_result():
+        nonlocal finalizer
+        if result is not None and finalize_result is not None:
+            if finalizer is None:
+                finalizer = asyncio.create_task(finalize_result(result))
+            await await_media_handoff(finalizer)
 
     try:
         drawing_message = await context.bot.send_message(
@@ -50,20 +63,38 @@ async def execute_media_generation(
             {media_task, stop_task},
             return_when=asyncio.FIRST_COMPLETED,
         )
-        if stop_task in done and stop_requested():
-            stopped = True
+        stopped = stop_task in done and stop_requested()
+        if media_task in done:
+            result = await media_task
+        elif stopped:
+            await cancel_task_quietly(media_task, timeout=1.0)
+            if media_task.done() and not media_task.cancelled():
+                result = media_task.result()
+        else:
+            result = await media_task
+
+        await finalize_completed_result()
+        stopped = stopped or stop_requested()
+        if stopped:
             await safe_edit_text(
                 drawing_message,
                 "⏹️ 媒体生成已停止。",
                 reply_markup=None,
             )
-            await cancel_task_quietly(media_task, timeout=1.0)
-            return {"stopped": True, "result": None}
+            return {"stopped": True, "result": result}
 
         await cancel_task_quietly(stop_task, timeout=0.2)
-        return {"stopped": False, "result": await media_task}
+        return {"stopped": False, "result": result}
+    except asyncio.CancelledError:
+        if media_task is not None:
+            await cancel_task_quietly(media_task, timeout=1.0)
+            if result is None and media_task.done() and not media_task.cancelled():
+                with contextlib.suppress(Exception):
+                    result = media_task.result()
+        await finalize_completed_result()
+        raise
     finally:
-        if stopped and media_task is not None and not media_task.done():
+        if media_task is not None and not media_task.done():
             await cancel_task_quietly(media_task, timeout=1.0)
         if stop_task is not None and not stop_task.done():
             await cancel_task_quietly(stop_task, timeout=0.2)

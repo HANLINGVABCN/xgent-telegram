@@ -1687,6 +1687,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     stream_mode = normalize_bool(UserDataManager.get('stream_mode', True), True)
     db = await BotMemoryDB.get_instance()
     cid, cdata = await get_or_create_chat_session()
+    attachment_generation = await db.get_attachment_generation()
     max_agent_iterations = normalize_agent_max_iterations(
         UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
     )
@@ -1757,6 +1758,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     # 根据流式/非流式开关选择回复方式
     stop_partial: List[str] = []
     token_text: List[str] = []   # token 用量文本出参，正文落库后再落库，保证顺序
+    generated_reply = make_generated_reply_persistence(
+        db, cid, update.effective_chat.id, attachment_generation, prov_name, model,
+    )
     if stream_mode:
         # stream_style: 'foreground'（前台流式，实时推送）/ 'background'（后台流式，累积后一次发）
         stream_style = normalize_stream_style(UserDataManager.get('stream_style', DEFAULT_STREAM_STYLE))
@@ -1766,7 +1770,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 prov_name, prov_data, model,
                 system_prompt, history,
                 stopped_partial_sink=stop_partial,
-                token_text_sink=token_text
+                token_text_sink=token_text,
+                generated_reply=generated_reply,
             )
         else:
             response = await send_streaming_response(
@@ -1774,7 +1779,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 prov_name, prov_data, model,
                 system_prompt, history,
                 stopped_partial_sink=stop_partial,
-                token_text_sink=token_text
+                token_text_sink=token_text,
+                generated_reply=generated_reply,
             )
     else:
         response = await send_non_streaming_response(
@@ -1782,7 +1788,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             prov_name, prov_data, model,
             system_prompt, history,
             stopped_partial_sink=stop_partial,
-            token_text_sink=token_text
+            token_text_sink=token_text,
+            generated_reply=generated_reply,
         )
     
     if not response:
@@ -1800,10 +1807,12 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         ),
                         reply_markup=None,
                     )
-            await _record_user_stopped_reply(
-                db, cid, update.effective_chat.id,
-                stop_partial[0] if stop_partial else "",
-            )
+            if (not generated_reply.recorded
+                    and attachment_generation == await db.get_attachment_generation()):
+                await _record_user_stopped_reply(
+                    db, cid, update.effective_chat.id,
+                    stop_partial[0] if stop_partial else "",
+                )
             return
         if trigger_status_msg is not None and trigger_status_iteration is not None:
             with contextlib.suppress(Exception):
@@ -1820,8 +1829,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
         return
     
     # 保存 AI 回复。
-    await GlobalRecorder.record_ai_reply(response, update.effective_chat.id)
-    await db.add_chat_message(cid, 'assistant', response)
+    if not generated_reply.recorded:
+        await GlobalRecorder.record_ai_reply(response, update.effective_chat.id)
+        await db.add_chat_message(cid, 'assistant', response)
     # token 用量在正文落库之后落库，保证 timestamp 晚于正文，刷新后顺序为「输出 + tokens」。
     if token_text:
         _entry = token_text[0]
@@ -2223,24 +2233,49 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             chat_id=update.effective_chat.id
                         )
 
-                        media_execution = await execute_media_generation(
-                            media_prompt,
-                            context=context,
-                            chat_id=update.effective_chat.id,
-                            generate_media=run_default_media_generation,
-                            keep_typing=keep_typing_while_waiting,
-                            stop_event_factory=get_or_create_stop_event,
-                            stop_requested=is_stop_requested,
-                            build_stop_keyboard=build_stop_keyboard,
-                            safe_edit_text=safe_edit_text,
-                            cancel_task_quietly=cancel_task_quietly,
-                        )
+                        async def finalize_media_result(result):
+                            notice, artifacts = build_external_media_output(result, media_prompt)
+                            metadata = await generated_image_metadata(artifacts, attachment_generation)
+                            await persist_media_result(
+                                recorder=GlobalRecorder,
+                                database=db,
+                                conversation_id=cid,
+                                chat_id=update.effective_chat.id,
+                                notice=notice,
+                                metadata=metadata,
+                            )
+                            result['image_attachment_ids'] = [
+                                ref['id'] for ref in (metadata or {}).get('attachments', [])
+                            ]
+                            result['persisted_notice'] = notice
+                            result['artifacts'] = artifacts
+
+                        try:
+                            media_execution = await execute_media_generation(
+                                media_prompt,
+                                context=context,
+                                chat_id=update.effective_chat.id,
+                                generate_media=run_default_media_generation,
+                                keep_typing=keep_typing_while_waiting,
+                                stop_event_factory=get_or_create_stop_event,
+                                stop_requested=is_stop_requested,
+                                build_stop_keyboard=build_stop_keyboard,
+                                safe_edit_text=safe_edit_text,
+                                cancel_task_quietly=cancel_task_quietly,
+                                finalize_result=finalize_media_result,
+                            )
+                        except AttachmentContextError as exc:
+                            await safe_edit_text(
+                                agent_stop_msg, f"图片持久化失败：{exc}", reply_markup=None,
+                            )
+                            return
                         if media_execution['stopped']:
                             round_state.should_continue = False
                             break
                         media_result = media_execution['result']
 
-                        media_notice, media_artifacts = build_external_media_output(media_result, media_prompt)
+                        media_notice = media_result['persisted_notice']
+                        media_artifacts = media_result['artifacts']
 
                         await send_media_generation_result(
                             media_result,
@@ -2254,13 +2289,6 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             logger=logger,
                         )
 
-                        await persist_media_result(
-                            recorder=GlobalRecorder,
-                            database=db,
-                            conversation_id=cid,
-                            chat_id=update.effective_chat.id,
-                            notice=media_notice,
-                        )
                         round_state.add_context(
                             _ctx_with_notice(await build_media_continuation_message(media_result, media_prompt), smart_notice)
                         )
@@ -2365,6 +2393,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
 
             stop_partial = []
             token_text = []
+            generated_reply = make_generated_reply_persistence(
+                db, cid, update.effective_chat.id, attachment_generation, prov_name, model,
+            )
             if stream_mode:
                 stream_style = normalize_stream_style(UserDataManager.get('stream_style', DEFAULT_STREAM_STYLE))
                 if stream_style == STREAM_STYLE_BACKGROUND:
@@ -2373,7 +2404,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         prov_name, prov_data, model,
                         system_prompt, next_history,
                         stopped_partial_sink=stop_partial,
-                        token_text_sink=token_text
+                        token_text_sink=token_text,
+                        generated_reply=generated_reply,
                     )
                 else:
                     response = await send_streaming_response(
@@ -2381,7 +2413,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         prov_name, prov_data, model,
                         system_prompt, next_history,
                         stopped_partial_sink=stop_partial,
-                        token_text_sink=token_text
+                        token_text_sink=token_text,
+                        generated_reply=generated_reply,
                     )
             else:
                 response = await send_non_streaming_response(
@@ -2389,7 +2422,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     prov_name, prov_data, model,
                     system_prompt, next_history,
                     stopped_partial_sink=stop_partial,
-                    token_text_sink=token_text
+                    token_text_sink=token_text,
+                    generated_reply=generated_reply,
                 )
             
             if not response:
@@ -2408,10 +2442,12 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             )
                         pending_round_status_msg = None
                         pending_round_iteration = None
-                    await _record_user_stopped_reply(
-                        db, cid, update.effective_chat.id,
-                        stop_partial[0] if stop_partial else "",
-                    )
+                    if (not generated_reply.recorded
+                            and attachment_generation == await db.get_attachment_generation()):
+                        await _record_user_stopped_reply(
+                            db, cid, update.effective_chat.id,
+                            stop_partial[0] if stop_partial else "",
+                        )
                     break
                 if pending_round_status_msg is not None and pending_round_iteration is not None:
                     with contextlib.suppress(Exception):
@@ -2428,8 +2464,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     pending_round_iteration = None
                 break
 
-            await GlobalRecorder.record_ai_reply(response, update.effective_chat.id)
-            await db.add_chat_message(cid, 'assistant', response)
+            if not generated_reply.recorded:
+                await GlobalRecorder.record_ai_reply(response, update.effective_chat.id)
+                await db.add_chat_message(cid, 'assistant', response)
             if token_text:
                 _entry = token_text[0]
                 await GlobalRecorder.record_token_usage(

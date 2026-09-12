@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from xgent_app.attachments import AttachmentContextError
+
 
 async def persist_agent_result(
     *,
@@ -74,10 +76,23 @@ async def persist_media_result(
     conversation_id: Any,
     chat_id: Any,
     notice: str,
+    metadata: Optional[dict[str, Any]] = None,
 ) -> None:
     """Preserve the media-specific recorder and conversation-history format."""
-    await recorder.record_media_reply(notice, chat_id)
-    await database.add_chat_message(
-        conversation_id, "user", f"[外部媒体模块回复]\n{notice}"
-    )
-
+    if metadata is None:
+        await recorder.record_media_reply(notice, chat_id)
+    else:
+        row_id = await recorder.record_media_reply(notice, chat_id, metadata=metadata)
+        if metadata.get("attachments") and row_id is None:
+            raise AttachmentContextError("Generated-image associations were not saved")
+    kwargs = {}
+    if metadata and "attachment_generation" in metadata:
+        kwargs["attachment_generation"] = metadata["attachment_generation"]
+    try:
+        await database.add_chat_message(
+            conversation_id, "user", f"[外部媒体模块回复]\n{notice}", **kwargs,
+        )
+    except Exception as exc:
+        if kwargs:
+            raise AttachmentContextError(f"Generated-image history sync failed: {exc}") from exc
+        raise

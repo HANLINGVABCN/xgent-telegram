@@ -2,6 +2,7 @@
 
 import base64
 import copy
+import hashlib
 import io
 import json
 import tempfile
@@ -14,7 +15,9 @@ from xgent_app.attachments import (
     ATTACHMENT_CONTEXT_MARKER,
     AttachmentContextError,
     create_attachment_reference,
+    create_generated_image_references,
     decode_full_text,
+    is_attachment_record,
     prepare_attachment_context,
     with_attachment_context,
     with_current_question,
@@ -29,9 +32,9 @@ from xgent_app.context_limits import (
 )
 
 
-def image_bytes(fmt="PNG", color="red"):
+def image_bytes(fmt="PNG", color="red", *, size=(13, 17), **save_options):
     output = io.BytesIO()
-    Image.new("RGB", (13, 17), color).save(output, format=fmt)
+    Image.new("RGB", size, color).save(output, format=fmt, **save_options)
     return output.getvalue()
 
 
@@ -305,6 +308,177 @@ class AttachmentTests(unittest.TestCase):
                                          "latest question")
         self.assertEqual("user", repeated[-1]["role"])
         self.assertEqual(5, len(repeated))
+
+
+class GeneratedAttachmentTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.uploads = self.root / "uploads"
+        self.generated = self.root / "generated_media"
+        self.uploads.mkdir()
+        self.generated.mkdir()
+        self.counter = 0
+
+    def artifact(self, data=None, **details):
+        self.counter += 1
+        path = self.generated / "2026-09-13" / f"123456_{self.counter:08x}_assistant_image.png"
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(image_bytes() if data is None else data)
+        return {
+            "path": str(path), "mime_type": "image/png", "source": "chat_native_media",
+            "provider_name": "provider", "model_name": "model", "prompt": "generation prompt",
+            **details,
+        }
+
+    def record(self, *refs, row_id=1, **metadata):
+        return {
+            "id": row_id, "role": "assistant", "msg_type": "ai_reply",
+            "content": "generated image index",
+            "metadata": {"attachments": list(refs), **metadata},
+        }
+
+    def restore(self, records):
+        return prepare_attachment_context(records, self.uploads, self.generated)
+
+    def legacy(self, artifact, *, role="assistant", msg_type="ai_reply"):
+        return {
+            "id": 1, "role": role, "msg_type": msg_type, "metadata": None,
+            "content": (
+                "generated\n\n"
+                f"\u3010\u7cfb\u7edf\u81ea\u52a8\u751f\u6210\uff1a\u672c\u56fe\u7247"
+                f"\u5df2\u81ea\u52a8\u5b58\u5165 {Path(artifact['path']).as_posix()}"
+                "\uff0c\u9700\u8981\u65f6\u8bf7read\u4ee5\u8fd4\u56de\u4e0a\u4e0b\u6587"
+                "\uff0c\u65e0\u8bc6\u56fe\u80fd\u529b\u65f6\u8bf7\u52ffread\u4ee5\u514d\u62a5\u9519\u3011"
+            ),
+        }
+
+    def test_generated_reference_records_actual_format_dimensions_checksum_and_source(self):
+        data = image_bytes("JPEG")
+        artifact = self.artifact(data, source="external_media_module")
+        ref = create_generated_image_references([artifact], self.generated)[0]
+        self.assertEqual("generated_media", ref["storage"])
+        self.assertEqual("image/jpeg", ref["mime_type"])
+        self.assertEqual((13, 17), (ref["width"], ref["height"]))
+        self.assertEqual(hashlib.sha256(data).hexdigest(), ref["sha256"])
+        self.assertEqual(len(data), ref["size"])
+        self.assertEqual("external_media_module", ref["source"])
+        for key in ("provider_name", "model_name", "prompt"):
+            self.assertEqual(artifact[key], ref[key])
+        parts, updates, errors = self.restore([self.record(ref)])
+        self.assertFalse(errors or updates)
+        self.assertEqual(data, base64.b64decode(parts[-1]["data"]))
+        self.assertIn("AI-generated image", parts[0]["text"])
+
+    def test_upload_and_generated_storage_remain_distinct_and_ordered(self):
+        artifacts = [self.artifact(image_bytes(color=color)) for color in ("red", "green")]
+        refs = create_generated_image_references(artifacts, self.generated)
+        data = image_bytes("JPEG")
+        path = self.uploads / refs[0]["path"]
+        path.parent.mkdir()
+        path.write_bytes(data)
+        upload = create_attachment_reference(
+            {"abs_path": str(path)}, self.uploads, "uploaded.jpg", data,
+        )
+        self.assertNotEqual(upload["id"], refs[0]["id"])
+        records = [
+            self.record(*reversed(refs), attachment_received_at_ns=200),
+            {
+                **self.record(upload, row_id=2, attachment_received_at_ns=100),
+                "role": "user", "msg_type": "user_photo",
+            },
+            self.record(refs[0], row_id=3, attachment_received_at_ns=300),
+        ]
+        parts, _, errors = self.restore(records)
+        self.assertFalse(errors)
+        self.assertEqual(
+            [data, *[Path(artifact["path"]).read_bytes() for artifact in artifacts]],
+            [base64.b64decode(part["data"]) for part in parts if part["type"] == "image"],
+        )
+
+    def test_original_over_eight_megabytes_is_fully_included(self):
+        data = image_bytes(size=(1800, 1800), compress_level=0)
+        self.assertGreater(len(data), 8 * 1024 * 1024)
+        refs = create_generated_image_references([self.artifact(data)], self.generated)
+        parts, _, errors = self.restore([self.record(*refs)])
+        self.assertFalse(errors)
+        self.assertEqual(data, base64.b64decode(parts[-1]["data"]))
+
+    def test_no_recent_generated_image_count_limit(self):
+        data = [image_bytes(color=(i, 40, 90)) for i in range(32)]
+        refs = create_generated_image_references([self.artifact(item) for item in data], self.generated)
+        parts, _, errors = self.restore([self.record(*reversed(refs))])
+        self.assertFalse(errors)
+        self.assertEqual(data, [base64.b64decode(p["data"]) for p in parts if p["type"] == "image"])
+
+    def test_missing_changed_and_corrupt_originals_are_explicit(self):
+        artifact = self.artifact()
+        refs = create_generated_image_references([artifact], self.generated)
+        path = Path(artifact["path"])
+        path.unlink()
+        self.assertIn("missing or unreadable", self.restore([self.record(*refs)])[2][0])
+        path.write_bytes(b"corrupted")
+        self.assertIn("has changed", self.restore([self.record(*refs)])[2][0])
+        with self.assertRaisesRegex(AttachmentContextError, "Cannot parse"):
+            create_generated_image_references([artifact], self.generated)
+
+    def test_generated_storage_rejects_paths_outside_root_and_unavailable_roots(self):
+        artifact = self.artifact()
+        ref = create_generated_image_references([artifact], self.generated)[0]
+        for path in (str(self.uploads / "secret.png"), "../secret.png"):
+            with self.assertRaisesRegex(AttachmentContextError, "outside"):
+                create_generated_image_references([{**artifact, "path": path}], self.generated)
+        errors = prepare_attachment_context([self.record(ref)], self.uploads)[2]
+        self.assertIn("unavailable attachment storage", errors[0])
+        for key, value in (("storage", "arbitrary"), ("source", {}), ("model_name", [])):
+            with self.subTest(key=key):
+                self.assertTrue(self.restore([self.record({**ref, key: value})])[2])
+
+    def test_trusted_legacy_images_from_both_sources_are_restored_and_backfilled(self):
+        for role, msg_type, source in (
+            ("assistant", "ai_reply", "chat_native_media"),
+            ("media_module", "media_reply", "external_media_module"),
+        ):
+            record = self.legacy(self.artifact(), role=role, msg_type=msg_type)
+            self.assertTrue(is_attachment_record(record))
+            parts, updates, errors = self.restore([record])
+            self.assertFalse(errors)
+            ref = updates[0][2]["attachments"][0]
+            self.assertTrue(ref["legacy"])
+            self.assertEqual(source, ref["source"])
+            self.assertEqual(image_bytes(), base64.b64decode(parts[-1]["data"]))
+
+    def test_ordinary_chat_and_new_echoed_notices_do_not_create_associations(self):
+        record = self.legacy(self.artifact())
+        cases = [
+            {**record, "role": "user", "msg_type": "user_text"},
+            {**record, "role": "system", "msg_type": "agent_result"},
+            {**record, "content": f"Please examine {self.generated / 'image.png'}"},
+            {**record, "metadata": {"generated_media_processed": True}},
+        ]
+        for case in cases:
+            self.assertFalse(is_attachment_record(case))
+            self.assertEqual(([], [], []), self.restore([case]))
+        self.assertEqual(([], [], []), self.restore([]))
+
+    def test_identifiable_but_unrecoverable_legacy_records_are_reported(self):
+        artifact = self.artifact()
+        record = self.legacy(artifact)
+        for path in (self.generated / "wrong-name.png", self.uploads / "outside.png"):
+            altered = self.legacy({**artifact, "path": str(path)})
+            self.assertTrue(self.restore([altered])[2])
+        Path(artifact["path"]).unlink()
+        self.assertTrue(self.restore([record])[2])
+        record["content"] = record["content"].replace("read", "invalid-read")
+        self.assertTrue(self.restore([record])[2])
+
+    def test_audio_and_video_do_not_gain_persistent_image_references(self):
+        refs = create_generated_image_references([
+            {"path": "/unused/audio.wav", "mime_type": "audio/wav"},
+            {"path": "/unused/video.mp4", "mime_type": "video/mp4"},
+        ], self.generated)
+        self.assertEqual([], refs)
 
 
 class RequestLimitTests(unittest.TestCase):

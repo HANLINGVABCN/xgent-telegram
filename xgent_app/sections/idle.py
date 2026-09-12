@@ -44,7 +44,10 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
         # 获取全局对话记忆
         global_depth = max(1, int(UserDataManager.get('global_depth', 30)))
         global_history = await db.get_conversation_messages(global_depth)
-
+        generated_reply = make_generated_reply_persistence(
+            db, None, BotConfig.AUTHORIZED_USER_ID, await db.get_attachment_generation(),
+            prov_name, model, record_prefix="[空闲提醒] ",
+        )
         agent_mode = UserDataManager.get('agent_mode', False)
         idle_prompt = (
             build_conversation_system_prompt(agent_mode) +
@@ -53,14 +56,21 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
 
         # 生成提醒消息。必须有硬上限：AI 回复超时设为“不限”时底层 HTTP 也不会
         # 超时，提供商静默挂起会让这个后台任务永远卡住，之后的空闲提醒全部停摆。
+        async def generate_idle_reply():
+            response, error = await ModelClient.think_and_reply(
+                prov_name, get_next_api_key(prov_name, prov_data['api_key']), prov_data['base_url'],
+                model, idle_prompt, global_history,
+                api_format=prov_data.get('api_format', 'openai'),
+                conversation_context=True,
+            )
+            media_artifacts = []
+            if response and not error and 'data:image/' in response.lower():
+                response, media_artifacts = await generated_reply.prepare(response)
+            return response, error, media_artifacts
+
         try:
-            response, error = await asyncio.wait_for(
-                ModelClient.think_and_reply(
-                    prov_name, get_next_api_key(prov_name, prov_data['api_key']), prov_data['base_url'],
-                    model, idle_prompt, global_history,
-                    api_format=prov_data.get('api_format', 'openai'),
-                    conversation_context=True,
-                ),
+            response, error, media_artifacts = await asyncio.wait_for(
+                generate_idle_reply(),
                 timeout=IDLE_MESSAGE_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
@@ -94,12 +104,17 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
                     chat_id=BotConfig.AUTHORIZED_USER_ID,
                     text=idle_chunk
                 )
+            if media_artifacts:
+                await send_generated_media_artifacts(
+                    context, BotConfig.AUTHORIZED_USER_ID, media_artifacts,
+                )
             
             # 记录发送时间
             await db.set_config('last_idle_notice_time', time.time())
             
             # 记录到全局消息
-            await GlobalRecorder.record_ai_reply(f"[空闲提醒] {response_text}")
+            if not generated_reply.recorded:
+                await GlobalRecorder.record_ai_reply(f"[空闲提醒] {response_text}")
             
             logger.info("已发送提醒消息给用户")
     
