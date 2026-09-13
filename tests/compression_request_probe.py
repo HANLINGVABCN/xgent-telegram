@@ -121,6 +121,7 @@ async def round_trips(bot, root):
             assert 'OLDEST-REQUIREMENT' in text and 'GLOBAL-TAIL' in text and 'progress 14' in text
             assert texts[-1] == latest['instruction']
             assert latest['instruction'].strip() == DEFAULT_COMPRESSION_PROMPT
+            assert text.count(DEFAULT_COMPRESSION_PROMPT) == 1
             rows = await h.db.get_display_history(0)
             assert rows[0]['msg_type'] == 'ai_reply' and rows[0]['content'] == 'SUMMARY-ONE'
             assert not await h.db.get_attachment_records()
@@ -130,6 +131,8 @@ async def round_trips(bot, root):
                 assert archive.namelist() == ['\u62e6\u622a\u8bb0\u5f55.txt', '\u63d0\u793a\u8bcd.txt',
                                              INSTRUCTION_NAME, memory(1), attachments(1)]
                 assert original in archive.read(memory(1)).decode()
+                assert archive.read(INSTRUCTION_NAME).decode() == latest['instruction']
+                assert Path(latest['instruction_path']).read_text(encoding='utf-8') == latest['instruction']
                 index = json.loads(archive.read(attachments(1)))
                 assert any(Path(item['path']).is_relative_to(bot.ArtifactManager.UPLOAD_DIR) for item in index)
             await h.call(fmt=fmt)

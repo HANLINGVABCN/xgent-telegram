@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from xgent_app.compression import (
-    ARCHIVE_MARKER, ATTACHMENTS_NAME, COMPRESSION_MARKER, INSTRUCTION_NAME, MEMORY_NAME,
+    ARCHIVE_MARKER, ATTACHMENTS_NAME, COMPRESSION_MARKER, DEFAULT_COMPRESSION_PROMPT, INSTRUCTION_NAME, MEMORY_NAME,
     SUMMARY_NAME, CompressionError, CompressionReply, archive_files, attachment_index,
     save_conversation_export, verify_export, with_archive_reference,
 )
@@ -16,6 +16,12 @@ from xgent_app.compression import (
 def record(text, kind='user_text', metadata=None, row_id=1):
     return {'id': row_id, 'role': 'assistant' if kind == 'ai_reply' else 'user',
             'msg_type': kind, 'content': text, 'timestamp': row_id, 'metadata': metadata}
+
+
+class CompressionPromptTests(unittest.TestCase):
+    def test_shipped_prompt_matches_the_bootstrap_default(self):
+        path = Path(__file__).resolve().parents[1] / 'prompts' / 'compression.txt'
+        self.assertEqual(DEFAULT_COMPRESSION_PROMPT, path.read_text(encoding='utf-8').strip())
 
 
 class ConversationExportTests(unittest.TestCase):
