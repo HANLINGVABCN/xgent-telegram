@@ -748,6 +748,7 @@ class TelegramStreamRenderer:
         self.context = context
         self.chat_id = chat_id
         self.current_msg = msg
+        self.message_ids = [getattr(msg, 'message_id', None)]
         self.reply_markup = reply_markup
         self.limit = limit
         self.stop_event = stop_event
@@ -902,6 +903,7 @@ class TelegramStreamRenderer:
                         reply_markup=self.reply_markup,
                         parse_mode=constants.ParseMode.HTML
                     )
+                    self.message_ids.append(getattr(self.current_msg, 'message_id', None))
                 except Exception as e:
                     self.live_edit_enabled = False
                     logger.warning(f"流式消息分段发送失败，改为结束后一次性发送: {e}")
@@ -1277,7 +1279,11 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             })
             if media_artifacts:
                 try:
-                    await send_generated_media_artifacts(context, chat_id, media_artifacts, caption=full_response)
+                    with media_presentation_scope(build_media_presentation(
+                        full_response, media_artifacts,
+                        replace_message_ids=renderer.message_ids if renderer else [getattr(msg, 'message_id', None)],
+                    )):
+                        await send_generated_media_artifacts(context, chat_id, media_artifacts, caption=full_response)
                     if msg:
                         try:
                             await msg.delete()
@@ -1594,7 +1600,10 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
             })
             if media_artifacts:
                 try:
-                    await send_generated_media_artifacts(context, chat_id, media_artifacts, caption=partial)
+                    with media_presentation_scope(build_media_presentation(
+                        partial, media_artifacts, replace_message_ids=[getattr(msg, 'message_id', None)],
+                    )):
+                        await send_generated_media_artifacts(context, chat_id, media_artifacts, caption=partial)
                     if msg:
                         try:
                             await msg.delete()
@@ -1894,7 +1903,10 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
             })
             if media_artifacts:
                 try:
-                    await send_generated_media_artifacts(context, chat_id, media_artifacts, caption=response)
+                    with media_presentation_scope(build_media_presentation(
+                        response, media_artifacts, replace_message_ids=[getattr(msg, 'message_id', None)],
+                    )):
+                        await send_generated_media_artifacts(context, chat_id, media_artifacts, caption=response)
                     if msg:
                         try:
                             await msg.delete()

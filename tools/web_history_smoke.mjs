@@ -143,36 +143,43 @@ try {
     await target.locator("#btn-settings").click();
     await target.locator(".skill-item").last().waitFor();
   }
-  async function toggleSkill(target, key) {
+  async function toggleSkill(target) {
     const response = target.waitForResponse((res) => res.url().endsWith("/api/config")
       && res.request().method() === "POST");
-    await target.locator(`.skill-item[data-path='daily.md'] [data-setting='${key}']`).click();
+    await target.locator(".skill-item[data-path='daily.md'] .skill-state").click();
     assert.equal((await response).status(), 200);
     await target.waitForFunction(() => !document.querySelector(
-      ".skill-item[data-path='daily.md'] [data-setting='hidden_skills']").disabled);
+      ".skill-item[data-path='daily.md'] .skill-state").disabled);
   }
   await openSettings(page);
-  const enabled = page.locator(".skill-item[data-path='daily.md'] [data-setting='disabled_skills']");
-  const hidden = page.locator(".skill-item[data-path='daily.md'] [data-setting='hidden_skills']");
-  assert.equal(await enabled.getAttribute("aria-checked"), "true");
-  await toggleSkill(page, "disabled_skills");
-  assert.equal(await enabled.getAttribute("aria-checked"), "false");
-  await toggleSkill(page, "hidden_skills");
-  assert.equal(await enabled.isDisabled(), true);
+  const state = page.locator(".skill-item[data-path='daily.md'] .skill-state");
+  assert.equal(await page.locator(".skill-item[data-path='daily.md'] button").count(), 1);
+  assert.equal(await state.getAttribute("data-state"), "enabled");
+  const colors = [await state.evaluate((button) => getComputedStyle(button).backgroundColor)];
+  await toggleSkill(page);
+  assert.equal(await state.getAttribute("data-state"), "disabled");
+  colors.push(await state.evaluate((button) => getComputedStyle(button).backgroundColor));
+  await toggleSkill(page);
+  assert.equal(await state.getAttribute("data-state"), "hidden");
+  colors.push(await state.evaluate((button) => getComputedStyle(button).backgroundColor));
+  assert.equal(new Set(colors).size, 3);
   await page.reload();
   await ready(page);
   await openSettings(page);
-  assert.equal(await hidden.getAttribute("aria-checked"), "true");
-  assert.equal(await enabled.getAttribute("aria-checked"), "false");
-  assert.equal(await enabled.isDisabled(), true);
-  await toggleSkill(page, "hidden_skills");
-  assert.equal(await enabled.getAttribute("aria-checked"), "false");
-  assert.equal(await enabled.isDisabled(), false);
-  await toggleSkill(page, "disabled_skills");
+  assert.equal(await state.getAttribute("data-state"), "hidden");
+  await toggleSkill(page);
+  assert.equal(await state.getAttribute("data-state"), "enabled");
+  await page.route('**/api/config', (route) => route.request().method() === 'POST'
+    ? route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'Fixture save failed' }) })
+    : route.continue());
+  await state.click();
+  await page.getByText(/Fixture save failed/).waitFor();
+  assert.equal(await state.getAttribute('data-state'), 'enabled');
+  await page.unroute('**/api/config');
   await page.locator(".skill-list").scrollIntoViewIfNeeded();
   await page.screenshot({ path: path.join(output, "desktop-skills.png") });
   await page.locator("#btn-close-settings").click();
-  console.log("ok three skill states, refresh persistence and unhide restoring disabled state");
+  console.log("ok one skill button, three colors, cycle, refresh persistence and failed saves");
 
   const mobile = await createPage({ width: 390, height: 844 });
   await verifyHistory(mobile.page);
@@ -191,7 +198,7 @@ try {
   const skillDimensions = await mobile.page.locator(".skill-item").evaluateAll((items) => items.map((item) => {
     const parent = item.getBoundingClientRect();
     const name = item.querySelector(".skill-name").getBoundingClientRect();
-    const controls = item.querySelector(".skill-controls").getBoundingClientRect();
+    const controls = item.querySelector(".skill-state").getBoundingClientRect();
     return {
       contained: parent.left >= 0 && parent.right <= innerWidth
         && name.left >= parent.left && name.right <= parent.right
@@ -227,6 +234,52 @@ try {
   assert.equal(await page.getByRole("link", { name: "Example", exact: true }).getAttribute("href"),
     "https://example.com");
   console.log("ok live vs restored markup, edit upserts, deletion and URL buttons");
+
+  await command(context, '/fixture/generated');
+  const generated = page.locator('#log .msg-row').filter({ has: page.getByRole('heading', { name: 'GENERATED REPLY', exact: true }) });
+  await generated.waitFor();
+  const generatedBody = await generated.locator('.body').innerHTML();
+  async function verifyGenerated() {
+    assert.equal(await generated.count(), 1);
+    assert.equal(await generated.locator('.bubble').count(), 1);
+    assert.equal(await generated.locator('.bubble-header').count(), 1);
+    assert.match(await generated.locator('.bubble-header').innerText(), /XGent/);
+    assert.equal(await generated.locator('.media-img').count(), 2);
+    assert.equal(await generated.locator('.body').innerHTML(), generatedBody);
+    assert.equal(await generated.locator('.media-paths').count(), 0, 'paths already in the notice must not repeat');
+    await page.waitForFunction(() => [...document.querySelectorAll('img[alt^="generated-"]')]
+      .every((image) => image.complete && image.naturalWidth === 480));
+    const pixels = await generated.locator('.media-img').evaluateAll((images) => images.map((image) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = image.naturalWidth; canvas.height = image.naturalHeight;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(image, 0, 0);
+      return [...ctx.getImageData(20, 20, 1, 1).data];
+    }));
+    assert.deepEqual(pixels, [[200, 75, 86, 255], [22, 139, 116, 255]]);
+    for (const href of await generated.locator('.media-dl').evaluateAll((links) => links.map((link) => link.getAttribute('href')))) {
+      assert.equal((await page.request.get(fixture.url + href)).status(), 200);
+    }
+    const layout = await generated.evaluate((row) => {
+      const image = row.querySelector('.message-media').getBoundingClientRect();
+      const body = row.querySelector('.body').getBoundingClientRect();
+      return { imageFirst: image.bottom <= body.top, overflow: row.scrollWidth > row.clientWidth + 1 };
+    });
+    assert.equal(layout.imageFirst, true);
+    assert.equal(layout.overflow, false);
+  }
+  await verifyGenerated();
+  await page.reload();
+  await ready(page);
+  await verifyGenerated();
+  await generated.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: path.join(output, 'desktop-generated-group.png') });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await verifyGenerated();
+  await generated.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: path.join(output, 'mobile-generated-group.png') });
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  console.log('ok generated media: two originals, full text, paths and downloads in one XGent bubble, including refresh during delivery');
 
   await command(context, "/fixture/busy");
   await page.reload();

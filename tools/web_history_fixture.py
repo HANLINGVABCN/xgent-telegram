@@ -18,6 +18,7 @@ from xgent_app import web_auth
 from xgent_app.web_bridge import WebBot
 from xgent_app.web_history import build_history_message, display_media_reference
 from xgent_app.web_server import WebChatConfig, WebChatServer
+from xgent_app.web_media import build_media_presentation, media_presentation_scope
 
 
 RICH_TEXT = """## Refresh verification
@@ -111,10 +112,25 @@ class Fixture:
     async def settings(self, *args):
         if args:
             key, value = args
-            self.setting_values[key] = value
+            if key == 'skill_state':
+                path, state = value['path'], value['state']
+                disabled = set(self.setting_values['disabled_skills'])
+                hidden = set(self.setting_values['hidden_skills'])
+                if state == 'hidden':
+                    hidden.add(path)
+                else:
+                    hidden.discard(path)
+                    if state == 'disabled':
+                        disabled.add(path)
+                    else:
+                        disabled.discard(path)
+                self.setting_values.update(disabled_skills=sorted(disabled), hidden_skills=sorted(hidden))
+            else:
+                self.setting_values[key] = value
         return {"values": dict(self.setting_values), "options": {"skill_list": [
             {"path": "daily.md", "label": "Daily", "source": "public"},
             {"path": "private/long.md", "label": "A deliberately long skill name for mobile layout verification", "source": "private"},
+            {"path": "private/\u4e2d\u6587\u8def\u5f84.md", "label": "\u4e2d\u6587\u6280\u80fd\u6587\u4ef6\u540d\u4e0e\u8def\u5f84\u6d4b\u8bd5", "source": "private"},
         ]}}
 
     def schedule(self, coroutine):
@@ -140,12 +156,34 @@ class Fixture:
         outbox.put({"type": "turn_end"})
 
     def submit_command(self, command, outbox):
-        if command in ("/fixture/busy", "/fixture/error", "/fixture/compression", "/fixture/compression-error", "/fixture/progress"):
+        if command in ("/fixture/busy", "/fixture/error", "/fixture/compression", "/fixture/compression-error", "/fixture/progress", "/fixture/generated"):
             self.busy = True
         self.schedule(self.command(command, outbox))
 
     async def command(self, command, outbox):
-        if command == '/fixture/progress':
+        if command == '/fixture/generated':
+            bot = WebBot(outbox, 1)
+            draft = await bot.send_message(1, 'Generating fixture media...')
+            artifacts = []
+            for number, color in ((1, '#c84b56'), (2, '#168b74')):
+                path = self.root / f'generated-{self.serial}-{number}.png'
+                image = Image.new('RGB', (480, 280), color)
+                ImageDraw.Draw(image).text((40, 40), f'GENERATED {number}', fill='white')
+                image.save(path)
+                artifacts.append({'path': str(path), 'mime_type': 'image/png'})
+            paths = '\n\n'.join(f"[Saved original: {Path(item['path']).as_posix()}]" for item in artifacts)
+            text = '## GENERATED REPLY\n\n**Two original images**, one complete reply.\n\n' + paths
+            self.add('ai_reply', text, [(Path(item['path']), Path(item['path']).name) for item in artifacts])
+            with media_presentation_scope(build_media_presentation(
+                text, artifacts, replace_message_ids=[draft.message_id],
+            )):
+                for item in artifacts:
+                    with open(item['path'], 'rb') as photo:
+                        await bot.send_photo(1, photo, caption='Short Telegram caption')
+                    await asyncio.sleep(2)
+            await draft.delete()
+            self.busy = False
+        elif command == '/fixture/progress':
             self.stopped = False
             bot = WebBot(outbox, 1)
             draft = await bot.send_message(1, 'STREAM DRAFT 0')

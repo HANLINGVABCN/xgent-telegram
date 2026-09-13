@@ -28,6 +28,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from xgent_app.web_media import current_media_presentation
+
 from xgent_app.fanout import (
     ChannelWorker,
     Op,
@@ -420,6 +422,25 @@ def markup_from_frame(rows: Any) -> Optional[Any]:
     return InlineKeyboardMarkup(keyboard) if keyboard else None
 
 
+def _present_media_frame(frame: Dict[str, Any]) -> Dict[str, Any]:
+    presentation = current_media_presentation()
+    if not presentation or frame['type'] not in {'message', 'edit', 'photo', 'document'}:
+        return frame
+    media = []
+    for source in presentation['media']:
+        item = dict(source)
+        if os.path.isfile(item['path']):
+            token = MEDIA_TOKEN_REGISTRY.register(item['path'], item['filename'])
+            item['download_url'] = f'/api/media/{token}'
+        else:
+            item['error'] = '原件不存在或无法读取'
+        media.append(item)
+    return {**frame, 'type': 'message', 'text': presentation['text'],
+            'parse_mode': None, 'msg_type': 'ai_reply',
+            'media_group_id': presentation['media_group_id'], 'media': media,
+            'replace_message_ids': presentation.get('replace_message_ids', [])}
+
+
 class WebBot:
     """把 PTB Bot 的调用序列化成 JSON 帧推进 WebOutbox。
 
@@ -444,7 +465,7 @@ class WebBot:
     def _emit(self, frame_type: str, **fields: Any) -> None:
         frame: Dict[str, Any] = {"type": frame_type, "ts": time.time()}
         frame.update(fields)
-        self.outbox.put(frame)
+        self.outbox.put(_present_media_frame(frame))
 
     async def send_message(self, chat_id: int, text: str, reply_markup: Any = None,
                            parse_mode: Any = None, **kwargs: Any) -> WebMessage:
@@ -752,7 +773,7 @@ class MirrorBot:
     def _emit(self, frame_type: str, **fields: Any) -> None:
         frame: Dict[str, Any] = {"type": frame_type, "ts": time.time()}
         frame.update(fields)
-        self.outbox.put(frame)
+        self.outbox.put(_present_media_frame(frame))
 
     # --- Telegram 通道 ---
 
@@ -1197,7 +1218,7 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
     def emit(frame_type: str, **fields: Any) -> None:
         frame: Dict[str, Any] = {"type": frame_type, "ts": time.time()}
         frame.update(fields)
-        outbox.put(frame)
+        outbox.put(_present_media_frame(frame))
 
     def _kw_text(kwargs: Dict[str, Any], args: tuple, send: bool = False) -> str:
         text = kwargs.get("text")

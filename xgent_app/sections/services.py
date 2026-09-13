@@ -53,6 +53,7 @@ from xgent_app.fanout import (
 )
 from xgent_app.web_server import WebChatConfig, WebChatServer
 from xgent_app.web_history import build_history_message, display_media_reference
+from xgent_app.web_media import build_media_presentation, current_media_presentation, media_presentation_scope
 # 记录来源标记：写进每条 global_messages 的 metadata.src。
 # CLI 与服务端是两个进程、只共享数据库；服务端的网页观察者（idle.py 的
 # _web_external_record_watcher）靠它区分"本进程写的（SSE 已直发，跳过）"和
@@ -1065,6 +1066,21 @@ def get_hidden_skills() -> set:
     raw = UserDataManager.get('hidden_skills', [])
     return {str(item) for item in raw} if isinstance(raw, list) else set()
 
+
+def get_skill_state(path: str) -> str:
+    if path in get_hidden_skills():
+        return 'hidden'
+    return 'disabled' if path in get_disabled_skills() else 'enabled'
+
+
+async def save_skill_state(path: str, state: str) -> None:
+    if path not in list_skill_files():
+        raise ValueError('技能文件已不存在，请重新打开技能菜单。')
+    db = await BotMemoryDB.get_instance()
+    values = await db.set_skill_state(path, state)
+    for key, items in values.items():
+        UserDataManager.set(key, items)
+
 def build_absolute_path_prompt_section() -> str:
     project_root = to_display_path(os.path.dirname(os.path.abspath(__file__)))
     skill_public_dir = to_display_path(SKILL_PUBLIC_DIR)
@@ -1717,6 +1733,16 @@ def _artifact_caption(body_text: str, artifact: Dict[str, Any], *, first: bool) 
 
 
 async def send_generated_media_artifacts(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
+                                         artifacts: List[Dict[str, Any]],
+                                         caption: Optional[str] = None):
+    presentation = current_media_presentation() or build_media_presentation(
+        caption or build_generated_media_reply_text('', artifacts), artifacts,
+    )
+    with media_presentation_scope(presentation):
+        await _send_generated_media_artifacts(context, chat_id, artifacts, caption)
+
+
+async def _send_generated_media_artifacts(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
                                          artifacts: List[Dict[str, Any]],
                                          caption: Optional[str] = None):
     # 多张图时每张图只挂它自己的存盘路径说明，而不是全部图的全套路径——

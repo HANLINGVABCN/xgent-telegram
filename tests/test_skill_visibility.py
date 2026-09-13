@@ -4,6 +4,53 @@ from tests.test_external_sync import SectionsProbeMixin
 
 
 class SkillVisibilityTests(SectionsProbeMixin, unittest.TestCase):
+    def test_state_change_is_atomic_and_preserves_other_skills(self):
+        result = self.run_probe(self.SECTIONS_PREAMBLE + r'''
+import asyncio
+from pathlib import Path
+from unittest.mock import patch
+
+async def main():
+    await ns['UserDataManager'].init()
+    db = await ns['BotMemoryDB'].get_instance()
+    root = Path('skill-public')
+    root.mkdir(exist_ok=True)
+    for name in ('one.md', 'two.md'):
+        (root / name).write_text('```!\nSUMMARY\n```', encoding='utf-8')
+    await asyncio.gather(ns['save_skill_state']('one.md', 'disabled'), ns['save_skill_state']('two.md', 'hidden'))
+    assert ns['get_skill_state']('one.md') == 'disabled'
+    assert ns['get_skill_state']('two.md') == 'hidden'
+    conn = await db._get_conn()
+    async def fail_after_first_write(sql, values):
+        await conn.execute(sql, values[0])
+        raise OSError('fixture write failure')
+    with patch.object(conn, 'executemany', fail_after_first_write):
+        try:
+            await ns['save_skill_state']('one.md', 'enabled')
+        except OSError:
+            pass
+        else:
+            raise AssertionError('write failure swallowed')
+    assert ns['get_skill_state']('one.md') == 'disabled'
+    assert await db.get_config_fresh('disabled_skills') == ['one.md']
+    assert await db.get_config_fresh('hidden_skills') == ['two.md']
+    for path, state in (('missing.md', 'enabled'), ('one.md', 'invalid')):
+        try:
+            await ns['save_skill_state'](path, state)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('invalid state accepted')
+    await ns['UserDataManager']._load_from_db()
+    assert ns['get_skill_state']('one.md') == 'disabled'
+    assert ns['get_skill_state']('two.md') == 'hidden'
+    await db.close()
+    print(json.dumps({'atomic': True, 'restart': True, 'validation': True}))
+
+asyncio.run(main())
+''')
+        self.assertTrue(all(result.values()))
+
     def test_prompt_states_web_settings_callbacks_and_restart(self):
         result = self.run_probe(self.SECTIONS_PREAMBLE + r'''
 import asyncio
@@ -40,14 +87,21 @@ async def main():
     assert ns['get_hidden_skills']() == set(files)
     keyboard = ns['get_skills_menu']().inline_keyboard
     assert all(len(button.callback_data.encode('utf-8')) <= 64 for row in keyboard for button in row)
-    callback = next(row[1].callback_data for row in keyboard[:-1]
-                    if long_name in ns['CallbackDataStore'].get(row[1].callback_data))
+    assert all(len(row) == 1 for row in keyboard)
     ns['check_authorized_user_middleware'] = AsyncMock(return_value=True)
-    update, context, _ = build_web_callback_objects(1, WebOutbox(), callback, 1)
-    await ns['handle_button_click'](update, context)
-    assert long_name not in ns['get_hidden_skills']()
-    assert long_name in ns['get_disabled_skills']()
-    assert long_name in ns['build_skill_prompt_section']()
+    for state in ('enabled', 'disabled', 'hidden', 'enabled'):
+        keyboard = ns['get_skills_menu']().inline_keyboard
+        callback = next(row[0].callback_data for row in keyboard[:-1]
+                        if long_name in ns['CallbackDataStore'].get(row[0].callback_data))
+        update, context, _ = build_web_callback_objects(1, WebOutbox(), callback, 1)
+        await ns['handle_button_click'](update, context)
+        assert ns['get_skill_state'](long_name) == state
+        await ns['UserDataManager']._load_from_db()
+        assert ns['get_skill_state'](long_name) == state
+    for state in ('disabled', 'hidden', 'enabled'):
+        await ns['_web_write_setting']('skill_state', {'path': files[0], 'state': state})
+        assert ns['get_skill_state'](files[0]) == state
+    assert long_name not in ns['get_disabled_skills']() and long_name not in ns['get_hidden_skills']()
     await db.close()
     print(json.dumps({'states': True, 'restart': True, 'callbacks': True}))
 

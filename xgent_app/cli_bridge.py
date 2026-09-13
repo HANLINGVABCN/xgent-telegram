@@ -48,6 +48,7 @@ from xgent_app.cli_render import (
 # 不在这里抄第二遍——两边判定一旦分裂就会出现"Web 能显示路径、CLI 不能"
 # 这类只在某个客户端复现的 bug。web_bridge 只依赖标准库，导入无副作用。
 from xgent_app.web_bridge import _local_path_from_send_arg, _markup_to_frame
+from xgent_app.web_media import current_media_presentation
 
 
 logger = logging.getLogger(__name__)
@@ -214,6 +215,9 @@ class _CliRelay:
     # -- 生产端 --
 
     def emit(self, op: str, **payload: Any) -> None:
+        presentation = current_media_presentation()
+        if presentation and op in {'send_message', 'edit_message_text', 'send_photo', 'send_document'}:
+            payload['media_presentation'] = presentation
         if not self._enabled:
             return
         try:

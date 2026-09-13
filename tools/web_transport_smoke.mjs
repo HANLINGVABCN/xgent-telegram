@@ -139,6 +139,24 @@ try {
   console.log("ok blocked SSE: automatic fallback, live edits, two tabs, refresh during execution and downloads");
 
   await clear(blocked, mobile);
+  await command(mobile, '/fixture/generated');
+  let generated = mobile.locator('#log .msg-row').filter({ has: mobile.getByRole('heading', { name: 'GENERATED REPLY', exact: true }) });
+  await generated.waitFor();
+  assert.equal(await generated.locator('.media-img').count(), 2);
+  assert.equal(await generated.locator('.bubble').count(), 1);
+  assert.equal(await mobile.getByText('Generating fixture media...', { exact: true }).count(), 0);
+  await mobile.reload();
+  await ready(mobile);
+  generated = mobile.locator('#log .msg-row').filter({ has: mobile.getByRole('heading', { name: 'GENERATED REPLY', exact: true }) });
+  assert.equal(await generated.count(), 1);
+  assert.equal(await generated.locator('.media-img').count(), 2);
+  assert.equal(await generated.locator('.bubble-header').count(), 1);
+  assert.equal(await generated.locator('.media-dl').count(), 2);
+  await generated.scrollIntoViewIfNeeded();
+  await mobile.screenshot({ path: path.join(output, 'tunnel-generated-group.png') });
+  await clear(blocked, mobile);
+  console.log('ok generated images, text and paths stay in one bubble through polling and refresh');
+
   await command(mobile, "/fixture/progress");
   await mobile.getByText("COMMAND STEP 1", { exact: true }).waitFor();
   dropNextBatch = true;

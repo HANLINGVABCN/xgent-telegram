@@ -99,14 +99,16 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
             # 发送给用户
             idle_message = f"系统提醒\n\n{response_text}"
             idle_chunks = split_text_for_telegram(idle_message)
-            for idle_chunk in idle_chunks:
-                await context.bot.send_message(
-                    chat_id=BotConfig.AUTHORIZED_USER_ID,
-                    text=idle_chunk
-                )
+            with media_presentation_scope(build_media_presentation(idle_message, media_artifacts)):
+                for idle_chunk in idle_chunks:
+                    await context.bot.send_message(
+                        chat_id=BotConfig.AUTHORIZED_USER_ID,
+                        text=idle_chunk
+                    )
             if media_artifacts:
                 await send_generated_media_artifacts(
                     context, BotConfig.AUTHORIZED_USER_ID, media_artifacts,
+                    caption=idle_message,
                 )
             
             # 记录发送时间
@@ -152,7 +154,7 @@ _web_config_watch_task: Optional[asyncio.Task] = None
 WEB_EDITABLE_SETTINGS = {
     'thinking_level', 'stream_mode', 'agent_mode', 'text_stitch_mode',
     'global_depth', 'agent_max_iterations', 'stream_timeout', 'chat_model',
-    'disabled_skills', 'hidden_skills', 'agent_command_timeout', 'idle_message_interval',
+    'disabled_skills', 'hidden_skills', 'skill_state', 'agent_command_timeout', 'idle_message_interval',
     'smart_match_threshold',
     # token 统计相关：价格表 / 手动合并表 / 报表默认选项
     'model_price_table', 'model_merge_map', 'stats_auto_merge', 'stats_metric',
@@ -356,6 +358,11 @@ def _relay_mirror_for(session_id: str, chat_id: int) -> Any:
 
 
 async def _replay_relay_op(mirror: Any, op: str, payload: Dict[str, Any]) -> None:
+    with media_presentation_scope(payload.get('media_presentation')):
+        await _replay_relay_op_with_presentation(mirror, op, payload)
+
+
+async def _replay_relay_op_with_presentation(mirror: Any, op: str, payload: Dict[str, Any]) -> None:
     """把 CLI 侧的一次 bot 调用原样重放到 Telegram + 网页。
 
     这里**不做任何过滤、不改写任何文案**：CLI 里对话核心发了什么，Telegram
@@ -765,6 +772,10 @@ async def _web_write_setting(key: str, value: Any) -> Dict[str, Any]:
             raise ValueError("智能匹配阈值需不小于 0")
         UserDataManager.set(key, pct)
         await UserDataManager.save_config(key, pct)
+    elif key == 'skill_state':
+        if not isinstance(value, dict):
+            raise ValueError('无效的技能状态')
+        await save_skill_state(str(value.get('path') or ''), str(value.get('state') or ''))
     elif key in {'disabled_skills', 'hidden_skills'}:
         # 前端传一个被禁用 skill 的相对路径列表。normalize 成 list[str]，去重。
         raw = value if isinstance(value, list) else []

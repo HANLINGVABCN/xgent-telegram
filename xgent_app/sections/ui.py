@@ -341,27 +341,23 @@ def get_more_settings_menu():
 
 
 def get_skills_menu():
-    """两个开关：启用简介、彻底隐藏；隐藏时保留原启用设置。"""
+    """一个按钮循环切换启用、普通关闭、彻底隐藏。"""
     skill_files = list_skill_files()
-    disabled = get_disabled_skills()
-    hidden = get_hidden_skills()
+    states = {'enabled': ('🟢', '启用', 'disabled'),
+              'disabled': ('🟡', '已关闭', 'hidden'),
+              'hidden': ('🔴', '已隐藏', 'enabled')}
 
     rows = []
     for rel_path in skill_files:
         label = os.path.splitext(os.path.basename(rel_path))[0]
-        is_off = rel_path in disabled
         is_private = rel_path.startswith("private/")
-        status_icon = "🔴" if is_off else "🟢"
+        status_icon, state_label, next_state = states[get_skill_state(rel_path)]
         source_icon = "🔒" if is_private else "📦"
         safe_key = rel_path.replace("/", "|")
         rows.append([
             InlineKeyboardButton(
-                f"{status_icon}{source_icon} {label}",
-                callback_data=CallbackDataStore.store(f"toggle_skill:{safe_key}"),
-            ),
-            InlineKeyboardButton(
-                '隐藏: 开' if rel_path in hidden else '隐藏: 关',
-                callback_data=CallbackDataStore.store(f"hide_skill:{safe_key}"),
+                f"{status_icon}{source_icon} {label} · {state_label}",
+                callback_data=CallbackDataStore.store(f"set_skill_state:{next_state}:{safe_key}"),
             ),
         ])
     rows.append([InlineKeyboardButton("🔙 返回", callback_data="menu_more_settings")])
@@ -374,7 +370,7 @@ def build_skills_menu_text() -> str:
     disabled = (get_disabled_skills() & files) - hidden
     return (
         '🧩 <b>Skill 管理</b>\n\n'
-        f'启用: {len(files - hidden - disabled)}  仅名字和路径: {len(disabled)}  隐藏: {len(hidden)}'
+        f'🟢 启用: {len(files - hidden - disabled)}  🟡 仅名字和路径: {len(disabled)}  🔴 隐藏: {len(hidden)}'
         if files else '🧩 <b>Skill 管理</b>\n\n📭 暂无 skill 文件。'
     )
 

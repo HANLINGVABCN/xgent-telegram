@@ -122,6 +122,18 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode=constants.ParseMode.HTML,
             )
 
+        elif data.startswith('set_skill_state:'):
+            _, state, safe_key = data.split(':', 2)
+            rel_path = safe_key.replace('|', '/')
+            await save_skill_state(rel_path, state)
+            await GlobalRecorder.record_system_op(
+                f'Skill 状态已更新: {rel_path}', {'skill_state': state},
+            )
+            await query.message.edit_text(
+                build_skills_menu_text(), reply_markup=get_skills_menu(),
+                parse_mode=constants.ParseMode.HTML,
+            )
+
         elif data.startswith(('toggle_skill:', 'hide_skill:')):
             safe_key = data.split(":", 1)[1]
             rel_path = safe_key.replace("|", "/")

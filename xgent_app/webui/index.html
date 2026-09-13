@@ -546,8 +546,10 @@
   .token-pill .speed { color: var(--accent); font-weight: 600; }
 
   /* ---- 媒体气泡与文件卡片 ---- */
-  .media-bubble { padding: 8px 8px 18px; position: relative; display: flex; flex-direction: column; gap: 6px; }
-  .media-bubble .ts { position: absolute; right: 12px; bottom: 4px; margin: 0; }
+  .message-media { display: grid; gap: 12px; min-width: 0; margin-bottom: 12px; }
+  .media-item { position: relative; min-width: 0; max-width: 100%; width: fit-content; }
+  .media-paths { color: var(--text-2); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 10px; }
+  .has-media .body:empty { display: none; }
   .bubble.user.media-bubble {
     background: var(--surface); border: 1px solid var(--line);
     box-shadow: var(--ai-shadow); color: var(--text);
@@ -556,17 +558,17 @@
   .bubble.user.media-bubble .ts { color: var(--text-3); }
 
   .media-img {
-    display: block; max-width: min(440px, 78vw); max-height: 420px;
+    display: block; max-width: min(440px, 100%); max-height: 420px;
     border-radius: var(--r-md); cursor: zoom-in;
-    border: 1px solid var(--line); object-fit: cover;
+    border: 1px solid var(--line); object-fit: contain;
     transition: transform 0.2s var(--ease), box-shadow 0.2s var(--ease);
   }
-  .media-img:hover { transform: scale(1.01); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12); }
+  .media-img:hover { box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12); }
   .media-video {
-    display: block; width: min(440px, 78vw); max-height: 400px;
+    display: block; width: 440px; max-width: 100%; max-height: 400px;
     border-radius: var(--r-md); background: #000; border: 1px solid var(--line);
   }
-  .media-audio { display: block; width: min(340px, 74vw); margin: 4px 0; }
+  .media-audio { display: block; width: 340px; max-width: 100%; margin: 4px 0; }
   .media-cap { font-size: 13.5px; color: var(--text-2); padding: 2px 6px 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
   .media-error { color: var(--danger); white-space: pre-wrap; overflow-wrap: anywhere; max-width: 100%; }
 
@@ -580,7 +582,7 @@
     opacity: 0; transform: translateY(-3px);
     transition: opacity var(--t), transform var(--t), color var(--t);
   }
-  .media-bubble:hover .media-dl { opacity: 1; transform: none; }
+  .media-item:hover .media-dl, .media-dl:focus-visible { opacity: 1; transform: none; }
   .media-dl:hover { color: var(--accent); border-color: var(--accent); }
   .media-dl .icon { width: 16px; height: 16px; }
   @media (hover: none) { .media-dl { opacity: 0.9; transform: none; } }
@@ -968,9 +970,17 @@
     padding: 8px 12px; background: var(--surface-2); border-radius: var(--r-sm);
   }
   .skill-name { font-size: 13.5px; color: var(--text-2); font-weight: 500; overflow-wrap: anywhere; min-width: 0; flex: 1 1 150px; }
-  .skill-controls { display: flex; gap: 12px; flex: 0 0 auto; }
-  .skill-control { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); }
-  .skill-controls .switch:disabled { opacity: 0.4; cursor: default; }
+  .skill-state {
+    display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+    width: 94px; height: 34px; flex: 0 0 94px; border-radius: 6px;
+    border: 1px solid currentColor; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  .skill-state[data-state="enabled"] { color: #087846; background: #e4f6ec; }
+  .skill-state[data-state="disabled"] { color: #785700; background: #fff4c2; }
+  .skill-state[data-state="hidden"] { color: #ad2831; background: #ffe9eb; }
+  .skill-state:disabled { opacity: 0.55; cursor: wait; }
+  .skill-state:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
+  .skill-state-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
   .hint { color: var(--text-3); font-size: 13px; line-height: 1.6; margin: 14px 6px 0; }
   .btn-danger-row {
     margin-top: 24px; width: 100%; padding: 13px;
@@ -1880,19 +1890,11 @@
     if (e.target === lightbox || e.target.classList.contains("lightbox-img-wrap")) closeLightbox();
   });
 
-  function makeMediaBubble(kind, filename, caption, downloadUrl, messageId, side, timestamp, error) {
-    side = side || "ai";
-    var stick = isNearBottom();
-    msgCount++;
-    updateEmptyState();
-
-    var row = document.createElement("div");
-    var entry;
-
+  function makeMediaContent(item) {
+    var kind = item.kind, filename = item.filename, downloadUrl = item.download_url;
+    var container = document.createElement("div");
+    container.className = "media-item";
     if (downloadUrl) {
-      row.className = "msg-row " + side;
-      var bubble = document.createElement("div");
-      bubble.className = "bubble " + side + " media-bubble";
 
       var media = null;
       if (kind === "photo") {
@@ -1920,13 +1922,7 @@
       }
 
       if (media) {
-        bubble.appendChild(media);
-        if (caption) {
-          var capEl = document.createElement("div");
-          capEl.className = "media-cap";
-          capEl.textContent = caption;
-          bubble.appendChild(capEl);
-        }
+        container.appendChild(media);
       } else {
         var card = document.createElement("div");
         card.className = "file-card";
@@ -1939,12 +1935,6 @@
         fcName.className = "fc-name";
         fcName.textContent = filename || "文件";
         fcBody.appendChild(fcName);
-        if (caption) {
-          var fcCap = document.createElement("div");
-          fcCap.className = "fc-cap";
-          fcCap.textContent = caption;
-          fcBody.appendChild(fcCap);
-        }
         var fcBtn = document.createElement("a");
         fcBtn.className = "fc-dl";
         fcBtn.href = downloadUrl;
@@ -1959,7 +1949,7 @@
           if (e.target.closest(".fc-dl")) return;
           fcBtn.click();
         });
-        bubble.appendChild(card);
+        container.appendChild(card);
       }
 
       var dlBtn = document.createElement("a");
@@ -1967,32 +1957,54 @@
       dlBtn.href = downloadUrl;
       dlBtn.download = filename || "file";
       dlBtn.title = "下载文件";
+      dlBtn.setAttribute("aria-label", "下载 " + (filename || "文件"));
       dlBtn.innerHTML = svgIcon("down");
-      if (media) bubble.appendChild(dlBtn);
-
-      var ts = document.createElement("span");
-      ts.className = "ts";
-      ts.textContent = nowTime(timestamp);
-      if (timestamp != null) ts.title = new Date(Number(timestamp) * 1000).toLocaleString();
-      bubble.appendChild(ts);
-      row.appendChild(bubble);
-      log.appendChild(row);
-      if (stick) scrollDown();
-      entry = { row: row, body: bubble, bubble: bubble, btns: null };
+      if (media) container.appendChild(dlBtn);
     } else {
-      row.className = "msg-row sys";
-      var pill = document.createElement("div");
-      pill.className = "sys-pill";
-      pill.textContent = (filename || (kind === "photo" ? "图片" : "文件")) +
-        (caption ? "\n" + caption : "") + "\n" + (error || "文件暂不可下载");
-      pill.classList.add("media-error");
-      enhanceBubbleContent(pill);
-      row.appendChild(pill);
-      log.appendChild(row);
-      if (stick) scrollDown();
-      entry = { row: row, body: pill, bubble: pill, btns: null };
+      container.classList.add("media-error");
+      container.textContent = (filename || (kind === "photo" ? "图片" : "文件")) +
+        "\n" + (item.error || "文件暂不可下载");
     }
-    if (messageId != null) byMessageId[messageId] = entry;
+    return container;
+  }
+
+  function setInlineMedia(entry, items) {
+    var stick = isNearBottom();
+    if (!items.length) {
+      if (entry.mediaContainer) entry.mediaContainer.remove();
+      if (entry.mediaPaths) entry.mediaPaths.remove();
+      entry.mediaContainer = entry.mediaPaths = null;
+      entry.bubble.classList.remove("has-media");
+      return;
+    }
+    if (!entry.mediaContainer) {
+      entry.mediaContainer = document.createElement("div");
+      entry.mediaContainer.className = "message-media";
+      entry.bubble.insertBefore(entry.mediaContainer, entry.body);
+    }
+    entry.mediaContainer.replaceChildren();
+    var paths = [];
+    var displayedText = String(entry.rawText || "").replace(/\\/g, "/");
+    items.forEach(function (item) {
+      entry.mediaContainer.appendChild(makeMediaContent(item));
+      if (item.path && displayedText.indexOf(item.path.replace(/\\/g, "/")) < 0) paths.push(item.path);
+    });
+    entry.bubble.classList.toggle("has-media", items.length > 0);
+    if (entry.mediaPaths) entry.mediaPaths.remove();
+    entry.mediaPaths = null;
+    if (paths.length) {
+      entry.mediaPaths = document.createElement("div");
+      entry.mediaPaths.className = "media-paths";
+      entry.mediaPaths.textContent = paths.join("\n");
+      entry.body.insertAdjacentElement("afterend", entry.mediaPaths);
+    }
+    if (stick) scrollDown();
+  }
+
+  function makeMediaBubble(kind, filename, caption, downloadUrl, messageId, side, timestamp, error) {
+    var entry = makeBubble(side || "ai", caption || "", messageId, null, null, null, timestamp);
+    entry.bubble.classList.add("media-bubble");
+    setInlineMedia(entry, [{ kind: kind, filename: filename, download_url: downloadUrl, error: error }]);
     return entry;
   }
 
@@ -2056,6 +2068,9 @@
 
   function removeEntry(entry) {
     if (!entry) return;
+    Object.keys(byMessageId).forEach(function (id) {
+      if (byMessageId[id] === entry) delete byMessageId[id];
+    });
     (entry.mediaEntries || []).forEach(removeEntry);
     (entry.objectUrls || []).forEach(function (url) { URL.revokeObjectURL(url); });
     if (entry.row && entry.row.parentNode) {
@@ -2067,8 +2082,11 @@
   }
 
   function putTextFrame(role, frame) {
-    var id = frame.record_id != null ? "history:" + frame.record_id : frame.message_id;
+    var id = frame.media_group_id || (frame.record_id != null ? "history:" + frame.record_id : frame.message_id);
     var entry = id != null ? byMessageId[id] : null;
+    (frame.replace_message_ids || []).forEach(function (previousId) {
+      if (byMessageId[previousId] !== entry) removeEntry(byMessageId[previousId]);
+    });
     if (!entry && frame.type === "edit" && id == null) entry = lastStreamEntry;
     var newRole = classifyMessageText(role, frame.text, frame.msg_type);
     if (entry && entry.rawText !== undefined && entry.role === newRole) {
@@ -2083,6 +2101,7 @@
       if (next && next.parentNode === log) log.insertBefore(entry.row, next);
     }
     if (frame.media) appendHistoryMedia(entry, frame, role);
+    if (frame.message_id != null) byMessageId[frame.message_id] = entry;
     return entry;
   }
 
@@ -2347,7 +2366,7 @@
       msgCount = 0;
       (data.messages || []).forEach(function (m) {
         var role = m.role === "user" ? "user" : (m.role === "assistant" ? "ai" : "sys");
-        var entry = makeBubble(role, m.content, m.id == null ? null : "history:" + m.id,
+        var entry = makeBubble(role, m.content, m.media_group_id || (m.id == null ? null : "history:" + m.id),
           m.parse_mode, null, m.msg_type, m.timestamp);
         appendHistoryMedia(entry, m, role);
       });
@@ -2363,19 +2382,26 @@
   function appendHistoryMedia(entry, message, role) {
     (entry.mediaEntries || []).forEach(removeEntry);
     entry.mediaEntries = [];
-    var after = entry.row;
-    (message.media || []).forEach(function (item) {
-      var card = makeMediaBubble(item.kind, item.filename, item.path, item.download_url,
-        null, role === "user" ? "user" : "ai", message.timestamp, item.error);
-      log.insertBefore(card.row, after.nextSibling);
-      after = card.row;
-      entry.mediaEntries.push(card);
-    });
+    if (message.media_group_id || message.msg_type === "ai_reply" || message.msg_type === "media_reply") {
+      setInlineMedia(entry, message.media || []);
+    } else {
+      var after = entry.row;
+      (message.media || []).forEach(function (item) {
+        var card = makeMediaBubble(item.kind, item.filename, item.path, item.download_url,
+          null, role === "user" ? "user" : "ai", message.timestamp, item.error);
+        log.insertBefore(card.row, after.nextSibling);
+        after = card.row;
+        entry.mediaEntries.push(card);
+      });
+    }
+    if (entry.mediaWarning) entry.mediaWarning.remove();
+    entry.mediaWarning = null;
     if (message.media_error) {
       var warning = document.createElement("div");
       warning.className = "media-error";
       warning.textContent = message.media_error;
       entry.body.appendChild(warning);
+      entry.mediaWarning = warning;
     }
   }
 
@@ -2969,44 +2995,31 @@
             name.textContent = (sk.source === "private" ? "🔒 " : "📦 ") + sk.label;
             item.dataset.path = sk.path;
             item.appendChild(name);
-            var controls = document.createElement("div");
-            controls.className = "skill-controls";
-            function addSwitch(key, labelText, selected, inverted) {
-              var label = document.createElement("span");
-              label.className = "skill-control";
-              label.appendChild(document.createTextNode(labelText));
-              var sw = document.createElement("button");
-              sw.type = "button"; sw.className = "switch";
-              sw.dataset.setting = key;
-              sw.setAttribute("role", "switch");
-              sw.setAttribute("aria-label", sk.label + " " + labelText);
-              sw.title = labelText === "启用" ? "关闭后保留名字和路径" : "从技能提示词中隐藏";
-              sw.innerHTML = '<span class="knob"></span>';
-              var on = inverted ? !selected[sk.path] : !!selected[sk.path];
-              sw.classList.toggle("on", on);
-              sw.setAttribute("aria-checked", on ? "true" : "false");
-              sw.addEventListener("click", function () {
-                var next = !sw.classList.contains("on");
-                sw.classList.toggle("on", next);
-                sw.setAttribute("aria-checked", next ? "true" : "false");
-                selected[sk.path] = inverted ? !next : next;
-                skillBox.querySelectorAll("button.switch").forEach(function (button) { button.disabled = true; });
-                saveSetting(key, Object.keys(selected).filter(function (p) { return selected[p]; }))
-                  .finally(function () {
-                    skillBox.querySelectorAll(".skill-item").forEach(function (it) {
-                      it.querySelectorAll("button.switch").forEach(function (button) {
-                        button.disabled = button.dataset.setting === "disabled_skills" && !!hiddenSet[it.dataset.path];
-                      });
-                    });
-                  });
-              });
-              label.appendChild(sw); controls.appendChild(label);
-              return sw;
+            var stateButton = document.createElement("button");
+            stateButton.type = "button";
+            stateButton.className = "skill-state";
+            var states = {
+              enabled: { label: "启用", next: "disabled", hint: "关闭后保留名字和路径" },
+              disabled: { label: "已关闭", next: "hidden", hint: "彻底隐藏该技能条目" },
+              hidden: { label: "已隐藏", next: "enabled", hint: "启用该技能" }
+            };
+            function showState(state) {
+              stateButton.dataset.state = state;
+              stateButton.innerHTML = '<span class="skill-state-dot" aria-hidden="true"></span><span>' + states[state].label + '</span>';
+              stateButton.title = states[state].hint;
+              stateButton.setAttribute("aria-label", sk.label + "：" + states[state].label + "；" + states[state].hint);
             }
-            var enabledSwitch = addSwitch("disabled_skills", "启用", disabledSet, true);
-            addSwitch("hidden_skills", "彻底隐藏", hiddenSet, false);
-            enabledSwitch.disabled = !!hiddenSet[sk.path];
-            item.appendChild(controls);
+            showState(hiddenSet[sk.path] ? "hidden" : (disabledSet[sk.path] ? "disabled" : "enabled"));
+            stateButton.addEventListener("click", function () {
+              var next = states[stateButton.dataset.state].next;
+              stateButton.disabled = true;
+              api("/api/config", { method: "POST", body: JSON.stringify({
+                key: "skill_state", value: { path: sk.path, state: next }
+              }) }).then(function () { showState(next); toast("已保存"); })
+                .catch(function (err) { toast("保存失败：" + err.message); })
+                .finally(function () { stateButton.disabled = false; });
+            });
+            item.appendChild(stateButton);
             skillBox.appendChild(item);
           });
           if (!skills.length) skillBox.textContent = "暂无安装的 Skill 插件";

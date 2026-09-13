@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from xgent_app.web_media import generated_media_group_id
+
 
 _UPLOAD = re.compile(
     r"^(?:\u7b2c\d+\u5f20: )?\[(?:\u6587\u4ef6|\u56fe\u7247)\] (?P<name>.+?)"
@@ -238,4 +240,8 @@ def build_history_message(
         if not item.get("error") and type(record.get("id")) is int:
             item["download_url"] = f"/api/history/media/{record['id']}/{index}"
         message["media"].append(item)
+    if kind in {'ai_reply', 'media_reply'} and message['media']:
+        message['media_group_id'] = generated_media_group_id([
+            item.get('path', '') for item in message['media']
+        ])
     return message

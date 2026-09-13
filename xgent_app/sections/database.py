@@ -1135,6 +1135,32 @@ class BotMemoryDB:
                 INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)
             ''', (key, json_value))
         self._config_cache[key] = value
+
+    async def set_skill_state(self, path: str, state: str) -> Dict[str, List[str]]:
+        if state not in {'enabled', 'disabled', 'hidden'}:
+            raise ValueError('无效的技能状态')
+        values = {}
+        async with self._transaction() as conn:
+            for key in ('disabled_skills', 'hidden_skills'):
+                cursor = await conn.execute('SELECT value FROM config WHERE key = ?', (key,))
+                row = await cursor.fetchone()
+                raw = json.loads(row['value']) if row else []
+                values[key] = {item for item in raw if isinstance(item, str)} if isinstance(raw, list) else set()
+            if state == 'hidden':
+                values['hidden_skills'].add(path)
+            else:
+                values['hidden_skills'].discard(path)
+                if state == 'disabled':
+                    values['disabled_skills'].add(path)
+                else:
+                    values['disabled_skills'].discard(path)
+            values = {key: sorted(items) for key, items in values.items()}
+            await conn.executemany(
+                'INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)',
+                [(key, json.dumps(items)) for key, items in values.items()],
+            )
+        self._config_cache.update(values)
+        return values
     
     # --- Provider管理（带缓存）---
     async def get_providers(self) -> Dict[str, Dict]:
