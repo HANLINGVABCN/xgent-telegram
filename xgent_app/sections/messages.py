@@ -1630,6 +1630,7 @@ async def _record_user_stopped_reply(db, cid, chat_id, partial_text: str) -> str
     return content
 
 
+@without_ui_history
 async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
                                content_override: Optional[Any] = None,
                                lock_acquired_event: Optional[asyncio.Event] = None,

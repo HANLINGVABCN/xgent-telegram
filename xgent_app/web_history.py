@@ -172,6 +172,8 @@ def build_history_message(
 ) -> dict[str, Any]:
     """No Base64 or short-lived download tokens enter the history response."""
     kind = record.get("msg_type")
+    if kind == 'ui_message':
+        return dict(record)
     role = record.get("role") or "user"
     if kind in {"agent_result", "media_reply", "agent_status"}:
         role = "assistant"

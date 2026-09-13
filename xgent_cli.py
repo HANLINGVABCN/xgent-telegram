@@ -844,7 +844,8 @@ async def _run_command(command: str) -> None:
         else:
             # 命令处理器的回复（/stats 报表、/start 菜单……）一律按命令返回呈现。
             set_turn_kind("cmd")
-            await handler(update, context)
+            async with _ns['ui_operation'](capture_text=True):
+                await handler(update, context)
     except Exception:
         _report_failure(f"命令 /{name}")
 
@@ -857,7 +858,8 @@ async def _run_callback(callback_data: str) -> None:
         BotConfig.AUTHORIZED_USER_ID, callback_data, 0,
     )
     try:
-        await handle_button_click(update, context)
+        async with _ns['ui_operation'](capture_text=True):
+            await handle_button_click(update, context)
     except Exception:
         _report_failure("按钮")
 

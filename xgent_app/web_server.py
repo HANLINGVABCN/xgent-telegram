@@ -98,6 +98,7 @@ class WebChatConfig:
         media_allowed_roots: Optional[List[str]] = None,
         read_health: Optional[Callable[[], Any]] = None,
         read_history_message: Optional[Callable[[int], Any]] = None,
+        submit_ui_callback: Optional[Callable[[str, int, str, WebOutbox], Any]] = None,
     ):
         self.host = host
         self.port = port
@@ -108,6 +109,7 @@ class WebChatConfig:
         self.submit_message = submit_message
         # 网页按钮 / 命令路由。可选，保留向后兼容（旧测试构造 WebChatConfig 时不传）。
         self.submit_callback = submit_callback or (lambda *a: None)
+        self.submit_ui_callback = submit_ui_callback
         self.submit_command = submit_command or (lambda *a: None)
         # 网页文件上传。可选：旧构造路径不传时回退为占位（没人会调到，因为
         # /api/upload 路由只在 idle 注入了真实回放时才注册语义）。
@@ -563,7 +565,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         limit = limit_val if limit_val > 0 else 1000000
         messages = self._run_coro(self.config.read_history(limit))
         self._send_json(
-            {"messages": messages, "busy": bool(self.config.is_busy())},
+            {"messages": messages, "busy": bool(self.config.is_busy()),
+             "ui_generation": getattr(messages, "generation", None),
+             "ui_tombstones": getattr(messages, "tombstones", [])},
             extra_headers={"Cache-Control": "no-store"},
         )
 
@@ -676,6 +680,22 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         data = self._read_json()
         if data is None:
             return
+        outbox = self.server.outbox  # type: ignore[attr-defined]
+        if any(key in data for key in ('ui_message_id', 'revision', 'button_id')):
+            ui_message_id = data.get('ui_message_id')
+            revision = data.get('revision')
+            button_id = data.get('button_id')
+            if (not isinstance(ui_message_id, str) or not re.fullmatch(r'[a-f0-9]{32}', ui_message_id)
+                    or type(revision) is not int or not 0 < revision < 2**63
+                    or not isinstance(button_id, str) or not re.fullmatch(r'\d{1,5}:\d{1,5}', button_id)):
+                self._send_json({'error': '菜单关联无效，请重新打开菜单。'}, status=400)
+                return
+            if self.config.submit_ui_callback is None:
+                self._send_json({'error': '菜单已失效，请重新打开菜单。'}, status=409)
+                return
+            self.config.submit_ui_callback(ui_message_id, revision, button_id, outbox)
+            self._send_json({'ok': True})
+            return
         callback_data = str(data.get("callback_data") or "")
         if not callback_data:
             self._send_json({"error": "缺少 callback_data"}, status=400)
@@ -685,7 +705,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             message_id = 0
 
-        outbox = self.server.outbox  # type: ignore[attr-defined]
         self.config.submit_callback(callback_data, message_id, outbox)
         self._send_json({"ok": True})
 

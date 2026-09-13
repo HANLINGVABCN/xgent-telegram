@@ -216,6 +216,7 @@ async def main():
     bot.TelegramRichAPI.send_rich_message = fake_web_rich
 
     await bot.rich_finalize_text_response(context, 7, msg, "真实回复正文", limit=4000)
+    assert bot.BotMemoryDB._instance is None, 'ordinary reply rendering must not open the UI database'
     frames = []
     while True:
         f = stream.get(timeout=0.1)

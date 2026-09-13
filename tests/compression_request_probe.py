@@ -108,7 +108,7 @@ async def round_trips(bot, root):
             await h.compress(fmt, via_callback=(fmt == 'openai_compatible'))
             latest = await h.db.get_latest_compression()
             assert latest['status'] == 'completed', latest
-            assert h.events == ['export', 'clear', 'read:' + memory(1), 'read:' + attachments(1), 'model'], h.events
+            assert h.events == ['export', 'clear', 'read:' + memory(1), 'model'], h.events
             frames = h.drain_frames()
             assert any(frame['type'] == 'chat_action' and frame['action'] == 'typing' for frame in frames)
             assert [frame for frame in frames if frame['type'] in {'compression_state', 'history_reset'}] == [
@@ -177,6 +177,58 @@ async def round_trips(bot, root):
                 assert summary_file(3) not in archive.namelist()
                 assert len(archive.namelist()) == 11
             results[fmt] = True
+    return results
+
+
+async def input_isolation(bot, root):
+    markers = ['ISOLATE-PERSONA', 'ISOLATE-ADDON', 'ISOLATE-MEMORY',
+               'ISOLATE-SKILL', 'ISOLATE-AGENT', 'ISOLATE-INDEX']
+    results = {}
+    for fmt in FORMATS:
+        for style in ('foreground', 'background', 'nonstream'):
+            async with CompressionHarness(bot, Path(root) / (fmt + style)) as h:
+                for key, marker in zip(('assistant_prompt', 'global_prompt_addon'), markers):
+                    await bot.save_runtime_prompt(key, marker)
+                for attribute in ('MEMORY_DIR', 'SKILL_PUBLIC_DIR', 'SKILL_PRIVATE_DIR', 'SKILL_LEGACY_DIR'):
+                    directory = h.root / attribute
+                    directory.mkdir()
+                    h.stack.enter_context(patch.object(bot, attribute, str(directory)))
+                (Path(bot.MEMORY_DIR) / 'fixture.txt').write_text(markers[2], encoding='utf-8')
+                (Path(bot.SKILL_PUBLIC_DIR) / 'fixture.md').write_text('```!\n' + markers[3] + '\n```', encoding='utf-8')
+                bot.PromptFileManager.set('agent_prompt_addon', markers[4])
+                normal_prompt = bot.build_conversation_system_prompt(False)
+                assert all(marker in normal_prompt for marker in markers[:-1])
+                await bot.ModelClient.think_and_reply('p', 'test-key', 'https://provider.invalid/v1', MODEL,
+                    normal_prompt, [{'role': 'user', 'content': 'ordinary chat'}],
+                    api_format=fmt, conversation_context=True)
+                assert all(marker in json.dumps(h.requests[-1]) for marker in markers[:-1])
+                ref = await h.add_upload(b'ATTACHMENT-ORIGINAL-ONLY', 'fixture.txt')
+                ref['source'] = markers[-1]
+                await bot.GlobalRecorder.record_attachment_message('INDEX-REFERENCE', bot.MessageType.USER_FILE, 1, [ref])
+                original = 'ISOLATE-GLOBAL-HEAD\n' + 'untouched original\n' * 5000 + 'ISOLATE-GLOBAL-TAIL'
+                await bot.GlobalRecorder.record_user_message(original)
+                instruction = 'ISOLATE-FROZEN-INSTRUCTION\n' + DEFAULT_COMPRESSION_PROMPT
+                bot.PromptFileManager.set('compression_prompt', instruction)
+                bot.UserDataManager.set('stream_mode', style != 'nonstream')
+                bot.UserDataManager.set('stream_style', style if style != 'nonstream' else 'foreground')
+                await h.compress(fmt)
+                entry = await h.db.get_latest_compression()
+                assert entry['status'] == 'completed', (fmt, style, entry)
+                request = h.requests[-1]
+                texts, images, _ = unpack_request(request)
+                assert not images and all(marker not in json.dumps(request) for marker in markers)
+                assert 'ATTACHMENT-ORIGINAL-ONLY' not in json.dumps(request)
+                supplied = '\n'.join(texts)
+                assert 'ISOLATE-GLOBAL-HEAD' in supplied and 'ISOLATE-GLOBAL-TAIL' in supplied
+                assert supplied.count('untouched original') == 5000
+                assert original in Path(entry['memory_path']).read_text(encoding='utf-8')
+                assert texts[-1] == instruction and '\n'.join(texts).count(instruction) == 1
+                assert len(texts) == 2, (fmt, style, texts)
+                assert not request.get('system') and not request.get('system_instruction')
+                with zipfile.ZipFile(entry['archive_path']) as archive:
+                    assert markers[-1] in archive.read(attachments(1)).decode()
+                    assert all(marker in archive.read('\u63d0\u793a\u8bcd.txt').decode() for marker in markers[:-1])
+                results[fmt + style] = True
     return results
 
 
@@ -474,6 +526,7 @@ async def stream_modes(bot, root):
 
 async def retry_saved(bot, root):
     async with CompressionHarness(bot, root) as h:
+        await bot.save_runtime_prompt('assistant_prompt', 'LEGACY-FROZEN-SYSTEM-MUST-NOT-REENTER')
         await bot.GlobalRecorder.record_user_message('RESTORE-ORIGINAL-TAIL')
         bot.PromptFileManager.set('compression_prompt', 'FROZEN-INSTRUCTION')
         h.error = (400, 'retry later')
@@ -496,6 +549,7 @@ async def retry_restarted(bot, root):
         assert 'export' not in h.events and 'clear' not in h.events
         assert unpack_request(h.requests[-1])[0][-1] == 'FROZEN-INSTRUCTION'
         assert 'RESTORE-ORIGINAL-TAIL' in contents(h.requests[-1])
+        assert 'LEGACY-FROZEN-SYSTEM-MUST-NOT-REENTER' not in json.dumps(h.requests[-1])
         assert Path(entry['archive_path']).read_bytes() == original_zip
         rows = await h.db.get_display_history(0)
         assert any(row['content'] == 'NEW-CONVERSATION-MESSAGE' for row in rows)

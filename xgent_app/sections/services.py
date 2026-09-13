@@ -52,12 +52,63 @@ from xgent_app.fanout import (
 )
 from xgent_app.web_server import WebChatConfig, WebChatServer
 from xgent_app.web_history import build_history_message, display_media_reference
+from xgent_app.ui_history import (
+    PROCESS_ID as UI_PROCESS_ID, UiHistoryError, UiHistorySnapshot,
+    active_ui_generation, advance_ui_generation, callback_lock, configure_ui_history,
+    replay_ui_context, ui_operation, validated_button, without_ui_history,
+)
 from xgent_app.web_media import build_media_presentation, current_media_presentation, media_presentation_scope
 # 记录来源标记：写进每条 global_messages 的 metadata.src。
 # CLI 与服务端是两个进程、只共享数据库；服务端的网页观察者（idle.py 的
 # _web_external_record_watcher）靠它区分"本进程写的（SSE 已直发，跳过）"和
 # "别的进程写的（CLI 的对话，要推成帧）"，否则同一句话会在网页上显示两遍。
 _RECORDER_SOURCE_ID = f"pid{os.getpid()}-{uuid.uuid4().hex[:6]}"
+
+
+def current_ui_workflow_guard() -> str:
+    state = {key: value for key, value in UserDataManager._data.items()
+             if key == 'state' or key.startswith(('temp_', 'editing_')) or key.endswith('_buffer')}
+    digest = hashlib.sha256(json.dumps(state, sort_keys=True, default=str).encode('utf-8')).hexdigest()
+    return f'{UI_PROCESS_ID}:{UserDataManager._ui_state_revision}:{digest}'
+
+
+def validate_saved_menu_action(action: str) -> None:
+    missing = False
+    if action.startswith(('set_skill_state:', 'toggle_skill:', 'hide_skill:')):
+        path = action.split(':', 2)[-1].replace('|', '/')
+        missing = path not in list_skill_files()
+    elif action.startswith(('view_prompt:', 'reload_prompt:', 'download_prompt:', 'modify_prompt:')):
+        missing = action.split(':', 1)[1] not in PromptFileManager.FILES
+    elif action.startswith(('act_delete_memory_menu:', 'act_delete_memory:')):
+        missing = action.split(':', 1)[1] not in list_memory_files()
+    else:
+        providers = UserDataManager.get('providers', {})
+        provider = model = None
+        for prefix in ('view_prov_', 'del_prov_', 'edit_pname_', 'edit_pkey_', 'edit_purl_',
+                       'mng_saved_', 'act_manual_mod_', 'prov_models_', 'fetch_market_'):
+            if action.startswith(prefix):
+                provider = action[len(prefix):]
+                break
+        if action.startswith(('set_mdl|', 'do_use|')):
+            _, _, provider, model = action.split('|', 3)
+        elif action.startswith('do_del|'):
+            _, provider, model = action.split('|', 2)
+        if provider is not None:
+            missing = provider not in providers
+            if model is not None and not missing:
+                models = providers[provider].get('models', [])
+                fetched = UserDataManager.get('fetched_cache', []) if (
+                    UserDataManager.get('temp_viewing_prov') == provider) else []
+                missing = model not in models and model not in fetched
+    if missing:
+        raise UiHistoryError('菜单对应的对象已不存在，请重新打开菜单。')
+
+
+configure_ui_history(
+    lambda: BotMemoryDB.get_instance(),
+    lambda value: CallbackDataStore.get(value) if 'CallbackDataStore' in globals() else value,
+    current_ui_workflow_guard,
+)
 
 
 class GlobalRecorder:
@@ -74,6 +125,9 @@ class GlobalRecorder:
         """
         stamped_metadata = dict(metadata or {})
         stamped_metadata.setdefault('src', _RECORDER_SOURCE_ID)
+        ui_generation = active_ui_generation()
+        if ui_generation is not None:
+            stamped_metadata.setdefault('ui_generation', ui_generation)
         rowid = None
         try:
             db = await BotMemoryDB.get_instance()
@@ -88,6 +142,8 @@ class GlobalRecorder:
                 **({'stop_event': stop_event} if stop_event is not None else {}),
             )
         except Exception as e:
+            if isinstance(e, UiHistoryError):
+                raise
             if 'compression_job_id' in stamped_metadata:
                 raise CompressionError(f"恢复回复写入失败：{e}") from e
             if 'attachments' in stamped_metadata:
@@ -223,7 +279,7 @@ class GlobalRecorder:
             role='system',
             content=operation,
             chat_id=chat_id,
-            metadata=details
+            metadata={'ui_audit': True, **(details or {})}
         )
 
     @staticmethod

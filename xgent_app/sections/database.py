@@ -2,6 +2,7 @@
 # Keep cross-section names available through the loader until the next decoupling phase.
 
 import inspect
+from xgent_app.ui_history import UiHistoryError, UiHistorySnapshot, hide_audit_record, ui_record, EXPIRED, CHANGED
 
 class BotMemoryDB:
     """Bot的永久记忆系统 - 异步SQLite + 连接池"""
@@ -114,6 +115,20 @@ class BotMemoryDB:
             CREATE TABLE IF NOT EXISTS context_compressions (
                 sequence INTEGER PRIMARY KEY,
                 payload TEXT NOT NULL
+            )
+        ''')
+
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS ui_messages (
+                ui_message_id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                generation INTEGER NOT NULL,
+                revision INTEGER NOT NULL,
+                timestamp REAL NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE(source, chat_id, message_id, generation)
             )
         ''')
 
@@ -423,13 +438,16 @@ class BotMemoryDB:
                                      stop_event: Optional[asyncio.Event] = None) -> Optional[int]:
         """记录一条全局消息，返回新行 rowid（供 token 统计双写关联去重）。"""
         compression = (metadata or {}).get('compression_job_id')
-        async with (self._transaction() if compression else self._write()) as conn:
-            if metadata and ('attachments' in metadata or 'attachment_generation' in metadata):
+        ui_scoped = metadata is not None and 'ui_generation' in metadata
+        async with (self._transaction() if compression or ui_scoped else self._write()) as conn:
+            if metadata and ('attachments' in metadata or 'attachment_generation' in metadata or ui_scoped):
                 cursor = await conn.execute(
                     "SELECT value FROM config WHERE key = 'attachment_generation'"
                 )
                 row = await cursor.fetchone()
                 generation = int(json.loads(row['value'])) if row else 0
+                if ui_scoped and metadata['ui_generation'] != generation:
+                    raise UiHistoryError(EXPIRED)
                 if metadata.get('attachment_generation', generation) != generation:
                     raise ValueError("对话已在附件处理期间清空，旧附件未关联到新对话。")
             if compression:
@@ -795,18 +813,24 @@ class BotMemoryDB:
         AGENT_CMD 不显示协议原文，轮次状态使用单独保存的 AGENT_STATUS。
         保留记录 ID、时间和元数据，供显示层恢复原始格式与附件。
         """
-        conn = await self._get_conn()
-        sql_limit = limit if limit > 0 else -1
-        cursor = await conn.execute('''
-            SELECT id, role, content, timestamp, msg_type, metadata FROM global_messages
-            ORDER BY timestamp DESC, id DESC LIMIT ?
-        ''', (sql_limit,))
-        rows = await cursor.fetchall()
+        async with self._transaction() as conn:
+            cursor = await conn.execute('''
+                SELECT id, role, content, timestamp, msg_type, metadata FROM global_messages
+                ORDER BY timestamp ASC, id ASC
+            ''')
+            rows = await cursor.fetchall()
+            cursor = await conn.execute('SELECT * FROM ui_messages ORDER BY timestamp, ui_message_id')
+            ui_rows = [dict(row) for row in await cursor.fetchall()]
+            cursor = await conn.execute("SELECT value FROM config WHERE key = 'attachment_generation'")
+            generation_row = await cursor.fetchone()
+            generation = int(json.loads(generation_row['value'])) if generation_row else 0
 
         result = []
-        for row in reversed(rows):
+        for row in rows:
             msg = dict(row)
             msg_type = msg.get('msg_type')
+            if hide_audit_record(msg):
+                continue
             if is_redundant_agent_command_record(msg_type, msg.get('content')):
                 continue
             if msg_type == MessageType.AGENT_CMD:
@@ -818,7 +842,78 @@ class BotMemoryDB:
                 MessageType.AGENT_RESULT, MessageType.MEDIA_REPLY, MessageType.AGENT_STATUS,
             ) else msg['role']
             result.append(msg)
-        return result
+        tombstones = []
+        for row in ui_rows:
+            if row['generation'] != generation:
+                continue
+            item = ui_record(row)
+            if item.pop('deleted'):
+                tombstones.append({key: item[key] for key in ('ui_message_id', 'revision', 'ui_generation')})
+            else:
+                result.append(item)
+        result.sort(key=lambda item: (item['timestamp'], item.get('id') or 0, item.get('ui_message_id', '')))
+        return UiHistorySnapshot(result[-limit:] if limit > 0 else result,
+                                 generation=generation, tombstones=tombstones)
+
+    async def get_ui_message(self, ui_message_id: str) -> Optional[Dict]:
+        conn = await self._get_conn()
+        cursor = await conn.execute('SELECT * FROM ui_messages WHERE ui_message_id = ?', (ui_message_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def apply_ui_frame(self, source: str, chat_id: int, frame: Dict, markup: List,
+                             *, generation: int, create: bool, guard: str,
+                             ui_message_id: Optional[str] = None,
+                             expected_revision: Optional[int] = None) -> Optional[Dict]:
+        async with self._transaction() as conn:
+            cursor = await conn.execute("SELECT value FROM config WHERE key = 'attachment_generation'")
+            generation_row = await cursor.fetchone()
+            current_generation = int(json.loads(generation_row['value'])) if generation_row else 0
+            if generation != current_generation:
+                raise UiHistoryError(EXPIRED)
+            if ui_message_id:
+                cursor = await conn.execute('SELECT * FROM ui_messages WHERE ui_message_id = ?', (ui_message_id,))
+            else:
+                cursor = await conn.execute('''
+                    SELECT * FROM ui_messages
+                    WHERE source = ? AND chat_id = ? AND message_id = ? AND generation = ?
+                ''', (source, chat_id, int(frame.get('message_id') or 0), generation))
+            saved = await cursor.fetchone()
+            if saved:
+                row = dict(saved)
+                payload = json.loads(row['payload'])
+                if row['generation'] != generation or payload.get('deleted'):
+                    raise UiHistoryError(EXPIRED)
+                if expected_revision is not None and row['revision'] != expected_revision:
+                    raise UiHistoryError(CHANGED)
+            else:
+                if ui_message_id:
+                    raise UiHistoryError(EXPIRED)
+                if not create or frame['type'] not in {'message', 'edit'}:
+                    return None
+                row = {
+                    'ui_message_id': uuid.uuid4().hex, 'source': source, 'chat_id': chat_id,
+                    'message_id': int(frame.get('message_id') or 0), 'generation': generation,
+                    'revision': 0, 'timestamp': float(frame.get('ts') or time.time()),
+                }
+                payload = {}
+            if frame['type'] in {'message', 'edit'}:
+                payload.update(content=str(frame.get('text') or ''), parse_mode=frame.get('parse_mode'))
+            if frame['type'] in {'message', 'edit', 'edit_markup'}:
+                payload.update(reply_markup=markup, guard=guard)
+            if frame['type'] == 'delete':
+                payload.update(deleted=True, reply_markup=[])
+            row['revision'] += 1
+            row['payload'] = json.dumps(payload, ensure_ascii=False)
+            await conn.execute('''
+                INSERT INTO ui_messages
+                    (ui_message_id, source, chat_id, message_id, generation, revision, timestamp, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ui_message_id) DO UPDATE SET revision = excluded.revision, payload = excluded.payload
+            ''', tuple(row[key] for key in (
+                'ui_message_id', 'source', 'chat_id', 'message_id', 'generation', 'revision', 'timestamp', 'payload',
+            )))
+            return row
 
     async def get_display_message(self, row_id: int) -> Optional[Dict]:
         """下载历史附件时重新读取关联；清空后旧地址立即失效。"""
@@ -1134,6 +1229,7 @@ class BotMemoryDB:
             cursor = await conn.execute(f'SELECT COUNT(*) AS count FROM {table}')
             counts[table] = int((await cursor.fetchone())['count'])
             await conn.execute(f'DELETE FROM {table}')
+        await conn.execute('DELETE FROM ui_messages')
         if not preserve_compressions:
             await conn.execute('DELETE FROM context_compressions')
         await conn.execute('''
@@ -1676,6 +1772,7 @@ class BotMemoryDB:
 # --- ☆ 用户数据管理（内存缓存 + 数据库同步）☆ ---
 class UserDataManager:
     """管理用户数据，内存缓存优先"""
+    _ui_state_revision = 0
     
     _data: Dict[str, Any] = {}
     _db: Optional[BotMemoryDB] = None
@@ -1793,6 +1890,8 @@ class UserDataManager:
     
     @classmethod
     def set(cls, key: str, value: Any):
+        if key == 'state':
+            cls._ui_state_revision += 1
         cls._data[key] = value
     
     @classmethod

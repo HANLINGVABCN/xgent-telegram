@@ -215,6 +215,10 @@ class _CliRelay:
     # -- 生产端 --
 
     def emit(self, op: str, **payload: Any) -> None:
+        from xgent_app.ui_history import relay_ui_context
+        ui_context = relay_ui_context()
+        if ui_context is not None:
+            payload['ui_context'] = ui_context
         presentation = current_media_presentation()
         if presentation and op in {'send_message', 'edit_message_text', 'send_photo', 'send_document'}:
             payload['media_presentation'] = presentation

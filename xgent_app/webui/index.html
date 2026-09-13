@@ -1272,6 +1272,9 @@
   var botAvatar = document.getElementById("bot-avatar");
 
   var byMessageId = {};
+  var uiGeneration = null;
+  var uiRevisions = {};
+  var uiDeleted = {};
   var evtSource = null;
   var suggestIndex = -1;
   var reconnectTimer = null;
@@ -2008,7 +2011,7 @@
     return entry;
   }
 
-  function renderButtons(rows, messageId) {
+  function renderButtons(rows, messageId, ui) {
     var container = document.createElement("div");
     container.className = "inline-keyboard";
     rows.forEach(function (row) {
@@ -2025,15 +2028,19 @@
           rowEl.appendChild(link);
           return;
         }
-        if (!btn.callback_data) return;
+        if (!btn.callback_data && !btn.unavailable) return;
         var b = document.createElement("button");
         b.className = "ik-btn";
         b.textContent = btn.text;
+        b.disabled = !!btn.unavailable;
+        if (btn.unavailable) b.title = "菜单已失效，请重新打开";
         b.addEventListener("click", function () {
           if (b.disabled) return;
           b.disabled = true; b.classList.add("loading");
           triggerHaptic();
-          api("/api/callback", { method: "POST", body: JSON.stringify({ callback_data: btn.callback_data, message_id: messageId }) })
+          var payload = ui ? {ui_message_id: ui.id, revision: ui.revision, button_id: btn.button_id} :
+            {callback_data: btn.callback_data, message_id: messageId};
+          api("/api/callback", { method: "POST", body: JSON.stringify(payload) })
             .catch(function (err) { toast(err.message); })
             .finally(function () { setTimeout(function () { b.disabled = false; b.classList.remove("loading"); }, 350); });
         });
@@ -2048,7 +2055,7 @@
     if (entry.btns && entry.btns.parentNode) entry.btns.parentNode.removeChild(entry.btns);
     entry.btns = null;
     if (markup && markup.length) {
-      entry.btns = renderButtons(markup, messageId);
+      entry.btns = renderButtons(markup, messageId, entry.ui);
       if (entry.btns && entry.bubble) entry.bubble.appendChild(entry.btns);
     }
   }
@@ -2082,7 +2089,8 @@
   }
 
   function putTextFrame(role, frame) {
-    var id = frame.media_group_id || (frame.record_id != null ? "history:" + frame.record_id : frame.message_id);
+    var id = frame.ui_message_id ? "ui:" + frame.ui_message_id :
+      (frame.media_group_id || (frame.record_id != null ? "history:" + frame.record_id : frame.message_id));
     var entry = id != null ? byMessageId[id] : null;
     (frame.replace_message_ids || []).forEach(function (previousId) {
       if (byMessageId[previousId] !== entry) removeEntry(byMessageId[previousId]);
@@ -2099,15 +2107,58 @@
       entry = makeBubble(role, frame.text, id, frame.parse_mode, null, frame.msg_type, frame.timestamp || frame.ts);
       if (next && next.parentNode === log) log.insertBefore(entry.row, next);
     }
+    bindUiMessage(entry, frame);
     if (frame.reply_markup !== undefined) {
       setButtons(entry, frame.reply_markup, frame.message_id != null ? frame.message_id : (frame.record_id || 0));
     }
     if (frame.media) appendHistoryMedia(entry, frame, role);
-    if (frame.message_id != null) byMessageId[frame.message_id] = entry;
+    if (frame.message_id != null && !frame.ui_message_id) byMessageId[frame.message_id] = entry;
     return entry;
   }
 
+  function bindUiMessage(entry, frame) {
+    if (!frame.ui_message_id) return;
+    entry.ui = {id: frame.ui_message_id, revision: frame.revision, generation: frame.ui_generation};
+    entry.row.dataset.uiMessageId = frame.ui_message_id;
+    entry.row.dataset.uiRevision = String(frame.revision);
+  }
+
+  function acceptUiFrame(frame) {
+    if (!frame.ui_message_id) return true;
+    if (!Number.isSafeInteger(frame.ui_generation) || !Number.isSafeInteger(frame.revision)) return false;
+    if (uiGeneration !== null && frame.ui_generation < uiGeneration) return false;
+    if (uiGeneration !== null && frame.ui_generation > uiGeneration) {
+      pendingFrames.push(frame);
+      resync();
+      return false;
+    }
+    uiGeneration = frame.ui_generation;
+    var id = frame.ui_message_id;
+    if (uiDeleted[id] || frame.revision <= (uiRevisions[id] || 0)) return false;
+    uiRevisions[id] = frame.revision;
+    if (frame.type === "delete") uiDeleted[id] = true;
+    return true;
+  }
+
+  function refreshMenus() {
+    var generation = historyGen;
+    return api("/api/history?limit=0").then(function (data) {
+      if (!historyReady || generation !== historyGen) return;
+      if (Number.isSafeInteger(data.ui_generation) && data.ui_generation !== uiGeneration) {
+        if (uiGeneration === null || data.ui_generation > uiGeneration) return resync();
+        return;
+      }
+      (data.ui_tombstones || []).forEach(function (item) {
+        handleFrame(Object.assign({}, item, {type: "delete"}));
+      });
+      (data.messages || []).forEach(function (item) {
+        if (item.ui_message_id) handleFrame(Object.assign({}, item, {type: "message", text: item.content}));
+      });
+    }).catch(function (err) { toast("菜单同步失败：" + err.message); });
+  }
+
   function handleFrame(frame) {
+    if (!acceptUiFrame(frame)) return;
     if (frame.type === "message") {
       putTextFrame("ai", frame);
       hideTyping();
@@ -2115,12 +2166,17 @@
       putTextFrame("ai", frame);
       hideTyping();
     } else if (frame.type === "edit_markup") {
-      var em = byMessageId[frame.message_id];
-      if (em) setButtons(em, frame.reply_markup, frame.message_id);
+      if (frame.ui_message_id) {
+        putTextFrame("ai", frame);
+      } else {
+        var em = byMessageId[frame.message_id];
+        if (em) setButtons(em, frame.reply_markup, frame.message_id);
+      }
     } else if (frame.type === "delete") {
-      var d = byMessageId[frame.message_id];
+      var deletedId = frame.ui_message_id ? "ui:" + frame.ui_message_id : frame.message_id;
+      var d = byMessageId[deletedId];
       removeEntry(d);
-      delete byMessageId[frame.message_id];
+      delete byMessageId[deletedId];
     } else if (frame.type === "user_message") {
       putTextFrame("user", frame);
       hideTyping();
@@ -2138,6 +2194,8 @@
       if (frame.action === "typing") showTyping(); else hideTyping();
     } else if (frame.type === "callback_answer") {
       toast(frame.text, frame.show_alert);
+    } else if (frame.type === "callback_done") {
+      if (frame.resync) refreshMenus();
     } else if (frame.type === "turn_end" || frame.type === "turn_error") {
       setBusy(false);
       var error = frame.type === "turn_error" ? (frame.text || "处理失败") : null;
@@ -2364,12 +2422,23 @@
       });
       log.innerHTML = "";
       byMessageId = {};
+      uiGeneration = Number.isSafeInteger(data.ui_generation) ? data.ui_generation : null;
+      uiRevisions = {};
+      uiDeleted = {};
+      (data.ui_tombstones || []).forEach(function (item) {
+        uiRevisions[item.ui_message_id] = item.revision;
+        uiDeleted[item.ui_message_id] = true;
+      });
       lastStreamEntry = null;
       msgCount = 0;
       (data.messages || []).forEach(function (m) {
+        if (m.ui_message_id && uiDeleted[m.ui_message_id]) return;
         var role = m.role === "user" ? "user" : (m.role === "assistant" ? "ai" : "sys");
-        var entry = makeBubble(role, m.content, m.media_group_id || (m.id == null ? null : "history:" + m.id),
+        var id = m.ui_message_id ? "ui:" + m.ui_message_id : (m.media_group_id || (m.id == null ? null : "history:" + m.id));
+        var entry = makeBubble(role, m.content, id,
           m.parse_mode, null, m.msg_type, m.timestamp);
+        if (m.ui_message_id) uiRevisions[m.ui_message_id] = m.revision;
+        bindUiMessage(entry, m);
         setButtons(entry, m.reply_markup, m.id || 0);
         appendHistoryMedia(entry, m, role);
       });

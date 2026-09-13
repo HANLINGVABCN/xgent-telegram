@@ -29,6 +29,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from xgent_app.web_media import current_media_presentation
+from xgent_app.ui_history import UiHistoryError, capture_ui_frame, resolve_callback
 
 from xgent_app.fanout import (
     ChannelWorker,
@@ -361,7 +362,7 @@ class WebMessage:
         return await self.bot.delete_message(chat_id=self.chat_id, message_id=self.message_id)
 
 
-def _markup_to_frame(reply_markup: Any) -> Optional[List[List[Dict[str, str]]]]:
+def _markup_to_frame(reply_markup: Any) -> Optional[List[List[Dict[str, Any]]]]:
     """把 InlineKeyboardMarkup 拍平成可 JSON 化的结构。
 
     保留 text + callback_data + url。Telegram 要求每个内联按钮必须带一个目标
@@ -374,9 +375,9 @@ def _markup_to_frame(reply_markup: Any) -> Optional[List[List[Dict[str, str]]]]:
     keyboard = getattr(reply_markup, "inline_keyboard", None)
     if not keyboard:
         return None
-    rows: List[List[Dict[str, str]]] = []
+    rows: List[List[Dict[str, Any]]] = []
     for row in keyboard:
-        buttons: List[Dict[str, str]] = []
+        buttons: List[Dict[str, Any]] = []
         for button in row:
             item = {
                 "text": str(getattr(button, "text", "")),
@@ -385,6 +386,13 @@ def _markup_to_frame(reply_markup: Any) -> Optional[List[List[Dict[str, str]]]]:
             url = getattr(button, "url", None)
             if url:
                 item["url"] = str(url)
+            web_app = getattr(button, 'web_app', None)
+            if web_app is not None and getattr(web_app, 'url', None):
+                item['url'] = str(web_app.url)
+                item['web_app'] = True
+            action = resolve_callback(item['callback_data']) if item['callback_data'] else ''
+            if action != item['callback_data']:
+                item['callback_action'] = action
             buttons.append(item)
         if buttons:
             rows.append(buttons)
@@ -401,7 +409,7 @@ def markup_from_frame(rows: Any) -> Optional[Any]:
     if not rows:
         return None
     try:
-        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
     except ImportError:  # pragma: no cover
         return None
     keyboard = []
@@ -414,7 +422,8 @@ def markup_from_frame(rows: Any) -> Optional[Any]:
             callback_data = str(btn.get("callback_data") or "")
             url = str(btn.get("url") or "")
             if url:
-                buttons.append(InlineKeyboardButton(text, url=url))
+                buttons.append(InlineKeyboardButton(text, web_app=WebAppInfo(url=url)) if btn.get('web_app')
+                               else InlineKeyboardButton(text, url=url))
             elif callback_data:
                 buttons.append(InlineKeyboardButton(text, callback_data=callback_data))
         if buttons:
@@ -439,6 +448,18 @@ def _present_media_frame(frame: Dict[str, Any]) -> Dict[str, Any]:
             'parse_mode': None, 'msg_type': 'ai_reply',
             'media_group_id': presentation['media_group_id'], 'media': media,
             'replace_message_ids': presentation.get('replace_message_ids', [])}
+
+
+async def emit_ui_frame(outbox: WebOutbox, chat_id: int, frame_type: str,
+                        *, source: Optional[str] = None, **fields: Any) -> None:
+    frame = {'type': frame_type, 'ts': time.time(), **fields}
+    try:
+        frame = await capture_ui_frame(frame, chat_id, source=source)
+    except UiHistoryError as exc:
+        logging.getLogger(__name__).warning('UI state was not saved: %s', exc)
+        outbox.put({'type': 'callback_answer', 'text': str(exc), 'show_alert': True})
+        raise
+    outbox.put(_present_media_frame(frame))
 
 
 class WebBot:
@@ -470,7 +491,7 @@ class WebBot:
     async def send_message(self, chat_id: int, text: str, reply_markup: Any = None,
                            parse_mode: Any = None, **kwargs: Any) -> WebMessage:
         message_id = self._allocate_message_id()
-        self._emit(
+        await emit_ui_frame(self.outbox, self.chat_id,
             "message",
             message_id=message_id,
             text=str(text),
@@ -482,7 +503,7 @@ class WebBot:
     async def edit_message_text(self, text: str, chat_id: Optional[int] = None,
                                 message_id: Optional[int] = None, reply_markup: Any = None,
                                 parse_mode: Any = None, **kwargs: Any) -> WebMessage:
-        self._emit(
+        await emit_ui_frame(self.outbox, self.chat_id,
             "edit",
             message_id=message_id,
             text=str(text),
@@ -494,13 +515,13 @@ class WebBot:
     async def edit_message_reply_markup(self, chat_id: Optional[int] = None,
                                         message_id: Optional[int] = None,
                                         reply_markup: Any = None, **kwargs: Any) -> bool:
-        self._emit("edit_markup", message_id=message_id,
-                   reply_markup=_markup_to_frame(reply_markup))
+        await emit_ui_frame(self.outbox, self.chat_id, "edit_markup", message_id=message_id,
+                            reply_markup=_markup_to_frame(reply_markup))
         return True
 
     async def delete_message(self, chat_id: Optional[int] = None,
                              message_id: Optional[int] = None, **kwargs: Any) -> bool:
-        self._emit("delete", message_id=message_id)
+        await emit_ui_frame(self.outbox, self.chat_id, "delete", message_id=message_id)
         return True
 
     async def send_chat_action(self, chat_id: Optional[int] = None,
@@ -742,10 +763,11 @@ class MirrorBot:
     _is_xgent_web_bot = True
 
     def __init__(self, outbox: WebOutbox, chat_id: int, real_bot: Any = None,
-                 channel: Any = None):
+                 channel: Any = None, ui_source: Optional[str] = None):
         self.outbox = outbox
         self.chat_id = chat_id
         self.real_bot = real_bot
+        self._ui_source = ui_source
         self._next_message_id = 1
         self._id_lock = threading.Lock()
         self._channel = channel
@@ -902,8 +924,8 @@ class MirrorBot:
         target = int(chat_id) if chat_id is not None else self.chat_id
         message_id = self._resolve_send_id(relay_message_id)
         # 先推网页帧，再交给 Telegram 通道：网页不等 Telegram。
-        self._emit(
-            "message", message_id=message_id, text=str(text),
+        await emit_ui_frame(self.outbox, self.chat_id,
+            "message", source=self._ui_source, message_id=message_id, text=str(text),
             parse_mode=str(parse_mode) if parse_mode else None,
             reply_markup=_markup_to_frame(reply_markup),
         )
@@ -920,8 +942,8 @@ class MirrorBot:
                                 parse_mode: Any = None, **kwargs: Any) -> WebMessage:
         target = int(chat_id) if chat_id is not None else self.chat_id
         logical, native = self._target_ids(message_id)
-        self._emit(
-            "edit", message_id=logical, text=str(text),
+        await emit_ui_frame(self.outbox, self.chat_id,
+            "edit", source=self._ui_source, message_id=logical, text=str(text),
             parse_mode=str(parse_mode) if parse_mode else None,
             reply_markup=_markup_to_frame(reply_markup),
         )
@@ -939,8 +961,8 @@ class MirrorBot:
                                         reply_markup: Any = None, **kwargs: Any) -> bool:
         target = int(chat_id) if chat_id is not None else self.chat_id
         logical, native = self._target_ids(message_id)
-        self._emit("edit_markup", message_id=logical,
-                   reply_markup=_markup_to_frame(reply_markup))
+        await emit_ui_frame(self.outbox, self.chat_id, "edit_markup", source=self._ui_source,
+                            message_id=logical, reply_markup=_markup_to_frame(reply_markup))
         self._offer(OP_EDIT_MARKUP, logical_id=logical, chat_id=target, payload={
             "reply_markup": _markup_to_frame(reply_markup),
             "native_id": native,
@@ -952,7 +974,7 @@ class MirrorBot:
                              message_id: Optional[int] = None, **kwargs: Any) -> bool:
         target = int(chat_id) if chat_id is not None else self.chat_id
         logical, native = self._target_ids(message_id)
-        self._emit("delete", message_id=logical)
+        await emit_ui_frame(self.outbox, self.chat_id, "delete", source=self._ui_source, message_id=logical)
         self._offer(OP_DELETE, logical_id=logical, chat_id=target,
                     payload={"native_id": native,
                              "kwargs": self._passthrough(kwargs)})
@@ -1234,7 +1256,9 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
     async def send_message(*args: Any, **kwargs: Any) -> Any:
         result = await saved["send_message"](real_bot, *args, **kwargs)
         try:
-            emit("message", message_id=getattr(result, "message_id", 0),
+            await emit_ui_frame(outbox, int(getattr(result, 'chat_id', None) or kwargs.get('chat_id')
+                                           or (args[0] if args else 0)),
+                 "message", source='telegram', message_id=getattr(result, "message_id", 0),
                  text=_kw_text(kwargs, args, send=True),
                  parse_mode=str(kwargs.get("parse_mode")) if kwargs.get("parse_mode") else None,
                  reply_markup=_markup_to_frame(kwargs.get("reply_markup")))
@@ -1250,7 +1274,9 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
             mid = kwargs.get("message_id")
             if mid is None and len(args) >= 3:
                 mid = args[2]
-            emit("edit", message_id=mid, text=_kw_text(kwargs, args),
+            await emit_ui_frame(outbox, int(kwargs.get('chat_id') or getattr(result, 'chat_id', None)
+                                           or (args[1] if len(args) >= 2 else 0)),
+                 "edit", source='telegram', message_id=mid, text=_kw_text(kwargs, args),
                  parse_mode=str(kwargs.get("parse_mode")) if kwargs.get("parse_mode") else None,
                  reply_markup=_markup_to_frame(kwargs.get("reply_markup")))
         except Exception:  # noqa: BLE001
@@ -1265,7 +1291,8 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
             mid = kwargs.get("message_id")
             if mid is None and len(args) >= 2:
                 mid = args[1]
-            emit("edit_markup", message_id=mid,
+            await emit_ui_frame(outbox, int(kwargs.get('chat_id') or (args[0] if args else 0)),
+                 "edit_markup", source='telegram', message_id=mid,
                  reply_markup=_markup_to_frame(kwargs.get("reply_markup")))
         except Exception:  # noqa: BLE001
             pass
@@ -1279,7 +1306,8 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
             mid = kwargs.get("message_id")
             if mid is None and len(args) >= 2:
                 mid = args[1]
-            emit("delete", message_id=mid)
+            await emit_ui_frame(outbox, int(kwargs.get('chat_id') or (args[0] if args else 0)),
+                                "delete", source='telegram', message_id=mid)
         except Exception:  # noqa: BLE001
             pass
         return result

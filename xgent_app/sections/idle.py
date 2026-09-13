@@ -164,10 +164,12 @@ WEB_EDITABLE_SETTINGS = {
 async def _web_read_history(limit: int) -> List[Dict[str, Any]]:
     db = await BotMemoryDB.get_instance()
     rows = await db.get_display_history(limit)
-    return await asyncio.to_thread(
+    messages = await asyncio.to_thread(
         lambda: [build_history_message(row, ArtifactManager.ROOT_DIR, os.path.join(AgentExecutor.WORK_DIR, 'workspace'))
                  for row in rows]
     )
+    return UiHistorySnapshot(messages, generation=getattr(rows, 'generation', None),
+                             tombstones=getattr(rows, 'tombstones', ()))
 
 
 async def _web_read_history_message(row_id: int) -> Optional[Dict[str, Any]]:
@@ -189,7 +191,11 @@ def _relay_markup_to_telegram(rows: Any) -> Optional[Any]:
     """
     if not rows:
         return None
-    return markup_from_frame(rows)
+    return markup_from_frame([
+        [{**button, 'callback_data': CallbackDataStore.store(button['callback_action'])}
+         if button.get('callback_action') else button for button in row]
+        for row in rows
+    ])
 
 
 # --- ☆ Telegram 出站通道 ☆ ---
@@ -345,7 +351,7 @@ def _relay_mirror_for(session_id: str, chat_id: int) -> Any:
     mirror = _relay_mirrors.get(session_id)
     if mirror is None:
         mirror = MirrorBot(_web_external_outbox, chat_id, real_bot=tg_bot,
-                           channel=telegram_channel())
+                           channel=telegram_channel(), ui_source='cli:' + session_id)
         while len(_relay_mirrors) >= _RELAY_MIRROR_MAX_SESSIONS:
             _relay_mirrors.popitem(last=False)
         _relay_mirrors[session_id] = mirror
@@ -358,7 +364,7 @@ def _relay_mirror_for(session_id: str, chat_id: int) -> Any:
 
 
 async def _replay_relay_op(mirror: Any, op: str, payload: Dict[str, Any]) -> None:
-    with media_presentation_scope(payload.get('media_presentation')):
+    with media_presentation_scope(payload.get('media_presentation')), replay_ui_context(payload.get('ui_context')):
         await _replay_relay_op_with_presentation(mirror, op, payload)
 
 
@@ -878,11 +884,37 @@ async def _web_handle_callback(callback_data: str, message_id: int, outbox: Any)
         BotConfig.AUTHORIZED_USER_ID, outbox, callback_data, message_id,
     )
     try:
-        await handle_button_click(update, context)
+        if callback_data == 'act_stop_generation':
+            await handle_button_click(update, context)
+        else:
+            async with ui_operation(capture_text=True):
+                await handle_button_click(update, context)
         outbox.put({"type": "callback_done"})
     except Exception as e:
         logger.exception("Web 回调失败")
         outbox.put({"type": "turn_error", "text": redact_sensitive_text(str(e))[:300]})
+
+
+async def _web_handle_ui_callback(ui_message_id: str, revision: int, button_id: str, outbox: Any) -> None:
+    from xgent_app.web_bridge import _allocate_web_message_id
+    try:
+        async with callback_lock(ui_message_id):
+            db = await BotMemoryDB.get_instance()
+            row, action = await validated_button(db, ui_message_id, revision, button_id)
+            validate_saved_menu_action(action)
+            message_id = _allocate_web_message_id()
+            update, context, _bot = build_web_callback_objects(
+                BotConfig.AUTHORIZED_USER_ID, outbox, action, message_id,
+            )
+            async with ui_operation(capture_text=True, binding=row, message_id=message_id):
+                await handle_button_click(update, context)
+    except UiHistoryError as exc:
+        outbox.put({'type': 'callback_answer', 'text': str(exc), 'show_alert': True})
+    except Exception:
+        logger.exception('Web saved-menu callback failed')
+        outbox.put({'type': 'callback_answer', 'text': '菜单操作失败，请重新打开菜单。', 'show_alert': True})
+    finally:
+        outbox.put({'type': 'callback_done', 'resync': True})
 
 
 async def _web_handle_command(command: str, outbox: Any) -> None:
@@ -908,7 +940,8 @@ async def _web_handle_command(command: str, outbox: Any) -> None:
             )
             await process_conversation(update, context, command)
         else:
-            await handler(update, context)
+            async with ui_operation(capture_text=True):
+                await handler(update, context)
         outbox.put({"type": "turn_end"})
     except Exception as e:
         logger.exception("Web 命令失败: %s", command)
@@ -1208,6 +1241,16 @@ def _web_submit_callback(callback_data: str, message_id: int, outbox: Any) -> No
     )
 
 
+def _web_submit_ui_callback(ui_message_id: str, revision: int, button_id: str, outbox: Any) -> None:
+    loop = _web_chat_server.config.loop if _web_chat_server else None
+    if loop is None:
+        outbox.put({'type': 'callback_answer', 'text': '服务未就绪', 'show_alert': True})
+        return
+    asyncio.run_coroutine_threadsafe(
+        _web_handle_ui_callback(ui_message_id, revision, button_id, outbox), loop,
+    )
+
+
 def _web_submit_command(command: str, outbox: Any) -> None:
     """HTTP 线程调用：把网页 /命令丢进事件循环。"""
     _ensure_web_command_map()
@@ -1238,21 +1281,22 @@ def mirror_to_web(handler):
 
     process_conversation 内部已装 install_tg_to_web_mirror，但命令和按钮回调不走
     process_conversation，所以 web 端看不到 TG 端的菜单切换/按钮变化。本装饰器在
-    handler 入口装镜像（web 在线时），finally restore，让 handler 里的
+    handler 入口装镜像，finally restore，让 handler 里的
     send_message / edit_text / edit_reply_markup 等也推网页 SSE 帧。
 
-    web 未运行时零开销——直接调原 handler。重入安全由 install_tg_to_web_mirror
-    内部的 _ACTIVE_MIRRORS 计数保证。
+    Web 未运行时仍保存菜单状态，之后开启网页可恢复。重入安全由镜像计数保证。
     """
     async def wrapped(update, context):
-        if not is_web_chat_running():
-            return await handler(update, context)
         from xgent_app.web_bridge import install_tg_to_web_mirror
-        outbox = get_web_outbox()
-        real_bot = get_web_real_bot()
+        outbox = get_web_outbox() or _web_external_outbox
+        real_bot = get_web_real_bot() or context.bot
         restore = install_tg_to_web_mirror(real_bot, outbox)
         try:
-            return await handler(update, context)
+            if getattr(getattr(update, 'callback_query', None), 'data', None) == 'act_stop_generation':
+                return await handler(update, context)
+            authorized = getattr(getattr(update, 'effective_user', None), 'id', None) == BotConfig.AUTHORIZED_USER_ID
+            async with ui_operation(capture_text=authorized):
+                return await handler(update, context)
         finally:
             restore()
     wrapped.__name__ = getattr(handler, "__name__", "wrapped")
@@ -1319,6 +1363,7 @@ async def start_web_chat_if_enabled(app: Optional[Any] = None, *,
         loop=asyncio.get_running_loop(),
         submit_message=_web_submit_message,
         submit_callback=_web_submit_callback,
+        submit_ui_callback=_web_submit_ui_callback,
         submit_command=_web_submit_command,
         submit_upload=_web_submit_upload,
         # 上传上限按 API_BASE_URL 选档，与 agent_sendfile.py 发送侧阈值同源：

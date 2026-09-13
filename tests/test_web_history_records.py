@@ -161,7 +161,9 @@ async def main():
     print(json.dumps({
         "reset_first": frames[0]["type"] == "history_reset",
         "single_reset": sum(frame["type"] == "history_reset" for frame in frames) == 1,
-        "history_empty": await ns["_web_read_history"](0) == [],
+        "history_cleared_with_fresh_menu": all(
+            row['msg_type'] == 'ui_message' for row in await ns['_web_read_history'](0)),
+        "model_history_empty": not (await db.get_compression_snapshot())['records'],
         "revoked": await ns["_web_read_history_message"](row_id) is None,
         "original_kept": Path(saved["abs_path"]).read_bytes() == b"original",
     }))

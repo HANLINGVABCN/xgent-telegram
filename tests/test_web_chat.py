@@ -17,6 +17,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from unittest.mock import patch
 
 from xgent_app import web_auth
 from xgent_app.web_bridge import WebBot, WebOutbox, build_web_conversation_objects
@@ -509,6 +510,34 @@ class WebServerHttpTests(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/", timeout=10) as resp:
             self.assertEqual(200, resp.status)
             self.assertIn(b"XGent Web Chat", resp.read())
+
+    def test_durable_callbacks_route_by_identity_without_trusting_client_action(self):
+        calls = []
+        cookie = self.login()
+        with patch.object(self.config, 'submit_ui_callback', lambda *args: calls.append(args)), \
+                patch.object(self.config, 'submit_callback', side_effect=AssertionError('legacy fallback')):
+            body = {'ui_message_id': 'a' * 32, 'revision': 8, 'button_id': '2:1',
+                    'callback_data': 'forged action', 'message_id': 12}
+            self.assertEqual(200, self.request('/api/callback', 'POST', body, cookie)[0])
+            self.assertEqual(('a' * 32, 8, '2:1'), calls[0][:3])
+            for values in ({'revision': True}, {'revision': 0}, {'revision': '8'},
+                           {'ui_message_id': ''}, {'ui_message_id': '../bad'},
+                           {'button_id': '99'}, {'button_id': None}):
+                self.assertEqual(400, self.request('/api/callback', 'POST', {**body, **values}, cookie)[0])
+            self.assertEqual(1, len(calls))
+            self.assertEqual(401, self.request('/api/callback', 'POST', body)[0])
+
+    def test_history_exposes_ui_generation_and_tombstones(self):
+        from xgent_app.ui_history import UiHistorySnapshot
+        tombstone = {'ui_message_id': 'b' * 32, 'revision': 5, 'ui_generation': 3}
+        snapshot = UiHistorySnapshot([{'role': 'user', 'content': 'retained'}],
+                                     generation=3, tombstones=[tombstone])
+        with patch.object(self.config, 'read_history', _async_result(snapshot)):
+            status, body, _ = self.request('/api/history', cookie=self.login())
+        self.assertEqual(200, status)
+        self.assertEqual(3, body['ui_generation'])
+        self.assertEqual([tombstone], body['ui_tombstones'])
+        self.assertEqual(list(snapshot), body['messages'])
 
     def test_api_requires_auth(self):
         for path in ("/api/history", "/api/config", "/api/stream", "/api/events", "/api/health"):

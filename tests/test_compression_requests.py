@@ -13,6 +13,12 @@ def probe(name, root):
 
 
 class CompressionRequestTests(unittest.TestCase):
+    def test_input_isolation_across_all_providers_and_renderers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            results = probe('input_isolation', Path(directory))
+            self.assertEqual(15, len(results))
+            self.assertTrue(all(results.values()))
+
     def test_all_providers_round_trips_and_fresh_process(self):
         with tempfile.TemporaryDirectory() as directory:
             results = probe('round_trips', Path(directory))

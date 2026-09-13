@@ -107,6 +107,7 @@ class TelegramRichAPI:
             raise TelegramError(f"sendRichMessageDraft failed: {result.get('description', result)}")
         return result
 
+@without_ui_history
 async def rich_finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
                                        msg: Any, response: str, limit: int = RICH_MESSAGE_CHAR_LIMIT):
     """使用 Rich Message 发送最终回复。失败时 fallback 到旧 HTML 编辑模式。"""
@@ -629,6 +630,7 @@ async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
 
     return sent
 
+@without_ui_history
 async def finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: Any,
                                  response: str, limit: int = 4000):
     html_response = markdown_to_telegram_html(response)
@@ -1034,6 +1036,7 @@ async def _preserve_media_after_error(generated_reply, raw, *, stopped=False):
         return text, exc
 
 
+@without_ui_history
 async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                    prov_name: str, prov_data: Dict, model: str,
                                    system_prompt: str, history: List[Dict],
@@ -1394,6 +1397,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
                 pass
 
 
+@without_ui_history
 async def send_background_streaming_response(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                               prov_name: str, prov_data: Dict, model: str,
                                               system_prompt: str, history: List[Dict],
@@ -1728,6 +1732,7 @@ def _nonstream_hard_timeout_seconds() -> float:
     return configured + 30.0
 
 
+@without_ui_history
 async def send_non_streaming_response(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                        prov_name: str, prov_data: Dict, model: str,
                                        system_prompt: str, history: List[Dict],
