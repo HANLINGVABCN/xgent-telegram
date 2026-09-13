@@ -23,6 +23,26 @@ class CompressionPromptTests(unittest.TestCase):
         path = Path(__file__).resolve().parents[1] / 'prompts' / 'compression.txt'
         self.assertEqual(DEFAULT_COMPRESSION_PROMPT, path.read_text(encoding='utf-8').strip())
 
+    def test_prompt_declares_fact_level_detail_without_a_word_target(self):
+        for clause in (
+            '\u4ee5\u72ec\u7acb\u4fe1\u606f\u70b9\u4e3a\u8bb0\u5f55\u5355\u4f4d',
+            '\u4e0d\u5f97\u7528\u4e00\u4e2a\u4e3b\u9898\u540d\u6216\u4e00\u53e5\u7ed3\u8bba'
+            '\u4ee3\u66ff\u591a\u4e2a\u72ec\u7acb\u4fe1\u606f\u70b9',
+            '\u4e0d\u8bbe\u56fa\u5b9a\u5b57\u6570',
+            '\u53ea\u4fdd\u7559\u539f\u6587\u5df2\u5199\u51fa\u7684\u7406\u7531\u548c\u4f9d\u636e',
+        ):
+            with self.subTest(clause=clause):
+                self.assertIn(clause, DEFAULT_COMPRESSION_PROMPT)
+
+    def test_detail_examples_are_explicitly_not_conversation_facts(self):
+        examples = DEFAULT_COMPRESSION_PROMPT.split(
+            '## \u8bb0\u5f55\u7c92\u5ea6\u793a\u4f8b\n', 1)[1].split(
+            '## \u8f93\u51fa\u7ed3\u6784\n', 1)[0]
+        self.assertIn('\u4e0d\u662f\u672c\u6b21\u5bf9\u8bdd\u4e8b\u5b9e', examples)
+        self.assertIn('\u4e0d\u5f97\u628a\u793a\u4f8b\u4e2d\u7684', examples)
+        self.assertEqual(2, examples.count('- \u4e0d\u5408\u683c\u8bb0\u5f55\uff1a'))
+        self.assertEqual(2, examples.count('- \u5408\u683c\u8bb0\u5f55\uff1a'))
+
 
 class ConversationExportTests(unittest.TestCase):
     def setUp(self):
