@@ -300,6 +300,50 @@ class WebBridgeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WebOutboxTests(unittest.TestCase):
+    def test_replay_is_numbered_repeatable_and_independent_of_subscribers(self):
+        outbox = WebOutbox()
+        initial = outbox.read_events()
+        with outbox.subscribe(numbered=True) as stream:
+            self.assertEqual(initial['epoch'], stream.epoch)
+            self.assertEqual(initial['cursor'], stream.cursor)
+            for index in range(3):
+                outbox.put({'type': 'edit', 'message_id': 17, 'text': str(index)})
+            batch = outbox.read_events(initial['cursor'], initial['epoch'])
+            self.assertEqual([1, 2, 3], [event['id'] for event in batch['events']])
+            self.assertEqual(batch['events'], [stream.get(0.1) for _ in range(3)])
+        self.assertEqual(batch, outbox.read_events(initial['cursor'], initial['epoch']))
+        self.assertEqual([], outbox.read_events(batch['cursor'], batch['epoch'])['events'])
+        self.assertEqual([], outbox.read_events()['events'])
+
+    def test_replay_overflow_restart_and_clear_require_resync(self):
+        outbox = WebOutbox(maxsize=2)
+        initial = outbox.read_events()
+        for index in range(3):
+            outbox.put({'type': 'message', 'text': f'old-{index}'})
+        self.assertTrue(outbox.read_events(0, initial['epoch'])['reset'])
+        first = outbox.read_events(1, initial['epoch'], limit=1)
+        self.assertTrue(first['more'])
+        self.assertEqual(2, first['cursor'])
+        self.assertFalse(outbox.read_events(2, initial['epoch'])['more'])
+        outbox.put({'type': 'history_reset'})
+        cleared = outbox.read_events(3, initial['epoch'])
+        self.assertTrue(cleared['reset'])
+        self.assertNotEqual(initial['epoch'], cleared['epoch'])
+        self.assertNotIn('old-', json.dumps(outbox.read_events(0, cleared['epoch'])))
+        self.assertTrue(WebOutbox().read_events(cleared['cursor'], cleared['epoch'])['reset'])
+
+    def test_replay_memory_is_bounded_and_frames_are_snapshots(self):
+        outbox = WebOutbox(replay_bytes=200)
+        initial = outbox.read_events()
+        frame = {'type': 'message', 'text': 'saved'}
+        outbox.put(frame)
+        frame['text'] = 'mutated'
+        self.assertEqual('saved', outbox.read_events(0, initial['epoch'])['events'][0]['frame']['text'])
+        outbox.put({'type': 'message', 'text': 'x' * 201})
+        batch = outbox.read_events(0, initial['epoch'])
+        self.assertTrue(batch['reset'])
+        self.assertEqual([], batch['events'])
+
     def test_get_timeout_returns_none(self):
         outbox = WebOutbox()
         stream = outbox.subscribe()
@@ -467,9 +511,48 @@ class WebServerHttpTests(unittest.TestCase):
             self.assertIn(b"XGent Web Chat", resp.read())
 
     def test_api_requires_auth(self):
-        for path in ("/api/history", "/api/config", "/api/stream", "/api/health"):
+        for path in ("/api/history", "/api/config", "/api/stream", "/api/events", "/api/health"):
             status, _body, _h = self.request(path)
             self.assertEqual(401, status, path)
+
+    def test_event_batches_complete_without_sse_and_replay_identically(self):
+        cookie = self.login()
+        status, initial, _ = self.request('/api/events', cookie=cookie)
+        self.assertEqual(200, status)
+        self.server.outbox.put({'type': 'edit', 'message_id': 61, 'text': 'progress'})
+        self.server.outbox.put({'type': 'turn_end'})
+        path = f"/api/events?after={initial['cursor']}&epoch={initial['epoch']}"
+        status, batch, headers = self.request(path, cookie=cookie)
+        self.assertEqual(200, status)
+        self.assertIn('no-store', headers['Cache-Control'])
+        self.assertIn('no-transform', headers['Cache-Control'])
+        self.assertGreater(int(headers['Content-Length']), 0)
+        self.assertEqual(['edit', 'turn_end'], [event['frame']['type'] for event in batch['events']])
+        self.assertEqual(batch, self.request(path, cookie=cookie)[1])
+        self.assertEqual(400, self.request('/api/events?after=-1', cookie=cookie)[0])
+        self.assertEqual(400, self.request('/api/events?after=garbage', cookie=cookie)[0])
+        original = self.config.is_web_enabled
+        self.config.is_web_enabled = lambda: False
+        try:
+            self.assertEqual(403, self.request(path, cookie=cookie)[0])
+        finally:
+            self.config.is_web_enabled = original
+
+    def test_stream_readiness_and_event_ids_share_replay_cursor(self):
+        cookie = self.login()
+        request = urllib.request.Request(self.base + '/api/stream', headers={'Cookie': cookie})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            self.assertEqual(b'event: ready\n', response.readline())
+            ready = json.loads(response.readline().decode().removeprefix('data: '))
+            self.assertEqual(b'\n', response.readline())
+            self.assertIn('no-transform', response.headers['Cache-Control'])
+            frame = {'type': 'message', 'message_id': 72, 'text': 'live text'}
+            self.server.outbox.put(frame)
+            event_id = response.readline().decode().strip().removeprefix('id: ')
+            self.assertEqual(f"{ready['epoch']}:{ready['cursor'] + 1}", event_id)
+            self.assertEqual(frame, json.loads(response.readline().decode().removeprefix('data: ')))
+        batch = self.server.outbox.read_events(ready['cursor'], ready['epoch'])
+        self.assertEqual(frame, batch['events'][0]['frame'])
 
     def test_liveness_probe_is_unauthenticated_and_leaks_nothing(self):
         """/healthz 给 nginx/PM2 探活用：不鉴权，但也**只**回一个 ok。

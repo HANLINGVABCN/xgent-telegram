@@ -242,6 +242,7 @@ def build_application() -> Any:
         ("media_model", cmd_media_model_menu),
         ("prompts", cmd_prompts_menu),
         ("clear_memory", cmd_delete_chat),
+        ("compress", cmd_compress),
         ("depth", cmd_depth_menu),
         ("params", cmd_timeout_menu),
         ("thinking", cmd_thinking_menu),

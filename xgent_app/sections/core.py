@@ -77,6 +77,7 @@ load_dotenv()
 # --- ☆ 全局控制状态 ☆ ---
 _stop_generation_event: Optional[asyncio.Event] = None   # 停止生成事件
 _is_processing = False                                    # 处理中锁
+_compression_running = False
 _conversation_processing_lock = asyncio.Lock()
 _startup_commands_synced = False
 _startup_menu_sent = False
@@ -1213,6 +1214,7 @@ class PromptFileManager:
     PROMPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prompts')
     
     FILES = {
+        'compression_prompt': 'compression.txt',
         'assistant_prompt': 'main.txt',
         'global_prompt_addon': 'global_addon.txt',
         'agent_prompt_addon': 'agent_addon.txt',
@@ -1222,6 +1224,7 @@ class PromptFileManager:
     }
 
     LABELS = {
+        'compression_prompt': '上下文压缩提示词',
         'assistant_prompt': '助手提示词',
         'global_prompt_addon': '全局追加提示词',
         'agent_prompt_addon': 'Agent 模式提示词',
@@ -1240,9 +1243,14 @@ class PromptFileManager:
             filepath = os.path.join(cls.PROMPTS_DIR, filename)
             if not os.path.exists(filepath):
                 os.makedirs(os.path.dirname(filepath), exist_ok=True)
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    f.write('')
-                logger.warning(f"提示词文件不存在，已创建空文件: {filename}")
+                try:
+                    with open(filepath, 'x', encoding='utf-8') as f:
+                        if key == 'compression_prompt':
+                            from xgent_app.compression import DEFAULT_COMPRESSION_PROMPT
+                            f.write(DEFAULT_COMPRESSION_PROMPT + '\n')
+                    logger.warning(f"提示词文件不存在，已创建: {filename}")
+                except FileExistsError:
+                    pass
         cls.reload_all()
     
     @classmethod
@@ -1262,21 +1270,44 @@ class PromptFileManager:
     def get(cls, key: str) -> str:
         """获取提示词内容"""
         return cls._cache.get(key, '')
+
+    @classmethod
+    def get_required(cls, key: str) -> str:
+        # A stale cache must not hide a deleted, unreadable or emptied file.
+        with open(cls.get_abs_path(key), 'r', encoding='utf-8') as handle:
+            disk_content = handle.read()
+        content = cls.get(key)
+        if not disk_content.strip() or not content.strip():
+            raise ValueError(f"{cls.get_label(key)}为空，请编辑或从文件重载。")
+        return content
     
     @classmethod
     def set(cls, key: str, content: str):
         """设置提示词并同步写入文件"""
-        cls._cache[key] = content
         filename = cls.FILES.get(key)
         if filename:
             filepath = os.path.join(cls.PROMPTS_DIR, filename)
+            temporary = None
             try:
                 os.makedirs(os.path.dirname(filepath), exist_ok=True)
-                with open(filepath, 'w', encoding='utf-8') as f:
+                with tempfile.NamedTemporaryFile(
+                    mode='w', encoding='utf-8', dir=os.path.dirname(filepath),
+                    prefix='.prompt-', suffix='.tmp', delete=False,
+                ) as f:
+                    temporary = f.name
                     f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temporary, filepath)
+                cls._cache[key] = content
                 logger.info(f"提示词已写入文件: {filename}")
             except Exception as e:
                 logger.error(f"写入提示词文件失败 {filename}: {e}")
+                raise
+            finally:
+                if temporary is not None:
+                    with contextlib.suppress(OSError):
+                        os.unlink(temporary)
 
     @classmethod
     def get_path(cls, key: str) -> str:

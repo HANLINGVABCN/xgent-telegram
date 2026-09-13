@@ -65,7 +65,7 @@ VENDOR_ASSETS: Dict[str, Any] = {
 }
 
 # SSE 心跳间隔。低于常见反代的 60s 空闲超时。
-SSE_HEARTBEAT_SECONDS = 25.0
+SSE_HEARTBEAT_SECONDS = 10.0
 
 
 class WebChatConfig:
@@ -167,7 +167,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         for key, value in (extra_headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
-        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+        with contextlib.suppress(ConnectionError):
             self.wfile.write(raw)
         if status != 200 and getattr(self, "command", "") == "POST":
             with contextlib.suppress(Exception):
@@ -358,11 +358,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._handle_read_config()
             elif path == "/api/stream":
                 self._handle_stream()
+            elif path == "/api/events":
+                self._handle_events()
             elif path == "/api/term/output":
                 self._handle_term_output()
             else:
                 self._send_json({"error": "not found"}, status=404)
-        except (BrokenPipeError, ConnectionResetError):
+        except ConnectionError:
             pass
         except Exception:
             logger.exception("web GET %s 失败", path)
@@ -707,6 +709,20 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.config.submit_command(command, outbox)
         self._send_json({"ok": True})
 
+    def _handle_events(self) -> None:
+        if not self._require_auth() or not self._require_web_enabled():
+            return
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        raw_cursor = (query.get('after') or [None])[0]
+        if raw_cursor is not None and not re.fullmatch(r'\d{1,16}', raw_cursor):
+            self._send_json({'error': 'invalid event cursor'}, status=400)
+            return
+        epoch = (query.get('epoch') or [''])[0]
+        payload = self.server.outbox.read_events(  # type: ignore[attr-defined]
+            int(raw_cursor) if raw_cursor is not None else None, epoch,
+        )
+        self._send_json(payload, extra_headers={'Cache-Control': 'private, no-store, no-transform'})
+
     def _handle_stream(self) -> None:
         if not self._require_auth():
             return
@@ -717,25 +733,27 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         try:
             # 每条连接一个独立订阅：帧是广播给所有连接的，不是被谁抢走一份。
             # 退出 with 时自动摘除，死连接不会继续占着广播位。
-            with outbox.subscribe() as stream:
+            with outbox.subscribe(numbered=True) as stream:
                 # 浏览器收到连接就绪后才请求历史；此时订阅必须已经建立。
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Cache-Control", "private, no-store, no-transform")
                 self.send_header("Connection", "keep-alive")
                 self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
-                self.wfile.write(b": connected\n\n")
+                ready = json.dumps({'epoch': stream.epoch, 'cursor': stream.cursor})
+                self.wfile.write(f"event: ready\ndata: {ready}\n\n".encode('utf-8'))
                 self.wfile.flush()
                 while not stop_event.is_set():
                     frame = stream.get(timeout=SSE_HEARTBEAT_SECONDS)
                     if frame is None:
-                        # 超时或队列关闭：发注释行保活，顺便探测连接是否还在。
-                        self.wfile.write(b": ping\n\n")
+                        # 超时或队列关闭：发送可观察的心跳，检测代理是否仍在转发。
+                        self.wfile.write(b"event: ping\ndata: {}\n\n")
                         self.wfile.flush()
                         continue
-                    payload = json.dumps(frame, ensure_ascii=False)
-                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                    payload = json.dumps(frame['frame'], ensure_ascii=False)
+                    event_id = f"{frame['epoch']}:{frame['id']}"
+                    self.wfile.write(f"id: {event_id}\ndata: {payload}\n\n".encode("utf-8"))
                     self.wfile.flush()
         except (ConnectionError, ValueError):
             # 浏览器关页面就是这条路径，属正常。

@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import copy
+import json
 import logging
 import mimetypes
 import ntpath
@@ -198,52 +200,95 @@ class WebOutbox:
         25 秒内它会继续抢帧、再写进已经死掉的 socket，这些帧就此**永久丢失**。
     表现就是网页消息缺失、错乱、不即时，必须手动刷新（重新拉 history）才恢复。
 
-    现在每个订阅者持有一条独立队列，put() 向所有订阅者各投一份，订阅者退出时
-    自行摘除。没有订阅者时 put() 直接丢弃：没人在线就不该攒帧，前端连上后会
-    重新拉一次 history 作为真相源，攒下来的旧帧反而会盖在新历史上造成错乱。
+    每个 SSE 订阅者持有一条独立队列，新订阅不回放旧帧。另保留有界事件日志，
+    不支持 SSE 的隧道通过短请求按游标补取增量，避免反复加载数据库历史。
 
     只提供 subscribe() 而不提供 outbox 级的 get()：广播总线上「先 put 再 get」
     本来就收不到，留一个看起来能用的 get() 只会把这类 bug 引回来。
     """
 
-    def __init__(self, maxsize: int = 1000):
+    def __init__(self, maxsize: int = 1000, replay_bytes: int = 8 * 1024 * 1024):
         self._maxsize = max(1, int(maxsize))
+        self._replay_limit = max(1, int(replay_bytes))
+        self._events = collections.deque()
+        self._event_bytes = 0
+        self._sequence = 0
+        self._epoch = secrets.token_hex(16)
         self._lock = threading.Lock()
-        self._queues: List["queue.Queue[Optional[Dict[str, Any]]]"] = []
+        self._queues: Dict["queue.Queue[Optional[Dict[str, Any]]]", bool] = {}
         self._closed = threading.Event()
 
-    def subscribe(self) -> "WebSubscription":
+    def subscribe(self, *, numbered: bool = False) -> "WebSubscription":
         """注册一个订阅者，返回它的私有帧视图。
 
         用 with 语句，或手动 close()，否则队列会留在广播列表里被一直投递。
         """
         q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=self._maxsize)
         with self._lock:
-            self._queues.append(q)
+            self._queues[q] = numbered
+            epoch, cursor = self._epoch, self._sequence
         if self._closed.is_set():
             # 在 close() 之后才订阅：立刻塞 None 唤醒，别让消费者干等一个 timeout。
             _offer(q, None)
-        return WebSubscription(self, q)
+        return WebSubscription(self, q, epoch, cursor)
 
     def _drop(self, q: "queue.Queue[Optional[Dict[str, Any]]]") -> None:
         with self._lock:
-            with contextlib.suppress(ValueError):
-                self._queues.remove(q)
+            self._queues.pop(q, None)
 
     def put(self, frame: Dict[str, Any]) -> None:
         """非阻塞广播给当前所有订阅者。"""
         if self._closed.is_set():
             return
+        saved = copy.deepcopy(frame)
+        size = len(json.dumps(saved, ensure_ascii=False).encode('utf-8'))
         with self._lock:
-            targets = list(self._queues)
-        for q in targets:
-            _offer(q, frame)
+            if saved.get('type') == 'history_reset':
+                self._events.clear()
+                self._event_bytes = self._sequence = 0
+                self._epoch = secrets.token_hex(16)
+            self._sequence += 1
+            event = {'epoch': self._epoch, 'id': self._sequence, 'frame': saved}
+            self._events.append((event, size))
+            self._event_bytes += size
+            while self._events and (len(self._events) > self._maxsize
+                                    or self._event_bytes > self._replay_limit):
+                self._event_bytes -= self._events.popleft()[1]
+            # Publish under the same lock so concurrent producers cannot reorder IDs.
+            for q, numbered in self._queues.items():
+                _offer(q, event if numbered else saved)
+
+    def read_events(self, after: Optional[int] = None, epoch: str = '',
+                    limit: int = 100) -> Dict[str, Any]:
+        """A finite, repeatable event batch; reading never consumes another tab's events."""
+        with self._lock:
+            oldest = self._events[0][0]['id'] if self._events else self._sequence + 1
+            reset = after is not None and (
+                epoch != self._epoch or after < oldest - 1 or after > self._sequence
+            )
+            events = []
+            cursor = self._sequence if after is None or reset else after
+            if after is not None and not reset:
+                size = 0
+                for event, length in self._events:
+                    if event['id'] <= after:
+                        continue
+                    events.append(event)
+                    size += length
+                    if len(events) >= max(1, min(limit, 100)) or size >= 512 * 1024:
+                        break
+                if events:
+                    cursor = events[-1]['id']
+            return {'epoch': self._epoch, 'cursor': cursor, 'events': events,
+                    'reset': reset, 'more': cursor < self._sequence}
 
     def close(self) -> None:
         self._closed.set()
         # 给每个订阅者塞一个 None，唤醒可能正在阻塞的消费者
         with self._lock:
             targets = list(self._queues)
+            self._events.clear()
+            self._event_bytes = 0
         for q in targets:
             _offer(q, None)
 
@@ -261,9 +306,12 @@ class WebOutbox:
 class WebSubscription:
     """单个 SSE 连接的私有帧视图。每个订阅者都能看到全量帧流。"""
 
-    def __init__(self, outbox: "WebOutbox", q: "queue.Queue[Optional[Dict[str, Any]]]"):
+    def __init__(self, outbox: "WebOutbox", q: "queue.Queue[Optional[Dict[str, Any]]]",
+                 epoch: str = '', cursor: int = 0):
         self._outbox = outbox
         self._queue = q
+        self.epoch = epoch
+        self.cursor = cursor
 
     def get(self, timeout: float = 25.0) -> Optional[Dict[str, Any]]:
         """取一帧；超时返回 None，供调用方发 SSE 心跳保活。"""

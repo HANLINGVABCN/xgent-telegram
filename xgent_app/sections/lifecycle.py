@@ -16,6 +16,7 @@ TELEGRAM_COMMAND_DESCRIPTIONS = (
     ("media_model", "选择默认媒体模型"),
     ("prompts", "管理提示词"),
     ("clear_memory", "清空上下文"),
+    ("compress", "压缩上下文并归档"),
     ("depth", "设置记忆深度"),
     ("params", "参数设置"),
     ("thinking", "设置思考深度"),

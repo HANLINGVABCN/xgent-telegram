@@ -139,6 +139,41 @@ try {
   await verifyHistory(page);
   console.log("ok desktop refresh, formatting, originals, downloads, search, reconnect");
 
+  async function openSettings(target) {
+    await target.locator("#btn-settings").click();
+    await target.locator(".skill-item").last().waitFor();
+  }
+  async function toggleSkill(target, key) {
+    const response = target.waitForResponse((res) => res.url().endsWith("/api/config")
+      && res.request().method() === "POST");
+    await target.locator(`.skill-item[data-path='daily.md'] [data-setting='${key}']`).click();
+    assert.equal((await response).status(), 200);
+    await target.waitForFunction(() => !document.querySelector(
+      ".skill-item[data-path='daily.md'] [data-setting='hidden_skills']").disabled);
+  }
+  await openSettings(page);
+  const enabled = page.locator(".skill-item[data-path='daily.md'] [data-setting='disabled_skills']");
+  const hidden = page.locator(".skill-item[data-path='daily.md'] [data-setting='hidden_skills']");
+  assert.equal(await enabled.getAttribute("aria-checked"), "true");
+  await toggleSkill(page, "disabled_skills");
+  assert.equal(await enabled.getAttribute("aria-checked"), "false");
+  await toggleSkill(page, "hidden_skills");
+  assert.equal(await enabled.isDisabled(), true);
+  await page.reload();
+  await ready(page);
+  await openSettings(page);
+  assert.equal(await hidden.getAttribute("aria-checked"), "true");
+  assert.equal(await enabled.getAttribute("aria-checked"), "false");
+  assert.equal(await enabled.isDisabled(), true);
+  await toggleSkill(page, "hidden_skills");
+  assert.equal(await enabled.getAttribute("aria-checked"), "false");
+  assert.equal(await enabled.isDisabled(), false);
+  await toggleSkill(page, "disabled_skills");
+  await page.locator(".skill-list").scrollIntoViewIfNeeded();
+  await page.screenshot({ path: path.join(output, "desktop-skills.png") });
+  await page.locator("#btn-close-settings").click();
+  console.log("ok three skill states, refresh persistence and unhide restoring disabled state");
+
   const mobile = await createPage({ width: 390, height: 844 });
   await verifyHistory(mobile.page);
   await mobile.page.reload();
@@ -151,6 +186,24 @@ try {
   await mobile.page.setViewportSize({ width: 320, height: 568 });
   await verifyHistory(mobile.page);
   await mobile.page.screenshot({ path: path.join(output, "mobile-narrow.png") });
+  await openSettings(mobile.page);
+  await mobile.page.locator(".skill-list").scrollIntoViewIfNeeded();
+  const skillDimensions = await mobile.page.locator(".skill-item").evaluateAll((items) => items.map((item) => {
+    const parent = item.getBoundingClientRect();
+    const name = item.querySelector(".skill-name").getBoundingClientRect();
+    const controls = item.querySelector(".skill-controls").getBoundingClientRect();
+    return {
+      contained: parent.left >= 0 && parent.right <= innerWidth
+        && name.left >= parent.left && name.right <= parent.right
+        && controls.left >= parent.left && controls.right <= parent.right,
+      overlaps: name.right > controls.left && name.left < controls.right
+        && name.bottom > controls.top && name.top < controls.bottom,
+      overflow: item.scrollWidth > item.clientWidth + 1,
+    };
+  }));
+  assert.ok(skillDimensions.every((item) => item.contained && !item.overlaps && !item.overflow),
+    JSON.stringify(skillDimensions));
+  await mobile.page.screenshot({ path: path.join(output, "mobile-skills.png") });
   await mobile.context.close();
   console.log("ok mobile refresh and file layout");
 
@@ -268,12 +321,32 @@ try {
   await clearPending();
   console.log("ok stop and disconnect cancel future uploads without automatic retries");
 
+  await command(context, "/fixture/compression-error");
+  await page.locator("#btn-stop").waitFor({ state: "visible" });
+  await page.reload();
+  await page.locator("#btn-stop").waitFor({ state: "visible" });
+  await ready(page);
+  await page.getByText("COMPRESSION FAILED: original context preserved", { exact: true }).waitFor();
+  assert.ok(await page.locator(".file-card").count() > 0);
+  console.log("ok compression failure remains visible after refresh during generation");
+
   const oldDownload = await page.locator(".file-card .fc-dl").first().getAttribute("href");
   await command(context, "/fixture/clear");
   await page.waitForFunction(() => document.querySelectorAll("#log .msg-row").length === 0);
   assert.equal((await context.request.get(fixture.url + oldDownload)).status(), 404);
+  await command(context, "/fixture/compression");
+  await page.locator("#btn-stop").waitFor({ state: "visible" });
+  await page.getByText("COMPRESSED FIXTURE", { exact: true }).waitFor();
+  await ready(page);
+  assert.equal(await page.locator(".file-card").count(), 1);
+  await page.reload();
+  await ready(page);
+  assert.equal(await page.getByText("COMPRESSED FIXTURE", { exact: true }).count(), 1);
+  const archiveLink = await page.locator(".file-card .fc-dl").getAttribute("href");
+  assert.equal((await context.request.get(fixture.url + archiveLink)).status(), 200);
+  await page.screenshot({ path: path.join(output, "desktop-compressed.png") });
   assert.equal(errors.length, 0, errors.join("\n"));
-  console.log(`ok clear revokes links; screenshots: ${output}`);
+  console.log(`ok clear revokes links; compression unlocks input and preserves downloads; screenshots: ${output}`);
 } finally {
   if (browser) await browser.close();
   const exited = new Promise((resolve) => child.once("exit", resolve));

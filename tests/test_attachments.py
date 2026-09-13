@@ -473,6 +473,31 @@ class GeneratedAttachmentTests(unittest.TestCase):
         record["content"] = record["content"].replace("read", "invalid-read")
         self.assertTrue(self.restore([record])[2])
 
+    def test_new_legacy_notice_and_mixed_multiline_order(self):
+        first, second = self.artifact(), self.artifact(image_bytes(color='green'))
+        old = self.legacy(first)
+        new = self.legacy(second)
+        start = new['content'].index('\uff0c\u9700\u8981\u65f6\u8bf7read')
+        new['content'] = new['content'][:start] + (
+            '\uff0c\u539f\u56fe\u81ea\u52a8\u8fdb\u5165\u5f53\u524d\u672a\u6e05\u7a7a'
+            '\u5bf9\u8bdd\u7684\u6bcf\u8f6e\u4e0a\u4e0b\u6587\uff0c\u65e0\u9700\u518d\u6b21read\u3011'
+        )
+        record = {**old, 'content': old['content'] + '\r\n' + new['content']}
+        parts, updates, errors = self.restore([record])
+        self.assertFalse(errors)
+        self.assertEqual(2, len(updates[0][2]['attachments']))
+        self.assertEqual([Path(first['path']).read_bytes(), Path(second['path']).read_bytes()],
+                         [base64.b64decode(p['data']) for p in parts if p['type'] == 'image'])
+
+    def test_quoted_legacy_notices_are_not_attachment_records(self):
+        record = self.legacy(self.artifact())
+        notice = record['content'].splitlines()[-1]
+        for content in (f'Example: {notice}', f'> {notice}', f'```text\n{notice}\n```',
+                        f'~~~\n{notice}\n~~~'):
+            candidate = {**record, 'content': content}
+            self.assertFalse(is_attachment_record(candidate))
+            self.assertEqual(([], [], []), self.restore([candidate]))
+
     def test_audio_and_video_do_not_gain_persistent_image_references(self):
         refs = create_generated_image_references([
             {"path": "/unused/audio.wav", "mime_type": "audio/wav"},

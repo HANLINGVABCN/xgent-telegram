@@ -18,6 +18,11 @@ from xgent_app.agent_context import (
 )
 from xgent_app.agent_search import run_search
 from xgent_app.generated_media import GeneratedMediaReply
+from xgent_app.compression import (
+    CompressionError, FrozenConversation, archive_files as compression_archive_files,
+    attachment_index as compression_attachment_index, has_new_content,
+    save_compression_archive, validate_summary, with_compressed_memory,
+)
 from xgent_app.attachments import (
     AttachmentContextError,
     create_attachment_reference,
@@ -1040,14 +1045,25 @@ def build_skill_prompt_section() -> str:
     if not skill_files:
         return ''
     disabled = get_disabled_skills()
-    skill_entries = ''.join(
-        f"- {skill_file}: {extract_skill_summary(skill_file)} (路径: {to_display_path(resolve_skill_abs_path(skill_file))})\n"
-        for skill_file in skill_files
-        if skill_file not in disabled
-    )
+    hidden = get_hidden_skills()
+    entries = []
+    for skill_file in skill_files:
+        if skill_file in hidden:
+            continue
+        path = to_display_path(resolve_skill_abs_path(skill_file))
+        if skill_file in disabled:
+            entries.append(f'- {skill_file}: 当前技能已关闭（路径: {path}）\n')
+        else:
+            entries.append(f'- {skill_file}: {extract_skill_summary(skill_file)} (路径: {path})\n')
+    skill_entries = ''.join(entries)
     if not skill_entries:
         return ''
     return f"\n\n{skill_entries}"
+
+
+def get_hidden_skills() -> set:
+    raw = UserDataManager.get('hidden_skills', [])
+    return {str(item) for item in raw} if isinstance(raw, list) else set()
 
 def build_absolute_path_prompt_section() -> str:
     project_root = to_display_path(os.path.dirname(os.path.abspath(__file__)))
@@ -1069,6 +1085,12 @@ def get_agent_runtime_prompt(agent_mode: bool) -> str:
     prompt = PromptFileManager.get('agent_prompt_addon')
     prompt += build_absolute_path_prompt_section()
     prompt += build_skill_prompt_section()
+    prompt += (
+        '\n【技能查阅】普通关闭只省略简介，不禁止使用。若任务需要已列出的关闭技能，'
+        '按其绝对路径用 read-x 先读取开头的 ```! 简介块；若块未结束则继续读取，'
+        '需要原理或完整流程时再分段查阅正文。不要声称未读取的内容已知。'
+        '此规则不授予修改权限；Agent 关闭时不得执行读取协议。\n'
+    )
     if not agent_mode:
         prompt += PromptFileManager.get('agent_disabled_addon')
     return prompt
@@ -1169,6 +1191,7 @@ async def build_model_conversation_history(history: List[Dict]) -> List[Dict]:
     try:
         db = await BotMemoryDB.get_instance()
         generation = await db.get_attachment_generation()
+        latest_compression = await db.get_latest_compression()
         records = await db.get_attachment_records()
         parts, updates, errors = await asyncio.to_thread(
             prepare_attachment_context, records, ArtifactManager.UPLOAD_DIR,
@@ -1185,13 +1208,22 @@ async def build_model_conversation_history(history: List[Dict]) -> List[Dict]:
                 + "\n".join(errors)
                 + "\n请恢复原件，或清空当前对话后重新上传/生成。"
             )
-        return with_attachment_context(history, parts)
+        return with_attachment_context(with_compressed_memory(history, latest_compression), parts)
     except AttachmentContextError:
         raise
     except Exception as exc:
         raise AttachmentContextError(
             f"附件上下文组装失败，本轮未调用模型：{exc}"
         ) from exc
+
+
+def publish_conversation_event(context, frame: Dict[str, Any]) -> None:
+    outbox = get_web_outbox()
+    if outbox is not None:
+        outbox.put(frame)
+    if getattr(context.bot, '_is_xgent_cli_bot', False):
+        from xgent_app.cli_bridge import relay_conversation_event
+        relay_conversation_event(frame)
 
 
 class ArtifactManager:

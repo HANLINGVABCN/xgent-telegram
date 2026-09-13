@@ -32,14 +32,13 @@ class BotMemoryDB:
             await conn.execute('BEGIN IMMEDIATE')
             try:
                 yield conn
+                await conn.commit()
             except BaseException:
                 try:
                     await conn.rollback()
                 except Exception as rollback_err:
                     logger.error(f"事务回滚失败: {rollback_err}")
                 raise
-            else:
-                await conn.commit()
 
     @contextlib.asynccontextmanager
     async def _write(self):
@@ -111,6 +110,13 @@ class BotMemoryDB:
             )
         ''')
         
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS context_compressions (
+                sequence INTEGER PRIMARY KEY,
+                payload TEXT NOT NULL
+            )
+        ''')
+
         # CLI 跨进程中继表：CLI 进程里对话核心对 bot 的每一次调用
         # （send_message / edit_message_text / delete_message ...）按顺序落一行，
         # 服务端观察者读出后原样回放到 MirrorBot 上，从而在 Telegram/网页得到
@@ -505,24 +511,31 @@ class BotMemoryDB:
         """获取所有消息（用于AI上下文）- 包含对话和系统操作"""
         conn = await self._get_conn()
         cursor = await conn.execute('''
-            SELECT role, content, timestamp, msg_type FROM global_messages
-            ORDER BY timestamp DESC LIMIT ?
+            SELECT role, content, timestamp, msg_type, metadata FROM global_messages
+            ORDER BY timestamp DESC, id DESC LIMIT ?
         ''', (limit,))
         rows = await cursor.fetchall()
-        
+        return self.conversation_records_to_messages(reversed(rows))
+
+    @staticmethod
+    def conversation_records_to_messages(rows, *, include_all: bool = False) -> List[Dict]:
+        from xgent_app.compression import metadata_of
+
         # 转换格式，系统操作转为 user 角色以便 AI 理解
         result = []
-        for row in reversed(rows):
+        for row in rows:
             msg = dict(row)
+            if not include_all and metadata_of(msg).get('compression_auxiliary'):
+                continue
             msg_type = msg.get('msg_type')
-            if is_redundant_agent_command_record(msg_type, msg.get('content')):
+            if not include_all and is_redundant_agent_command_record(msg_type, msg.get('content')):
                 continue
             # token 用量提示是给用户看的 UI 信息，不喂给模型，否则「↑ N tokens」这类
             # 文本会混进上下文污染对话。
-            if msg_type == MessageType.TOKEN_USAGE:
+            if not include_all and msg_type == MessageType.TOKEN_USAGE:
                 continue
             # 轮次状态行（✅ Agent 第 N 轮…）同理：纯 UI，不进上下文。
-            if msg_type == MessageType.AGENT_STATUS:
+            if not include_all and msg_type == MessageType.AGENT_STATUS:
                 continue
             
             # 系统操作以 system 角色注入（OpenAI 格式原样支持；Gemini/Claude 在各自构建器里降级为 user），
@@ -586,6 +599,69 @@ class BotMemoryDB:
 
     async def get_attachment_generation(self) -> int:
         return int(await self.get_config_fresh('attachment_generation', 0))
+
+    async def _compression_snapshot(self, conn) -> Dict[str, Any]:
+        cursor = await conn.execute('SELECT * FROM global_messages ORDER BY id')
+        records = [dict(row) for row in await cursor.fetchall()]
+        cursor = await conn.execute('SELECT * FROM chat_messages ORDER BY id')
+        mirror = [dict(row) for row in await cursor.fetchall()]
+        cursor = await conn.execute('SELECT * FROM chat_sessions ORDER BY id')
+        sessions = [dict(row) for row in await cursor.fetchall()]
+        cursor = await conn.execute('SELECT payload FROM context_compressions ORDER BY sequence')
+        rounds = [json.loads(row['payload']) for row in await cursor.fetchall()]
+        cursor = await conn.execute("SELECT value FROM config WHERE key = 'attachment_generation'")
+        row = await cursor.fetchone()
+        return {
+            'generation': int(json.loads(row['value'])) if row else 0,
+            'records': records, 'mirror_records': mirror, 'sessions': sessions,
+            'compressions': rounds,
+        }
+
+    async def get_compression_snapshot(self) -> Dict[str, Any]:
+        async with self._transaction() as conn:
+            return await self._compression_snapshot(conn)
+
+    async def get_latest_compression(self) -> Optional[Dict[str, Any]]:
+        conn = await self._get_conn()
+        cursor = await conn.execute(
+            'SELECT payload FROM context_compressions ORDER BY sequence DESC LIMIT 1'
+        )
+        row = await cursor.fetchone()
+        return json.loads(row['payload']) if row else None
+
+    async def commit_compression(self, snapshot: Dict, entry: Dict, chat_id: int,
+                                 notice: str, metadata: Dict,
+                                 stop_event: asyncio.Event) -> int:
+        from xgent_app.compression import CompressionError
+
+        async with self._transaction() as conn:
+            if stop_event.is_set():
+                raise CompressionError('用户已停止压缩，旧上下文保持不变。')
+            if await self._compression_snapshot(conn) != snapshot:
+                raise CompressionError('压缩期间对话已变化或被清空，未应用摘要，请重试。')
+            if entry['sequence'] != len(snapshot['compressions']) + 1:
+                raise CompressionError('压缩归档编号冲突，未应用摘要。')
+            await conn.execute(
+                'INSERT INTO context_compressions (sequence, payload) VALUES (?, ?)',
+                (entry['sequence'], json.dumps(entry, ensure_ascii=False)),
+            )
+            await conn.execute('DELETE FROM global_messages')
+            await conn.execute('DELETE FROM chat_messages')
+            await conn.execute('DELETE FROM chat_sessions')
+            await conn.execute('''
+                INSERT INTO config (key, value) VALUES ('attachment_generation', '1')
+                ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1
+            ''')
+            cursor = await conn.execute('''
+                INSERT INTO global_messages (chat_id, user_id, msg_type, role, content,
+                                             timestamp, session_id, metadata)
+                VALUES (?, 0, ?, 'system', ?, ?, ?, ?)
+            ''', (chat_id, MessageType.SYSTEM_OP, notice, time.time(), SINGLE_MEMORY_SESSION_ID,
+                  json.dumps(metadata, ensure_ascii=False)))
+            if stop_event.is_set():
+                raise CompressionError('用户已停止压缩，旧上下文保持不变。')
+            row_id = cursor.lastrowid
+        return row_id
 
     async def backfill_attachment_metadata(self, row_id: int, previous: Optional[str],
                                            metadata: Dict[str, Any]) -> bool:
@@ -952,6 +1028,7 @@ class BotMemoryDB:
             await conn.execute('DELETE FROM global_messages')
             await conn.execute('DELETE FROM chat_messages')
             await conn.execute('DELETE FROM chat_sessions')
+            await conn.execute('DELETE FROM context_compressions')
             await conn.execute('''
                 INSERT INTO config (key, value) VALUES ('attachment_generation', '1')
                 ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1
@@ -1548,6 +1625,10 @@ class UserDataManager:
             ),
             'disabled_skills': [
                 str(s) for s in (await cls._require_db().get_config('disabled_skills', [])) or []
+                if isinstance(s, str)
+            ],
+            'hidden_skills': [
+                s for s in (await cls._require_db().get_config('hidden_skills', [])) or []
                 if isinstance(s, str)
             ],
             # 各提供商最近一次联网拉取结果：{prov: {'models': [...], 'ts': int}}。

@@ -789,24 +789,8 @@ async def cmd_skills_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
         return
     await UserDataManager.init()
-    skill_files = list_skill_files()
-    disabled = get_disabled_skills()
-    if not skill_files:
-        await update.message.reply_text(
-            "🧩 <b>Skill 管理</b>\n\n📭 暂无 skill 文件。",
-            reply_markup=get_skills_menu(),
-            parse_mode=constants.ParseMode.HTML
-        )
-        return
-    lines = ["🧩 <b>Skill 管理</b>\n"]
-    for rel_path in skill_files:
-        label = os.path.splitext(os.path.basename(rel_path))[0]
-        status = "🔴" if rel_path in disabled else "🟢"
-        source = "🔒" if rel_path.startswith("private/") else "📦"
-        lines.append(f"{status}{source} {label}")
-    lines.append(f"\n📦=公有 🔒=私有  共 {len(skill_files)} 个 skill，{len(disabled)} 个已禁用。")
     await update.message.reply_text(
-        "\n".join(lines),
+        build_skills_menu_text(),
         reply_markup=get_skills_menu(),
         parse_mode=constants.ParseMode.HTML
     )

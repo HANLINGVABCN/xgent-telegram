@@ -50,6 +50,7 @@ class Fixture:
         self.busy = False
         self.stopped = False
         self.tasks = set()
+        self.setting_values = {'disabled_skills': [], 'hidden_skills': []}
         self.populate()
 
     def add(self, kind, content, media=None, metadata=None):
@@ -108,7 +109,13 @@ class Fixture:
         return build_history_message(row, self.root, self.root) if row else None
 
     async def settings(self, *args):
-        return {"values": {}, "options": {}, "skills": []}
+        if args:
+            key, value = args
+            self.setting_values[key] = value
+        return {"values": dict(self.setting_values), "options": {"skill_list": [
+            {"path": "daily.md", "label": "Daily", "source": "public"},
+            {"path": "private/long.md", "label": "A deliberately long skill name for mobile layout verification", "source": "private"},
+        ]}}
 
     def schedule(self, coroutine):
         def start():
@@ -133,12 +140,48 @@ class Fixture:
         outbox.put({"type": "turn_end"})
 
     def submit_command(self, command, outbox):
-        if command in ("/fixture/busy", "/fixture/error"):
+        if command in ("/fixture/busy", "/fixture/error", "/fixture/compression", "/fixture/compression-error", "/fixture/progress"):
             self.busy = True
         self.schedule(self.command(command, outbox))
 
     async def command(self, command, outbox):
-        if command in ("/fixture/busy", "/fixture/error"):
+        if command == '/fixture/progress':
+            self.stopped = False
+            bot = WebBot(outbox, 1)
+            draft = await bot.send_message(1, 'STREAM DRAFT 0')
+            for step in range(1, 11):
+                if self.stopped:
+                    break
+                text = f'COMMAND STEP {step}'
+                self.add('agent_result', text)
+                await bot.send_message(1, text)
+                await draft.edit_text(f'STREAM DRAFT {step}')
+                await asyncio.sleep(1)
+            answer = 'PROGRESS STOPPED' if self.stopped else 'PROGRESS COMPLETE'
+            self.add('ai_reply', answer)
+            await draft.edit_text(answer)
+            path = self.root / 'memory export.zip'
+            self.add('system_op', 'PROGRESS ARCHIVE', [(path, 'progress.zip')])
+            with path.open('rb') as file:
+                await bot.send_document(1, file, filename='progress.zip')
+            self.busy = False
+        elif command == '/fixture/compression-error':
+            outbox.put({'type': 'compression_state', 'busy': True})
+            await asyncio.sleep(3)
+            outbox.put({'type': 'edit', 'message_id': 900, 'text': 'COMPRESSION FAILED: original context preserved'})
+            self.busy = False
+            outbox.put({'type': 'compression_state', 'busy': False, 'committed': False})
+        elif command == '/fixture/compression':
+            outbox.put({'type': 'compression_state', 'busy': True})
+            await asyncio.sleep(0.5)
+            self.records.clear()
+            self.add('system_op', 'COMPRESSED FIXTURE', [(self.root / 'memory export.zip', 'archive.zip')])
+            outbox.put({'type': 'history_reset'})
+            await asyncio.sleep(0.2)
+            self.busy = False
+            outbox.put({'type': 'compression_state', 'busy': False, 'committed': True})
+            return
+        elif command in ("/fixture/busy", "/fixture/error"):
             self.stopped = False
             await asyncio.sleep(2)
             if command.endswith("error"):

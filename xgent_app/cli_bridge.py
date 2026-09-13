@@ -351,6 +351,11 @@ def relay_user_message(text: str) -> None:
     _RELAY.emit("user_echo", text=str(text))
 
 
+def relay_conversation_event(frame: dict) -> None:
+    if frame.get('type') in {'history_reset', 'compression_state'}:
+        _RELAY.emit('conversation_event', frame=dict(frame))
+
+
 atexit.register(close_relay)
 
 

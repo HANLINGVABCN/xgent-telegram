@@ -76,6 +76,11 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.answer("当前没有正在生成的回答")
         return
 
+    if data == 'cmd_compress':
+        await query.answer()
+        await cmd_compress(update, context)
+        return
+
     if data == "act_finish_text_stitch":
         await UserDataManager.init()
         await finish_text_conversation(update, context)
@@ -112,61 +117,34 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
         elif data == "menu_skills":
-            skill_files = list_skill_files()
-            disabled = get_disabled_skills()
-            if not skill_files:
-                # 进入 Skill 管理专属界面（只有“返回”按钮），而不是留在“更多设置”
-                # 菜单；否则用户重复点“Skill 管理”会因为文本和键盘都没变而触发
-                # Telegram 的 “Message is not modified” 错误，被顶层兜底报成
-                # “操作失败，请稍后重试”。
-                await query.message.edit_text(
-                    "🧩 <b>Skill 管理</b>\n\n📭 暂无 skill 文件。",
-                    reply_markup=get_skills_menu(),
-                    parse_mode=constants.ParseMode.HTML,
-                )
-            else:
-                lines = ["🧩 <b>Skill 管理</b>\n"]
-                for rel_path in skill_files:
-                    label = os.path.splitext(os.path.basename(rel_path))[0]
-                    status = "🔴" if rel_path in disabled else "🟢"
-                    source = "🔒" if rel_path.startswith("private/") else "📦"
-                    lines.append(f"{status}{source} {label}")
-                lines.append(f"\n📦=公有 🔒=私有  共 {len(skill_files)} 个，{len(disabled)} 个已禁用。")
-                await query.message.edit_text(
-                    "\n".join(lines),
-                    reply_markup=get_skills_menu(),
-                    parse_mode=constants.ParseMode.HTML,
-                )
+            await query.message.edit_text(
+                build_skills_menu_text(), reply_markup=get_skills_menu(),
+                parse_mode=constants.ParseMode.HTML,
+            )
 
-        elif data.startswith("toggle_skill:"):
-            # callback_data 里 / 被换成 | 避免解析干扰，这里还原
+        elif data.startswith(('toggle_skill:', 'hide_skill:')):
             safe_key = data.split(":", 1)[1]
             rel_path = safe_key.replace("|", "/")
-            disabled = get_disabled_skills()
-            if rel_path in disabled:
-                disabled.discard(rel_path)
+            if rel_path not in list_skill_files():
+                await query.message.reply_text('技能文件已不存在，请重新打开技能菜单。')
+                return
+            hidden_toggle = data.startswith('hide_skill:')
+            if not hidden_toggle and rel_path in get_hidden_skills():
+                await query.message.reply_text('请先关闭该技能的隐藏开关。')
+                return
+            key = 'hidden_skills' if hidden_toggle else 'disabled_skills'
+            selected = get_hidden_skills() if hidden_toggle else get_disabled_skills()
+            if rel_path in selected:
+                selected.discard(rel_path)
             else:
-                disabled.add(rel_path)
-            disabled_list = sorted(disabled)
-            UserDataManager.set('disabled_skills', disabled_list)
-            await UserDataManager.save_config('disabled_skills', disabled_list)
-            label = os.path.splitext(os.path.basename(rel_path))[0]
+                selected.add(rel_path)
+            await UserDataManager.save_config(key, sorted(selected))
             await GlobalRecorder.record_system_op(
-                f"Skill {label} 切换为: {'禁用' if rel_path in disabled else '启用'}",
-                {"skill": rel_path, "disabled": rel_path in disabled},
+                f'Skill 设置已更新: {rel_path}', {key: sorted(selected)},
             )
-            # 刷新菜单
-            skill_files = list_skill_files()
-            lines = ["🧩 <b>Skill 管理</b>\n"]
-            for rp in skill_files:
-                lbl = os.path.splitext(os.path.basename(rp))[0]
-                status = "🔴" if rp in disabled else "🟢"
-                source = "🔒" if rp.startswith("private/") else "📦"
-                lines.append(f"{status}{source} {lbl}")
-            lines.append(f"\n📦=公有 🔒=私有  共 {len(skill_files)} 个，{len(disabled)} 个已禁用。")
             with contextlib.suppress(Exception):
                 await query.message.edit_text(
-                    "\n".join(lines),
+                    build_skills_menu_text(),
                     reply_markup=get_skills_menu(),
                     parse_mode=constants.ParseMode.HTML,
                 )
@@ -1271,13 +1249,13 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             if not buffer:
                 await query.answer("⚠️ 还没有输入内容。", show_alert=True)
                 return
-            UserDataManager.set('state', BotState.IDLE)
-            UserDataManager.set('editing_prompt_key', "")
-            UserDataManager.set('prompt_buffer', "")
             if key in {'assistant_prompt', 'global_prompt_addon'}:
                 await save_runtime_prompt(key, buffer)
             else:
                 PromptFileManager.set(key, buffer)
+            UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('editing_prompt_key', "")
+            UserDataManager.set('prompt_buffer', "")
             await GlobalRecorder.record_system_op(
                 f"修改提示词: {PromptFileManager.get_label(key)}",
                 {"length": len(buffer)}

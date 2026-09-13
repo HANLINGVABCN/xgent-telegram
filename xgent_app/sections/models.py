@@ -8,6 +8,7 @@ from xgent_app.context_limits import (
     validate_limits,
     validate_request_body,
 )
+from xgent_app.compression import FrozenConversation
 
 class ModelClient:
     _VALID_ROLES = {'user', 'assistant', 'system'}
@@ -39,7 +40,13 @@ class ModelClient:
     async def _prepare_conversation_request(prov_name: str, base_url: str, model: str,
                                             system_prompt: str, history: list,
                                             max_tokens: Optional[int]) -> Tuple[list, Optional[int]]:
-        history = await build_model_conversation_history(history)
+        frozen = isinstance(history, FrozenConversation)
+        if frozen:
+            db = await BotMemoryDB.get_instance()
+            if history.generation != await db.get_attachment_generation():
+                raise AttachmentContextError('压缩快照已失效，本轮未调用模型。')
+        else:
+            history = await build_model_conversation_history(history)
         key = f"{base_url.rstrip('/')}|{model}"
         discovered = UserDataManager.get('discovered_model_limits', {})
         configured = UserDataManager.get('model_request_limits', {})
@@ -49,7 +56,17 @@ class ModelClient:
         limits.update(ModelClient._discovered_model_limits.get(key, {}))
         limits.update(validate_limits(configured.get(f"{prov_name}/{model}", {})))
         limits = validate_limits(limits)
-        return ConversationRequest(history, limits, system_prompt), reserved_output_tokens(limits, max_tokens)
+        request = ConversationRequest(history, limits, system_prompt)
+        request.require_complete = frozen
+        return request, reserved_output_tokens(limits, max_tokens)
+
+    @staticmethod
+    def _check_compression_completion(history: list, reason: Any) -> None:
+        if (getattr(history, 'require_complete', False) and reason is not None
+                and str(reason).lower() not in {'stop', 'end_turn', 'stop_sequence', 'eos_token'}):
+            raise AttachmentContextError(
+                f'压缩输出未正常完成（{reason}），未清除旧上下文。'
+            )
 
     @staticmethod
     def _validate_conversation_request(body: Dict[str, Any], history: list) -> None:
@@ -599,23 +616,35 @@ class ModelClient:
     def _extract_openai_compatible_sse_text(text: str, usage_sink: Optional[List[Dict[str, int]]] = None,
                                            history: Optional[list] = None) -> str:
         texts: List[str] = []
+        finished = False
         for raw_line in (text or "").splitlines():
             line = raw_line.strip()
             if not line.startswith("data:"):
                 continue
             payload = line[5:].strip()
-            if not payload or payload == "[DONE]":
+            if payload == "[DONE]":
+                finished = True
+                continue
+            if not payload:
                 continue
             try:
                 data = json.loads(payload)
             except json.JSONDecodeError:
+                if getattr(history, 'require_complete', False):
+                    raise AttachmentContextError('压缩响应包含损坏的数据，未清除旧上下文。')
                 continue
             if data.get("error"):
                 ModelClient._raise_conversation_request_error(history, data["error"])
             record_token_usage(usage_sink, data.get("usage"))
+            for choice in data.get('choices') or []:
+                reason = choice.get('finish_reason')
+                ModelClient._check_compression_completion(history, reason)
+                finished = finished or reason is not None
             chunk_text = ModelClient._extract_openai_compatible_text(data, stream=True)
             if chunk_text:
                 texts.append(chunk_text)
+        if getattr(history, 'require_complete', False) and not finished:
+            raise AttachmentContextError('压缩响应中途结束，未清除旧上下文。')
         return "".join(texts)
 
     @staticmethod
@@ -780,6 +809,8 @@ class ModelClient:
             if data.get("error"):
                 ModelClient._raise_conversation_request_error(history, data["error"])
             record_token_usage(usage_sink, data.get("usage"))
+            for choice in data.get('choices') or []:
+                ModelClient._check_compression_completion(history, choice.get('finish_reason'))
             text = ModelClient._extract_openai_compatible_text(data)
             if text:
                 write_model_trace("model_response", {
@@ -1031,6 +1062,7 @@ class ModelClient:
                 record_token_usage(usage_sink, data.get('usageMetadata'))
                 candidates = data.get('candidates', [])
                 finish_reason = candidates[0].get('finishReason') if candidates else None
+                ModelClient._check_compression_completion(history, finish_reason)
                 text = ModelClient._extract_gemini_text_response(data)
                 logger.info(
                     f"Gemini non-stream completed: model={model}, "
@@ -1153,6 +1185,7 @@ class ModelClient:
                     ModelClient._raise_conversation_request_error(history, data["error"])
                 record_token_usage(usage_sink, data.get('usage'))
                 stop_reason = data.get('stop_reason')
+                ModelClient._check_compression_completion(history, stop_reason)
                 text = ModelClient._extract_claude_text_response(data)
                 logger.info(
                     f"Claude non-stream completed: model={model}, "
@@ -1844,6 +1877,7 @@ class ModelClient:
                 return None, "对方暂时没反应，用户稍后再试试？"
 
             finish_reason = getattr(choice, 'finish_reason', None)
+            ModelClient._check_compression_completion(history, finish_reason)
             logger.info(
                 f"OpenAI non-stream completed: provider={prov_name}, model={model}, "
                 f"finish_reason={finish_reason}, text_len={len(content)}, "

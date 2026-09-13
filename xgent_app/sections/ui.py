@@ -9,7 +9,7 @@ class CallbackDataStore:
     @classmethod
     def store(cls, data: str) -> str:
         """存储数据并返回短ID"""
-        if len(data) <= 60:
+        if len(data.encode('utf-8')) <= 60:
             return data
         short_id = f"cb_{short_hash(data)}"
         # 碰撞检测：如果短ID已存在但对应不同数据，扩展哈希长度
@@ -334,19 +334,17 @@ def get_more_settings_menu():
          InlineKeyboardButton("🧩 Skill 管理", callback_data="menu_skills")],
         [InlineKeyboardButton("📤 导出", callback_data="cmd_export_all"),
          InlineKeyboardButton("⬆️ 更新", callback_data="cmd_update")],
+        [InlineKeyboardButton("压缩上下文", callback_data="cmd_compress")],
         [InlineKeyboardButton("🔄 重启", callback_data="cmd_restart"),
          InlineKeyboardButton("🔙 返回", callback_data="act_main_menu")]
     ])
 
 
 def get_skills_menu():
-    """Skill 管理菜单：每个 skill 一个开关按钮（🟢启用/🔴禁用）。
-
-    callback_data 用 toggle_skill:<相对路径>，相对路径里的 / 会在 callbacks.py
-    里按 : 切分后取最后一段——为避免路径里的 / 干扰解析，这里用 | 代替 /。
-    """
+    """两个开关：启用简介、彻底隐藏；隐藏时保留原启用设置。"""
     skill_files = list_skill_files()
     disabled = get_disabled_skills()
+    hidden = get_hidden_skills()
 
     rows = []
     for rel_path in skill_files:
@@ -355,14 +353,30 @@ def get_skills_menu():
         is_private = rel_path.startswith("private/")
         status_icon = "🔴" if is_off else "🟢"
         source_icon = "🔒" if is_private else "📦"
-        # 路径里的 / 换成 |，避免 callback_data 解析时被 : 切分搞乱
         safe_key = rel_path.replace("/", "|")
-        rows.append([InlineKeyboardButton(
-            f"{status_icon}{source_icon} {label}",
-            callback_data=f"toggle_skill:{safe_key}",
-        )])
+        rows.append([
+            InlineKeyboardButton(
+                f"{status_icon}{source_icon} {label}",
+                callback_data=CallbackDataStore.store(f"toggle_skill:{safe_key}"),
+            ),
+            InlineKeyboardButton(
+                '隐藏: 开' if rel_path in hidden else '隐藏: 关',
+                callback_data=CallbackDataStore.store(f"hide_skill:{safe_key}"),
+            ),
+        ])
     rows.append([InlineKeyboardButton("🔙 返回", callback_data="menu_more_settings")])
     return InlineKeyboardMarkup(rows)
+
+
+def build_skills_menu_text() -> str:
+    files = set(list_skill_files())
+    hidden = get_hidden_skills() & files
+    disabled = (get_disabled_skills() & files) - hidden
+    return (
+        '🧩 <b>Skill 管理</b>\n\n'
+        f'启用: {len(files - hidden - disabled)}  仅名字和路径: {len(disabled)}  隐藏: {len(hidden)}'
+        if files else '🧩 <b>Skill 管理</b>\n\n📭 暂无 skill 文件。'
+    )
 
 
 def get_thinking_level_menu():

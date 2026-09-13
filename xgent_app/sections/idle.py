@@ -152,7 +152,7 @@ _web_config_watch_task: Optional[asyncio.Task] = None
 WEB_EDITABLE_SETTINGS = {
     'thinking_level', 'stream_mode', 'agent_mode', 'text_stitch_mode',
     'global_depth', 'agent_max_iterations', 'stream_timeout', 'chat_model',
-    'disabled_skills', 'agent_command_timeout', 'idle_message_interval',
+    'disabled_skills', 'hidden_skills', 'agent_command_timeout', 'idle_message_interval',
     'smart_match_threshold',
     # token 统计相关：价格表 / 手动合并表 / 报表默认选项
     'model_price_table', 'model_merge_map', 'stats_auto_merge', 'stats_metric',
@@ -379,6 +379,13 @@ async def _replay_relay_op(mirror: Any, op: str, payload: Dict[str, Any]) -> Non
             # user_message 帧让网页渲染成用户气泡（右侧），而不是 AI 气泡。
             outbox.put({"type": "user_message", "text": text,
                         "ts": time.time(), "external": True})
+        return
+
+    if op == 'conversation_event':
+        frame = payload.get('frame')
+        if (isinstance(frame, dict) and frame.get('type') in {'history_reset', 'compression_state'}
+                and _web_external_outbox is not None):
+            _web_external_outbox.put(frame)
         return
 
     if op == 'send_message':
@@ -669,6 +676,7 @@ async def _web_read_settings() -> Dict[str, Any]:
             'smart_match_threshold': int(UserDataManager.get('smart_match_threshold', 90) or 90),
             'chat_model': f"{prov_name}|{current_model}" if prov_name and current_model else '',
             'disabled_skills': disabled_skills,
+            'hidden_skills': sorted(get_hidden_skills()),
             'model_price_table': model_price_table,
             'model_merge_map': model_merge_map,
             'stats_auto_merge': stats_auto_merge,
@@ -757,7 +765,7 @@ async def _web_write_setting(key: str, value: Any) -> Dict[str, Any]:
             raise ValueError("智能匹配阈值需不小于 0")
         UserDataManager.set(key, pct)
         await UserDataManager.save_config(key, pct)
-    elif key == 'disabled_skills':
+    elif key in {'disabled_skills', 'hidden_skills'}:
         # 前端传一个被禁用 skill 的相对路径列表。normalize 成 list[str]，去重。
         raw = value if isinstance(value, list) else []
         cleaned = sorted({str(item) for item in raw if item})
@@ -916,6 +924,7 @@ def _ensure_web_command_map() -> None:
         ("media_model", "cmd_media_model_menu"),
         ("prompts", "cmd_prompts_menu"),
         ("clear_memory", "cmd_delete_chat"),
+        ("compress", "cmd_compress"),
         ("depth", "cmd_depth_menu"),
         ("params", "cmd_timeout_menu"),
         ("thinking", "cmd_thinking_menu"),

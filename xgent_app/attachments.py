@@ -35,11 +35,30 @@ _CONFIG_PREFIXES = (
 _GENERATED_IMAGE_PREFIX = "\u3010\u7cfb\u7edf\u81ea\u52a8\u751f\u6210\uff1a\u672c\u56fe\u7247\u5df2\u81ea\u52a8\u5b58\u5165 "
 _GENERATED_IMAGE_NOTICE = re.compile(
     "^" + re.escape(_GENERATED_IMAGE_PREFIX)
-    + r"(?P<path>.+?)\uff0c\u9700\u8981\u65f6\u8bf7read\u4ee5\u8fd4\u56de\u4e0a\u4e0b\u6587"
-    + r"(?:\uff0c\u65e0\u8bc6\u56fe\u80fd\u529b\u65f6\u8bf7\u52ffread\u4ee5\u514d\u62a5\u9519)?\u3011$",
+    + r"(?P<path>[^\r\n]+?)\uff0c(?:\u9700\u8981\u65f6\u8bf7read\u4ee5\u8fd4\u56de\u4e0a\u4e0b\u6587"
+    + r"(?:\uff0c\u65e0\u8bc6\u56fe\u80fd\u529b\u65f6\u8bf7\u52ffread\u4ee5\u514d\u62a5\u9519)?"
+    + r"|\u539f\u56fe\u81ea\u52a8\u8fdb\u5165\u5f53\u524d\u672a\u6e05\u7a7a\u5bf9\u8bdd\u7684\u6bcf\u8f6e\u4e0a\u4e0b\u6587\uff0c\u65e0\u9700\u518d\u6b21read)\u3011$",
     re.MULTILINE,
 )
 _GENERATED_SOURCES = {"chat_native_media", "external_media_module"}
+
+
+def _generated_notice_lines(content: str) -> list[str]:
+    """A quoted example is not the standalone notice appended by the sender."""
+    lines = []
+    fence = None
+    for line in content.splitlines():
+        match = re.match(r'^\s{0,3}(`{3,}|~{3,})(.*)$', line)
+        if match:
+            token, rest = match.groups()
+            if fence is None:
+                fence = token
+            elif token[0] == fence[0] and len(token) >= len(fence) and not rest.strip():
+                fence = None
+            continue
+        if fence is None and line.startswith(_GENERATED_IMAGE_PREFIX):
+            lines.append(line)
+    return lines
 
 
 def _resolve_storage_path(path: str, storage_root: str | Path) -> Path:
@@ -224,7 +243,7 @@ def is_attachment_record(record: dict[str, Any]) -> bool:
         return True
     return "attachments" in metadata or (
         metadata.get("generated_media_processed") is not True
-        and _GENERATED_IMAGE_PREFIX in str(record.get("content") or "")
+        and bool(_generated_notice_lines(str(record.get("content") or "")))
     )
 
 
@@ -277,10 +296,11 @@ def _legacy_generated_references(record: dict, generated_root: str | Path | None
     }:
         return []
     content = str(record.get("content") or "")
-    if _GENERATED_IMAGE_PREFIX not in content:
+    notices = _generated_notice_lines(content)
+    if not notices:
         return []
-    matches = list(_GENERATED_IMAGE_NOTICE.finditer(content))
-    if len(matches) != content.count(_GENERATED_IMAGE_PREFIX):
+    matches = [_GENERATED_IMAGE_NOTICE.fullmatch(line) for line in notices]
+    if any(match is None for match in matches):
         raise AttachmentContextError("Legacy generated-image index cannot be verified")
     if generated_root is None:
         raise AttachmentContextError("Generated-image storage is not configured")
