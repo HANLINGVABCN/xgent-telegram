@@ -81,6 +81,11 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await cmd_compress(update, context)
         return
 
+    if data.startswith('retry_compress:'):
+        await query.answer()
+        await run_context_compression(update, context, retry_job_id=data.split(':', 1)[1])
+        return
+
     if data == "act_finish_text_stitch":
         await UserDataManager.init()
         await finish_text_conversation(update, context)

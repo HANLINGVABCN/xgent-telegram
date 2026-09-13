@@ -157,6 +157,35 @@ try {
   await clear(blocked, mobile);
   console.log('ok generated images, text and paths stay in one bubble through polling and refresh');
 
+  await command(mobile, '/fixture/compression-hold-error');
+  await mobile.locator('#bot-avatar.pulsing').waitFor();
+  await mobile.getByText('RESTORING FIXTURE', { exact: true }).first().waitFor();
+  await mobile.reload();
+  await mobile.locator('#bot-avatar.pulsing').waitFor();
+  await mobile.screenshot({ path: path.join(output, 'tunnel-mobile-restore-busy.png') });
+  assert.equal((await blocked.request.post(url + '/api/command', {
+    data: { command: '/fixture/release-restore' }, headers: { Origin: url },
+  })).status(), 200);
+  await ready(mobile);
+  await mobile.getByText('COMPRESSION FAILED: archive retained; retry available', { exact: true }).waitFor();
+  await mobile.reload();
+  await ready(mobile);
+  const restoreButton = mobile.getByRole('button', { name: '\u91cd\u8bd5\u6062\u590d', exact: true });
+  await restoreButton.waitFor();
+  assert.ok(await mobile.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
+  await mobile.screenshot({ path: path.join(output, 'tunnel-mobile-restore-retry.png') });
+  await restoreButton.click();
+  await mobile.locator('#bot-avatar.pulsing').waitFor();
+  await ready(mobile);
+  assert.equal(await mobile.getByText('COMPRESSION SUMMARY', { exact: true }).count(), 1);
+  assert.equal(await mobile.locator('#bot-avatar.pulsing').count(), 0);
+  assert.equal(await restoreButton.count(), 0);
+  const restoredArchive = await mobile.locator('.file-card .fc-dl').getAttribute('href');
+  assert.equal((await mobile.request.get(url + restoredArchive)).status(), 200);
+  await mobile.screenshot({ path: path.join(output, 'tunnel-mobile-restored.png') });
+  await clear(blocked, mobile);
+  console.log('ok compression over polling: busy avatar, refreshed failure, manual retry and archive download');
+
   await command(mobile, "/fixture/progress");
   await mobile.getByText("COMMAND STEP 1", { exact: true }).waitFor();
   dropNextBatch = true;

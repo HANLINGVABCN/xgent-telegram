@@ -2093,12 +2093,14 @@
       entry.rawText = frame.text;
       entry.body.innerHTML = renderText(frame.text, frame.parse_mode);
       enhanceBubbleContent(entry.body);
-      if (frame.reply_markup !== undefined) setButtons(entry, frame.reply_markup, id);
     } else {
       var next = entry && entry.row.nextSibling;
       removeEntry(entry);
-      entry = makeBubble(role, frame.text, id, frame.parse_mode, frame.reply_markup, frame.msg_type, frame.timestamp || frame.ts);
+      entry = makeBubble(role, frame.text, id, frame.parse_mode, null, frame.msg_type, frame.timestamp || frame.ts);
       if (next && next.parentNode === log) log.insertBefore(entry.row, next);
+    }
+    if (frame.reply_markup !== undefined) {
+      setButtons(entry, frame.reply_markup, frame.message_id != null ? frame.message_id : (frame.record_id || 0));
     }
     if (frame.media) appendHistoryMedia(entry, frame, role);
     if (frame.message_id != null) byMessageId[frame.message_id] = entry;
@@ -2155,7 +2157,7 @@
       setBusy(!!frame.busy);
       if (!frame.busy) {
         reconcileAfterTurn = false;
-        // Failure notices are live UI output, not replacement conversation memory.
+        // Restore failures and retry controls are durable after the archive switch.
         if (frame.committed) resync();
       }
     } else if (frame.type === "history_reset") {
@@ -2368,6 +2370,7 @@
         var role = m.role === "user" ? "user" : (m.role === "assistant" ? "ai" : "sys");
         var entry = makeBubble(role, m.content, m.media_group_id || (m.id == null ? null : "history:" + m.id),
           m.parse_mode, null, m.msg_type, m.timestamp);
+        setButtons(entry, m.reply_markup, m.id || 0);
         appendHistoryMedia(entry, m, role);
       });
       // 刷新途中接上的流式帧与落库记录可能交叠，轮次结束后用完整记录收敛。

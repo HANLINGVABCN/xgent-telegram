@@ -49,6 +49,16 @@ class HistoryDescriptorTests(unittest.TestCase):
             self.assertEqual(1234567890, message["timestamp"])
             self.assertNotIn("metadata", message)
 
+    def test_restore_retry_keyboard_is_durable_and_strictly_scoped(self):
+        for status in ('pending', 'running', 'failed', 'stopped'):
+            message = self.build('system_op', 'restore status', {'compression_task': {
+                'id': 'a' * 32, 'status': status,
+            }})
+            self.assertEqual('retry_compress:' + 'a' * 32,
+                             message['reply_markup'][0][0]['callback_data'])
+        for task in ({'id': 'a' * 32, 'status': 'completed'}, {'id': '../outside', 'status': 'failed'}, None):
+            self.assertNotIn('reply_markup', self.build('system_op', metadata={'compression_task': task}))
+
     def test_display_metadata_does_not_replace_model_record(self):
         record = {
             "id": 3, "role": "system", "msg_type": "agent_result", "content": "shell notice",

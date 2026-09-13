@@ -51,6 +51,8 @@ class Fixture:
         self.busy = False
         self.stopped = False
         self.tasks = set()
+        self.restore_notice = None
+        self.restore_gate = None
         self.setting_values = {'disabled_skills': [], 'hidden_skills': []}
         self.populate()
 
@@ -156,9 +158,54 @@ class Fixture:
         outbox.put({"type": "turn_end"})
 
     def submit_command(self, command, outbox):
-        if command in ("/fixture/busy", "/fixture/error", "/fixture/compression", "/fixture/compression-error", "/fixture/progress", "/fixture/generated"):
+        if command in ("/fixture/busy", "/fixture/error", "/fixture/compression", "/fixture/compression-error",
+                       "/fixture/compression-hold-error", "/fixture/progress", "/fixture/generated"):
             self.busy = True
         self.schedule(self.command(command, outbox))
+
+    def submit_callback(self, data, message_id, outbox):
+        if (data != 'retry_compress:' + 'a' * 32 or self.restore_notice is None
+                or message_id != self.restore_notice['id'] or message_id not in self.records):
+            outbox.put({'type': 'callback_answer', 'text': 'Invalid restore callback', 'show_alert': True})
+            return
+        self.busy = True
+        self.schedule(self.restore(outbox, retry=True))
+
+    async def restore(self, outbox, *, retry=False, failed=False, hold=False):
+        outbox.put({'type': 'compression_state', 'busy': True})
+        bot = WebBot(outbox, 1)
+        if not retry:
+            await bot.send_message(1, 'EXPORTING FIXTURE')
+            await asyncio.sleep(0.7)
+            self.records.clear()
+            self.restore_notice = self.add('system_op', 'RESTORING FIXTURE', [
+                (self.root / 'memory export.zip', 'archive.zip'),
+            ], metadata={'compression_task': {'id': 'a' * 32, 'status': 'running'}})
+            outbox.put({'type': 'history_reset'})
+        else:
+            self.restore_notice['content'] = 'RESTORING FIXTURE'
+            self.restore_notice['metadata']['compression_task']['status'] = 'running'
+        draft = await bot.send_message(1, 'RESTORING FIXTURE')
+        if hold:
+            self.restore_gate = asyncio.Event()
+            await self.restore_gate.wait()
+            self.restore_gate = None
+        else:
+            await asyncio.sleep(2.5)
+        row = self.restore_notice
+        if failed:
+            row['content'] = 'COMPRESSION FAILED: archive retained; retry available'
+            row['metadata']['compression_task']['status'] = 'failed'
+            restored = build_history_message(row, self.root, self.root)
+            outbox.put({'type': 'edit', 'message_id': draft.message_id, 'record_id': row['id'],
+                        'text': row['content'], 'reply_markup': restored['reply_markup']})
+        else:
+            self.add('ai_reply', '## RESTORED CONVERSATION\n\nCOMPRESSION SUMMARY')
+            await draft.edit_text('## RESTORED CONVERSATION\n\nCOMPRESSION SUMMARY')
+            row['content'] = 'COMPRESSED FIXTURE'
+            row['metadata']['compression_task']['status'] = 'completed'
+        self.busy = False
+        outbox.put({'type': 'compression_state', 'busy': False, 'committed': True})
 
     async def command(self, command, outbox):
         if command == '/fixture/generated':
@@ -203,21 +250,12 @@ class Fixture:
             with path.open('rb') as file:
                 await bot.send_document(1, file, filename='progress.zip')
             self.busy = False
-        elif command == '/fixture/compression-error':
-            outbox.put({'type': 'compression_state', 'busy': True})
-            await asyncio.sleep(3)
-            outbox.put({'type': 'edit', 'message_id': 900, 'text': 'COMPRESSION FAILED: original context preserved'})
-            self.busy = False
-            outbox.put({'type': 'compression_state', 'busy': False, 'committed': False})
-        elif command == '/fixture/compression':
-            outbox.put({'type': 'compression_state', 'busy': True})
-            await asyncio.sleep(0.5)
-            self.records.clear()
-            self.add('system_op', 'COMPRESSED FIXTURE', [(self.root / 'memory export.zip', 'archive.zip')])
-            outbox.put({'type': 'history_reset'})
-            await asyncio.sleep(0.2)
-            self.busy = False
-            outbox.put({'type': 'compression_state', 'busy': False, 'committed': True})
+        elif command in {'/fixture/compression-error', '/fixture/compression', '/fixture/compression-hold-error'}:
+            await self.restore(outbox, failed=command.endswith('-error'), hold='-hold-' in command)
+            return
+        elif command == '/fixture/release-restore':
+            if self.restore_gate is not None:
+                self.restore_gate.set()
             return
         elif command in ("/fixture/busy", "/fixture/error"):
             self.stopped = False
@@ -278,6 +316,7 @@ async def main(port, serve):
             host="127.0.0.1", port=port, password_hash=web_auth.hash_password(password),
             bot_token="", authorized_user_id=1, loop=fixture.loop,
             submit_message=fixture.submit_message, submit_command=fixture.submit_command,
+            submit_callback=fixture.submit_callback,
             submit_upload=fixture.submit_upload, read_history=fixture.history,
             read_history_message=fixture.message, read_settings=fixture.settings,
             write_setting=fixture.settings, request_stop=fixture.stop,

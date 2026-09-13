@@ -1243,6 +1243,8 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             if notice_text:
                 await renderer.append(f"\n\n{notice_text}")
 
+        if getattr(generated_reply, 'text_only', False) and not stop_event.is_set():
+            await generated_reply.prepare(''.join(raw_response_parts).strip())
         full_response = ''.join(raw_response_parts).strip() if native_media_detected else (await renderer.finish() if renderer else "")
         if stop_event.is_set():
             full_response, _artifacts = await generated_reply.prepare(
@@ -1337,6 +1339,8 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
         raise
     except Exception as e:
         logger.error(f"流式响应错误: {e}")
+        if getattr(generated_reply, 'text_only', False):
+            generated_reply.error = str(e)
         partial, media_error = await _preserve_media_after_error(
             generated_reply, ''.join(raw_response_parts).strip(),
         )
@@ -1660,6 +1664,8 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
         raise
     except Exception as e:
         logger.error(f"后台流式响应错误: {e}")
+        if getattr(generated_reply, 'text_only', False):
+            generated_reply.error = str(e)
         partial, media_error = await _preserve_media_after_error(
             generated_reply, ''.join(raw_response_parts).strip(),
         )
@@ -1959,6 +1965,8 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
         raise
     except Exception as e:
         logger.error(f"非流式响应错误: {e}")
+        if getattr(generated_reply, 'text_only', False):
+            generated_reply.error = str(e)
         _partial, media_error = await _preserve_media_after_error(generated_reply, response or "")
         if media_error is not None:
             e = media_error

@@ -65,8 +65,13 @@ class ModelClient:
         if (getattr(history, 'require_complete', False) and reason is not None
                 and str(reason).lower() not in {'stop', 'end_turn', 'stop_sequence', 'eos_token'}):
             raise AttachmentContextError(
-                f'压缩输出未正常完成（{reason}），未清除旧上下文。'
+                f'压缩恢复输出未正常完成（{reason}），原文归档保留，可手动重试。'
             )
+
+    @staticmethod
+    def _check_compression_stream_end(history: list, finished: bool) -> None:
+        if getattr(history, 'require_complete', False) and not finished:
+            raise AttachmentContextError('压缩恢复流未收到完整结束标记，原文归档保留，可手动重试。')
 
     @staticmethod
     def _validate_conversation_request(body: Dict[str, Any], history: list) -> None:
@@ -631,7 +636,7 @@ class ModelClient:
                 data = json.loads(payload)
             except json.JSONDecodeError:
                 if getattr(history, 'require_complete', False):
-                    raise AttachmentContextError('压缩响应包含损坏的数据，未清除旧上下文。')
+                    raise AttachmentContextError('压缩响应包含损坏的数据，原文归档保留，可手动重试。')
                 continue
             if data.get("error"):
                 ModelClient._raise_conversation_request_error(history, data["error"])
@@ -644,7 +649,7 @@ class ModelClient:
             if chunk_text:
                 texts.append(chunk_text)
         if getattr(history, 'require_complete', False) and not finished:
-            raise AttachmentContextError('压缩响应中途结束，未清除旧上下文。')
+            raise AttachmentContextError('压缩响应中途结束，原文归档保留，可手动重试。')
         return "".join(texts)
 
     @staticmethod
@@ -876,6 +881,7 @@ class ModelClient:
         })
 
         yielded_any_text = False
+        finished = False
         try:
             async with ModelClient._http_client_context() as client:
                 # 最多两轮：第一轮带思考参数，被拒时去掉参数重开一次流。
@@ -914,15 +920,22 @@ class ModelClient:
 
                         async for payload in ModelClient._iter_sse_payloads(resp):
                             if payload == '[DONE]':
+                                finished = True
                                 break
                             try:
                                 data = json.loads(payload)
                             except json.JSONDecodeError:
+                                if getattr(history, 'require_complete', False):
+                                    raise AttachmentContextError('压缩恢复流包含损坏的数据，原文归档保留。')
                                 logger.debug(f"OpenAI compatible SSE parse failed: {payload[:200]}")
                                 continue
                             if data.get("error"):
                                 ModelClient._raise_conversation_request_error(history, data["error"])
                             record_token_usage(usage_sink, data.get("usage"))
+                            for choice in (data.get('choices') or [])[:1]:
+                                reason = choice.get('finish_reason')
+                                ModelClient._check_compression_completion(history, reason)
+                                finished = finished or reason is not None
                             text = ModelClient._extract_openai_compatible_text(data, stream=True)
                             if text:
                                 yielded_any_text = True
@@ -930,6 +943,7 @@ class ModelClient:
                     # 流正常跑完，不要进入第二轮重试。
                     break
 
+            ModelClient._check_compression_stream_end(history, finished)
             if not yielded_any_text:
                 ModelClient._raise_conversation_request_error(history, "模型未返回有效内容。")
                 text, error = await ModelClient._complete_openai_compatible_http(
@@ -1423,6 +1437,7 @@ class ModelClient:
             })
 
         yielded_any_text = False
+        finished = False
         try:
             request_kwargs = {
                 "model": model,
@@ -1477,12 +1492,16 @@ class ModelClient:
                 async for chunk in stream:
                     record_token_usage(usage_sink, _value_from_obj(chunk, 'usage'))
                     if chunk.choices:
+                        reason = getattr(chunk.choices[0], 'finish_reason', None)
+                        ModelClient._check_compression_completion(history, reason)
+                        finished = finished or reason is not None
                         chunk_text = ModelClient._openai_sdk_message_text(
                             chunk.choices[0].delta, stream=True,
                         )
                         if chunk_text:
                             yielded_any_text = True
                             yield chunk_text
+            ModelClient._check_compression_stream_end(history, finished)
             if not yielded_any_text:
                 ModelClient._raise_conversation_request_error(history, "模型未返回有效内容。")
 
@@ -1553,6 +1572,7 @@ class ModelClient:
         try:
             event_count = 0
             text_event_count = 0
+            finished = False
             last_payload_time = time.monotonic()
             async with ModelClient._http_client_context() as client:
               # 最多两轮：第一轮带思考参数，被拒时去掉参数重开一次流。
@@ -1596,12 +1616,15 @@ class ModelClient:
                             logger.warning(f"Gemini SSE gap {gap:.2f}s before event #{event_count}")
 
                         if payload == '[DONE]':
+                            finished = True
                             logger.info(f"Gemini stream done after {event_count} events, {text_event_count} text events")
                             break
 
                         try:
                             data = json.loads(payload)
                         except json.JSONDecodeError:
+                            if getattr(history, 'require_complete', False):
+                                raise AttachmentContextError('压缩恢复流包含损坏的数据，原文归档保留。')
                             logger.debug(f"Gemini SSE parse failed: {payload[:200]}")
                             continue
 
@@ -1611,6 +1634,9 @@ class ModelClient:
 
                         candidates = data.get('candidates', [])
                         if candidates:
+                            reason = candidates[0].get('finishReason')
+                            ModelClient._check_compression_completion(history, reason)
+                            finished = finished or reason is not None
                             parts = candidates[0].get('content', {}).get('parts', [])
                             yielded_any_text = False
                             for part in parts:
@@ -1631,6 +1657,7 @@ class ModelClient:
                             logger.warning(f"Gemini event #{event_count} had no candidates: {payload[:200]}")
                 # 流正常跑完，不要进入第二轮重试。
                 break
+            ModelClient._check_compression_stream_end(history, finished)
             if not text_event_count:
                 ModelClient._raise_conversation_request_error(history, "Gemini 未返回有效内容。")
         except AttachmentContextError:
@@ -1703,6 +1730,7 @@ class ModelClient:
         })
 
         yielded_any_text = False
+        finished = False
         try:
             async with ModelClient._http_client_context() as client:
               # 最多两轮：第一轮带思考参数，被拒时去掉参数重开一次流。
@@ -1741,11 +1769,14 @@ class ModelClient:
                     
                     async for payload in ModelClient._iter_sse_payloads(resp):
                         if payload == '[DONE]':
+                            finished = True
                             break
 
                         try:
                             data = json.loads(payload)
                         except json.JSONDecodeError:
+                            if getattr(history, 'require_complete', False):
+                                raise AttachmentContextError('压缩恢复流包含损坏的数据，原文归档保留。')
                             logger.debug(f"Claude SSE parse failed: {payload[:200]}")
                             continue
 
@@ -1755,6 +1786,12 @@ class ModelClient:
                             message = data.get('message') or {}
                             record_token_usage(usage_sink, message.get('usage'))
                         record_token_usage(usage_sink, data.get('usage'))
+                        if data.get('type') == 'message_delta':
+                            reason = (data.get('delta') or {}).get('stop_reason')
+                            ModelClient._check_compression_completion(history, reason)
+                            finished = finished or reason is not None
+                        if data.get('type') == 'message_stop':
+                            finished = True
 
                         if data.get('type') == 'content_block_delta':
                             delta = data.get('delta') or {}
@@ -1769,6 +1806,7 @@ class ModelClient:
                                 yield text
                 # 流正常跑完，不要进入第二轮重试。
                 break
+            ModelClient._check_compression_stream_end(history, finished)
             if not yielded_any_text:
                 ModelClient._raise_conversation_request_error(history, "Claude 未返回有效内容。")
         except AttachmentContextError:

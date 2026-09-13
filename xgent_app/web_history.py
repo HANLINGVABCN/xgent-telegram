@@ -196,6 +196,12 @@ def build_history_message(
     elif kind not in {"ai_reply", "media_reply", "user_text", "user_file", "user_photo"}:
         if _HTML_PRESENTATION.search(content):
             message["parse_mode"] = "HTML"
+    task = metadata.get('compression_task')
+    if (isinstance(task, dict) and re.fullmatch(r'[a-f0-9]{32}', str(task.get('id', '')))
+            and task.get('status') in {'pending', 'running', 'failed', 'stopped'}):
+        message['reply_markup'] = [[{
+            'text': '\u91cd\u8bd5\u6062\u590d', 'callback_data': 'retry_compress:' + task['id'],
+        }]]
     if kind not in _FILE_TYPES:
         return message
     if (metadata.get("attachment_purpose") == "configuration"

@@ -19,9 +19,8 @@ from xgent_app.agent_context import (
 from xgent_app.agent_search import run_search
 from xgent_app.generated_media import GeneratedMediaReply
 from xgent_app.compression import (
-    CompressionError, FrozenConversation, archive_files as compression_archive_files,
-    attachment_index as compression_attachment_index, has_new_content,
-    save_compression_archive, validate_summary, with_compressed_memory,
+    CompressionError, CompressionReply, FrozenConversation, has_new_content,
+    save_conversation_export, verify_export, with_archive_reference,
 )
 from xgent_app.attachments import (
     AttachmentContextError,
@@ -67,7 +66,8 @@ class GlobalRecorder:
     @staticmethod
     async def record(msg_type: str, role: str, content: str,
                      chat_id: Optional[int] = None, user_id: Optional[int] = None,
-                     session_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None):
+                     session_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+                     stop_event: Optional[asyncio.Event] = None):
         """记录消息到全局表 - 始终记录。
 
         普通记录失败只记日志；附件关联是完整上下文的必要条件，必须写入成功。
@@ -84,9 +84,12 @@ class GlobalRecorder:
                 role=role,
                 content=content,
                 session_id=session_id or UserDataManager.get('current_chat_id'),
-                metadata=stamped_metadata
+                metadata=stamped_metadata,
+                **({'stop_event': stop_event} if stop_event is not None else {}),
             )
         except Exception as e:
+            if 'compression_job_id' in stamped_metadata:
+                raise CompressionError(f"恢复回复写入失败：{e}") from e
             if 'attachments' in stamped_metadata:
                 raise AttachmentContextError(f"附件关联写入失败，未调用模型：{e}") from e
             logger.error(f"全局消息记录失败（已忽略，不中断主流程）: {e}")
@@ -147,7 +150,8 @@ class GlobalRecorder:
     
     @staticmethod
     async def record_ai_reply(content: str, chat_id: Optional[int] = None,
-                              metadata: Optional[Dict[str, Any]] = None):
+                              metadata: Optional[Dict[str, Any]] = None,
+                              stop_event: Optional[asyncio.Event] = None):
         """记录AI回复。"""
         return await GlobalRecorder.record(
             msg_type=MessageType.AI_REPLY,
@@ -155,6 +159,7 @@ class GlobalRecorder:
             content=content,
             chat_id=chat_id,
             metadata={'generated_media_processed': True, **(metadata or {})},
+            **({'stop_event': stop_event} if stop_event is not None else {}),
         )
 
     @staticmethod
@@ -230,7 +235,7 @@ class GlobalRecorder:
         record_system_message 记录操作结果（如"✅ 已成功导出..."），让 AI 能看到用户已完成
         的操作结果，避免重复询问。
         """
-        await GlobalRecorder.record(
+        return await GlobalRecorder.record(
             msg_type=MessageType.SYSTEM_OP,
             role='system',
             content=content,
@@ -1224,7 +1229,7 @@ async def build_model_conversation_history(history: List[Dict]) -> List[Dict]:
                 + "\n".join(errors)
                 + "\n请恢复原件，或清空当前对话后重新上传/生成。"
             )
-        return with_attachment_context(with_compressed_memory(history, latest_compression), parts)
+        return with_attachment_context(with_archive_reference(history, latest_compression), parts)
     except AttachmentContextError:
         raise
     except Exception as exc:

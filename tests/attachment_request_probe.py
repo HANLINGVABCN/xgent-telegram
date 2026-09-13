@@ -112,6 +112,7 @@ class Harness:
         ):
             await self.db.set_config(name, value)
         await bot.UserDataManager.init()
+        bot.PromptFileManager.init()
         transport = httpx.MockTransport(self.respond)
         self.http = httpx.AsyncClient(transport=transport)
         self.sdk = AsyncOpenAI(
@@ -147,7 +148,7 @@ class Harness:
         if self.force_sse or body.get("stream") or "streamGenerateContent" in str(request.url):
             data = {
                 "id": "test", "object": "chat.completion.chunk", "created": 1, "model": MODEL,
-                "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}}],
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
                 "candidates": [gemini], "type": "content_block_delta",
                 "delta": {"type": "text_delta", "text": text},
             }
