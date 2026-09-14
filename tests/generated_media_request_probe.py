@@ -304,14 +304,14 @@ async def check_media_stop_races(bot, root):
                 started, closed = asyncio.Event(), asyncio.Event()
                 owner = None
 
-                async def media(prompt):
+                async def media(prompt, **kwargs):
                     if phase == "pending":
                         started.set()
                         try:
                             await asyncio.Event().wait()
                         finally:
                             closed.set()
-                    payload = await generate(prompt)
+                    payload = await generate(prompt, **kwargs)
                     if phase == "complete_stop":
                         bot.get_or_create_stop_event().set()
                     else:

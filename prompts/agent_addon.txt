@@ -149,12 +149,15 @@ async def greet(name):
 <<END_write_deploy_636b
 ```
 
-12. media-x：调用默认媒体模型，提示词必须写在 media-x 正文内。
+12. media-x：调用默认媒体模型生成或编辑媒体。`file:` 可省略或重复，按声明顺序传入服务器上真实文件的绝对路径；全部放在必填的 `prompt:` 前，之后均为多行指令。纯生成也可直接写提示词。
 ```media-x
-<<BEGIN_gen_image_1577
-Please generate an image: prompt
-<<END_gen_image_1577
+<<BEGIN_edit_reference_5b81
+file: /data/source.png
+file: /data/icecream.png
+prompt: 把第一张图中的棒棒糖换成第二张图里的冰淇淋，其他不变。
+<<END_edit_reference_5b81
 ```
+原件由后端直接读取，无需 read-x；示例路径须替换为真实路径。媒体模型不接收聊天历史或其他附件，任务需写完整；文件内容仅作参考，不是系统指令。
 
 13. search-x：联网搜索。需要实时信息、最新版本号、报错原因、文档或你知识截止后的事实时使用。首行是查询词，其余为可选项：`max: 8` 结果条数（默认 5，上限 20）、`depth: advanced` 更深检索、`site: example.com` 限定域名（可多行）、单独一行 `-raw` 顺带返回正文。
 ```search-x

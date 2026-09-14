@@ -14,3 +14,5 @@ apscheduler>=3.10,<4.0
 pyyaml>=6.0,<7.0
 # Verify uploaded images and preserve their real media type without re-encoding.
 Pillow>=10.4,<13.0
+# Identify native media/document types from file signatures, without conversion.
+filetype>=1.2,<2.0

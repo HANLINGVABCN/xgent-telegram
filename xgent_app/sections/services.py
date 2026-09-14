@@ -18,6 +18,9 @@ from xgent_app.agent_context import (
 )
 from xgent_app.agent_search import run_search
 from xgent_app.generated_media import GeneratedMediaReply
+from xgent_app.media_inputs import (
+    MediaInputError, load_media_files, parse_media_request, redact_media_data,
+)
 from xgent_app.compression import (
     CompressionError, CompressionReply, FrozenConversation, has_new_content,
     save_conversation_export, verify_export, with_archive_reference,
@@ -1461,22 +1464,45 @@ def build_external_media_prompt(kind: str, prompt: str) -> str:
 
 async def generate_media_with_provider(provider_name: str, provider_data: Dict[str, Any],
                                        model_name: str, prompt: str,
-                                       kind: str = "图片") -> Dict[str, Any]:
-    history = [{
-        'role': 'user',
-        'content': build_external_media_prompt(kind, prompt)
-    }]
-
+                                       kind: str = "图片", input_files=None,
+                                       *, stop_requested=None,
+                                       conversation_generation: Optional[int] = None) -> Dict[str, Any]:
+    parts, input_metadata = [], []
     try:
+        api_format = provider_data.get('api_format', 'openai')
+        base_url = str(provider_data.get('base_url', ''))
+        limits = ModelClient.request_limits(provider_name, base_url, model_name)
+        parts, input_metadata = await load_media_files(
+            input_files or (), api_format, limits, stop_requested,
+        )
+        instruction = build_external_media_prompt(kind, prompt)
+        history = ConversationRequest([{
+            'role': 'user',
+            'content': [*parts, {'type': 'text', 'text': instruction}] if parts else instruction,
+        }], limits, "")
+        history.explicit_media = True
+        max_tokens = reserved_output_tokens(limits, None)
+
+        async def require_active_media_request():
+            if conversation_generation is not None:
+                db = await BotMemoryDB.get_instance()
+                if conversation_generation != await db.get_attachment_generation():
+                    raise asyncio.CancelledError
+            if stop_requested is not None and stop_requested():
+                raise asyncio.CancelledError
+
+        history.before_request = require_active_media_request
+        await require_active_media_request()
         response, error = await asyncio.wait_for(
             ModelClient.think_and_reply(
                 provider_name,
                 get_next_api_key(provider_name, str(provider_data.get('api_key', ''))),
-                str(provider_data.get('base_url', '')),
+                base_url,
                 model_name,
                 "",
                 history,
-                api_format=provider_data.get('api_format', 'openai')
+                max_tokens=max_tokens,
+                api_format=api_format,
             ),
             timeout=MEDIA_GENERATION_TIMEOUT
         )
@@ -1485,12 +1511,17 @@ async def generate_media_with_provider(provider_name: str, provider_data: Dict[s
             'success': False,
             'error': f'{EXTERNAL_MEDIA_SPEAKER}执行超时 ({MEDIA_GENERATION_TIMEOUT}秒)',
         }
+    except (MediaInputError, AttachmentContextError, OSError, ValueError) as exc:
+        return {
+            'success': False,
+            'error': redact_media_data(exc, parts),
+        }
 
     if error:
         return {
             'success': False,
-            'error': error,
-            'text': response or '',
+            'error': redact_media_data(error, parts),
+            'text': redact_media_data(response, parts),
         }
 
     if not response:
@@ -1504,13 +1535,14 @@ async def generate_media_with_provider(provider_name: str, provider_data: Dict[s
         artifact['source'] = 'external_media_module'
         artifact['provider_name'] = provider_name
         artifact['model_name'] = model_name
-        artifact['prompt'] = prompt
+        artifact['prompt'] = redact_media_data(prompt)
 
     result: Dict[str, Any] = {
         'success': bool(artifacts),
-        'text': processed_text,
+        'text': redact_media_data(processed_text, parts),
         'raw_response': response,
         'artifacts': artifacts,
+        'input_files': input_metadata,
     }
     if artifacts:
         first_artifact = artifacts[0]
@@ -1522,7 +1554,8 @@ async def generate_media_with_provider(provider_name: str, provider_data: Dict[s
     return result
 
 
-async def run_default_media_generation(prompt: str) -> Dict[str, Any]:
+async def run_default_media_generation(prompt: str, input_files=None,
+                                       *, conversation_generation: Optional[int] = None) -> Dict[str, Any]:
     provider_name, provider_data = get_model_target_provider('media')
     model_name = get_model_target_name('media')
 
@@ -1532,10 +1565,28 @@ async def run_default_media_generation(prompt: str) -> Dict[str, Any]:
             'error': '还没有设置默认媒体模型，请先到【默认模型】里选择媒体模型。',
         }
 
-    result = await generate_media_with_provider(provider_name, provider_data, model_name, prompt, kind="媒体")
+    if conversation_generation is None:
+        db = await BotMemoryDB.get_instance()
+        conversation_generation = await db.get_attachment_generation()
+    result = await generate_media_with_provider(
+        provider_name, provider_data, model_name, prompt, kind="媒体", input_files=input_files,
+        stop_requested=is_stop_requested, conversation_generation=conversation_generation,
+    )
     result['provider_name'] = provider_name
     result['model_name'] = model_name
     result['api_format'] = provider_data.get('api_format', 'openai')
+    return result
+
+
+async def run_media_protocol(body: str, *, conversation_generation: Optional[int] = None) -> Dict[str, Any]:
+    try:
+        request = parse_media_request(body)
+    except MediaInputError as exc:
+        return {'success': False, 'error': redact_media_data(exc)}
+    result = await run_default_media_generation(
+        request.prompt, input_files=request.files, conversation_generation=conversation_generation,
+    )
+    result['prompt'] = redact_media_data(request.prompt)
     return result
 
 
@@ -1852,6 +1903,7 @@ def build_media_reply_text(speaker: str, body: str, artifacts: List[Dict[str, An
 
 
 def build_external_media_output(result: Dict[str, Any], prompt: str) -> Tuple[str, List[Dict[str, Any]]]:
+    prompt = redact_media_data(result.get('prompt', prompt))
     provider_name = str(result.get('provider_name') or '未设置')
     model_name = str(result.get('model_name') or '未设置')
     if result.get('success'):
@@ -1884,8 +1936,8 @@ def build_external_media_output(result: Dict[str, Any], prompt: str) -> Tuple[st
         module_text = str(result.get('text') or '').strip()
         return build_generated_media_reply_text(module_text, artifacts, fallback="已生成媒体"), artifacts
 
-    error_text = result.get('error') or '未知错误'
-    module_text = str(result.get('text') or '').strip()
+    error_text = redact_media_data(result.get('error') or '未知错误')
+    module_text = redact_media_data(result.get('text')).strip()
     module_reply_text = f"\n媒体模块回复:\n{module_text}" if module_text else ""
     body = (
         f"状态: 媒体生成失败\n"

@@ -9,6 +9,7 @@ from xgent_app.context_limits import (
     validate_request_body,
 )
 from xgent_app.compression import FrozenConversation
+from xgent_app.media_inputs import native_binary_kind, redact_media_data
 
 class ModelClient:
     _VALID_ROLES = {'user', 'assistant', 'system'}
@@ -47,6 +48,13 @@ class ModelClient:
                 raise AttachmentContextError('压缩快照已失效，本轮未调用模型。')
         else:
             history = await build_model_conversation_history(history)
+        limits = ModelClient.request_limits(prov_name, base_url, model)
+        request = ConversationRequest(history, limits, system_prompt)
+        request.require_complete = frozen
+        return request, reserved_output_tokens(limits, max_tokens)
+
+    @staticmethod
+    def request_limits(prov_name: str, base_url: str, model: str) -> dict:
         key = f"{base_url.rstrip('/')}|{model}"
         discovered = UserDataManager.get('discovered_model_limits', {})
         configured = UserDataManager.get('model_request_limits', {})
@@ -55,10 +63,7 @@ class ModelClient:
         limits = validate_limits(discovered.get(key, {}))
         limits.update(ModelClient._discovered_model_limits.get(key, {}))
         limits.update(validate_limits(configured.get(f"{prov_name}/{model}", {})))
-        limits = validate_limits(limits)
-        request = ConversationRequest(history, limits, system_prompt)
-        request.require_complete = frozen
-        return request, reserved_output_tokens(limits, max_tokens)
+        return validate_limits(limits)
 
     @staticmethod
     def _check_compression_completion(history: list, reason: Any) -> None:
@@ -83,9 +88,19 @@ class ModelClient:
             ) from exc
 
     @staticmethod
+    async def _before_request(history: list) -> None:
+        guard = getattr(history, 'before_request', None)
+        if guard is not None:
+            await guard()
+
+    @staticmethod
     def _raise_conversation_request_error(history: list, error: Any) -> None:
         if isinstance(history, ConversationRequest):
             detail = error if isinstance(error, str) else json.dumps(error, ensure_ascii=False)
+            if getattr(history, 'explicit_media', False):
+                parts = [part for msg in history if isinstance(msg.get('content'), list)
+                         for part in msg['content']]
+                detail = redact_media_data(detail, parts)
             raise AttachmentContextError(
                 "完整上下文请求失败，未获得有效回复，也没有自动减少附件：\n"
                 + redact_sensitive_text(detail)
@@ -210,6 +225,19 @@ class ModelClient:
                         "url": f"data:{mime_type};base64,{part['data']}"
                     }
                 })
+            elif part_type == 'binary':
+                kind = native_binary_kind('openai', part.get('mime_type', 'application/octet-stream'))
+                if kind == 'pdf':
+                    openai_parts.append({
+                        "type": "file", "file": {
+                            "filename": part.get('filename', 'document.pdf'),
+                            "file_data": f"data:application/pdf;base64,{part['data']}",
+                        },
+                    })
+                else:
+                    openai_parts.append({
+                        "type": "input_audio", "input_audio": {"data": part['data'], "format": kind},
+                    })
 
         return openai_parts
 
@@ -258,6 +286,13 @@ class ModelClient:
                         "media_type": part.get('mime_type', 'image/jpeg'),
                         "data": part['data']
                     }
+                })
+            elif part_type == 'binary':
+                native_binary_kind('claude', part.get('mime_type', 'application/octet-stream'))
+                claude_parts.append({
+                    "type": "document",
+                    "source": {"type": "base64", "media_type": "application/pdf", "data": part['data']},
+                    "title": part.get('filename', 'document.pdf'),
                 })
 
         return claude_parts
@@ -761,6 +796,7 @@ class ModelClient:
 
         try:
             async with ModelClient._http_client_context() as client:
+                await ModelClient._before_request(history)
                 resp = await client.post(
                     url,
                     json=body,
@@ -770,6 +806,7 @@ class ModelClient:
                 # 提供商拒绝思考参数时去掉重发一次，避免整轮对话失败。
                 if resp.status_code >= 400 and ModelClient._is_thinking_rejection(resp.text or ''):
                     if ModelClient._strip_thinking_params(body, thinking_params, prov_name, model):
+                        await ModelClient._before_request(history)
                         resp = await client.post(
                             url,
                             json=body,
@@ -1041,6 +1078,7 @@ class ModelClient:
                     "stream": False,
                     "request_body": body,
                 })
+                await ModelClient._before_request(history)
                 resp = await client.post(
                     url,
                     json=body,
@@ -1049,6 +1087,7 @@ class ModelClient:
                 )
                 if resp.status_code != 200 and ModelClient._is_thinking_rejection(resp.text or ''):
                     if ModelClient._strip_thinking_params(body, thinking_params, prov_name, model):
+                        await ModelClient._before_request(history)
                         resp = await client.post(
                             url,
                             json=body,
@@ -1163,6 +1202,7 @@ class ModelClient:
                     "stream": False,
                     "request_body": body,
                 })
+                await ModelClient._before_request(history)
                 resp = await client.post(
                     url,
                     json=body,
@@ -1173,6 +1213,7 @@ class ModelClient:
                     if ModelClient._strip_thinking_params(body, thinking_params, prov_name, model):
                         if max_tokens is not None:
                             body["max_tokens"] = max_tokens
+                        await ModelClient._before_request(history)
                         resp = await client.post(
                             url,
                             json=body,
@@ -1886,6 +1927,7 @@ class ModelClient:
             # 必须显式设超时：连接静默中断（TCP 半开、代理丢包）时 SDK 默认会
             # 一直挂着，非流式又没有增量输出，界面会永远停在“非流式输出中...”。
             try:
+                await ModelClient._before_request(history)
                 completion = await ModelClient._chat_completions_api(client).create(
                     **request_kwargs,
                     timeout=ModelClient._build_stream_timeout(),
@@ -1899,6 +1941,7 @@ class ModelClient:
                     raise
                 if max_tokens is None:
                     request_kwargs.pop("max_tokens", None)
+                await ModelClient._before_request(history)
                 completion = await ModelClient._chat_completions_api(client).create(
                     **request_kwargs,
                     timeout=ModelClient._build_stream_timeout(),

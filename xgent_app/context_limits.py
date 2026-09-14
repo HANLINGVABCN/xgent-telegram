@@ -8,7 +8,6 @@ from typing import Any
 
 from xgent_app.attachments import AttachmentContextError
 
-
 DEFAULT_OUTPUT_RESERVE = 4096
 
 
@@ -27,10 +26,12 @@ def limits_from_model_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         ("inputTokenLimit", "max_input_tokens"),
         ("outputTokenLimit", "max_output_tokens"),
         ("max_images", "max_images"),
+        ("max_files", "max_files"),
+        ("max_file_bytes", "max_file_bytes"),
         ("max_request_bytes", "max_request_bytes"),
     ):
         value = metadata.get(source)
-        minimum = 0 if target == "max_images" else 1
+        minimum = 0 if target in {"max_images", "max_files"} else 1
         if type(value) is int and value >= minimum:
             result[target] = value
     if isinstance(metadata.get("supports_images"), bool):
@@ -49,6 +50,7 @@ def validate_limits(limits: dict) -> dict:
     numeric_keys = (
         "context_window", "max_input_tokens", "max_output_tokens", "max_images",
         "max_request_bytes", "output_reserve_tokens", "image_token_budget",
+        "max_files", "max_file_bytes",
     )
     unknown = result.keys() - {*numeric_keys, "supports_images"}
     if unknown:
@@ -57,7 +59,7 @@ def validate_limits(limits: dict) -> dict:
         if key not in result:
             continue
         value = result[key]
-        minimum = 0 if key == "max_images" else 1
+        minimum = 0 if key in {"max_images", "max_files"} else 1
         if type(value) is not int or value < minimum:
             raise AttachmentContextError(f"Invalid model request limit: {key}={value!r}")
     if "supports_images" in result and not isinstance(result["supports_images"], bool):
@@ -82,6 +84,7 @@ def reserved_output_tokens(limits: dict, max_tokens: int | None) -> int | None:
 def estimate_input_tokens(history: list, system_prompt: str, limits: dict) -> int:
     # Without a provider tokenizer, UTF-8 bytes give a conservative text budget.
     # Images are estimated from their pixel patches; upstream remains authoritative.
+    # Native documents/audio/video have unknown token costs and are not estimated.
     tokens = len(system_prompt.encode("utf-8")) + 16
     for message in history:
         tokens += 16
@@ -128,14 +131,18 @@ def validate_request_body(body: dict, history: list) -> None:
         )
     if "context_window" not in limits and "max_input_tokens" not in limits:
         return
+    native = any(part.get("type") == "binary" for msg in history
+                 if isinstance(msg.get("content"), list) for part in msg["content"])
+    estimate_label = ("Text/image portion estimate (native file tokens require API validation)"
+                      if native else "Full input conservative estimate")
     tokens = estimate_input_tokens(history, history.system_prompt, limits)
     if limits.get("max_input_tokens") is not None and tokens > limits["max_input_tokens"]:
         raise AttachmentContextError(
-            f"Full input conservative estimate {tokens} tokens exceeds input limit "
+            f"{estimate_label} {tokens} tokens exceeds input limit "
             f"{limits['max_input_tokens']} (output reservation: {output})"
         )
     if limits.get("context_window") is not None and tokens + output > limits["context_window"]:
         raise AttachmentContextError(
-            f"Full input conservative estimate {tokens} + output reservation {output} "
+            f"{estimate_label} {tokens} + output reservation {output} "
             f"exceeds context window {limits['context_window']}"
         )

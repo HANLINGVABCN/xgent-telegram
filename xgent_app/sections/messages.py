@@ -2237,13 +2237,16 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         await GlobalRecorder.record(
                             msg_type=MessageType.AGENT_CMD,
                             role='system',
-                            content=f"[Agent媒体生成] {media_prompt}",
+                            content=f"[Agent媒体生成] {redact_media_data(media_prompt)}",
                             chat_id=update.effective_chat.id
                         )
 
                         async def finalize_media_result(result):
                             notice, artifacts = build_external_media_output(result, media_prompt)
-                            metadata = await generated_image_metadata(artifacts, attachment_generation)
+                            metadata = await generated_image_metadata(artifacts, attachment_generation) or {}
+                            metadata['attachment_generation'] = attachment_generation
+                            if result.get('input_files'):
+                                metadata['media_inputs'] = result['input_files']
                             await persist_media_result(
                                 recorder=GlobalRecorder,
                                 database=db,
@@ -2258,12 +2261,17 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             result['persisted_notice'] = notice
                             result['artifacts'] = artifacts
 
+                        async def generate_requested_media(body):
+                            return await run_media_protocol(
+                                body, conversation_generation=attachment_generation,
+                            )
+
                         try:
                             media_execution = await execute_media_generation(
                                 media_prompt,
                                 context=context,
                                 chat_id=update.effective_chat.id,
-                                generate_media=run_default_media_generation,
+                                generate_media=generate_requested_media,
                                 keep_typing=keep_typing_while_waiting,
                                 stop_event_factory=get_or_create_stop_event,
                                 stop_requested=is_stop_requested,
