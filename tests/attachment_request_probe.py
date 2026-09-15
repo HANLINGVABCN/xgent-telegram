@@ -782,15 +782,15 @@ async def check_malformed_ingress(bot, root):
             rows = await h.db.get_attachment_records()
             assert len(rows) == 1
             assert json.loads(rows[0]["metadata"])["attachments"][0]["kind"] == "invalid"
-            assert len(h.requests) == before
-            assert "\u65e0\u6cd5\u5b8c\u6574" in json.dumps(h.drain_frames(), ensure_ascii=False)
-            try:
-                await h.call()
-            except AttachmentContextError:
-                pass
-            else:
-                raise AssertionError("a later turn silently omitted the invalid upload")
-            assert len(h.requests) == before
+            # Invalid attachments degrade gracefully: the model call proceeds
+            # with an informational text placeholder instead of being blocked.
+            assert len(h.requests) == before + 1
+            req_texts = unpack_request(h.requests[-1])[0]
+            assert any("Unsupported file format" in t for t in req_texts), \
+                f"degraded placeholder missing for {name}"
+            # A later turn also succeeds — no permanent block.
+            await h.call()
+            assert len(h.requests) == before + 2
             result[name] = True
         await h.db.clear_all_conversation_memory()
         with patch.object(h.db, "get_attachment_records", AsyncMock(side_effect=OSError("disk failure"))):

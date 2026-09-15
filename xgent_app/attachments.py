@@ -336,7 +336,28 @@ def _restore_reference(reference: dict, upload_root: str | Path,
         raise AttachmentContextError(f"{name}: invalid attachment reference")
     kind = reference.get("kind")
     if kind == "invalid":
-        raise AttachmentContextError(f"{name}: {reference.get('error', 'Parsing failed')}")
+        # Gracefully degrade: let the model see the file exists without blocking
+        # the entire conversation.  Resolve the path so the user/model can still
+        # locate the original file on disk.
+        storage = reference.get("storage", "uploads")
+        if storage == "generated_media" and generated_root is not None:
+            root = generated_root
+        else:
+            root = upload_root
+        try:
+            path = _resolve_storage_path(reference["path"], root)
+        except (AttachmentContextError, KeyError):
+            path = reference.get("path", "(unknown)")
+        error_detail = reference.get("error", "Parsing failed")
+        label = (
+            f"[Attachment: {name}]\n"
+            f"Original: {path}\n"
+            f"Size: {reference.get('size', '?')} bytes\n"
+            f"[Unsupported file format — content not available: {error_detail}]"
+        )
+        if reference.get("caption"):
+            label += f"\nUser caption:\n{reference['caption']}\n[End user caption]"
+        return path if isinstance(path, Path) else Path(str(path)), [{"type": "text", "text": label}]
     mime_type = reference.get("mime_type")
     if not isinstance(mime_type, str) or not mime_type:
         raise AttachmentContextError(f"{name}: invalid attachment media type")

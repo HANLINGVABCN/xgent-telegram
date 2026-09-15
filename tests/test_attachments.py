@@ -105,7 +105,7 @@ class AttachmentTests(unittest.TestCase):
                 self.assertEqual(data, base64.b64decode(parts[-1]["data"]))
                 self.assertEqual((13, 17), (ref["width"], ref["height"]))
 
-    def test_binary_and_corrupt_images_leave_blocking_references(self):
+    def test_binary_and_corrupt_images_leave_degraded_references(self):
         for data, name in ((b"%PDF-1.7 fake", "test.pdf"), (b"\x00\x01", "test.bin"),
                            (b"not an image", "test.png"), (b"PK\x03\x04bad", "test.zip"),
                            (image_bytes("JPEG")[:-3], "truncated.jpg")):
@@ -113,9 +113,12 @@ class AttachmentTests(unittest.TestCase):
                 ref = self.reference(data, name)
                 self.assertEqual("invalid", ref["kind"])
                 parts, _, errors = self.restore(ref)
-                self.assertFalse(parts)
-                self.assertTrue(errors)
-                self.assertIn(name, errors[0])
+                # Invalid attachments degrade gracefully: text placeholder, no errors.
+                self.assertTrue(parts)
+                self.assertFalse(errors)
+                self.assertEqual("text", parts[0]["type"])
+                self.assertIn(name, parts[0]["text"])
+                self.assertIn("Unsupported file format", parts[0]["text"])
 
     def test_missing_original_blocks_instead_of_omitting(self):
         ref = self.reference(b"original")
