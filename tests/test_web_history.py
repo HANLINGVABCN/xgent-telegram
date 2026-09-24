@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import sys
 import tempfile
 import threading
+import types
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -359,6 +361,72 @@ class DurableHistoryHttpTests(unittest.TestCase):
     def test_busy_state_is_available_after_refresh(self):
         self.state["busy"] = True
         self.assertIs(True, self.request("/api/history", cookie=self.cookie)[1]["busy"])
+
+
+class HistoryReplayFoldTests(unittest.TestCase):
+    """翻页/刷新的历史回放：ai_reply 正文里的 *-x 协议块按开关**实时**折成
+    <blockquote expandable>，与 Telegram/CLI 同源（同一个 render_folded_html）。
+    只改显示——DB 里的 content 逐字节不变；开关关或无块 → 回退原始 markdown。
+    守住 _section_ns() 这条跨命名空间取渲染器的接缝：取不到就退化不折。"""
+
+    NONCE = "0123456789AB"
+
+    def _block(self, tag="run-x", body="df -h\ndu -sh /var"):
+        return f"```{tag}\n<<BEGIN_{self.NONCE}\n{body}\n<<END_{self.NONCE}\n```"
+
+    def _fake_server(self, hide):
+        server = types.ModuleType("xgent_server")
+        server.markdown_to_telegram_html = lambda t: "<p>" + t + "</p>"
+        server._should_hide_protocol_blocks = lambda: hide
+        return server
+
+    def _build(self, content, *, hide=True, metadata=None, server=True):
+        record = {
+            "id": 11, "role": "assistant", "timestamp": 1,
+            "msg_type": "ai_reply", "content": content,
+            "metadata": json.dumps(metadata) if metadata is not None else None,
+        }
+        mods = {"xgent_server": self._fake_server(hide)} if server else {}
+        with patch.dict(sys.modules, mods):
+            if not server:
+                sys.modules.pop("xgent_server", None)
+            return build_history_message(record, "/s", "/w")
+
+    def test_switch_on_folds_protocol_block(self):
+        content = "先看磁盘：\n" + self._block() + "\n完成。"
+        msg = self._build(content, hide=True)
+        self.assertEqual("HTML", msg["parse_mode"])
+        self.assertIn("<blockquote expandable>", msg["content"])
+        self.assertNotIn("<<BEGIN_", msg["content"])   # 协议标记不外泄
+        self.assertNotIn(self.NONCE, msg["content"])
+        self.assertNotIn("```", msg["content"])
+        self.assertEqual("ai_reply", msg["msg_type"])  # 记录本身不变
+
+    def test_switch_off_keeps_raw_markdown(self):
+        content = "先看磁盘：\n" + self._block() + "\n完成。"
+        msg = self._build(content, hide=False)
+        self.assertIsNone(msg.get("parse_mode"))
+        self.assertEqual(content, msg["content"])       # 原文，绝不折
+
+    def test_no_protocol_block_not_forced_into_html(self):
+        content = "# 标题\n\n普通回复，没有协议块。"
+        msg = self._build(content, hide=True)
+        self.assertIsNone(msg.get("parse_mode"))
+        self.assertEqual(content, msg["content"])       # 交回 markdown 渲染
+
+    def test_display_metadata_takes_precedence(self):
+        # 已有 display（live 落库的镜像）优先，不再二次折叠。
+        msg = self._build(self._block(), hide=True,
+                          metadata={"display": {"content": "已折好", "parse_mode": "HTML"}})
+        self.assertEqual("已折好", msg["content"])
+        self.assertEqual("HTML", msg["parse_mode"])
+
+    def test_no_server_namespace_falls_back_to_raw(self):
+        # 取不到 section 命名空间（纯单测/独立进程）→ 不折，回退原文。
+        content = self._block()
+        msg = self._build(content, hide=True, server=False)
+        self.assertIsNone(msg.get("parse_mode"))
+        self.assertEqual(content, msg["content"])
 
 
 if __name__ == "__main__":

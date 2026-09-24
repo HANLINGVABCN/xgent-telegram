@@ -703,6 +703,31 @@ def _save_history() -> None:
 # 突然插进来会把输入行冲乱。按需拉取——/getchat 把数据库里的跨端历史渲染
 # 出来，看完继续聊，新消息不会自己冒出来。
 
+def _fold_ai_reply_for_cli(content: str) -> str:
+    """AI 回复的显示折叠：折叠开且含协议块 → *-x 块折成 <blockquote expandable>
+    （正文封顶 50 行 + 「已折叠 N 行」），与 Telegram/网页同源（同一个
+    _folded_display_html → render_folded_html）；折叠关或无块 → 照旧 markdown→
+    telegram-HTML。渲染出的 <pre> 码条经 TUI segment_lines 折成原地可展开块。
+
+    只改**显示**：/getchat 拉出来的 content 仍是原始文本，落库/中继逐字节不变。
+    """
+    hide = _ns.get("_should_hide_protocol_blocks")
+    fold = _ns.get("_folded_display_html")
+    if callable(hide) and callable(fold):
+        try:
+            if hide():
+                return fold(content, hide_unclosed=False)
+        except Exception:
+            pass
+    convert = _ns.get("markdown_to_telegram_html")
+    if callable(convert):
+        try:
+            return convert(content)
+        except Exception:
+            pass
+    return content
+
+
 def _render_history_rows(rows: Sequence[dict]) -> None:
     """把 get_display_history 的行渲染到终端。独立成函数方便单测。"""
     renderer = SCREEN.renderer()
@@ -720,12 +745,7 @@ def _render_history_rows(rows: Sequence[dict]) -> None:
             SCREEN.print_block(lines, message_id=None)
         elif role == "assistant":
             if msg_type == MessageType.AI_REPLY:
-                convert = _ns.get("markdown_to_telegram_html")
-                if callable(convert):
-                    try:
-                        content = convert(content)
-                    except Exception:
-                        pass
+                content = _fold_ai_reply_for_cli(content)
                 lines = renderer.render_message(content, (), "HTML")
             else:
                 # AGENT_RESULT/媒体回执存库时已是 Telegram HTML

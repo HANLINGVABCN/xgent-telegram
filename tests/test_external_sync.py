@@ -398,6 +398,46 @@ print(json.dumps({
         self.assertTrue(result["ai_row"], "AI 回复要走 Markdown 渲染并带 XGent 头")
         self.assertTrue(result["sys_row"])
 
+    def test_sync_folds_protocol_block_when_hidden(self):
+        """折叠开时，跨端历史回放里 AI 回复的 *-x 协议块折成 <blockquote expandable>，
+        与 Telegram/网页同源（同一个 _folded_display_html→render_folded_html）；
+        协议标记/nonce/围栏不外泄，正文放进可展开 <pre> 里可见。只改显示。"""
+        result = self.run_probe(r'''
+import json, xgent_cli
+# 隔离掉 DB/开关初始化：把折叠开关钉成 ON，只验证 CLI 折叠接线本身。
+xgent_cli._ns["_should_hide_protocol_blocks"] = lambda: True
+NONCE = "0123456789AB"
+block = "```run-x\n<<BEGIN_" + NONCE + "\ndf -h\ndu -sh /var\n<<END_" + NONCE + "\n```"
+content = "先看磁盘：\n" + block + "\n完成。"
+folded = xgent_cli._fold_ai_reply_for_cli(content)
+print(json.dumps({
+    "expandable": "<blockquote expandable>" in folded,
+    "no_begin": "<<BEGIN_" not in folded,
+    "no_nonce": NONCE not in folded,
+    "no_fence": "```" not in folded,
+    "body_visible": "df -h" in folded,
+}))
+''')
+        self.assertTrue(result["expandable"], "折叠开时协议块要折成可展开 blockquote")
+        self.assertTrue(result["no_begin"])
+        self.assertTrue(result["no_nonce"])
+        self.assertTrue(result["no_fence"])
+        self.assertTrue(result["body_visible"], "正文放进可展开 <pre>，应可见")
+
+    def test_sync_off_keeps_ai_reply_raw_markdown(self):
+        """折叠关时，AI 回复照旧走 markdown，不折、不外泄结构。"""
+        result = self.run_probe(r'''
+import json, xgent_cli
+xgent_cli._ns["_should_hide_protocol_blocks"] = lambda: False
+NONCE = "0123456789AB"
+block = "```run-x\n<<BEGIN_" + NONCE + "\ndf -h\n<<END_" + NONCE + "\n```"
+folded = xgent_cli._fold_ai_reply_for_cli("看：\n" + block)
+print(json.dumps({
+    "no_expandable": "<blockquote expandable>" not in folded,
+}))
+''')
+        self.assertTrue(result["no_expandable"], "折叠关时不应折成可展开 blockquote")
+
 
 class RestartFromCliTests(SectionsProbeMixin, unittest.TestCase):
     """CLI 发起 /restart：检测外部 PM2 托管、CLI 会话不退出。"""

@@ -167,6 +167,46 @@ def _describe_media(ref: Any, storage: Path, *, attachment: bool) -> dict[str, A
     return item
 
 
+def _section_ns() -> dict | None:
+    """运行中的服务端把所有 section 函数 exec 进 xgent_server（直接跑时是 __main__）
+    的 globals。web_history 是叶子模块、不在那个共享命名空间里，按需从 sys.modules
+    取回折叠要用的渲染器/开关；找不到（如纯单测、独立进程）返回 None → 回退不折叠
+    （沿用历史行为，测试不受影响）。"""
+    import sys
+    for name in ("xgent_server", "__main__"):
+        mod = sys.modules.get(name)
+        if mod is not None and hasattr(mod, "markdown_to_telegram_html") \
+                and hasattr(mod, "_should_hide_protocol_blocks"):
+            return vars(mod)
+    return None
+
+
+def _folded_history_html(content: str) -> str | None:
+    """折叠模式 ON 且正文含协议块时，返回折叠后的 Telegram-HTML；否则 None（照常走 markdown）。
+
+    只改**显示**：DB 记录里的 content 仍是原始文本，翻页/刷新时按开关**实时**折叠——
+    与 Telegram/CLI 三端同源（同一个 ProtocolParser.render_folded_html），落库/执行/
+    镜像永远用完整原文。返回 None 表示"没得折叠/开关关着/取不到渲染器"，交回上层
+    照常走 markdown。
+    """
+    if not content:
+        return None
+    ns = _section_ns()
+    if ns is None:
+        return None
+    try:
+        from xgent_app.protocols import ProtocolParser
+        if not ns["_should_hide_protocol_blocks"]():
+            return None
+        folded = ProtocolParser.render_folded_html(
+            content, prose_renderer=ns["markdown_to_telegram_html"])
+    except Exception:
+        return None
+    # 无协议块时 render_folded_html 原样返回输入——那种情况让 markdown 渲染器
+    # 处理更合适（它支持标题/列表/表格），别把纯文本硬塞进 HTML 通道。
+    return folded if folded != content else None
+
+
 def build_history_message(
     record: dict[str, Any], storage_root: str | Path, workspace_root: str | Path,
 ) -> dict[str, Any]:
@@ -195,9 +235,15 @@ def build_history_message(
     display = metadata.get("display")
     if isinstance(display, dict) and isinstance(display.get("content"), str):
         message.update(content=display["content"], parse_mode=display.get("parse_mode"))
-    elif kind not in {"ai_reply", "media_reply", "user_text", "user_file", "user_photo"}:
-        if _HTML_PRESENTATION.search(content):
-            message["parse_mode"] = "HTML"
+    elif kind in {"ai_reply", "media_reply"}:
+        # 刷新/翻页的历史回放此前直接渲染原始 markdown——协议块整篇摊开、不折叠
+        # （live 靠镜像的 display 折，历史记录没有 display 就露了原文）。这里按开关
+        # 实时折成 <blockquote expandable>，与 live/Telegram/CLI 同源；无块则回退 markdown。
+        folded = _folded_history_html(content)
+        if folded is not None:
+            message.update(content=folded, parse_mode="HTML")
+    elif kind not in {"user_text", "user_file", "user_photo"} and _HTML_PRESENTATION.search(content):
+        message["parse_mode"] = "HTML"
     task = metadata.get('compression_task')
     if (isinstance(task, dict) and re.fullmatch(r'[a-f0-9]{32}', str(task.get('id', '')))
             and task.get('status') in {'pending', 'running', 'failed', 'stopped'}):
