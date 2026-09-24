@@ -12,14 +12,17 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock
 
 from xgent_app.fanout import (
+    MAX_OP_ATTEMPTS,
     ChannelWorker,
     Op,
+    OP_CHAT_ACTION,
     OP_EDIT,
     OP_EDIT_MARKUP,
     OP_SEND,
     OpNotDeliverable,
+    OpTransientError,
 )
-from xgent_app.web_bridge import deliver_op_to_bot, MirrorBot
+from xgent_app.web_bridge import deliver_op_to_bot, MirrorBot, _markup_to_frame, markup_from_frame
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +34,7 @@ class _FakeStore:
 
     def __init__(self):
         self.rows = []
+        self.dead = []
         self._next_id = 1
 
     async def append(self, channel, op):
@@ -48,6 +52,15 @@ class _FakeStore:
 
     async def delete(self, row_ids):
         self.rows = [r for r in self.rows if r["id"] not in row_ids]
+
+    async def record_attempt(self, row_id, attempts, error):
+        for r in self.rows:
+            if r["id"] == row_id:
+                r["attempts"] = attempts
+                r["last_error"] = error
+
+    async def deadletter(self, channel, op, error):
+        self.dead.append((op.kind, op.logical_id, error))
 
 
 class _FakeBadRequest(Exception):
@@ -164,17 +177,35 @@ class TestBadRequestTranslation(unittest.TestCase):
         finally:
             wb._TgBadRequest = original_cls
 
-    def test_unknown_badrequest_not_translated(self):
-        """不在 _PERM_PATTERNS 中的 BadRequest 不应被翻译。"""
+    def test_unknown_badrequest_is_permanent(self):
+        """任何 BadRequest（哪怕文案从没见过）都是永久错误，必须翻译成 OpNotDeliverable。
+
+        以前靠文案白名单：白名单漏一种，那一种就被当成网络故障无限重试。
+        """
         import xgent_app.web_bridge as wb
         original_cls = wb._TgBadRequest
         try:
             wb._TgBadRequest = _FakeBadRequest
             bot = MagicMock()
             bot.edit_message_text = AsyncMock(
-                side_effect=_FakeBadRequest("Some unknown bad request reason"))
+                side_effect=_FakeBadRequest("Can't parse inlinekeyboardbutton: text buttons are not allowed"))
             op = self._make_edit_op()
-            with self.assertRaises(_FakeBadRequest):
+            with self.assertRaises(OpNotDeliverable):
+                _run(deliver_op_to_bot(bot, op, 42))
+        finally:
+            wb._TgBadRequest = original_cls
+
+    def test_flood_badrequest_is_transient(self):
+        """限流类 400 是暂时的，应翻译成 OpTransientError 走熔断路径。"""
+        import xgent_app.web_bridge as wb
+        original_cls = wb._TgBadRequest
+        try:
+            wb._TgBadRequest = _FakeBadRequest
+            bot = MagicMock()
+            bot.edit_message_text = AsyncMock(
+                side_effect=_FakeBadRequest("Too Many Requests: retry after 5"))
+            op = self._make_edit_op()
+            with self.assertRaises(OpTransientError):
                 _run(deliver_op_to_bot(bot, op, 42))
         finally:
             wb._TgBadRequest = original_cls
@@ -260,6 +291,121 @@ class TestDrainStoreSkipsPoisonMessage(unittest.TestCase):
         remaining = _run(store.count("telegram"))
         self.assertEqual(remaining, 0,
                          "补投完成后 store 中不应有残留记录")
+
+
+# ---------------------------------------------------------------------------
+# 防线 5：未知错误按条计次、持久、到上限进死信，绝不堵队头
+# ---------------------------------------------------------------------------
+
+class TestUnknownErrorAttemptsAndDeadletter(unittest.TestCase):
+
+    def _worker_and_store(self, deliver):
+        store = _FakeStore()
+        worker = ChannelWorker("telegram", deliver, is_configured=lambda: True, store=store)
+        return worker, store
+
+    def test_unknown_error_does_not_block_following_rows(self):
+        """队头是一条抛未知异常的消息：它被跳过，后面的照常投递，且它的 attempts 落库。"""
+        delivered = []
+
+        async def deliver(op, native):
+            if op.logical_id == 1:
+                raise RuntimeError("some brand-new failure nobody whitelisted")
+            delivered.append(op.logical_id)
+            return 500 + int(op.logical_id)
+
+        worker, store = self._worker_and_store(deliver)
+
+        async def run():
+            await store.append("telegram", Op(kind=OP_SEND, chat_id=1, logical_id=1, payload={"text": "bad"}))
+            await store.append("telegram", Op(kind=OP_SEND, chat_id=1, logical_id=2, payload={"text": "ok"}))
+            await store.append("telegram", Op(kind=OP_SEND, chat_id=1, logical_id=3, payload={"text": "ok2"}))
+            await worker._drain_store(0)
+
+        _run(run())
+        self.assertEqual(delivered, [2, 3])
+        bad_rows = [r for r in store.rows if r["logical_id"] == 1]
+        self.assertEqual(len(bad_rows), 1, "坏消息未到上限前应留在库里")
+        self.assertEqual(bad_rows[0]["attempts"], 1)
+        self.assertEqual(worker._breaker.state, "closed", "单条坏消息不应推开熔断器")
+
+    def test_attempts_survive_restart_and_reach_deadletter(self):
+        """attempts 存在库里：换一个新 worker（模拟重启）继续累加，到上限进死信。"""
+        async def deliver(op, native):
+            raise RuntimeError("always fails")
+
+        store = _FakeStore()
+
+        async def run():
+            await store.append("telegram", Op(kind=OP_SEND, chat_id=1, logical_id=7, payload={"text": "x"}))
+            for _ in range(MAX_OP_ATTEMPTS):
+                worker = ChannelWorker("telegram", deliver, is_configured=lambda: True, store=store)
+                await worker._drain_store(0)
+
+        _run(run())
+        self.assertEqual(store.rows, [], "到上限后待发库里不应再有它")
+        self.assertEqual(len(store.dead), 1)
+        self.assertEqual(store.dead[0][1], 7)
+
+    def test_transient_error_stops_drain_without_counting(self):
+        """通道级故障（超时/断网）：停下整轮补投，但不给队头那条记账。"""
+        async def deliver(op, native):
+            raise OpTransientError("network down")
+
+        worker, store = self._worker_and_store(deliver)
+
+        async def run():
+            await store.append("telegram", Op(kind=OP_SEND, chat_id=1, logical_id=1, payload={"text": "a"}))
+            await store.append("telegram", Op(kind=OP_SEND, chat_id=1, logical_id=2, payload={"text": "b"}))
+            for _ in range(10):
+                await worker._drain_store(0)
+
+        _run(run())
+        self.assertEqual(len(store.rows), 2, "断网期间内容一条不能丢")
+        self.assertTrue(all(int(r.get("attempts") or 0) == 0 for r in store.rows))
+        self.assertEqual(store.dead, [])
+
+    def test_chat_action_not_persisted_while_circuit_open(self):
+        """熔断开闸时 send_chat_action 直接丢，不往待发库里堆。"""
+        async def deliver(op, native):
+            raise OpTransientError("down")
+
+        worker, store = self._worker_and_store(deliver)
+        for _ in range(3):
+            worker._breaker.record_failure()
+        self.assertEqual(worker._breaker.state, "open")
+
+        _run(worker._handle(Op(kind=OP_CHAT_ACTION, chat_id=1, payload={"action": "typing"})))
+        self.assertEqual(store.rows, [])
+
+        _run(worker._handle(Op(kind=OP_SEND, chat_id=1, logical_id=9, payload={"text": "keep me"})))
+        self.assertEqual(len(store.rows), 1, "真正的内容必须照常落库")
+
+
+# ---------------------------------------------------------------------------
+# 防线 6：按钮拍平/还原不再制造"无目标按钮"毒药
+# ---------------------------------------------------------------------------
+
+class TestMarkupRoundTrip(unittest.TestCase):
+
+    def test_url_button_survives_flatten_and_targetless_button_dropped(self):
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("打开", url="https://example.com"),
+            InlineKeyboardButton("停止", callback_data="stop"),
+        ]])
+        rows = _markup_to_frame(markup)
+        self.assertEqual(rows[0][0].get("url"), "https://example.com")
+
+        # 混进一个既无 url 也无 callback_data 的坏按钮（老版本拍平 url 按钮的产物）
+        rows[0].append({"text": "纯文本", "callback_data": ""})
+        rebuilt = markup_from_frame(rows)
+        kinds = [(b.url, b.callback_data) for b in rebuilt.inline_keyboard[0]]
+        self.assertEqual(kinds, [("https://example.com", None), (None, "stop")])
+
+    def test_all_targetless_returns_none(self):
+        self.assertIsNone(markup_from_frame([[{"text": "a", "callback_data": ""}]]))
 
 
 if __name__ == "__main__":

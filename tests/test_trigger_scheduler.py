@@ -81,7 +81,7 @@ async def main():
     await mgr.startup(None)
     scheduler = mgr._scheduler
     scan_jobs = [j for j in scheduler.get_jobs()
-                 if j.id == 'self-trigger:pickup-scan']
+                 if j.id == 'internal:pickup-scan']
     await mgr.shutdown()
     db = await ns["BotMemoryDB"].get_instance()
     await db.close()
@@ -174,12 +174,21 @@ async def main():
     removed = [j.id for j in mgr._scheduler.get_jobs()
                if j.id == 'self-trigger:trg_probe_pickup']
 
+    # 回归护栏：内部巡检 job 绝不能被对账逻辑当失效任务摘除。
+    # 曾用 self-trigger:pickup-scan 前缀，首次扫描剥前缀→DB 无此任务→自我删除，
+    # 此后再不扫描、CLI 任务永远无人拾取。多扫几轮确认它仍活着。
+    await mgr._pickup_scan()
+    await mgr._pickup_scan()
+    scan_alive = [j.id for j in mgr._scheduler.get_jobs()
+                  if j.id == 'internal:pickup-scan']
+
     await mgr.shutdown()
     await db.close()
     print(json.dumps({
         "before": len(before),
         "picked": len(picked),
         "removed": len(removed),
+        "scan_alive": len(scan_alive),
     }))
 
 asyncio.run(main())
@@ -187,6 +196,7 @@ asyncio.run(main())
         self.assertEqual(result["before"], 0)
         self.assertEqual(result["picked"], 1)
         self.assertEqual(result["removed"], 0)
+        self.assertEqual(result["scan_alive"], 1)  # 巡检 job 多轮扫描后必须仍存活
 
     def test_t4_delivery_bot(self):
         """T4: build_trigger_delivery_bot 在 PTB / 纯 Web 两态构造正确。"""
@@ -222,6 +232,52 @@ asyncio.run(main())
         self.assertTrue(result["ptb_chat"])
         self.assertEqual(result["web_type"], "MirrorBot")
         self.assertTrue(result["web_real_none"])
+
+    def test_t5_real_command_execution(self):
+        """T5: 真正跑一次触发器命令，校验输出/退出码/状态。
+
+        这是防「删属性/换机制留残引用」类崩溃的兜底：直接执行 _run_trigger_command
+        的真实子进程路径（MAX_RUN_SECONDS AttributeError 当初就藏在这条路径上，
+        因为没有任何测试实际 fire 过命令，才全绿带崩溃地上线）。
+        """
+        result = self.run_probe(SECTIONS_PREAMBLE + """
+import asyncio
+
+async def main():
+    mgr = ns["SelfTriggerManager"]
+    await ns["UserDataManager"].init()
+    db = await ns["BotMemoryDB"].get_instance()
+
+    # 成功路径：echo 正常退出
+    ok_task = {
+        'id': 'trg_exec_ok', 'chat_id': 1, 'conversation_id': 'conv',
+        'command': 'echo hello_from_trigger', 'condition_expr': None,
+        'timezone': 'Asia/Shanghai',
+    }
+    ok = await mgr._run_trigger_command(ok_task, 'run_ok')
+
+    # 失败路径：非零退出码必须如实反映，不被吞成成功
+    fail_task = dict(ok_task, id='trg_exec_fail', command='exit 3')
+    fail = await mgr._run_trigger_command(fail_task, 'run_fail')
+
+    await db.close()
+    print(json.dumps({
+        "ok_status": ok["status"],
+        "ok_exit": ok["exit_code"],
+        "ok_output_has_marker": "hello_from_trigger" in ok["output"],
+        "ok_error": ok["error"],
+        "fail_status": fail["status"],
+        "fail_exit": fail["exit_code"],
+    }))
+
+asyncio.run(main())
+""")
+        self.assertEqual(result["ok_status"], "completed")
+        self.assertEqual(result["ok_exit"], 0)
+        self.assertTrue(result["ok_output_has_marker"])
+        self.assertIsNone(result["ok_error"])
+        self.assertEqual(result["fail_status"], "failed")
+        self.assertEqual(result["fail_exit"], 3)
 
 
 if __name__ == '__main__':

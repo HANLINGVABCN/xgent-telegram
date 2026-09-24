@@ -1,6 +1,17 @@
 # This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
+from xgent_app.protocols import ProtocolParser
+
+
+def _should_hide_protocol_blocks() -> bool:
+    """当前会话是否开启「隐藏协议代码块」。
+
+    只影响「显示」这一层：开启后把 AI 回复正文里的 *-x 协议块折叠成一行占位，
+    绝不触碰被落库 / 执行 / 镜像的原始文本。默认 False（关）。
+    """
+    return normalize_bool(UserDataManager.get('hide_protocol_blocks', False), False)
+
 async def keep_typing_while_waiting(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
                                     stop_event: asyncio.Event, interval: float = 4.0,
                                     max_duration: Optional[float] = None,
@@ -107,21 +118,26 @@ class TelegramRichAPI:
             raise TelegramError(f"sendRichMessageDraft failed: {result.get('description', result)}")
         return result
 
+@without_ui_history
 async def rich_finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
                                        msg: Any, response: str, limit: int = RICH_MESSAGE_CHAR_LIMIT):
     """使用 Rich Message 发送最终回复。失败时 fallback 到旧 HTML 编辑模式。"""
+    # 隐藏协议代码块：只改「显示」，另起 display 变量，绝不重绑 response——
+    # 落库 / 执行 / 镜像用的是调用方各自的返回值局部变量，与这里无关。
+    # 定稿默认 hide_unclosed=False：即便模型截断，未闭合块也原样完整显示、不折叠。
+    display = ProtocolParser.redact_protocol_blocks(response) if _should_hide_protocol_blocks() else response
     # sendRichMessage 直连 Telegram Bot API，绕过 context.bot。网页会话用的是
     # WebBot / MirrorBot（_is_xgent_web_bot），直连既不会往网页 outbox 推帧，又
     # 会对纯网页会话误发到 Telegram。网页端改走 finalize_text_response：经
     # context.bot 发 edit/message 帧，网页看得到回复，MirrorBot 也能正常镜像到
     # TG（表格等仍以 <pre> 等宽块呈现，仅失去原生 RichBlock 排版）。
     if getattr(context.bot, "_is_xgent_web_bot", False):
-        await finalize_text_response(context, chat_id, msg, response, min(limit, 4000))
+        await finalize_text_response(context, chat_id, msg, display, min(limit, 4000))
         return
     try:
         await TelegramRichAPI.send_rich_message(
             chat_id=chat_id,
-            text=response,
+            text=display,
         )
         # 删除原来的占位消息
         try:
@@ -131,7 +147,7 @@ async def rich_finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_i
         logger.info(f"Rich Message 发送成功: chat_id={chat_id}")
     except Exception as e:
         logger.warning(f"Rich Message 最终发送失败，降级为 HTML 编辑模式: {e}")
-        await finalize_text_response(context, chat_id, msg, response, min(limit, 4000))
+        await finalize_text_response(context, chat_id, msg, display, min(limit, 4000))
 
 
 def _parse_markdown_table_row(line: str) -> Optional[List[str]]:
@@ -629,6 +645,7 @@ async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
 
     return sent
 
+@without_ui_history
 async def finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: Any,
                                  response: str, limit: int = 4000):
     html_response = markdown_to_telegram_html(response)
@@ -748,12 +765,18 @@ class TelegramStreamRenderer:
         self.context = context
         self.chat_id = chat_id
         self.current_msg = msg
+        self.message_ids = [getattr(msg, 'message_id', None)]
         self.reply_markup = reply_markup
         self.limit = limit
         self.stop_event = stop_event
         self.queue: asyncio.Queue = asyncio.Queue()
         self.response_parts: List[str] = []
         self.current_text = ""
+        # 隐藏协议代码块：只影响流式「显示」。current_text / response_parts / finish()
+        # 恒为原始文本（落库 / 执行 / 镜像取的就是它们），脱敏只在 _display_text() 临渲染时发生。
+        self._hide_blocks = normalize_bool(UserDataManager.get('hide_protocol_blocks', False), False)
+        # 去重基准：脱敏后文本较上次没变则跳过这次 draft/edit，长代码块流式时消息静止、零 API 抖动。
+        self._last_display: Optional[str] = None
         self.pending_text = ""
         self._task: Optional[asyncio.Task] = None
         self.live_edit_enabled = True
@@ -772,6 +795,17 @@ class TelegramStreamRenderer:
         self._is_web_bot = bool(getattr(context.bot, "_is_xgent_web_bot", False))
         if self._is_web_bot:
             self._rich_draft_enabled = False
+
+    def _display_text(self, raw: str, hide_unclosed: bool) -> str:
+        """把要「显示」的原始文本按开关脱敏；关或无块时原样返回，绝不改累加器。
+
+        hide_unclosed=True 仅流式中途用（已 BEGIN 未 END 的尾巴折「生成中…」）；
+        hide_unclosed=False 定稿用（未闭合 / 截断 / 写错的块原样完整显示、不折叠，
+        防止把整段回复吞成一行）。
+        """
+        if not self._hide_blocks:
+            return raw
+        return ProtocolParser.redact_protocol_blocks(raw, hide_unclosed=hide_unclosed)
 
     def start(self):
         self._task = asyncio.create_task(self._render_loop())
@@ -806,7 +840,10 @@ class TelegramStreamRenderer:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
         partial = ''.join(self.response_parts).strip()
-        visible_text = self.current_text.strip() or partial
+        # 定稿显示：未闭合 / 截断块原样完整显示（hide_unclosed=False），绝不折成「生成中…」。
+        # 返回值 partial 恒为原始文本，落库不受影响。
+        visible_text = self._display_text(self.current_text, hide_unclosed=False).strip() \
+            or self._display_text(partial, hide_unclosed=False)
         if visible_text:
             # 用 Rich Message 固化已生成内容（网页会话绕过：见 __init__ 注释）
             if not self._is_web_bot:
@@ -836,10 +873,13 @@ class TelegramStreamRenderer:
         """流式完成后：用 Rich Message 发送最终内容，删除旧占位消息。"""
         if not self.current_text.strip():
             return
+        # 定稿显示：未闭合 / 截断 / 写错的块原样完整显示（hide_unclosed=False），
+        # 绝不折成「生成中…」、绝不把整段回复吞成一行。current_text 自身不动。
+        display = self._display_text(self.current_text, hide_unclosed=False)
         if self.live_edit_enabled and not self._is_web_bot:
             # 优先尝试 Rich Message 固化（网页会话绕过：见 __init__ 注释）
             try:
-                await TelegramRichAPI.send_rich_message(chat_id=self.chat_id, text=self.current_text)
+                await TelegramRichAPI.send_rich_message(chat_id=self.chat_id, text=display)
                 try:
                     await self.current_msg.delete()
                 except Exception:
@@ -850,7 +890,7 @@ class TelegramStreamRenderer:
         # 网页会话或 Rich 固化失败：降级为 HTML 编辑（经 context.bot，网页收 edit 帧）
         if self.live_edit_enabled:
             try:
-                html_text = markdown_to_telegram_html(self.current_text)
+                html_text = markdown_to_telegram_html(display)
                 await safe_edit_text(self.current_msg, html_text, reply_markup=None,
                                      parse_mode=constants.ParseMode.HTML)
             except Exception as e:
@@ -882,35 +922,46 @@ class TelegramStreamRenderer:
         text = self.pending_text
         self.pending_text = ""
 
-        if len(self.current_text) + len(text) > self.limit:
+        # 溢出判定按「显示长度」：隐藏时折叠后的正文更短，分段更晚触发（合理）；
+        # 不隐藏时 _display_text 原样返回，len 与原来完全一致，行为不变。
+        if len(self._display_text(self.current_text + text, hide_unclosed=True)) > self.limit:
             if self.live_edit_enabled and self.current_text.strip():
                 try:
-                    html_text = markdown_to_telegram_html(self.current_text)
+                    html_text = markdown_to_telegram_html(self._display_text(self.current_text, hide_unclosed=True))
                     await safe_edit_text(self.current_msg, html_text, reply_markup=None,
                                          parse_mode=constants.ParseMode.HTML)
                 except Exception as e:
                     self.live_edit_enabled = False
                     logger.warning(f"流式消息刷新失败，改为结束后一次性发送: {e}")
             self.current_text = text
+            self._last_display = None  # 新段：重置去重基准
             if self.live_edit_enabled:
                 try:
                     new_text = text if text.strip() else "…"
-                    html_text = markdown_to_telegram_html(new_text)
+                    html_text = markdown_to_telegram_html(self._display_text(new_text, hide_unclosed=True))
                     self.current_msg = await self.context.bot.send_message(
                         chat_id=self.chat_id,
                         text=html_text,
                         reply_markup=self.reply_markup,
                         parse_mode=constants.ParseMode.HTML
                     )
+                    self.message_ids.append(getattr(self.current_msg, 'message_id', None))
                 except Exception as e:
                     self.live_edit_enabled = False
                     logger.warning(f"流式消息分段发送失败，改为结束后一次性发送: {e}")
             return
 
         self.current_text += text
-        if not self.current_text.strip():
+        # 流式中途显示：把已写的 *-x 块折成占位（含「已 BEGIN 未 END」尾巴的「生成中…」），
+        # 原始代码从不渲染到任何一端 → 不存在「代码先出现再折叠」的回流跳动。
+        # current_text 累加器本身不动，落库 / 执行 / 镜像恒取原始文本。
+        display = self._display_text(self.current_text, hide_unclosed=True)
+        if not display.strip():
             return
         if not self.live_edit_enabled:
+            return
+        # 长块静默：脱敏后文本较上次没变，跳过这次 draft/edit，流式期间消息静止、零 API 抖动。
+        if self._hide_blocks and display == self._last_display:
             return
 
         # 优先使用 Rich Message Draft 推送
@@ -918,7 +969,7 @@ class TelegramStreamRenderer:
             try:
                 # 文本较短时在开头添加 <tg-thinking> 思考块（API 10.1 Draft 专属）
                 # 给用户"AI 正在思考"的视觉反馈，文本足够长后自动移除
-                draft_text = self.current_text
+                draft_text = display
                 if len(draft_text.strip()) < 80:
                     draft_text = "<tg-thinking>正在思考…</tg-thinking>\n\n" + draft_text
                 await TelegramRichAPI.send_rich_message_draft(
@@ -926,6 +977,7 @@ class TelegramStreamRenderer:
                     text=draft_text,
                     draft_id=self._draft_id,
                 )
+                self._last_display = display
                 return
             except RetryAfter as e:
                 # Telegram 429 限流：永久降级到 HTML edit，避免后续 chunk 反复撞 429。
@@ -963,7 +1015,7 @@ class TelegramStreamRenderer:
         # 立即取消 edit_task 返回。safe_edit_text 用 retry_on_retry_after=False
         # 模式，第一次撞 RetryAfter 直接抛（不内部 sleep），让这里能立即设冷却期。
         try:
-            html_text = markdown_to_telegram_html(self.current_text)
+            html_text = markdown_to_telegram_html(display)
             _stop_event = get_or_create_stop_event()
             edit_task = asyncio.create_task(safe_edit_text(
                 self.current_msg, html_text, reply_markup=self.reply_markup,
@@ -984,6 +1036,7 @@ class TelegramStreamRenderer:
                 await stop_task
             # 重新 await edit_task 拿到异常（如果有）
             await edit_task
+            self._last_display = display
         except RetryAfter as e:
             # HTML edit 撞 429：设冷却期，不永久关闭 live_edit_enabled
             # 冷却期过后下个 chunk 会再试，限流可能已解除
@@ -1010,12 +1063,36 @@ def _stream_chunk_idle_timeout_seconds() -> float:
     return configured + 30.0
 
 
+async def _ensure_generated_reply(generated_reply, chat_id, provider_name, model_name):
+    if generated_reply is not None:
+        return generated_reply
+    db = await BotMemoryDB.get_instance()
+    return make_generated_reply_persistence(
+        db, None, chat_id, await db.get_attachment_generation(), provider_name, model_name,
+    )
+
+
+async def _preserve_media_after_error(generated_reply, raw, *, stopped=False):
+    if generated_reply is None:
+        return "", None
+    try:
+        text, _artifacts = await generated_reply.prepare(raw, stopped=stopped, partial=True)
+        return text, None
+    except Exception as exc:
+        text = generated_reply.text
+        if not generated_reply.recorded:
+            text = _MEDIA_AUTOSAVE_NOTICE_RE.sub('', text).strip()
+        return text, exc
+
+
+@without_ui_history
 async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                    prov_name: str, prov_data: Dict, model: str,
                                    system_prompt: str, history: List[Dict],
                                    extra_media_artifacts: Optional[List[Dict[str, Any]]] = None,
                                    stopped_partial_sink: Optional[List[str]] = None,
-                                   token_text_sink: Optional[List[str]] = None) -> Optional[str]:
+                                   token_text_sink: Optional[List[str]] = None,
+                                   generated_reply: Optional[GeneratedMediaReply] = None) -> Optional[str]:
     """流式回复：上游边生成，Telegram 边按字符刷新显示。
 
     stopped_partial_sink：可选出参。用户中途手动停止时，把已经生成的部分文本
@@ -1043,6 +1120,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
     logger.info(f"[停止诊断] 流式开始: stop_event id={id(stop_event)}")
 
     try:
+        generated_reply = await _ensure_generated_reply(generated_reply, chat_id, prov_name, model)
         stop_kb = build_stop_keyboard()
         msg = await context.bot.send_message(
             chat_id=chat_id,
@@ -1064,10 +1142,12 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             model, system_prompt, history,
             api_format=prov_data.get('api_format', 'openai'),
             usage_sink=usage_sink,
-            trace_id=trace_id
+            trace_id=trace_id,
+            conversation_context=True,
         ).__aiter__()
         stop_task = asyncio.create_task(stop_event.wait())
         stream_timed_out = False
+        next_chunk_task = None
         try:
             while True:
                 next_chunk_task = asyncio.create_task(stream_iter.__anext__())
@@ -1091,21 +1171,18 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
 
                 if not done:
                     stream_timed_out = True
-                    await cancel_task_quietly(next_chunk_task, timeout=1.0)
                     break
 
                 if stop_task in done and stop_event.is_set():
                     stopped_by_user = True
-                    if renderer and not stop_notice_rendered:
-                        await renderer.stop_and_keep_partial()
-                        stop_notice_rendered = True
-                    await cancel_task_quietly(next_chunk_task, timeout=1.0)
                     break
 
                 try:
                     chunk = next_chunk_task.result()
                 except StopAsyncIteration:
                     break
+                finally:
+                    next_chunk_task = None
 
                 raw_response_parts.append(chunk)
                 if native_media_detected:
@@ -1126,6 +1203,11 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
                 await renderer.append(chunk)
                 media_detection_tail = (media_detection_tail + chunk)[-64:]
         finally:
+            # A completed chunk belongs to this reply even if stop/cancel won the wait.
+            await cancel_task_quietly(next_chunk_task, timeout=1.0)
+            if next_chunk_task is not None and next_chunk_task.done() and not next_chunk_task.cancelled():
+                with contextlib.suppress(Exception):
+                    raw_response_parts.append(next_chunk_task.result())
             await cancel_task_quietly(stop_task, timeout=0.2)
             aclose = getattr(stream_iter, 'aclose', None)
             if aclose is not None:
@@ -1137,25 +1219,44 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
                     await cancel_task_quietly(close_task, timeout=0.2)
 
         if stopped_by_user:
+            partial, media_artifacts = await generated_reply.prepare(
+                ''.join(raw_response_parts).strip(), stopped=True, partial=True,
+            )
             if renderer and not stop_notice_rendered:
                 await renderer.stop_and_keep_partial()
+            if native_media_detected or media_artifacts:
+                stop_notice = (
+                    "⏹️ 已停止，已完成的图片保留在当前对话中。"
+                    if generated_reply.recorded else
+                    "⏹️ 已停止，未完成的媒体未作为成功结果保留。"
+                )
+                await safe_edit_text(
+                    msg, (partial + "\n\n" + stop_notice).strip(),
+                    reply_markup=None,
+                )
             write_model_trace("model_stopped", {
                 "trace_id": trace_id,
                 "provider": prov_name,
                 "provider_format": prov_data.get('api_format', 'openai'),
                 "model": model,
                 "stream": True,
-                "partial_response": ''.join(raw_response_parts).strip(),
+                "partial_response": partial,
                 "usage": usage_sink[0] if usage_sink else None,
                 "elapsed_seconds": time.monotonic() - generation_started_at,
             })
             if stopped_partial_sink is not None:
-                stopped_partial_sink.append(''.join(raw_response_parts).strip())
+                stopped_partial_sink.append(partial)
             return None
 
         if stream_timed_out:
             waited = int(_stream_chunk_idle_timeout_seconds())
-            partial = ''.join(raw_response_parts).strip()
+            timeout_notice = (
+                f"\n\n⏱️ 已超过 {waited} 秒没有收到新内容，本次流式回复被中断。"
+                "上面是已经收到的部分；可以直接重发这条消息重试。"
+            )
+            partial, _artifacts = await generated_reply.prepare(
+                ''.join(raw_response_parts).strip() + timeout_notice, partial=True,
+            )
             write_model_trace("model_error", {
                 "trace_id": trace_id,
                 "provider": prov_name,
@@ -1167,10 +1268,6 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
                 "usage": usage_sink[0] if usage_sink else None,
                 "elapsed_seconds": time.monotonic() - generation_started_at,
             })
-            timeout_notice = (
-                f"\n\n⏱️ 已超过 {waited} 秒没有收到新内容，本次流式回复被中断。"
-                "上面是已经收到的部分；可以直接重发这条消息重试。"
-            )
             if renderer and not native_media_detected:
                 try:
                     await renderer.append(timeout_notice)
@@ -1179,7 +1276,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
                 partial = (await renderer.finish()) or partial
             elif msg:
                 try:
-                    await safe_edit_text(msg, (partial + timeout_notice).strip(), reply_markup=None)
+                    await safe_edit_text(msg, partial.strip(), reply_markup=None)
                 except Exception as e:
                     logger.warning(f"流式超时提示发送失败: {e}")
             await send_token_usage_message(
@@ -1198,8 +1295,13 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             if notice_text:
                 await renderer.append(f"\n\n{notice_text}")
 
+        if getattr(generated_reply, 'text_only', False) and not stop_event.is_set():
+            await generated_reply.prepare(''.join(raw_response_parts).strip())
         full_response = ''.join(raw_response_parts).strip() if native_media_detected else (await renderer.finish() if renderer else "")
         if stop_event.is_set():
+            full_response, _artifacts = await generated_reply.prepare(
+                full_response, stopped=True, partial=True,
+            )
             if renderer:
                 await renderer.stop_and_keep_partial()
             write_model_trace("model_stopped", {
@@ -1217,9 +1319,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             return None
 
         if full_response:
-            media_artifacts: List[Dict[str, Any]] = []
-            if native_media_detected:
-                full_response, media_artifacts = extract_inline_generated_media(full_response)
+            full_response, media_artifacts = await generated_reply.prepare(full_response)
             full_response = append_external_media_notices_to_response(full_response, extra_media_artifacts)
             write_model_trace("model_response", {
                 "trace_id": trace_id,
@@ -1233,7 +1333,11 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             })
             if media_artifacts:
                 try:
-                    await send_generated_media_artifacts(context, chat_id, media_artifacts, caption=full_response)
+                    with media_presentation_scope(build_media_presentation(
+                        full_response, media_artifacts,
+                        replace_message_ids=renderer.message_ids if renderer else [getattr(msg, 'message_id', None)],
+                    )):
+                        await send_generated_media_artifacts(context, chat_id, media_artifacts, caption=full_response)
                     if msg:
                         try:
                             await msg.delete()
@@ -1269,10 +1373,32 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             await context.bot.send_message(chat_id=chat_id, text=empty_text)
         return empty_text
 
+    except asyncio.CancelledError:
+        if renderer:
+            await renderer.cancel()
+        partial, media_error = await _preserve_media_after_error(
+            generated_reply, ''.join(raw_response_parts).strip(), stopped=True,
+        )
+        if media_error is not None:
+            logger.error(f"取消流式回复时保存已完成图片失败: {media_error}")
+            with contextlib.suppress(Exception):
+                await safe_edit_text(
+                    renderer.current_msg if renderer else msg,
+                    format_provider_exception(media_error), reply_markup=None,
+                )
+        if stopped_partial_sink is not None:
+            stopped_partial_sink.append(partial)
+        raise
     except Exception as e:
         logger.error(f"流式响应错误: {e}")
+        if getattr(generated_reply, 'text_only', False):
+            generated_reply.error = str(e)
+        partial, media_error = await _preserve_media_after_error(
+            generated_reply, ''.join(raw_response_parts).strip(),
+        )
+        if media_error is not None:
+            e = media_error
         error_text = format_provider_exception(e)
-        partial = ''.join(raw_response_parts).strip()
         write_model_trace("model_error", {
             "trace_id": trace_id,
             "provider": prov_name,
@@ -1308,7 +1434,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
                 await context.bot.send_message(chat_id=chat_id, text=fallback_text[:4000])
             except Exception as last_err:
                 logger.error(f"连 send_message 都失败了，UI 可能卡住: {last_err}")
-        return error_text
+        return None if isinstance(e, AttachmentContextError) else error_text
     finally:
         if typing_stop:
             typing_stop.set()
@@ -1320,12 +1446,14 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
                 pass
 
 
+@without_ui_history
 async def send_background_streaming_response(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                               prov_name: str, prov_data: Dict, model: str,
                                               system_prompt: str, history: List[Dict],
                                               extra_media_artifacts: Optional[List[Dict[str, Any]]] = None,
                                               stopped_partial_sink: Optional[List[str]] = None,
-                                              token_text_sink: Optional[List[str]] = None) -> Optional[str]:
+                                              token_text_sink: Optional[List[str]] = None,
+                                              generated_reply: Optional[GeneratedMediaReply] = None) -> Optional[str]:
     """后台流式：底层用流式 API 拿 token，但不实时推送到 Telegram。
 
     只累积到字符串里，每隔几秒把占位消息更新为"已生成 N 字"（走 safe_edit_text
@@ -1358,6 +1486,7 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
     last_progress_at = generation_started_at
 
     try:
+        generated_reply = await _ensure_generated_reply(generated_reply, chat_id, prov_name, model)
         stop_kb = build_stop_keyboard()
         msg = await context.bot.send_message(
             chat_id=chat_id,
@@ -1377,9 +1506,11 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
             model, system_prompt, history,
             api_format=prov_data.get('api_format', 'openai'),
             usage_sink=usage_sink,
-            trace_id=trace_id
+            trace_id=trace_id,
+            conversation_context=True,
         ).__aiter__()
         stop_task = asyncio.create_task(stop_event.wait())
+        next_chunk_task = None
         try:
             while True:
                 next_chunk_task = asyncio.create_task(stream_iter.__anext__())
@@ -1392,18 +1523,18 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
 
                 if not done:
                     stream_timed_out = True
-                    await cancel_task_quietly(next_chunk_task, timeout=1.0)
                     break
 
                 if stop_task in done and stop_event.is_set():
                     stopped_by_user = True
-                    await cancel_task_quietly(next_chunk_task, timeout=1.0)
                     break
 
                 try:
                     chunk = next_chunk_task.result()
                 except StopAsyncIteration:
                     break
+                finally:
+                    next_chunk_task = None
 
                 raw_response_parts.append(chunk)
 
@@ -1422,6 +1553,10 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
                     except Exception as e:
                         logger.debug(f"进度更新失败（可忽略）: {e}")
         finally:
+            await cancel_task_quietly(next_chunk_task, timeout=1.0)
+            if next_chunk_task is not None and next_chunk_task.done() and not next_chunk_task.cancelled():
+                with contextlib.suppress(Exception):
+                    raw_response_parts.append(next_chunk_task.result())
             await cancel_task_quietly(stop_task, timeout=0.2)
             aclose = getattr(stream_iter, 'aclose', None)
             if aclose is not None:
@@ -1434,7 +1569,8 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
 
         partial = ''.join(raw_response_parts).strip()
 
-        if stopped_by_user:
+        if stopped_by_user or stop_event.is_set():
+            partial, _artifacts = await generated_reply.prepare(partial, stopped=True, partial=True)
             stop_text = (partial + "\n\n⏹️ 已停止，保留以上已生成内容。").strip() if partial else "⏹️ 已停止，还没有生成可保留的内容。"
             write_model_trace("model_stopped", {
                 "trace_id": trace_id,
@@ -1469,7 +1605,10 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
                 f"\n\n⏱️ 已超过 {waited} 秒没有收到新内容，本次流式回复被中断。"
                 "上面是已经收到的部分；可以直接重发这条消息重试。"
             )
-            timeout_text = (partial + timeout_notice).strip() if partial else timeout_notice.strip()
+            partial, _artifacts = await generated_reply.prepare(
+                partial + timeout_notice, partial=True,
+            )
+            timeout_text = partial.strip()
             write_model_trace("model_error", {
                 "trace_id": trace_id,
                 "provider": prov_name,
@@ -1504,10 +1643,7 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
 
         # 正常完成
         if partial:
-            media_artifacts: List[Dict[str, Any]] = []
-            if contains_inline_generated_media(partial.lower()):
-                native_media_detected = True
-                partial, media_artifacts = extract_inline_generated_media(partial)
+            partial, media_artifacts = await generated_reply.prepare(partial)
             partial = append_external_media_notices_to_response(partial, extra_media_artifacts)
             write_model_trace("model_response", {
                 "trace_id": trace_id,
@@ -1521,7 +1657,10 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
             })
             if media_artifacts:
                 try:
-                    await send_generated_media_artifacts(context, chat_id, media_artifacts, caption=partial)
+                    with media_presentation_scope(build_media_presentation(
+                        partial, media_artifacts, replace_message_ids=[getattr(msg, 'message_id', None)],
+                    )):
+                        await send_generated_media_artifacts(context, chat_id, media_artifacts, caption=partial)
                     if msg:
                         try:
                             await msg.delete()
@@ -1565,10 +1704,27 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
             await context.bot.send_message(chat_id=chat_id, text=empty_text)
         return empty_text
 
+    except asyncio.CancelledError:
+        partial, media_error = await _preserve_media_after_error(
+            generated_reply, ''.join(raw_response_parts).strip(), stopped=True,
+        )
+        if media_error is not None:
+            logger.error(f"取消后台流式回复时保存已完成图片失败: {media_error}")
+            with contextlib.suppress(Exception):
+                await safe_edit_text(msg, format_provider_exception(media_error), reply_markup=None)
+        if stopped_partial_sink is not None:
+            stopped_partial_sink.append(partial)
+        raise
     except Exception as e:
         logger.error(f"后台流式响应错误: {e}")
+        if getattr(generated_reply, 'text_only', False):
+            generated_reply.error = str(e)
+        partial, media_error = await _preserve_media_after_error(
+            generated_reply, ''.join(raw_response_parts).strip(),
+        )
+        if media_error is not None:
+            e = media_error
         error_text = format_provider_exception(e)
-        partial = ''.join(raw_response_parts).strip()
         write_model_trace("model_error", {
             "trace_id": trace_id,
             "provider": prov_name,
@@ -1597,7 +1753,7 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
                 await context.bot.send_message(chat_id=chat_id, text=fallback_text[:4000])
             except Exception as last_err:
                 logger.error(f"连 send_message 都失败了，UI 可能卡住: {last_err}")
-        return error_text
+        return None if isinstance(e, AttachmentContextError) else error_text
     finally:
         if typing_stop:
             typing_stop.set()
@@ -1625,12 +1781,14 @@ def _nonstream_hard_timeout_seconds() -> float:
     return configured + 30.0
 
 
+@without_ui_history
 async def send_non_streaming_response(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                        prov_name: str, prov_data: Dict, model: str,
                                        system_prompt: str, history: List[Dict],
                                        extra_media_artifacts: Optional[List[Dict[str, Any]]] = None,
                                        stopped_partial_sink: Optional[List[str]] = None,
-                                       token_text_sink: Optional[List[str]] = None) -> Optional[str]:
+                                       token_text_sink: Optional[List[str]] = None,
+                                       generated_reply: Optional[GeneratedMediaReply] = None) -> Optional[str]:
     """非流式回复：等待完整回复后一次性发送。
 
     stopped_partial_sink：可选出参，语义同流式版本。
@@ -1640,6 +1798,9 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
     TELEGRAM_MSG_LIMIT = RICH_MESSAGE_CHAR_LIMIT
 
     msg = None
+    response = ""
+    response_task = None
+    stop_task = None
     typing_stop = None
     typing_task = None
     stop_event = get_or_create_stop_event()
@@ -1649,6 +1810,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
     logger.info(f"[停止诊断] 非流式开始: stop_event id={id(stop_event)}")
 
     try:
+        generated_reply = await _ensure_generated_reply(generated_reply, chat_id, prov_name, model)
         stop_kb = build_stop_keyboard()
         msg = await context.bot.send_message(
             chat_id=chat_id,
@@ -1668,7 +1830,8 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
             model, system_prompt, history,
             api_format=prov_data.get('api_format', 'openai'),
             usage_sink=usage_sink,
-            trace_id=trace_id
+            trace_id=trace_id,
+            conversation_context=True,
         ))
         stop_task = asyncio.create_task(stop_event.wait())
         # 兜底硬上限必须加在这个 wait 上：模型无响应时 response_task 和
@@ -1691,6 +1854,10 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
         if not done:
             await cancel_task_quietly(response_task, timeout=1.0)
             await cancel_task_quietly(stop_task, timeout=0.2)
+            if response_task.done() and not response_task.cancelled():
+                response, error = response_task.result()
+                if response and not error:
+                    await generated_reply.prepare(response)
             waited = int(time.monotonic() - generation_started_at)
             timeout_text = (
                 f"⏱️ 等待模型回复超过 {waited} 秒仍无响应，已中断本次请求。\n"
@@ -1713,11 +1880,22 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
                 pass
             return timeout_text
         if stop_task in done and stop_event.is_set():
+            partial = ""
+            await cancel_task_quietly(response_task, timeout=1.0)
+            if response_task.done() and not response_task.cancelled():
+                response, error = response_task.result()
+                if response and not error:
+                    partial, _artifacts = await generated_reply.prepare(
+                        response, stopped=True,
+                    )
             try:
-                await safe_edit_text(msg, "⏹️ 已停止。非流式请求已取消，未产生可保留的增量内容。", reply_markup=None)
+                stop_text = (
+                    "⏹️ 已停止，已完成的内容已保留。" if partial else
+                    "⏹️ 已停止。非流式请求已取消，未产生可保留的增量内容。"
+                )
+                await safe_edit_text(msg, stop_text, reply_markup=None)
             except Exception:
                 pass
-            await cancel_task_quietly(response_task, timeout=1.0)
             write_model_trace("model_stopped", {
                 "trace_id": trace_id,
                 "provider": prov_name,
@@ -1728,7 +1906,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
                 "elapsed_seconds": time.monotonic() - generation_started_at,
             })
             if stopped_partial_sink is not None:
-                stopped_partial_sink.append("")
+                stopped_partial_sink.append(partial)
             return None
 
         await cancel_task_quietly(stop_task, timeout=0.2)
@@ -1741,12 +1919,15 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
 
         # 检查用户是否在等待期间停止了
         if stop_event.is_set():
+            partial, _artifacts = await generated_reply.prepare(
+                response or "", stopped=True, partial=True,
+            )
             try:
                 await safe_edit_text(msg, "⏹️ 已停止。", reply_markup=None)
             except Exception:
                 pass
             if stopped_partial_sink is not None:
-                stopped_partial_sink.append(response or "")
+                stopped_partial_sink.append(partial)
             return None
 
         if error:
@@ -1768,9 +1949,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
             return error
 
         if response:
-            media_artifacts: List[Dict[str, Any]] = []
-            if contains_inline_generated_media(response):
-                response, media_artifacts = extract_inline_generated_media(response)
+            response, media_artifacts = await generated_reply.prepare(response)
             response = append_external_media_notices_to_response(response, extra_media_artifacts)
             write_model_trace("model_response", {
                 "trace_id": trace_id,
@@ -1784,7 +1963,10 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
             })
             if media_artifacts:
                 try:
-                    await send_generated_media_artifacts(context, chat_id, media_artifacts, caption=response)
+                    with media_presentation_scope(build_media_presentation(
+                        response, media_artifacts, replace_message_ids=[getattr(msg, 'message_id', None)],
+                    )):
+                        await send_generated_media_artifacts(context, chat_id, media_artifacts, caption=response)
                     if msg:
                         try:
                             await msg.delete()
@@ -1818,8 +2000,30 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
             await context.bot.send_message(chat_id=chat_id, text=empty_text)
         return empty_text
 
+    except asyncio.CancelledError:
+        await cancel_task_quietly(response_task, timeout=1.0)
+        if response_task is not None and response_task.done() and not response_task.cancelled():
+            with contextlib.suppress(Exception):
+                completed_response, error = response_task.result()
+                if completed_response and not error:
+                    response = completed_response
+        partial, media_error = await _preserve_media_after_error(
+            generated_reply, response or "", stopped=True,
+        )
+        if media_error is not None:
+            logger.error(f"取消非流式回复时保存已完成图片失败: {media_error}")
+            with contextlib.suppress(Exception):
+                await safe_edit_text(msg, format_provider_exception(media_error), reply_markup=None)
+        if stopped_partial_sink is not None:
+            stopped_partial_sink.append(partial)
+        raise
     except Exception as e:
         logger.error(f"非流式响应错误: {e}")
+        if getattr(generated_reply, 'text_only', False):
+            generated_reply.error = str(e)
+        _partial, media_error = await _preserve_media_after_error(generated_reply, response or "")
+        if media_error is not None:
+            e = media_error
         error_text = format_provider_exception(e)
         write_model_trace("model_error", {
             "trace_id": trace_id,
@@ -1838,8 +2042,10 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
                 await context.bot.send_message(chat_id=chat_id, text=error_text)
         except Exception:
             pass
-        return error_text
+        return None if isinstance(e, AttachmentContextError) else error_text
     finally:
+        await cancel_task_quietly(response_task, timeout=1.0)
+        await cancel_task_quietly(stop_task, timeout=0.2)
         if typing_stop:
             typing_stop.set()
         if typing_task:

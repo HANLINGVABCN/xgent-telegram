@@ -2,6 +2,7 @@
 # Keep cross-section names available through the loader until the next decoupling phase.
 
 import inspect
+from xgent_app.ui_history import UiHistoryError, UiHistorySnapshot, hide_audit_record, ui_record, EXPIRED, CHANGED
 
 class BotMemoryDB:
     """Bot的永久记忆系统 - 异步SQLite + 连接池"""
@@ -32,14 +33,13 @@ class BotMemoryDB:
             await conn.execute('BEGIN IMMEDIATE')
             try:
                 yield conn
+                await conn.commit()
             except BaseException:
                 try:
                     await conn.rollback()
                 except Exception as rollback_err:
                     logger.error(f"事务回滚失败: {rollback_err}")
                 raise
-            else:
-                await conn.commit()
 
     @contextlib.asynccontextmanager
     async def _write(self):
@@ -111,6 +111,27 @@ class BotMemoryDB:
             )
         ''')
         
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS context_compressions (
+                sequence INTEGER PRIMARY KEY,
+                payload TEXT NOT NULL
+            )
+        ''')
+
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS ui_messages (
+                ui_message_id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                generation INTEGER NOT NULL,
+                revision INTEGER NOT NULL,
+                timestamp REAL NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE(source, chat_id, message_id, generation)
+            )
+        ''')
+
         # CLI 跨进程中继表：CLI 进程里对话核心对 bot 的每一次调用
         # （send_message / edit_message_text / delete_message ...）按顺序落一行，
         # 服务端观察者读出后原样回放到 MirrorBot 上，从而在 Telegram/网页得到
@@ -163,6 +184,32 @@ class BotMemoryDB:
         await conn.execute('''
             CREATE INDEX IF NOT EXISTS idx_channel_outbox_channel
             ON channel_outbox(channel, id)
+        ''')
+        # 每条待发操作的累计失败次数要持久：进程重启就归零的话，一条毒药
+        # 永远攒不到上限，每次重启都重新在队头堵一遍。
+        for migration in (
+            'ALTER TABLE channel_outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0',
+            'ALTER TABLE channel_outbox ADD COLUMN last_error TEXT',
+        ):
+            try:
+                await conn.execute(migration)
+            except Exception:
+                pass
+        # 死信：重试到上限仍失败的操作搬到这里留档，不再占待发队列。
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS channel_deadletter (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                logical_id INTEGER,
+                chat_id INTEGER,
+                payload TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                dead_at REAL NOT NULL
+            )
         ''')
 
         # 内部兼容索引表（当前单一全局记忆模式下仅保留一条固定记录）
@@ -380,21 +427,61 @@ class BotMemoryDB:
         except Exception as e:
             logger.warning(f"token 用量统计历史迁移失败（下次启动重试）: {e}")
 
+        await self._migrate_compression_seed()
         self._initialized = True
         logger.info("📚 系统记忆数据库初始化完成")
     
     # --- 全局消息记录（仅全局模式使用）---
     async def record_global_message(self, chat_id: int, user_id: int, msg_type: str,
                                      role: str, content: str, session_id: Optional[str] = None,
-                                     metadata: Optional[Dict[str, Any]] = None) -> Optional[int]:
+                                     metadata: Optional[Dict[str, Any]] = None,
+                                     stop_event: Optional[asyncio.Event] = None) -> Optional[int]:
         """记录一条全局消息，返回新行 rowid（供 token 统计双写关联去重）。"""
-        async with self._write() as conn:
-            cursor = await conn.execute('''
-                INSERT INTO global_messages (chat_id, user_id, msg_type, role, content, timestamp, session_id, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (chat_id, user_id, msg_type, role, content, time.time(), session_id,
-                  json.dumps(metadata) if metadata else None))
-            return cursor.lastrowid
+        compression = (metadata or {}).get('compression_job_id')
+        ui_scoped = metadata is not None and 'ui_generation' in metadata
+        async with (self._transaction() if compression or ui_scoped else self._write()) as conn:
+            if metadata and ('attachments' in metadata or 'attachment_generation' in metadata or ui_scoped):
+                cursor = await conn.execute(
+                    "SELECT value FROM config WHERE key = 'attachment_generation'"
+                )
+                row = await cursor.fetchone()
+                generation = int(json.loads(row['value'])) if row else 0
+                if ui_scoped and metadata['ui_generation'] != generation:
+                    raise UiHistoryError(EXPIRED)
+                if metadata.get('attachment_generation', generation) != generation:
+                    raise ValueError("对话已在附件处理期间清空，旧附件未关联到新对话。")
+            if compression:
+                from xgent_app.compression import CompressionError
+                entry = await self._require_compression_job(conn, compression, metadata.get('compression_attempt'))
+                if entry['status'] != 'running':
+                    raise CompressionError('恢复任务已结束，本次未重复写入回复。')
+                if metadata.get('compression_complete') and stop_event is not None and stop_event.is_set():
+                    raise CompressionError('用户已停止恢复，未登记为完整压缩结果。')
+            now = time.time()
+            row_id = await self._insert_global_record(
+                conn, chat_id, user_id, msg_type, role, content, now, session_id, metadata,
+            )
+            if compression:
+                await conn.execute('''
+                    INSERT INTO chat_messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)
+                ''', (session_id, role, content, now))
+                await conn.execute('UPDATE chat_sessions SET last_active = ? WHERE id = ?', (now, session_id))
+                if metadata.get('compression_complete'):
+                    entry.update(status='completed', summary=content, response_row_id=row_id, completed_at=now, error='')
+                    await self._save_compression_job(conn, entry)
+                    await self._update_compression_notice(conn, entry)
+                    if stop_event is not None and stop_event.is_set():
+                        raise CompressionError('用户已停止恢复，未登记为完整压缩结果。')
+            return row_id
+
+    @staticmethod
+    async def _insert_global_record(conn, chat_id, user_id, msg_type, role, content, timestamp, session_id, metadata):
+        cursor = await conn.execute('''
+            INSERT INTO global_messages (chat_id, user_id, msg_type, role, content, timestamp, session_id, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (chat_id, user_id, msg_type, role, content, timestamp, session_id,
+              json.dumps(metadata, ensure_ascii=False) if metadata else None))
+        return cursor.lastrowid
 
     # --- token 用量统计（独立表，/stats 数据源）---
     async def add_token_stat(self, model: str, usage: Dict[str, Any],
@@ -471,24 +558,31 @@ class BotMemoryDB:
         """获取所有消息（用于AI上下文）- 包含对话和系统操作"""
         conn = await self._get_conn()
         cursor = await conn.execute('''
-            SELECT role, content, timestamp, msg_type FROM global_messages
-            ORDER BY timestamp DESC LIMIT ?
+            SELECT role, content, timestamp, msg_type, metadata FROM global_messages
+            ORDER BY timestamp DESC, id DESC LIMIT ?
         ''', (limit,))
         rows = await cursor.fetchall()
-        
+        return self.conversation_records_to_messages(reversed(rows))
+
+    @staticmethod
+    def conversation_records_to_messages(rows, *, include_all: bool = False) -> List[Dict]:
+        from xgent_app.compression import metadata_of
+
         # 转换格式，系统操作转为 user 角色以便 AI 理解
         result = []
-        for row in reversed(rows):
+        for row in rows:
             msg = dict(row)
+            if not include_all and metadata_of(msg).get('compression_auxiliary'):
+                continue
             msg_type = msg.get('msg_type')
-            if is_redundant_agent_command_record(msg_type, msg.get('content')):
+            if not include_all and is_redundant_agent_command_record(msg_type, msg.get('content')):
                 continue
             # token 用量提示是给用户看的 UI 信息，不喂给模型，否则「↑ N tokens」这类
             # 文本会混进上下文污染对话。
-            if msg_type == MessageType.TOKEN_USAGE:
+            if not include_all and msg_type == MessageType.TOKEN_USAGE:
                 continue
             # 轮次状态行（✅ Agent 第 N 轮…）同理：纯 UI，不进上下文。
-            if msg_type == MessageType.AGENT_STATUS:
+            if not include_all and msg_type == MessageType.AGENT_STATUS:
                 continue
             
             # 系统操作以 system 角色注入（OpenAI 格式原样支持；Gemini/Claude 在各自构建器里降级为 user），
@@ -534,27 +628,209 @@ class BotMemoryDB:
         
         return result
 
+    async def get_attachment_records(self) -> List[Dict]:
+        """所有未清空的上传和生成图片记录，不受普通对话窗口限制。"""
+        from xgent_app.attachments import is_attachment_record
+
+        conn = await self._get_conn()
+        cursor = await conn.execute('''
+            SELECT id, chat_id, msg_type, role, content, timestamp, metadata FROM global_messages
+            WHERE (role = 'user' AND msg_type IN (?, ?))
+               OR (role = 'assistant' AND msg_type = ?)
+               OR (role = 'media_module' AND msg_type = ?)
+            ORDER BY id
+        ''', (MessageType.USER_FILE, MessageType.USER_PHOTO,
+              MessageType.AI_REPLY, MessageType.MEDIA_REPLY))
+        return [record for row in await cursor.fetchall()
+                if is_attachment_record(record := dict(row))]
+
+    async def get_attachment_generation(self) -> int:
+        return int(await self.get_config_fresh('attachment_generation', 0))
+
+    async def _compression_snapshot(self, conn) -> Dict[str, Any]:
+        cursor = await conn.execute('SELECT * FROM global_messages ORDER BY timestamp, id')
+        records = [dict(row) for row in await cursor.fetchall()]
+        cursor = await conn.execute('SELECT * FROM chat_messages ORDER BY id')
+        mirror = [dict(row) for row in await cursor.fetchall()]
+        cursor = await conn.execute('SELECT * FROM chat_sessions ORDER BY id')
+        sessions = [dict(row) for row in await cursor.fetchall()]
+        cursor = await conn.execute('SELECT payload FROM context_compressions ORDER BY sequence')
+        rounds = [json.loads(row['payload']) for row in await cursor.fetchall()]
+        cursor = await conn.execute("SELECT value FROM config WHERE key = 'attachment_generation'")
+        row = await cursor.fetchone()
+        return {
+            'generation': int(json.loads(row['value'])) if row else 0,
+            'records': records, 'mirror_records': mirror, 'sessions': sessions,
+            'compressions': rounds,
+        }
+
+    async def get_compression_snapshot(self) -> Dict[str, Any]:
+        async with self._transaction() as conn:
+            return await self._compression_snapshot(conn)
+
+    async def get_latest_compression(self) -> Optional[Dict[str, Any]]:
+        conn = await self._get_conn()
+        cursor = await conn.execute(
+            'SELECT payload FROM context_compressions ORDER BY sequence DESC LIMIT 1'
+        )
+        row = await cursor.fetchone()
+        return json.loads(row['payload']) if row else None
+
+    async def begin_compression(self, snapshot: Dict, bundle: Dict, chat_id: int,
+                                provider: str, model: str, source: str,
+                                stop_event: asyncio.Event) -> Dict:
+        from xgent_app.compression import CompressionError
+        async with self._transaction() as conn:
+            if stop_event.is_set():
+                raise CompressionError('用户已停止压缩，尚未清空原上下文。')
+            if await self._compression_snapshot(conn) != snapshot:
+                raise CompressionError('导出期间对话已变化或被清空，本次未清空上下文，请重试。')
+            await self._clear_conversation_memory(conn, preserve_compressions=True)
+            entry = {
+                **bundle, 'sequence': len(snapshot['compressions']) + 1,
+                'job_id': uuid.uuid4().hex, 'created_at': time.time(), 'status': 'pending',
+                'generation': snapshot['generation'] + 1, 'summary': '', 'error': '',
+                'source_records': snapshot['records'], 'mirror_records': snapshot['mirror_records'],
+                'sessions': snapshot['sessions'], 'chat_id': chat_id, 'src': source,
+                'provider': provider, 'model': model,
+            }
+            notice, metadata = self._compression_notice(entry)
+            entry['notice_row_id'] = await self._insert_global_record(
+                conn, chat_id, 0, MessageType.SYSTEM_OP, 'system', notice,
+                time.time(), SINGLE_MEMORY_SESSION_ID, metadata,
+            )
+            await conn.execute(
+                'INSERT INTO context_compressions (sequence, payload) VALUES (?, ?)',
+                (entry['sequence'], json.dumps(entry, ensure_ascii=False)),
+            )
+            if stop_event.is_set():
+                raise CompressionError('用户已停止压缩，尚未清空原上下文。')
+        return entry
+
+    async def _require_compression_job(self, conn, job_id: str, attempt: Optional[str] = None) -> Dict:
+        from xgent_app.compression import CompressionError
+        cursor = await conn.execute('SELECT payload FROM context_compressions ORDER BY sequence DESC LIMIT 1')
+        row = await cursor.fetchone()
+        entry = json.loads(row['payload']) if row else {}
+        cursor = await conn.execute("SELECT value FROM config WHERE key = 'attachment_generation'")
+        generation_row = await cursor.fetchone()
+        generation = int(json.loads(generation_row['value'])) if generation_row else 0
+        if (entry.get('job_id') != job_id or entry.get('generation') != generation
+                or attempt is not None and entry.get('attempt') != attempt):
+            raise CompressionError('该恢复任务已被清空或新的压缩替代，旧结果不会写回当前对话。')
+        return entry
+
+    @staticmethod
+    async def _save_compression_job(conn, entry):
+        await conn.execute('UPDATE context_compressions SET payload = ? WHERE sequence = ?',
+                           (json.dumps(entry, ensure_ascii=False), entry['sequence']))
+
+    @staticmethod
+    def _compression_notice(entry):
+        from xgent_app.web_history import display_media_reference
+        states = {'pending': '已导出并清空，等待恢复', 'running': '正在恢复',
+                  'completed': '恢复完成', 'failed': '恢复失败', 'stopped': '用户已手动停止恢复'}
+        text = (f"上下文归档（第 {entry['sequence']} 段）：{states.get(entry['status'], entry['status'])}。\n"
+                f"归档：{entry['archive_path']}\n文本记录：{entry['text_dir']}")
+        if entry.get('error'):
+            text += '\n' + entry['error']
+        metadata = {
+            'src': entry.get('src'), 'compression_auxiliary': True,
+            'compression_task': {'id': entry['job_id'], 'status': entry['status'], 'sequence': entry['sequence']},
+            'display_media': [display_media_reference(entry['archive_path'], '系统记忆.zip')],
+        }
+        return text, metadata
+
+    async def _update_compression_notice(self, conn, entry):
+        text, metadata = self._compression_notice(entry)
+        await conn.execute('UPDATE global_messages SET content = ?, metadata = ?, timestamp = ? WHERE id = ?',
+                           (text, json.dumps(metadata, ensure_ascii=False), time.time(), entry['notice_row_id']))
+
+    async def start_compression_attempt(self, job_id: str, provider: str, model: str) -> Dict:
+        from xgent_app.compression import CompressionError
+        async with self._transaction() as conn:
+            entry = await self._require_compression_job(conn, job_id)
+            if entry['status'] == 'completed':
+                raise CompressionError('该段已经恢复完成，不会重复调用模型。')
+            entry.update(status='running', attempt=uuid.uuid4().hex, provider=provider, model=model, error='')
+            await self._save_compression_job(conn, entry)
+            await self._update_compression_notice(conn, entry)
+        return entry
+
+    async def fail_compression_attempt(self, entry: Dict, status: str, error: str) -> Optional[Dict]:
+        from xgent_app.compression import CompressionError
+        async with self._transaction() as conn:
+            try:
+                current = await self._require_compression_job(conn, entry['job_id'], entry.get('attempt'))
+            except CompressionError:
+                return None
+            if current['status'] != 'completed':
+                current.update(status=status, error=error)
+                await self._save_compression_job(conn, current)
+                await self._update_compression_notice(conn, current)
+            return current
+
+    async def _migrate_compression_seed(self):
+        """Materialize only the active legacy seed, once, without relinking its paths."""
+        async with self._transaction() as conn:
+            cursor = await conn.execute('SELECT payload FROM context_compressions ORDER BY sequence DESC LIMIT 1')
+            row = await cursor.fetchone()
+            entry = json.loads(row['payload']) if row else {}
+            if not entry.get('summary') or entry.get('version', 1) >= 2 or entry.get('seed_materialized'):
+                return
+            cursor = await conn.execute('SELECT MIN(timestamp) AS ts FROM global_messages')
+            first = await cursor.fetchone()
+            timestamp = min(float(entry.get('created_at') or time.time()),
+                            float(first['ts'] or time.time()) - 0.000001)
+            metadata = {'generated_media_processed': True, 'compression_sequence': entry['sequence'],
+                        'compression_job_id': entry.setdefault('job_id', uuid.uuid4().hex),
+                        'compression_complete': True, 'compression_legacy_seed': True}
+            entry['response_row_id'] = await self._insert_global_record(
+                conn, BotConfig.AUTHORIZED_USER_ID, 0, MessageType.AI_REPLY, 'assistant', entry['summary'],
+                timestamp, SINGLE_MEMORY_SESSION_ID, metadata,
+            )
+            await conn.execute('INSERT INTO chat_messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)',
+                               (SINGLE_MEMORY_SESSION_ID, 'assistant', entry['summary'], timestamp))
+            entry.update(seed_materialized=True, status='completed')
+            await self._save_compression_job(conn, entry)
+
+    async def backfill_attachment_metadata(self, row_id: int, previous: Optional[str],
+                                           metadata: Dict[str, Any]) -> bool:
+        """只更新仍存在且未被其他协程修改的记录，绝不复活已清空的关联。"""
+        async with self._write() as conn:
+            cursor = await conn.execute('''
+                UPDATE global_messages SET metadata = ?
+                WHERE id = ? AND metadata IS ?
+            ''', (json.dumps(metadata, ensure_ascii=False), row_id, previous))
+            return cursor.rowcount == 1
+
     async def get_display_history(self, limit: int = 50) -> List[Dict]:
         """供 web 前端显示用的历史。与 get_conversation_messages（给模型上下文）解耦：
 
         模型上下文里执行结果要当 user 喂给 AI；但前端显示时这些是「AI/系统侧产出的结果」，
         应显示在 AI 一侧。这里把 AGENT_RESULT/MEDIA_REPLY 映射成 assistant，其余按真实
         role。冗余记录过滤与 get_conversation_messages 保持一致。
-        AGENT_CMD 不显示原文（协议块/媒体提示词），连续的合并成一条与实时流
-        同款的状态行"✅ Agent · N 个操作已完成"，刷新前后观感一致。
+        AGENT_CMD 不显示协议原文，轮次状态使用单独保存的 AGENT_STATUS。
+        保留记录 ID、时间和元数据，供显示层恢复原始格式与附件。
         """
-        conn = await self._get_conn()
-        sql_limit = limit if limit > 0 else -1
-        cursor = await conn.execute('''
-            SELECT role, content, timestamp, msg_type FROM global_messages
-            ORDER BY timestamp DESC LIMIT ?
-        ''', (sql_limit,))
-        rows = await cursor.fetchall()
+        async with self._transaction() as conn:
+            cursor = await conn.execute('''
+                SELECT id, role, content, timestamp, msg_type, metadata FROM global_messages
+                ORDER BY timestamp ASC, id ASC
+            ''')
+            rows = await cursor.fetchall()
+            cursor = await conn.execute('SELECT * FROM ui_messages ORDER BY timestamp, ui_message_id')
+            ui_rows = [dict(row) for row in await cursor.fetchall()]
+            cursor = await conn.execute("SELECT value FROM config WHERE key = 'attachment_generation'")
+            generation_row = await cursor.fetchone()
+            generation = int(json.loads(generation_row['value'])) if generation_row else 0
 
         result = []
-        for row in reversed(rows):
+        for row in rows:
             msg = dict(row)
             msg_type = msg.get('msg_type')
+            if hide_audit_record(msg):
+                continue
             if is_redundant_agent_command_record(msg_type, msg.get('content')):
                 continue
             if msg_type == MessageType.AGENT_CMD:
@@ -562,18 +838,92 @@ class BotMemoryDB:
                 # 消息显示（用户看到的是 AI 正文 + 每轮的 AGENT_STATUS 状态行），
                 # 刷新后的历史同样不显示。
                 continue
-            # 执行结果 / 媒体回复：AI 侧产出 → 显示到对面（assistant）。
-            # msg_type 一并返回，供 _web_read_history 决定哪些消息需 Markdown→HTML 转换
-            # （AI_REPLY 存的是 Markdown 原文，TOKEN_USAGE/AGENT_RESULT 已是 HTML）。
-            display_role = 'assistant' if msg_type in (
+            msg['role'] = 'assistant' if msg_type in (
                 MessageType.AGENT_RESULT, MessageType.MEDIA_REPLY, MessageType.AGENT_STATUS,
             ) else msg['role']
-            result.append({
-                'role': display_role,
-                'content': msg['content'],
-                'msg_type': msg_type,
-            })
-        return result
+            result.append(msg)
+        tombstones = []
+        for row in ui_rows:
+            if row['generation'] != generation:
+                continue
+            item = ui_record(row)
+            if item.pop('deleted'):
+                tombstones.append({key: item[key] for key in ('ui_message_id', 'revision', 'ui_generation')})
+            else:
+                result.append(item)
+        result.sort(key=lambda item: (item['timestamp'], item.get('id') or 0, item.get('ui_message_id', '')))
+        return UiHistorySnapshot(result[-limit:] if limit > 0 else result,
+                                 generation=generation, tombstones=tombstones)
+
+    async def get_ui_message(self, ui_message_id: str) -> Optional[Dict]:
+        conn = await self._get_conn()
+        cursor = await conn.execute('SELECT * FROM ui_messages WHERE ui_message_id = ?', (ui_message_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def apply_ui_frame(self, source: str, chat_id: int, frame: Dict, markup: List,
+                             *, generation: int, create: bool, guard: str,
+                             ui_message_id: Optional[str] = None,
+                             expected_revision: Optional[int] = None) -> Optional[Dict]:
+        async with self._transaction() as conn:
+            cursor = await conn.execute("SELECT value FROM config WHERE key = 'attachment_generation'")
+            generation_row = await cursor.fetchone()
+            current_generation = int(json.loads(generation_row['value'])) if generation_row else 0
+            if generation != current_generation:
+                raise UiHistoryError(EXPIRED)
+            if ui_message_id:
+                cursor = await conn.execute('SELECT * FROM ui_messages WHERE ui_message_id = ?', (ui_message_id,))
+            else:
+                cursor = await conn.execute('''
+                    SELECT * FROM ui_messages
+                    WHERE source = ? AND chat_id = ? AND message_id = ? AND generation = ?
+                ''', (source, chat_id, int(frame.get('message_id') or 0), generation))
+            saved = await cursor.fetchone()
+            if saved:
+                row = dict(saved)
+                payload = json.loads(row['payload'])
+                if row['generation'] != generation or payload.get('deleted'):
+                    raise UiHistoryError(EXPIRED)
+                if expected_revision is not None and row['revision'] != expected_revision:
+                    raise UiHistoryError(CHANGED)
+            else:
+                if ui_message_id:
+                    raise UiHistoryError(EXPIRED)
+                if not create or frame['type'] not in {'message', 'edit'}:
+                    return None
+                row = {
+                    'ui_message_id': uuid.uuid4().hex, 'source': source, 'chat_id': chat_id,
+                    'message_id': int(frame.get('message_id') or 0), 'generation': generation,
+                    'revision': 0, 'timestamp': float(frame.get('ts') or time.time()),
+                }
+                payload = {}
+            if frame['type'] in {'message', 'edit'}:
+                payload.update(content=str(frame.get('text') or ''), parse_mode=frame.get('parse_mode'))
+            if frame['type'] in {'message', 'edit', 'edit_markup'}:
+                payload.update(reply_markup=markup, guard=guard)
+            if frame['type'] == 'delete':
+                payload.update(deleted=True, reply_markup=[])
+            row['revision'] += 1
+            row['payload'] = json.dumps(payload, ensure_ascii=False)
+            await conn.execute('''
+                INSERT INTO ui_messages
+                    (ui_message_id, source, chat_id, message_id, generation, revision, timestamp, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ui_message_id) DO UPDATE SET revision = excluded.revision, payload = excluded.payload
+            ''', tuple(row[key] for key in (
+                'ui_message_id', 'source', 'chat_id', 'message_id', 'generation', 'revision', 'timestamp', 'payload',
+            )))
+            return row
+
+    async def get_display_message(self, row_id: int) -> Optional[Dict]:
+        """下载历史附件时重新读取关联；清空后旧地址立即失效。"""
+        conn = await self._get_conn()
+        cursor = await conn.execute('''
+            SELECT id, role, content, timestamp, msg_type, metadata FROM global_messages
+            WHERE id = ?
+        ''', (row_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
 
     async def get_max_relay_op_id(self) -> int:
         """cli_relay_ops 的最大 id。"""
@@ -647,24 +997,75 @@ class BotMemoryDB:
         async with self._write() as conn:
             cursor = await conn.execute('''
                 INSERT INTO channel_outbox
-                    (channel, kind, logical_id, chat_id, payload, seq, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (channel, kind, logical_id, chat_id, payload, seq, created_at, attempts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 str(channel), str(row.get('kind') or ''),
                 row.get('logical_id'), row.get('chat_id'),
                 str(row.get('payload') or '{}'),
                 int(row.get('seq') or 0), float(row.get('created_at') or time.time()),
+                int(row.get('attempts') or 0),
             ))
             return int(cursor.lastrowid or 0)
 
     async def fetch_channel_ops(self, channel: str, limit: int = 1000) -> List[Dict]:
         conn = await self._get_conn()
         cursor = await conn.execute('''
-            SELECT id, kind, logical_id, chat_id, payload, seq, created_at
+            SELECT id, kind, logical_id, chat_id, payload, seq, created_at, attempts, last_error
             FROM channel_outbox WHERE channel = ?
             ORDER BY id ASC LIMIT ?
         ''', (str(channel), int(limit)))
         return [dict(row) for row in await cursor.fetchall()]
+
+    async def record_channel_op_attempt(self, row_id: int, attempts: int, error: str) -> None:
+        async with self._write() as conn:
+            await conn.execute(
+                'UPDATE channel_outbox SET attempts = ?, last_error = ? WHERE id = ?',
+                (int(attempts), str(error or '')[:500], int(row_id)))
+
+    async def deadletter_channel_op(self, channel: str, row: Dict[str, Any], error: str) -> None:
+        """把一条待发操作搬进死信表。调用方随后删待发行；这里只负责留档。"""
+        async with self._write() as conn:
+            await conn.execute('''
+                INSERT INTO channel_deadletter
+                    (channel, kind, logical_id, chat_id, payload, seq, created_at,
+                     attempts, last_error, dead_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                str(channel), str(row.get('kind') or ''),
+                row.get('logical_id'), row.get('chat_id'),
+                str(row.get('payload') or '{}'),
+                int(row.get('seq') or 0), float(row.get('created_at') or time.time()),
+                int(row.get('attempts') or 0), str(error or '')[:500], time.time(),
+            ))
+            # 死信只为事后排查，封顶 2000 行，别让它自己变成第二个无限增长的表。
+            await conn.execute('''
+                DELETE FROM channel_deadletter WHERE id NOT IN (
+                    SELECT id FROM channel_deadletter ORDER BY id DESC LIMIT 2000
+                )
+            ''')
+
+    async def fetch_channel_deadletters(self, channel: Optional[str] = None,
+                                        limit: int = 100) -> List[Dict]:
+        conn = await self._get_conn()
+        if channel:
+            cursor = await conn.execute('''
+                SELECT * FROM channel_deadletter WHERE channel = ?
+                ORDER BY id DESC LIMIT ?
+            ''', (str(channel), int(limit)))
+        else:
+            cursor = await conn.execute(
+                'SELECT * FROM channel_deadletter ORDER BY id DESC LIMIT ?', (int(limit),))
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def clear_channel_deadletters(self, channel: Optional[str] = None) -> int:
+        async with self._write() as conn:
+            if channel:
+                cursor = await conn.execute(
+                    'DELETE FROM channel_deadletter WHERE channel = ?', (str(channel),))
+            else:
+                cursor = await conn.execute('DELETE FROM channel_deadletter')
+            return int(cursor.rowcount or 0)
 
     async def delete_channel_ops(self, row_ids: List[int]) -> None:
         ids = [int(value) for value in (row_ids or []) if value]
@@ -820,27 +1221,36 @@ class BotMemoryDB:
     async def clear_all_conversation_memory(self) -> Dict[str, int]:
         """清空对话相关记忆，保留 providers、config、prompts 等配置"""
         async with self._transaction() as conn:
+            return await self._clear_conversation_memory(conn, preserve_compressions=False)
 
-            async def _count(table_name: str) -> int:
-                cursor = await conn.execute(f'SELECT COUNT(*) AS count FROM {table_name}')
-                row = await cursor.fetchone()
-                return int(row['count']) if row and row['count'] is not None else 0
-
-            counts = {
-                'global_messages': await _count('global_messages'),
-                'chat_messages': await _count('chat_messages'),
-                'chat_sessions': await _count('chat_sessions'),
-            }
-
-            await conn.execute('DELETE FROM global_messages')
-            await conn.execute('DELETE FROM chat_messages')
-            await conn.execute('DELETE FROM chat_sessions')
+    async def _clear_conversation_memory(self, conn, *, preserve_compressions: bool) -> Dict[str, int]:
+        counts = {}
+        for table in ('global_messages', 'chat_messages', 'chat_sessions'):
+            cursor = await conn.execute(f'SELECT COUNT(*) AS count FROM {table}')
+            counts[table] = int((await cursor.fetchone())['count'])
+            await conn.execute(f'DELETE FROM {table}')
+        await conn.execute('DELETE FROM ui_messages')
+        if not preserve_compressions:
+            await conn.execute('DELETE FROM context_compressions')
+        await conn.execute('''
+            INSERT INTO config (key, value) VALUES ('attachment_generation', '1')
+            ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1
+        ''')
         return counts
 
     # --- 内部兼容镜像消息 ---
-    async def add_chat_message(self, session_id: str, role: str, content: str):
+    async def add_chat_message(self, session_id: str, role: str, content: str,
+                               *, attachment_generation: Optional[int] = None):
         """添加消息到内部兼容镜像"""
         async with self._transaction() as conn:
+            if attachment_generation is not None:
+                cursor = await conn.execute(
+                    "SELECT value FROM config WHERE key = 'attachment_generation'"
+                )
+                row = await cursor.fetchone()
+                generation = int(json.loads(row['value'])) if row else 0
+                if attachment_generation != generation:
+                    raise ValueError("对话已在附件处理期间清空，旧回复未写回新对话。")
             await conn.execute('''
                 INSERT INTO chat_messages (session_id, role, content, timestamp)
                 VALUES (?, ?, ?, ?)
@@ -928,6 +1338,32 @@ class BotMemoryDB:
                 INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)
             ''', (key, json_value))
         self._config_cache[key] = value
+
+    async def set_skill_state(self, path: str, state: str) -> Dict[str, List[str]]:
+        if state not in {'enabled', 'disabled', 'hidden'}:
+            raise ValueError('无效的技能状态')
+        values = {}
+        async with self._transaction() as conn:
+            for key in ('disabled_skills', 'hidden_skills'):
+                cursor = await conn.execute('SELECT value FROM config WHERE key = ?', (key,))
+                row = await cursor.fetchone()
+                raw = json.loads(row['value']) if row else []
+                values[key] = {item for item in raw if isinstance(item, str)} if isinstance(raw, list) else set()
+            if state == 'hidden':
+                values['hidden_skills'].add(path)
+            else:
+                values['hidden_skills'].discard(path)
+                if state == 'disabled':
+                    values['disabled_skills'].add(path)
+                else:
+                    values['disabled_skills'].discard(path)
+            values = {key: sorted(items) for key, items in values.items()}
+            await conn.executemany(
+                'INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)',
+                [(key, json.dumps(items)) for key, items in values.items()],
+            )
+        self._config_cache.update(values)
+        return values
     
     # --- Provider管理（带缓存）---
     async def get_providers(self) -> Dict[str, Dict]:
@@ -1336,6 +1772,7 @@ class BotMemoryDB:
 # --- ☆ 用户数据管理（内存缓存 + 数据库同步）☆ ---
 class UserDataManager:
     """管理用户数据，内存缓存优先"""
+    _ui_state_revision = 0
     
     _data: Dict[str, Any] = {}
     _db: Optional[BotMemoryDB] = None
@@ -1381,6 +1818,8 @@ class UserDataManager:
             'assistant_prompt': await cls._require_db().get_config('assistant_prompt', PromptFileManager.get('assistant_prompt')),
             'global_prompt_addon': await cls._require_db().get_config('global_prompt_addon', PromptFileManager.get('global_prompt_addon')),
             'global_depth': await cls._require_db().get_config('global_depth', 30),
+            'model_request_limits': await cls._require_db().get_config('model_request_limits', {}),
+            'discovered_model_limits': await cls._require_db().get_config('discovered_model_limits', {}),
             'agent_mode': await cls._require_db().get_config('agent_mode', False),
             'agent_confirm': await cls._require_db().get_config('agent_confirm', False),
             'stream_mode': normalize_bool(await cls._require_db().get_config('stream_mode', True), True),
@@ -1401,6 +1840,11 @@ class UserDataManager:
             'web_public_url': str(await cls._require_db().get_config('web_public_url', '') or ''),
             'terminal_enabled': normalize_bool(await cls._require_db().get_config('terminal_enabled', False), False),
             'silent_unauthorized': normalize_bool(await cls._require_db().get_config('silent_unauthorized', False), False),
+            # read 留存：开启后 read 读到的完整内容跨轮持久化进上下文（文本走普通消息、图片/二进制走持久附件）。
+            'readx_persist_context': normalize_bool(await cls._require_db().get_config('readx_persist_context', False), False),
+            # 隐藏协议代码块：开启后 AI 回复正文里的 *-x 协议块只在「显示」层折成一行占位；
+            # 落库 / 执行 / 镜像用的原始文本不受影响。
+            'hide_protocol_blocks': normalize_bool(await cls._require_db().get_config('hide_protocol_blocks', False), False),
             # 只缓存"有没有设密码"这个布尔，哈希本身按需读库，不进内存快照。
             '_web_has_password': bool(
                 await cls._require_db().get_config(WEB_PASSWORD_CONFIG_KEY, '')
@@ -1416,6 +1860,10 @@ class UserDataManager:
             ),
             'disabled_skills': [
                 str(s) for s in (await cls._require_db().get_config('disabled_skills', [])) or []
+                if isinstance(s, str)
+            ],
+            'hidden_skills': [
+                s for s in (await cls._require_db().get_config('hidden_skills', [])) or []
                 if isinstance(s, str)
             ],
             # 各提供商最近一次联网拉取结果：{prov: {'models': [...], 'ts': int}}。
@@ -1447,6 +1895,8 @@ class UserDataManager:
     
     @classmethod
     def set(cls, key: str, value: Any):
+        if key == 'state':
+            cls._ui_state_revision += 1
         cls._data[key] = value
     
     @classmethod

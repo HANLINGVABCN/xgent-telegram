@@ -177,7 +177,7 @@ python3 skill-public/script/vps-manager/vps_tool.py ssh-cmd --name hk-1
 1. 先通过 `run-x` 执行 `ssh-cmd` 获取连接命令
 2. 用 `shell-x` 启动该 SSH 命令建立交互会话
 3. 通过 `stdin-x` 向会话发送操作命令
-4. 用 `shellread-x` 观察输出进度
+4. 用 `stdin-x`（空 body 或只写 `wait:`）观察输出进度
 5. 排查完毕后用 `shellkill-x` 关闭会话
 
 ## 安全注意事项

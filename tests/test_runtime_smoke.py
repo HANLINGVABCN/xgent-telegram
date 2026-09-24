@@ -216,6 +216,7 @@ async def main():
     bot.TelegramRichAPI.send_rich_message = fake_web_rich
 
     await bot.rich_finalize_text_response(context, 7, msg, "真实回复正文", limit=4000)
+    assert bot.BotMemoryDB._instance is None, 'ordinary reply rendering must not open the UI database'
     frames = []
     while True:
         f = stream.get(timeout=0.1)
@@ -520,6 +521,91 @@ print(json.dumps({
         self.assertTrue(data["has_caption"])
         self.assertTrue(data["has_context_prefix"])
         self.assertEqual(3, data["saved_notice_count"])
+
+    def test_hide_protocol_blocks_display_only_record_intact(self):
+        """隐藏协议代码块：只改显示、对话记录原样；截断不折全文；开关开/关行为。"""
+        output = self.run_probe(r'''
+import asyncio, json
+from types import SimpleNamespace as NS
+import xgent_server as bot
+
+RAW = "看下磁盘\n```run-x\n<<BEGIN_diskchk_7f3a2b1c\ndf -h\nrm -rf /tmp/x\n<<END_diskchk_7f3a2b1c\n```\n完成"
+TRUNC = "看下磁盘\n```run-x\n<<BEGIN_diskchk_7f3a2b1c\ndf -h\nrm -rf /tmp/x"
+
+class FakeMsg:
+    message_id = 1
+    async def delete(self): return True
+    async def edit_text(self, *a, **kw): return True
+
+async def main():
+    # (A) hide=on 定稿 rich_finalize：显示折叠，response 参数对象不被改
+    bot.UserDataManager.set('hide_protocol_blocks', True)
+    tg_calls = []
+    async def fake_tg_rich(*a, **kw):
+        tg_calls.append(kw.get("text")); return {"ok": True}
+    bot.TelegramRichAPI.send_rich_message = fake_tg_rich
+    response_obj = RAW
+    await bot.rich_finalize_text_response(
+        NS(bot=NS(_is_xgent_web_bot=False)), 7, FakeMsg(), response_obj, limit=4000)
+    finalize_display = tg_calls[-1] if tg_calls else ""
+
+    # (B)(C) hide=on 流式渲染器：response_parts / finish 恒为原文；_display_text 折叠
+    r = bot.TelegramStreamRenderer(NS(bot=NS(_is_xgent_web_bot=True)), 7, FakeMsg(), None, limit=4000)
+    for k in range(0, len(RAW), 7):
+        await r.append(RAW[k:k+7])
+    record_parts = ''.join(r.response_parts)
+    mid_display = r._display_text(RAW, hide_unclosed=True)
+    final_display = r._display_text(RAW, hide_unclosed=False)
+    trunc_stream = r._display_text(TRUNC, hide_unclosed=True)
+    trunc_final = r._display_text(TRUNC, hide_unclosed=False)
+    hide_flag_on = r._hide_blocks is True
+    should_fn_on = bot._should_hide_protocol_blocks() is True
+    record_finish = await r.finish()
+
+    # (E) hide=off：显示与记录都原样透传
+    bot.UserDataManager.set('hide_protocol_blocks', False)
+    r2 = bot.TelegramStreamRenderer(NS(bot=NS(_is_xgent_web_bot=True)), 7, FakeMsg(), None, limit=4000)
+    off_true = r2._display_text(RAW, hide_unclosed=True)
+    off_false = r2._display_text(RAW, hide_unclosed=False)
+    off_flag = r2._hide_blocks is False
+    should_fn_off = bot._should_hide_protocol_blocks() is False
+
+    print(json.dumps({
+        "finalize_folded": ("行已折叠" in finalize_display) and ("df -h" not in finalize_display) and ("rm -rf" not in finalize_display),
+        "finalize_has_icon": "run" in finalize_display,
+        "finalize_response_unchanged": response_obj == RAW,
+        "record_parts_raw": record_parts == RAW,
+        "record_finish_raw": record_finish == RAW,
+        "mid_display_folded": ("行已折叠" in mid_display) and ("rm -rf" not in mid_display),
+        "final_display_folded": ("行已折叠" in final_display) and ("rm -rf" not in final_display),
+        "trunc_stream_folded": ("生成中" in trunc_stream) and ("rm -rf" not in trunc_stream),
+        "trunc_final_raw": ("df -h" in trunc_final) and ("rm -rf" in trunc_final) and ("生成中" not in trunc_final),
+        "hide_flag_on": hide_flag_on,
+        "should_fn_on": should_fn_on,
+        "off_true_raw": off_true == RAW,
+        "off_false_raw": off_false == RAW,
+        "off_flag": off_flag,
+        "should_fn_off": should_fn_off,
+    }, ensure_ascii=False))
+
+asyncio.run(main())
+''')
+        data = json.loads(output.strip().splitlines()[-1])
+        self.assertTrue(data["finalize_folded"], "定稿 hide=on：显示必须折叠，且不含原始命令")
+        self.assertTrue(data["finalize_has_icon"], "折叠占位应含类型标签 run")
+        self.assertTrue(data["finalize_response_unchanged"], "rich_finalize 不得改动传入的 response 对象")
+        self.assertTrue(data["record_parts_raw"], "对话记录护栏：response_parts 必须逐字为原文")
+        self.assertTrue(data["record_finish_raw"], "对话记录护栏：finish() 返回值（落库值）必须逐字为原文")
+        self.assertTrue(data["mid_display_folded"], "流式中途：闭合块显示折叠、不含原始命令")
+        self.assertTrue(data["final_display_folded"], "定稿：闭合块显示折叠、不含原始命令")
+        self.assertTrue(data["trunc_stream_folded"], "流式中途：截断尾巴折成「生成中…」")
+        self.assertTrue(data["trunc_final_raw"], "定稿遇截断块必须原样显示，绝不折成「生成中…」或吞成一行")
+        self.assertTrue(data["hide_flag_on"], "hide=on 时渲染器 _hide_blocks 必须为真")
+        self.assertTrue(data["should_fn_on"], "_should_hide_protocol_blocks 必须反映开关开")
+        self.assertTrue(data["off_true_raw"], "hide=off：流式显示原样透传")
+        self.assertTrue(data["off_false_raw"], "hide=off：定稿显示原样透传")
+        self.assertTrue(data["off_flag"], "hide=off 时渲染器 _hide_blocks 必须为假")
+        self.assertTrue(data["should_fn_off"], "_should_hide_protocol_blocks 必须反映开关关")
 
 
 if __name__ == "__main__":

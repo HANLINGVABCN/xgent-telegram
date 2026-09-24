@@ -77,6 +77,7 @@ load_dotenv()
 # --- ☆ 全局控制状态 ☆ ---
 _stop_generation_event: Optional[asyncio.Event] = None   # 停止生成事件
 _is_processing = False                                    # 处理中锁
+_compression_running = False
 _conversation_processing_lock = asyncio.Lock()
 _startup_commands_synced = False
 _startup_menu_sent = False
@@ -338,6 +339,33 @@ def register_runtime_secret(value: Any) -> None:
         # 太短的值容易在正常文本里误伤，跳过。
         if len(key) >= 8:
             _RUNTIME_SECRETS.add(key)
+
+
+def register_runtime_secret_raw(value: Any) -> None:
+    """按原样登记一个密钥明文，不做逗号切分、不设长度下限。
+
+    ask 协议录入的私密变量走这里：用户指定的密钥可能很短、可能含逗号，
+    register_runtime_secret 的切分与 >=8 过滤会漏掉它们，导致脱敏失效。
+    这里整串登记，确保 echo $VAR 的明文回显一定能被 redact_sensitive_text 打码。
+    """
+    text = str(value or '')
+    if text:
+        _RUNTIME_SECRETS.add(text)
+
+
+def unregister_runtime_secret_raw(value: Any) -> None:
+    """从脱敏名单移除一个原样登记的密钥明文（清空上下文时调用）。"""
+    _RUNTIME_SECRETS.discard(str(value or ''))
+
+
+# 把 ask 协议的密钥存储接上脱敏名单：录入即登记明文，清空即移除。
+from xgent_app.agent_ask import SECRET_STORE as _ASK_SECRET_STORE
+_ASK_SECRET_STORE.register_hook = register_runtime_secret_raw
+_ASK_SECRET_STORE.unregister_hook = unregister_runtime_secret_raw
+
+# 把 shell/run 输出→模型上下文的构造处接上脱敏：echo $VAR 之类的明文回显在这里打码。
+from xgent_app.shell_output import set_context_redactor as _set_ctx_redactor
+_set_ctx_redactor(redact_sensitive_text)
 
 
 def register_provider_secrets(providers: Optional[Dict[str, Any]]) -> None:
@@ -860,6 +888,9 @@ class BotState:
     SET_WEB_PORT = 'set_web_port'
     SET_WEB_PUBLIC_URL = 'set_web_public_url'
     IMPORT_PROVIDER_CONFIG = 'import_provider_config'
+    # ask 协议：录入某道表单题的自定义文本 / 密钥。side-key 存 (ask_id, qid)。
+    ASK_FIELD_INPUT = 'ask_field_input'
+    ASK_SECRET_INPUT = 'ask_secret_input'
 
 PROVIDER_CONFIG_FORMAT = 'xgent-telegram-provider-config'
 LEGACY_PROVIDER_CONFIG_FORMATS = {'telegram-ai-bot-provider-config'}
@@ -1154,7 +1185,6 @@ def has_pending_text_conversation(update: Update) -> bool:
 # ---------------------------------------------------------------------------
 
 ALBUM_FLUSH_QUIET_SECONDS = 3.0
-ALBUM_MAX_PHOTOS = 10  # Telegram album hard cap; defensive truncation.
 
 
 class PendingAlbumConversation:
@@ -1164,18 +1194,22 @@ class PendingAlbumConversation:
         self.update = update  # representative update (caption-bearing, falls back to first)
         self.context = context
         self.media_group_id = media_group_id
-        self.photos: List[Dict[str, str]] = []  # each: {image_b64, saved_notice, index_text}
+        self.photos: List[Dict[str, Any]] = []
         self.caption: str = ""
         self.flush_task: Optional[Any] = None
         self.closed: bool = False
+        self.downloading: int = 0
+        self.received_message_ids: set = set()
+        self.failed: bool = False
 
-    def add_photo(self, image_b64: str, saved_notice: str, index_text: str,
-                  caption: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        self.photos.append({
-            "image_b64": image_b64,
-            "saved_notice": saved_notice,
-            "index_text": index_text,
-        })
+    def add_photo(self, payload: Dict[str, Any], update: Update,
+                  context: ContextTypes.DEFAULT_TYPE):
+        message_id = update.message.message_id
+        if any(p.get("source_message_id") == message_id for p in self.photos):
+            return
+        self.photos.append({**payload, "source_message_id": message_id})
+        self.photos.sort(key=lambda p: p["source_message_id"])
+        caption = payload.get("caption", "")
         if caption and not self.caption:
             self.caption = caption
             self.update = update
@@ -1184,6 +1218,14 @@ class PendingAlbumConversation:
 
 _pending_album_conversations: Dict[Tuple[int, str], "PendingAlbumConversation"] = {}
 _pending_album_conversations_lock = threading.RLock()
+
+def cancel_pending_album_conversations() -> None:
+    with _pending_album_conversations_lock:
+        for pending in _pending_album_conversations.values():
+            pending.closed = True
+            if pending.flush_task is not None:
+                pending.flush_task.cancel()
+        _pending_album_conversations.clear()
 
 
 REDUNDANT_AGENT_COMMAND_PREFIXES: Tuple[str, ...] = ()
@@ -1202,6 +1244,7 @@ class PromptFileManager:
     PROMPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prompts')
     
     FILES = {
+        'compression_prompt': 'compression.txt',
         'assistant_prompt': 'main.txt',
         'global_prompt_addon': 'global_addon.txt',
         'agent_prompt_addon': 'agent_addon.txt',
@@ -1211,6 +1254,7 @@ class PromptFileManager:
     }
 
     LABELS = {
+        'compression_prompt': '上下文压缩提示词',
         'assistant_prompt': '助手提示词',
         'global_prompt_addon': '全局追加提示词',
         'agent_prompt_addon': 'Agent 模式提示词',
@@ -1220,7 +1264,14 @@ class PromptFileManager:
     }
     
     _cache: Dict[str, str] = {}
-    
+    _stat_sigs: Dict[str, tuple] = {}
+
+    @staticmethod
+    def _file_signature(filepath: str) -> tuple:
+        """文件变更指纹：纳秒级 mtime + 字节大小，比裸 mtime 更抗粗粒度时间戳。"""
+        st = os.stat(filepath)
+        return (st.st_mtime_ns, st.st_size)
+
     @classmethod
     def init(cls):
         """初始化：确保目录和文件存在，加载到缓存"""
@@ -1229,9 +1280,14 @@ class PromptFileManager:
             filepath = os.path.join(cls.PROMPTS_DIR, filename)
             if not os.path.exists(filepath):
                 os.makedirs(os.path.dirname(filepath), exist_ok=True)
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    f.write('')
-                logger.warning(f"提示词文件不存在，已创建空文件: {filename}")
+                try:
+                    with open(filepath, 'x', encoding='utf-8') as f:
+                        if key == 'compression_prompt':
+                            from xgent_app.compression import DEFAULT_COMPRESSION_PROMPT
+                            f.write(DEFAULT_COMPRESSION_PROMPT + '\n')
+                    logger.warning(f"提示词文件不存在，已创建: {filename}")
+                except FileExistsError:
+                    pass
         cls.reload_all()
     
     @classmethod
@@ -1242,30 +1298,72 @@ class PromptFileManager:
             try:
                 with open(filepath, 'r', encoding='utf-8') as f:
                     cls._cache[key] = f.read()
+                cls._stat_sigs[key] = cls._file_signature(filepath)
                 logger.info(f"加载提示词: {filename} ({len(cls._cache[key])}字)")
             except Exception as e:
                 logger.error(f"加载提示词文件失败 {filename}: {e}")
                 cls._cache[key] = ''
+                cls._stat_sigs.pop(key, None)
     
     @classmethod
     def get(cls, key: str) -> str:
-        """获取提示词内容"""
-        return cls._cache.get(key, '')
-    
-    @classmethod
-    def set(cls, key: str, content: str):
-        """设置提示词并同步写入文件"""
-        cls._cache[key] = content
+        """获取提示词内容。
+
+        以文件为准：每次按文件指纹（mtime+大小）探测，文件被直接编辑后即时生效，无需重启或手动重载。
+        读取失败（文件缺失/占用等）时保留上一份可用缓存，避免运行中的提示词被清空。
+        """
         filename = cls.FILES.get(key)
         if filename:
             filepath = os.path.join(cls.PROMPTS_DIR, filename)
             try:
+                signature = cls._file_signature(filepath)
+                if cls._stat_sigs.get(key) != signature:
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        cls._cache[key] = f.read()
+                    cls._stat_sigs[key] = signature
+            except OSError:
+                pass  # 保留上一份可用缓存
+        return cls._cache.get(key, '')
+
+    @classmethod
+    def get_required(cls, key: str) -> str:
+        # A stale cache must not hide a deleted, unreadable or emptied file.
+        with open(cls.get_abs_path(key), 'r', encoding='utf-8') as handle:
+            disk_content = handle.read()
+        content = cls.get(key)
+        if not disk_content.strip() or not content.strip():
+            raise ValueError(f"{cls.get_label(key)}为空，请编辑或从文件重载。")
+        return content
+    
+    @classmethod
+    def set(cls, key: str, content: str):
+        """设置提示词并同步写入文件"""
+        filename = cls.FILES.get(key)
+        if filename:
+            filepath = os.path.join(cls.PROMPTS_DIR, filename)
+            temporary = None
+            try:
                 os.makedirs(os.path.dirname(filepath), exist_ok=True)
-                with open(filepath, 'w', encoding='utf-8') as f:
+                with tempfile.NamedTemporaryFile(
+                    mode='w', encoding='utf-8', dir=os.path.dirname(filepath),
+                    prefix='.prompt-', suffix='.tmp', delete=False,
+                ) as f:
+                    temporary = f.name
                     f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temporary, filepath)
+                cls._cache[key] = content
+                with contextlib.suppress(OSError):
+                    cls._stat_sigs[key] = cls._file_signature(filepath)
                 logger.info(f"提示词已写入文件: {filename}")
             except Exception as e:
                 logger.error(f"写入提示词文件失败 {filename}: {e}")
+                raise
+            finally:
+                if temporary is not None:
+                    with contextlib.suppress(OSError):
+                        os.unlink(temporary)
 
     @classmethod
     def get_path(cls, key: str) -> str:

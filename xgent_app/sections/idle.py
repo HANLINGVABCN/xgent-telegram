@@ -44,7 +44,10 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
         # 获取全局对话记忆
         global_depth = max(1, int(UserDataManager.get('global_depth', 30)))
         global_history = await db.get_conversation_messages(global_depth)
-
+        generated_reply = make_generated_reply_persistence(
+            db, None, BotConfig.AUTHORIZED_USER_ID, await db.get_attachment_generation(),
+            prov_name, model, record_prefix="[空闲提醒] ",
+        )
         agent_mode = UserDataManager.get('agent_mode', False)
         idle_prompt = (
             build_conversation_system_prompt(agent_mode) +
@@ -53,13 +56,21 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
 
         # 生成提醒消息。必须有硬上限：AI 回复超时设为“不限”时底层 HTTP 也不会
         # 超时，提供商静默挂起会让这个后台任务永远卡住，之后的空闲提醒全部停摆。
+        async def generate_idle_reply():
+            response, error = await ModelClient.think_and_reply(
+                prov_name, get_next_api_key(prov_name, prov_data['api_key']), prov_data['base_url'],
+                model, idle_prompt, global_history,
+                api_format=prov_data.get('api_format', 'openai'),
+                conversation_context=True,
+            )
+            media_artifacts = []
+            if response and not error and 'data:image/' in response.lower():
+                response, media_artifacts = await generated_reply.prepare(response)
+            return response, error, media_artifacts
+
         try:
-            response, error = await asyncio.wait_for(
-                ModelClient.think_and_reply(
-                    prov_name, get_next_api_key(prov_name, prov_data['api_key']), prov_data['base_url'],
-                    model, idle_prompt, global_history,
-                    api_format=prov_data.get('api_format', 'openai')
-                ),
+            response, error, media_artifacts = await asyncio.wait_for(
+                generate_idle_reply(),
                 timeout=IDLE_MESSAGE_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
@@ -67,6 +78,13 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
                 f"空闲提醒生成超时（>{int(IDLE_MESSAGE_TIMEOUT_SECONDS)}s）: "
                 f"provider={prov_name}, model={model}"
             )
+            return
+        except AttachmentContextError as exc:
+            await context.bot.send_message(
+                chat_id=BotConfig.AUTHORIZED_USER_ID,
+                text=f"空闲提醒失败：{exc}",
+            )
+            await db.set_config('last_idle_notice_time', time.time())
             return
 
         response_text = (response or "").strip()
@@ -81,17 +99,24 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
             # 发送给用户
             idle_message = f"系统提醒\n\n{response_text}"
             idle_chunks = split_text_for_telegram(idle_message)
-            for idle_chunk in idle_chunks:
-                await context.bot.send_message(
-                    chat_id=BotConfig.AUTHORIZED_USER_ID,
-                    text=idle_chunk
+            with media_presentation_scope(build_media_presentation(idle_message, media_artifacts)):
+                for idle_chunk in idle_chunks:
+                    await context.bot.send_message(
+                        chat_id=BotConfig.AUTHORIZED_USER_ID,
+                        text=idle_chunk
+                    )
+            if media_artifacts:
+                await send_generated_media_artifacts(
+                    context, BotConfig.AUTHORIZED_USER_ID, media_artifacts,
+                    caption=idle_message,
                 )
             
             # 记录发送时间
             await db.set_config('last_idle_notice_time', time.time())
             
             # 记录到全局消息
-            await GlobalRecorder.record_ai_reply(f"[空闲提醒] {response_text}")
+            if not generated_reply.recorded:
+                await GlobalRecorder.record_ai_reply(f"[空闲提醒] {response_text}")
             
             logger.info("已发送提醒消息给用户")
     
@@ -129,8 +154,8 @@ _web_config_watch_task: Optional[asyncio.Task] = None
 WEB_EDITABLE_SETTINGS = {
     'thinking_level', 'stream_mode', 'agent_mode', 'text_stitch_mode',
     'global_depth', 'agent_max_iterations', 'stream_timeout', 'chat_model',
-    'disabled_skills', 'agent_command_timeout', 'idle_message_interval',
-    'smart_match_threshold',
+    'disabled_skills', 'hidden_skills', 'skill_state', 'agent_command_timeout', 'idle_message_interval',
+    'smart_match_threshold', 'hide_protocol_blocks',
     # token 统计相关：价格表 / 手动合并表 / 报表默认选项
     'model_price_table', 'model_merge_map', 'stats_auto_merge', 'stats_metric',
 }
@@ -138,41 +163,23 @@ WEB_EDITABLE_SETTINGS = {
 
 async def _web_read_history(limit: int) -> List[Dict[str, Any]]:
     db = await BotMemoryDB.get_instance()
-    # 用显示专用查询：执行结果/媒体回复显示在 AI 侧，不沿用模型上下文的 user 映射。
     rows = await db.get_display_history(limit)
-    result = []
-    for row in rows:
-        msg_type = row.get('msg_type')
-        content = str(row.get('content') or '')
-        # AI_REPLY 存的是 Markdown 原文：转成 Telegram HTML 再返回，前端 sanitizeHtml
-        # 即可正常渲染粗体/标题/列表/引用/代码等。刷新后格式不再丢失。
-        # TOKEN_USAGE/AGENT_RESULT/AGENT_CMD/MEDIA_REPLY 已是 HTML，不再二次转换，
-        # 但要带 parse_mode=HTML 让前端走 sanitizeHtml 而非纯文本分支（否则 <i>/<pre>
-        # 等标签被 escapeHtml 转义成字面文本）。
-        if msg_type == MessageType.AI_REPLY:
-            try:
-                content = markdown_to_telegram_html(content)
-            except Exception:
-                pass  # 转换失败退回原文，总比报错好
-            result.append({'role': 'assistant', 'content': content, 'parse_mode': 'HTML'})
-        elif msg_type in (MessageType.TOKEN_USAGE, MessageType.AGENT_RESULT,
-                          MessageType.AGENT_CMD, MessageType.AGENT_STATUS,
-                          MessageType.MEDIA_REPLY, MessageType.SYSTEM_OP):
-            # 这些类型存库时已是 Telegram HTML，直接带 parse_mode 让前端渲染。
-            # token 统计行是元信息不是正文：降级成 system 角色，前端渲染成居中
-            # 灰条，不再混在 AI 气泡流里（对齐实时流的观感）。
-            result.append({
-                'role': 'system' if msg_type == MessageType.TOKEN_USAGE
-                        else str(row.get('role') or 'user'),
-                'content': content,
-                'parse_mode': 'HTML',
-            })
-        else:
-            result.append({
-                'role': str(row.get('role') or 'user'),
-                'content': content,
-            })
-    return result
+    messages = await asyncio.to_thread(
+        lambda: [build_history_message(row, ArtifactManager.ROOT_DIR, os.path.join(AgentExecutor.WORK_DIR, 'workspace'))
+                 for row in rows]
+    )
+    return UiHistorySnapshot(messages, generation=getattr(rows, 'generation', None),
+                             tombstones=getattr(rows, 'tombstones', ()))
+
+
+async def _web_read_history_message(row_id: int) -> Optional[Dict[str, Any]]:
+    db = await BotMemoryDB.get_instance()
+    row = await db.get_display_message(row_id)
+    if row is None:
+        return None
+    return await asyncio.to_thread(
+        build_history_message, row, ArtifactManager.ROOT_DIR, os.path.join(AgentExecutor.WORK_DIR, 'workspace'),
+    )
 
 
 def _relay_markup_to_telegram(rows: Any) -> Optional[Any]:
@@ -184,19 +191,11 @@ def _relay_markup_to_telegram(rows: Any) -> Optional[Any]:
     """
     if not rows:
         return None
-    keyboard = []
-    for row in rows:
-        buttons = []
-        for btn in row or []:
-            if not isinstance(btn, dict):
-                continue
-            buttons.append(InlineKeyboardButton(
-                str(btn.get('text') or ''),
-                callback_data=str(btn.get('callback_data') or ''),
-            ))
-        if buttons:
-            keyboard.append(buttons)
-    return InlineKeyboardMarkup(keyboard) if keyboard else None
+    return markup_from_frame([
+        [{**button, 'callback_data': CallbackDataStore.store(button['callback_action'])}
+         if button.get('callback_action') else button for button in row]
+        for row in rows
+    ])
 
 
 # --- ☆ Telegram 出站通道 ☆ ---
@@ -246,6 +245,14 @@ class _ChannelOutboxStore:
     async def count(self, channel: str) -> int:
         db = await BotMemoryDB.get_instance()
         return await db.count_channel_ops(channel)
+
+    async def record_attempt(self, row_id: int, attempts: int, error: str) -> None:
+        db = await BotMemoryDB.get_instance()
+        await db.record_channel_op_attempt(row_id, attempts, error)
+
+    async def deadletter(self, channel: str, op: Any, error: str) -> None:
+        db = await BotMemoryDB.get_instance()
+        await db.deadletter_channel_op(channel, op.to_row(), error)
 
 
 async def _telegram_channel_recovered(replayed: int, skipped: int) -> None:
@@ -344,7 +351,7 @@ def _relay_mirror_for(session_id: str, chat_id: int) -> Any:
     mirror = _relay_mirrors.get(session_id)
     if mirror is None:
         mirror = MirrorBot(_web_external_outbox, chat_id, real_bot=tg_bot,
-                           channel=telegram_channel())
+                           channel=telegram_channel(), ui_source='cli:' + session_id)
         while len(_relay_mirrors) >= _RELAY_MIRROR_MAX_SESSIONS:
             _relay_mirrors.popitem(last=False)
         _relay_mirrors[session_id] = mirror
@@ -357,6 +364,11 @@ def _relay_mirror_for(session_id: str, chat_id: int) -> Any:
 
 
 async def _replay_relay_op(mirror: Any, op: str, payload: Dict[str, Any]) -> None:
+    with media_presentation_scope(payload.get('media_presentation')), replay_ui_context(payload.get('ui_context')):
+        await _replay_relay_op_with_presentation(mirror, op, payload)
+
+
+async def _replay_relay_op_with_presentation(mirror: Any, op: str, payload: Dict[str, Any]) -> None:
     """把 CLI 侧的一次 bot 调用原样重放到 Telegram + 网页。
 
     这里**不做任何过滤、不改写任何文案**：CLI 里对话核心发了什么，Telegram
@@ -380,6 +392,13 @@ async def _replay_relay_op(mirror: Any, op: str, payload: Dict[str, Any]) -> Non
             # user_message 帧让网页渲染成用户气泡（右侧），而不是 AI 气泡。
             outbox.put({"type": "user_message", "text": text,
                         "ts": time.time(), "external": True})
+        return
+
+    if op == 'conversation_event':
+        frame = payload.get('frame')
+        if (isinstance(frame, dict) and frame.get('type') in {'history_reset', 'compression_state'}
+                and _web_external_outbox is not None):
+            _web_external_outbox.put(frame)
         return
 
     if op == 'send_message':
@@ -654,6 +673,7 @@ async def _web_read_settings() -> Dict[str, Any]:
         'values': {
             'thinking_level': normalize_thinking_level(UserDataManager.get('thinking_level')),
             'stream_mode': normalize_bool(UserDataManager.get('stream_mode', True), True),
+            'hide_protocol_blocks': normalize_bool(UserDataManager.get('hide_protocol_blocks', False), False),
             'agent_mode': bool(UserDataManager.get('agent_mode', False)),
             'text_stitch_mode': normalize_text_stitch_mode(UserDataManager.get('text_stitch_mode')),
             'global_depth': int(UserDataManager.get('global_depth', 30) or 30),
@@ -670,6 +690,7 @@ async def _web_read_settings() -> Dict[str, Any]:
             'smart_match_threshold': int(UserDataManager.get('smart_match_threshold', 90) or 90),
             'chat_model': f"{prov_name}|{current_model}" if prov_name and current_model else '',
             'disabled_skills': disabled_skills,
+            'hidden_skills': sorted(get_hidden_skills()),
             'model_price_table': model_price_table,
             'model_merge_map': model_merge_map,
             'stats_auto_merge': stats_auto_merge,
@@ -715,7 +736,7 @@ async def _web_write_setting(key: str, value: Any) -> Dict[str, Any]:
         UserDataManager.set(key, level)
         await UserDataManager.save_config(key, level)
         ModelClient._thinking_unsupported.clear()
-    elif key in {'stream_mode', 'agent_mode'}:
+    elif key in {'stream_mode', 'agent_mode', 'hide_protocol_blocks'}:
         flag = normalize_bool(value, False)
         UserDataManager.set(key, flag)
         await UserDataManager.save_config(key, flag)
@@ -758,7 +779,11 @@ async def _web_write_setting(key: str, value: Any) -> Dict[str, Any]:
             raise ValueError("智能匹配阈值需不小于 0")
         UserDataManager.set(key, pct)
         await UserDataManager.save_config(key, pct)
-    elif key == 'disabled_skills':
+    elif key == 'skill_state':
+        if not isinstance(value, dict):
+            raise ValueError('无效的技能状态')
+        await save_skill_state(str(value.get('path') or ''), str(value.get('state') or ''))
+    elif key in {'disabled_skills', 'hidden_skills'}:
         # 前端传一个被禁用 skill 的相对路径列表。normalize 成 list[str]，去重。
         raw = value if isinstance(value, list) else []
         cleaned = sorted({str(item) for item in raw if item})
@@ -860,11 +885,37 @@ async def _web_handle_callback(callback_data: str, message_id: int, outbox: Any)
         BotConfig.AUTHORIZED_USER_ID, outbox, callback_data, message_id,
     )
     try:
-        await handle_button_click(update, context)
+        if callback_data == 'act_stop_generation':
+            await handle_button_click(update, context)
+        else:
+            async with ui_operation(capture_text=True):
+                await handle_button_click(update, context)
         outbox.put({"type": "callback_done"})
     except Exception as e:
         logger.exception("Web 回调失败")
         outbox.put({"type": "turn_error", "text": redact_sensitive_text(str(e))[:300]})
+
+
+async def _web_handle_ui_callback(ui_message_id: str, revision: int, button_id: str, outbox: Any) -> None:
+    from xgent_app.web_bridge import _allocate_web_message_id
+    try:
+        async with callback_lock(ui_message_id):
+            db = await BotMemoryDB.get_instance()
+            row, action = await validated_button(db, ui_message_id, revision, button_id)
+            validate_saved_menu_action(action)
+            message_id = _allocate_web_message_id()
+            update, context, _bot = build_web_callback_objects(
+                BotConfig.AUTHORIZED_USER_ID, outbox, action, message_id,
+            )
+            async with ui_operation(capture_text=True, binding=row, message_id=message_id):
+                await handle_button_click(update, context)
+    except UiHistoryError as exc:
+        outbox.put({'type': 'callback_answer', 'text': str(exc), 'show_alert': True})
+    except Exception:
+        logger.exception('Web saved-menu callback failed')
+        outbox.put({'type': 'callback_answer', 'text': '菜单操作失败，请重新打开菜单。', 'show_alert': True})
+    finally:
+        outbox.put({'type': 'callback_done', 'resync': True})
 
 
 async def _web_handle_command(command: str, outbox: Any) -> None:
@@ -890,7 +941,8 @@ async def _web_handle_command(command: str, outbox: Any) -> None:
             )
             await process_conversation(update, context, command)
         else:
-            await handler(update, context)
+            async with ui_operation(capture_text=True):
+                await handler(update, context)
         outbox.put({"type": "turn_end"})
     except Exception as e:
         logger.exception("Web 命令失败: %s", command)
@@ -917,6 +969,7 @@ def _ensure_web_command_map() -> None:
         ("media_model", "cmd_media_model_menu"),
         ("prompts", "cmd_prompts_menu"),
         ("clear_memory", "cmd_delete_chat"),
+        ("compress", "cmd_compress"),
         ("depth", "cmd_depth_menu"),
         ("params", "cmd_timeout_menu"),
         ("thinking", "cmd_thinking_menu"),
@@ -1114,63 +1167,36 @@ async def _web_run_file_conversation(filename: str, content: bytes,
 
 async def _web_run_photo_conversation(filename: str, content: bytes,
                                       caption: str, outbox: Any) -> None:
-    """网页上传图片后跑一轮对话，让 AI 真正"看懂"图片内容。
-
-    历史 bug：网页上传的图片此前统一走 _web_run_file_conversation（文档
-    语义），只存盘、记路径索引，从不构造 multimodal image content——AI
-    完全看不到图里画的是什么，只知道"有个文件"。这与 Telegram 端
-    handle_photo_message（other_messages.py）把图片 base64 编码后塞进
-    content_override 的行为不对等。
-
-    现在改为调用 build_photo_multimodal_payload（other_messages.py 里从
-    _prepare_photo_payload 抽取的纯函数），构造与 Telegram 端完全一致的
-    multimodal content，让 Web 上传图片时 AI 的识图能力和 Telegram 对齐。
-
-    图片本体仍同步到 Telegram（与文件上传路径一致），但图片是纯二进制，
-    不存在提供商配置/黑名单等需要按状态机分流的场景，所以不需要复用
-    process_incoming_document——这与 Telegram 端 handle_photo_message
-    不检查文档状态机、直接处理的行为一致。
-    """
+    """网页图片与 Telegram 图片共用原件保存、附件关联和每轮组装逻辑。"""
+    received_at_ns = time.time_ns()
     try:
         update, context, _bot = build_web_mirror_objects(
             BotConfig.AUTHORIZED_USER_ID, outbox, _web_real_bot,
             channel=telegram_channel(),
         )
 
-        payload = build_photo_multimodal_payload(content, caption, filename)
+        db = await BotMemoryDB.get_instance()
+        generation = await db.get_attachment_generation()
+        payload = await asyncio.to_thread(build_photo_multimodal_payload, content, caption, filename)
         saved_photo = payload["saved_photo"]
         memory_text = payload["index_text"]
 
-        # 图片本体同步到 Telegram，对齐 _web_run_file_conversation 的现状行为。
-        await _web_deliver_file_to_tg(saved_photo['abs_path'], filename, caption)
-
-        await GlobalRecorder.record_user_message(
-            memory_text, MessageType.USER_PHOTO, BotConfig.AUTHORIZED_USER_ID
+        await GlobalRecorder.record_attachment_message(
+            memory_text, MessageType.USER_PHOTO, BotConfig.AUTHORIZED_USER_ID,
+            [payload["attachment"]], generation,
+            metadata={'attachment_received_at_ns': received_at_ns},
         )
 
-        multimodal_content: List[Dict[str, str]] = []
-        if payload["caption"]:
-            multimodal_content.append({"type": "text", "text": f"用户附言：{payload['caption']}"})
-        multimodal_content.append({"type": "text", "text": payload["saved_notice"]})
-        multimodal_content.append({
-            "type": "image",
-            "mime_type": "image/jpeg",
-            "data": payload["image_b64"],
-        })
-
-        await process_conversation(update, context, memory_text, content_override=multimodal_content)
+        # 同步和模型请求都使用已持久化的同一份原件。
+        await _web_deliver_file_to_tg(saved_photo['abs_path'], filename, caption)
+        await process_conversation(update, context, memory_text)
         outbox.put({"type": "turn_end"})
     except Exception as e:
         logger.exception("Web 图片对话失败")
         outbox.put({"type": "turn_error", "text": redact_sensitive_text(str(e))[:300]})
 
 
-# 图片文件后缀白名单，用于网页上传时区分"图片"（走 multimodal，AI 能看懂）
-# 和"普通文件"（走 process_incoming_document，只是路径索引）。与
-# Telegram 端 filters.PHOTO 依赖 Telegram 自己的媒体分类不同，网页上传
-# 只能拿到文件名，所以退化成按后缀判断——覆盖常见格式即可，不追求完备
-# （不在名单里的图片格式，比如小众的 .heic，会走普通文件路径，只是
-# AI 看不懂内容，不影响文件本身正常存盘和发送）。
+# 此白名单只决定入口；文档入口也会按原始字节识别图片并持久化。
 _WEB_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
 
@@ -1216,6 +1242,16 @@ def _web_submit_callback(callback_data: str, message_id: int, outbox: Any) -> No
     )
 
 
+def _web_submit_ui_callback(ui_message_id: str, revision: int, button_id: str, outbox: Any) -> None:
+    loop = _web_chat_server.config.loop if _web_chat_server else None
+    if loop is None:
+        outbox.put({'type': 'callback_answer', 'text': '服务未就绪', 'show_alert': True})
+        return
+    asyncio.run_coroutine_threadsafe(
+        _web_handle_ui_callback(ui_message_id, revision, button_id, outbox), loop,
+    )
+
+
 def _web_submit_command(command: str, outbox: Any) -> None:
     """HTTP 线程调用：把网页 /命令丢进事件循环。"""
     _ensure_web_command_map()
@@ -1246,21 +1282,22 @@ def mirror_to_web(handler):
 
     process_conversation 内部已装 install_tg_to_web_mirror，但命令和按钮回调不走
     process_conversation，所以 web 端看不到 TG 端的菜单切换/按钮变化。本装饰器在
-    handler 入口装镜像（web 在线时），finally restore，让 handler 里的
+    handler 入口装镜像，finally restore，让 handler 里的
     send_message / edit_text / edit_reply_markup 等也推网页 SSE 帧。
 
-    web 未运行时零开销——直接调原 handler。重入安全由 install_tg_to_web_mirror
-    内部的 _ACTIVE_MIRRORS 计数保证。
+    Web 未运行时仍保存菜单状态，之后开启网页可恢复。重入安全由镜像计数保证。
     """
     async def wrapped(update, context):
-        if not is_web_chat_running():
-            return await handler(update, context)
         from xgent_app.web_bridge import install_tg_to_web_mirror
-        outbox = get_web_outbox()
-        real_bot = get_web_real_bot()
+        outbox = get_web_outbox() or _web_external_outbox
+        real_bot = get_web_real_bot() or context.bot
         restore = install_tg_to_web_mirror(real_bot, outbox)
         try:
-            return await handler(update, context)
+            if getattr(getattr(update, 'callback_query', None), 'data', None) == 'act_stop_generation':
+                return await handler(update, context)
+            authorized = getattr(getattr(update, 'effective_user', None), 'id', None) == BotConfig.AUTHORIZED_USER_ID
+            async with ui_operation(capture_text=authorized):
+                return await handler(update, context)
         finally:
             restore()
     wrapped.__name__ = getattr(handler, "__name__", "wrapped")
@@ -1327,6 +1364,7 @@ async def start_web_chat_if_enabled(app: Optional[Any] = None, *,
         loop=asyncio.get_running_loop(),
         submit_message=_web_submit_message,
         submit_callback=_web_submit_callback,
+        submit_ui_callback=_web_submit_ui_callback,
         submit_command=_web_submit_command,
         submit_upload=_web_submit_upload,
         # 上传上限按 API_BASE_URL 选档，与 agent_sendfile.py 发送侧阈值同源：
@@ -1337,6 +1375,7 @@ async def start_web_chat_if_enabled(app: Optional[Any] = None, *,
             else 50 * 1024 * 1024
         ),
         read_history=_web_read_history,
+        read_history_message=_web_read_history_message,
         read_settings=_web_read_settings,
         write_setting=_web_write_setting,
         # 分通道健康详情。同步回调（runtime.runtime_health 不 await 任何东西）：

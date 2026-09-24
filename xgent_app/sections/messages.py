@@ -3,11 +3,12 @@
 
 from xgent_app.agent_coordinator import plan_agent_round_transition
 from xgent_app.agent_status import AgentTurnOrigin, build_agent_round_status
+from xgent_app.agent_ask import PENDING_ASKS, SECRET_STORE, PendingAsk, parse_ask_form
 from xgent_app.agent_context import (
+    build_ask_context_message,
     build_file_context_message,
     build_sendfile_context_message,
     build_shell_context_message,
-    build_trigger_context_message,
 )
 from xgent_app.agent_history import (
     persist_agent_result,
@@ -16,7 +17,6 @@ from xgent_app.agent_history import (
 )
 from xgent_app.agent_dispatch import dispatch_standard_protocol
 from xgent_app.agent_shell import execute_shell_protocol
-from xgent_app.agent_trigger import execute_trigger_protocol
 from xgent_app.agent_file_delivery import send_written_agent_file
 from xgent_app.agent_files import (
     write_base64_protocol_file,
@@ -31,6 +31,26 @@ from xgent_app.agent_presenter import (
     build_standard_operation_presentation,
 )
 
+def build_document_attachment_payload(doc_name: str, content_bytes: bytes, caption: str,
+                                      context_prefix: str = "", mime_type: Optional[str] = None,
+                                      source_message_id: Optional[int] = None) -> Dict[str, Any]:
+    saved_file = ArtifactManager.save_binary_upload(doc_name, content_bytes)
+    reference = ArtifactManager.attachment_reference(
+        saved_file, doc_name, content_bytes, caption, context_prefix,
+        mime_type=mime_type, source_message_id=source_message_id,
+    )
+    kind = "图片" if reference['kind'] == 'image' else "文件"
+    note = ArtifactManager.shorten_text(caption, 80) if caption else ""
+    return {
+        "saved_file": saved_file,
+        "attachment": reference,
+        "caption": caption,
+        "saved_notice": ArtifactManager.build_saved_notice(kind, saved_file['rel_path']),
+        "index_text": ArtifactManager.build_index_message(kind, doc_name, saved_file['rel_path'], note),
+        "is_document": True,
+    }
+
+
 async def process_incoming_document(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -41,6 +61,8 @@ async def process_incoming_document(
     file_size: Optional[int] = None,
     mime_type: Optional[str] = None,
     sync_to_telegram: Optional[Callable[[str, str, str], Awaitable[None]]] = None,
+    attachment_generation: Optional[int] = None,
+    attachment_received_at_ns: Optional[int] = None,
 ) -> None:
     """处理一份已经拿到字节的文档，按当前状态机分流。
 
@@ -73,7 +95,8 @@ async def process_incoming_document(
         await GlobalRecorder.record_user_message(
             f"[提供商配置文件] {doc_name}",
             MessageType.USER_FILE,
-            update.effective_chat.id
+            update.effective_chat.id,
+            metadata={'attachment_purpose': 'configuration'},
         )
         if not doc_name.lower().endswith('.json'):
             await update.message.reply_text("⚠️ 请发送 JSON 配置文件，或发送 cancel 取消。")
@@ -147,7 +170,8 @@ async def process_incoming_document(
         await GlobalRecorder.record_user_message(
             f"[黑名单文件] {doc_name}",
             MessageType.USER_FILE,
-            update.effective_chat.id
+            update.effective_chat.id,
+            metadata={'attachment_purpose': 'configuration'},
         )
         if not _looks_like_text_file(doc_name):
             await update.message.reply_text("🫠 黑名单批量导入只接受 txt / md / text 文件。")
@@ -178,7 +202,8 @@ async def process_incoming_document(
         await GlobalRecorder.record_user_message(
             f"[记忆文件] {doc_name}",
             MessageType.USER_FILE,
-            update.effective_chat.id
+            update.effective_chat.id,
+            metadata={'attachment_purpose': 'configuration'},
         )
         if not _looks_like_text_file(doc_name):
             await update.message.reply_text("🫠 记忆导入只接受 txt / md / text 文件。")
@@ -208,7 +233,8 @@ async def process_incoming_document(
         await GlobalRecorder.record_user_message(
             f"[文件] {doc_name}",
             MessageType.USER_FILE,
-            update.effective_chat.id
+            update.effective_chat.id,
+            metadata={'attachment_purpose': 'configuration'},
         )
 
         if not _looks_like_text_file(doc_name):
@@ -250,76 +276,51 @@ async def process_incoming_document(
     # 注意：save_binary_upload 必须只调用一次——sync_to_telegram 和下面的
     # 记忆/AI 上下文必须引用同一份落盘文件，不能各存一份产生两个路径。
     try:
-        saved_file = ArtifactManager.save_binary_upload(doc_name, content_bytes)
-        if sync_to_telegram is not None:
-            await sync_to_telegram(saved_file['abs_path'], doc_name, caption)
-
-        note = ArtifactManager.shorten_text(caption, 80) if caption else ""
-        memory_text = ArtifactManager.build_index_message("文件", doc_name, saved_file['rel_path'], note)
-
-        await GlobalRecorder.record_user_message(
-            memory_text,
-            MessageType.USER_FILE,
-            update.effective_chat.id
-        )
-
-        turn_parts: List[Dict[str, str]] = []
-        if caption:
-            turn_parts.append({"type": "text", "text": f"用户附言：{caption}"})
-        turn_parts.append({
-            "type": "text",
-            "text": ArtifactManager.build_saved_notice("文件", saved_file['rel_path'], f"原文件名：{doc_name}")
-        })
-
-        inline_text = ArtifactManager.try_decode_text(content_bytes)
-        if inline_text is not None:
-            clipped_text, was_clipped = ArtifactManager.clip_inline_text(inline_text)
-            clip_note = (
-                "\n[系统提示] 文件内容过长，本轮只内联了前半部分，完整内容仍可通过保存路径重新读取。"
-                if was_clipped else ""
-            )
-            turn_parts.append({
-                "type": "text",
-                "text": (
-                    f"[文件内容开始]\n{clipped_text}{clip_note}\n[文件内容结束]\n"
-                    "请直接基于文件内容回答，并说明文件保存路径。"
-                )
-            })
-        else:
-            turn_parts.append({
-                "type": "text",
-                "text": (
-                    "这份文件已经保存到路径里了，但不会把全文长期塞在上下文里。"
-                    "如果后面还要继续分析，请优先按保存路径重新读取。"
-                )
-            })
-
+        if attachment_received_at_ns is None:
+            attachment_received_at_ns = time.time_ns()
+        if attachment_generation is None:
+            db = await BotMemoryDB.get_instance()
+            attachment_generation = await db.get_attachment_generation()
         context_prefix = build_incoming_context_prefix(update.message)
+        payload = await asyncio.to_thread(
+            build_document_attachment_payload,
+            doc_name, content_bytes, caption, context_prefix, mime_type,
+            source_message_id=getattr(update.message, 'message_id', None),
+        )
+        saved_file = payload["saved_file"]
+        memory_text = payload["index_text"]
         if context_prefix:
             memory_text = f"{context_prefix}\n{memory_text}"
 
-        await process_conversation(
-            update,
-            context,
-            memory_text,
-            content_override=turn_parts
+        await GlobalRecorder.record_attachment_message(
+            memory_text, MessageType.USER_FILE, update.effective_chat.id, [payload["attachment"]],
+            attachment_generation,
+            metadata={'attachment_received_at_ns': attachment_received_at_ns},
         )
+        if sync_to_telegram is not None:
+            await sync_to_telegram(saved_file['abs_path'], doc_name, caption)
+
+        await process_conversation(update, context, memory_text)
     except Exception as e:
         logger.error(f"File save/process error: {e}")
-        await update.message.reply_text(f"文件 {safe_text(doc_name)} 已收到，但保存或转交模型失败。")
+        await update.message.reply_text(
+            f"文件 {safe_text(doc_name)} 未能完整交给模型：{safe_text(str(e))}"
+        )
 
 
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    received_at_ns = time.time_ns()
     if not await check_authorized_user_middleware(update, context):
         return
 
     # 处理中锁（仅对非提示词编辑状态生效）
     await UserDataManager.init()
     state = UserDataManager.get('state')
-    if (not is_prompt_edit_state(state)
-            and state != BotState.SET_COMMAND_BLACKLIST
-            and state != BotState.SET_MEMORY
-            and state != BotState.IMPORT_PROVIDER_CONFIG):
+    configuration_upload = is_prompt_edit_state(state) or state in {
+        BotState.SET_COMMAND_BLACKLIST, BotState.SET_MEMORY, BotState.IMPORT_PROVIDER_CONFIG,
+    }
+    media_group_id = getattr(update.message, "media_group_id", None)
+    if not configuration_upload:
         if _conversation_processing_lock.locked():
             await update.message.reply_text(
                 "⏳ 系统仍在处理上一个请求... 请稍等。"
@@ -329,13 +330,30 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     doc = update.message.document
     doc_name = doc.file_name or f"document_{uuid.uuid4().hex[:8]}.bin"
     # caption 同样只取原文：格式属性丢弃，字符一字不差。
-    caption = (update.message.caption or "").strip()
+    caption = update.message.caption or ""
     # 转发的富文本消息：caption 可能为空，文字在 rich_message.blocks 里
     if not caption:
-        caption = _extract_rich_message_text(update.message).strip()
+        caption = _extract_rich_message_text(update.message)
         if caption:
             logger.warning(f"handle_document_message: extracted caption via rich_message, len={len(caption)}: {caption[:200]}")
 
+    if media_group_id and not configuration_upload:
+        async def prepare_document():
+            data = bytes(await download_telegram_file(doc))
+            return await asyncio.to_thread(
+                build_document_attachment_payload, doc_name, data, caption,
+                build_incoming_context_prefix(update.message), doc.mime_type,
+                update.message.message_id,
+            )
+
+        await _handle_album_attachment(
+            update, context, media_group_id, prepare_document, MessageType.USER_FILE,
+            received_at_ns=received_at_ns,
+        )
+        return
+
+    db = await BotMemoryDB.get_instance()
+    attachment_generation = await db.get_attachment_generation()
     content_bytes = bytes(await download_telegram_file(doc))
     await process_incoming_document(
         update, context,
@@ -344,6 +362,8 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         caption=caption,
         file_size=doc.file_size,
         mime_type=doc.mime_type,
+        attachment_generation=attachment_generation,
+        attachment_received_at_ns=received_at_ns,
     )
 
 
@@ -688,6 +708,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 转发/引用来源前缀只加在正常对话上（见文件末尾的正常对话分支）。
     # 配置状态下必须保持原样：前缀会被当成 Token、API Key 或黑名单规则本身存进配置。
 
+    # ask 协议表单的「自定义文本 / 密钥」录入：完全自包含（自己处理 cancel、录入、
+    # 密钥落 SecretStore、重画表单），处理完直接 return，不落入下面的通用配置状态机。
+    if state in (BotState.ASK_FIELD_INPUT, BotState.ASK_SECRET_INPUT):
+        await _handle_ask_text_input(update, context, state, text)
+        return
+
     # 普通聊天按拼接模式决定：直接发送，或累计到“完成”按钮后再写入记忆。
     if state != BotState.IDLE:
         recorded_text = (
@@ -701,6 +727,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             if state == BotState.IMPORT_PROVIDER_CONFIG
             else "[已填入 API Key，内容已隐藏]"
             if state in (BotState.EDIT_PROV_KEY, BotState.ADD_PROV_KEY)
+            else "[已录入表单密钥，内容已隐藏]"
+            if state == BotState.ASK_SECRET_INPUT
             else text
         )
         await GlobalRecorder.record_user_message(recorded_text, MessageType.USER_TEXT, update.effective_chat.id)
@@ -1610,12 +1638,14 @@ async def _record_user_stopped_reply(db, cid, chat_id, partial_text: str) -> str
     return content
 
 
+@without_ui_history
 async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
                                content_override: Optional[Any] = None,
                                lock_acquired_event: Optional[asyncio.Event] = None,
                                force_agent_mode: bool = False,
                                reset_agent_iterations: bool = True,
-                               agent_origin: Optional[AgentTurnOrigin] = None):
+                               agent_origin: Optional[AgentTurnOrigin] = None,
+                               resume_state: Optional[Dict[str, Any]] = None):
     """处理对话（全局模式 + Agent 协议执行：命令 / 读文件 / 发文件 / 写文件 / 媒体）"""
     global _is_processing, _stop_generation_event
 
@@ -1648,6 +1678,7 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
                     force_agent_mode,
                     reset_agent_iterations,
                     agent_origin,
+                    resume_state,
                 )
             finally:
                 _stop_generation_event = None
@@ -1660,13 +1691,19 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                        content_override: Optional[Any] = None,
                                        force_agent_mode: bool = False,
                                        reset_agent_iterations: bool = True,
-                                       agent_origin: Optional[AgentTurnOrigin] = None):
+                                       agent_origin: Optional[AgentTurnOrigin] = None,
+                                       resume_state: Optional[Dict[str, Any]] = None):
     """process_conversation 内部实现"""
     agent_mode = force_agent_mode or UserDataManager.get('agent_mode', False)
     agent_origin = agent_origin or AgentTurnOrigin.user()
     stream_mode = normalize_bool(UserDataManager.get('stream_mode', True), True)
     db = await BotMemoryDB.get_instance()
     cid, cdata = await get_or_create_chat_session()
+    # 暂存当前对话上下文，供 run-x 子进程（如 xgent_trigger.py）登记任务时透传，
+    # 使后台任务结果能投递回正确对话。单对话串行，类属性暂存安全。
+    AgentExecutor._current_chat_id = update.effective_chat.id
+    AgentExecutor._current_conversation_id = cid
+    attachment_generation = await db.get_attachment_generation()
     max_agent_iterations = normalize_agent_max_iterations(
         UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)
     )
@@ -1725,15 +1762,16 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
 
     global_depth = max(1, int(UserDataManager.get('global_depth', 30)))
     system_prompt = build_conversation_system_prompt(agent_mode)
-    history = await db.get_conversation_messages(global_depth)
-    if content_override is not None:
-        # 文件/图片本体只在本轮临时喂给模型；长期记忆和导出仍只保留路径索引。
-        for msg in reversed(history):
-            if msg.get('role') == 'user':
-                msg['content'] = content_override
-                break
-        else:
-            history.append({'role': 'user', 'content': content_override})
+    if resume_state is not None:
+        # ask 表单提交后的恢复：用发起提问那一刻的内存历史快照（含 readx 多模态），
+        # 追加这一条「用户表单回答」，而不是从数据库重建——重建会把图片/二进制块
+        # 退化成纯文本 notice，破坏 readx 已加载进上下文的完整内容。只追加，不重建。
+        history = list(resume_state['turn_history_snapshot'])
+        history.append(resume_state['answer_message'])
+    else:
+        history = with_current_question(
+            await db.get_conversation_messages(global_depth), text, content_override,
+        )
     
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
@@ -1743,6 +1781,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     # 根据流式/非流式开关选择回复方式
     stop_partial: List[str] = []
     token_text: List[str] = []   # token 用量文本出参，正文落库后再落库，保证顺序
+    generated_reply = make_generated_reply_persistence(
+        db, cid, update.effective_chat.id, attachment_generation, prov_name, model,
+    )
     if stream_mode:
         # stream_style: 'foreground'（前台流式，实时推送）/ 'background'（后台流式，累积后一次发）
         stream_style = normalize_stream_style(UserDataManager.get('stream_style', DEFAULT_STREAM_STYLE))
@@ -1752,7 +1793,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 prov_name, prov_data, model,
                 system_prompt, history,
                 stopped_partial_sink=stop_partial,
-                token_text_sink=token_text
+                token_text_sink=token_text,
+                generated_reply=generated_reply,
             )
         else:
             response = await send_streaming_response(
@@ -1760,7 +1802,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 prov_name, prov_data, model,
                 system_prompt, history,
                 stopped_partial_sink=stop_partial,
-                token_text_sink=token_text
+                token_text_sink=token_text,
+                generated_reply=generated_reply,
             )
     else:
         response = await send_non_streaming_response(
@@ -1768,7 +1811,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             prov_name, prov_data, model,
             system_prompt, history,
             stopped_partial_sink=stop_partial,
-            token_text_sink=token_text
+            token_text_sink=token_text,
+            generated_reply=generated_reply,
         )
     
     if not response:
@@ -1786,10 +1830,12 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         ),
                         reply_markup=None,
                     )
-            await _record_user_stopped_reply(
-                db, cid, update.effective_chat.id,
-                stop_partial[0] if stop_partial else "",
-            )
+            if (not generated_reply.recorded
+                    and attachment_generation == await db.get_attachment_generation()):
+                await _record_user_stopped_reply(
+                    db, cid, update.effective_chat.id,
+                    stop_partial[0] if stop_partial else "",
+                )
             return
         if trigger_status_msg is not None and trigger_status_iteration is not None:
             with contextlib.suppress(Exception):
@@ -1806,8 +1852,12 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
         return
     
     # 保存 AI 回复。
-    await GlobalRecorder.record_ai_reply(response, update.effective_chat.id)
-    await db.add_chat_message(cid, 'assistant', response)
+    if not generated_reply.recorded:
+        await GlobalRecorder.record_ai_reply(
+            response, update.effective_chat.id,
+            metadata=await generated_image_metadata(generated_reply.artifacts, attachment_generation),
+        )
+        await db.add_chat_message(cid, 'assistant', response)
     # token 用量在正文落库之后落库，保证 timestamp 晚于正文，刷新后顺序为「输出 + tokens」。
     if token_text:
         _entry = token_text[0]
@@ -1869,6 +1919,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
 
             operation_iteration = agent_iteration + 1
             round_state = AgentRoundState()
+            form_shown = False  # ask 协议：本轮弹了表单则结束循环、等用户提交后再恢复
             provider_api_format = str(prov_data.get('api_format', 'openai'))
             agent_stop_msg = await context.bot.send_message(
                 chat_id=update.effective_chat.id,
@@ -1974,15 +2025,62 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                 operation_presentation,
                                 parse_mode=constants.ParseMode.HTML,
                             )
-                        await persist_standard_operation_result(
-                            recorder=GlobalRecorder,
-                            message_type=MessageType.AGENT_RESULT,
-                            database=db,
-                            conversation_id=cid,
-                            chat_id=update.effective_chat.id,
-                            operation=standard_operation,
-                            presentation=operation_presentation,
+                        # read 留存开关：开启且本次是成功的 read 时，把完整内容跨轮持久化。
+                        # 文本 → 完整正文作为模型可见内容落库（普通窗口消息，且能被压缩捕获）；
+                        # 图片/二进制 → 登记持久附件，每轮由 build_model_conversation_history 恢复。
+                        # 关闭或非 read → 维持现状，只落摘要 notice。
+                        readx_persist = normalize_bool(
+                            UserDataManager.get('readx_persist_context', False), False
                         )
+                        _ctx_msg = standard_operation.get('context_message')
+                        _ctx_content = _ctx_msg.get('content') if isinstance(_ctx_msg, dict) else None
+                        _is_readx = (
+                            standard_operation.get('kind') == 'read'
+                            and standard_operation.get('success')
+                        )
+                        if readx_persist and _is_readx and isinstance(_ctx_content, str):
+                            await persist_agent_result(
+                                recorder=GlobalRecorder,
+                                message_type=MessageType.AGENT_RESULT,
+                                database=db,
+                                conversation_id=cid,
+                                chat_id=update.effective_chat.id,
+                                notice=standard_operation['notice'],
+                                display_content=_ctx_content,
+                            )
+                        else:
+                            await persist_standard_operation_result(
+                                recorder=GlobalRecorder,
+                                message_type=MessageType.AGENT_RESULT,
+                                database=db,
+                                conversation_id=cid,
+                                chat_id=update.effective_chat.id,
+                                operation=standard_operation,
+                                presentation=operation_presentation,
+                            )
+                            if readx_persist and _is_readx and isinstance(_ctx_content, list):
+                                _src = standard_operation.get('source') or {}
+                                _raw, _base = _src.get('raw_content'), _src.get('basename')
+                                _mime = _src.get('mime_type') or ''
+                                if _raw and _base:
+                                    try:
+                                        _saved = ArtifactManager.save_binary_upload(_base, _raw)
+                                        _is_img = _mime.startswith('image/')
+                                        _ref = ArtifactManager.attachment_reference(
+                                            _saved, _base, _raw,
+                                            context_prefix="（模型通过 read 读入的文件）",
+                                            mime_type=_mime, expected_image=_is_img,
+                                            expected_binary=(not _is_img),
+                                        )
+                                        await GlobalRecorder.record_attachment_message(
+                                            content=standard_operation['notice'],
+                                            msg_type=(MessageType.USER_PHOTO if _is_img
+                                                      else MessageType.USER_FILE),
+                                            chat_id=update.effective_chat.id,
+                                            attachments=[_ref],
+                                        )
+                                    except Exception as exc:
+                                        logger.warning(f"read 留存：附件登记失败（已忽略）: {exc}")
                         round_state.add_context(
                             _ctx_with_notice(standard_operation['context_message'], smart_notice)
                         )
@@ -2103,31 +2201,63 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             round_state.should_continue = True
                         continue
 
-                    if block_type == 'trigger':
-                        trigger_notice = await execute_trigger_protocol(
-                            block,
-                            trigger_manager=SelfTriggerManager,
-                            bot=context.bot,
+                    if block_type == 'ask':
+                        ask_form, ask_err = parse_ask_form(block.get('body') or '')
+                        if ask_err:
+                            # 格式错误：回灌给模型让它改正，不阻断、不抛异常。
+                            await safe_send_message(
+                                context, update.effective_chat.id, f"⚠️ {ask_err}",
+                            )
+                            await persist_agent_result(
+                                recorder=GlobalRecorder,
+                                message_type=MessageType.AGENT_RESULT,
+                                database=db,
+                                conversation_id=cid,
+                                chat_id=update.effective_chat.id,
+                                notice=f"[ask结果] {ask_err}",
+                            )
+                            round_state.add_context(
+                                _ctx_with_notice(build_ask_context_message(f"[ask结果] {ask_err}"), smart_notice)
+                            )
+                            round_state.should_continue = True
+                            continue
+                        # 解析成功：快照当前内存历史（含 readx 多模态），存挂起表单，
+                        # 发出表单消息，本轮就此结束——释放锁，等用户在任一端提交后恢复。
+                        ask_id = PENDING_ASKS.new_id()
+                        pending = PendingAsk(
+                            ask_id=ask_id,
+                            form=ask_form,
+                            generation=attachment_generation,
+                            turn_history_snapshot=list(agent_turn_history),
+                            agent_iteration=agent_iteration,
                             chat_id=update.effective_chat.id,
-                            conversation_id=cid,
-                            original_text=text,
-                            response=response,
+                            origin=AgentTurnOrigin.ask(),
                         )
+                        form_header = (
+                            "📝 需要你的输入：请在下面选择/填写后点「✅ 提交」。\n"
+                            "（提交前可以反复改；密钥项的内容只进环境变量，绝不会发给 AI。）"
+                        )
+                        form_msg = await context.bot.send_message(
+                            chat_id=update.effective_chat.id,
+                            text=form_header,
+                            reply_markup=ask_form.build_keyboard(ask_id, pending.draft),
+                        )
+                        with contextlib.suppress(Exception):
+                            pending.form_message_id = form_msg.message_id
+                        PENDING_ASKS.put(pending)
                         await persist_agent_result(
                             recorder=GlobalRecorder,
                             message_type=MessageType.AGENT_RESULT,
                             database=db,
                             conversation_id=cid,
                             chat_id=update.effective_chat.id,
-                            notice=trigger_notice,
+                            notice=f"[ask] 已向用户弹出表单（{len(ask_form.questions)} 个问题），等待提交。",
                         )
-                        round_state.add_context(
-                            _ctx_with_notice(build_trigger_context_message(trigger_notice), smart_notice)
-                        )
-                        round_state.should_continue = True
-                        continue
+                        form_shown = True
+                        round_state.should_continue = False
+                        break  # 一条消息只处理第一个 ask 表单，其余忽略
 
-                    if block_type in {'shell', 'stdin', 'shellread', 'shellkill'}:
+                    if block_type in {'shell', 'stdin', 'shellkill'}:
                         shell_execution = await execute_shell_protocol(
                             block,
                             shell_manager=AgentShellSessionManager,
@@ -2148,7 +2278,6 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         action_label = {
                             'shell': '启动会话',
                             'stdin': '输入会话',
-                            'shellread': '读取会话',
                             'shellkill': '关闭会话',
                         }[block_type]
                         pause_note = ""
@@ -2158,16 +2287,17 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         if shell_result.get('running'):
                             pause_note = "\n" + pause_display_text
 
+                        shell_presentation = build_shell_presentation(
+                            action_label=action_label,
+                            shell_result=shell_result,
+                            session_id=session_id,
+                            display_output=display_output,
+                            pause_note=pause_note,
+                        )
                         await safe_send_message(
                             context,
                             update.effective_chat.id,
-                            build_shell_presentation(
-                                action_label=action_label,
-                                shell_result=shell_result,
-                                session_id=session_id,
-                                display_output=display_output,
-                                pause_note=pause_note,
-                            ),
+                            shell_presentation,
                             parse_mode=constants.ParseMode.HTML
                         )
 
@@ -2185,6 +2315,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             conversation_id=cid,
                             chat_id=update.effective_chat.id,
                             notice=shell_notice,
+                            display_metadata={"display": {
+                                "content": shell_presentation, "parse_mode": "HTML",
+                            }},
                         )
                         if shell_result.get('running'):
                             round_state.add_context(
@@ -2192,7 +2325,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             )
                             round_state.should_continue = True
                             # 会话仍在运行不代表本次回复的后续协议无效；继续按原顺序处理，
-                            # 这样同一回复中的 shellread/stdin/shellkill 不会被静默跳过。
+                            # 这样同一回复中的 stdin/shellkill 不会被静默跳过。
                             continue
                         round_state.add_context(
                             _ctx_with_notice(build_shell_context_message(shell_notice, running=False), smart_notice)
@@ -2205,28 +2338,61 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         await GlobalRecorder.record(
                             msg_type=MessageType.AGENT_CMD,
                             role='system',
-                            content=f"[Agent媒体生成] {media_prompt}",
+                            content=f"[Agent媒体生成] {redact_media_data(media_prompt)}",
                             chat_id=update.effective_chat.id
                         )
 
-                        media_execution = await execute_media_generation(
-                            media_prompt,
-                            context=context,
-                            chat_id=update.effective_chat.id,
-                            generate_media=run_default_media_generation,
-                            keep_typing=keep_typing_while_waiting,
-                            stop_event_factory=get_or_create_stop_event,
-                            stop_requested=is_stop_requested,
-                            build_stop_keyboard=build_stop_keyboard,
-                            safe_edit_text=safe_edit_text,
-                            cancel_task_quietly=cancel_task_quietly,
-                        )
+                        async def finalize_media_result(result):
+                            notice, artifacts = build_external_media_output(result, media_prompt)
+                            metadata = await generated_image_metadata(artifacts, attachment_generation) or {}
+                            metadata['attachment_generation'] = attachment_generation
+                            if result.get('input_files'):
+                                metadata['media_inputs'] = result['input_files']
+                            await persist_media_result(
+                                recorder=GlobalRecorder,
+                                database=db,
+                                conversation_id=cid,
+                                chat_id=update.effective_chat.id,
+                                notice=notice,
+                                metadata=metadata,
+                            )
+                            result['image_attachment_ids'] = [
+                                ref['id'] for ref in (metadata or {}).get('attachments', [])
+                            ]
+                            result['persisted_notice'] = notice
+                            result['artifacts'] = artifacts
+
+                        async def generate_requested_media(body):
+                            return await run_media_protocol(
+                                body, conversation_generation=attachment_generation,
+                            )
+
+                        try:
+                            media_execution = await execute_media_generation(
+                                media_prompt,
+                                context=context,
+                                chat_id=update.effective_chat.id,
+                                generate_media=generate_requested_media,
+                                keep_typing=keep_typing_while_waiting,
+                                stop_event_factory=get_or_create_stop_event,
+                                stop_requested=is_stop_requested,
+                                build_stop_keyboard=build_stop_keyboard,
+                                safe_edit_text=safe_edit_text,
+                                cancel_task_quietly=cancel_task_quietly,
+                                finalize_result=finalize_media_result,
+                            )
+                        except AttachmentContextError as exc:
+                            await safe_edit_text(
+                                agent_stop_msg, f"图片持久化失败：{exc}", reply_markup=None,
+                            )
+                            return
                         if media_execution['stopped']:
                             round_state.should_continue = False
                             break
                         media_result = media_execution['result']
 
-                        media_notice, media_artifacts = build_external_media_output(media_result, media_prompt)
+                        media_notice = media_result['persisted_notice']
+                        media_artifacts = media_result['artifacts']
 
                         await send_media_generation_result(
                             media_result,
@@ -2240,13 +2406,6 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             logger=logger,
                         )
 
-                        await persist_media_result(
-                            recorder=GlobalRecorder,
-                            database=db,
-                            conversation_id=cid,
-                            chat_id=update.effective_chat.id,
-                            notice=media_notice,
-                        )
                         round_state.add_context(
                             _ctx_with_notice(await build_media_continuation_message(media_result, media_prompt), smart_notice)
                         )
@@ -2257,6 +2416,22 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 # typing 状态会空转到 max_duration 才停。
                 typing_stop.set()
                 await cancel_task_quietly(typing_task)
+
+            # ask 表单已弹出：本轮到此结束，释放锁，等用户在任一端提交后由
+            # resume_from_ask 重新进入。把"进行中"状态改成"等待填写"，不再叫模型。
+            if form_shown:
+                with contextlib.suppress(Exception):
+                    await safe_edit_text(
+                        agent_stop_msg,
+                        build_agent_round_status(
+                            operation_iteration,
+                            "completed",
+                            origin=agent_origin,
+                            operation_count=len(protocol_blocks),
+                        ),
+                        reply_markup=None,
+                    )
+                break
 
             # over 协议的拦截点，全局就这一处：模型说了不必回灌，且这一轮每个操作都成功，
             # 就把回灌载荷丢掉，让下面的协调器落到"没有新上下文"那条既有分支——正常收尾、
@@ -2351,6 +2526,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
 
             stop_partial = []
             token_text = []
+            generated_reply = make_generated_reply_persistence(
+                db, cid, update.effective_chat.id, attachment_generation, prov_name, model,
+            )
             if stream_mode:
                 stream_style = normalize_stream_style(UserDataManager.get('stream_style', DEFAULT_STREAM_STYLE))
                 if stream_style == STREAM_STYLE_BACKGROUND:
@@ -2359,7 +2537,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         prov_name, prov_data, model,
                         system_prompt, next_history,
                         stopped_partial_sink=stop_partial,
-                        token_text_sink=token_text
+                        token_text_sink=token_text,
+                        generated_reply=generated_reply,
                     )
                 else:
                     response = await send_streaming_response(
@@ -2367,7 +2546,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         prov_name, prov_data, model,
                         system_prompt, next_history,
                         stopped_partial_sink=stop_partial,
-                        token_text_sink=token_text
+                        token_text_sink=token_text,
+                        generated_reply=generated_reply,
                     )
             else:
                 response = await send_non_streaming_response(
@@ -2375,7 +2555,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     prov_name, prov_data, model,
                     system_prompt, next_history,
                     stopped_partial_sink=stop_partial,
-                    token_text_sink=token_text
+                    token_text_sink=token_text,
+                    generated_reply=generated_reply,
                 )
             
             if not response:
@@ -2394,10 +2575,12 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             )
                         pending_round_status_msg = None
                         pending_round_iteration = None
-                    await _record_user_stopped_reply(
-                        db, cid, update.effective_chat.id,
-                        stop_partial[0] if stop_partial else "",
-                    )
+                    if (not generated_reply.recorded
+                            and attachment_generation == await db.get_attachment_generation()):
+                        await _record_user_stopped_reply(
+                            db, cid, update.effective_chat.id,
+                            stop_partial[0] if stop_partial else "",
+                        )
                     break
                 if pending_round_status_msg is not None and pending_round_iteration is not None:
                     with contextlib.suppress(Exception):
@@ -2414,8 +2597,12 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     pending_round_iteration = None
                 break
 
-            await GlobalRecorder.record_ai_reply(response, update.effective_chat.id)
-            await db.add_chat_message(cid, 'assistant', response)
+            if not generated_reply.recorded:
+                await GlobalRecorder.record_ai_reply(
+                    response, update.effective_chat.id,
+                    metadata=await generated_image_metadata(generated_reply.artifacts, attachment_generation),
+                )
+                await db.add_chat_message(cid, 'assistant', response)
             if token_text:
                 _entry = token_text[0]
                 await GlobalRecorder.record_token_usage(
@@ -2426,5 +2613,151 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 )
             agent_turn_history = next_history
             agent_turn_history.append({'role': 'assistant', 'content': response})
+
+
+async def resume_from_ask(ask_id: str) -> str:
+    """用户提交（或取消）ask 表单后恢复 Agent 循环。
+
+    返回给回调层一句可展示的短提示。**原子 pop 天然防重复提交**：
+    第二次点击拿不到 pending，返回"已处理"。
+    """
+    pending = PENDING_ASKS.pop(ask_id)
+    if pending is None:
+        return "这个表单已经处理过或已失效。"
+
+    db = await BotMemoryDB.get_instance()
+    current_gen = await db.get_attachment_generation()
+    if pending.generation != current_gen:
+        # 期间被 /清空上下文：快照历史已作废，别拿旧上下文继续。
+        return "上下文已清空，这个表单已失效——如需继续，请让 AI 重新发起提问。"
+
+    answer_text = pending.form.assemble_answer(pending.draft)
+
+    # 记录一条用户消息（表单回答，不含明文密钥）到全局记忆，供三端展示与后续历史。
+    await GlobalRecorder.record_user_message(
+        answer_text, MessageType.USER_TEXT, pending.chat_id,
+    )
+
+    # 走 trigger 同款投递：MirrorBot（TG + 网页双通道），与哪个端点了提交无关。
+    bot = build_trigger_delivery_bot(int(pending.chat_id))
+    update = _SelfTriggerUpdate(bot, int(pending.chat_id))
+    context = _SelfTriggerContext(bot)
+    resume_state = {
+        'turn_history_snapshot': pending.turn_history_snapshot,
+        'answer_message': build_ask_context_message(answer_text),
+    }
+    asyncio.create_task(process_conversation(
+        update,
+        context,
+        answer_text,
+        force_agent_mode=True,
+        reset_agent_iterations=False,
+        agent_origin=pending.origin or AgentTurnOrigin.ask(),
+        resume_state=resume_state,
+    ))
+    return "已提交，正在继续处理。"
+
+
+async def cancel_ask(ask_id: str) -> str:
+    """用户取消 ask 表单：丢弃挂起表单，把"用户取消"回灌给模型让它自行收尾。"""
+    pending = PENDING_ASKS.pop(ask_id)
+    if pending is None:
+        return "这个表单已经处理过或已失效。"
+
+    db = await BotMemoryDB.get_instance()
+    if pending.generation != await db.get_attachment_generation():
+        return "上下文已清空，这个表单已失效。"
+
+    notice = "[用户已取消表单] 用户没有作答，请不要再等待表单结果，自行决定如何收尾或改用其它方式。"
+    await GlobalRecorder.record_user_message(notice, MessageType.USER_TEXT, pending.chat_id)
+    bot = build_trigger_delivery_bot(int(pending.chat_id))
+    update = _SelfTriggerUpdate(bot, int(pending.chat_id))
+    context = _SelfTriggerContext(bot)
+    resume_state = {
+        'turn_history_snapshot': pending.turn_history_snapshot,
+        'answer_message': build_ask_context_message(notice),
+    }
+    asyncio.create_task(process_conversation(
+        update, context, notice,
+        force_agent_mode=True,
+        reset_agent_iterations=False,
+        agent_origin=pending.origin or AgentTurnOrigin.ask(),
+        resume_state=resume_state,
+    ))
+    return "已取消。"
+
+
+async def _handle_ask_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                 state: str, text: str) -> None:
+    """处理 ask 表单里「自定义文本 / 密钥」的一条录入。自包含：不落通用状态机。
+
+    - 密钥（ASK_SECRET_INPUT）：明文只写 SecretStore（os.environ + 脱敏名单），
+      draft 只标记「已录入」，落库是占位符——明文绝不进 draft/模型/库。
+    - 自定义（ASK_FIELD_INPUT）：普通文本，进 draft 也可入模型，落原文。
+    录完清状态、原地重画表单键盘（拿不到表单消息 id 时退化为新发一条）。
+    """
+    target = UserDataManager.get('ask_input_target') or {}
+    ask_id = target.get('ask_id', '')
+    qid = target.get('qid', '')
+    pending = PENDING_ASKS.get(ask_id)
+
+    # 录入期间输 cancel：只取消这一项录入，回到表单（表单本身还在）。
+    is_cancel = text.strip().lower() == 'cancel'
+
+    if pending is None:
+        UserDataManager.set('state', BotState.IDLE)
+        UserDataManager.set('ask_input_target', None)
+        await update.message.reply_text("这个表单已失效，请让 AI 重新发起提问。")
+        return
+
+    question = pending.form.question(qid)
+    if question is None or is_cancel:
+        UserDataManager.set('state', BotState.IDLE)
+        UserDataManager.set('ask_input_target', None)
+        if is_cancel:
+            await update.message.reply_text("已取消这一项的录入，其它选项不受影响。")
+        return
+
+    if state == BotState.ASK_SECRET_INPUT:
+        # 明文只进 SecretStore：写 os.environ + 登记脱敏名单；draft 只留「已录入」。
+        db = await BotMemoryDB.get_instance()
+        generation = await db.get_attachment_generation()
+        SECRET_STORE.set(generation, question.var, text)
+        pending.ensure_entry(qid)['filled'] = True
+        # 录库占位符已在上游 masking 段记过；这里给用户一句可见回执（不含明文）。
+        await update.message.reply_text(
+            f"🔒 已录入变量 ${question.var}，内容只进了环境变量，没有发给 AI。回到表单继续。"
+        )
+    else:
+        entry = pending.ensure_entry(qid)
+        entry['custom'] = text
+        # 选择题填了自定义 → 视为改选自定义，清掉预设勾选，避免二义。
+        if question.qtype in ('single', 'multi'):
+            entry['selected'] = []
+        await GlobalRecorder.record_user_message(text, MessageType.USER_TEXT, update.effective_chat.id)
+        await update.message.reply_text("✅ 已填入，回到表单继续。")
+
+    UserDataManager.set('state', BotState.IDLE)
+    UserDataManager.set('ask_input_target', None)
+
+    # 原地重画表单键盘反映「已填/已录入」。
+    new_markup = pending.form.build_keyboard(ask_id, pending.draft)
+    redrawn = False
+    if pending.form_message_id is not None:
+        with contextlib.suppress(Exception):
+            await context.bot.edit_message_reply_markup(
+                chat_id=pending.chat_id,
+                message_id=pending.form_message_id,
+                reply_markup=new_markup,
+            )
+            redrawn = True
+    if not redrawn:
+        with contextlib.suppress(Exception):
+            sent = await context.bot.send_message(
+                chat_id=pending.chat_id,
+                text="📝 表单已更新，请继续选择/填写后点「✅ 提交」。",
+                reply_markup=new_markup,
+            )
+            pending.form_message_id = sent.message_id
 
 # --- ☆ 命令函数 ☆ ---

@@ -44,10 +44,10 @@ class ProtocolParser:
     # 路径里可以有空格，尾部空白由调用方 .strip() 掉。
     _OPEN_RE = re.compile(
         r"^[^\n]*?```(?P<tag>"
-        r"run-x|shell-x|stdin-x:[^\n]+|shellread-x:[^\n]+|shellkill-x:[^\n]+|"
-        r"trigger-x(?::[^\n]+)?|sendfile-x|read-x:[^\n]+|read-x|edit-x(?::[^\n]+)?|grep-x|"
+        r"run-x|shell-x|stdin-x:[^\n]+|shellkill-x:[^\n]+|"
+        r"sendfile-x|read-x|edit-x(?::[^\n]+)?|grep-x|"
         r"search-x|fetch-x|"
-        r"media-x|file-x(?::[^\n]+)?|over-x"
+        r"media-x|file-x(?::[^\n]+)?|ask-x|intel-x|over-x"
         r")\s*$"
     )
 
@@ -61,6 +61,27 @@ class ProtocolParser:
     # 1.0 = 精确匹配；0.9-0.99 = 容错匹配，执行但在结果回灌时给 AI 提示；
     # < 0.9 = 视为不匹配，协议块不执行。
     _SMART_MATCH_THRESHOLD = 0.9
+
+    # 折叠协议块时的一行占位图标/标签（按 _build_block 归一化后的 type 索引）。
+    # 覆盖全部 tag；未知 type 回落到 ("🔧", type)，见 _placeholder_icon_label。
+    _PLACEHOLDER_ICON_LABEL: Dict[str, Tuple[str, str]] = {
+        "run": ("🔧", "run"),
+        "shell": ("🔧", "shell"),
+        "edit": ("📝", "edit"),
+        "file": ("📄", "file"),
+        "file_base64": ("📄", "file"),
+        "read": ("📖", "read"),
+        "grep": ("🔍", "grep"),
+        "search": ("🔍", "search"),
+        "fetch": ("🌐", "fetch"),
+        "media": ("🖼️", "media"),
+        "stdin": ("⌨️", "stdin"),
+        "shellkill": ("⏹️", "shellkill"),
+        "sendfile": ("📎", "sendfile"),
+        "ask": ("❓", "ask"),
+        "intel": ("🧠", "intel"),
+        "over": ("✅", "over"),
+    }
 
     @classmethod
     def _collect_marked_body(
@@ -172,34 +193,10 @@ class ProtocolParser:
                 **common,
             }
 
-        if normalized_tag.startswith("shellread:"):
-            return {
-                "type": "shellread",
-                "path": normalized_tag[10:].strip(),
-                "body": raw_body.strip(),
-                **common,
-            }
-
         if normalized_tag.startswith("shellkill:"):
             return {
                 "type": "shellkill",
                 "path": normalized_tag[10:].strip(),
-                "body": raw_body.strip(),
-                **common,
-            }
-
-        if normalized_tag == "trigger" or normalized_tag.startswith("trigger:"):
-            return {
-                "type": "trigger",
-                "path": normalized_tag[8:].strip() if normalized_tag.startswith("trigger:") else "",
-                "body": raw_body,
-                **common,
-            }
-
-        if normalized_tag.startswith("read:"):
-            return {
-                "type": "read",
-                "path": normalized_tag[5:].strip(),
                 "body": raw_body.strip(),
                 **common,
             }
@@ -341,6 +338,88 @@ class ProtocolParser:
         cleaned: List[str] = []
         previous_blank = False
         for line in result:
+            is_blank = line.strip() == ""
+            if is_blank and previous_blank:
+                continue
+            cleaned.append(line)
+            previous_blank = is_blank
+        return "\n".join(cleaned)
+
+    @classmethod
+    def _placeholder_icon_label(cls, block_type: str) -> Tuple[str, str]:
+        """按归一化 type 取占位图标与标签；未知 type 回落到 ("🔧", type)。"""
+        return cls._PLACEHOLDER_ICON_LABEL.get(block_type, ("🔧", block_type))
+
+    @classmethod
+    def _format_block_placeholder(cls, block: Dict[str, Any]) -> str:
+        """把一个闭合协议块渲染成一行占位：〔{icon} {label}[ path] · {N} 行已折叠〕。"""
+        icon, label = cls._placeholder_icon_label(block.get("type", ""))
+        path = (block.get("path") or "").strip()
+        head = f"{label} {path}".strip() if path else label
+        body = block.get("body") or ""
+        line_count = 0 if not body else body.count("\n") + 1
+        return f"〔{icon} {head} · {line_count} 行已折叠〕"
+
+    @classmethod
+    def redact_protocol_blocks(cls, ai_response: str, hide_unclosed: bool = False) -> str:
+        """把 AI 回复里的 Agent 协议块折叠成一行占位——只改「显示」，不改执行/存储。
+
+        与 strip_protocol_blocks 共用 _match_open/_collect_marked_body/_build_block
+        的同一套文法，逐块处理：
+
+        - 每个「闭合」协议块（围栏行 → 收尾```）折成一行 _format_block_placeholder。
+        - hide_unclosed=True（仅流式中途用）：结尾若有「已写围栏+BEGIN、还没闭合」
+          的真协议块，折成一行〔{icon} {label} · 生成中…〕并收尾（丢弃未闭合尾巴的
+          原始内容，等定稿再原样显示）。裸围栏（无 BEGIN，_match_open 失败）不算
+          协议块，原样保留。
+        - hide_unclosed=False（定稿默认）：**不折叠未闭合尾巴**——截断/写错/缺 END
+          的块原样完整显示，绝不折成「生成中…」、绝不把整段回复吞成一行。
+        - 普通 ```lang 演示块（不含 -x）不被 _OPEN_RE 识别 → 原样保留。
+        - 有折叠时收尾合并连续空行（照抄 strip_protocol_blocks）；无折叠 / 空输入
+          原样返回。占位行不匹配围栏文法，故 redact(redact(x)) == redact(x)。
+        """
+        if not ai_response:
+            return ai_response
+
+        lines = ai_response.split("\n")
+        n = len(lines)
+        out: List[str] = []
+        changed = False
+        i = 0
+        while i < n:
+            opened = cls._match_open(lines, i)
+            if opened is None:
+                out.append(lines[i])
+                i += 1
+                continue
+            tag, nonce, body_start = opened
+            body_lines, end_i, _smart, _ratio = cls._collect_marked_body(
+                lines, body_start, f"{cls._END_PREFIX}{nonce}", smart_match=True
+            )
+            if end_i is None:
+                # 未闭合块：围栏 + BEGIN 都在，但一直没等到 END + 收尾```。
+                if hide_unclosed:
+                    stub_type = cls._build_block(tag, "", i, i).get("type", "")
+                    icon, label = cls._placeholder_icon_label(stub_type)
+                    out.append(f"〔{icon} {label} · 生成中…〕")
+                    changed = True
+                else:
+                    # 定稿：未闭合尾巴原样完整显示，绝不折叠。
+                    out.extend(lines[i:])
+                break
+            # 闭合块 → 一行占位。
+            block = cls._build_block(tag, "\n".join(body_lines), i, end_i)
+            out.append(cls._format_block_placeholder(block))
+            changed = True
+            i = end_i + 1
+
+        if not changed:
+            return ai_response
+
+        # 合并折叠后产生的连续空行（与 strip_protocol_blocks 收尾一致）。
+        cleaned: List[str] = []
+        previous_blank = False
+        for line in out:
             is_blank = line.strip() == ""
             if is_blank and previous_blank:
                 continue

@@ -255,5 +255,110 @@ command: echo test
             SelfTriggerManager._parse_definition(yaml_body)
 
 
+class TestFlatSyntax(unittest.TestCase):
+    """扁平写法：顶层直接写 after/at/cron/timezone/when/repeat，免嵌套。"""
+
+    def test_flat_after_equivalent_to_nested(self):
+        flat = SelfTriggerManager._parse_definition(
+            "task: 延迟检查\nafter: 30s\ncommand: echo test"
+        )
+        nested = SelfTriggerManager._parse_definition(
+            "task: 延迟检查\nschedule:\n  after: 30s\ncommand: echo test"
+        )
+        self.assertEqual(flat['schedule_type'], nested['schedule_type'])
+        self.assertEqual(flat['schedule_expr'], nested['schedule_expr'])
+        self.assertEqual(flat['schedule_expr'], '30s')
+
+    def test_flat_when_repeat(self):
+        result = SelfTriggerManager._parse_definition(
+            "task: 等应用启动\nwhen: READY\nrepeat: true\ncommand: tail -f app.log"
+        )
+        self.assertEqual(result['condition_expr'], 'READY')
+        self.assertTrue(result['repeat'])
+
+    def test_flat_cron_with_timezone(self):
+        result = SelfTriggerManager._parse_definition(
+            "task: 每小时\ncron: 0 * * * *\ntimezone: Asia/Shanghai\ncommand: df -h"
+        )
+        self.assertEqual(result['schedule_type'], 'cron')
+        self.assertEqual(result['schedule_expr'], '0 * * * *')
+        self.assertEqual(result['timezone'], 'Asia/Shanghai')
+
+    def test_nested_wins_over_flat(self):
+        # 同时给嵌套 schedule 和顶层 after：嵌套优先，顶层被忽略
+        result = SelfTriggerManager._parse_definition(
+            "task: t\nschedule:\n  cron: 0 * * * *\nafter: 99s\ncommand: echo"
+        )
+        self.assertEqual(result['schedule_type'], 'cron')
+        self.assertEqual(result['schedule_expr'], '0 * * * *')
+
+    def test_flat_repeat_without_when_still_errors(self):
+        # 扁平写法不绕过校验：repeat 无 when 仍报错
+        with self.assertRaisesRegex(ValueError, 'repeat 为 true 时必须同时设置'):
+            SelfTriggerManager._parse_definition(
+                "task: t\nrepeat: true\ncommand: echo"
+            )
+
+    def test_flat_conflicting_time_fields_still_error(self):
+        with self.assertRaisesRegex(ValueError, '只能使用一个时间字段'):
+            SelfTriggerManager._parse_definition(
+                "task: t\nafter: 30s\ncron: 0 * * * *\ncommand: echo"
+            )
+
+
+class TestComputeDefinitionEquivalence(unittest.TestCase):
+    """CLI 路径（_compute_definition 直接喂 dict）与 YAML 路径结果必须等价。"""
+
+    def test_flat_dict_equals_yaml(self):
+        via_yaml = SelfTriggerManager._parse_definition(
+            "task: 备份\nschedule:\n  cron: 0 2 * * *\n  timezone: Asia/Shanghai\ncommand: dump.sh"
+        )
+        via_dict = SelfTriggerManager._compute_definition({
+            'task': '备份',
+            'command': 'dump.sh',
+            'schedule': {'cron': '0 2 * * *', 'timezone': 'Asia/Shanghai'},
+        })
+        self.assertEqual(via_yaml['schedule_type'], via_dict['schedule_type'])
+        self.assertEqual(via_yaml['schedule_expr'], via_dict['schedule_expr'])
+        self.assertEqual(via_yaml['timezone'], via_dict['timezone'])
+
+    def test_compute_definition_validates(self):
+        # repeat 无 when 仍报错（校验在 _compute_definition 里，不因入口不同而绕过）
+        with self.assertRaisesRegex(ValueError, 'repeat 为 true 时必须同时设置'):
+            SelfTriggerManager._compute_definition({
+                'task': 't', 'command': 'echo',
+                'condition': {'repeat': True},
+            })
+
+    def test_compute_definition_conflicting_time(self):
+        with self.assertRaisesRegex(ValueError, '只能使用一个时间字段'):
+            SelfTriggerManager._compute_definition({
+                'task': 't', 'command': 'echo',
+                'schedule': {'after': '30s', 'cron': '0 * * * *'},
+            })
+
+
+class TestNoTimeout(unittest.TestCase):
+    """超时已彻底取消：不再有 MAX_RUN_SECONDS，也不保留从不生效的并发闸门。"""
+
+    def test_max_run_seconds_removed(self):
+        self.assertFalse(
+            hasattr(SelfTriggerManager, 'MAX_RUN_SECONDS'),
+            "MAX_RUN_SECONDS 应已删除——超时上限已取消",
+        )
+
+    def test_dead_concurrency_gate_removed(self):
+        # 方案 c：不设并发上限，删掉从不 acquire 的信号量与配置常量，
+        # 避免"有闸门"的假象（详见 SelfTriggerManager 类头说明）。
+        self.assertFalse(
+            hasattr(SelfTriggerManager, '_run_semaphore'),
+            "_run_semaphore 是死代码（从不 acquire），应删除",
+        )
+        self.assertFalse(
+            hasattr(SelfTriggerManager, 'MAX_CONCURRENT_RUNS'),
+            "MAX_CONCURRENT_RUNS 已无实际作用，应删除",
+        )
+
+
 if __name__ == '__main__':
     unittest.main()

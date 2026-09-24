@@ -159,6 +159,113 @@ class AgentMediaTests(unittest.IsolatedAsyncioTestCase):
                 cancel_task_quietly=cancel_quietly,
             )
 
+    async def test_simultaneous_stop_and_completion_still_finalizes_all_images(self):
+        context, _message, keep_typing, cancel_quietly = self._dependencies()
+        stop_event = asyncio.Event()
+        payload = {"success": True, "artifacts": ["first", "second"]}
+        finalized = AsyncMock()
+
+        async def generate(_prompt):
+            stop_event.set()
+            return payload
+
+        result = await execute_media_generation(
+            "draw", context=context, chat_id=1, generate_media=generate,
+            keep_typing=keep_typing, stop_event_factory=lambda: stop_event,
+            stop_requested=stop_event.is_set, build_stop_keyboard=Mock(),
+            safe_edit_text=AsyncMock(), cancel_task_quietly=cancel_quietly,
+            finalize_result=finalized,
+        )
+        finalized.assert_awaited_once_with(payload)
+        self.assertEqual({"stopped": True, "result": payload}, result)
+
+    async def test_stop_during_finalization_waits_for_persistence(self):
+        context, _message, keep_typing, cancel_quietly = self._dependencies()
+        stop_event = asyncio.Event()
+        saved = []
+
+        async def finalize(payload):
+            stop_event.set()
+            await asyncio.sleep(0)
+            saved.append(payload)
+
+        payload = {"success": True}
+        result = await execute_media_generation(
+            "draw", context=context, chat_id=1, generate_media=AsyncMock(return_value=payload),
+            keep_typing=keep_typing, stop_event_factory=lambda: stop_event,
+            stop_requested=stop_event.is_set, build_stop_keyboard=Mock(),
+            safe_edit_text=AsyncMock(), cancel_task_quietly=cancel_quietly,
+            finalize_result=finalize,
+        )
+        self.assertEqual([payload], saved)
+        self.assertTrue(result["stopped"])
+
+    async def test_cancel_during_finalization_does_not_cancel_durable_handoff(self):
+        context, _message, keep_typing, cancel_quietly = self._dependencies()
+        stop_event, started, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        saved = []
+
+        async def finalize(payload):
+            started.set()
+            await release.wait()
+            saved.append(payload)
+
+        payload = {"success": True}
+        task = asyncio.create_task(execute_media_generation(
+            "draw", context=context, chat_id=1, generate_media=AsyncMock(return_value=payload),
+            keep_typing=keep_typing, stop_event_factory=lambda: stop_event,
+            stop_requested=stop_event.is_set, build_stop_keyboard=Mock(),
+            safe_edit_text=AsyncMock(), cancel_task_quietly=cancel_quietly,
+            finalize_result=finalize,
+        ))
+        await asyncio.wait_for(started.wait(), 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        task.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual([payload], saved)
+
+    async def test_cancel_as_generation_finishes_still_finalizes_once(self):
+        context, _message, keep_typing, cancel_quietly = self._dependencies()
+        stop_event = asyncio.Event()
+        payload = {"success": True, "artifacts": ["first", "second"]}
+        finalized = AsyncMock()
+        task = None
+
+        async def generate(_prompt):
+            asyncio.get_running_loop().call_soon(task.cancel)
+            return payload
+
+        task = asyncio.create_task(execute_media_generation(
+            "draw", context=context, chat_id=1, generate_media=generate,
+            keep_typing=keep_typing, stop_event_factory=lambda: stop_event,
+            stop_requested=stop_event.is_set, build_stop_keyboard=Mock(),
+            safe_edit_text=AsyncMock(), cancel_task_quietly=cancel_quietly,
+            finalize_result=finalized,
+        ))
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        finalized.assert_awaited_once_with(payload)
+
+    async def test_finalization_failure_prevents_success_return(self):
+        context, message, keep_typing, cancel_quietly = self._dependencies()
+        stop_event = asyncio.Event()
+        with self.assertRaisesRegex(OSError, "disk full"):
+            await execute_media_generation(
+                "draw", context=context, chat_id=1,
+                generate_media=AsyncMock(return_value={"success": True}),
+                keep_typing=keep_typing, stop_event_factory=lambda: stop_event,
+                stop_requested=stop_event.is_set, build_stop_keyboard=Mock(),
+                safe_edit_text=AsyncMock(), cancel_task_quietly=cancel_quietly,
+                finalize_result=AsyncMock(side_effect=OSError("disk full")),
+            )
+        message.delete.assert_awaited_once()
+
 
 if __name__ == "__main__":
     unittest.main()

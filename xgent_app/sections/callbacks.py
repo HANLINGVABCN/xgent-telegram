@@ -54,6 +54,80 @@ async def _sync_web_switches(query: Any, app: Any = None) -> None:
         await query.answer(note)
 
 
+async def _dispatch_ask_callback(update: Any, context: Any, data: str) -> None:
+    """处理 ask 协议表单的按钮：选项切换 / 自定义或密钥录入 / 提交 / 取消。
+
+    三端共用：Telegram 真按钮、网页可点按钮、CLI 数字菜单点进来的 data 一致。
+    草稿状态存在 PENDING_ASKS（进程内），提交前的切换只改草稿并原地重画键盘，
+    提交/取消才调 resume_from_ask / cancel_ask 恢复 Agent 循环。
+    """
+    query = update.callback_query
+    parts = data.split(":")
+    action = parts[0]
+
+    # 提交 / 取消：交给 messages 侧恢复循环，然后撤掉表单键盘。
+    if action in ("askd", "askx"):
+        ask_id = parts[1] if len(parts) > 1 else ""
+        msg = await (resume_from_ask(ask_id) if action == "askd" else cancel_ask(ask_id))
+        with contextlib.suppress(Exception):
+            await query.answer(msg)
+        with contextlib.suppress(Exception):
+            await query.edit_message_reply_markup(reply_markup=None)
+        return
+
+    ask_id = parts[1] if len(parts) > 1 else ""
+    pending = PENDING_ASKS.get(ask_id)
+    if pending is None:
+        with contextlib.suppress(Exception):
+            await query.answer("这个表单已失效，请让 AI 重新发起。")
+        return
+
+    qid = parts[2] if len(parts) > 2 else ""
+    question = pending.form.question(qid)
+    if question is None:
+        with contextlib.suppress(Exception):
+            await query.answer("找不到这个问题。")
+        return
+
+    if action == "asks":  # 单选：选中即互斥，清掉旧的自定义
+        idx = int(parts[3])
+        entry = pending.ensure_entry(qid)
+        entry["selected"] = [idx]
+        entry.pop("custom", None)
+        with contextlib.suppress(Exception):
+            await query.answer("已选择")
+    elif action == "askm":  # 多选：切换
+        idx = int(parts[3])
+        entry = pending.ensure_entry(qid)
+        sel = set(entry.get("selected") or [])
+        sel.discard(idx) if idx in sel else sel.add(idx)
+        entry["selected"] = sorted(sel)
+        with contextlib.suppress(Exception):
+            await query.answer("已切换")
+    elif action in ("asko", "askk"):  # 自定义文本 / 密钥：进状态机，等用户下一条消息
+        state = BotState.ASK_SECRET_INPUT if action == "askk" else BotState.ASK_FIELD_INPUT
+        UserDataManager.set("state", state)
+        UserDataManager.set("ask_input_target", {"ask_id": ask_id, "qid": qid})
+        hint = "\n🔒 内容只写进环境变量，绝不会发给 AI。" if action == "askk" else ""
+        with contextlib.suppress(Exception):
+            await query.answer()
+        with contextlib.suppress(Exception):
+            # 不用 ForceReply：录入靠状态机捕获下一条消息即可（见 messages.py 的
+            # ASK_FIELD_INPUT/ASK_SECRET_INPUT 分支），无需强制回复。ForceReply 会在
+            # 客户端把「回复某条消息」的草稿粘在输入框上——用户若没回而是点了别的按钮，
+            # 这条草稿就一直挂着，每次进聊天都弹，故去掉。
+            await query.message.reply_text(
+                f"请填写：{question.prompt}{hint}\n（直接发一条消息即可；发 cancel 取消录入）",
+            )
+        return  # 不重画键盘，等用户把内容发进来再重画
+
+    # 选项类：原地重画键盘反映最新草稿（Telegram 可靠；其它端草稿已存服务端，提交照样对）。
+    with contextlib.suppress(Exception):
+        await query.edit_message_reply_markup(
+            reply_markup=pending.form.build_keyboard(ask_id, pending.draft)
+        )
+
+
 async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await check_authorized_user_middleware(update, context):
@@ -76,6 +150,16 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.answer("当前没有正在生成的回答")
         return
 
+    if data == 'cmd_compress':
+        await query.answer()
+        await cmd_compress(update, context)
+        return
+
+    if data.startswith('retry_compress:'):
+        await query.answer()
+        await run_context_compression(update, context, retry_job_id=data.split(':', 1)[1])
+        return
+
     if data == "act_finish_text_stitch":
         await UserDataManager.init()
         await finish_text_conversation(update, context)
@@ -84,6 +168,13 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
     if data == "act_cancel_text_stitch":
         await UserDataManager.init()
         await cancel_text_conversation(update)
+        return
+
+    # ask 协议表单：选项切换 / 自定义或密钥录入 / 提交 / 取消。
+    # 早于菜单流程处理：草稿切换是高频操作，不该走 record_button_click 刷屏。
+    if data.split(":", 1)[0] in ("asks", "askm", "asko", "askk", "askd", "askx"):
+        await UserDataManager.init()
+        await _dispatch_ask_callback(update, context, data)
         return
 
     await UserDataManager.init()
@@ -112,61 +203,46 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
         elif data == "menu_skills":
-            skill_files = list_skill_files()
-            disabled = get_disabled_skills()
-            if not skill_files:
-                # 进入 Skill 管理专属界面（只有“返回”按钮），而不是留在“更多设置”
-                # 菜单；否则用户重复点“Skill 管理”会因为文本和键盘都没变而触发
-                # Telegram 的 “Message is not modified” 错误，被顶层兜底报成
-                # “操作失败，请稍后重试”。
-                await query.message.edit_text(
-                    "🧩 <b>Skill 管理</b>\n\n📭 暂无 skill 文件。",
-                    reply_markup=get_skills_menu(),
-                    parse_mode=constants.ParseMode.HTML,
-                )
-            else:
-                lines = ["🧩 <b>Skill 管理</b>\n"]
-                for rel_path in skill_files:
-                    label = os.path.splitext(os.path.basename(rel_path))[0]
-                    status = "🔴" if rel_path in disabled else "🟢"
-                    source = "🔒" if rel_path.startswith("private/") else "📦"
-                    lines.append(f"{status}{source} {label}")
-                lines.append(f"\n📦=公有 🔒=私有  共 {len(skill_files)} 个，{len(disabled)} 个已禁用。")
-                await query.message.edit_text(
-                    "\n".join(lines),
-                    reply_markup=get_skills_menu(),
-                    parse_mode=constants.ParseMode.HTML,
-                )
+            await query.message.edit_text(
+                build_skills_menu_text(), reply_markup=get_skills_menu(),
+                parse_mode=constants.ParseMode.HTML,
+            )
 
-        elif data.startswith("toggle_skill:"):
-            # callback_data 里 / 被换成 | 避免解析干扰，这里还原
+        elif data.startswith('set_skill_state:'):
+            _, state, safe_key = data.split(':', 2)
+            rel_path = safe_key.replace('|', '/')
+            await save_skill_state(rel_path, state)
+            await GlobalRecorder.record_system_op(
+                f'Skill 状态已更新: {rel_path}', {'skill_state': state},
+            )
+            await query.message.edit_text(
+                build_skills_menu_text(), reply_markup=get_skills_menu(),
+                parse_mode=constants.ParseMode.HTML,
+            )
+
+        elif data.startswith(('toggle_skill:', 'hide_skill:')):
             safe_key = data.split(":", 1)[1]
             rel_path = safe_key.replace("|", "/")
-            disabled = get_disabled_skills()
-            if rel_path in disabled:
-                disabled.discard(rel_path)
+            if rel_path not in list_skill_files():
+                await query.message.reply_text('技能文件已不存在，请重新打开技能菜单。')
+                return
+            hidden_toggle = data.startswith('hide_skill:')
+            if not hidden_toggle and rel_path in get_hidden_skills():
+                await query.message.reply_text('请先关闭该技能的隐藏开关。')
+                return
+            key = 'hidden_skills' if hidden_toggle else 'disabled_skills'
+            selected = get_hidden_skills() if hidden_toggle else get_disabled_skills()
+            if rel_path in selected:
+                selected.discard(rel_path)
             else:
-                disabled.add(rel_path)
-            disabled_list = sorted(disabled)
-            UserDataManager.set('disabled_skills', disabled_list)
-            await UserDataManager.save_config('disabled_skills', disabled_list)
-            label = os.path.splitext(os.path.basename(rel_path))[0]
+                selected.add(rel_path)
+            await UserDataManager.save_config(key, sorted(selected))
             await GlobalRecorder.record_system_op(
-                f"Skill {label} 切换为: {'禁用' if rel_path in disabled else '启用'}",
-                {"skill": rel_path, "disabled": rel_path in disabled},
+                f'Skill 设置已更新: {rel_path}', {key: sorted(selected)},
             )
-            # 刷新菜单
-            skill_files = list_skill_files()
-            lines = ["🧩 <b>Skill 管理</b>\n"]
-            for rp in skill_files:
-                lbl = os.path.splitext(os.path.basename(rp))[0]
-                status = "🔴" if rp in disabled else "🟢"
-                source = "🔒" if rp.startswith("private/") else "📦"
-                lines.append(f"{status}{source} {lbl}")
-            lines.append(f"\n📦=公有 🔒=私有  共 {len(skill_files)} 个，{len(disabled)} 个已禁用。")
             with contextlib.suppress(Exception):
                 await query.message.edit_text(
-                    "\n".join(lines),
+                    build_skills_menu_text(),
                     reply_markup=get_skills_menu(),
                     parse_mode=constants.ParseMode.HTML,
                 )
@@ -1096,6 +1172,40 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode=constants.ParseMode.HTML
             )
 
+        elif data == "toggle_readx_persist_context":
+            # read 留存：开启后 read 读到的完整内容跨轮持久化进上下文
+            # （文本走普通消息、图片/二进制走持久附件），关闭时只存摘要。
+            on = not normalize_bool(UserDataManager.get('readx_persist_context', False), False)
+            UserDataManager.set('readx_persist_context', on)
+            await UserDataManager.save_config('readx_persist_context', on)
+            await GlobalRecorder.record_system_op(
+                f"read 内容留存{'开启' if on else '关闭'}",
+                {"readx_persist_context": on}
+            )
+            await query.answer(f"已{'开启' if on else '关闭'} read 留存", show_alert=False)
+            await query.message.edit_text(
+                build_settings_menu_text(),
+                reply_markup=get_more_settings_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
+        elif data == "toggle_hide_protocol_blocks":
+            # 隐藏协议代码块：开启后 AI 回复正文里的 *-x 协议块只在「显示」层折成一行占位；
+            # 落库 / 执行 / 镜像用的原始文本不受影响。
+            on = not normalize_bool(UserDataManager.get('hide_protocol_blocks', False), False)
+            UserDataManager.set('hide_protocol_blocks', on)
+            await UserDataManager.save_config('hide_protocol_blocks', on)
+            await GlobalRecorder.record_system_op(
+                f"隐藏代码块{'开启' if on else '关闭'}",
+                {"hide_protocol_blocks": on}
+            )
+            await query.answer(f"已{'开启' if on else '关闭'}隐藏代码块", show_alert=False)
+            await query.message.edit_text(
+                build_settings_menu_text(),
+                reply_markup=get_more_settings_menu(),
+                parse_mode=constants.ParseMode.HTML
+            )
+
         elif data.startswith("view_prompt:"):
             key = data.split(":", 1)[1]
             await show_prompt_detail(query, key)
@@ -1271,13 +1381,13 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             if not buffer:
                 await query.answer("⚠️ 还没有输入内容。", show_alert=True)
                 return
-            UserDataManager.set('state', BotState.IDLE)
-            UserDataManager.set('editing_prompt_key', "")
-            UserDataManager.set('prompt_buffer', "")
             if key in {'assistant_prompt', 'global_prompt_addon'}:
                 await save_runtime_prompt(key, buffer)
             else:
                 PromptFileManager.set(key, buffer)
+            UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('editing_prompt_key', "")
+            UserDataManager.set('prompt_buffer', "")
             await GlobalRecorder.record_system_op(
                 f"修改提示词: {PromptFileManager.get_label(key)}",
                 {"length": len(buffer)}

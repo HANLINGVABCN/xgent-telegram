@@ -47,6 +47,28 @@ class AgentResultsTests(unittest.TestCase):
         }))
         self.assertEqual(result["kind"], "read")
 
+    def test_read_preserves_source_for_attachment_registration(self):
+        # read 留存开关靠 read_path_for_model 额外返回的 'source'（原始字节+类型+文件名）
+        # 登记持久附件；normalize 必须原样透传该字段，纯文本 read 则不带 source。
+        message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "notice"},
+                {"type": "binary", "mime_type": "application/pdf", "data": "abc"},
+            ],
+        }
+        source = {"raw_content": b"%PDF-1.4", "mime_type": "application/pdf",
+                  "basename": "doc.pdf"}
+        result = normalize_read_result(
+            {"notice": "notice", "message": message, "source": source}
+        )
+        self.assertEqual(result["source"], source)
+
+        text_result = normalize_read_result(
+            {"notice": "n", "message": {"role": "user", "content": "full text"}}
+        )
+        self.assertNotIn("source", text_result)
+
     def test_grep_keeps_hits_for_presenter(self):
         result = normalize_grep_result(
             {"success": True, "output": "a.py:1:hit", "hits": 1}

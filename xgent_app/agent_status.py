@@ -26,15 +26,21 @@ class AgentTurnOrigin:
     def trigger(cls, task_id: str, run_id: str) -> "AgentTurnOrigin":
         return cls(kind="trigger", task_id=str(task_id), run_id=str(run_id))
 
+    @classmethod
+    def ask(cls) -> "AgentTurnOrigin":
+        return cls(kind="ask")
+
     @property
     def is_trigger(self) -> bool:
         return self.kind == "trigger"
 
     def label(self) -> str:
-        if not self.is_trigger:
-            return ""
-        task_id = self.task_id or "未知任务"
-        return f"后台任务 {task_id}"
+        if self.is_trigger:
+            task_id = self.task_id or "未知任务"
+            return f"后台任务 {task_id}"
+        if self.kind == "ask":
+            return "表单回答"
+        return ""
 
 
 def build_agent_round_status(

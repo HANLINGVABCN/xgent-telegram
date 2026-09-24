@@ -3,9 +3,23 @@
 只负责把执行结果变成展示文本或模型上下文，不执行命令、不发送消息。
 """
 
-from typing import Any, Dict, Tuple
+from typing import Any, Callable, Dict, Tuple
 
 from xgent_app.text_utils import clip_middle_text
+
+
+# 脱敏钩子：默认恒等；命名空间侧（core）把它接到 redact_sensitive_text。
+# ask 协议注入的私密变量若被 `echo $VAR` 打印出来，明文会随 shell/run 输出回灌给
+# 模型——这里在「输出→模型上下文/持久化」的构造处统一打码，是那条泄漏路径的唯一闸口。
+# 注意只作用于 build_run_notice / build_shell_notice（模型上下文+落库），
+# 不动 format_shell_display_output（仅给用户看的 Telegram 展示，用户有权看到自己的密钥）。
+_redactor: Callable[[str], str] = lambda text: text
+
+
+def set_context_redactor(func: Callable[[str], str]) -> None:
+    """接上真正的脱敏函数（core.redact_sensitive_text）。"""
+    global _redactor
+    _redactor = func
 
 
 def build_shell_notice(action_label: str, shell_result: Dict[str, Any],
@@ -46,7 +60,7 @@ def build_shell_notice(action_label: str, shell_result: Dict[str, Any],
             f"判定依据: {wait_state_reason}\n"
             f"判定置信度: {wait_state_confidence}\n"
         )
-    return (
+    return _redactor(
         f"[Agent shell {action_label}]\n"
         f"会话: {session_id}\n"
         f"命令: {command}\n"
@@ -111,7 +125,7 @@ def get_shell_pause_messages(pause_reason: str) -> Tuple[str, str]:
 def build_run_notice(run_result: Dict[str, Any]) -> str:
     output = str(run_result.get('output') or '(无输出)')
     stored_output = format_shell_context_output(output, running=False)
-    return (
+    return _redactor(
         "[Agent run]\n"
         f"命令: {run_result.get('command') or ''}\n"
         f"成功: {run_result.get('success')}\n"

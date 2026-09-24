@@ -131,6 +131,19 @@ console.log("\n XSS / 消毒");
   check("javascript: 链接被剥 href", !/href="javascript/i.test(link), link);
   const ok = render("[x](https://example.com)");
   check("正常链接保留并加 rel", ok.includes('rel="noopener noreferrer"'), ok);
+  const nested = render('<section><a href="javascript:alert(1)" onclick="alert(1)">x</a><img src=x onerror=alert(1)></section>');
+  check("剥掉外层标签后仍消毒子树", !/javascript:|onclick|onerror|<img/i.test(nested), nested);
+  const css = render('<div class="lightbox open" style="position:fixed">x</div>');
+  check("消息不能注入应用布局类", !/lightbox|position:fixed/.test(css), css);
+}
+
+console.log("\n Telegram HTML 多行代码");
+{
+  const renderHtml = (src) => vm.runInContext("renderText", sandbox)(src, "HTML");
+  const out = renderHtml("<b>Agent Shell</b>\n<pre>first\n  second\nthird</pre>\nend");
+  check("pre 内的原始换行保留", out.includes("<pre>first\n  second\nthird</pre>"), out);
+  check("pre 内不注入 br", !/<pre>[^]*<br[^]*<\/pre>/.test(out), out);
+  check("普通文字的换行可见", renderHtml("first\nsecond").includes("<br>"), out);
 }
 
 console.log("\n 流式：未闭合围栏不炸版");

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Callable, Mapping, Optional, TypedDict
 
 
-SHELL_PROTOCOL_TYPES = frozenset({"shell", "stdin", "shellread", "shellkill"})
+SHELL_PROTOCOL_TYPES = frozenset({"shell", "stdin", "shellkill"})
 
 
 class ShellExecution(TypedDict):
@@ -47,10 +47,6 @@ async def execute_shell_protocol(
             shell_result = await shell_manager.send_input(
                 block["path"], macro_steps, stop_event_factory()
             )
-    elif block_type == "shellread":
-        shell_result = await shell_manager.read(
-            block["path"], stop_event_factory()
-        )
     else:
         shell_result = await shell_manager.kill(block["path"])
 

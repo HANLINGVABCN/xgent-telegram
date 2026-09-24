@@ -1,6 +1,4 @@
-import tempfile
 import unittest
-from pathlib import Path
 
 from xgent_app.agent_context import (
     build_edit_context_message,
@@ -54,44 +52,32 @@ class AgentContextTests(unittest.TestCase):
         self.assertEqual("AQI=", attachment["content"][1]["data"])
         self.assertNotIn("filename", attachment["content"][1])
 
-    def test_media_context_includes_small_generated_image(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            image_path = Path(temp_dir) / "generated.png"
-            image_path.write_bytes(b"png-data")
-            message = build_media_context_message(
-                {
-                    "success": True,
-                    "text": "媒体已生成",
-                    "mime_type": "image/png",
-                    "file_path": str(image_path),
-                },
-                "媒体结果",
-                max_inline_bytes=1024,
-            )
-
-        self.assertIsInstance(message["content"], list)
-        self.assertEqual("image", message["content"][1]["type"])
-        self.assertEqual("image/png", message["content"][1]["mime_type"])
-
-    def test_media_context_does_not_inline_large_image(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            image_path = Path(temp_dir) / "large.png"
-            image_path.write_bytes(b"0123456789")
-            message = build_media_context_message(
-                {
-                    "success": True,
-                    "text": "媒体已生成",
-                    "mime_type": "image/png",
-                    "file_path": str(image_path),
-                },
-                "媒体已生成\n【系统自动生成：本图片已自动存入 /tmp/large.png，需要时请read以返回上下文】",
-                max_inline_bytes=1,
-            )
-
+    def test_media_context_leaves_all_images_to_durable_assembly(self):
+        message = build_media_context_message(
+            {
+                "success": True, "text": "媒体已生成",
+                "image_attachment_ids": ["first", "second"],
+                "artifacts": [
+                    {"path": "/unused/first.png", "size": 10 * 1024 * 1024},
+                    {"path": "/unused/second.png", "size": 20 * 1024 * 1024},
+                ],
+            },
+            "媒体结果",
+        )
         self.assertIsInstance(message["content"], str)
-        self.assertIn("媒体已生成", message["content"])
-        self.assertIn("媒体过大", message["content"])
-        self.assertIn("系统自动生成", message["content"])
+        self.assertIn("媒体结果", message["content"])
+        self.assertIn("全部图片已持久关联", message["content"])
+        self.assertIn("Conversation attachments", message["content"])
+        self.assertNotIn("媒体过大", message["content"])
+        self.assertNotIn("data:", message["content"])
+
+    def test_media_context_does_not_claim_unlinked_images_are_visible(self):
+        message = build_media_context_message(
+            {"success": True, "file_path": "/unused/generated.png", "mime_type": "image/png"},
+            "媒体执行说明",
+        )
+        self.assertIn("没有已持久关联的图片", message["content"])
+        self.assertNotIn("全部图片已持久关联", message["content"])
 
     def test_context_builders_are_side_effect_free(self):
         message = build_edit_context_message("notice")

@@ -393,7 +393,7 @@ class AgentShellSession:
             return self.output[-max_chars:]
 
     def read_from_offset(self, offset: int) -> Tuple[str, int]:
-        """按绝对字符偏移读取新增输出，不修改 shellread 使用的 read_index。"""
+        """按绝对字符偏移读取新增输出，不修改 read() 使用的 read_index。"""
         with self.lock:
             absolute_start = self.output_start_offset
             absolute_end = absolute_start + len(self.output)
@@ -1300,10 +1300,11 @@ class SelfTriggerManager:
     REPEAT_DUPLICATE_BACKOFF_MAX_SECONDS = 300.0
     DEFAULT_TIMEZONE = os.getenv('TRIGGER_TIMEZONE', 'Asia/Shanghai')
     MAX_CAPTURE_CHARS = 200000
-    # 触发器命令的硬上限。没有它的话，一个挂起的命令会一直占着 _task_locks
-    # 和 _runtime_tasks 槽位，之后每次调度都只记录“上一次仍在运行，跳过”，
-    # 这个任务到进程重启前都是死的，而且用户完全看不到任何提示。
-    MAX_RUN_SECONDS = float(os.getenv('TRIGGER_MAX_RUN_SECONDS', '3600'))
+    # 触发器命令没有时间上限：tail -f、长时数据迁移等可以真·长跑，不设死线、
+    # 不因耗时杀任务。同一任务由 _task_lock 单飞守卫（_launch_runtime 保证上次
+    # 没跑完就跳过本次调度），不同任务之间目前不设并发上限——个人 bot 场景任务
+    # 数有限，够用。之前有个 _run_semaphore 从不 acquire，是营造"有闸门"假象的
+    # 死代码，已删除；真要限并发需另立会主动 acquire/release 的机制。
     # 跨进程拾取扫描周期：CLI/其他进程登记的任务由持有调度器的进程在此
     # 周期内接手执行。对照 cli_relay_ops 的 0.3s 轮询，这里不需要亚秒级
     # ——任务本身是分钟级的定时/监控语义。
@@ -1315,6 +1316,7 @@ class SelfTriggerManager:
     _scheduler: Optional[AsyncIOScheduler] = None
     _runtime_tasks: Dict[str, asyncio.Task] = {}
     _processes: Dict[str, Any] = {}
+    _process_output_paths: Dict[str, str] = {}
     _task_locks: Dict[str, asyncio.Lock] = {}
     _lock = asyncio.Lock()
     _execution_tasks: set = set()
@@ -1414,11 +1416,41 @@ class SelfTriggerManager:
         try:
             config = yaml.safe_load(body)
         except yaml.YAMLError as e:
-            raise ValueError(f'trigger 定义 YAML 格式错误: {str(e)}') from e
+            raise ValueError(
+                f'trigger 定义 YAML 格式错误: {str(e)}。'
+                '常见原因：缩进要用 2 空格；或改用扁平写法（顶层直接写 after: 30s / when: READY，无需嵌套 schedule/condition）'
+            ) from e
 
         if not isinstance(config, dict):
             raise ValueError('trigger 定义必须是 YAML 对象（键值对），不能是列表或纯文本')
 
+        # 兼容扁平写法：顶层直接写 after/at/cron/timezone 归一进 schedule，
+        # when/repeat 归一进 condition，免去嵌套缩进的手写摩擦。嵌套写法仍优先：
+        # 若已显式给了 schedule/condition 对象，则忽略同名顶层键，不覆盖。
+        flat_schedule = {
+            key: config[key]
+            for key in ('after', 'at', 'cron', 'timezone')
+            if key in config
+        }
+        if flat_schedule and not config.get('schedule'):
+            config['schedule'] = flat_schedule
+        flat_condition = {
+            key: config[key]
+            for key in ('when', 'repeat')
+            if key in config
+        }
+        if flat_condition and not config.get('condition'):
+            config['condition'] = flat_condition
+
+        return cls._compute_definition(config)
+
+    @classmethod
+    def _compute_definition(cls, config: Dict[str, Any]) -> Dict[str, Any]:
+        """校验已归一的 config（含嵌套 schedule/condition）并算出调度/条件字段。
+
+        _parse_definition（YAML 入口）与 register_from_fields（CLI 入口）都汇聚到
+        这里，保证两条输入路径的校验与计算完全一致、不分叉。
+        """
         # 必填字段：task 和 command
         task_summary = config.get('task', '').strip()
         if not task_summary:
@@ -1548,53 +1580,6 @@ class SelfTriggerManager:
         }
 
     @classmethod
-    async def handle_protocol(cls, target: str, body: str, bot: Any, chat_id: int,
-                              conversation_id: str, origin_user_text: str,
-                              origin_assistant_text: str) -> str:
-        """处理 trigger-x 协议。
-
-        支持三种形式：
-        1. trigger-x + <<BEGIN_...   → 创建新任务
-        2. trigger-x:show + <<BEGIN_... → 查看活跃任务
-        3. trigger-x:kill:<任务ID> + <<BEGIN_... → 取消任务
-        4. trigger-x:kill:all + <<BEGIN_... → 取消所有任务
-        """
-        normalized_target = (target or '').strip()
-
-        # 查看活跃任务
-        if normalized_target == 'show':
-            return await cls.format_active_tasks()
-
-        # 取消所有任务
-        if normalized_target == 'kill:all':
-            count = await cls.cancel_all()
-            return f"✅ 已取消全部触发任务，共 {count} 个"
-
-        # 取消指定任务
-        if normalized_target.startswith('kill:'):
-            task_id = normalized_target[5:].strip()
-            if not task_id:
-                raise ValueError("trigger-x:kill: 后必须指定任务 ID，例如 trigger-x:kill:trg_abc123")
-            return await cls.cancel(task_id)
-
-        # 不支持的目标
-        if normalized_target:
-            raise ValueError(
-                f'trigger-x 不支持的目标: {normalized_target}\n'
-                '支持的操作：\n'
-                '  - trigger-x          → 创建新任务\n'
-                '  - trigger-x:show     → 查看活跃任务\n'
-                '  - trigger-x:kill:<ID> → 取消指定任务\n'
-                '  - trigger-x:kill:all → 取消所有任务'
-            )
-
-        # 创建新任务
-        return await cls.register(
-            body, bot, chat_id, conversation_id,
-            origin_user_text, origin_assistant_text,
-        )
-
-    @classmethod
     async def register(cls, body: str, bot: Any, chat_id: int, conversation_id: str,
                        origin_user_text: str, origin_assistant_text: str) -> str:
         """注册一个新的 trigger 任务。"""
@@ -1638,6 +1623,81 @@ class SelfTriggerManager:
         schedule_text = cls._format_schedule(task)
         condition_text = f"，条件: {definition['condition_expr']}" if definition.get('condition_expr') else ''
         repeat_text = '，条件命中后自动重启监控' if definition.get('repeat') else ''
+        return (
+            f"✅ 已创建触发任务 {task_id}\n"
+            f"📝 任务: {definition['summary']}\n"
+            f"⏰ 计划: {schedule_text}{condition_text}{repeat_text}"
+        )
+
+    @classmethod
+    async def register_from_fields(cls, *, command: str, chat_id: int,
+                                   conversation_id: str,
+                                   task: Optional[str] = None,
+                                   after: Optional[str] = None,
+                                   at: Optional[str] = None,
+                                   cron: Optional[str] = None,
+                                   when: Optional[str] = None,
+                                   repeat: bool = False,
+                                   timezone: Optional[str] = None,
+                                   origin_user_text: str = '',
+                                   origin_assistant_text: str = '') -> str:
+        """CLI 入口：从结构化字段登记任务，零 YAML 往返。
+
+        把 flag 组装成 _compute_definition 认识的 config（含嵌套 schedule/condition），
+        复用同一套校验与落库逻辑。schedule 字段互斥由 _compute_definition 校验。
+        """
+        config: Dict[str, Any] = {
+            'task': (task or '').strip() or (command.strip()[:80] if command else ''),
+            'command': command,
+        }
+        schedule: Dict[str, Any] = {}
+        if after is not None:
+            schedule['after'] = after
+        if at is not None:
+            schedule['at'] = at
+        if cron is not None:
+            schedule['cron'] = cron
+        if timezone is not None:
+            schedule['timezone'] = timezone
+        if schedule:
+            config['schedule'] = schedule
+        condition: Dict[str, Any] = {}
+        if when is not None:
+            condition['when'] = when
+        if repeat:
+            condition['repeat'] = True
+        if condition:
+            config['condition'] = condition
+
+        definition = cls._compute_definition(config)
+        task_id = await cls._new_task_id()
+        now = time.time()
+        task_row = {
+            'id': task_id,
+            'chat_id': chat_id,
+            'conversation_id': conversation_id,
+            **definition,
+            'status': 'scheduled' if definition['schedule_type'] in {'once', 'cron'} else 'pending',
+            'origin_user_text': origin_user_text,
+            'origin_assistant_text': origin_assistant_text,
+            'created_at': now,
+            'updated_at': now,
+        }
+        db = await BotMemoryDB.get_instance()
+        await db.create_trigger_task(task_row)
+
+        schedule_text = cls._format_schedule(task_row)
+        condition_text = f"，条件: {definition['condition_expr']}" if definition.get('condition_expr') else ''
+        repeat_text = '，条件命中后自动重启监控' if definition.get('repeat') else ''
+        # CLI 是无调度器进程：只落库，服务端 _pickup_scan 接管执行。
+        if cls._scheduler is None:
+            return (
+                f"✅ 已登记触发任务 {task_id}\n"
+                f"📝 任务: {definition['summary']}\n"
+                f"⏰ 计划: {schedule_text}{condition_text}{repeat_text}\n"
+                f"🖥️ 服务端将在 {int(cls.PICKUP_SCAN_SECONDS)} 秒内接管执行"
+            )
+        await cls._activate_task(task_row, recovery=False)
         return (
             f"✅ 已创建触发任务 {task_id}\n"
             f"📝 任务: {definition['summary']}\n"
@@ -1803,7 +1863,11 @@ class SelfTriggerManager:
                 cls._pickup_scan,
                 trigger='interval',
                 seconds=cls.PICKUP_SCAN_SECONDS,
-                id='self-trigger:pickup-scan',
+                # 内部巡检 job 必须用 internal: 前缀，绝不能用 self-trigger:。
+                # _pickup_scan 的对账循环会把所有 self-trigger:* 的 job 剥前缀当 task_id
+                # 去 DB 对账，不在活跃任务里就摘除；若巡检 job 自己也叫 self-trigger:*，
+                # 首次扫描就会把自己删掉，此后再不扫描、CLI 任务永远无人拾取。
+                id='internal:pickup-scan',
                 max_instances=1,
                 coalesce=True,
                 misfire_grace_time=30,
@@ -2128,6 +2192,7 @@ class SelfTriggerManager:
                 task_id, status='running', last_started_at=time.time(), last_error=None,
             )
 
+            command_started_at = time.monotonic()
             try:
                 result = await cls._run_trigger_command(task, run_id)
             except asyncio.CancelledError:
@@ -2144,6 +2209,9 @@ class SelfTriggerManager:
                     await db.update_trigger_task(task_id, status='recovering')
                 raise
             except Exception as exc:
+                process = cls._processes.get(task_id)
+                if process is not None:
+                    await terminate_async_process(process)
                 logger.error(f'trigger 任务 {task_id} 执行失败: {exc}', exc_info=True)
                 result = {
                     'status': 'failed', 'trigger_reason': 'execution_error',
@@ -2151,6 +2219,15 @@ class SelfTriggerManager:
                     'output_path': None, 'error': str(exc)[:2000],
                 }
             finally:
+                output_path = cls._process_output_paths.pop(task_id, None)
+                output_bytes = 0
+                if output_path:
+                    with contextlib.suppress(OSError):
+                        output_bytes = os.path.getsize(output_path)
+                elapsed_seconds = max(0.0, time.monotonic() - command_started_at)
+                await memory_maintenance.trim_after_large_command(
+                    elapsed_seconds, output_bytes
+                )
                 cls._processes.pop(task_id, None)
 
             finished_at = time.time()
@@ -2263,6 +2340,7 @@ class SelfTriggerManager:
         output_dir = os.path.join(COMMAND_OUTPUT_DIR, now.strftime('%Y-%m-%d'))
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"trigger_{task['id']}_{run_id}.txt")
+        cls._process_output_paths[task['id']] = output_path
         captured_parts: List[str] = []
         captured_length = 0
         output_truncated = False
@@ -2286,27 +2364,15 @@ class SelfTriggerManager:
             **kwargs,
         )
         cls._processes[task['id']] = process
-        run_deadline = time.monotonic() + cls.MAX_RUN_SECONDS
-        run_timed_out = False
 
         with open(output_path, 'w', encoding='utf-8', errors='replace') as output_file:
             output_file.write(f"Command:\n{command}\n\nStarted at: {datetime.now().isoformat(timespec='seconds')}\n\nOutput:\n")
             if process.stdout is None:
                 raise RuntimeError('触发器子进程没有可读的 stdout')
             while True:
-                remaining = run_deadline - time.monotonic()
-                if remaining <= 0:
-                    run_timed_out = True
-                    await terminate_async_process(process)
-                    break
-                try:
-                    chunk = await asyncio.wait_for(
-                        process.stdout.read(4096), timeout=remaining
-                    )
-                except asyncio.TimeoutError:
-                    run_timed_out = True
-                    await terminate_async_process(process)
-                    break
+                # 触发器命令没有时间上限（见类头说明）：读到自然 EOF 或条件命中
+                # 为止，不设死线，不因耗时杀任务。
+                chunk = await process.stdout.read(4096)
                 if not chunk:
                     break
                 text_chunk = decoder.decode(chunk)
@@ -2328,10 +2394,6 @@ class SelfTriggerManager:
                 if captured_length < cls.MAX_CAPTURE_CHARS:
                     captured_parts.append(final_text[:cls.MAX_CAPTURE_CHARS - captured_length])
             await process.wait()
-            if run_timed_out:
-                output_file.write(
-                    f"\n\n[超时] 命令运行超过 {int(cls.MAX_RUN_SECONDS)} 秒，已被强制终止。\n"
-                )
             output_file.write(f"\n\nFinished at: {datetime.now().isoformat(timespec='seconds')}\nExit code: {process.returncode}\n")
 
         output = ''.join(captured_parts).strip() or '(无输出)'
@@ -2339,14 +2401,7 @@ class SelfTriggerManager:
             output += f"\n\n[输出过长，内存结果仅保留前 {cls.MAX_CAPTURE_CHARS} 字符；完整输出见文件]"
         matched_conditions = condition.matched_literals() if condition else []
         exit_code = process.returncode if process.returncode is not None else -1
-        if run_timed_out:
-            # 超时要覆盖条件判定：条件未命中不是因为进程正常退出，
-            # 而是被我们杀掉的，必须如实告诉用户和模型。
-            output += f"\n\n[超时] 命令运行超过 {int(cls.MAX_RUN_SECONDS)} 秒，已被强制终止。"
-            status = 'failed'
-            trigger_reason = 'timeout'
-            error = f'命令运行超过 {int(cls.MAX_RUN_SECONDS)} 秒未结束，已被强制终止'
-        elif condition:
+        if condition:
             status = 'condition_matched' if matched else 'condition_unmatched'
             trigger_reason = 'condition_matched' if matched else 'process_exited_before_condition'
             error = None if matched else '进程已退出，但条件表达式未满足'

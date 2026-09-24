@@ -27,6 +27,9 @@ APT_UPDATED=0
 SKIP_CONFIRM=0
 # ensure_virtualenv 这一次有没有真的新建/重建 venv。
 VENV_CREATED=0
+# 更新代码用的 GitHub 仓库信息（强制写死正式公开仓库）
+UPDATE_REPO_URL="https://github.com/HANLINGVABCN/xgent-telegram"
+UPDATE_BRANCH="main"
 
 # ensure_python 挑出来的解释器绝对路径。空串代表还没挑过。
 PYTHON_BIN=""
@@ -1047,6 +1050,35 @@ env_unset() {
     chmod 600 .env
 }
 
+# 注释掉一个键（在行首加 #）— 用于"关闭 Bot"时保留 Token。
+env_comment() {
+    local key="$1" tmp_file
+    [ -f ".env" ] || return 0
+    tmp_file="$(mktemp ./.env.XXXXXX)"
+    chmod 600 "$tmp_file"
+    sed "s/^${key}=/#${key}=/" .env > "$tmp_file"
+    mv "$tmp_file" .env
+    chmod 600 .env
+}
+
+# 取消注释一个键（去掉行首 #）— 用于"开启 Bot"时恢复 Token。
+env_uncomment() {
+    local key="$1" tmp_file
+    [ -f ".env" ] || return 0
+    tmp_file="$(mktemp ./.env.XXXXXX)"
+    chmod 600 "$tmp_file"
+    sed "s/^#${key}=/${key}=/" .env > "$tmp_file"
+    mv "$tmp_file" .env
+    chmod 600 .env
+}
+
+# 检查某个键是否被注释（即存在 #KEY=... 行）
+env_is_commented() {
+    local key="$1"
+    [ -f ".env" ] || return 1
+    grep -q "^#${key}=" .env
+}
+
 # 容器运行状态：running / exited / missing / docker-unavailable
 local_api_container_status() {
     if ! command_exists docker; then
@@ -1343,7 +1375,7 @@ ensure_env_value() {
 }
 
 # 「切换部署模式」的入口（install.sh switch-mode）。真正的改法已经收进
-# 组件清单里的 bot 一项——填 Token / 换授权 ID / 移除 Bot 都在那里，
+# 组件清单里的 bot 一项——填 Token / 换授权 ID / 关闭·开启 Bot 都在那里，
 # 这里只是把老命令名接过去，免得再维护第二份提示与校验逻辑。
 switch_deploy_mode() {
     local do_restart=""
@@ -1835,41 +1867,70 @@ migrate_legacy_pm2_process() {
     fi
 }
 
+resolve_pm2_memory_restart() {
+    if [ -n "${PM2_MAX_MEMORY_RESTART:-}" ]; then
+        PM2_MEMORY_RESTART="$PM2_MAX_MEMORY_RESTART"
+        PM2_MEMORY_RESTART_SOURCE="环境变量 PM2_MAX_MEMORY_RESTART（固定覆盖）"
+        PM2_MEMORY_RESTART_ENABLED=1
+    else
+        # PM2 的 max-memory-restart 只能保存静态值，无法表达运行中的动态上限。
+        # 自动模式不向 PM2 写静态阈值，由 Python 进程每秒读取 /proc 实时执行 95% 上限。
+        PM2_MEMORY_RESTART=""
+        PM2_MEMORY_RESTART_SOURCE="进程内实时监控：每秒读取 MemAvailable 与进程 RSS，动态保留 5%"
+        PM2_MEMORY_RESTART_ENABLED=0
+    fi
+}
+
 start_with_pm2() {
-    local code mode env_mode socks5_url
+    local code mode env_mode socks5_url pm2_memory_limit
+    local -a pm2_memory_args=()
+
+    resolve_pm2_memory_restart
+    pm2_memory_limit="$PM2_MEMORY_RESTART"
+    if [ "$PM2_MEMORY_RESTART_ENABLED" -eq 1 ]; then
+        pm2_memory_args=(--max-memory-restart "$pm2_memory_limit")
+    fi
 
     ensure_pm2
     migrate_legacy_pm2_process
 
     info "[运行] 正在使用 PM2 启动 XGent for Telegram..."
     echo "   IP 出站模式: $(ip_mode_label)"
+    if [ "$PM2_MEMORY_RESTART_ENABLED" -eq 1 ]; then
+        echo "   PM2 固定内存重启阈值: $pm2_memory_limit（$PM2_MEMORY_RESTART_SOURCE）"
+    else
+        echo "   实时内存重启阈值: 可用内存池的 95%（$PM2_MEMORY_RESTART_SOURCE）"
+    fi
 
-    # 进程已存在时原地重启（pm_id 不变），并用 --update-env 刷新环境变量。
-    # 变量设为空串而不是 unset：Bot 侧把空串视为默认模式，
-    # 这样 --update-env 才能覆盖掉旧进程里残留的模式设置。
+    # 固定覆盖模式可以原地更新 PM2。自动模式必须重建一次进程，才能可靠清除
+    # 旧版本持久化在 PM2 里的 1G/max_memory_restart 静态阈值。
     if pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
-        mode="$(get_ip_mode)"
-        env_mode="$mode"
-        [ "$mode" = "default" ] && env_mode=""
-        socks5_url=""
-        [ "$mode" = "sock5" ] && socks5_url="$(get_socks5_proxy)"
-        if env XGENT_IP_MODE="$env_mode" XGENT_SOCKS5_PROXY="$socks5_url" \
-            TELEGRAM_AI_BOT_IP_MODE="" TELEGRAM_AI_BOT_SOCKS5_PROXY="" \
-            TELEGRAM_AI_BOT_APP_ENTRY="" XGENT_APP_ENTRY="$APP_ENTRY" \
-            PYTHONPATH="$(pythonpath_with_project)" \
-            pm2 restart "$PM2_APP_NAME" --update-env; then
-            echo "   PM2 原地重启成功（进程 ID 保持不变）。"
-            echo "   查看日志: pm2 logs $PM2_APP_NAME"
-            if pm2 save >/dev/null; then
-                echo "   PM2 进程列表已保存。"
+        if [ "$PM2_MEMORY_RESTART_ENABLED" -eq 0 ]; then
+            info "   正在清除 PM2 中旧的静态内存阈值并启用实时监控..."
+            pm2 delete "$PM2_APP_NAME" >/dev/null 2>&1 || true
+            sleep 1
+        else
+            mode="$(get_ip_mode)"
+            env_mode="$mode"
+            [ "$mode" = "default" ] && env_mode=""
+            socks5_url=""
+            [ "$mode" = "sock5" ] && socks5_url="$(get_socks5_proxy)"
+            if env XGENT_IP_MODE="$env_mode" XGENT_SOCKS5_PROXY="$socks5_url" \
+                TELEGRAM_AI_BOT_IP_MODE="" TELEGRAM_AI_BOT_SOCKS5_PROXY="" \
+                TELEGRAM_AI_BOT_APP_ENTRY="" XGENT_APP_ENTRY="$APP_ENTRY" \
+                PYTHONPATH="$(pythonpath_with_project)" \
+                pm2 restart "$PM2_APP_NAME" --update-env "${pm2_memory_args[@]}"; then
+                echo "   PM2 原地重启成功（进程 ID 保持不变）。"
+                echo "   查看日志: pm2 logs $PM2_APP_NAME"
+                if pm2 save >/dev/null; then
+                    echo "   PM2 进程列表已保存。"
+                fi
+                return
             fi
-            return
+            warn "   PM2 restart 失败（进程状态不一致），正在清理残留并重新启动..."
+            pm2 delete "$PM2_APP_NAME" 2>/dev/null || true
+            sleep 1
         fi
-        # restart 失败通常是 PM2 状态不一致（dump 记录了进程但实际不存在）。
-        # 清理残留记录后 fallback 到 start 分支重新创建。
-        warn "   PM2 restart 失败（进程状态不一致），正在清理残留并重新启动..."
-        pm2 delete "$PM2_APP_NAME" 2>/dev/null || true
-        sleep 1
     fi
 
     code="$(bot_python_code)"
@@ -1879,7 +1940,7 @@ start_with_pm2() {
         --cwd "$SCRIPT_DIR" \
         --interpreter none \
         --stop-exit-codes 78 \
-        --max-memory-restart 1G \
+        "${pm2_memory_args[@]}" \
         --exp-backoff-restart-delay=100 \
         -- -c "$code"
 
@@ -2006,6 +2067,138 @@ restart_app() {
             start_service
             ;;
     esac
+}
+
+# ==========================================================================
+# 代码更新
+# ==========================================================================
+
+
+
+
+update_via_download() {
+    info "[更新] 方式: 下载最新代码覆盖"
+
+    local zip_url tmp_dir tmp_zip
+    zip_url="${UPDATE_REPO_URL}/archive/refs/heads/${UPDATE_BRANCH}.zip"
+
+    tmp_dir="$(mktemp -d)"
+    tmp_zip="$tmp_dir/update.zip"
+
+    # 下载
+    info "[更新] 正在从 GitHub 下载最新代码..."
+    echo "   $zip_url"
+    if command_exists curl; then
+        if ! curl -fSL "$zip_url" -o "$tmp_zip" 2>&1; then
+            error "[错误] 下载失败。请检查网络连接。"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
+    elif command_exists wget; then
+        if ! wget -q "$zip_url" -O "$tmp_zip" 2>&1; then
+            error "[错误] 下载失败。请检查网络连接。"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
+    else
+        error "[错误] 未找到 curl 或 wget，无法下载。"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    if [ ! -s "$tmp_zip" ]; then
+        error "[错误] 下载失败或文件为空。"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    # 解压 (使用 Python 内置库，避免依赖 unzip)
+    info "[更新] 正在解压..."
+    if ! python3 -c "import zipfile; zipfile.ZipFile('$tmp_zip', 'r').extractall('$tmp_dir')" 2>/dev/null; then
+        error "[错误] 解压失败。"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    # GitHub zip 解压后目录名是 repo-branch，找到它
+    local repo_name
+    repo_name="$(find "$tmp_dir" -mindepth 1 -maxdepth 1 -type d | head -1)"
+    if [ -z "$repo_name" ] || [ ! -d "$repo_name" ]; then
+        error "[错误] 解压后未找到代码目录。"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    # 备份当前 install.sh
+    cp -f "$SCRIPT_DIR/install.sh" "$SCRIPT_DIR/install.sh.bak" 2>/dev/null || true
+
+    # 覆盖代码文件，跳过用户数据
+    info "[更新] 正在覆盖代码文件..."
+    if command_exists rsync; then
+        rsync -a --exclude='.git/' \
+                 --exclude='.env' --exclude='.env.*' \
+                 --exclude='*.db' --exclude='*.db-*' \
+                 --exclude='venv/' --exclude='.venv/' \
+                 --exclude='.install-state/' \
+                 --exclude='skill-private/' \
+                 --exclude='memory/' \
+                 --exclude='workspace/' \
+                 --exclude='xgent_storage/' \
+                 --exclude='.local-api-data/' \
+                 --exclude='*.log' --exclude='*.pid' --exclude='logs/' \
+                 --exclude='*.bak*' \
+                 --exclude='.xgent-version' \
+                 "$repo_name"/ "$SCRIPT_DIR"/
+    else
+        # 没有 rsync，用 cp 逐目录覆盖核心代码
+        warn "   未找到 rsync，使用 cp 覆盖（推荐安装 rsync 获得更可靠的更新体验）。"
+        local item
+        for item in install.sh requirements.txt xgent_server.py xgent_cli.py \
+                    bin prompts xgent_app tests tools docs \
+                    skill-public README.md LICENSE OPTIMIZATION_SUMMARY.md; do
+            if [ -e "$repo_name/$item" ]; then
+                cp -rf "$repo_name/$item" "$SCRIPT_DIR/" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    rm -rf "$tmp_dir"
+    success "代码文件已覆盖完成。"
+    echo "   旧 install.sh 已备份为 install.sh.bak"
+}
+
+update_code() {
+    info "[更新] 正在检查代码更新..."
+
+    local do_update=""
+    echo ""
+    read -r -p "   即将从 GitHub 下载最新代码并覆盖本地（保留所有用户配置和数据），是否继续？[Y/n]: " do_update
+    case "$do_update" in
+        n|N) return 0 ;;
+        *)   ;;
+    esac
+
+    update_via_download || return 1
+
+    # 更新 .xgent-version
+    printf 'updated-%s' "$(date +%Y%m%d)" > "$SCRIPT_DIR/.xgent-version"
+
+    # 重新安装依赖（复用 prepare_base_environment）
+    info "[更新] 正在重新检查环境和依赖..."
+    prepare_base_environment
+
+    # 询问重启
+    if service_running; then
+        echo ""
+        local do_restart=""
+        read -r -p "代码已更新，是否立即重启服务？[Y/n]: " do_restart
+        case "$do_restart" in
+            n|N) warn "已跳过重启。请稍后执行: bash install.sh restart" ;;
+            *)   restart_app ;;
+        esac
+    else
+        warn "服务当前未运行，跳过重启。可通过主菜单选 2) 启动服务。"
+    fi
 }
 
 # 收集本地 API 所需 .env 变量；已有值则显示并允许回车保留
@@ -2793,6 +2986,12 @@ component_state_bot() {
     id="$(env_get AUTHORIZED_USER_ID)"
 
     if [ -z "$token" ]; then
+        # 检查是否是注释掉的（已关闭）
+        if env_is_commented "BOT_TOKEN"; then
+            is_number "$id" || id="?"
+            printf 'disabled|Telegram Bot 已配置（授权用户 ID %s）  🔴 已关闭\n' "$id"
+            return
+        fi
         printf 'missing|未配置 Bot Token，当前是仅 Web 模式\n'
         return
     fi
@@ -2804,12 +3003,13 @@ component_state_bot() {
         printf 'error|AUTHORIZED_USER_ID 还是仅 Web 模式留下的占位值 1，Bot 会拒绝所有人\n'
         return
     fi
-    printf 'installed|Telegram Bot 已配置（授权用户 ID %s）\n' "$id"
+    printf 'installed|Telegram Bot 已配置（授权用户 ID %s）  🟢 已开启\n' "$id"
 }
 
 component_icon() {
     case "$1" in
         installed) printf '%b' "${GREEN}✅${NC}" ;;
+        disabled)  printf '%b' "${GREEN}✅${NC}" ;;
         error)     printf '%b' "${YELLOW}🟡${NC}" ;;
         *)         printf '%b' "${RED}❌${NC}" ;;
     esac
@@ -2818,6 +3018,7 @@ component_icon() {
 component_state_text() {
     case "$1" in
         installed) printf '已安装' ;;
+        disabled)  printf '已安装' ;;
         error)     printf '状态异常' ;;
         *)         printf '未安装' ;;
     esac
@@ -3041,10 +3242,11 @@ deploy_bot() {
 
     if [ "$state" = "installed" ]; then
         echo "   状态: 已安装 — ${row#*|}"
+        echo "   Bot Token 已配置    授权用户 ID 已配置"
         echo ""
         echo "   1) 更换 Bot Token"
         echo "   2) 更换授权用户 ID"
-        echo "   3) 移除 Bot（切换为仅 Web 模式）"
+        echo "   3) 关闭 Bot（切换为仅 Web + CLI 模式）"
         echo "   4) 返回"
         read -r -p "   请选择 [1-4，默认 4]: " choice
         case "$choice" in
@@ -3058,15 +3260,48 @@ deploy_bot() {
                 prompt_authorized_user_id force
                 ;;
             3)
-                read -r -p "   确认移除 Bot Token、切换为仅 Web 模式？[y/N]: " confirm
+                read -r -p "   确认关闭 Bot、切换为仅 Web + CLI 模式？[y/N]: " confirm
                 case "$confirm" in
                     y|Y)
-                        env_unset "BOT_TOKEN"
+                        env_comment "BOT_TOKEN"
                         sync_deploy_mode_state
-                        success "已切换为仅 Web 模式（历史记录和模型配置都保留）。"
+                        success "已关闭 Bot（Token 已注释保留，未删除、未卸载）。"
+                        info "   下次进入此菜单可一键重新开启。"
                         ;;
                     *) warn "   已取消。" ;;
                 esac
+                ;;
+            *) : ;;
+        esac
+        return
+    fi
+
+    # ---- 已关闭状态（Token 被注释） ----
+    if [ "$state" = "disabled" ]; then
+        echo "   状态: 已安装 — ${row#*|}"
+        echo "   Bot Token 已配置（已注释）    授权用户 ID 已配置"
+        echo ""
+        echo "   1) 开启 Bot（恢复 Token，重新启用 Telegram Bot）"
+        echo "   2) 更换 Bot Token"
+        echo "   3) 更换授权用户 ID"
+        echo "   4) 返回"
+        read -r -p "   请选择 [1-4，默认 4]: " choice
+        case "$choice" in
+            1)
+                env_uncomment "BOT_TOKEN"
+                sync_deploy_mode_state
+                success "Bot 已重新开启！"
+                ;;
+            2)
+                # 先取消注释旧的，再删掉，再重新填
+                env_uncomment "BOT_TOKEN"
+                env_unset "BOT_TOKEN"
+                ensure_env_value "BOT_TOKEN" "   请输入 Telegram Bot Token（输入时不显示）" secret
+                sync_deploy_mode_state
+                validate_telegram_token
+                ;;
+            3)
+                prompt_authorized_user_id force
                 ;;
             *) : ;;
         esac
@@ -3214,6 +3449,7 @@ show_menu() {
     echo "  8) 本地 API 容器 (Docker)  启动/关闭本地 Telegram Bot API server"
     echo "  9) 彻底重建 PM2 进程       重新加载 PM2 启动参数，进程 ID 会 +1"
     echo " 10) 卸载本脚本安装的运行内容"
+    echo " 11) 更新代码                 从 GitHub 下载最新代码覆盖本地（保留用户数据）"
     echo "  0) 退出"
     echo ""
 }
@@ -3230,6 +3466,7 @@ show_usage() {
     echo "  ./install.sh switch-mode     配置 / 移除 Telegram Bot（等价于组件清单里的第 3 项）"
     echo "  ./install.sh uninstall       卸载本脚本安装的运行内容"
     echo "  ./install.sh uninstall -y    跳过确认直接卸载"
+    echo "  ./install.sh update          从 GitHub 下载最新代码覆盖本地"
     echo ""
     echo "安装后可用命令:"
     echo "  xgent                        打开本地终端客户端（与 Telegram/Web 共用同一套对话核心）"
@@ -3298,7 +3535,7 @@ main() {
 
     print_banner
     show_menu
-    read -r -p "请输入选项 [0-10，默认 1]: " choice
+    read -r -p "请输入选项 [0-11，默认 1]: " choice
 
     case "$choice" in
         ""|1)
@@ -3346,6 +3583,9 @@ main() {
         10)
             uninstall_app --no-banner
             exit 0
+            ;;
+        11)
+            update_code
             ;;
         0|q|Q)
             warn "已退出。"
@@ -3434,6 +3674,10 @@ case "${1:-}" in
         shift
         parse_uninstall_options "$@"
         uninstall_app
+        ;;
+    update|--update)
+        print_banner
+        update_code
         ;;
     help|--help|-h)
         show_usage

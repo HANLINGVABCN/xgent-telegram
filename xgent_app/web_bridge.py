@@ -16,14 +16,20 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import copy
+import json
 import logging
 import mimetypes
+import ntpath
 import os
 import queue
 import secrets
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
+
+from xgent_app.web_media import current_media_presentation
+from xgent_app.ui_history import UiHistoryError, capture_ui_frame, resolve_callback
 
 from xgent_app.fanout import (
     ChannelWorker,
@@ -36,16 +42,30 @@ from xgent_app.fanout import (
     OP_PHOTO,
     OP_SEND,
     OpNotDeliverable,
+    OpTransientError,
     get_channel_registry,
 )
 
-# deliver_op_to_bot 需要把 Telegram 永久性 BadRequest 翻译成 OpNotDeliverable，
-# 否则不可恢复的 400 错误会被 fanout 当作临时网络故障无限重试，卡死整条队列。
+# deliver_op_to_bot 要把 Telegram 的异常分成两类交给 fanout：
+#   永久性（BadRequest / Forbidden）-> OpNotDeliverable，直接丢；
+#   暂时性（TimedOut / NetworkError / RetryAfter）-> OpTransientError，走熔断。
+# 分类必须按**异常类型**而不是按报错文案：文案白名单漏掉哪一种，那一种就会
+# 被当成"网络故障"无限重试、卡死整条待发队列（历史上已经复发过多次）。
 # 保持可选导入：模块其余部分仍然不硬依赖 telegram 包。
 try:
-    from telegram.error import BadRequest as _TgBadRequest
+    from telegram.error import (
+        BadRequest as _TgBadRequest,
+        Forbidden as _TgForbidden,
+        NetworkError as _TgNetworkError,
+        RetryAfter as _TgRetryAfter,
+        TimedOut as _TgTimedOut,
+    )
 except ImportError:  # pragma: no cover
     _TgBadRequest = type(None)  # 永远不会 isinstance 命中
+    _TgForbidden = type(None)
+    _TgNetworkError = type(None)
+    _TgRetryAfter = type(None)
+    _TgTimedOut = type(None)
 
 logger = logging.getLogger(__name__)
 
@@ -95,8 +115,8 @@ class MediaTokenRegistry:
 
     token 用 secrets.token_urlsafe 生成，猜测空间足够大；注册表本身只是
     进程内存里的一个有界字典（FIFO 淘汰最旧的），长时间运行也不会无限
-    增长。进程重启后 token 全部失效——这是预期行为，历史消息里的图片/
-    文件链接只在当前进程生命周期内有效，与 Telegram 侧消息互不影响。
+    增长。这里只服务实时帧；历史消息通过数据库附件关联获得稳定下载地址，
+    不依赖这些进程内 token。
     """
 
     def __init__(self, max_entries: int = 500):
@@ -139,6 +159,13 @@ def _local_path_from_send_arg(obj):
     return None
 
 
+def _media_filename(obj: Any, filename: Optional[str] = None, fallback: str = "file") -> str:
+    name = filename or getattr(obj, "filename", None) or getattr(obj, "name", None)
+    if not name and isinstance(obj, str) and _local_path_from_send_arg(obj):
+        name = obj
+    return ntpath.basename(str(name)) if name else fallback
+
+
 # 进程级单例：Web 服务器路由（web_server.py 的 GET /api/media/<token>）与
 # 这里的 send_photo/send_document 共用同一份注册表，前者按 token 查文件，
 # 后者往里面登记文件。放在模块级而不是塞进某个类实例，是因为 WebBot /
@@ -176,52 +203,95 @@ class WebOutbox:
         25 秒内它会继续抢帧、再写进已经死掉的 socket，这些帧就此**永久丢失**。
     表现就是网页消息缺失、错乱、不即时，必须手动刷新（重新拉 history）才恢复。
 
-    现在每个订阅者持有一条独立队列，put() 向所有订阅者各投一份，订阅者退出时
-    自行摘除。没有订阅者时 put() 直接丢弃：没人在线就不该攒帧，前端连上后会
-    重新拉一次 history 作为真相源，攒下来的旧帧反而会盖在新历史上造成错乱。
+    每个 SSE 订阅者持有一条独立队列，新订阅不回放旧帧。另保留有界事件日志，
+    不支持 SSE 的隧道通过短请求按游标补取增量，避免反复加载数据库历史。
 
     只提供 subscribe() 而不提供 outbox 级的 get()：广播总线上「先 put 再 get」
     本来就收不到，留一个看起来能用的 get() 只会把这类 bug 引回来。
     """
 
-    def __init__(self, maxsize: int = 1000):
+    def __init__(self, maxsize: int = 1000, replay_bytes: int = 8 * 1024 * 1024):
         self._maxsize = max(1, int(maxsize))
+        self._replay_limit = max(1, int(replay_bytes))
+        self._events = collections.deque()
+        self._event_bytes = 0
+        self._sequence = 0
+        self._epoch = secrets.token_hex(16)
         self._lock = threading.Lock()
-        self._queues: List["queue.Queue[Optional[Dict[str, Any]]]"] = []
+        self._queues: Dict["queue.Queue[Optional[Dict[str, Any]]]", bool] = {}
         self._closed = threading.Event()
 
-    def subscribe(self) -> "WebSubscription":
+    def subscribe(self, *, numbered: bool = False) -> "WebSubscription":
         """注册一个订阅者，返回它的私有帧视图。
 
         用 with 语句，或手动 close()，否则队列会留在广播列表里被一直投递。
         """
         q: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=self._maxsize)
         with self._lock:
-            self._queues.append(q)
+            self._queues[q] = numbered
+            epoch, cursor = self._epoch, self._sequence
         if self._closed.is_set():
             # 在 close() 之后才订阅：立刻塞 None 唤醒，别让消费者干等一个 timeout。
             _offer(q, None)
-        return WebSubscription(self, q)
+        return WebSubscription(self, q, epoch, cursor)
 
     def _drop(self, q: "queue.Queue[Optional[Dict[str, Any]]]") -> None:
         with self._lock:
-            with contextlib.suppress(ValueError):
-                self._queues.remove(q)
+            self._queues.pop(q, None)
 
     def put(self, frame: Dict[str, Any]) -> None:
         """非阻塞广播给当前所有订阅者。"""
         if self._closed.is_set():
             return
+        saved = copy.deepcopy(frame)
+        size = len(json.dumps(saved, ensure_ascii=False).encode('utf-8'))
         with self._lock:
-            targets = list(self._queues)
-        for q in targets:
-            _offer(q, frame)
+            if saved.get('type') == 'history_reset':
+                self._events.clear()
+                self._event_bytes = self._sequence = 0
+                self._epoch = secrets.token_hex(16)
+            self._sequence += 1
+            event = {'epoch': self._epoch, 'id': self._sequence, 'frame': saved}
+            self._events.append((event, size))
+            self._event_bytes += size
+            while self._events and (len(self._events) > self._maxsize
+                                    or self._event_bytes > self._replay_limit):
+                self._event_bytes -= self._events.popleft()[1]
+            # Publish under the same lock so concurrent producers cannot reorder IDs.
+            for q, numbered in self._queues.items():
+                _offer(q, event if numbered else saved)
+
+    def read_events(self, after: Optional[int] = None, epoch: str = '',
+                    limit: int = 100) -> Dict[str, Any]:
+        """A finite, repeatable event batch; reading never consumes another tab's events."""
+        with self._lock:
+            oldest = self._events[0][0]['id'] if self._events else self._sequence + 1
+            reset = after is not None and (
+                epoch != self._epoch or after < oldest - 1 or after > self._sequence
+            )
+            events = []
+            cursor = self._sequence if after is None or reset else after
+            if after is not None and not reset:
+                size = 0
+                for event, length in self._events:
+                    if event['id'] <= after:
+                        continue
+                    events.append(event)
+                    size += length
+                    if len(events) >= max(1, min(limit, 100)) or size >= 512 * 1024:
+                        break
+                if events:
+                    cursor = events[-1]['id']
+            return {'epoch': self._epoch, 'cursor': cursor, 'events': events,
+                    'reset': reset, 'more': cursor < self._sequence}
 
     def close(self) -> None:
         self._closed.set()
         # 给每个订阅者塞一个 None，唤醒可能正在阻塞的消费者
         with self._lock:
             targets = list(self._queues)
+            self._events.clear()
+            self._event_bytes = 0
         for q in targets:
             _offer(q, None)
 
@@ -239,9 +309,12 @@ class WebOutbox:
 class WebSubscription:
     """单个 SSE 连接的私有帧视图。每个订阅者都能看到全量帧流。"""
 
-    def __init__(self, outbox: "WebOutbox", q: "queue.Queue[Optional[Dict[str, Any]]]"):
+    def __init__(self, outbox: "WebOutbox", q: "queue.Queue[Optional[Dict[str, Any]]]",
+                 epoch: str = '', cursor: int = 0):
         self._outbox = outbox
         self._queue = q
+        self.epoch = epoch
+        self.cursor = cursor
 
     def get(self, timeout: float = 25.0) -> Optional[Dict[str, Any]]:
         """取一帧；超时返回 None，供调用方发 SSE 心跳保活。"""
@@ -289,27 +362,104 @@ class WebMessage:
         return await self.bot.delete_message(chat_id=self.chat_id, message_id=self.message_id)
 
 
-def _markup_to_frame(reply_markup: Any) -> Optional[List[List[Dict[str, str]]]]:
+def _markup_to_frame(reply_markup: Any) -> Optional[List[List[Dict[str, Any]]]]:
     """把 InlineKeyboardMarkup 拍平成可 JSON 化的结构。
 
-    只取 text 和 callback_data——网页端唯一需要的按钮是"停止"。
+    保留 text + callback_data + url。Telegram 要求每个内联按钮必须带一个目标
+    （callback_data / url / ...），只拍平 text 与 callback_data 的话，url 按钮
+    还原回去就成了"纯文本按钮"，Telegram 报 "text buttons are not allowed"，
+    这条消息在待发库里永远投不出去。
     """
     if reply_markup is None:
         return None
     keyboard = getattr(reply_markup, "inline_keyboard", None)
     if not keyboard:
         return None
-    rows: List[List[Dict[str, str]]] = []
+    rows: List[List[Dict[str, Any]]] = []
     for row in keyboard:
-        buttons: List[Dict[str, str]] = []
+        buttons: List[Dict[str, Any]] = []
         for button in row:
-            buttons.append({
+            item = {
                 "text": str(getattr(button, "text", "")),
                 "callback_data": str(getattr(button, "callback_data", "") or ""),
-            })
+            }
+            url = getattr(button, "url", None)
+            if url:
+                item["url"] = str(url)
+            web_app = getattr(button, 'web_app', None)
+            if web_app is not None and getattr(web_app, 'url', None):
+                item['url'] = str(web_app.url)
+                item['web_app'] = True
+            action = resolve_callback(item['callback_data']) if item['callback_data'] else ''
+            if action != item['callback_data']:
+                item['callback_action'] = action
+            buttons.append(item)
         if buttons:
             rows.append(buttons)
     return rows or None
+
+
+def markup_from_frame(rows: Any) -> Optional[Any]:
+    """_markup_to_frame 的逆运算：扁平按钮结构 -> InlineKeyboardMarkup。
+
+    Telegram 拒绝没有目标的内联按钮（"text buttons are not allowed"），而且是
+    400——这样的按钮进了待发库就永远投不出去。所以 url / callback_data 都没有
+    的按钮直接剔除，宁可少一个按钮。没装 telegram 包时返回 None。
+    """
+    if not rows:
+        return None
+    try:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+    except ImportError:  # pragma: no cover
+        return None
+    keyboard = []
+    for row in rows:
+        buttons = []
+        for btn in row or []:
+            if not isinstance(btn, dict):
+                continue
+            text = str(btn.get("text") or "")
+            callback_data = str(btn.get("callback_data") or "")
+            url = str(btn.get("url") or "")
+            if url:
+                buttons.append(InlineKeyboardButton(text, web_app=WebAppInfo(url=url)) if btn.get('web_app')
+                               else InlineKeyboardButton(text, url=url))
+            elif callback_data:
+                buttons.append(InlineKeyboardButton(text, callback_data=callback_data))
+        if buttons:
+            keyboard.append(buttons)
+    return InlineKeyboardMarkup(keyboard) if keyboard else None
+
+
+def _present_media_frame(frame: Dict[str, Any]) -> Dict[str, Any]:
+    presentation = current_media_presentation()
+    if not presentation or frame['type'] not in {'message', 'edit', 'photo', 'document'}:
+        return frame
+    media = []
+    for source in presentation['media']:
+        item = dict(source)
+        if os.path.isfile(item['path']):
+            token = MEDIA_TOKEN_REGISTRY.register(item['path'], item['filename'])
+            item['download_url'] = f'/api/media/{token}'
+        else:
+            item['error'] = '原件不存在或无法读取'
+        media.append(item)
+    return {**frame, 'type': 'message', 'text': presentation['text'],
+            'parse_mode': None, 'msg_type': 'ai_reply',
+            'media_group_id': presentation['media_group_id'], 'media': media,
+            'replace_message_ids': presentation.get('replace_message_ids', [])}
+
+
+async def emit_ui_frame(outbox: WebOutbox, chat_id: int, frame_type: str,
+                        *, source: Optional[str] = None, **fields: Any) -> None:
+    frame = {'type': frame_type, 'ts': time.time(), **fields}
+    try:
+        frame = await capture_ui_frame(frame, chat_id, source=source)
+    except UiHistoryError as exc:
+        logging.getLogger(__name__).warning('UI state was not saved: %s', exc)
+        outbox.put({'type': 'callback_answer', 'text': str(exc), 'show_alert': True})
+        raise
+    outbox.put(_present_media_frame(frame))
 
 
 class WebBot:
@@ -336,12 +486,12 @@ class WebBot:
     def _emit(self, frame_type: str, **fields: Any) -> None:
         frame: Dict[str, Any] = {"type": frame_type, "ts": time.time()}
         frame.update(fields)
-        self.outbox.put(frame)
+        self.outbox.put(_present_media_frame(frame))
 
     async def send_message(self, chat_id: int, text: str, reply_markup: Any = None,
                            parse_mode: Any = None, **kwargs: Any) -> WebMessage:
         message_id = self._allocate_message_id()
-        self._emit(
+        await emit_ui_frame(self.outbox, self.chat_id,
             "message",
             message_id=message_id,
             text=str(text),
@@ -353,7 +503,7 @@ class WebBot:
     async def edit_message_text(self, text: str, chat_id: Optional[int] = None,
                                 message_id: Optional[int] = None, reply_markup: Any = None,
                                 parse_mode: Any = None, **kwargs: Any) -> WebMessage:
-        self._emit(
+        await emit_ui_frame(self.outbox, self.chat_id,
             "edit",
             message_id=message_id,
             text=str(text),
@@ -365,13 +515,13 @@ class WebBot:
     async def edit_message_reply_markup(self, chat_id: Optional[int] = None,
                                         message_id: Optional[int] = None,
                                         reply_markup: Any = None, **kwargs: Any) -> bool:
-        self._emit("edit_markup", message_id=message_id,
-                   reply_markup=_markup_to_frame(reply_markup))
+        await emit_ui_frame(self.outbox, self.chat_id, "edit_markup", message_id=message_id,
+                            reply_markup=_markup_to_frame(reply_markup))
         return True
 
     async def delete_message(self, chat_id: Optional[int] = None,
                              message_id: Optional[int] = None, **kwargs: Any) -> bool:
-        self._emit("delete", message_id=message_id)
+        await emit_ui_frame(self.outbox, self.chat_id, "delete", message_id=message_id)
         return True
 
     async def send_chat_action(self, chat_id: Optional[int] = None,
@@ -385,8 +535,7 @@ class WebBot:
         # 文件本体不走 SSE：二进制塞进 JSON 帧会把内存和带宽打爆。改为注册一个
         # 下载 token，前端拿 /api/media/<token> 去拉——能拿到本地路径时才注册
         # （_local_path_from_send_arg 拿不到就是 None，前端据此不渲染下载入口）。
-        name = filename or getattr(document, "filename", None) or getattr(document, "name", None)
-        display_name = str(name) if name else "file"
+        display_name = _media_filename(document, filename)
         local_path = _local_path_from_send_arg(document)
         download_url = None
         if local_path is not None:
@@ -402,12 +551,14 @@ class WebBot:
     async def send_photo(self, chat_id: Optional[int] = None, photo: Any = None,
                          caption: Optional[str] = None, **kwargs: Any) -> WebMessage:
         local_path = _local_path_from_send_arg(photo)
+        display_name = _media_filename(photo, fallback="image")
         download_url = None
         if local_path is not None:
-            token = MEDIA_TOKEN_REGISTRY.register(local_path, os.path.basename(local_path))
+            token = MEDIA_TOKEN_REGISTRY.register(local_path, display_name)
             download_url = f"/api/media/{token}"
         message_id = self._allocate_message_id()
         self._emit("photo", message_id=message_id,
+                   filename=display_name,
                    caption=str(caption) if caption else None,
                    download_url=download_url)
         return WebMessage(self, message_id, int(chat_id or self.chat_id), str(caption or ""))
@@ -495,22 +646,6 @@ async def deliver_op_to_bot(bot: Any, op: Op, native_id: Optional[int], *,
             raise OpNotDeliverable(f"bot 没有方法 {name}")
         return fn
 
-    # Telegram 永久性 BadRequest（"Message to edit not found" 等）不是网络故障，
-    # 重试永远不会成功。必须在这里翻译成 OpNotDeliverable，让 fanout 安全丢弃
-    # 并继续处理后续消息——否则一条毒药操作就能卡死整条待发队列。
-    _PERM_PATTERNS = (
-        "message to edit not found",
-        "message is not modified",
-        "message can't be deleted",
-        "message to delete not found",
-        "chat not found",
-        "bot was blocked by the user",
-        "message_id_invalid",
-        "message identifier is not specified",
-        "can't parse entities",
-        "cant parse entities",
-    )
-
     try:
         if kind == OP_SEND:
             result = await method("send_message")(
@@ -572,13 +707,33 @@ async def deliver_op_to_bot(bot: Any, op: Op, native_id: Optional[int], *,
 
     except OpNotDeliverable:
         raise  # OpNotDeliverable 已经是正确分类，直接上抛
+    except OpTransientError:
+        raise
     except Exception as exc:
-        if isinstance(exc, _TgBadRequest):
-            msg = str(exc).lower()
-            if any(p in msg for p in _PERM_PATTERNS):
-                raise OpNotDeliverable(
-                    f"Telegram 永久拒绝: {exc}") from exc
-        raise  # 其他错误（网络超时、限流等）原样上抛，走熔断路径
+        raise classify_telegram_error(exc) from exc
+
+
+def classify_telegram_error(exc: BaseException) -> BaseException:
+    """把 Telegram 异常归成 fanout 认识的两类；认不出的原样返回。
+
+    PTB 的继承关系是 NetworkError -> (BadRequest, TimedOut)，所以先判具体的
+    BadRequest / TimedOut，再判笼统的 NetworkError。RetryAfter 与 Forbidden 是
+    TelegramError 的直接子类。
+    """
+    if isinstance(exc, _TgRetryAfter):
+        return OpTransientError(f"Telegram 限流: {exc}")
+    if isinstance(exc, _TgTimedOut):
+        return OpTransientError(f"Telegram 超时: {exc}")
+    if isinstance(exc, _TgBadRequest):
+        msg = str(exc).lower()
+        if any(p in msg for p in ("too many requests", "retry after", "flood")):
+            return OpTransientError(f"Telegram 限流: {exc}")
+        return OpNotDeliverable(f"Telegram 永久拒绝: {exc}")
+    if isinstance(exc, _TgForbidden):
+        return OpNotDeliverable(f"Telegram 拒绝访问: {exc}")
+    if isinstance(exc, _TgNetworkError):
+        return OpTransientError(f"Telegram 网络故障: {exc}")
+    return exc
 
 
 class MirrorBot:
@@ -608,10 +763,11 @@ class MirrorBot:
     _is_xgent_web_bot = True
 
     def __init__(self, outbox: WebOutbox, chat_id: int, real_bot: Any = None,
-                 channel: Any = None):
+                 channel: Any = None, ui_source: Optional[str] = None):
         self.outbox = outbox
         self.chat_id = chat_id
         self.real_bot = real_bot
+        self._ui_source = ui_source
         self._next_message_id = 1
         self._id_lock = threading.Lock()
         self._channel = channel
@@ -639,7 +795,7 @@ class MirrorBot:
     def _emit(self, frame_type: str, **fields: Any) -> None:
         frame: Dict[str, Any] = {"type": frame_type, "ts": time.time()}
         frame.update(fields)
-        self.outbox.put(frame)
+        self.outbox.put(_present_media_frame(frame))
 
     # --- Telegram 通道 ---
 
@@ -768,8 +924,8 @@ class MirrorBot:
         target = int(chat_id) if chat_id is not None else self.chat_id
         message_id = self._resolve_send_id(relay_message_id)
         # 先推网页帧，再交给 Telegram 通道：网页不等 Telegram。
-        self._emit(
-            "message", message_id=message_id, text=str(text),
+        await emit_ui_frame(self.outbox, self.chat_id,
+            "message", source=self._ui_source, message_id=message_id, text=str(text),
             parse_mode=str(parse_mode) if parse_mode else None,
             reply_markup=_markup_to_frame(reply_markup),
         )
@@ -786,8 +942,8 @@ class MirrorBot:
                                 parse_mode: Any = None, **kwargs: Any) -> WebMessage:
         target = int(chat_id) if chat_id is not None else self.chat_id
         logical, native = self._target_ids(message_id)
-        self._emit(
-            "edit", message_id=logical, text=str(text),
+        await emit_ui_frame(self.outbox, self.chat_id,
+            "edit", source=self._ui_source, message_id=logical, text=str(text),
             parse_mode=str(parse_mode) if parse_mode else None,
             reply_markup=_markup_to_frame(reply_markup),
         )
@@ -805,8 +961,8 @@ class MirrorBot:
                                         reply_markup: Any = None, **kwargs: Any) -> bool:
         target = int(chat_id) if chat_id is not None else self.chat_id
         logical, native = self._target_ids(message_id)
-        self._emit("edit_markup", message_id=logical,
-                   reply_markup=_markup_to_frame(reply_markup))
+        await emit_ui_frame(self.outbox, self.chat_id, "edit_markup", source=self._ui_source,
+                            message_id=logical, reply_markup=_markup_to_frame(reply_markup))
         self._offer(OP_EDIT_MARKUP, logical_id=logical, chat_id=target, payload={
             "reply_markup": _markup_to_frame(reply_markup),
             "native_id": native,
@@ -818,7 +974,7 @@ class MirrorBot:
                              message_id: Optional[int] = None, **kwargs: Any) -> bool:
         target = int(chat_id) if chat_id is not None else self.chat_id
         logical, native = self._target_ids(message_id)
-        self._emit("delete", message_id=logical)
+        await emit_ui_frame(self.outbox, self.chat_id, "delete", source=self._ui_source, message_id=logical)
         self._offer(OP_DELETE, logical_id=logical, chat_id=target,
                     payload={"native_id": native,
                              "kwargs": self._passthrough(kwargs)})
@@ -839,8 +995,7 @@ class MirrorBot:
                             relay_message_id: Any = None,
                             **kwargs: Any) -> WebMessage:
         target = int(chat_id) if chat_id is not None else self.chat_id
-        name = filename or getattr(document, "filename", None) or getattr(document, "name", None)
-        display_name = str(name) if name else "file"
+        display_name = _media_filename(document, filename)
         # 提前取本地路径：一是文件对象读完可能被关闭，二是补发时 transient 已经
         # 没了，只能靠路径重新打开——拿不到路径的（BytesIO、file:// 容器路径）
         # 就是不可持久化的，durable=False。
@@ -868,12 +1023,14 @@ class MirrorBot:
                          relay_message_id: Any = None, **kwargs: Any) -> WebMessage:
         target = int(chat_id) if chat_id is not None else self.chat_id
         local_path = _local_path_from_send_arg(photo)
+        display_name = _media_filename(photo, fallback="image")
         message_id = self._resolve_send_id(relay_message_id)
         download_url = None
         if local_path is not None:
-            token = MEDIA_TOKEN_REGISTRY.register(local_path, os.path.basename(local_path))
+            token = MEDIA_TOKEN_REGISTRY.register(local_path, display_name)
             download_url = f"/api/media/{token}"
         self._emit("photo", message_id=message_id,
+                   filename=display_name,
                    caption=str(caption) if caption else None,
                    download_url=download_url)
         self._offer(OP_PHOTO, logical_id=message_id, chat_id=target,
@@ -1083,7 +1240,7 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
     def emit(frame_type: str, **fields: Any) -> None:
         frame: Dict[str, Any] = {"type": frame_type, "ts": time.time()}
         frame.update(fields)
-        outbox.put(frame)
+        outbox.put(_present_media_frame(frame))
 
     def _kw_text(kwargs: Dict[str, Any], args: tuple, send: bool = False) -> str:
         text = kwargs.get("text")
@@ -1099,7 +1256,9 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
     async def send_message(*args: Any, **kwargs: Any) -> Any:
         result = await saved["send_message"](real_bot, *args, **kwargs)
         try:
-            emit("message", message_id=getattr(result, "message_id", 0),
+            await emit_ui_frame(outbox, int(getattr(result, 'chat_id', None) or kwargs.get('chat_id')
+                                           or (args[0] if args else 0)),
+                 "message", source='telegram', message_id=getattr(result, "message_id", 0),
                  text=_kw_text(kwargs, args, send=True),
                  parse_mode=str(kwargs.get("parse_mode")) if kwargs.get("parse_mode") else None,
                  reply_markup=_markup_to_frame(kwargs.get("reply_markup")))
@@ -1115,7 +1274,9 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
             mid = kwargs.get("message_id")
             if mid is None and len(args) >= 3:
                 mid = args[2]
-            emit("edit", message_id=mid, text=_kw_text(kwargs, args),
+            await emit_ui_frame(outbox, int(kwargs.get('chat_id') or getattr(result, 'chat_id', None)
+                                           or (args[1] if len(args) >= 2 else 0)),
+                 "edit", source='telegram', message_id=mid, text=_kw_text(kwargs, args),
                  parse_mode=str(kwargs.get("parse_mode")) if kwargs.get("parse_mode") else None,
                  reply_markup=_markup_to_frame(kwargs.get("reply_markup")))
         except Exception:  # noqa: BLE001
@@ -1130,7 +1291,8 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
             mid = kwargs.get("message_id")
             if mid is None and len(args) >= 2:
                 mid = args[1]
-            emit("edit_markup", message_id=mid,
+            await emit_ui_frame(outbox, int(kwargs.get('chat_id') or (args[0] if args else 0)),
+                 "edit_markup", source='telegram', message_id=mid,
                  reply_markup=_markup_to_frame(kwargs.get("reply_markup")))
         except Exception:  # noqa: BLE001
             pass
@@ -1144,7 +1306,8 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
             mid = kwargs.get("message_id")
             if mid is None and len(args) >= 2:
                 mid = args[1]
-            emit("delete", message_id=mid)
+            await emit_ui_frame(outbox, int(kwargs.get('chat_id') or (args[0] if args else 0)),
+                                "delete", source='telegram', message_id=mid)
         except Exception:  # noqa: BLE001
             pass
         return result
@@ -1164,11 +1327,8 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
     async def send_document(*args: Any, **kwargs: Any) -> Any:
         result = await saved["send_document"](real_bot, *args, **kwargs)
         try:
-            doc = kwargs.get("document")
-            name = (kwargs.get("filename")
-                    or getattr(doc, "filename", None)
-                    or getattr(doc, "name", None)
-                    or "file")
+            doc = kwargs.get("document", args[1] if len(args) > 1 else None)
+            name = _media_filename(doc, kwargs.get("filename"))
             local_path = _local_path_from_send_arg(doc)
             download_url = None
             if local_path is not None:
@@ -1187,12 +1347,15 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
     async def send_photo(*args: Any, **kwargs: Any) -> Any:
         result = await saved["send_photo"](real_bot, *args, **kwargs)
         try:
-            local_path = _local_path_from_send_arg(kwargs.get("photo"))
+            photo = kwargs.get("photo", args[1] if len(args) > 1 else None)
+            local_path = _local_path_from_send_arg(photo)
+            name = _media_filename(photo, fallback="image")
             download_url = None
             if local_path is not None:
-                token = MEDIA_TOKEN_REGISTRY.register(local_path, os.path.basename(local_path))
+                token = MEDIA_TOKEN_REGISTRY.register(local_path, name)
                 download_url = f"/api/media/{token}"
             emit("photo", message_id=getattr(result, "message_id", 0),
+                 filename=name,
                  caption=str(kwargs.get("caption")) if kwargs.get("caption") else None,
                  download_url=download_url)
         except Exception:  # noqa: BLE001

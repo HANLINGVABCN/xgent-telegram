@@ -7,12 +7,20 @@ from xgent_app.agent_context import (
     build_read_text_context_message,
 )
 from xgent_app.protocols import ProtocolParser
+from xgent_app import memory_maintenance
+from xgent_app.media_inputs import MediaInputError, native_binary_kind
 class AgentExecutor:
     """安全地执行 AI 请求的 shell 命令"""
     
     TIMEOUT = DEFAULT_AGENT_COMMAND_TIMEOUT  # 秒
     MAX_FILE_SIZE = 50 * 1024 * 1024
     WORK_DIR = os.path.dirname(os.path.abspath(__file__))
+    # 当前对话上下文：run-x 子进程需要它来登记 trigger 任务（xgent_trigger.py 读
+    # XGENT_CHAT_ID/XGENT_CONVERSATION_ID）。由 _process_conversation_inner 在每轮
+    # 处理开始时暂存。单用户 + _conversation_processing_lock 保证同时只有一个对话
+    # 在跑，所以类属性暂存是安全的；将来若要支持真·多对话并发，须改为显式传参。
+    _current_chat_id: Optional[int] = None
+    _current_conversation_id: Optional[str] = None
     MEDIA_INLINE_MAX_BYTES = 8 * 1024 * 1024
     TEXT_INLINE_MAX_BYTES = 512 * 1024
     # [edit] 原地替换的备份后缀（后随时间戳）
@@ -1298,13 +1306,17 @@ class AgentExecutor:
         return opts
 
     @classmethod
-    async def read_file_ranged(cls, requested: str) -> Dict[str, Any]:
+    async def read_file_ranged(cls, requested: str, api_format: str = 'openai') -> Dict[str, Any]:
         """带行号的文本读取，支持 path[:START-END] 或 path[:START:+COUNT]。
 
         - 无区间：读全文（受 TEXT_INLINE_MAX_BYTES 限制），输出 cat -n 格式。
         - START-END：读 [START, END] 闭区间。
         - START:+COUNT：从 START 行起读 COUNT 行。
         - START-：从 START 行读到文件尾。
+
+        ``api_format`` 透传给非文本分支——历史上这里硬编码成 'openai'，导致用
+        path: 字段读非文本文件时，无论真实提供商是谁都按 OpenAI 能力判定
+        （gemini 能原生吃的二进制被误拒）。
         """
         path_part, range_part = cls._split_read_range(requested)
         target_path = cls.resolve_file_path(path_part)
@@ -1319,7 +1331,7 @@ class AgentExecutor:
 
         if not cls.is_text_file(target_path, mime_type):
             # 非文本走原 read_path_for_model 逻辑（图片/二进制等）
-            return await cls.read_path_for_model(path_part, api_format='openai')
+            return await cls.read_path_for_model(path_part, api_format=api_format)
 
         def _read_full() -> str:
             with open(target_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -1485,24 +1497,42 @@ class AgentExecutor:
                     data_b64,
                     attachment_type='image',
                 ),
+                # 供 read 留存开关登记持久附件用（原始字节+类型+文件名）。
+                'source': {'raw_content': raw_content, 'mime_type': mime_type, 'basename': basename},
             }
 
-        if api_format in {'gemini', 'vertex'}:
+        # 其余二进制：按“接入层到底能不能原生吃这个 mime”放开判定，而不是只认图片。
+        # native_binary_kind 与 models.py 的序列化层同源——pdf(openai/claude)、
+        # audio(openai/openai_compatible)、任意二进制(gemini/vertex) 都能稳定直传。
+        # 不支持的组合抛 MediaInputError，这里捕获成“给模型看的清晰报错文本”，
+        # 而不是抛异常（抛异常只会在 dispatch 变成一句通用“读取失败”，信息更少）。
+        # 目标：能读就读，读不了也明确告诉模型为什么、下一步怎么办——不静默、不阻断。
+        try:
+            native_binary_kind(api_format, mime_type)
+        except MediaInputError as exc:
+            fail_notice = (
+                f"[read结果] 无法把 {display_path} 的文件本体直接交给当前模型："
+                f"{exc}（{mime_type}，{file_size} bytes）。"
+                "该文件已在磁盘上，可改用 shell 工具处理（如 ffmpeg/pdftotext 等），"
+                "或切换到支持该格式原生输入的模型后重试。"
+            )
             return {
-                'notice': notice + f"（文件本体，{mime_type}，{file_size} bytes）",
-                'message': build_read_attachment_context_message(
-                    notice,
-                    mime_type,
-                    basename,
-                    data_b64,
-                    attachment_type='binary',
-                ),
+                'notice': fail_notice,
+                'message': {'role': 'user', 'content': fail_notice},
             }
 
-        raise ValueError(
-            f"当前接入层不支持把 {mime_type} 文件本体直接交给当前模型；"
-            "当前仅图片可稳定直传，其他文件本体请改用支持原生文件输入的模型通道。"
-        )
+        return {
+            'notice': notice + f"（文件本体，{mime_type}，{file_size} bytes）",
+            'message': build_read_attachment_context_message(
+                notice,
+                mime_type,
+                basename,
+                data_b64,
+                attachment_type='binary',
+            ),
+            # 供 read 留存开关登记持久附件用（原始字节+类型+文件名）。
+            'source': {'raw_content': raw_content, 'mime_type': mime_type, 'basename': basename},
+        }
     
     @classmethod
     def extract_file_block(cls, ai_response: str) -> Optional[Tuple[str, str]]:
@@ -1559,10 +1589,18 @@ class AgentExecutor:
             else:
                 kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
 
+            run_env = {**os.environ, 'LANG': 'en_US.UTF-8'}
+            # 把当前对话上下文透传给子进程：xgent_trigger.py 用它登记任务并
+            # 把结果投递回正确对话。仅在已知时注入，避免污染无关命令。
+            if cls._current_chat_id is not None:
+                run_env['XGENT_CHAT_ID'] = str(cls._current_chat_id)
+            if cls._current_conversation_id is not None:
+                run_env['XGENT_CONVERSATION_ID'] = str(cls._current_conversation_id)
+
             process = await asyncio.create_subprocess_shell(
                 command,
                 cwd=cls.WORK_DIR,
-                env={**os.environ, 'LANG': 'en_US.UTF-8'},
+                env=run_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 **kwargs
@@ -1622,6 +1660,7 @@ class AgentExecutor:
 
             elapsed_seconds = round(max(0.0, time.monotonic() - started_at), 2)
             saved = await save_command_output_async(command, output)
+            await memory_maintenance.trim_after_large_command(elapsed_seconds, saved['bytes'])
             rc = process.returncode if process else -1
             return {
                 'success': bool(not stopped and not timed_out and rc == 0),
@@ -1642,6 +1681,7 @@ class AgentExecutor:
             output = f"执行异常: {str(e)[:200]}"
             elapsed_seconds = round(max(0.0, time.monotonic() - started_at), 2)
             saved = await save_command_output_async(command, output)
+            await memory_maintenance.trim_after_large_command(elapsed_seconds, saved['bytes'])
             return {
                 'success': False,
                 'command': command,

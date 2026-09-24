@@ -25,20 +25,23 @@ class AgentDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
         self.stop_factory.assert_not_called()
 
-    async def test_read_path_uses_ranged_reader(self):
+    async def test_read_body_with_range_uses_ranged_reader(self):
+        # read-x 只在正文写路径（围栏行 read-x:/path 写法已取消）：带区间的
+        # 正文走 read_file_ranged，不再有 block['path'] 分支。
+        self.executor._split_read_range.return_value = ("/tmp/a", "1-2")
         self.executor.read_file_ranged = AsyncMock(
             return_value={"notice": "read", "message": {"role": "user", "content": "x"}}
         )
 
         result = await dispatch_standard_protocol(
-            {"type": "read", "path": "/tmp/a:1-2", "body": ""},
+            {"type": "read", "body": "/tmp/a:1-2"},
             executor=self.executor,
             provider_api_format="openai",
             stop_event_factory=self.stop_factory,
             logger=self.logger,
         )
 
-        self.executor.read_file_ranged.assert_awaited_once_with("/tmp/a:1-2")
+        self.executor.read_file_ranged.assert_awaited_once_with("/tmp/a:1-2", "openai")
         self.assertEqual(result["kind"], "read")
         self.stop_factory.assert_not_called()
 

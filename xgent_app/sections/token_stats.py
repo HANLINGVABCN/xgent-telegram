@@ -262,13 +262,24 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   .card .k { font-size: 12px; color: #888; }
   .card .v { font-size: 19px; font-weight: 600; margin-top: 3px; }
   .chart-box { background: #fff; border-radius: 10px; padding: 14px; box-shadow: 0 1px 3px rgba(0,0,0,.06); margin-bottom: 16px; }
-  .chart-box h2 { font-size: 14px; margin: 0 0 10px; }
+  .chart-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 0 10px; }
+  .chart-head h2 { font-size: 14px; margin: 0; }
+  .seg { display: inline-flex; border: 1px solid #ddd; border-radius: 6px; overflow: hidden; flex: none; }
+  .seg button { border: 0; background: #fff; color: #555; padding: 3px 12px; font-size: 12px; cursor: pointer; font-family: inherit; }
+  .seg button + button { border-left: 1px solid #ddd; }
+  .seg button.active { background: #4a90e2; color: #fff; }
   canvas { max-height: 340px; }
   table.tbl { width: 100%; border-collapse: collapse; background: #fff; border-radius: 10px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
   table.tbl th, table.tbl td { padding: 8px 10px; text-align: right; border-bottom: 1px solid #f0f0f0; font-size: 13px; }
   table.tbl th { background: #fafbfc; font-weight: 600; }
+  table.tbl th.sortable { cursor: pointer; user-select: none; }
+  table.tbl th.sortable:hover { background: #eef2f7; }
+  table.tbl th.sortable::after { content: ''; font-size: 10px; color: #4a90e2; }
+  table.tbl th.sortable.asc::after { content: ' \25B2'; }
+  table.tbl th.sortable.desc::after { content: ' \25BC'; }
   table.tbl td.l, table.tbl th.l { text-align: left; }
-  table.tbl tr:hover { background: #fafbfc; }
+  table.tbl tbody tr:hover { background: #fafbfc; }
+  table.tbl tfoot td { font-weight: 600; background: #f2f5f9; border-top: 2px solid #e2e8f0; }
   .hint { font-size: 11px; color: #999; margin-top: 4px; }
 </style>
 </head>
@@ -292,11 +303,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="row">
       <label>相同模型自动合并（最小交集）：</label>
       <input type="checkbox" id="autoMerge" __AUTO_MERGE__>
-      <label>指标：</label>
-      <select id="metric">
-        <option value="token" __M_TOKEN__>Token 用量</option>
-        <option value="cost" __M_COST__>费用 (USD)</option>
-      </select>
+      <span class="hint" style="margin:0">每张图右上角可单独切换 Token / 费用</span>
     </div>
 
     <details><summary>🔗 手动合并表（规范名 = 成员，逗号分隔；优先于自动合并）</summary>
@@ -319,12 +326,38 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 
   <div class="summary" id="summary"></div>
-  <div class="chart-box"><h2>📈 折线图 · <span id="lineMetric">Token</span> 趋势（按天）</h2><canvas id="line"></canvas></div>
-  <div class="chart-box"><h2>🥧 饼图 · 各模型费用占比</h2><canvas id="pie"></canvas></div>
-  <div class="chart-box"><h2>📋 明细表格</h2>
+  <div class="chart-box">
+    <div class="chart-head">
+      <h2>📈 折线图 · 趋势（按天）</h2>
+      <div class="seg" id="lineSeg">
+        <button type="button" data-metric="token">Token</button>
+        <button type="button" data-metric="cost">费用</button>
+      </div>
+    </div>
+    <canvas id="line"></canvas>
+  </div>
+  <div class="chart-box">
+    <div class="chart-head">
+      <h2>🥧 饼图 · 各模型占比</h2>
+      <div class="seg" id="pieSeg">
+        <button type="button" data-metric="token">Token</button>
+        <button type="button" data-metric="cost">费用</button>
+      </div>
+    </div>
+    <canvas id="pie"></canvas>
+  </div>
+  <div class="chart-box">
+    <div class="chart-head">
+      <h2>📋 明细表格 <span id="tblCount" class="hint" style="margin:0"></span></h2>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <input type="search" id="tblFilter" placeholder="🔍 筛选模型名" style="width:150px;">
+        <button type="button" class="btn ghost" id="exportCsv">⬇ 导出 CSV</button>
+      </div>
+    </div>
     <table class="tbl" id="tbl"><thead><tr>
-      <th class="l">模型</th><th>调用</th><th>输入</th><th>输出</th><th>缓存</th><th>思考</th><th>总计</th><th>费用</th><th>单价(in/out/cache)</th>
-    </tr></thead><tbody></tbody></table>
+      <th class="l sortable" data-sort="model">模型</th><th class="sortable" data-sort="count">调用</th><th class="sortable" data-sort="input">输入</th><th class="sortable" data-sort="output">输出<sup>*</sup></th><th class="sortable" data-sort="cached">缓存</th><th class="sortable" data-sort="reasoning">其中思考</th><th class="sortable" data-sort="total">总计</th><th class="sortable" data-sort="share">占比</th><th class="sortable" data-sort="cost">费用</th><th class="sortable" data-sort="avgcost">单次均费</th><th>单价(in/out/cache)</th>
+    </tr></thead><tbody></tbody><tfoot></tfoot></table>
+    <div class="hint"><sup>*</sup>「输出」已含「思考(reasoning)」token，费用按输出单价整体计入；「其中思考」是其子集，仅供参考，不重复计费。「占比」按总 token 计；合计行为当前时间段全部模型（不受筛选影响）。</div>
   </div>
   <div class="hint">价格表/合并表的改动会自动存到浏览器 localStorage（同文件同路径记忆）。图表依赖 Chart.js CDN，离线时仅表格可用。</div>
 </div>
@@ -387,7 +420,11 @@ const STATE = {
   startMs: __START_MS__,
   endMs: __END_MS__,
   autoMerge: __AUTO_MERGE_JS__,
-  metric: __METRIC_JS__,
+  lineMetric: __METRIC_JS__,
+  pieMetric: 'cost',
+  sortKey: 'total',
+  sortDir: 'desc',
+  tableFilter: '',
   priceTable: Object.assign({}, DEFAULT_PRICE),
   mergeMap: Object.assign({}, DEFAULT_MERGE),
 };
@@ -408,7 +445,7 @@ function aggregate() {
     const cost = computeCost(r, p);
     if (!perModel[m]) perModel[m] = {count:0,input:0,output:0,cached:0,reasoning:0,total:0,cost:0};
     const pm = perModel[m]; pm.count++; pm.input+=r.input; pm.output+=r.output; pm.cached+=r.cached; pm.reasoning+=r.reasoning; pm.total+=r.total; pm.cost+=cost;
-    const d = new Date(r.ts * 1000).toISOString().slice(0, 10);
+    const d = dayKey(r.ts * 1000);
     if (!perDay[d]) perDay[d] = {};
     if (!perDay[d][m]) perDay[d][m] = {input:0,output:0,cached:0,total:0,cost:0,count:0};
     const pd = perDay[d][m]; pd.input+=r.input; pd.output+=r.output; pd.cached+=r.cached; pd.total+=r.total; pd.cost+=cost; pd.count++;
@@ -420,6 +457,9 @@ function aggregate() {
 
 function fmt(n) { if (n >= 1e6) return (n/1e6).toFixed(2)+'M'; if (n >= 1e3) return (n/1e3).toFixed(2)+'K'; return n; }
 function fmtCost(c) { if (!c) return '—'; if (c < 0.01) return '$'+c.toFixed(6); return '$'+c.toFixed(4); }
+function esc(s) { return String(s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+// 本地时区按天（与后端 datetime.fromtimestamp 一致；不能用 toISOString，那是 UTC）
+function dayKey(ms) { const d = new Date(ms); const p = function(n){ return String(n).padStart(2,'0'); }; return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate()); }
 
 let lineChart = null, pieChart = null;
 const COLORS = ['#4dc9f6','#f67019','#f53794','#acc236','#166a8f','#00a950','#58595b','#8549ba','#6c0498','#0555b8','#e6c229','#cd040b','#5d3a1a','#0b5394'];
@@ -429,6 +469,13 @@ function render() {
   const agg = aggregate();
   const s = document.getElementById('summary');
   s.innerHTML = '';
+  // 缓存节省：缓存 token 若按输入原价计费 vs 实际按缓存价计费的差额，按各模型单价分别算
+  let cacheSaved = 0;
+  for (const m in agg.perModel) {
+    const pm = agg.perModel[m], p = modelPrice(m, STATE.priceTable);
+    cacheSaved += pm.cached / 1e6 * Math.max(0, (p.input || 0) - (p.cached || 0));
+  }
+  const avgCost = agg.grand.count ? agg.grand.cost / agg.grand.count : 0;
   const cards = [
     ['调用次数', agg.grand.count],
     ['输入 token', fmt(agg.grand.input)],
@@ -436,9 +483,10 @@ function render() {
     ['缓存命中', fmt(agg.grand.cached)],
     ['总 token', fmt(agg.grand.total)],
     ['总费用', fmtCost(agg.grand.cost)],
+    ['单次均费', fmtCost(avgCost)],
+    ['缓存省下', fmtCost(cacheSaved)],
   ];
   cards.forEach(function(c) { const d = document.createElement('div'); d.className = 'card'; d.innerHTML = '<div class="k">'+c[0]+'</div><div class="v">'+c[1]+'</div>'; s.appendChild(d); });
-  document.getElementById('lineMetric').textContent = STATE.metric === 'cost' ? '费用(USD)' : 'Token';
 
   const days = Object.keys(agg.perDay).sort();
   const models = Object.keys(agg.perModel).sort(function(a, b) { return agg.perModel[b].total - agg.perModel[a].total; });
@@ -448,7 +496,7 @@ function render() {
     return { label: m, data: days.map(function(d) {
       const v = agg.perDay[d][m];
       if (!v) return 0;
-      return STATE.metric === 'cost' ? Number((v.cost||0).toFixed(6)) : (v.total||0);
+      return STATE.lineMetric === 'cost' ? Number((v.cost||0).toFixed(6)) : (v.total||0);
     }), borderWidth: 2, tension: 0.3, pointRadius: 2, borderColor: color(i), backgroundColor: color(i) };
   });
   lineChart = new Chart(document.getElementById('line'), {
@@ -458,20 +506,72 @@ function render() {
   });
 
   if (pieChart) pieChart.destroy();
-  const pieLabels = models.filter(function(m) { return agg.perModel[m].cost > 0; });
-  const pieData = pieLabels.map(function(m) { return Number((agg.perModel[m].cost||0).toFixed(6)); });
+  const pieField = STATE.pieMetric === 'cost' ? 'cost' : 'total';
+  const pieLabels = models.filter(function(m) { return (agg.perModel[m][pieField] || 0) > 0; });
+  const pieVal = function(m) {
+    return STATE.pieMetric === 'cost' ? Number((agg.perModel[m].cost||0).toFixed(6)) : (agg.perModel[m].total||0);
+  };
+  const pieData = pieLabels.map(pieVal);
+  const pieIsCost = STATE.pieMetric === 'cost';
   pieChart = new Chart(document.getElementById('pie'), {
     type: 'doughnut',
     data: { labels: pieLabels.length ? pieLabels : models, datasets: [{ data: pieLabels.length ? pieData : models.map(function(m){return 1;}), backgroundColor: models.map(function(_, i){return color(i);}) }] },
-    options: { responsive: true, plugins: { legend: { position: 'right' } }, cutout: '45%' }
+    options: { responsive: true, cutout: '45%', plugins: { legend: { position: 'right' },
+      tooltip: { callbacks: { label: function(ctx) {
+        const arr = ctx.dataset.data || [];
+        let total = 0; for (let i = 0; i < arr.length; i++) total += Number(arr[i]) || 0;
+        const v = Number(ctx.parsed) || 0;
+        const pct = total > 0 ? (v / total * 100).toFixed(1) : '0.0';
+        const valStr = pieIsCost ? fmtCost(v) : fmt(v) + ' token';
+        return (ctx.label || '') + ': ' + valStr + ' (' + pct + '%)';
+      } } } } }
   });
 
+  // 明细表按用户选择的列排序（独立于图表；图表始终按 total 排以稳定配色）
+  const tableModels = sortModels(models, agg).filter(function(m) {
+    const f = (STATE.tableFilter || '').toLowerCase();
+    return !f || m.toLowerCase().indexOf(f) >= 0;
+  });
+  document.querySelectorAll('#tbl th.sortable').forEach(function(th) {
+    th.classList.remove('asc', 'desc');
+    if (th.getAttribute('data-sort') === STATE.sortKey) th.classList.add(STATE.sortDir);
+  });
+  document.getElementById('tblCount').textContent =
+    '（显示 ' + tableModels.length + ' / 共 ' + models.length + ' 模型）';
+  const gt = agg.grand.total || 0;
   const tb = document.querySelector('#tbl tbody'); tb.innerHTML = '';
-  models.forEach(function(m) {
+  tableModels.forEach(function(m) {
     const pm = agg.perModel[m]; const p = modelPrice(m, STATE.priceTable);
+    const share = gt > 0 ? (pm.total / gt * 100).toFixed(1) + '%' : '—';
+    const avg = pm.count ? pm.cost / pm.count : 0;
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td class="l">'+m+'</td><td>'+pm.count+'</td><td>'+fmt(pm.input)+'</td><td>'+fmt(pm.output)+'</td><td>'+fmt(pm.cached)+'</td><td>'+fmt(pm.reasoning)+'</td><td>'+fmt(pm.total)+'</td><td>'+fmtCost(pm.cost)+'</td><td>$'+p.input+'/M·$'+p.output+'/M·$'+p.cached+'/M</td>';
+    tr.innerHTML = '<td class="l">'+esc(m)+'</td><td>'+pm.count+'</td><td>'+fmt(pm.input)+'</td><td>'+fmt(pm.output)+'</td><td>'+fmt(pm.cached)+'</td><td>'+fmt(pm.reasoning)+'</td><td>'+fmt(pm.total)+'</td><td>'+share+'</td><td>'+fmtCost(pm.cost)+'</td><td>'+fmtCost(avg)+'</td><td>$'+p.input+'/M·$'+p.output+'/M·$'+p.cached+'/M</td>';
     tb.appendChild(tr);
+  });
+  // 合计行：始终为当前时间段全部模型（不随筛选变化）
+  const g = agg.grand;
+  const gAvg = g.count ? g.cost / g.count : 0;
+  const tf = document.querySelector('#tbl tfoot'); tf.innerHTML = '';
+  const ftr = document.createElement('tr');
+  ftr.className = 'total-row';
+  ftr.innerHTML = '<td class="l">合计（全部 '+models.length+' 模型）</td><td>'+g.count+'</td><td>'+fmt(g.input)+'</td><td>'+fmt(g.output)+'</td><td>'+fmt(g.cached)+'</td><td>'+fmt(g.reasoning)+'</td><td>'+fmt(g.total)+'</td><td>100%</td><td>'+fmtCost(g.cost)+'</td><td>'+fmtCost(gAvg)+'</td><td>—</td>';
+  tf.appendChild(ftr);
+}
+
+// 明细表排序：占比与总 token 同序；单次均费 = 费用/调用次数
+function sortModels(models, agg) {
+  function sortVal(name, m) {
+    const pm = agg.perModel[m];
+    if (name === 'model') return m.toLowerCase();
+    if (name === 'share') return pm.total || 0;
+    if (name === 'avgcost') return pm.count ? pm.cost / pm.count : 0;
+    return pm[name] || 0;
+  }
+  return models.slice().sort(function(a, b) {
+    const va = sortVal(STATE.sortKey, a), vb = sortVal(STATE.sortKey, b);
+    if (va < vb) return STATE.sortDir === 'asc' ? -1 : 1;
+    if (va > vb) return STATE.sortDir === 'asc' ? 1 : -1;
+    return 0;
   });
 }
 
@@ -488,12 +588,84 @@ function bindChange() {
   STATE.startMs = fromLocalInput(document.getElementById('start').value);
   STATE.endMs = fromLocalInput(document.getElementById('end').value);
   STATE.autoMerge = document.getElementById('autoMerge').checked;
-  STATE.metric = document.getElementById('metric').value;
   render();
 }
-['start', 'end', 'autoMerge', 'metric'].forEach(function(id) {
+['start', 'end', 'autoMerge'].forEach(function(id) {
   document.getElementById(id).addEventListener('change', bindChange);
 });
+
+// 每张图右上角的 Token / 费用 独立开关
+function bindSeg(segId, stateKey) {
+  const seg = document.getElementById(segId);
+  function sync() {
+    seg.querySelectorAll('button').forEach(function(b) {
+      b.classList.toggle('active', b.getAttribute('data-metric') === STATE[stateKey]);
+    });
+  }
+  seg.querySelectorAll('button').forEach(function(b) {
+    b.addEventListener('click', function() {
+      STATE[stateKey] = b.getAttribute('data-metric');
+      sync();
+      render();
+    });
+  });
+  sync();
+}
+bindSeg('lineSeg', 'lineMetric');
+bindSeg('pieSeg', 'pieMetric');
+
+// 明细表列头点击排序：同列再点切换升/降序
+document.querySelectorAll('#tbl th.sortable').forEach(function(th) {
+  th.addEventListener('click', function() {
+    const key = th.getAttribute('data-sort');
+    if (STATE.sortKey === key) {
+      STATE.sortDir = STATE.sortDir === 'asc' ? 'desc' : 'asc';
+    } else {
+      STATE.sortKey = key;
+      STATE.sortDir = key === 'model' ? 'asc' : 'desc';
+    }
+    render();
+  });
+});
+
+// 明细表筛选框：输入即时过滤行（不影响图表与合计行）
+document.getElementById('tblFilter').addEventListener('input', function() {
+  STATE.tableFilter = this.value || '';
+  render();
+});
+
+// 导出 CSV（与表格一致：同排序、同筛选；末尾附全部模型合计行）
+document.getElementById('exportCsv').onclick = function() {
+  const agg = aggregate();
+  const gt = agg.grand.total || 0;
+  const f = (STATE.tableFilter || '').toLowerCase();
+  const models = sortModels(Object.keys(agg.perModel), agg).filter(function(m) {
+    return !f || m.toLowerCase().indexOf(f) >= 0;
+  });
+  const q = function(s) { return '"' + String(s).replace(/"/g, '""') + '"'; };
+  const rows = [['模型', '调用', '输入', '输出(含思考)', '缓存', '其中思考', '总计',
+                 '总token占比', '费用USD', '单次均费USD', '输入单价', '输出单价', '缓存单价']];
+  models.forEach(function(m) {
+    const pm = agg.perModel[m], p = modelPrice(m, STATE.priceTable);
+    const share = gt > 0 ? (pm.total / gt * 100).toFixed(2) + '%' : '';
+    const avg = pm.count ? (pm.cost / pm.count) : 0;
+    rows.push([m, pm.count, pm.input, pm.output, pm.cached, pm.reasoning, pm.total,
+               share, (pm.cost || 0).toFixed(6), avg.toFixed(6), p.input, p.output, p.cached]);
+  });
+  const gAvg = agg.grand.count ? (agg.grand.cost / agg.grand.count) : 0;
+  rows.push(['合计(全部模型)', agg.grand.count, agg.grand.input, agg.grand.output, agg.grand.cached,
+             agg.grand.reasoning, agg.grand.total, '100%', (agg.grand.cost || 0).toFixed(6),
+             gAvg.toFixed(6), '', '', '']);
+  const csv = rows.map(function(r) { return r.map(q).join(','); }).join('\r\n');
+  // 加 BOM，Excel 才不乱码中文
+  const blob = new Blob(['﻿' + csv], {type: 'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'token_stats_' + dayKey(Date.now()) + '.csv';
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a); URL.revokeObjectURL(url);
+};
 
 function setRangeDays(n) {
   const now = Date.now();
@@ -521,7 +693,7 @@ function renderMergeTable() {
   const tb = document.querySelector('#mergeTable tbody'); tb.innerHTML = '';
   Object.keys(STATE.mergeMap).forEach(function(canon) {
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td><input class="mname" value="'+canon+'"></td><td><input style="width:100%" value="'+STATE.mergeMap[canon].join(', ')+'"></td><td><button class="btn ghost" data-del="1">✕</button></td>';
+    tr.innerHTML = '<td><input class="mname" value="'+esc(canon)+'"></td><td><input style="width:100%" value="'+esc(STATE.mergeMap[canon].join(', '))+'"></td><td><button class="btn ghost" data-del="1">✕</button></td>';
     tr.querySelector('[data-del]').onclick = function() { delete STATE.mergeMap[canon]; renderMergeTable(); };
     tb.appendChild(tr);
   });
@@ -550,7 +722,7 @@ function renderPriceTable() {
   Object.keys(STATE.priceTable).forEach(function(m) {
     const p = STATE.priceTable[m];
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td><input class="mname" value="'+m+'"></td><td><input type="number" step="0.01" value="'+p.input+'"></td><td><input type="number" step="0.01" value="'+p.output+'"></td><td><input type="number" step="0.01" value="'+p.cached+'"></td><td><button class="btn ghost" data-del="1">✕</button></td>';
+    tr.innerHTML = '<td><input class="mname" value="'+esc(m)+'"></td><td><input type="number" step="0.01" value="'+p.input+'"></td><td><input type="number" step="0.01" value="'+p.output+'"></td><td><input type="number" step="0.01" value="'+p.cached+'"></td><td><button class="btn ghost" data-del="1">✕</button></td>';
     tr.querySelector('[data-del]').onclick = function() { delete STATE.priceTable[m]; renderPriceTable(); };
     tb.appendChild(tr);
   });
@@ -607,9 +779,16 @@ def build_token_stats_html(
     metric = options.get('metric', 'token') or 'token'
     gen_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    records_json = json.dumps(records, ensure_ascii=False)
-    price_json = json.dumps(price_table, ensure_ascii=False)
-    merge_json = json.dumps(merge_map, ensure_ascii=False)
+    # 直嵌进 <script>：转义 < > 防冲破标签，转义 U+2028/2029（JSON 合法但 JS 字符串字面量非法）。
+    # 模型名来自不可信上游，可能带任意字符。
+    def _embed(obj: Any) -> str:
+        return (json.dumps(obj, ensure_ascii=False)
+                .replace('<', '\\u003c').replace('>', '\\u003e')
+                .replace('\u2028', '\\u2028').replace('\u2029', '\\u2029'))
+
+    records_json = _embed(records)
+    price_json = _embed(price_table)
+    merge_json = _embed(merge_map)
 
     start_ms = 'null' if start is None else int(start * 1000)
     end_ms = 'null' if end is None else int(end * 1000)
@@ -618,8 +797,6 @@ def build_token_stats_html(
 
     auto_merge_chk = 'checked' if auto_merge else ''
     auto_merge_js = 'true' if auto_merge else 'false'
-    m_token_sel = 'selected' if metric == 'token' else ''
-    m_cost_sel = 'selected' if metric == 'cost' else ''
     metric_js = json.dumps(metric)
 
     html_doc = (
@@ -629,8 +806,6 @@ def build_token_stats_html(
         .replace('__START_ISO__', start_iso)
         .replace('__END_ISO__', end_iso)
         .replace('__AUTO_MERGE__', auto_merge_chk)
-        .replace('__M_TOKEN__', m_token_sel)
-        .replace('__M_COST__', m_cost_sel)
         .replace('__RECORDS_JSON__', records_json)
         .replace('__PRICE_JSON__', price_json)
         .replace('__MERGE_JSON__', merge_json)
@@ -711,14 +886,24 @@ async def cmd_token_stats(update, context):
         fname = f"token_stats{period}.html"
         first = datetime.fromtimestamp(info['first']).strftime('%Y-%m-%d')
         last = datetime.fromtimestamp(info['last']).strftime('%Y-%m-%d')
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=io.BytesIO(data),
-            filename=fname,
-            caption=(f"📊 Token 统计报表（交互式）\n"
-                     f"共 {info['count']} 条记录 · 时间跨度 {first} ~ {last}\n"
-                     f"打开网页后可在页面内调整时间段/合并/指标/价格表"),
+        export_info = ArtifactManager.save_export(fname, data)
+        await GlobalRecorder.record_system_message(
+            f"已生成 Token 统计报表（{info['count']} 条记录，{first} ~ {last}）。\n"
+            f"服务器文件路径：{export_info['abs_path']}（{export_info['size']} bytes）",
+            update.effective_chat.id,
+            metadata={'display_media': [
+                display_media_reference(export_info['abs_path'], fname),
+            ]},
         )
+        with open(export_info['abs_path'], 'rb') as export_file:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=export_file,
+                filename=fname,
+                caption=(f"📊 Token 统计报表（交互式）\n"
+                         f"共 {info['count']} 条记录 · 时间跨度 {first} ~ {last}\n"
+                         f"打开网页后可在页面内调整时间段/合并/指标/价格表"),
+            )
         await status.delete()
         await GlobalRecorder.record_system_op(f"导出 Token 统计报表 ({info['count']} 条)")
     except Exception as e:

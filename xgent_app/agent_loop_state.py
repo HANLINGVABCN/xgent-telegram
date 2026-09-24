@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Mapping, Optional
 #   shellkill           会话不存在时 _get() 抛 KeyError，被 except 兜成 success: False
 #   file / file_base64  失败走执行分支自己的 except，在那里显式否决
 #
-# read 和 stdin / shellread 刻意不在名单里：read 的异常分支返回的 dict 根本没有
+# read 和 stdin 刻意不在名单里：read 的异常分支返回的 dict 根本没有
 # success 键，_normalize 默认补 True；shell 系的 _format_result 恒返回 True。
 # 拿它们当判据等于把失败当成功放过去——那正是 over 唯一不能犯的错。
 OVER_ELIGIBLE_TYPES = frozenset({"run", "edit", "shellkill", "file", "file_base64"})

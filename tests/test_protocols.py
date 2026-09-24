@@ -22,12 +22,12 @@ class ProtocolParserTests(unittest.TestCase):
             "先说明\n"
             f"{protocol_block('run-x', 'echo ok', NONCE_A)}\n"
             "中间文字\n"
-            f"{protocol_block('read-x:/tmp/demo.txt:1-3', '', NONCE_B)}\n"
+            f"{protocol_block('read-x', '/tmp/demo.txt:1-3', NONCE_B)}\n"
         )
         blocks = ProtocolParser.extract_protocol_blocks(response)
         self.assertEqual(["run", "read"], [block["type"] for block in blocks])
         self.assertEqual("echo ok", blocks[0]["body"])
-        self.assertEqual("/tmp/demo.txt:1-3", blocks[1]["path"])
+        self.assertEqual("/tmp/demo.txt:1-3", blocks[1]["body"])
 
     def test_search_and_fetch_blocks_keep_multiline_body(self):
         # 反斜杠不能出现在 f-string 表达式里（Python 3.12 前）。
@@ -168,12 +168,10 @@ class ProtocolParserTests(unittest.TestCase):
             ("run-x", "echo ok", "run", "", "echo ok"),
             ("shell-x", "sleep 1", "shell", "", "sleep 1"),
             ("stdin-x:shell_1", "line: echo ok", "stdin", "shell_1", "line: echo ok"),
-            ("shellread-x:shell_1", "check", "shellread", "shell_1", "check"),
             ("shellkill-x:shell_1", "done", "shellkill", "shell_1", "done"),
-            ("trigger-x:show", "", "trigger", "show", ""),
+            ("intel-x", "callers foo .", "intel", "", "callers foo ."),
             ("sendfile-x", "/tmp/demo.txt", "sendfile", "", "/tmp/demo.txt"),
             ("read-x", "/tmp/demo.txt:1-2", "read", "", "/tmp/demo.txt:1-2"),
-            ("read-x:/tmp/demo.txt:1-2", "", "read", "/tmp/demo.txt:1-2", ""),
             ("edit-x", "edit body", "edit", "", "edit body"),
             ("grep-x", "grep body", "grep", "", "grep body"),
             ("media-x", "draw image", "media", "", "draw image"),
@@ -189,6 +187,27 @@ class ProtocolParserTests(unittest.TestCase):
                 self.assertEqual(expected_type, block["type"])
                 self.assertEqual(expected_path, block["path"])
                 self.assertEqual(expected_body, block["body"])
+
+    def test_shellread_tag_no_longer_executes(self):
+        # shellread-x 已并入 stdin-x（空 body / 只 wait 即纯读）；旧写法不得再执行。
+        response = protocol_block("shellread-x:shell_1", "读取原因", NONCE_A)
+        self.assertEqual([], ProtocolParser.extract_protocol_blocks(response))
+        self.assertEqual(response, ProtocolParser.strip_protocol_blocks(response))
+
+    def test_read_x_fence_line_path_no_longer_executes(self):
+        # read-x 路径统一写正文；围栏行写路径的旧写法不再被识别为协议。
+        response = protocol_block("read-x:/tmp/demo.txt:1-2", "", NONCE_A)
+        self.assertEqual([], ProtocolParser.extract_protocol_blocks(response))
+        self.assertEqual(response, ProtocolParser.strip_protocol_blocks(response))
+
+    def test_read_x_body_path_still_executes(self):
+        # 正文写路径是唯一保留的 read-x 写法，必须照常解析。
+        block = ProtocolParser.extract_protocol_blocks(
+            protocol_block("read-x", "/tmp/demo.txt:1-2", NONCE_A)
+        )[0]
+        self.assertEqual("read", block["type"])
+        self.assertEqual("", block["path"])
+        self.assertEqual("/tmp/demo.txt:1-2", block["body"])
 
     def test_begin_and_end_nonce_must_match(self):
         response = (
@@ -362,6 +381,113 @@ class FenceLineShapeTests(unittest.TestCase):
         # 标签后面还有别的东西 -> 不是协议围栏行，别猜。
         response = f"```run-x 顺便说一句\n<<BEGIN_{self.NONCE}\necho ok\n<<END_{self.NONCE}\n```"
         self.assertEqual([], ProtocolParser.extract_protocol_blocks(response))
+
+
+class RedactProtocolBlocksTests(unittest.TestCase):
+    def test_single_block_folds_to_one_line(self):
+        response = protocol_block("run-x", "df -h\ndu -sh /var", NONCE_A)
+        out = ProtocolParser.redact_protocol_blocks(response)
+        self.assertEqual(1, len(out.splitlines()))
+        self.assertIn("🔧", out)
+        self.assertIn("run", out)
+        self.assertIn("2 行已折叠", out)
+        self.assertNotIn("df -h", out)
+        self.assertNotIn("<<BEGIN_", out)
+        self.assertNotIn("```", out)
+
+    def test_edit_block_placeholder_includes_path(self):
+        response = protocol_block("edit-x:/etc/app/config.py", "old\nnew", NONCE_A)
+        out = ProtocolParser.redact_protocol_blocks(response)
+        self.assertIn("📝", out)
+        self.assertIn("/etc/app/config.py", out)
+        self.assertNotIn("old", out)
+
+    def test_prose_preserved_blocks_each_one_line(self):
+        response = (
+            "先看磁盘：\n"
+            f"{protocol_block('run-x', 'df -h', NONCE_A)}\n"
+            "再读配置：\n"
+            f"{protocol_block('read-x', '/tmp/a.txt', NONCE_B)}\n"
+            "完成。"
+        )
+        out = ProtocolParser.redact_protocol_blocks(response)
+        self.assertIn("先看磁盘：", out)
+        self.assertIn("再读配置：", out)
+        self.assertIn("完成。", out)
+        self.assertNotIn("df -h", out)
+        self.assertNotIn("/tmp/a.txt", out)
+        self.assertEqual(2, out.count("行已折叠"))
+
+    def test_plain_code_fence_untouched(self):
+        response = "示例：\n```python\nprint('hi')\n```\n讲完了。"
+        self.assertEqual(response, ProtocolParser.redact_protocol_blocks(response))
+
+    def test_hide_unclosed_true_folds_in_progress_tail(self):
+        response = (
+            "开始执行：\n"
+            f"```run-x\n<<BEGIN_{NONCE_A}\nfor i in range(100):\n    print(i)"
+        )
+        out = ProtocolParser.redact_protocol_blocks(response, hide_unclosed=True)
+        self.assertIn("开始执行：", out)
+        self.assertIn("生成中", out)
+        self.assertIn("🔧", out)
+        self.assertNotIn("range(100)", out)
+        self.assertNotIn("<<BEGIN_", out)
+
+    def test_hide_unclosed_false_keeps_truncated_tail_raw(self):
+        # 防「全文折叠」回归：定稿遇未闭合/截断块，原样保留、不折叠。
+        response = (
+            "开始执行：\n"
+            f"```run-x\n<<BEGIN_{NONCE_A}\nfor i in range(100):\n    print(i)"
+        )
+        out = ProtocolParser.redact_protocol_blocks(response, hide_unclosed=False)
+        self.assertEqual(response, out)
+        self.assertNotIn("生成中", out)
+        self.assertNotIn("行已折叠", out)
+
+    def test_hide_unclosed_false_folds_closed_but_keeps_truncated_tail(self):
+        response = (
+            f"{protocol_block('run-x', 'echo done', NONCE_A)}\n"
+            "然后继续：\n"
+            f"```edit-x:/a.py\n<<BEGIN_{NONCE_B}\nprint('unfinished')"
+        )
+        out = ProtocolParser.redact_protocol_blocks(response, hide_unclosed=False)
+        self.assertIn("行已折叠", out)
+        self.assertNotIn("echo done", out)
+        self.assertIn("print('unfinished')", out)
+        self.assertIn("<<BEGIN_", out)
+        self.assertNotIn("生成中", out)
+
+    def test_bare_fence_without_begin_not_folded(self):
+        response = "```run-x\ndf -h\n```"
+        self.assertEqual(response, ProtocolParser.redact_protocol_blocks(response, hide_unclosed=True))
+        self.assertEqual(response, ProtocolParser.redact_protocol_blocks(response, hide_unclosed=False))
+
+    def test_idempotent(self):
+        response = (
+            "文字\n"
+            f"{protocol_block('run-x', 'echo ok', NONCE_A)}\n"
+            f"{protocol_block('shell-x', 'ls -la', NONCE_B)}\n"
+            "尾巴"
+        )
+        once = ProtocolParser.redact_protocol_blocks(response)
+        self.assertEqual(once, ProtocolParser.redact_protocol_blocks(once))
+
+    def test_empty_and_no_block_input_unchanged(self):
+        self.assertEqual("", ProtocolParser.redact_protocol_blocks(""))
+        plain = "就是一段普通文字\n没有任何协议块\n\n结束"
+        self.assertEqual(plain, ProtocolParser.redact_protocol_blocks(plain))
+
+    def test_consecutive_blanks_collapsed_after_fold(self):
+        response = (
+            "上文\n\n"
+            f"{protocol_block('run-x', 'echo ok', NONCE_A)}\n\n\n"
+            "下文"
+        )
+        out = ProtocolParser.redact_protocol_blocks(response)
+        self.assertNotIn("\n\n\n", out)
+        self.assertIn("上文", out)
+        self.assertIn("下文", out)
 
 
 if __name__ == "__main__":

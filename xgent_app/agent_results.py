@@ -15,6 +15,7 @@ from xgent_app.agent_context import (
     build_edit_context_message,
     build_fetch_context_message,
     build_grep_context_message,
+    build_intel_context_message,
     build_read_context_message,
     build_run_context_message,
     build_search_context_message,
@@ -102,6 +103,18 @@ def normalize_grep_result(raw: Mapping[str, Any]) -> AgentOperationResult:
     )
 
 
+def normalize_intel_result(raw: Mapping[str, Any]) -> AgentOperationResult:
+    """Normalize a code-intel analysis result (plain text → context)."""
+    notice = str(raw.get("output") or raw.get("notice") or "")
+    return _normalize(
+        raw,
+        kind="intel",
+        notice=notice,
+        output=notice,
+        context_message=build_intel_context_message(notice),
+    )
+
+
 def normalize_run_result(raw: Mapping[str, Any]) -> AgentOperationResult:
     """Normalize a run executor result and preserve its detailed fields."""
     notice = build_run_notice(dict(raw))
@@ -147,6 +160,7 @@ def failed_result(kind: str, message: str) -> AgentOperationResult:
         "grep": build_grep_context_message,
         "search": build_search_context_message,
         "fetch": build_fetch_context_message,
+        "intel": build_intel_context_message,
     }
     build = builders.get(kind, build_run_context_message)
     return _normalize(

@@ -23,6 +23,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import socketserver
 import threading
 import time
@@ -64,7 +65,7 @@ VENDOR_ASSETS: Dict[str, Any] = {
 }
 
 # SSE 心跳间隔。低于常见反代的 60s 空闲超时。
-SSE_HEARTBEAT_SECONDS = 25.0
+SSE_HEARTBEAT_SECONDS = 10.0
 
 
 class WebChatConfig:
@@ -96,6 +97,8 @@ class WebChatConfig:
         is_web_enabled: Optional[Callable[[], bool]] = None,
         media_allowed_roots: Optional[List[str]] = None,
         read_health: Optional[Callable[[], Any]] = None,
+        read_history_message: Optional[Callable[[int], Any]] = None,
+        submit_ui_callback: Optional[Callable[[str, int, str, WebOutbox], Any]] = None,
     ):
         self.host = host
         self.port = port
@@ -106,6 +109,7 @@ class WebChatConfig:
         self.submit_message = submit_message
         # 网页按钮 / 命令路由。可选，保留向后兼容（旧测试构造 WebChatConfig 时不传）。
         self.submit_callback = submit_callback or (lambda *a: None)
+        self.submit_ui_callback = submit_ui_callback
         self.submit_command = submit_command or (lambda *a: None)
         # 网页文件上传。可选：旧构造路径不传时回退为占位（没人会调到，因为
         # /api/upload 路由只在 idle 注入了真实回放时才注册语义）。
@@ -125,6 +129,7 @@ class WebChatConfig:
         # run_coroutine_threadsafe 就白搭了。
         self.read_health = read_health or (lambda: {})
         self.read_history = read_history
+        self.read_history_message = read_history_message
         self.read_settings = read_settings
         self.write_setting = write_setting
         self.request_stop = request_stop
@@ -164,7 +169,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         for key, value in (extra_headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
-        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+        with contextlib.suppress(ConnectionError):
             self.wfile.write(raw)
         if status != 200 and getattr(self, "command", "") == "POST":
             with contextlib.suppress(Exception):
@@ -349,15 +354,19 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._handle_health()
             elif path == "/api/history":
                 self._handle_history()
+            elif path.startswith("/api/history/media/"):
+                self._handle_history_media(path[len("/api/history/media/"):])
             elif path == "/api/config":
                 self._handle_read_config()
             elif path == "/api/stream":
                 self._handle_stream()
+            elif path == "/api/events":
+                self._handle_events()
             elif path == "/api/term/output":
                 self._handle_term_output()
             else:
                 self._send_json({"error": "not found"}, status=404)
-        except (BrokenPipeError, ConnectionResetError):
+        except ConnectionError:
             pass
         except Exception:
             logger.exception("web GET %s 失败", path)
@@ -555,7 +564,32 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             limit_val = 0
         limit = limit_val if limit_val > 0 else 1000000
         messages = self._run_coro(self.config.read_history(limit))
-        self._send_json({"messages": messages})
+        self._send_json(
+            {"messages": messages, "busy": bool(self.config.is_busy()),
+             "ui_generation": getattr(messages, "generation", None),
+             "ui_tombstones": getattr(messages, "tombstones", [])},
+            extra_headers={"Cache-Control": "no-store"},
+        )
+
+    def _handle_history_media(self, reference: str) -> None:
+        if not self._require_auth() or not self._require_web_enabled():
+            return
+        match = re.fullmatch(r"([1-9]\d{0,18})/(\d{1,19})", reference)
+        if (not match or int(match[1]) > 2**63 - 1
+                or self.config.read_history_message is None):
+            self._send_json({"error": "附件关联不存在"}, status=404)
+            return
+        message = self._run_coro(self.config.read_history_message(int(match[1])))
+        media = message.get("media", []) if message else []
+        index = int(match[2])
+        if index >= len(media):
+            self._send_json({"error": "附件关联不存在或记忆已清空"}, status=404)
+            return
+        item = media[index]
+        if item.get("error") or not item.get("path"):
+            self._send_json({"error": item.get("error") or "附件不可用"}, status=404)
+            return
+        self._serve_media_file(item["path"], item["filename"], item["mime_type"])
 
     def _handle_read_config(self) -> None:
         if not self._require_auth():
@@ -646,6 +680,22 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         data = self._read_json()
         if data is None:
             return
+        outbox = self.server.outbox  # type: ignore[attr-defined]
+        if any(key in data for key in ('ui_message_id', 'revision', 'button_id')):
+            ui_message_id = data.get('ui_message_id')
+            revision = data.get('revision')
+            button_id = data.get('button_id')
+            if (not isinstance(ui_message_id, str) or not re.fullmatch(r'[a-f0-9]{32}', ui_message_id)
+                    or type(revision) is not int or not 0 < revision < 2**63
+                    or not isinstance(button_id, str) or not re.fullmatch(r'\d{1,5}:\d{1,5}', button_id)):
+                self._send_json({'error': '菜单关联无效，请重新打开菜单。'}, status=400)
+                return
+            if self.config.submit_ui_callback is None:
+                self._send_json({'error': '菜单已失效，请重新打开菜单。'}, status=409)
+                return
+            self.config.submit_ui_callback(ui_message_id, revision, button_id, outbox)
+            self._send_json({'ok': True})
+            return
         callback_data = str(data.get("callback_data") or "")
         if not callback_data:
             self._send_json({"error": "缺少 callback_data"}, status=400)
@@ -655,7 +705,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             message_id = 0
 
-        outbox = self.server.outbox  # type: ignore[attr-defined]
         self.config.submit_callback(callback_data, message_id, outbox)
         self._send_json({"ok": True})
 
@@ -679,36 +728,53 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.config.submit_command(command, outbox)
         self._send_json({"ok": True})
 
+    def _handle_events(self) -> None:
+        if not self._require_auth() or not self._require_web_enabled():
+            return
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        raw_cursor = (query.get('after') or [None])[0]
+        if raw_cursor is not None and not re.fullmatch(r'\d{1,16}', raw_cursor):
+            self._send_json({'error': 'invalid event cursor'}, status=400)
+            return
+        epoch = (query.get('epoch') or [''])[0]
+        payload = self.server.outbox.read_events(  # type: ignore[attr-defined]
+            int(raw_cursor) if raw_cursor is not None else None, epoch,
+        )
+        self._send_json(payload, extra_headers={'Cache-Control': 'private, no-store, no-transform'})
+
     def _handle_stream(self) -> None:
         if not self._require_auth():
             return
         if not self._require_web_enabled():
             return
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        # 反代缓冲会让 SSE 完全失效（帧攒着不发）。
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
-
         outbox = self.server.outbox  # type: ignore[attr-defined]
         stop_event = self.server.shutdown_event  # type: ignore[attr-defined]
         try:
             # 每条连接一个独立订阅：帧是广播给所有连接的，不是被谁抢走一份。
             # 退出 with 时自动摘除，死连接不会继续占着广播位。
-            with outbox.subscribe() as stream:
+            with outbox.subscribe(numbered=True) as stream:
+                # 浏览器收到连接就绪后才请求历史；此时订阅必须已经建立。
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "private, no-store, no-transform")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                ready = json.dumps({'epoch': stream.epoch, 'cursor': stream.cursor})
+                self.wfile.write(f"event: ready\ndata: {ready}\n\n".encode('utf-8'))
+                self.wfile.flush()
                 while not stop_event.is_set():
                     frame = stream.get(timeout=SSE_HEARTBEAT_SECONDS)
                     if frame is None:
-                        # 超时或队列关闭：发注释行保活，顺便探测连接是否还在。
-                        self.wfile.write(b": ping\n\n")
+                        # 超时或队列关闭：发送可观察的心跳，检测代理是否仍在转发。
+                        self.wfile.write(b"event: ping\ndata: {}\n\n")
                         self.wfile.flush()
                         continue
-                    payload = json.dumps(frame, ensure_ascii=False)
-                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                    payload = json.dumps(frame['frame'], ensure_ascii=False)
+                    event_id = f"{frame['epoch']}:{frame['id']}"
+                    self.wfile.write(f"id: {event_id}\ndata: {payload}\n\n".encode("utf-8"))
                     self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, ValueError):
+        except (ConnectionError, ValueError):
             # 浏览器关页面就是这条路径，属正常。
             pass
 
@@ -729,11 +795,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _handle_media_resolve(self) -> None:
         """按服务器路径换一个下载 token（POST /api/media/resolve）。
 
-        为什么需要它：媒体帧里的 download_url 只在当前进程生命周期内有效，
-        而且刷新后 /api/history 只回文本——但每条媒体操作入库的文本都带着
-        服务器绝对路径（"已保存到 x""已发送服务器文件给用户: x"）。前端刷新
-        时从历史文本里挖出路径，来这里换一个**新** token，媒体卡片因此跨
-        刷新、跨进程重启都能恢复。
+        保留旧客户端的路径换 token 接口。当前网页历史使用记录关联的
+        /api/history/media/<record_id>/<index>，不再从聊天正文推断路径。
 
         信任边界：不是任意路径读取。只接受 media_allowed_roots（本应用自己
         的数据目录：xgent_storage、agent workspace）之内的**已存在文件**，
@@ -797,45 +860,66 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         要求登录（和其它 /api/* 一致）——这不是公开静态资源，是用户自己的
         聊天内容。token 本身只在当前进程内存里有效，重启后全部失效。
         """
-        if not self._require_auth():
+        if not self._require_auth() or not self._require_web_enabled():
             return
         entry = MEDIA_TOKEN_REGISTRY.resolve(token)
         if entry is None:
             self._send_json({"error": "not found"}, status=404)
             return
         abs_path, filename, mime_type = entry
+        self._serve_media_file(abs_path, filename, mime_type)
+
+    def _serve_media_file(self, abs_path: str, filename: str, mime_type: str) -> None:
         try:
-            size = os.path.getsize(abs_path)
+            handle = open(abs_path, "rb")
         except OSError:
             self._send_json({"error": "file missing"}, status=404)
             return
-
-        # inline 让 <video>/<audio> 标签能直接播放、<img> 能直接显示；
-        # 其余类型保持 attachment，浏览器落盘而不是尝试内联执行。
-        inline_mime = mime_type.startswith(("image/", "video/", "audio/", "text/"))
-        disposition = "inline" if inline_mime else "attachment"
-        # RFC 5987 编码文件名，兼容非 ASCII 文件名（中文文件名很常见）。
-        quoted_name = urllib.parse.quote(filename)
-        self.send_response(200)
-        self.send_header("Content-Type", mime_type)
-        self.send_header("Content-Length", str(size))
-        self.send_header("Content-Disposition", f"{disposition}; filename*=UTF-8''{quoted_name}")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Cache-Control", "private, max-age=3600")
-        self.end_headers()
-        try:
-            # 流式分块读写：视频等大文件不能一次性 read() 进内存，否则一个
-            # 大文件下载就能把工作线程内存打爆（和 _read_multipart 的 50MB
-            # 量级完全不是一个数量级，这里必须流式处理）。
-            with open(abs_path, "rb") as handle:
-                while True:
-                    chunk = handle.read(65536)
+        with handle:
+            size = os.fstat(handle.fileno()).st_size
+            start, end, partial = 0, size - 1, False
+            range_header = self.headers.get("Range")
+            if range_header:
+                match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header)
+                if match and (match[1] or match[2]):
+                    start = int(match[1]) if match[1] else max(0, size - int(match[2]))
+                    end = min(size - 1, int(match[2])) if match[1] and match[2] else size - 1
+                    partial = 0 <= start <= end < size
+                if not partial:
+                    self._send_json(
+                        {"error": "invalid range"}, status=416,
+                        extra_headers={"Content-Range": f"bytes */{size}"},
+                    )
+                    return
+            if not re.fullmatch(r"[a-zA-Z0-9.+_-]+/[a-zA-Z0-9.+_-]+", mime_type):
+                mime_type = "application/octet-stream"
+            # HTML 报表与 SVG 必须下载；不能让附件脚本获得本站登录权限。
+            inline = (mime_type.startswith(("image/", "video/", "audio/"))
+                      and mime_type != "image/svg+xml")
+            disposition = "inline" if inline else "attachment"
+            quoted_name = urllib.parse.quote(filename, safe="")
+            self.send_response(206 if partial else 200)
+            self.send_header("Content-Type", mime_type)
+            self.send_header("Content-Length", str(end - start + 1))
+            self.send_header("Content-Disposition", f"{disposition}; filename*=UTF-8''{quoted_name}")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+            self.send_header("Cache-Control", "private, no-store")
+            self.send_header("Accept-Ranges", "bytes")
+            if partial:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+            try:
+                handle.seek(start)
+                remaining = end - start + 1
+                while remaining > 0:
+                    chunk = handle.read(min(65536, remaining))
                     if not chunk:
                         break
                     self.wfile.write(chunk)
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            # 浏览器中途取消下载，或文件在两次 stat/read 之间被删除，都属正常。
-            pass
+                    remaining -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
 
     def _serve_vendor_asset(self, path: str) -> None:
         """本地自带的第三方静态资源（xterm.js 等），不要求认证——与 index.html

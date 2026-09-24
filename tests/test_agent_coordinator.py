@@ -133,7 +133,7 @@ class OverProtocolTests(unittest.TestCase):
         # 这些协议的结果本身就是模型要读的东西，over 一律失效。
         for block_type in (
             "read", "grep", "search", "fetch", "media",
-            "shell", "stdin", "shellread", "trigger", "sendfile",
+            "shell", "stdin", "trigger", "sendfile",
         ):
             with self.subTest(block_type=block_type):
                 state = self._round()

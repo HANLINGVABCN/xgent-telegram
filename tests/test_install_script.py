@@ -834,12 +834,12 @@ class EnvFileTests(InstallScriptLibraryMixin, unittest.TestCase):
         # mktemp 默认落在 /tmp，跨文件系统时 mv 会退化成复制+删除，复制中途失败
         # 就把含 BOT_TOKEN 和全部 api_key 的 .env 截断且无备份。同目录才是原子
         # rename。set_ip_mode / migrate_env_key 以前各自违反过这条。
-        for name in ("env_set", "env_unset"):
+        for name in ("env_set", "env_unset", "env_comment", "env_uncomment"):
             block = INSTALL_SCRIPT[INSTALL_SCRIPT.index(f"{name}() {{"):]
             block = block[:block.index("\n}\n")]
             self.assertIn("mktemp ./.env.XXXXXX", block, name)
-        # 恰好两处，说明没有第三个函数又自己拼了一遍 .env 的写入。
-        self.assertEqual(2, INSTALL_SCRIPT.count("mktemp ./.env.XXXXXX"))
+        # 恰好四处，说明没有其他函数又自己拼了一遍 .env 的写入。
+        self.assertEqual(4, INSTALL_SCRIPT.count("mktemp ./.env.XXXXXX"))
 
     def test_socks5_proxy_value_is_cleaned_like_every_other_value(self):
         # 这个读法以前是唯一没去 \r 的：代理地址带个回车符传给 httpx，
@@ -954,6 +954,61 @@ class UninstallSafetyTests(unittest.TestCase):
         ]
         self.assertNotIn('resolve_path "$SCRIPT_DIR/venv"', guard)
         self.assertIn('basename "$resolved"', guard)
+
+
+@requires_bash_harness
+class PM2AdaptiveMemoryTests(InstallScriptLibraryMixin, unittest.TestCase):
+    def resolve(self, override=None):
+        with self.temp_dir() as temp_dir:
+            root = self.sandbox(temp_dir)
+            env = {} if override is None else {"PM2_MAX_MEMORY_RESTART": override}
+            result = self.run_lib(
+                'resolve_pm2_memory_restart\n'
+                + 'printf "%s|%s|%s\\n" "$PM2_MEMORY_RESTART" '
+                  '"$PM2_MEMORY_RESTART_SOURCE" "$PM2_MEMORY_RESTART_ENABLED"\n',
+                root,
+                env_extra=env,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            return result.stdout.strip(), result.stderr
+
+    def test_environment_override_is_preserved(self):
+        value, stderr = self.resolve("768M")
+        self.assertEqual(
+            "768M|环境变量 PM2_MAX_MEMORY_RESTART（固定覆盖）|1",
+            value,
+        )
+        self.assertEqual("", stderr)
+
+    def test_automatic_mode_uses_in_process_realtime_monitor(self):
+        value, stderr = self.resolve()
+        self.assertEqual(
+            "|进程内实时监控：每秒读取 MemAvailable 与进程 RSS，动态保留 5%|0",
+            value,
+        )
+        self.assertEqual("", stderr)
+
+    def test_automatic_mode_does_not_write_a_static_pm2_limit(self):
+        block = INSTALL_SCRIPT[
+            INSTALL_SCRIPT.index('start_with_pm2() {'):
+            INSTALL_SCRIPT.index('restart_pm2_detached() {')
+        ]
+        self.assertIn('pm2_memory_args=()', block)
+        self.assertIn('pm2 delete "$PM2_APP_NAME"', block)
+        self.assertIn('"${pm2_memory_args[@]}"', block)
+        self.assertNotIn('--max-memory-restart 1G', block)
+        self.assertNotIn('PM2_MEMORY_RESTART="0"', block)
+        self.assertIn('pm2 save', block)
+
+    def test_explicit_override_adds_pm2_static_limit(self):
+        block = INSTALL_SCRIPT[
+            INSTALL_SCRIPT.index('start_with_pm2() {'):
+            INSTALL_SCRIPT.index('restart_pm2_detached() {')
+        ]
+        self.assertIn(
+            'pm2_memory_args=(--max-memory-restart "$pm2_memory_limit")',
+            block,
+        )
 
 
 if __name__ == "__main__":

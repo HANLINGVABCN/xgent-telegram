@@ -143,6 +143,78 @@ async def _set_terminal_enabled(ns: Dict[str, Any], want: bool) -> None:
     await ns["UserDataManager"].save_config("terminal_enabled", want)
 
 
+async def _outbox_stats(ns: Dict[str, Any]) -> None:
+    """待发库与死信的概况：多少行、最老一条多久、attempts 分布、最近死因。"""
+    db = await ns["BotMemoryDB"].get_instance()
+    conn = await db._get_conn()
+    cursor = await conn.execute('''
+        SELECT channel, COUNT(*) AS n, MIN(created_at) AS oldest,
+               SUM(CASE WHEN attempts > 0 THEN 1 ELSE 0 END) AS failing,
+               MAX(attempts) AS max_attempts
+        FROM channel_outbox GROUP BY channel
+    ''')
+    rows = await cursor.fetchall()
+    if not rows:
+        print("outbox: empty")
+    for row in rows:
+        age = int(time.time() - float(row["oldest"] or time.time()))
+        print(f"outbox channel={row['channel']} rows={row['n']} oldest_age_s={age} "
+              f"failing={row['failing'] or 0} max_attempts={row['max_attempts'] or 0}")
+    cursor = await conn.execute('''
+        SELECT kind, COUNT(*) AS n FROM channel_outbox GROUP BY kind ORDER BY n DESC
+    ''')
+    for row in await cursor.fetchall():
+        print(f"  kind={row['kind']} rows={row['n']}")
+    cursor = await conn.execute(
+        'SELECT id, kind, attempts, last_error FROM channel_outbox WHERE attempts > 0 '
+        'ORDER BY attempts DESC, id ASC LIMIT 5')
+    for row in await cursor.fetchall():
+        print(f"  failing id={row['id']} kind={row['kind']} attempts={row['attempts']} "
+              f"error={(row['last_error'] or '')[:120]}")
+    dead = await db.fetch_channel_deadletters(limit=5)
+    cursor = await conn.execute('SELECT COUNT(*) AS n FROM channel_deadletter')
+    total = (await cursor.fetchone())["n"]
+    print(f"deadletter rows={total}")
+    for row in dead:
+        print(f"  dead id={row['id']} kind={row['kind']} attempts={row['attempts']} "
+              f"error={(row['last_error'] or '')[:120]}")
+
+
+async def _outbox_purge(ns: Dict[str, Any], args: list) -> int:
+    """清待发库。`outbox-purge all` 全清；`outbox-purge <小时>` 只清比这更老的。"""
+    db = await ns["BotMemoryDB"].get_instance()
+    what = (args[0] if args else "").strip().lower()
+    async with db._write() as conn:
+        if what == "all":
+            cursor = await conn.execute('DELETE FROM channel_outbox')
+        else:
+            try:
+                hours = float(what)
+            except ValueError:
+                print("用法: outbox-purge all | outbox-purge <小时>", file=sys.stderr)
+                return 2
+            cursor = await conn.execute(
+                'DELETE FROM channel_outbox WHERE created_at < ?',
+                (time.time() - hours * 3600.0,))
+        print(int(cursor.rowcount or 0))
+    return 0
+
+
+async def _deadletter(ns: Dict[str, Any], args: list) -> int:
+    db = await ns["BotMemoryDB"].get_instance()
+    what = (args[0] if args else "list").strip().lower()
+    if what == "clear":
+        print(await db.clear_channel_deadletters())
+        return 0
+    for row in await db.fetch_channel_deadletters(limit=50):
+        print(f"id={row['id']} channel={row['channel']} kind={row['kind']} "
+              f"logical_id={row['logical_id']} attempts={row['attempts']} "
+              f"dead_at={time.strftime('%m-%d %H:%M', time.localtime(float(row['dead_at'])))} "
+              f"error={(row['last_error'] or '')[:160]}")
+        print(f"    payload={str(row['payload'])[:200]}")
+    return 0
+
+
 async def _dispatch(command: str, args: list) -> int:
     ns = _load()
     try:
@@ -158,6 +230,12 @@ async def _dispatch(command: str, args: list) -> int:
             await _set_web_enabled(ns, bool(args) and args[0] == "1")
         elif command == "set-terminal-enabled":
             await _set_terminal_enabled(ns, bool(args) and args[0] == "1")
+        elif command == "outbox-stats":
+            await _outbox_stats(ns)
+        elif command == "outbox-purge":
+            return await _outbox_purge(ns, args)
+        elif command == "deadletter":
+            return await _deadletter(ns, args)
         else:
             print(f"未知子命令: {command}", file=sys.stderr)
             return 2
@@ -172,7 +250,8 @@ def main(argv: list) -> int:
         print(
             "用法: xgent_config.py "
             "{get-web-state|set-password|get-port|set-port <值>|set-web-enabled 0|1"
-            "|set-terminal-enabled 0|1|probe-port <端口>}",
+            "|set-terminal-enabled 0|1|probe-port <端口>"
+            "|outbox-stats|outbox-purge all|<小时>|deadletter [list|clear]}",
             file=sys.stderr,
         )
         return 2

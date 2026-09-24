@@ -26,7 +26,7 @@ XGent for Telegram 的提示词结构、拼接逻辑、回复流程和基础功�
 
 - `prompts/main.txt`：主提示词，当前只定义基础身份。
 - `prompts/global_addon.txt`：全局事实层，说明运行环境、上下文读取和记忆使用规则。
-- `prompts/agent_addon.txt`：Agent 与工具能力说明，定义 `run`、`shell`、`stdin:*`、`shellread:*`、`shellkill:*`、`trigger:*`、`read`、`edit`、`grep`、`file:`、`sendfile`、`search`、`fetch`、`media` 等协议。
+- `prompts/agent_addon.txt`：Agent 与工具能力说明，定义 `run`、`shell`、`stdin:*`、`shellkill:*`、`read`、`edit`、`grep`、`intel`、`file:`、`sendfile`、`search`、`fetch`、`media`、`ask`、`over` 等协议（后台任务用 `run-x` 调 `trigger` 命令）。
 - `prompts/agent_disabled_addon.txt`：Agent 关闭时的补充说明。
 - `prompts/extras/idle_message.txt`：空闲提醒消息的生成提示。
 - `prompts/extras/unauthorized_reply_messages.txt`：未授权用户的拒绝回复。
@@ -86,7 +86,7 @@ skill 文件简介只读取 `!` 围栏协议块：
    - `send_non_streaming_response()`
 6. 回复成功后，写入 `global_messages` 和兼容镜像 `chat_messages`。
 7. 如果 Agent 模式开启，解析模型回复里的协议块并执行工具；只有新的真实用户消息会把持久化 Agent 轮数重置为 0。
-8. 工具结果和未来的 trigger 系统结果继续占用同一轮次预算。命令层始终可以生成并显示系统结果；Agent 层在准备再次调用模型前递增轮数，超出上限时显示当前轮数和上限，不再调用模型。shell/stdin/shellread 会先等到命令结束、交互提示、明显长驻或等待窗口到期，再把当前结果回灌给模型继续自动判断。
+8. 工具结果和未来的 trigger 系统结果继续占用同一轮次预算。命令层始终可以生成并显示系统结果；Agent 层在准备再次调用模型前递增轮数，超出上限时显示当前轮数和上限，不再调用模型。shell/stdin 会先等到命令结束、交互提示、明显长驻或等待窗口到期，再把当前结果回灌给模型继续自动判断。
 
 停止按钮会设置全局停止事件。命令、媒体生成和 Agent 操作会检查该事件并尽量中断后续流程。
 
@@ -106,7 +106,7 @@ skill 文件简介只读取 `!` 围栏协议块：
 - `read` 会把文件本体直接回灌给当前工具循环：文本/代码/JSON/Markdown 等作为完整文本，图片作为图片本体。
 - `read` 的文件本体通常不会完整写入长期记忆；长期记忆通常只保存读取提示、路径和简短说明。
 - `run` 会等待一次性命令结束，把完整输出保存到 `xgent_storage/command_outputs/`，并把返回码、输出路径和截断输出写入全局记忆。
-- `shell` 用于交互式或长驻会话；长驻/日志类/等待输入的命令仍在运行时会记录当前输出并回灌给 AI，AI 可继续自动决定 `stdin`、`shellread`、`shellkill` 或回复用户。
+- `shell` 用于交互式或长驻会话；长驻/日志类/等待输入的命令仍在运行时会记录当前输出并回灌给 AI，AI 可继续自动决定 `stdin`、`shellkill` 或回复用户。
 - `file:` 与 `sendfile` 执行后会把执行结果回灌给 AI 并写入上下文，但只包含状态、路径、大小和错误信息，不包含文件本体；需要内容时应使用 `read`。
 - 后续需要完整内容时，应按路径重新读取。
 
@@ -116,8 +116,7 @@ Agent 模式开启后，模型可以通过协议块调用真实工具：
 
 - `run`：执行会自然结束的一次性命令，适合测试、构建、诊断、Git、依赖、服务状态和只读检查；完整输出会保存到路径。
 - `shell`：启动可持续交互 shell 会话并返回会话 ID。适合交互式、阻塞式、长驻、持续输出或需要多次输入的任务。
-- `stdin`：向已有 shell 会话输入终端宏；普通文本直接写，只有明确控制前缀才有特殊含义；`key:` 发送按键，`line:` 输入文本并回车，`paste:` 或 `paste: <<EOF` 显式粘贴文本，`raw:`/`hex:`/`base64:`/`bytes:` 可表达任意字节；完整语法见 `skill/stdin-syntax.md`。
-- `shellread`：快速读取已有 shell 会话的新输出，只短暂捕获当前输出，不按完整命令等待窗口长等，适合用户明确要求继续观察持续日志、安装进度或服务状态。
+- `stdin`：向已有 shell 会话输入终端宏；普通文本直接写，只有明确控制前缀才有特殊含义；`key:` 发送按键，`line:` 输入文本并回车，`paste:` 或 `paste: <<EOF` 显式粘贴文本，`raw:`/`hex:`/`base64:`/`bytes:` 可表达任意字节；完整语法见 `skill/stdin-syntax.md`。空 body 或只写 `wait:` 时不发送输入、只短暂捕获并回灌会话的新增输出，用于继续观察持续日志、安装进度或服务状态。
 - `shellkill`：关闭不再需要的 shell 会话。
 - `trigger`：创建独立的持久化后台 Shell 任务，块内顶部必须提供自包含的 `#@summary`，并可继续用 `#@after`、`#@at`、`#@cron`、`#@tz`、`#@when`、`#@repeat` 配置调度、时区、粘性 AND/OR 字面条件和重复监控。summary 作为任务元数据持久化，不会作为 Shell 命令执行；旧任务缺少 summary 时回退到历史请求或命令。它与 shell 会话无关，不使用 session_id、watch 暗号或 context。任务与运行结果存入 SQLite；Bot 重启后恢复未来任务、立即补跑逾期单次任务、至多合并补跑一次错过的 cron，并重新执行真正被中断的任务；已完成但未投递的结果只补投递。repeat 使用投递背压：上一轮结果完成投递后才启动下一轮，旧版产生的多条积压结果在启动时只保留最新一条；连续相同结果会静默去重并指数退避，任务保持活跃且结果变化后恢复正常间隔。完成时 Telegram 始终先显示包含任务概述、结果状态和任务 ID 的系统提醒；随后 Agent 层沿用最近真实用户消息的持久化轮数，未超限才用完整 `[后台任务结果]` 调用模型，超限则只显示当前轮数提示且不消耗模型 Token。支持 `trigger:show`、`trigger:kill:<id>`、`trigger:kill:all`。
 - `read`：按路径读取文件本体并直接回灌给 AI。文本/代码/JSON/Markdown 等作为完整文本上下文返回，图片作为图片本体返回，其他文件视模型通道能力返回。
@@ -128,7 +127,7 @@ Agent 模式开启后，模型可以通过协议块调用真实工具：
 - `search`：联网检索并回灌摘要结果，需要配置 Tavily API Key。
 - `fetch`：抓取指定网页正文并回灌给模型。
 - `media`：调用默认媒体模型生成图片或其他媒体。
-- `over`：本回合收尾，放在回复末尾，块内正文是模型预写给用户的收尾语。系统照常执行前面的协议、把结果照常发给用户并写入上下文（下一轮用户消息时模型仍读得到），但**不再把结果回灌给当前工具循环**，本回合直接结束，省掉一轮"已完成，如有需要请告知"式的空回复。只对 `run`、`edit`、`shellkill`、`file` 四类生效，且要求它们全部成功；出现其它协议、或任何一个操作失败（返回码非零、超时、被中断、edit 未找到 / 不唯一、shellkill 会话不存在、file 写入失败），`over` 自动作废并退回正常回灌。名单之所以这么窄：只有这四类的 `success` 位在失败时确实会翻成假，`read` 的异常路径和 shell 系的 `stdin`/`shellread` 会把失败报成成功，放进来就会漏看失败。
+- `over`：本回合收尾，放在回复末尾，块内正文是模型预写给用户的收尾语。系统照常执行前面的协议、把结果照常发给用户并写入上下文（下一轮用户消息时模型仍读得到），但**不再把结果回灌给当前工具循环**，本回合直接结束，省掉一轮"已完成，如有需要请告知"式的空回复。只对 `run`、`edit`、`shellkill`、`file` 四类生效，且要求它们全部成功；出现其它协议、或任何一个操作失败（返回码非零、超时、被中断、edit 未找到 / 不唯一、shellkill 会话不存在、file 写入失败），`over` 自动作废并退回正常回灌。名单之所以这么窄：只有这四类的 `success` 位在失败时确实会翻成假，`read` 的异常路径和 shell 系的 `stdin` 会把失败报成成功，放进来就会漏看失败。
 
 Agent 命令会受 `prompts/extras/agent_command_blacklist.txt` 管理。一次性命令优先走 `run`；交互、长驻或持续输出命令走 `shell`，仍在运行时会记录当前输出并回灌给 AI 继续判断。
 
