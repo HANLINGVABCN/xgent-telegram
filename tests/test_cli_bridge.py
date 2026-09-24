@@ -23,6 +23,7 @@ from unittest import mock
 
 from xgent_app import cli_bridge
 import xgent_app.cli_render as cli_render
+from xgent_app.protocols import ProtocolParser
 from xgent_app.cli_render import (
     MessageRenderer,
     Palette,
@@ -39,6 +40,14 @@ from xgent_app.cli_render import (
 
 def run(coro):
     return asyncio.run(coro)
+
+
+NONCE_A = "0123456789AB"
+
+
+def protocol_block(tag: str, body: str, nonce: str = NONCE_A) -> str:
+    """与 test_protocols.py 同构的协议块字面量（本文件按需自带，避免跨测试文件依赖）。"""
+    return f"```{tag}\n<<BEGIN_{nonce}\n{body}\n<<END_{nonce}\n```"
 
 
 class FakeMarkup:
@@ -756,6 +765,38 @@ class MessageKindClassificationTests(unittest.TestCase):
             with self.subTest(text=text):
                 for line in self.send(text, parse_mode).split("\n"):
                     self.assertLessEqual(display_width(line), cap, repr(line))
+
+
+class FoldedHtmlRenderTests(unittest.TestCase):
+    """CLI 兜底渲染器吃「折叠后的 <blockquote expandable> HTML」不能把代码藏没。
+
+    三端共用同一份折叠 HTML（TG 原生 expandable / 网页点击展开 / CLI 经 html_to_ansi）。
+    旧的一行死占位曾让终端「一行代码都看不到」；新 HTML 把代码放进可展开的 <pre>，
+    CLI 行式渲染必须把正文完整画出来，且不漏 <blockquote>/<pre> 生标签、不泄漏协议标记。
+    """
+
+    def _render(self, folded_html):
+        renderer = MessageRenderer(Palette(False), width=80)
+        return "\n".join(renderer.render_text(folded_html, parse_mode="HTML"))
+
+    def test_folded_block_shows_full_code_in_terminal(self):
+        body = "df -h\ndu -sh /var"
+        response = "先看磁盘：\n" + protocol_block("run-x", body, NONCE_A) + "\n完成。"
+        folded = ProtocolParser.render_folded_html(response)  # 默认 html.escape 散文
+        out = self._render(folded)
+        # 代码在终端里完整可见（回归守卫：不再「一行都看不到」）。
+        self.assertIn("df -h", out)
+        self.assertIn("du -sh /var", out)
+        self.assertIn("run", out)          # header 标签存活
+        self.assertIn("先看磁盘", out)
+        self.assertIn("完成", out)
+        # 不泄漏协议标记 / 生 HTML 标签 / 旧死占位。
+        self.assertNotIn("<<BEGIN_", out)
+        self.assertNotIn("<blockquote", out)
+        self.assertNotIn("<pre>", out)
+        self.assertNotIn("行已折叠", out)
+        non_blank = [line for line in out.splitlines() if line.strip()]
+        self.assertGreater(len(non_blank), 1)
 
 
 if __name__ == "__main__":

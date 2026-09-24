@@ -21,9 +21,12 @@
     那类操作，比在几百个 token 之后回忆一串随机字符可靠得多。
 """
 
+import html
 import re
 from difflib import SequenceMatcher
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from xgent_app.text_utils import head_lines
 
 
 class ProtocolParser:
@@ -426,3 +429,159 @@ class ProtocolParser:
             cleaned.append(line)
             previous_blank = is_blank
         return "\n".join(cleaned)
+
+    # ------------------------------------------------------------------
+    # 真·可展开折叠：把回复切成 [散文|协议块] 序列，块渲染成可展开元素。
+    # 与 strip/redact 共用 _match_open/_collect_marked_body/_build_block 同一文法。
+    # scan_folded_segments 是纯结构解析（无渲染依赖），供 CLI TUI 直接建消息模型；
+    # render_folded_html 在其上产出最终 Telegram-HTML（散文经注入的 prose_renderer，
+    # 协议块→<blockquote expandable>），同一份 HTML 同时喂电报原生折叠与网页折叠。
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def scan_folded_segments(
+        cls,
+        ai_response: str,
+        hide_unclosed: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """把回复切成有序的 [散文段 | 协议块] 段序列（纯结构，不渲染）。
+
+        返回每段是 dict：
+          - 散文：{"kind": "prose", "text": str}
+          - 闭合块：{"kind": "block", "type", "icon", "label", "path",
+                     "body"(完整正文), "line_count", "closed": True, "generating": False}
+          - 未闭合尾块（仅 hide_unclosed=True）：同上但 closed=False, generating=True,
+                     body="" —— 流式中途「生成中…」占位，原始正文从不外泄。
+
+        hide_unclosed=False（定稿）时，未闭合尾巴原样并入 prose（不折叠、防吞），
+        与 redact_protocol_blocks 一致：命中首个未闭合块即停止扫描。
+        """
+        if not ai_response:
+            return []
+        lines = ai_response.split("\n")
+        n = len(lines)
+        segments: List[Dict[str, Any]] = []
+        prose_buf: List[str] = []
+
+        def flush_prose() -> None:
+            if prose_buf:
+                segments.append({"kind": "prose", "text": "\n".join(prose_buf)})
+                prose_buf.clear()
+
+        i = 0
+        while i < n:
+            opened = cls._match_open(lines, i)
+            if opened is None:
+                prose_buf.append(lines[i])
+                i += 1
+                continue
+            tag, nonce, body_start = opened
+            body_lines, end_i, _smart, _ratio = cls._collect_marked_body(
+                lines, body_start, f"{cls._END_PREFIX}{nonce}", smart_match=True
+            )
+            if end_i is None:
+                if hide_unclosed:
+                    flush_prose()
+                    stub_type = cls._build_block(tag, "", i, i).get("type", "")
+                    icon, label = cls._placeholder_icon_label(stub_type)
+                    segments.append({
+                        "kind": "block", "type": stub_type, "icon": icon,
+                        "label": label, "path": "", "body": "",
+                        "line_count": 0, "closed": False, "generating": True,
+                    })
+                else:
+                    prose_buf.extend(lines[i:])
+                    flush_prose()
+                break
+            block = cls._build_block(tag, "\n".join(body_lines), i, end_i)
+            flush_prose()
+            btype = block.get("type", "")
+            icon, label = cls._placeholder_icon_label(btype)
+            body = block.get("body") or ""
+            line_count = 0 if not body else body.count("\n") + 1
+            segments.append({
+                "kind": "block", "type": btype, "icon": icon, "label": label,
+                "path": (block.get("path") or "").strip(), "body": body,
+                "line_count": line_count, "closed": True, "generating": False,
+            })
+            i = end_i + 1
+        flush_prose()
+        return segments
+
+    # 单块展开后最多显示的正文行数。① 展开 = 块头 + 前 N 行(+②)；第 N+1 行起
+    # 永不渲染。正文 ≤ N 行时无 ②，展开即整块。spec 固定 50。
+    _FOLD_MAX_LINES = 50
+
+    @classmethod
+    def _render_block_blockquote(
+        cls,
+        seg: Dict[str, Any],
+        max_lines: Optional[int] = None,
+    ) -> str:
+        """把一个协议块段渲染成 Telegram-HTML 的 <blockquote expandable>。
+
+        闭合块 → <blockquote expandable>：首行块头 "{icon} {label}[ path] · {N} 行"
+        （N=正文总行数，收起态电报原生预览即这一行），其后 <pre>{escape(前 max_lines 行)}</pre>；
+        正文超过 max_lines 时，末尾追加纯文字标签「已折叠 K 行」(K=总行数−max_lines)，
+        标注第 max_lines+1 行起被折且永不渲染。正文 ≤ max_lines：无标签，展开即整块。
+        未闭合块（generating）→ 不带 expandable 的「⚡ … · 生成中…」，正文为空，
+        绝不外泄在写的原始内容。**只改显示**，落库/执行/镜像永远用完整原文。
+        """
+        limit = cls._FOLD_MAX_LINES if max_lines is None else max_lines
+        icon = seg.get("icon") or "🔧"
+        label = seg.get("label") or seg.get("type") or ""
+        path = (seg.get("path") or "").strip()
+        head = f"{icon} {label} {path}".strip() if path else f"{icon} {label}".strip()
+
+        if seg.get("generating"):
+            return f"<blockquote>⚡ {html.escape(head)} · 生成中…</blockquote>"
+
+        body = seg.get("body") or ""
+        line_count = seg.get("line_count", 0)
+        header_line = html.escape(f"{head} · {line_count} 行")
+        preview, dropped = head_lines(body, limit)
+        escaped_body = html.escape(preview, quote=False)
+        inner = f"{header_line}\n<pre>{escaped_body}</pre>"
+        if dropped > 0:
+            inner += f"\n{html.escape(f'已折叠 {dropped} 行')}"
+        return f"<blockquote expandable>{inner}</blockquote>"
+
+    @classmethod
+    def render_folded_html(
+        cls,
+        ai_response: str,
+        hide_unclosed: bool = False,
+        prose_renderer: Optional[Callable[[str], str]] = None,
+        max_lines: Optional[int] = None,
+    ) -> str:
+        """把回复渲染成最终 Telegram-HTML：协议块折成 <blockquote expandable>。
+
+        散文段经 ``prose_renderer``（调用方注入 markdown_to_telegram_html，保持与全局
+        一致的渲染；协议解析器是独立模块、拿不到 section 命名空间里的渲染器，故用注入）；
+        prose_renderer=None 时退化为 html.escape（供无 app 依赖的单元测试）。
+
+        无任何协议块时原样返回输入（上层再按需过 markdown→HTML）。产出的
+        <blockquote>/<pre> 不匹配围栏文法且正文已转义，故 f(f(x)) == f(x)。
+        **只改显示**：不触碰 DB/执行/镜像的原始文本。
+        """
+        if not ai_response:
+            return ai_response
+        segments = cls.scan_folded_segments(ai_response, hide_unclosed=hide_unclosed)
+        if not any(s.get("kind") == "block" for s in segments):
+            return ai_response
+        parts: List[str] = []
+        for seg in segments:
+            if seg.get("kind") == "prose":
+                text = seg.get("text") or ""
+                if not text.strip():
+                    continue
+                if prose_renderer is not None:
+                    rendered = prose_renderer(text)
+                else:
+                    rendered = html.escape(text, quote=False)
+                if rendered and rendered.strip():
+                    parts.append(rendered)
+            else:
+                parts.append(cls._render_block_blockquote(seg, max_lines))
+        return "\n".join(p for p in parts if p)
+

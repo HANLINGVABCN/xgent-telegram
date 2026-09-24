@@ -76,6 +76,7 @@ from xgent_app.cli_palette import (
     SlashPalette,
     interactive_supported as palette_supported,
 )
+from xgent_app import cli_tui
 
 _MIGRATED_RUNTIME_PATHS = _migrate_legacy_runtime_paths()
 _ns: dict = {"__file__": __file__}
@@ -1278,6 +1279,90 @@ async def _shutdown_runtime() -> None:
         logger.exception("CLI 关闭数据库失败")
 
 
+async def _dispatch_submitted(line: Any) -> bool:
+    """处理一行**已提交**的输入，返回 True 表示"该退出 CLI 了"。
+
+    这是 legacy 行式主循环与全屏 TUI 的**共用**路由：两条前端拿到用户敲下的
+    一整行后都调它，exit/命令/编号/`:N`/`/前缀`/对话的判定逻辑只有这一份，
+    保证两端语义逐字一致。sentinel（_EXIT/_CANCEL/…）是 legacy reader 专属，
+    在调用本函数之前就被消化掉；这里只见普通文本行。
+    """
+    text = str(line).strip()
+    if not text:
+        return False
+    if "\n" in text:
+        # 多行只可能来自粘贴。命令、编号、exit 都是单行的东西，多行内容
+        # 一律当正文——否则贴一段以 "/" 或数字开头的日志会被解析成命令或
+        # 菜单选择，把用户想问的那段话吃掉。
+        _echo_submitted(text, conversation=True)
+        await _run_turn(_run_conversation(text))
+        return False
+    low = text.lower()
+    if low in ("exit", "quit"):
+        return True
+    if low in ("/help", "help", "?", "/?"):
+        _take_palette()
+        _echo_submitted(text, conversation=False)
+        _print_help()
+        return False
+    if low in ("/menu", "menu"):
+        _take_palette()
+        _echo_submitted(text, conversation=False)
+        _show_current_menu()
+        return False
+
+    # 命令面板刚打出来时，裸编号先解释成"选第 N 条命令"。面板是一次性的：
+    # 取走即失效，所以它不会长期挡住按钮菜单的编号。
+    palette = _take_palette()
+    if palette and text.isdigit():
+        number = int(text)
+        if 1 <= number <= len(palette):
+            _echo_submitted(f"/{palette[number - 1]}", conversation=False)
+            await _run_turn(_run_command(f"/{palette[number - 1]}"))
+            return False
+        SCREEN.notice(f"编号超出范围，命令面板共 {len(palette)} 项。", "warn")
+        return False
+
+    # CLI 把"点按钮"和"发消息"挤进了同一个输入通道，这是 Telegram/Web
+    # 结构上没有的歧义——那边点击和打字是两个独立物理通道。两种写法：
+    #   ":N"  显式按钮，任何状态下都优先解释为点击第 N 项；
+    #   "N"   裸编号，只在 IDLE 时当按钮，否则让给状态机。
+    # 两条规则缺一不可：只让编号赢，状态机正等着用户输数字时（自定义超时
+    # 秒数/记忆深度/Agent 轮数）真正的输入会被当成编号吃掉；只让状态机赢，
+    # SET_MEMORY、SET_COMMAND_BLACKLIST 这类"文本一律进缓冲区、只有按钮
+    # 能退出"的状态（callbacks.py:201/468 发提示时带 reply_markup）又会把
+    # 用户永久困住。":N" 就是那条任何时候都打得开的出口。
+    explicit_pick = text.startswith(":") and text[1:].strip().isdigit()
+    bare_pick = text.isdigit() and UserDataManager.get('state') == BotState.IDLE
+    if explicit_pick or bare_pick:
+        options = get_last_menu_options()
+        number = int(text[1:].strip() if explicit_pick else text)
+        if options and 1 <= number <= len(options):
+            _echo_submitted(text, conversation=False)
+            await _run_turn(_run_callback(options[number - 1]))
+            return False
+        if options:
+            SCREEN.notice(f"编号超出范围，当前菜单共 {len(options)} 项（输入 /menu 重看）。", "warn")
+            return False
+        if explicit_pick:
+            SCREEN.notice("当前没有可选的菜单。", "warn")
+            return False
+        # 裸编号但当前没有菜单：当普通文本处理——在 Telegram 里输入
+        # "42" 本来就只是发一条消息。
+
+    if text.startswith("/"):
+        routed = _route_command_prefix(text)
+        if routed is None:
+            return False
+        _echo_submitted(routed, conversation=False)
+        await _run_turn(_run_command(routed))
+    else:
+        # 对话消息：打印用户块（❯ User + 正文），消息在回卷里永久可见
+        _echo_submitted(text, conversation=True)
+        await _run_turn(_run_conversation(text))
+    return False
+
+
 async def _main_loop() -> None:
     _banner()
 
@@ -1304,79 +1389,8 @@ async def _main_loop() -> None:
             if _input_state_active():
                 await _run_turn(_run_conversation("cancel"))
             continue
-        text = str(line).strip()
-        if not text:
-            continue
-        if "\n" in text:
-            # 多行只可能来自粘贴。命令、编号、exit 都是单行的东西，多行内容
-            # 一律当正文——否则贴一段以 "/" 或数字开头的日志会被解析成命令或
-            # 菜单选择，把用户想问的那段话吃掉。
-            _echo_submitted(text, conversation=True)
-            await _run_turn(_run_conversation(text))
-            continue
-        low = text.lower()
-        if low in ("exit", "quit"):
+        if await _dispatch_submitted(line):
             break
-        if low in ("/help", "help", "?", "/?"):
-            _take_palette()
-            _echo_submitted(text, conversation=False)
-            _print_help()
-            continue
-        if low in ("/menu", "menu"):
-            _take_palette()
-            _echo_submitted(text, conversation=False)
-            _show_current_menu()
-            continue
-
-        # 命令面板刚打出来时，裸编号先解释成"选第 N 条命令"。面板是一次性的：
-        # 取走即失效，所以它不会长期挡住按钮菜单的编号。
-        palette = _take_palette()
-        if palette and text.isdigit():
-            number = int(text)
-            if 1 <= number <= len(palette):
-                _echo_submitted(f"/{palette[number - 1]}", conversation=False)
-                await _run_turn(_run_command(f"/{palette[number - 1]}"))
-                continue
-            SCREEN.notice(f"编号超出范围，命令面板共 {len(palette)} 项。", "warn")
-            continue
-
-        # CLI 把"点按钮"和"发消息"挤进了同一个输入通道，这是 Telegram/Web
-        # 结构上没有的歧义——那边点击和打字是两个独立物理通道。两种写法：
-        #   ":N"  显式按钮，任何状态下都优先解释为点击第 N 项；
-        #   "N"   裸编号，只在 IDLE 时当按钮，否则让给状态机。
-        # 两条规则缺一不可：只让编号赢，状态机正等着用户输数字时（自定义超时
-        # 秒数/记忆深度/Agent 轮数）真正的输入会被当成编号吃掉；只让状态机赢，
-        # SET_MEMORY、SET_COMMAND_BLACKLIST 这类"文本一律进缓冲区、只有按钮
-        # 能退出"的状态（callbacks.py:201/468 发提示时带 reply_markup）又会把
-        # 用户永久困住。":N" 就是那条任何时候都打得开的出口。
-        explicit_pick = text.startswith(":") and text[1:].strip().isdigit()
-        bare_pick = text.isdigit() and UserDataManager.get('state') == BotState.IDLE
-        if explicit_pick or bare_pick:
-            options = get_last_menu_options()
-            number = int(text[1:].strip() if explicit_pick else text)
-            if options and 1 <= number <= len(options):
-                _echo_submitted(text, conversation=False)
-                await _run_turn(_run_callback(options[number - 1]))
-                continue
-            if options:
-                SCREEN.notice(f"编号超出范围，当前菜单共 {len(options)} 项（输入 /menu 重看）。", "warn")
-                continue
-            if explicit_pick:
-                SCREEN.notice("当前没有可选的菜单。", "warn")
-                continue
-            # 裸编号但当前没有菜单：当普通文本处理——在 Telegram 里输入
-            # "42" 本来就只是发一条消息。
-
-        if text.startswith("/"):
-            routed = _route_command_prefix(text)
-            if routed is None:
-                continue
-            _echo_submitted(routed, conversation=False)
-            await _run_turn(_run_command(routed))
-        else:
-            # 对话消息：打印用户块（❯ User + 正文），消息在回卷里永久可见
-            _echo_submitted(text, conversation=True)
-            await _run_turn(_run_conversation(text))
 
 
 def _route_command_prefix(text: str) -> Optional[str]:
@@ -1410,8 +1424,66 @@ def _route_command_prefix(text: str) -> Optional[str]:
     return None
 
 
+def _run_tui_main() -> None:
+    """全屏 prompt_toolkit 前端。
+
+    只换绘制/输入半边：装一个与 TerminalScreen 同接口的 PtScreen（`set_screen`
+    换掉共享屏幕对象），CliBot 的方法签名、`_RELAY.emit`、`_register_menu`
+    一字不改——relay/落库逐字节不变。路由仍走 `_dispatch_submitted`（与 legacy
+    共用）。跳过 legacy 的 readline / SIGINT / 常驻输入框：pt 自己接管 raw 模式、
+    键位与全屏重绘，两套输入系统不能同时抢 stdin。
+    """
+    global SCREEN, PALETTE
+    from xgent_app.cli_bridge import set_screen
+
+    pt_screen = cli_tui.PtScreen(palette=PALETTE)
+    set_screen(pt_screen)
+    SCREEN = pt_screen
+    PALETTE = pt_screen.palette
+
+    hooks = cli_tui.TuiHooks(
+        dispatch=_dispatch_submitted,
+        banner=_banner,
+        prompt_text=_prompt_plain,
+        command_names=_command_names,
+        describe_command=_describe_command,
+        turn_active=lambda: _turn_active,
+        request_stop=_request_stop,
+        remember_history=_remember_history,
+        history_file=str(HISTORY_FILE),
+    )
+
+    async def _run():
+        await _init_runtime()
+        try:
+            await cli_tui.run_tui(pt_screen, hooks)
+        finally:
+            await _shutdown_runtime()
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass
+    except cli_tui.TuiUnavailable as exc:
+        # pt 已确认可导入（tui_enabled 把过关），到这一步只可能是 App 建不起来。
+        # 常见的"pt 不可用"早在 main() 里被 tui_enabled() 挡下走了 legacy，
+        # 这里不再中途回退（运行时已初始化），只报明失败并干净退出。
+        logger.warning("全屏 TUI 启动失败：%s", exc)
+        print(f"全屏 TUI 启动失败：{exc}", file=sys.stderr)
+    # pt full_screen 退出时已还原主屏与终端状态，普通 print 收尾即可。
+    print()
+    print("再见。")
+
+
 def main() -> None:
     _quiet_console_logging()
+
+    # 全屏 TUI 严格 opt-in（XGENT_CLI_TUI + pt 可用 + 双向 TTY）。不满足一律
+    # 走久经验证的 legacy 行式渲染器——它同时也是 pt 不可用时的兜底。
+    if cli_tui.tui_enabled():
+        _run_tui_main()
+        return
+
     _remember_terminal_state()
     _setup_readline()
     _install_sigint_handler()

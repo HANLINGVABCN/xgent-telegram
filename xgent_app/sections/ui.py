@@ -331,7 +331,7 @@ def get_more_settings_menu():
          InlineKeyboardButton("🧹 清空上下文", callback_data="cmd_delete")],
         [InlineKeyboardButton(f"🔇 静默未授权:{'🟢 开' if normalize_bool(UserDataManager.get('silent_unauthorized', False), False) else '🔴 关'}", callback_data="toggle_silent_unauthorized")],
         [InlineKeyboardButton(f"📎 read留存:{'🟢 开' if normalize_bool(UserDataManager.get('readx_persist_context', False), False) else '🔴 关'}", callback_data="toggle_readx_persist_context")],
-        [InlineKeyboardButton(f"🙈 隐藏代码块:{'🟢 开' if normalize_bool(UserDataManager.get('hide_protocol_blocks', False), False) else '🔴 关'}", callback_data="toggle_hide_protocol_blocks")],
+        [InlineKeyboardButton(f"🗂 折叠代码块:{'🟢 开' if normalize_bool(UserDataManager.get('hide_protocol_blocks', True), True) else '🔴 关'}", callback_data="toggle_hide_protocol_blocks")],
         [InlineKeyboardButton("ℹ️ 状态", callback_data="cmd_info"),
          InlineKeyboardButton("🧩 Skill 管理", callback_data="menu_skills")],
         [InlineKeyboardButton("📤 导出", callback_data="cmd_export_all"),

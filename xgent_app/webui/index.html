@@ -453,6 +453,42 @@
   .bubble blockquote > :first-child { margin-top: 0; }
   .bubble blockquote > :last-child { margin-bottom: 0; }
 
+  /* 可展开折叠的协议代码块（服务端 <blockquote expandable>，与电报原生 expandable 同源）。
+     默认折叠：限高 + 底部渐隐 + 「点击展开」提示；点击切换 .expanded 展开看全。
+     首行是 "🔧 run · N 行" 之类的 header，点它（或非代码区）即可展开/收起。 */
+  .bubble blockquote[expandable] {
+    position: relative; cursor: pointer;
+    max-height: 132px; overflow: hidden;
+    transition: max-height 0.18s ease;
+    padding-bottom: 22px;
+  }
+  .bubble blockquote[expandable].expanded {
+    max-height: none; padding-bottom: 6px;
+  }
+  /* 折叠态底部渐隐遮罩，暗示「还有更多」 */
+  .bubble blockquote[expandable]::before {
+    content: ""; position: absolute; left: 0; right: 0; bottom: 18px; height: 34px;
+    background: linear-gradient(to bottom, transparent, var(--surface-2));
+    pointer-events: none; transition: opacity 0.18s ease;
+  }
+  .bubble.user blockquote[expandable]::before {
+    background: linear-gradient(to bottom, transparent, rgba(0, 0, 0, 0.2));
+  }
+  .bubble blockquote[expandable].expanded::before { opacity: 0; }
+  /* 底部「点击展开 / 收起」提示条 */
+  .bubble blockquote[expandable]::after {
+    content: "▾ 点击展开"; position: absolute; left: 0; right: 0; bottom: 0;
+    text-align: center; font-size: 12px; color: var(--accent);
+    padding: 2px 0; background: var(--surface-2);
+    pointer-events: none; user-select: none;
+  }
+  .bubble.user blockquote[expandable]::after {
+    background: rgba(0, 0, 0, 0.2); color: rgba(255, 255, 255, 0.9);
+  }
+  .bubble blockquote[expandable].expanded::after { content: "▴ 收起"; }
+  /* 折叠块里的代码块外壳去掉多余外边距，贴合 blockquote 内边距 */
+  .bubble blockquote[expandable] .code-block-wrap { margin: 6px 0 0; }
+
   /* 行内代码 */
   .bubble :not(pre) > code {
     background: var(--surface-2); border: 1px solid var(--line);
@@ -1531,6 +1567,10 @@
           if (c.tagName === "A" && a.name === "href") {
             if (!/^(https?:|mailto:)/i.test(a.value)) c.removeAttribute(a.name);
           } else if (c.tagName === "A" && (a.name === "target" || a.name === "rel")) {
+          } else if (c.tagName === "BLOCKQUOTE" && a.name === "expandable") {
+            // 保留：服务端 render_folded_html 用 <blockquote expandable> 标记
+            // 「可展开折叠的协议代码块」（与电报原生 expandable 同源），网页据此做
+            // 折叠交互（CSS blockquote[expandable] + bindContentClicks 里的点击切换）。
           } else if (a.name === "class") {
             var classes = a.value.split(/\s+/).filter(function (name) {
               return /^(language-[a-zA-Z0-9_+#.-]+|ta-(left|center|right)|task-item|task-checkbox|checked|table-wrap)$/.test(name);
@@ -1683,6 +1723,16 @@
           pre.classList.toggle("wrapped");
           btn.classList.toggle("done", pre.classList.contains("wrapped"));
         }
+        return;
+      }
+
+      // 可展开折叠块：点 header / 非代码区切换展开。点代码块壳（复制/换行按钮上面
+      // 已 return；选词由 getSelection 守卫）不触发折叠，免得复制代码时误收起。
+      var foldBq = e.target.closest("blockquote[expandable]");
+      if (foldBq && !e.target.closest(".code-block-wrap")) {
+        if (String(window.getSelection() || "").length) return;
+        foldBq.classList.toggle("expanded");
+        e.stopPropagation();
         return;
       }
 
@@ -2771,7 +2821,7 @@
   var SETTING_FIELDS = [
     { key: "thinking_level", label: "思考深度 / 推理等级", type: "select" },
     { key: "stream_mode", label: "打字机流式输出", type: "bool" },
-    { key: "hide_protocol_blocks", label: "隐藏协议代码块", type: "bool" },
+    { key: "hide_protocol_blocks", label: "折叠协议代码块", type: "bool" },
     { key: "agent_mode", label: "Agent 智能体模式", type: "bool" },
     { key: "text_stitch_mode", label: "文字拼接模式", type: "select" },
     { key: "global_depth", label: "全局记忆轮数", type: "number", min: 1 },

@@ -490,5 +490,159 @@ class RedactProtocolBlocksTests(unittest.TestCase):
         self.assertIn("下文", out)
 
 
+class RenderFoldedTests(unittest.TestCase):
+    """render_folded_html：把协议块折成「真·可展开」的 <blockquote expandable>。
+
+    与旧的 redact_protocol_blocks（一行死占位、代码全藏）不同：这里代码**是可见的**
+    （放在可展开的 <pre> 里），用户能点开看全。测试守住的是：
+      - 折成合法的 Telegram-HTML（<blockquote expandable> + 转义过的 <pre>）；
+      - 协议标记 / 围栏 / nonce 绝不泄漏到显示层；
+      - 散文经注入的 prose_renderer（生产里是 markdown_to_telegram_html）；
+      - 未闭合尾巴的两种语义（流式=生成中占位、定稿=原样不折，防吞）；
+      - 幂等、空输入/无块原样；正文按「前 50 行 + 已折叠 N 行」封顶，第 51 行永不外泄。
+    """
+
+    def test_single_block_becomes_expandable_blockquote(self):
+        response = protocol_block("run-x", "df -h\ndu -sh /var", NONCE_A)
+        out = ProtocolParser.render_folded_html(response)
+        self.assertIn("<blockquote expandable>", out)
+        self.assertIn("</blockquote>", out)
+        self.assertIn("<pre>", out)
+        self.assertIn("🔧", out)
+        self.assertIn("run", out)
+        self.assertIn("· 2 行", out)          # 行数进 header
+        self.assertIn("df -h", out)            # 代码可见（可展开），不再一行都看不到
+        self.assertIn("du -sh /var", out)
+        self.assertNotIn("<<BEGIN_", out)      # 协议标记不外泄
+        self.assertNotIn(NONCE_A, out)
+        self.assertNotIn("```", out)
+
+    def test_block_body_is_html_escaped(self):
+        # 正文里的 < & > 必须转义，否则 Telegram 报 "Unclosed start tag"（真机踩过）。
+        response = protocol_block("run-x", "echo '<a> & <b>'", NONCE_A)
+        out = ProtocolParser.render_folded_html(response)
+        self.assertIn("&lt;a&gt; &amp; &lt;b&gt;", out)
+        self.assertNotIn("<a>", out)
+
+    def test_edit_block_header_includes_path(self):
+        response = protocol_block("edit-x:/etc/app/config.py", "old\nnew", NONCE_A)
+        out = ProtocolParser.render_folded_html(response)
+        self.assertIn("📝", out)
+        self.assertIn("/etc/app/config.py", out)
+        self.assertIn("<blockquote expandable>", out)
+        self.assertIn("old", out)              # 正文可见
+
+    def test_prose_and_multiple_blocks_interleave(self):
+        response = (
+            "先看磁盘：\n"
+            f"{protocol_block('run-x', 'df -h', NONCE_A)}\n"
+            "再读配置：\n"
+            f"{protocol_block('read-x', '/tmp/a.txt', NONCE_B)}\n"
+            "完成。"
+        )
+        # 注入一个可辨认的散文渲染器，模拟 markdown_to_telegram_html。
+        out = ProtocolParser.render_folded_html(
+            response, prose_renderer=lambda t: "<p>" + t + "</p>")
+        self.assertEqual(2, out.count("<blockquote expandable>"))
+        self.assertIn("<p>先看磁盘：</p>", out)
+        self.assertIn("<p>再读配置：</p>", out)
+        self.assertIn("<p>完成。</p>", out)
+
+    def test_plain_code_fence_not_folded(self):
+        response = "示例：\n```python\nprint('hi')\n```\n讲完了。"
+        self.assertEqual(response, ProtocolParser.render_folded_html(response))
+
+    def test_bare_fence_without_begin_not_folded(self):
+        response = "```run-x\ndf -h\n```"
+        self.assertEqual(response, ProtocolParser.render_folded_html(response, hide_unclosed=True))
+        self.assertEqual(response, ProtocolParser.render_folded_html(response, hide_unclosed=False))
+
+    def test_hide_unclosed_true_tail_is_generating_not_expandable(self):
+        response = (
+            "开始执行：\n"
+            f"```run-x\n<<BEGIN_{NONCE_A}\nfor i in range(100):\n    print(i)"
+        )
+        out = ProtocolParser.render_folded_html(response, hide_unclosed=True)
+        self.assertIn("生成中", out)
+        self.assertIn("<blockquote>", out)
+        self.assertNotIn("<blockquote expandable>", out)   # 生成中不带 expandable
+        self.assertNotIn("range(100)", out)                # 未闭合正文绝不外泄
+        self.assertNotIn("<<BEGIN_", out)
+
+    def test_hide_unclosed_false_tail_kept_raw(self):
+        # 防「全文折没」：定稿遇未闭合块 → 无 block 段 → 原样返回（identity）。
+        response = (
+            "开始执行：\n"
+            f"```run-x\n<<BEGIN_{NONCE_A}\nfor i in range(100):\n    print(i)"
+        )
+        out = ProtocolParser.render_folded_html(response, hide_unclosed=False)
+        self.assertEqual(response, out)
+
+    def test_hide_unclosed_false_folds_closed_keeps_open_tail_raw(self):
+        response = (
+            f"{protocol_block('run-x', 'echo done', NONCE_A)}\n"
+            "然后继续：\n"
+            f"```edit-x:/a.py\n<<BEGIN_{NONCE_B}\nprint('unfinished')"
+        )
+        out = ProtocolParser.render_folded_html(
+            response, hide_unclosed=False, prose_renderer=lambda t: t)
+        self.assertIn("<blockquote expandable>", out)   # 闭合块照折
+        self.assertIn("echo done", out)                 # 闭合块代码可见
+        self.assertIn("print('unfinished')", out)       # 未闭合尾巴原样
+        self.assertNotIn("生成中", out)
+
+    def test_idempotent(self):
+        response = (
+            "文字\n"
+            f"{protocol_block('run-x', 'echo ok', NONCE_A)}\n"
+            f"{protocol_block('shell-x', 'ls -la', NONCE_B)}\n"
+            "尾巴"
+        )
+        once = ProtocolParser.render_folded_html(response, prose_renderer=lambda t: t)
+        twice = ProtocolParser.render_folded_html(once, prose_renderer=lambda t: t)
+        self.assertEqual(once, twice)
+
+    def test_empty_and_no_block_input_unchanged(self):
+        self.assertEqual("", ProtocolParser.render_folded_html(""))
+        plain = "就是一段普通文字\n没有任何协议块\n\n结束"
+        self.assertEqual(plain, ProtocolParser.render_folded_html(plain))
+
+    def test_body_over_50_lines_capped_with_fold_label(self):
+        # spec ②：正文 > 50 行 → 只显示前 50 行 + 一行「已折叠 N 行」(N=总行数−50)，
+        # 第 51 行起永不渲染。
+        body = "\n".join(f"line{i}" for i in range(1, 61))   # 60 行
+        response = protocol_block("read-x", body, NONCE_A)
+        out = ProtocolParser.render_folded_html(response)
+        self.assertIn("<blockquote expandable>", out)
+        self.assertIn("· 60 行", out)          # header 标总行数
+        self.assertIn("已折叠 10 行", out)      # ② 标签：60 − 50
+        self.assertIn("line50", out)            # 第 50 行仍在
+        self.assertNotIn("line51", out)         # 第 51 行起永不外泄
+        self.assertNotIn("line60", out)
+
+    def test_body_at_50_lines_no_fold_label(self):
+        body = "\n".join(f"L{i}" for i in range(1, 51))      # 正好 50 行
+        response = protocol_block("read-x", body, NONCE_A)
+        out = ProtocolParser.render_folded_html(response)
+        self.assertIn("<blockquote expandable>", out)
+        self.assertNotIn("已折叠", out)         # ≤50 行：无 ②
+        self.assertIn("L50", out)               # 整块可见
+
+    def test_body_under_50_full_no_label(self):
+        response = protocol_block("run-x", "a\nb\nc", NONCE_A)
+        out = ProtocolParser.render_folded_html(response)
+        self.assertNotIn("已折叠", out)
+        for ln in ("a", "b", "c"):
+            self.assertIn(ln, out)
+
+    def test_max_lines_override_caps_preview(self):
+        body = "\n".join(f"row{i}" for i in range(1, 11))     # 10 行
+        response = protocol_block("run-x", body, NONCE_A)
+        out = ProtocolParser.render_folded_html(response, max_lines=3)
+        self.assertIn("row3", out)
+        self.assertNotIn("row4", out)
+        self.assertIn("已折叠 7 行", out)        # 10 − 3
+
+
 if __name__ == "__main__":
     unittest.main()

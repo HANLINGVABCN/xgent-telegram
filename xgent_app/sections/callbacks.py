@@ -1190,16 +1190,16 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
         elif data == "toggle_hide_protocol_blocks":
-            # 隐藏协议代码块：开启后 AI 回复正文里的 *-x 协议块只在「显示」层折成一行占位；
-            # 落库 / 执行 / 镜像用的原始文本不受影响。
-            on = not normalize_bool(UserDataManager.get('hide_protocol_blocks', False), False)
+            # 折叠协议代码块（默认开）：开启后 AI 回复正文里的 *-x 协议块在「显示」层折成
+            # 可展开控件（前 50 行 +「已折叠 N 行」）；落库 / 执行 / 镜像用的原始文本不受影响。
+            on = not normalize_bool(UserDataManager.get('hide_protocol_blocks', True), True)
             UserDataManager.set('hide_protocol_blocks', on)
             await UserDataManager.save_config('hide_protocol_blocks', on)
             await GlobalRecorder.record_system_op(
-                f"隐藏代码块{'开启' if on else '关闭'}",
+                f"折叠代码块{'开启' if on else '关闭'}",
                 {"hide_protocol_blocks": on}
             )
-            await query.answer(f"已{'开启' if on else '关闭'}隐藏代码块", show_alert=False)
+            await query.answer(f"已{'开启' if on else '关闭'}折叠代码块", show_alert=False)
             await query.message.edit_text(
                 build_settings_menu_text(),
                 reply_markup=get_more_settings_menu(),

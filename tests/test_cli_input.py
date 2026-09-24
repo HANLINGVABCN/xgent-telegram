@@ -164,8 +164,13 @@ print(json.dumps({
     def test_main_loop_breaks_only_on_sentinels(self):
         source = (ROOT / "xgent_cli.py").read_text(encoding="utf-8")
         self.assertIn("if line is _EXIT or line is _EOF:", source)
-        # 空行必须走 continue 而不是 break。
-        self.assertIn("if not text:\n            continue", source)
+        # 行路由现在抽进共享的 _dispatch_submitted（legacy 与 TUI 共用）。
+        # 空行必须"不退出"：路由对空行返回 False，主循环据此继续下一轮。
+        self.assertIn("if not text:\n        return False", source)
+        # 只有 exit/quit 把"该退出"传上去；主循环凭 _dispatch_submitted 的
+        # 返回值 break，别的分支一律返回 False。
+        self.assertIn('if low in ("exit", "quit"):\n        return True', source)
+        self.assertIn("if await _dispatch_submitted(line):\n            break", source)
 
 
 class SlashCommandTests(CliProbeMixin, unittest.TestCase):

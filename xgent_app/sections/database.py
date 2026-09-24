@@ -1842,9 +1842,10 @@ class UserDataManager:
             'silent_unauthorized': normalize_bool(await cls._require_db().get_config('silent_unauthorized', False), False),
             # read 留存：开启后 read 读到的完整内容跨轮持久化进上下文（文本走普通消息、图片/二进制走持久附件）。
             'readx_persist_context': normalize_bool(await cls._require_db().get_config('readx_persist_context', False), False),
-            # 隐藏协议代码块：开启后 AI 回复正文里的 *-x 协议块只在「显示」层折成一行占位；
+            # 折叠协议代码块（默认开）：开启后 AI 回复正文里的 *-x 协议块在「显示」层折成
+            # 可展开控件（收起→块头；展开→块头+前 50 行+「已折叠 N 行」标签，第 51 行起不显示）；
             # 落库 / 执行 / 镜像用的原始文本不受影响。
-            'hide_protocol_blocks': normalize_bool(await cls._require_db().get_config('hide_protocol_blocks', False), False),
+            'hide_protocol_blocks': normalize_bool(await cls._require_db().get_config('hide_protocol_blocks', True), True),
             # 只缓存"有没有设密码"这个布尔，哈希本身按需读库，不进内存快照。
             '_web_has_password': bool(
                 await cls._require_db().get_config(WEB_PASSWORD_CONFIG_KEY, '')

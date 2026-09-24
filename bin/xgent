@@ -51,6 +51,12 @@ if [ -z "$PYTHON" ]; then
     exit 1
 fi
 
+# 默认启用全屏 TUI：原地展开折叠的协议代码块 + PgUp/PgDn/Home/End 滚动、
+# 鼠标点击展开。tui_enabled() 仍会校验 TTY 与 prompt_toolkit 是否可用，
+# 非交互/管道/依赖缺失时自动回退 legacy 行式渲染器；想强制回退设
+# XGENT_CLI_NO_TUI=1（或显式 XGENT_CLI_TUI=0）。
+export XGENT_CLI_TUI="${XGENT_CLI_TUI:-1}"
+
 # 必须切到项目目录再启动：数据库、日志、storage 都是相对 cwd 解析的
 # （core.py 的 DB_FILE = "xgent_memory.db"、log_file = getcwd()/…）。
 # 在别处直接跑会凭空建出一套空数据库，用户会以为配置和记忆全丢了。

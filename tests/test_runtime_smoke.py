@@ -202,6 +202,9 @@ import xgent_server as bot
 from xgent_app.web_bridge import WebOutbox
 
 async def main():
+    # 这条回归专盯「折叠关」时的 rich 通道路由（web→outbox / 原生 TG→rich API）。
+    # 折叠现已默认开，会强制走 HTML edit 通道，与本测点无关，故显式关掉隔离默认值。
+    bot.UserDataManager.set('hide_protocol_blocks', False)
     # ---- 网页 bot：必须走 finalize_text_response，不直连 TG rich API ----
     outbox = WebOutbox()
     stream = outbox.subscribe()
@@ -523,7 +526,18 @@ print(json.dumps({
         self.assertEqual(3, data["saved_notice_count"])
 
     def test_hide_protocol_blocks_display_only_record_intact(self):
-        """隐藏协议代码块：只改显示、对话记录原样；截断不折全文；开关开/关行为。"""
+        """隐藏协议块（真·可展开版）：折叠只改显示、对话记录逐字原样。
+
+        守住四条硬不变量：
+          (A) hide=on 定稿 rich_finalize **强制走 HTML 通道**（原生 <blockquote
+              expandable>），绕过 send_rich_message；传入的 response 对象不被改。
+          (B/C) 流式渲染器 response_parts / finish() 恒为原文（落库值）；_display_html
+              产出可展开块、代码可见但协议标记不外泄。
+          (D) 未闭合尾巴：流式中途折「生成中…」（不外泄正文）、定稿原样不折（防吞）。
+          (E) hide=off：显示与记录都原样透传（_display_html == markdown_to_telegram_html）。
+        注意：与旧「一行死占位」不同，新版**代码是可见的**（放进可展开 <pre>），
+        所以显示层里出现 df -h 是预期，护栏改盯「标记不泄漏 + 记录恒为原文」。
+        """
         output = self.run_probe(r'''
 import asyncio, json
 from types import SimpleNamespace as NS
@@ -532,79 +546,95 @@ import xgent_server as bot
 RAW = "看下磁盘\n```run-x\n<<BEGIN_diskchk_7f3a2b1c\ndf -h\nrm -rf /tmp/x\n<<END_diskchk_7f3a2b1c\n```\n完成"
 TRUNC = "看下磁盘\n```run-x\n<<BEGIN_diskchk_7f3a2b1c\ndf -h\nrm -rf /tmp/x"
 
+edited = []
 class FakeMsg:
     message_id = 1
     async def delete(self): return True
-    async def edit_text(self, *a, **kw): return True
+    async def edit_text(self, text=None, *a, **kw):
+        edited.append(text); return True
 
 async def main():
-    # (A) hide=on 定稿 rich_finalize：显示折叠，response 参数对象不被改
+    # (A) hide=on 定稿 rich_finalize：走 HTML 通道、绕过 send_rich_message；response 不被改
     bot.UserDataManager.set('hide_protocol_blocks', True)
-    tg_calls = []
+    rich_calls = []
     async def fake_tg_rich(*a, **kw):
-        tg_calls.append(kw.get("text")); return {"ok": True}
+        rich_calls.append(kw.get("text")); return {"ok": True}
     bot.TelegramRichAPI.send_rich_message = fake_tg_rich
     response_obj = RAW
     await bot.rich_finalize_text_response(
         NS(bot=NS(_is_xgent_web_bot=False)), 7, FakeMsg(), response_obj, limit=4000)
-    finalize_display = tg_calls[-1] if tg_calls else ""
+    finalize_html = edited[-1] if edited else ""
 
-    # (B)(C) hide=on 流式渲染器：response_parts / finish 恒为原文；_display_text 折叠
+    # (B)(C) hide=on 流式渲染器：response_parts / finish 恒为原文；_display_html 出可展开块
     r = bot.TelegramStreamRenderer(NS(bot=NS(_is_xgent_web_bot=True)), 7, FakeMsg(), None, limit=4000)
     for k in range(0, len(RAW), 7):
         await r.append(RAW[k:k+7])
     record_parts = ''.join(r.response_parts)
-    mid_display = r._display_text(RAW, hide_unclosed=True)
-    final_display = r._display_text(RAW, hide_unclosed=False)
-    trunc_stream = r._display_text(TRUNC, hide_unclosed=True)
-    trunc_final = r._display_text(TRUNC, hide_unclosed=False)
+    mid_html = r._display_html(RAW, hide_unclosed=True)
+    final_html = r._display_html(RAW, hide_unclosed=False)
+    trunc_stream = r._display_html(TRUNC, hide_unclosed=True)
+    trunc_final = r._display_html(TRUNC, hide_unclosed=False)
     hide_flag_on = r._hide_blocks is True
+    force_html_on = r._force_html is True
+    rich_draft_off = r._rich_draft_enabled is False
     should_fn_on = bot._should_hide_protocol_blocks() is True
     record_finish = await r.finish()
 
     # (E) hide=off：显示与记录都原样透传
     bot.UserDataManager.set('hide_protocol_blocks', False)
     r2 = bot.TelegramStreamRenderer(NS(bot=NS(_is_xgent_web_bot=True)), 7, FakeMsg(), None, limit=4000)
-    off_true = r2._display_text(RAW, hide_unclosed=True)
-    off_false = r2._display_text(RAW, hide_unclosed=False)
+    off_html = r2._display_html(RAW, hide_unclosed=False)
+    off_text = r2._display_text(RAW, hide_unclosed=True)
     off_flag = r2._hide_blocks is False
+    off_force_html = r2._force_html is False
     should_fn_off = bot._should_hide_protocol_blocks() is False
+    md_raw = bot.markdown_to_telegram_html(RAW)
 
     print(json.dumps({
-        "finalize_folded": ("行已折叠" in finalize_display) and ("df -h" not in finalize_display) and ("rm -rf" not in finalize_display),
-        "finalize_has_icon": "run" in finalize_display,
+        "finalize_via_html": bool(edited) and rich_calls == [],
+        "finalize_has_expandable": "<blockquote expandable>" in finalize_html,
+        "finalize_shows_code": "df -h" in finalize_html,
+        "finalize_no_marker_leak": ("<<BEGIN_" not in finalize_html) and ("diskchk_7f3a2b1c" not in finalize_html) and ("```" not in finalize_html),
         "finalize_response_unchanged": response_obj == RAW,
         "record_parts_raw": record_parts == RAW,
         "record_finish_raw": record_finish == RAW,
-        "mid_display_folded": ("行已折叠" in mid_display) and ("rm -rf" not in mid_display),
-        "final_display_folded": ("行已折叠" in final_display) and ("rm -rf" not in final_display),
-        "trunc_stream_folded": ("生成中" in trunc_stream) and ("rm -rf" not in trunc_stream),
-        "trunc_final_raw": ("df -h" in trunc_final) and ("rm -rf" in trunc_final) and ("生成中" not in trunc_final),
+        "mid_html_expandable": ("<blockquote expandable>" in mid_html) and ("df -h" in mid_html) and ("<<BEGIN_" not in mid_html),
+        "final_html_expandable": ("<blockquote expandable>" in final_html) and ("df -h" in final_html),
+        "trunc_stream_generating": ("生成中" in trunc_stream) and ("rm -rf" not in trunc_stream) and ("df -h" not in trunc_stream),
+        "trunc_final_raw": ("df -h" in trunc_final) and ("rm -rf" in trunc_final) and ("生成中" not in trunc_final) and ("<blockquote expandable>" not in trunc_final),
+        "force_html_on": force_html_on,
+        "rich_draft_off": rich_draft_off,
         "hide_flag_on": hide_flag_on,
         "should_fn_on": should_fn_on,
-        "off_true_raw": off_true == RAW,
-        "off_false_raw": off_false == RAW,
+        "off_html_is_markdown": (off_html == md_raw) and ("<blockquote expandable>" not in off_html),
+        "off_text_raw": off_text == RAW,
         "off_flag": off_flag,
+        "off_force_html": off_force_html,
         "should_fn_off": should_fn_off,
     }, ensure_ascii=False))
 
 asyncio.run(main())
 ''')
         data = json.loads(output.strip().splitlines()[-1])
-        self.assertTrue(data["finalize_folded"], "定稿 hide=on：显示必须折叠，且不含原始命令")
-        self.assertTrue(data["finalize_has_icon"], "折叠占位应含类型标签 run")
+        self.assertTrue(data["finalize_via_html"], "hide=on 定稿必须走 HTML 通道并绕过 send_rich_message")
+        self.assertTrue(data["finalize_has_expandable"], "定稿 HTML 必须含原生 <blockquote expandable>")
+        self.assertTrue(data["finalize_shows_code"], "可展开块里代码应可见（不再一行都看不到）")
+        self.assertTrue(data["finalize_no_marker_leak"], "显示层绝不能泄漏协议标记 / 围栏 / nonce")
         self.assertTrue(data["finalize_response_unchanged"], "rich_finalize 不得改动传入的 response 对象")
         self.assertTrue(data["record_parts_raw"], "对话记录护栏：response_parts 必须逐字为原文")
         self.assertTrue(data["record_finish_raw"], "对话记录护栏：finish() 返回值（落库值）必须逐字为原文")
-        self.assertTrue(data["mid_display_folded"], "流式中途：闭合块显示折叠、不含原始命令")
-        self.assertTrue(data["final_display_folded"], "定稿：闭合块显示折叠、不含原始命令")
-        self.assertTrue(data["trunc_stream_folded"], "流式中途：截断尾巴折成「生成中…」")
-        self.assertTrue(data["trunc_final_raw"], "定稿遇截断块必须原样显示，绝不折成「生成中…」或吞成一行")
+        self.assertTrue(data["mid_html_expandable"], "流式中途：闭合块显示可展开块、代码可见、标记不泄漏")
+        self.assertTrue(data["final_html_expandable"], "定稿：闭合块显示可展开块、代码可见")
+        self.assertTrue(data["trunc_stream_generating"], "流式中途：未闭合尾巴折「生成中…」，原始正文绝不外泄")
+        self.assertTrue(data["trunc_final_raw"], "定稿遇未闭合块必须原样显示，绝不折成「生成中…」或吞掉")
+        self.assertTrue(data["force_html_on"], "hide=on 时渲染器 _force_html 必须为真（强制 HTML 通道）")
+        self.assertTrue(data["rich_draft_off"], "hide=on 时必须关闭 rich draft（走 HTML edit）")
         self.assertTrue(data["hide_flag_on"], "hide=on 时渲染器 _hide_blocks 必须为真")
         self.assertTrue(data["should_fn_on"], "_should_hide_protocol_blocks 必须反映开关开")
-        self.assertTrue(data["off_true_raw"], "hide=off：流式显示原样透传")
-        self.assertTrue(data["off_false_raw"], "hide=off：定稿显示原样透传")
+        self.assertTrue(data["off_html_is_markdown"], "hide=off：_display_html 必须与 markdown_to_telegram_html 逐字节一致、无 expandable")
+        self.assertTrue(data["off_text_raw"], "hide=off：_display_text 原样透传")
         self.assertTrue(data["off_flag"], "hide=off 时渲染器 _hide_blocks 必须为假")
+        self.assertTrue(data["off_force_html"], "hide=off 时 _force_html 必须为假（不强制 HTML 通道）")
         self.assertTrue(data["should_fn_off"], "_should_hide_protocol_blocks 必须反映开关关")
 
 

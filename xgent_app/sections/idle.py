@@ -673,7 +673,7 @@ async def _web_read_settings() -> Dict[str, Any]:
         'values': {
             'thinking_level': normalize_thinking_level(UserDataManager.get('thinking_level')),
             'stream_mode': normalize_bool(UserDataManager.get('stream_mode', True), True),
-            'hide_protocol_blocks': normalize_bool(UserDataManager.get('hide_protocol_blocks', False), False),
+            'hide_protocol_blocks': normalize_bool(UserDataManager.get('hide_protocol_blocks', True), True),
             'agent_mode': bool(UserDataManager.get('agent_mode', False)),
             'text_stitch_mode': normalize_text_stitch_mode(UserDataManager.get('text_stitch_mode')),
             'global_depth': int(UserDataManager.get('global_depth', 30) or 30),

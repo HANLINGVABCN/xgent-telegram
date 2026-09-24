@@ -5,12 +5,13 @@ from xgent_app.protocols import ProtocolParser
 
 
 def _should_hide_protocol_blocks() -> bool:
-    """当前会话是否开启「隐藏协议代码块」。
+    """当前会话是否开启「折叠协议代码块」。
 
-    只影响「显示」这一层：开启后把 AI 回复正文里的 *-x 协议块折叠成一行占位，
-    绝不触碰被落库 / 执行 / 镜像的原始文本。默认 False（关）。
+    只影响「显示」这一层：开启后把 AI 回复正文里的 *-x 协议块折成可展开控件
+    （收起→块头；展开→块头+前 50 行+「已折叠 N 行」），绝不触碰被落库 /
+    执行 / 镜像的原始文本。默认 True（开）。
     """
-    return normalize_bool(UserDataManager.get('hide_protocol_blocks', False), False)
+    return normalize_bool(UserDataManager.get('hide_protocol_blocks', True), True)
 
 async def keep_typing_while_waiting(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
                                     stop_event: asyncio.Event, interval: float = 4.0,
@@ -124,8 +125,17 @@ async def rich_finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_i
     """使用 Rich Message 发送最终回复。失败时 fallback 到旧 HTML 编辑模式。"""
     # 隐藏协议代码块：只改「显示」，另起 display 变量，绝不重绑 response——
     # 落库 / 执行 / 镜像用的是调用方各自的返回值局部变量，与这里无关。
-    # 定稿默认 hide_unclosed=False：即便模型截断，未闭合块也原样完整显示、不折叠。
-    display = ProtocolParser.redact_protocol_blocks(response) if _should_hide_protocol_blocks() else response
+    if _should_hide_protocol_blocks():
+        # 折叠开：把 *-x 协议块渲染成原生可展开的 <blockquote expandable>，强制走
+        # HTML 通道——原生 expandable 只有 HTML sendMessage 渲染得出，rich 网关
+        # （sendRichMessage 吃 markdown）不认这个标签。display 已是最终 HTML，
+        # 直发不再过 markdown_to_telegram_html（否则 <blockquote>/<pre> 被二次转义）。
+        # 定稿 hide_unclosed=False：即便模型截断，未闭合块也原样完整显示、不折叠。
+        display_html = _folded_display_html(response, hide_unclosed=False)
+        await finalize_html_response(context, chat_id, msg, display_html, min(limit, 4000))
+        return
+    # 折叠关：完全保持原 rich 路（逐字节不变）。
+    display = response
     # sendRichMessage 直连 Telegram Bot API，绕过 context.bot。网页会话用的是
     # WebBot / MirrorBot（_is_xgent_web_bot），直连既不会往网页 outbox 推帧，又
     # 会对纯网页会话误发到 Telegram。网页端改走 finalize_text_response：经
@@ -148,6 +158,7 @@ async def rich_finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_i
     except Exception as e:
         logger.warning(f"Rich Message 最终发送失败，降级为 HTML 编辑模式: {e}")
         await finalize_text_response(context, chat_id, msg, display, min(limit, 4000))
+
 
 
 def _parse_markdown_table_row(line: str) -> Optional[List[str]]:
@@ -658,6 +669,79 @@ async def finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     for extra_chunk in chunks[1:]:
         await safe_send_message(context, chat_id, extra_chunk, parse_mode=constants.ParseMode.HTML)
 
+
+def _folded_display_html(response: str, hide_unclosed: bool = False) -> str:
+    """折叠开专用：response → 最终 Telegram-HTML（*-x 块折成 <blockquote expandable>）。
+
+    散文段经 markdown_to_telegram_html（注入，保持全局一致渲染）；无任何协议块时
+    render_folded_html 原样返回输入 → 这里退回 markdown→HTML，保证产物始终是 HTML。
+    只改显示：绝不触碰落库 / 执行 / 镜像的原始文本。
+    """
+    folded = ProtocolParser.render_folded_html(
+        response, hide_unclosed=hide_unclosed, prose_renderer=markdown_to_telegram_html
+    )
+    if folded is response:  # identity：未折叠任何协议块
+        return markdown_to_telegram_html(response)
+    return folded
+
+
+def split_html_for_telegram(html_text: str, limit: int = 4000) -> List[str]:
+    """把已渲染好的 Telegram-HTML 按行切成 ≤limit 的段，绝不在 <pre>/<blockquote>
+    标签内部切开（否则触发 Telegram 'Unclosed start tag'）。
+
+    只在标签嵌套深度回到 0 的行边界处分段；单个顶层片段（如超长散文）仍超限时
+    兜底用 split_text_for_telegram 硬切。折叠块正文已在 protocols 层截到安全长度，
+    故正常情况下每个 <blockquote> 都能整块落进某一段。
+    """
+    if len(html_text) <= limit:
+        return [html_text]
+    lines = html_text.split("\n")
+    chunks: List[str] = []
+    cur: List[str] = []
+    cur_len = 0
+    depth = 0
+    for line in lines:
+        add = len(line) + (1 if cur else 0)
+        if cur and depth == 0 and cur_len + add > limit:
+            chunks.append("\n".join(cur))
+            cur = []
+            cur_len = 0
+            add = len(line)
+        cur.append(line)
+        cur_len += add
+        depth += line.count("<pre") + line.count("<blockquote")
+        depth -= line.count("</pre>") + line.count("</blockquote>")
+        if depth < 0:
+            depth = 0
+    if cur:
+        chunks.append("\n".join(cur))
+    final: List[str] = []
+    for chunk in chunks:
+        if len(chunk) <= limit:
+            final.append(chunk)
+        else:
+            final.extend(split_text_for_telegram(chunk, limit))
+    return final
+
+
+@without_ui_history
+async def finalize_html_response(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: Any,
+                                 html_text: str, limit: int = 4000):
+    """发送「已渲染好的」Telegram-HTML，不再过 markdown_to_telegram_html（避免二次转义）。
+
+    折叠消息（含 <blockquote expandable>）走这条路：在块边界分段，parse_mode=HTML
+    直发，原生 expandable / <pre> 属性原样到达 Telegram 与网页。
+    """
+    safe_html = html_text if (html_text and str(html_text).strip()) else " "
+    chunks = split_html_for_telegram(safe_html, limit)
+    logger.info(
+        f"Sending final folded HTML: chat_id={chat_id}, html_len={len(safe_html)}, chunks={len(chunks)}"
+    )
+    await safe_edit_text(msg, chunks[0], reply_markup=None, parse_mode=constants.ParseMode.HTML)
+    for extra_chunk in chunks[1:]:
+        await safe_send_message(context, chat_id, extra_chunk, parse_mode=constants.ParseMode.HTML)
+
+
 def _retry_after_seconds(exc: RetryAfter) -> float:
     retry_after = getattr(exc, 'retry_after', 1.0)
     if hasattr(retry_after, 'total_seconds'):
@@ -772,9 +856,9 @@ class TelegramStreamRenderer:
         self.queue: asyncio.Queue = asyncio.Queue()
         self.response_parts: List[str] = []
         self.current_text = ""
-        # 隐藏协议代码块：只影响流式「显示」。current_text / response_parts / finish()
-        # 恒为原始文本（落库 / 执行 / 镜像取的就是它们），脱敏只在 _display_text() 临渲染时发生。
-        self._hide_blocks = normalize_bool(UserDataManager.get('hide_protocol_blocks', False), False)
+        # 折叠协议代码块：只影响流式「显示」。current_text / response_parts / finish()
+        # 恒为原始文本（落库 / 执行 / 镜像取的就是它们），折叠只在 _display_text() 临渲染时发生。
+        self._hide_blocks = normalize_bool(UserDataManager.get('hide_protocol_blocks', True), True)
         # 去重基准：脱敏后文本较上次没变则跳过这次 draft/edit，长代码块流式时消息静止、零 API 抖动。
         self._last_display: Optional[str] = None
         self.pending_text = ""
@@ -793,11 +877,18 @@ class TelegramStreamRenderer:
         # 网页端禁用 Rich Draft，流式刷新与收尾都走 HTML edit（经 context.bot，
         # 网页收 edit 帧，MirrorBot 也正常镜像到 TG）。
         self._is_web_bot = bool(getattr(context.bot, "_is_xgent_web_bot", False))
-        if self._is_web_bot:
+        # 折叠开：原生 <blockquote expandable> 只有 HTML 通道渲染得出，rich 网关
+        # （sendRichMessage(Draft) 吃 markdown）不认这个标签 → 强制走 HTML edit
+        # （与网页会话同款），流式刷新与收尾都不走 rich。
+        self._force_html = self._hide_blocks
+        if self._is_web_bot or self._force_html:
             self._rich_draft_enabled = False
 
     def _display_text(self, raw: str, hide_unclosed: bool) -> str:
         """把要「显示」的原始文本按开关脱敏；关或无块时原样返回，绝不改累加器。
+
+        仅用于「长度估算」与「去重基准」：折叠开时返回一行占位（短、静止），
+        流式期间消息不抖动。真正发送的 HTML 由 _display_html 产出。
 
         hide_unclosed=True 仅流式中途用（已 BEGIN 未 END 的尾巴折「生成中…」）；
         hide_unclosed=False 定稿用（未闭合 / 截断 / 写错的块原样完整显示、不折叠，
@@ -806,6 +897,19 @@ class TelegramStreamRenderer:
         if not self._hide_blocks:
             return raw
         return ProtocolParser.redact_protocol_blocks(raw, hide_unclosed=hide_unclosed)
+
+    def _display_html(self, raw: str, hide_unclosed: bool) -> str:
+        """要显示的原始文本 → 最终 Telegram-HTML（直发 parse_mode=HTML，不再二次转义）。
+
+        折叠开：render_folded_html —— *-x 协议块折成 <blockquote expandable>（原生可
+        展开），散文经 markdown_to_telegram_html；无协议块时退回 markdown→HTML。
+        折叠关：markdown_to_telegram_html（与改版前逐字节一致）。
+        只改显示：current_text / response_parts / finish() 恒为原始文本。
+        """
+        if not self._hide_blocks:
+            return markdown_to_telegram_html(raw)
+        return _folded_display_html(raw, hide_unclosed=hide_unclosed)
+
 
     def start(self):
         self._task = asyncio.create_task(self._render_loop())
@@ -840,8 +944,22 @@ class TelegramStreamRenderer:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
         partial = ''.join(self.response_parts).strip()
-        # 定稿显示：未闭合 / 截断块原样完整显示（hide_unclosed=False），绝不折成「生成中…」。
+        # 折叠开：定稿显示走 <blockquote expandable> HTML + 块边界分段（HTML 通道）。
         # 返回值 partial 恒为原始文本，落库不受影响。
+        if self._hide_blocks:
+            display_html = self._display_html(self.current_text or partial, hide_unclosed=False)
+            if display_html and display_html.strip():
+                stopped_html = display_html + "\n\n⏹️ 已停止，保留以上已生成内容。"
+            else:
+                stopped_html = "⏹️ 已停止，还没有生成可保留的内容。"
+            if self.live_edit_enabled:
+                try:
+                    await finalize_html_response(self.context, self.chat_id, self.current_msg,
+                                                 stopped_html, min(self.limit, 4000))
+                except Exception as e:
+                    logger.debug(f"折叠停止保留失败: {e}")
+            return partial
+        # 定稿显示：未闭合 / 截断块原样完整显示（hide_unclosed=False），绝不折成「生成中…」。
         visible_text = self._display_text(self.current_text, hide_unclosed=False).strip() \
             or self._display_text(partial, hide_unclosed=False)
         if visible_text:
@@ -872,6 +990,18 @@ class TelegramStreamRenderer:
     async def remove_controls(self):
         """流式完成后：用 Rich Message 发送最终内容，删除旧占位消息。"""
         if not self.current_text.strip():
+            return
+        # 折叠开：定稿产出最终 <blockquote expandable> HTML，走 HTML 通道并在块边界
+        # 分段（单条 safe_edit_text 无法分段，故用 finalize_html_response）。current_text
+        # 自身不动，落库 / 执行 / 镜像恒取原始文本。
+        if self._hide_blocks:
+            if self.live_edit_enabled:
+                try:
+                    display_html = self._display_html(self.current_text, hide_unclosed=False)
+                    await finalize_html_response(self.context, self.chat_id, self.current_msg,
+                                                 display_html, min(self.limit, 4000))
+                except Exception as e:
+                    logger.debug(f"折叠定稿 HTML 发送失败: {e}")
             return
         # 定稿显示：未闭合 / 截断 / 写错的块原样完整显示（hide_unclosed=False），
         # 绝不折成「生成中…」、绝不把整段回复吞成一行。current_text 自身不动。
@@ -927,7 +1057,7 @@ class TelegramStreamRenderer:
         if len(self._display_text(self.current_text + text, hide_unclosed=True)) > self.limit:
             if self.live_edit_enabled and self.current_text.strip():
                 try:
-                    html_text = markdown_to_telegram_html(self._display_text(self.current_text, hide_unclosed=True))
+                    html_text = self._display_html(self.current_text, hide_unclosed=True)
                     await safe_edit_text(self.current_msg, html_text, reply_markup=None,
                                          parse_mode=constants.ParseMode.HTML)
                 except Exception as e:
@@ -938,7 +1068,7 @@ class TelegramStreamRenderer:
             if self.live_edit_enabled:
                 try:
                     new_text = text if text.strip() else "…"
-                    html_text = markdown_to_telegram_html(self._display_text(new_text, hide_unclosed=True))
+                    html_text = self._display_html(new_text, hide_unclosed=True)
                     self.current_msg = await self.context.bot.send_message(
                         chat_id=self.chat_id,
                         text=html_text,
@@ -952,8 +1082,10 @@ class TelegramStreamRenderer:
             return
 
         self.current_text += text
-        # 流式中途显示：把已写的 *-x 块折成占位（含「已 BEGIN 未 END」尾巴的「生成中…」），
-        # 原始代码从不渲染到任何一端 → 不存在「代码先出现再折叠」的回流跳动。
+        # 流式中途显示：折叠开时把已写的 *-x 块折成可展开 <blockquote>（含「已 BEGIN
+        # 未 END」尾巴的「生成中…」占位），原始代码从不渲染到任何一端 → 不存在「代码
+        # 先出现再折叠」的回流跳动。这里的 display 是脱敏「占位文本」，仅用于空判 / 去重
+        # 基准 / rich draft；真正发送的 HTML 由 _display_html 在下面的 edit 分支产出。
         # current_text 累加器本身不动，落库 / 执行 / 镜像恒取原始文本。
         display = self._display_text(self.current_text, hide_unclosed=True)
         if not display.strip():
@@ -1015,7 +1147,7 @@ class TelegramStreamRenderer:
         # 立即取消 edit_task 返回。safe_edit_text 用 retry_on_retry_after=False
         # 模式，第一次撞 RetryAfter 直接抛（不内部 sleep），让这里能立即设冷却期。
         try:
-            html_text = markdown_to_telegram_html(display)
+            html_text = self._display_html(self.current_text, hide_unclosed=True)
             _stop_event = get_or_create_stop_event()
             edit_task = asyncio.create_task(safe_edit_text(
                 self.current_msg, html_text, reply_markup=self.reply_markup,
