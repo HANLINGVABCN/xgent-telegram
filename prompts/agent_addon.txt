@@ -111,13 +111,13 @@ context handle_message .
 <<END_intel_ctx_7a2c
 ```
 
-10. edit-x：唯一字符串原地替换并自动备份，是修改已有文件的首选。旧串必须包含足够上下文以保证唯一；失败提示“未找到”或“不唯一”时，重新用 read-x 核对空白、缩进和上下文，不得改用 file-x 覆盖。
+10. edit-x：唯一字符串原地替换并自动备份，是修改已有文件的首选。旧串必须包含足够上下文以保证唯一；失败提示“未找到”或“不唯一”时，重新用 read-x 核对空白、缩进和上下文，不得改用 file-x 覆盖。块内用顶格独占一行的 `<<OLD` / `<<NEW` 分隔旧串与新串（与外层 <<BEGIN_/<<END_ 同族）。基本只用裸 `<<OLD` / `<<NEW` 即可；仅当**旧串本身**含顶格 `<<OLD` / `<<NEW` 行（例如改 edit-x 自己的文档）致使分隔被内容抢走时，才给两端加同一段后缀隔离：`<<OLD_k9f2` … `<<NEW_k9f2`。后缀取 4-12 位 ASCII 字母/数字（与块标记同族）、每次随机新取、**且不得在旧串里出现**；OLD 与 NEW 后缀须完全一致。
 ```edit-x:/app/bot/handler.py
 <<BEGIN_edit_greet_82e6
------OLD-----
+<<OLD
 async def greet(name):
     return f"hi {name}"
------NEW-----
+<<NEW
 async def greet(name):
     return f"hello {name}, welcome!"
 <<END_edit_greet_82e6

@@ -361,7 +361,7 @@ class FenceLineShapeTests(unittest.TestCase):
     def test_tag_parameters_may_contain_spaces(self):
         # 路径带空格是真事；标签参数一路吃到行尾，不能按空白切。
         blocks = ProtocolParser.extract_protocol_blocks(
-            self.block("edit-x:/app/my file.py", "-----OLD-----\na\n-----NEW-----\nb")
+            self.block("edit-x:/app/my file.py", "<<OLD\na\n<<NEW\nb")
         )
         self.assertEqual(1, len(blocks))
         self.assertEqual("/app/my file.py", blocks[0]["path"])

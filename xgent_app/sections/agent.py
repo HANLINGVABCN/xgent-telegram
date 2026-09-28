@@ -25,9 +25,14 @@ class AgentExecutor:
     TEXT_INLINE_MAX_BYTES = 512 * 1024
     # [edit] 原地替换的备份后缀（后随时间戳）
     EDIT_BACKUP_SUFFIX = '.editbak.'
-    # [edit] 固定分隔标记（标记行必须顶格独占一行）
-    _EDIT_OLD_MARK = '-----OLD-----'
-    _EDIT_NEW_MARK = '-----NEW-----'
+    # [edit] 段分隔哨兵（顶格独占一行，与外层 <<BEGIN_/<<END_ 同族，抗内容冲突）。
+    # 可选后缀：<<OLD_<后缀> / <<NEW_<同一后缀>，OLD 与 NEW 必须同后缀配对；
+    # 仅当旧串本身含顶格 <<OLD / <<NEW 行时才需要（如改 edit-x 自身文档），平时裸用即可。
+    # 后缀字符集与外层 nonce 同族（ASCII 字母/数字/下划线）；提示词建议 4-12 位随机、
+    # 且不得出现在旧串中，解析器接受 1-64 位作容错带（长度不影响正确性，同后缀才是关键）。
+    _EDIT_OLD_MARK = '<<OLD'
+    _EDIT_NEW_MARK = '<<NEW'
+    _EDIT_SUFFIX_MAX = 64
     # [grep] 跳过的噪声目录
     GREP_SKIP_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv',
                       'dist', 'build', '.idea', '.vscode'}
@@ -914,19 +919,16 @@ class AgentExecutor:
     async def edit_file(cls, edit_body: str, explicit_path: str = "") -> Dict[str, Any]:
         """字符串级原地替换：把文件中唯一存在的 old_str 换成 new_str。
 
-        body 格式（标记行必须顶格独占一行，内容区可含任意字符）：
-            /path/to/file
-            -----OLD-----
+        body 格式（<<OLD / <<NEW 哨兵各自顶格独占一行，内容区原样、可多行）：
+            <<OLD
             旧字符串（原样，可多行）
-            -----NEW-----
+            <<NEW
             新字符串（原样，可多行）
 
-        若 old_str 或 new_str 恰好含有分隔标记行，可在路径后追加自定义标记：
-            /path/to/file
-            <<MARKER_OLD
-            ...
-            >>MARKER_NEW
-            ...
+        路径来自块头 `edit-x:/path/to/file`（无块头时取 body 首行）。哨兵与外层
+        <<BEGIN_/<<END_ 同族，旧/新串里极难恰好撞上顶格的 <<OLD / <<NEW。万一旧串
+        本身就含顶格 <<OLD / <<NEW 行（如改 edit-x 自身文档），给两个哨兵加同一段
+        随机后缀即可彻底隔离：<<OLD_k9f2 … <<NEW_k9f2（OLD 与 NEW 后缀须一致）。
         返回 dict 含 success/path/backed_up/matches/line_range 等。
         """
         old_str, new_str, requested_path, parse_err = cls._parse_edit_body(edit_body, explicit_path)
@@ -1052,14 +1054,18 @@ class AgentExecutor:
     def _parse_edit_body(cls, body: str, explicit_path: str = "") -> Tuple[str, str, str, str]:
         """解析 edit 块 body，返回 (old_str, new_str, path, err)。
 
-        格式（固定分隔标记，标记行必须顶格独占一行）：
-            /path
-            -----OLD-----
+        格式（<<OLD / <<NEW 哨兵，各自顶格独占一行）：
+            <<OLD
             旧串（原样，可多行）
-            -----NEW-----
+            <<NEW
             新串（原样，可多行）
-        若旧/新串本身含分隔标记行（极罕见），AI 会收到"未找到"反馈，
-        自然会换一段上下文重试，无需自定义标记。
+        path 一般来自块头 edit-x:/path（explicit_path），此时 body 只含两段；
+        无块头时取 body 首行为 path。
+
+        可选后缀：哨兵可写成 <<OLD_<后缀> / <<NEW_<同一后缀>（后缀限 ASCII
+        字母/数字/下划线，与外层 <<BEGIN_/<<END_ 同族）。OLD 取首个 <<OLD 家族
+        行、记下其后缀，NEW 只认带**完全相同后缀**的那一行。平时裸用 <<OLD/<<NEW；
+        仅当旧串本身含顶格 <<OLD / <<NEW 行（如改 edit-x 自身文档）才需加后缀隔离。
         """
         body = body.replace('\r\n', '\n')
         lines = body.split('\n')
@@ -1072,25 +1078,57 @@ class AgentExecutor:
             path_line = lines[0].strip()
             rest_lines = lines[1:]
 
-        if cls._EDIT_OLD_MARK not in rest_lines:
+        # OLD 分隔：首个等于 <<OLD 或 <<OLD_<后缀> 的顶格行；记下后缀供 NEW 配对
+        idx_old = -1
+        suffix = ''
+        for i, ln in enumerate(rest_lines):
+            s = cls._edit_mark_suffix(ln, cls._EDIT_OLD_MARK)
+            if s is not None:
+                idx_old = i
+                suffix = s
+                break
+        if idx_old < 0:
             return '', '', '', (
-                f"edit 块缺少分隔标记行 '{cls._EDIT_OLD_MARK}'。"
-                f"格式：第一行路径，随后 '{cls._EDIT_OLD_MARK}'，旧串，"
-                f"再 '{cls._EDIT_NEW_MARK}'，新串。"
+                f"edit 块缺少分隔标记行 '{cls._EDIT_OLD_MARK}'（或带后缀的 "
+                f"'{cls._EDIT_OLD_MARK}_<后缀>'）。格式：块头 edit-x:/path（或 body "
+                f"首行）给出路径，随后顶格 '{cls._EDIT_OLD_MARK}'、旧串、"
+                f"'{cls._EDIT_NEW_MARK}'、新串。"
             )
-        if cls._EDIT_NEW_MARK not in rest_lines:
+
+        # NEW 分隔：OLD 之后首个与其后缀完全一致的 <<NEW 家族行（裸对裸）
+        new_mark = cls._EDIT_NEW_MARK + suffix
+        idx_new = -1
+        for i in range(idx_old + 1, len(rest_lines)):
+            if rest_lines[i] == new_mark:
+                idx_new = i
+                break
+        if idx_new < 0:
             return '', '', '', (
-                f"edit 块缺少分隔标记行 '{cls._EDIT_NEW_MARK}'（在 OLD 段之后）。"
+                f"edit 块缺少与 '{cls._EDIT_OLD_MARK}{suffix}' 配对的 "
+                f"'{new_mark}' 分隔行（须在 OLD 段之后，且后缀与 OLD 完全一致）。"
             )
-        idx_old = rest_lines.index(cls._EDIT_OLD_MARK)
-        idx_new = rest_lines.index(cls._EDIT_NEW_MARK)
-        if idx_new <= idx_old:
-            return '', '', '', (
-                f"标记顺序错误：'{cls._EDIT_NEW_MARK}' 必须出现在 '{cls._EDIT_OLD_MARK}' 之后。"
-            )
+
         old_str = '\n'.join(rest_lines[idx_old + 1: idx_new])
         new_str = '\n'.join(rest_lines[idx_new + 1:])
         return old_str, new_str, path_line, ''
+
+    @classmethod
+    def _edit_mark_suffix(cls, line: str, base: str) -> Optional[str]:
+        """line 若是分隔哨兵，返回其后缀（裸标记返回 ''），否则返回 None。
+
+        base 为 '<<OLD' 或 '<<NEW'。裸标记即整行 == base；带后缀即
+        base + '_' + <1-64 位 ASCII 字母/数字/下划线>。返回值含前导下划线
+        （如 '_k9f2'），便于直接拼出配对的另一端。越界/含其它字符的行不认作
+        哨兵（返回 None），会退化成"缺 <<OLD"类报错，安全失败、不误截断。"""
+        if line == base:
+            return ''
+        prefix = base + '_'
+        if line.startswith(prefix):
+            body = line[len(prefix):]
+            if (body and len(body) <= cls._EDIT_SUFFIX_MAX
+                    and body.isascii() and all(c.isalnum() or c == '_' for c in body)):
+                return line[len(base):]  # '_' + body
+        return None
 
     @staticmethod
     def _line_numbers_of(content: str, needle: str) -> List[int]:
