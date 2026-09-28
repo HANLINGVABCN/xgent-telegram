@@ -517,6 +517,24 @@ class RenderFoldedTests(unittest.TestCase):
         self.assertNotIn(NONCE_A, out)
         self.assertNotIn("```", out)
 
+    def test_telegram_mode_has_no_pre_inside_blockquote(self):
+        # Bot API 对 blockquote 内嵌 <pre>/<code> 会 400 → 整条回退不折叠。
+        body = "\n".join(f"line {i} <x>" for i in range(1, 61))
+        response = protocol_block("run-x", body, NONCE_A)
+        out = ProtocolParser.render_folded_html(response, monospace=False)
+        self.assertIn("<blockquote expandable>", out)
+        self.assertNotIn("<pre>", out)
+        self.assertNotIn("<code>", out)
+        self.assertIn("line 50 &lt;x&gt;", out)
+        self.assertNotIn("line 51 ", out)
+        self.assertTrue(out.endswith("<i>已折叠 10 行</i></blockquote>"))
+
+    def test_telegram_mode_short_block_has_no_folded_label(self):
+        response = protocol_block("run-x", "a\nb", NONCE_A)
+        out = ProtocolParser.render_folded_html(response, monospace=False)
+        self.assertIn("a\nb</blockquote>", out)
+        self.assertNotIn("已折叠", out)
+
     def test_block_body_is_html_escaped(self):
         # 正文里的 < & > 必须转义，否则 Telegram 报 "Unclosed start tag"（真机踩过）。
         response = protocol_block("run-x", "echo '<a> & <b>'", NONCE_A)

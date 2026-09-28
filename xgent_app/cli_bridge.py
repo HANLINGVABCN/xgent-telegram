@@ -447,6 +447,12 @@ def dismiss_menu() -> bool:
         return had
 
 
+def active_menu_message_id() -> Optional[int]:
+    """当前可选菜单所在的消息 id（TUI 据此把菜单留在可原地更新的实时区）。"""
+    with _MENU_LOCK:
+        return _active_menu_message_id
+
+
 def get_last_menu_options() -> List[str]:
     """当前可选菜单的 callback_data 列表，顺序与显示编号一一对应。"""
     with _MENU_LOCK:
@@ -865,6 +871,7 @@ __all__ = [
     "build_cli_conversation_objects",
     "build_cli_callback_objects",
     "build_cli_command_objects",
+    "active_menu_message_id",
     "get_last_menu_options",
     "get_last_menu_labels",
     "menu_is_top",

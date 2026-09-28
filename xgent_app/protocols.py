@@ -29,6 +29,45 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from xgent_app.text_utils import head_lines
 
 
+def _truncate_to_escaped_budget(s: str, budget: int) -> str:
+    """返回 ``s`` 的最长前缀，使其经 ``html.escape(quote=False)`` 后长度 ≤ budget。
+
+    单行代码本身就超预算时（压缩 JS/CSS、无换行长行）不能按原始字符数截——``<``/``&``
+    转义后各膨胀成 4/5 字符，按原始长度截仍可能让整块超过 Telegram 单条上限、被分段
+    硬切成残缺 HTML。这里按转义后的实际长度逐字符累加，保证前缀塞得进配额。
+    """
+    used = 0
+    for i, ch in enumerate(s):
+        w = len(html.escape(ch, quote=False))
+        if used + w > budget:
+            return s[:i]
+        used += w
+    return s
+
+
+def _elide_middle_to_escaped_budget(s: str, budget: int) -> str:
+    """中段省略 ``s``（保留头尾、中间填 …），使其经 ``html.escape(quote=False)`` 后 ≤ budget。
+
+    用于块头里的 path/命令：它无长度上限（深层嵌套路径、带 query 的长 URL、长命令行），
+    只截尾会把「是哪个文件/命令」这类关键信息丢在两端之一，故保留头尾、省略中段。按
+    **转义后**长度二分——path/命令可能含 ``<`` ``&`` ``"``，转义后膨胀，按原始长度截不安全。
+    """
+    if len(html.escape(s, quote=False)) <= budget:
+        return s
+    ell = "…"
+    lo, hi, best = 0, len(s), ""
+    while lo <= hi:
+        keep = (lo + hi) // 2
+        head_keep = (keep + 1) // 2
+        tail_keep = keep - head_keep
+        cand = s[:head_keep] + ell + (s[-tail_keep:] if tail_keep else "")
+        if len(html.escape(cand, quote=False)) <= budget:
+            best, lo = cand, keep + 1
+        else:
+            hi = keep - 1
+    return best or ell
+
+
 class ProtocolParser:
     """解析使用唯一成对标记的 Agent 协议。"""
 
@@ -503,6 +542,7 @@ class ProtocolParser:
                 "kind": "block", "type": btype, "icon": icon, "label": label,
                 "path": (block.get("path") or "").strip(), "body": body,
                 "line_count": line_count, "closed": True, "generating": False,
+                "raw": "\n".join(lines[i:end_i + 1]),  # BEGIN..END 完整原文（网页「复制全部」）
             })
             i = end_i + 1
         flush_prose()
@@ -511,12 +551,23 @@ class ProtocolParser:
     # 单块展开后最多显示的正文行数。① 展开 = 块头 + 前 N 行(+②)；第 N+1 行起
     # 永不渲染。正文 ≤ N 行时无 ②，展开即整块。spec 固定 50。
     _FOLD_MAX_LINES = 50
+    # 展开预览的字符预算：前 50 行若超长（如长 CSS/压缩代码行），少显示几行，
+    # 「已折叠 N 行」相应变大——保证单个折叠块在 Telegram 形态下 < 4096，不会被
+    # 分段硬切成残缺 HTML（残块 → 400 → 退回纯文本）。三端同一份预览，显示一致。
+    _FOLD_MAX_CHARS = 3200
+    # 块头（<b>icon name path</b> · N 行）里的 path/命令无长度上限：正文预算保住了正文，
+    # 却保不住块头——长路径/长命令行会把整块 tg 形态顶过 Telegram 单条上限，重蹈「单块被
+    # 分段硬切成残缺 <blockquote>」的覆辙。故块头也设预算，中段省略过长 path。512 + 正文
+    # 3200 + 标签开销 ≈ 3780 < 4000，保证任何单个折叠块必 < 单条上限、永不进硬切兜底。
+    _HEAD_MAX_CHARS = 512
 
     @classmethod
     def _render_block_blockquote(
         cls,
         seg: Dict[str, Any],
         max_lines: Optional[int] = None,
+        monospace: bool = True,
+        raw_copy: bool = False,
     ) -> str:
         """把一个协议块段渲染成 Telegram-HTML 的 <blockquote expandable>。
 
@@ -526,25 +577,87 @@ class ProtocolParser:
         标注第 max_lines+1 行起被折且永不渲染。正文 ≤ max_lines：无标签，展开即整块。
         未闭合块（generating）→ 不带 expandable 的「⚡ … · 生成中…」，正文为空，
         绝不外泄在写的原始内容。**只改显示**，落库/执行/镜像永远用完整原文。
+
+        monospace=False（Telegram）：blockquote 内不嵌 <pre>，正文为转义纯文本——
+        Bot API 对 blockquote 里嵌 pre/code 会 400，整条回退成不折叠。
+        raw_copy=True（仅网页）：把 BEGIN..END 完整原文放进 data-raw，供「复制全部」。
+        「已折叠 K 行」包在 <i> 里：它是标注不是正文，各端据此特殊显示。
         """
         limit = cls._FOLD_MAX_LINES if max_lines is None else max_lines
         icon = seg.get("icon") or "🔧"
-        label = seg.get("label") or seg.get("type") or ""
+        btype = (seg.get("type") or seg.get("label") or "").strip()
+        # 块头显示协议原名（file-x / run-x …），加粗：它是标注不是正文，各端特殊显示
+        name = btype if (not btype or btype.endswith("-x")) else f"{btype}-x"
         path = (seg.get("path") or "").strip()
-        head = f"{icon} {label} {path}".strip() if path else f"{icon} {label}".strip()
+        if path:
+            # path/命令无长度上限：中段省略，使块头有界——否则长路径把整块顶过单条上限、
+            # 被分段硬切成残缺 <blockquote>（正文已限长，块头是唯一漏网的膨胀源）。
+            prefix = f"{icon} {name} "
+            path = _elide_middle_to_escaped_budget(
+                path, max(cls._HEAD_MAX_CHARS - len(html.escape(prefix, quote=False)), 16))
+            head = (prefix + path).strip()
+        else:
+            head = f"{icon} {name}".strip()
 
         if seg.get("generating"):
-            return f"<blockquote>⚡ {html.escape(head)} · 生成中…</blockquote>"
+            return f"<blockquote>⚡ <b>{html.escape(head)}</b> · 生成中…</blockquote>"
 
         body = seg.get("body") or ""
         line_count = seg.get("line_count", 0)
-        header_line = html.escape(f"{head} · {line_count} 行")
+        header_line = f"<b>{html.escape(head)}</b> · {line_count} 行"
         preview, dropped = head_lines(body, limit)
         escaped_body = html.escape(preview, quote=False)
-        inner = f"{header_line}\n<pre>{escaped_body}</pre>"
+        if len(escaped_body) > cls._FOLD_MAX_CHARS:
+            kept: List[str] = []
+            used = 0
+            for ln in preview.split("\n"):
+                # 单行本身就可能超预算（压缩代码/无换行长行）：按【转义后】长度截，
+                # 防止 escape 膨胀后整块超过 Telegram 单条上限 → 被分段硬切成残缺 HTML。
+                esc_len = len(html.escape(ln, quote=False))
+                if esc_len > cls._FOLD_MAX_CHARS:
+                    ln = _truncate_to_escaped_budget(ln, cls._FOLD_MAX_CHARS)
+                    esc_len = len(html.escape(ln, quote=False))
+                cost = esc_len + 1
+                if kept and used + cost > cls._FOLD_MAX_CHARS:
+                    break
+                kept.append(ln)
+                used += cost
+            dropped += preview.count("\n") + 1 - len(kept)
+            preview = "\n".join(kept)
+            escaped_body = html.escape(preview, quote=False)
+        if monospace:
+            inner = f"{header_line}\n<pre>{escaped_body}</pre>"
+        elif escaped_body:
+            inner = f"{header_line}\n{escaped_body}"
+        else:
+            inner = header_line
         if dropped > 0:
-            inner += f"\n{html.escape(f'已折叠 {dropped} 行')}"
-        return f"<blockquote expandable>{inner}</blockquote>"
+            inner += f"\n<i>{html.escape(f'已折叠 {dropped} 行')}</i>"
+        attrs = " expandable"
+        if raw_copy and seg.get("raw"):
+            # 换行编成 &#10;：属性保持单行，按行分段的 split_html_for_telegram 不会切进属性
+            attrs += ' data-raw="' + html.escape(seg["raw"], quote=True).replace("\n", "&#10;") + '"'
+        return f"<blockquote{attrs}>{inner}</blockquote>"
+
+    _TG_FOLD_RE = re.compile(r"<blockquote expandable[^>]*>(.*?)</blockquote>", re.S)
+
+    @classmethod
+    def to_telegram_html(cls, html_text: str) -> str:
+        """标准折叠 HTML（网页形态）→ Telegram 可接受形态。幂等。
+
+        全链路只渲染一种标准形态（<blockquote expandable data-raw=…> 内含 <pre>），
+        网页/CLI/历史回放/镜像帧都用它，保证多端与刷新前后显示一致；只有真正打到
+        Telegram Bot API 的那一刻经这里转换：去掉 data-raw、拆掉 blockquote 里的
+        <pre>（Bot API 对 blockquote 嵌 pre/code 报 400 → 整条回退成不折叠）。
+        """
+        if not html_text or "<blockquote expandable" not in html_text:
+            return html_text
+
+        def _one(m: "re.Match[str]") -> str:
+            inner = m.group(1).replace("<pre>", "").replace("</pre>", "")
+            return f"<blockquote expandable>{inner}</blockquote>"
+
+        return cls._TG_FOLD_RE.sub(_one, html_text)
 
     @classmethod
     def render_folded_html(
@@ -553,6 +666,8 @@ class ProtocolParser:
         hide_unclosed: bool = False,
         prose_renderer: Optional[Callable[[str], str]] = None,
         max_lines: Optional[int] = None,
+        monospace: bool = True,
+        raw_copy: bool = False,
     ) -> str:
         """把回复渲染成最终 Telegram-HTML：协议块折成 <blockquote expandable>。
 
@@ -582,6 +697,6 @@ class ProtocolParser:
                 if rendered and rendered.strip():
                     parts.append(rendered)
             else:
-                parts.append(cls._render_block_blockquote(seg, max_lines))
+                parts.append(cls._render_block_blockquote(seg, max_lines, monospace, raw_copy))
         return "\n".join(p for p in parts if p)
 

@@ -131,6 +131,8 @@ async def rich_finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_i
         # （sendRichMessage 吃 markdown）不认这个标签。display 已是最终 HTML，
         # 直发不再过 markdown_to_telegram_html（否则 <blockquote>/<pre> 被二次转义）。
         # 定稿 hide_unclosed=False：即便模型截断，未闭合块也原样完整显示、不折叠。
+        # 标准形态（网页形态）一份到底：网页/镜像/刷新一致；打到 Telegram 时由
+        # bot 出口适配（protocols.to_telegram_html）转换，见 runtime.build_application。
         display_html = _folded_display_html(response, hide_unclosed=False)
         await finalize_html_response(context, chat_id, msg, display_html, min(limit, 4000))
         return
@@ -534,6 +536,13 @@ def split_text_for_telegram(text: str, limit: int = 4000) -> List[str]:
 def plain_text_from_html(text: str) -> str:
     cleaned = re.sub(r'</(p|div|br|pre|blockquote|li|h[1-6])\s*>', '\n', str(text), flags=re.I)
     cleaned = re.sub(r'<[^>]+>', '', cleaned)
+    # 兜底：被硬切在标签中间的半截标签（行尾一个 '<' 后面没有闭合 '>'）整段删掉。
+    # 否则接下来的 html.unescape 会把 data-raw 里转义过的原始代码全部还原，连同
+    # '<blockquote expandable data-raw=' 前缀一起当纯文本刷屏（2026-09-28 事故的可见
+    # 症状）。此步必须在 unescape 之前——此时正文里的 '<' 都还是 '&lt;'，裸 '<' 只可能
+    # 是标签分隔符。正常情况下 split 已在标签边界切、根本不会产生半截标签，这里只是最
+    # 后一道防线。
+    cleaned = re.sub(r'<[^>\n]*$', '', cleaned, flags=re.M)
     return html.unescape(cleaned)
 
 # 注：这里曾有一个 markdown_to_plain_text(text) = plain_text_from_html(
@@ -567,7 +576,11 @@ def _sanitize_telegram_html(text: str) -> str:
     # 防止第三方内容或残留的 <br> 漏网打到 API 触发 "Can't parse entities"。
     text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
 
-    result = re.sub(r'<[^>]+>', _replace_tag, text)
+    # <[^>]*> 匹配完整标签；末尾的 |< 兜住被硬切在标签中间、没有闭合 '>' 的半截标签
+    # ——后者会走进 _replace_tag 的 not tag_match 分支被 html.escape 成 '&lt;'，从而
+    # 不再有残缺 <blockquote/<pre 打到 Telegram 触发 400（否则整条消息退回纯文本 →
+    # 裸标签刷屏，2026-09-28 事故的放大环节）。
+    result = re.sub(r'<[^>]*>|<', _replace_tag, text)
 
     # 修复未闭合的标签：统计开闭标签，补全缺失的闭合标签
     open_tags: List[str] = []
@@ -596,7 +609,17 @@ async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
     if not raw_text:
         raw_text = " "
     parse_mode = kwargs.get('parse_mode')
-    chunks = split_text_for_telegram(raw_text, limit)
+    if parse_mode == constants.ParseMode.HTML:
+        # 已渲染好的 Telegram-HTML：必须按【标签边界】切、按出口形态计长
+        # （split_html_for_telegram / _tg_len）。绝不能用 split_text_for_telegram 按
+        # 【原始字符位置】硬切——折叠块标准形态里巨大的 data-raw 属性会把原始长度顶爆，
+        # 硬切会落在 data-raw 或任意标签中间 → 残缺 <blockquote>/<pre> → Telegram 400
+        # → 退回纯文本 → 满屏裸标签。这正是 2026-09-28 事故：finalize 已在块边界把 HTML
+        # 切好，chunks[1:] 走到这里却被按【原始长度】重新切碎（data-raw 令原始长度远大于
+        # 出口长度，必超 3900 而触发硬切）。改为按标签边界重切，天然幂等、不会切坏。
+        chunks = split_html_for_telegram(raw_text, limit)
+    else:
+        chunks = split_text_for_telegram(raw_text, limit)
     sent: List[Any] = []
 
     for index, chunk in enumerate(chunks):
@@ -660,17 +683,21 @@ async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
 async def finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: Any,
                                  response: str, limit: int = 4000):
     html_response = markdown_to_telegram_html(response)
-    chunks = split_text_for_telegram(html_response, limit)
+    # 按标签边界切（split_html_for_telegram），不用 split_text_for_telegram：后者会在
+    # 恰好 limit 处硬切，可能落在 <pre>/<code>/<a href="…"> 标签中间 → 400。此处 html_response
+    # 已是 Telegram-HTML（含代码块 <pre>），按单元切更安全，且与折叠路径统一。
+    chunks = split_html_for_telegram(html_response, limit)
     logger.info(
         f"Sending final Telegram response: chat_id={chat_id}, "
         f"text_len={len(response)}, html_len={len(html_response)}, chunks={len(chunks)}"
     )
     await safe_edit_text(msg, chunks[0], reply_markup=None, parse_mode=constants.ParseMode.HTML)
     for extra_chunk in chunks[1:]:
-        await safe_send_message(context, chat_id, extra_chunk, parse_mode=constants.ParseMode.HTML)
+        await safe_send_message(context, chat_id, extra_chunk, limit=limit, parse_mode=constants.ParseMode.HTML)
 
 
-def _folded_display_html(response: str, hide_unclosed: bool = False) -> str:
+def _folded_display_html(response: str, hide_unclosed: bool = False, monospace: bool = True,
+                         raw_copy: bool = True) -> str:
     """折叠开专用：response → 最终 Telegram-HTML（*-x 块折成 <blockquote expandable>）。
 
     散文段经 markdown_to_telegram_html（注入，保持全局一致渲染）；无任何协议块时
@@ -678,7 +705,8 @@ def _folded_display_html(response: str, hide_unclosed: bool = False) -> str:
     只改显示：绝不触碰落库 / 执行 / 镜像的原始文本。
     """
     folded = ProtocolParser.render_folded_html(
-        response, hide_unclosed=hide_unclosed, prose_renderer=markdown_to_telegram_html
+        response, hide_unclosed=hide_unclosed, prose_renderer=markdown_to_telegram_html,
+        monospace=monospace, raw_copy=raw_copy,
     )
     if folded is response:  # identity：未折叠任何协议块
         return markdown_to_telegram_html(response)
@@ -686,42 +714,74 @@ def _folded_display_html(response: str, hide_unclosed: bool = False) -> str:
 
 
 def split_html_for_telegram(html_text: str, limit: int = 4000) -> List[str]:
-    """把已渲染好的 Telegram-HTML 按行切成 ≤limit 的段，绝不在 <pre>/<blockquote>
-    标签内部切开（否则触发 Telegram 'Unclosed start tag'）。
+    """把已渲染好的 Telegram-HTML 按【顶层单元】切成 ≤limit 的段，绝不在
+    <pre>/<blockquote> 标签内部切开（否则触发 Telegram 'Unclosed start tag' → 400）。
 
-    只在标签嵌套深度回到 0 的行边界处分段；单个顶层片段（如超长散文）仍超限时
-    兜底用 split_text_for_telegram 硬切。折叠块正文已在 protocols 层截到安全长度，
-    故正常情况下每个 <blockquote> 都能整块落进某一段。
+    先按标签嵌套深度把 HTML 拆成一串顶层单元——每个 <blockquote> 折叠块整体是一个
+    单元，深度回到 0 的散文行各自是一个单元——再把整块单元贪心装箱进 ≤limit 的段。
+    单元永远整进整出，只有【单个单元自身就超限】（如超长散文行）才退到
+    split_text_for_telegram 硬切；折叠块正文已在 protocols 层截到安全长度，正常进不来。
+
+    这样修好了老 bug：两个各自不超限、合起来超限的折叠块，曾因分段判断只看「当前累计
+    + 下一【行】」，而块的开头行很短、判断通过后整块又在 depth>0 里被吸进来无从再切，
+    最终把两块并进同一段、末段兜底按整段硬切成残缺 HTML → Telegram 400 → 退回纯文本、
+    满屏 <blockquote… 裸标签。改成按【整块单元】判断，块与块之间永远能在边界分开。
+
+    全程按 Telegram 实际收到的形态计长（_tg_len：标准形态的 data-raw / 块内 <pre> 在
+    Bot API 出口才剥掉，不占 4096 配额）。
     """
-    if len(html_text) <= limit:
+    if _tg_len(html_text) <= limit:
         return [html_text]
-    lines = html_text.split("\n")
+
+    # ① 按标签深度切成顶层单元：深度从 0 升起再回到 0 的整段（折叠块 / 散文代码块）为
+    #    一个单元；深度始终为 0 的行（普通散文行）各自成一个单元。
+    units: List[str] = []
+    buf: List[str] = []
+    depth = 0
+    for line in html_text.split("\n"):
+        buf.append(line)
+        depth += line.count("<pre") + line.count("<blockquote")
+        depth -= line.count("</pre>") + line.count("</blockquote>")
+        if depth <= 0:
+            depth = 0
+            units.append("\n".join(buf))
+            buf = []
+    if buf:  # 结尾标签未闭合（异常输入兜底）：剩余整段作为一个单元
+        units.append("\n".join(buf))
+
+    # ② 贪心装箱：整块单元累加到 ≤limit；放不下就先封当前段，单元另起一段。
     chunks: List[str] = []
     cur: List[str] = []
     cur_len = 0
-    depth = 0
-    for line in lines:
-        add = len(line) + (1 if cur else 0)
-        if cur and depth == 0 and cur_len + add > limit:
+    for unit in units:
+        u_len = _tg_len(unit)
+        add = u_len + (1 if cur else 0)
+        if cur and cur_len + add > limit:
             chunks.append("\n".join(cur))
             cur = []
             cur_len = 0
-            add = len(line)
-        cur.append(line)
+            add = u_len
+        cur.append(unit)
         cur_len += add
-        depth += line.count("<pre") + line.count("<blockquote")
-        depth -= line.count("</pre>") + line.count("</blockquote>")
-        if depth < 0:
-            depth = 0
     if cur:
         chunks.append("\n".join(cur))
+
+    # ③ 仅当单个单元自身仍超限（超长散文行等）才硬切——折叠块已在 protocols 层截到
+    #    安全长度，永远进不了这条兜底。
     final: List[str] = []
     for chunk in chunks:
-        if len(chunk) <= limit:
+        if _tg_len(chunk) <= limit:
             final.append(chunk)
         else:
             final.extend(split_text_for_telegram(chunk, limit))
     return final
+
+
+def _tg_len(html_text: str) -> int:
+    """这段 HTML 打到 Telegram 时的实际长度（经出口适配后）。"""
+    if "<blockquote expandable" not in html_text:
+        return len(html_text)
+    return len(ProtocolParser.to_telegram_html(html_text))
 
 
 @without_ui_history
@@ -739,7 +799,7 @@ async def finalize_html_response(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     )
     await safe_edit_text(msg, chunks[0], reply_markup=None, parse_mode=constants.ParseMode.HTML)
     for extra_chunk in chunks[1:]:
-        await safe_send_message(context, chat_id, extra_chunk, parse_mode=constants.ParseMode.HTML)
+        await safe_send_message(context, chat_id, extra_chunk, limit=limit, parse_mode=constants.ParseMode.HTML)
 
 
 def _retry_after_seconds(exc: RetryAfter) -> float:

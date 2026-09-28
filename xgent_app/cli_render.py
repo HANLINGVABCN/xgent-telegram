@@ -36,6 +36,8 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple
 # --------------------------------------------------------------------------
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# 协议折叠块头：「{icon} {name}-x[ path] · {N} 行」（protocols._render_block_blockquote）
+_FOLD_HEADER_RE = re.compile(r"^\S+\s+\S+-x\b.*·\s*\d+\s*行$")
 
 # --------------------------------------------------------------------------
 # 常驻输入框挂载
@@ -639,6 +641,11 @@ class MessageRenderer:
             for paragraph in rendered.split("\n"):
                 if not paragraph.strip():
                     lines.append("")
+                    continue
+                if _FOLD_HEADER_RE.search(_ANSI_RE.sub("", paragraph).strip()):
+                    # 协议折叠块头（「📄 file-x /长路径 · 70 行」）整行不主动折：交给终端 /
+                    # TUI 软换行，保证它永远是一行，TUI 才能稳定识别成可折叠块。
+                    lines.append(indent + paragraph.rstrip())
                     continue
                 for wrapped in wrap_line(paragraph.rstrip(), body_width):
                     lines.append(indent + wrapped)

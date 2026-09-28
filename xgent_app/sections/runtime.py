@@ -218,6 +218,9 @@ def build_application() -> Any:
         builder = builder.base_file_url(f"{BotConfig.API_BASE_URL}/file/bot")
         builder = builder.local_mode(True)
     app = builder.build()
+    # 折叠块标准形态 → Telegram 形态，只在 Bot API 出口转换（多端显示一致的关键）
+    from xgent_app.tg_html_adapter import install_telegram_html_adapter
+    install_telegram_html_adapter(app.bot)
 
     job_queue = app.job_queue
     if job_queue is None:

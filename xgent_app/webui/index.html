@@ -453,41 +453,46 @@
   .bubble blockquote > :first-child { margin-top: 0; }
   .bubble blockquote > :last-child { margin-bottom: 0; }
 
-  /* 可展开折叠的协议代码块（服务端 <blockquote expandable>，与电报原生 expandable 同源）。
-     默认折叠：限高 + 底部渐隐 + 「点击展开」提示；点击切换 .expanded 展开看全。
-     首行是 "🔧 run · N 行" 之类的 header，点它（或非代码区）即可展开/收起。 */
-  .bubble blockquote[expandable] {
-    position: relative; cursor: pointer;
-    max-height: 132px; overflow: hidden;
-    transition: max-height 0.18s ease;
-    padding-bottom: 22px;
+  /* 协议块（服务端 <blockquote expandable>，与电报原生 expandable 同源）：紧凑卡片。
+     一行块头（▸ 名称 · N 行 + 右侧三个按钮），下接代码；收起只露前 3 行，
+     无渐隐无提示条。≤3 行且无「已折叠」标签的块不可折叠（pb-short）。 */
+  .bubble blockquote.pb {
+    margin: 6px 0; padding: 0; border: 1px solid var(--code-border);
+    border-left: 3px solid var(--accent); border-radius: 8px;
+    background: var(--code-bg); color: var(--code-fg); overflow: hidden;
+    cursor: pointer; font-size: 13px;
   }
-  .bubble blockquote[expandable].expanded {
-    max-height: none; padding-bottom: 6px;
+  .bubble blockquote.pb.pb-short { cursor: auto; }
+  .pb-head {
+    display: flex; align-items: center; gap: 6px; min-width: 0;
+    padding: 2px 4px 2px 8px; background: var(--code-header);
+    font: 12.5px/1.6 var(--font); color: #CBD5E1; user-select: none;
   }
-  /* 折叠态底部渐隐遮罩，暗示「还有更多」 */
-  .bubble blockquote[expandable]::before {
-    content: ""; position: absolute; left: 0; right: 0; bottom: 18px; height: 34px;
-    background: linear-gradient(to bottom, transparent, var(--surface-2));
-    pointer-events: none; transition: opacity 0.18s ease;
+  .pb-caret { flex-shrink: 0; width: 10px; font-size: 10px; color: var(--accent); transition: transform 0.12s; }
+  .pb.expanded .pb-caret { transform: rotate(90deg); }
+  .pb-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pb-head .code-btn { padding: 1px 6px; font-size: 11px; }
+  .pb-title b { color: #E2E8F0; font-weight: 650; font-family: var(--mono); font-size: 12px; }
+  .pb-count { color: #94A3B8; }
+  .pb-head .code-btn span { display: inline; }
+  .bubble blockquote.pb pre {
+    margin: 0; border: none; border-radius: 0; box-shadow: none;
+    padding: 3px 10px; font: 12.5px/1.5 var(--mono);
+    overflow: hidden;
   }
-  .bubble.user blockquote[expandable]::before {
-    background: linear-gradient(to bottom, transparent, rgba(0, 0, 0, 0.2));
+  .bubble blockquote.pb:not(.expanded):not(.pb-short) pre {
+    box-sizing: content-box; max-height: 4.5em; padding-bottom: 0; margin-bottom: 3px;
   }
-  .bubble blockquote[expandable].expanded::before { opacity: 0; }
-  /* 底部「点击展开 / 收起」提示条 */
-  .bubble blockquote[expandable]::after {
-    content: "▾ 点击展开"; position: absolute; left: 0; right: 0; bottom: 0;
-    text-align: center; font-size: 12px; color: var(--accent);
-    padding: 2px 0; background: var(--surface-2);
-    pointer-events: none; user-select: none;
+  .bubble blockquote.pb.expanded pre,
+  .bubble blockquote.pb.pb-short pre { max-height: none; overflow-x: auto; }
+  /* 「已折叠 N 行」：标注不是正文——虚线胶囊、斜体、不可选，只在展开态出现 */
+  .bubble blockquote.pb i.pb-folded {
+    display: none; margin: 1px 10px 5px; padding: 0 8px;
+    font: italic 11px/1.7 var(--font); color: #94A3B8;
+    border: 1px dashed rgba(148, 163, 184, 0.55); border-radius: 999px;
+    user-select: none; cursor: default;
   }
-  .bubble.user blockquote[expandable]::after {
-    background: rgba(0, 0, 0, 0.2); color: rgba(255, 255, 255, 0.9);
-  }
-  .bubble blockquote[expandable].expanded::after { content: "▴ 收起"; }
-  /* 折叠块里的代码块外壳去掉多余外边距，贴合 blockquote 内边距 */
-  .bubble blockquote[expandable] .code-block-wrap { margin: 6px 0 0; }
+  .bubble blockquote.pb.expanded i.pb-folded { display: inline-block; }
 
   /* 行内代码 */
   .bubble :not(pre) > code {
@@ -1567,7 +1572,7 @@
           if (c.tagName === "A" && a.name === "href") {
             if (!/^(https?:|mailto:)/i.test(a.value)) c.removeAttribute(a.name);
           } else if (c.tagName === "A" && (a.name === "target" || a.name === "rel")) {
-          } else if (c.tagName === "BLOCKQUOTE" && a.name === "expandable") {
+          } else if (c.tagName === "BLOCKQUOTE" && (a.name === "expandable" || a.name === "data-raw")) {
             // 保留：服务端 render_folded_html 用 <blockquote expandable> 标记
             // 「可展开折叠的协议代码块」（与电报原生 expandable 同源），网页据此做
             // 折叠交互（CSS blockquote[expandable] + bindContentClicks 里的点击切换）。
@@ -1666,7 +1671,47 @@
     btn._t = setTimeout(function () { btn.innerHTML = old; btn.classList.remove("done"); }, 1400);
   }
 
+  function enhanceProtocolBlocks(container) {
+    var bqs = container.querySelectorAll("blockquote[expandable]");
+    Array.prototype.forEach.call(bqs, function (bq) {
+      if (bq.dataset.pb === "1") return;
+      bq.dataset.pb = "1";
+      var pre = bq.querySelector("pre");
+      var label = bq.querySelector("i");
+      var title = "";
+      var node = bq.firstChild;
+      while (node && node !== pre) { title += node.textContent || ""; node = node.nextSibling; }
+      title = title.replace(/\s+/g, " ").trim();
+      var text = pre ? (pre.querySelector("code") || pre).textContent.replace(/\n$/, "") : "";
+      var short = !label && text.split("\n").length <= 3;
+
+      var head = document.createElement("div");
+      head.className = "pb-head";
+      head.innerHTML = (short ? "" : '<span class="pb-caret">▶</span>') +
+        '<span class="pb-title">' + (function () {
+          var cut = title.lastIndexOf(" · ");
+          return cut < 0 ? '<b>' + escapeHtml(title) + '</b>'
+            : '<b>' + escapeHtml(title.slice(0, cut)) + '</b><span class="pb-count">' + escapeHtml(title.slice(cut)) + '</span>';
+        })() + '</span>' +
+        (pre ? '<button class="code-btn btn-wrap" type="button" title="切换自动换行">' + svgIcon("wrap") + '<span>换行</span></button>' +
+               '<button class="code-btn btn-copy" type="button" title="复制显示的代码">' + svgIcon("copy") + '<span>复制</span></button>' : '') +
+        (bq.getAttribute("data-raw") ? '<button class="code-btn btn-copy-all" type="button" title="复制整个协议块（BEGIN 到 END 原文）">' + svgIcon("copy") + '<span>复制全部</span></button>' : '');
+
+      while (bq.firstChild) bq.removeChild(bq.firstChild);
+      bq.appendChild(head);
+      if (pre) {
+        pre.dataset.enhanced = "1";
+        pre.innerHTML = '<code>' + highlightCode(text, "CODE") + '</code>';
+        bq.appendChild(pre);
+      }
+      if (label) { label.className = "pb-folded"; bq.appendChild(label); }
+      bq.classList.add("pb");
+      if (short) bq.classList.add("pb-short");
+    });
+  }
+
   function enhanceBubbleContent(container) {
+    enhanceProtocolBlocks(container);
     var pres = container.querySelectorAll("pre");
     Array.prototype.forEach.call(pres, function (pre) {
       if (pre.dataset.enhanced === "1") return;
@@ -1711,10 +1756,15 @@
 
       var btn = e.target.closest(".code-btn");
       if (btn) {
-        var wrap = btn.closest(".code-block-wrap");
+        var wrap = btn.closest(".code-block-wrap, blockquote.pb");
         var pre = wrap && wrap.querySelector("pre");
-        if (!pre) return;
         e.stopPropagation();
+        if (btn.classList.contains("btn-copy-all")) {
+          copyText(wrap.getAttribute("data-raw") || "").then(function () { flashCopied(btn, true); })
+                                                      .catch(function () { toast("复制失败，请手动选中"); });
+          return;
+        }
+        if (!pre) return;
         if (btn.classList.contains("btn-copy")) {
           var codeEl = pre.querySelector("code") || pre;
           copyText(codeEl.textContent).then(function () { flashCopied(btn, true); })
@@ -1726,13 +1776,18 @@
         return;
       }
 
-      // 可展开折叠块：点 header / 非代码区切换展开。点代码块壳（复制/换行按钮上面
-      // 已 return；选词由 getSelection 守卫）不触发折叠，免得复制代码时误收起。
-      var foldBq = e.target.closest("blockquote[expandable]");
-      if (foldBq && !e.target.closest(".code-block-wrap")) {
-        if (String(window.getSelection() || "").length) return;
-        foldBq.classList.toggle("expanded");
+      // 协议块：单击任意处展开/收起；双击/三击（e.detail>1）取消待切换、留给选词；
+      // 拖选结束的 click 因有选区也不切换。≤3 行的块（pb-short）不折叠。
+      var foldBq = e.target.closest("blockquote.pb");
+      if (foldBq) {
         e.stopPropagation();
+        if (foldBq.classList.contains("pb-short") || e.target.closest(".pb-folded")) return;
+        clearTimeout(foldBq._ft);
+        if (e.detail > 1) return;
+        foldBq._ft = setTimeout(function () {
+          if (String(window.getSelection() || "").length) return;
+          foldBq.classList.toggle("expanded");
+        }, 250);
         return;
       }
 

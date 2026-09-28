@@ -716,7 +716,7 @@ def _fold_ai_reply_for_cli(content: str) -> str:
     if callable(hide) and callable(fold):
         try:
             if hide():
-                return fold(content, hide_unclosed=False)
+                return fold(content, hide_unclosed=False, raw_copy=False)
         except Exception:
             pass
     convert = _ns.get("markdown_to_telegram_html")
@@ -1358,7 +1358,8 @@ async def _dispatch_submitted(line: Any) -> bool:
         options = get_last_menu_options()
         number = int(text[1:].strip() if explicit_pick else text)
         if options and 1 <= number <= len(options):
-            _echo_submitted(text, conversation=False)
+            if not isinstance(SCREEN, cli_tui.PtScreen):  # TUI：菜单原地更新，不追加回显
+                _echo_submitted(text, conversation=False)
             await _run_turn(_run_callback(options[number - 1]))
             return False
         if options:
@@ -1455,6 +1456,7 @@ def _run_tui_main() -> None:
     """
     global SCREEN, PALETTE
     from xgent_app.cli_bridge import set_screen
+    from xgent_app.cli_bridge import active_menu_message_id as _active_menu_message_id
 
     pt_screen = cli_tui.PtScreen(palette=PALETTE)
     set_screen(pt_screen)
@@ -1471,6 +1473,7 @@ def _run_tui_main() -> None:
         request_stop=_request_stop,
         remember_history=_remember_history,
         history_file=str(HISTORY_FILE),
+        menu_message_id=_active_menu_message_id,
     )
 
     async def _run():

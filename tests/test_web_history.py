@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import asyncio
 import json
 from pathlib import Path
@@ -396,10 +397,11 @@ class HistoryReplayFoldTests(unittest.TestCase):
         content = "先看磁盘：\n" + self._block() + "\n完成。"
         msg = self._build(content, hide=True)
         self.assertEqual("HTML", msg["parse_mode"])
-        self.assertIn("<blockquote expandable>", msg["content"])
+        self.assertIn("<blockquote expandable", msg["content"])
         self.assertNotIn("<<BEGIN_", msg["content"])   # 协议标记不外泄
-        self.assertNotIn(self.NONCE, msg["content"])
-        self.assertNotIn("```", msg["content"])
+        visible = re.sub(r' data-raw="[^"]*"', "", msg["content"])  # 「复制全部」的原文只在隐藏属性里
+        self.assertNotIn(self.NONCE, visible)
+        self.assertNotIn("```", visible)
         self.assertEqual("ai_reply", msg["msg_type"])  # 记录本身不变
 
     def test_switch_off_keeps_raw_markdown(self):

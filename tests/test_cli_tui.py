@@ -1,235 +1,203 @@
 """全屏 CLI TUI（cli_tui）的行为测试。
 
-pt 的 Application 那层在无 TTY 环境跑不起来，所以本模块只测**能脱离终端**的
-纯逻辑：分段（segment_lines）、消息模型（MessageModel 的 upsert/toggle/
-render_rows 折叠语义）、drop-in 屏幕（PtScreen 的 on_change/update_block 命中）、
-opt-in 判定（tui_enabled 的环境闸门）与 slash 补全（slash_completions）。
-
-pt 装了的话额外跑一个"能建起来、按 Ctrl+C 能干净退出"的烟测（PipeInput +
-DummyOutput，importorskip 兜底），确保接线没写错；跑不到的交互细节靠
-legacy 兜底与"只换绘制半边"的接缝保住不回归。
+折叠语义与 Telegram/网页一致：收起 = 只显示「▸ 块头」；展开 = 块头 + 前 50 行
+(+「已折叠 K 行」纯文字)。纯逻辑（分段/模型/屏幕/补全/底栏）脱离终端测；pt 装了
+再用 PipeInput + DummyOutput 端到端驱动真 App（选块、展开、滚动、补全、退出）。
 """
 
 from __future__ import annotations
 
+import asyncio
+import importlib.util
 import os
 import unittest
 from unittest import mock
 
 from xgent_app import cli_tui
-from xgent_app.cli_render import Palette
+from xgent_app.cli_render import MessageRenderer, Palette
+from xgent_app.protocols import ProtocolParser
+from tests.test_protocols import NONCE_A, protocol_block
 
 
-def _bars(n: int, prefix: str = "code") -> list:
-    """造 n 行"代码条"（│ 打头），模拟 MessageRenderer._render_pre 的产物。"""
-    return [f"│ {prefix}{i}" for i in range(n)]
+def _folded_lines(body_lines: int, width: int = 80, color: bool = False) -> list:
+    """造一条真实的折叠回复：散文 + 大块(run) + 散文 + 小块(edit)，经真渲染器出行。"""
+    big = protocol_block("run-x", "\n".join(f"l{i}" for i in range(body_lines)), NONCE_A)
+    small = protocol_block("edit-x:/etc/a.py", "x\ny", "NONCEB12")
+    html = ProtocolParser.render_folded_html(
+        "说明\n" + big + "\n中间\n" + small, prose_renderer=lambda t: t)
+    return MessageRenderer(Palette(color), width).render_text(html, "HTML")
+
+
+def _plain(rows) -> list:
+    return [cli_tui._strip_ansi(t) for t, _ in rows]
 
 
 class SegmentLinesTests(unittest.TestCase):
-    def test_long_run_is_collapsible(self):
-        lines = ["散文一行"] + _bars(12)
-        blocks = cli_tui.segment_lines(lines, collapse_min=8)
-        self.assertEqual(len(blocks), 2)
-        self.assertFalse(blocks[0].collapsible)
-        self.assertTrue(blocks[1].collapsible)
-        self.assertEqual(len(blocks[1].lines), 12)
+    def test_folded_reply_splits_into_prose_and_fold_blocks(self):
+        blocks = cli_tui.segment_lines(_folded_lines(55))
+        folds = [b for b in blocks if b.collapsible]
+        self.assertEqual(2, len(folds))
+        self.assertIn("run-x · 55 行", cli_tui._strip_ansi(folds[0].header))  # 保留 -x
+        self.assertEqual(51, len(folds[0].lines))           # 50 行代码 + 标签
+        self.assertEqual("已折叠 5 行", cli_tui._strip_ansi(folds[0].lines[-1]).strip())
+        self.assertTrue(folds[0].foldable)
+        self.assertEqual(2, len(folds[1].lines))            # ≤3 行：无标签、不折叠
+        self.assertFalse(folds[1].foldable)
 
-    def test_short_run_merged_into_prose(self):
-        lines = ["头"] + _bars(3) + ["尾"]
-        blocks = cli_tui.segment_lines(lines, collapse_min=8)
-        # 短代码不值得折叠，全并进散文，一整块不可折叠。
-        self.assertEqual(len(blocks), 1)
-        self.assertFalse(blocks[0].collapsible)
-        self.assertEqual(len(blocks[0].lines), 5)
+    def test_colored_output_segments_the_same(self):
+        folds = [b for b in cli_tui.segment_lines(_folded_lines(55, color=True)) if b.collapsible]
+        self.assertEqual(2, len(folds))
 
-    def test_prose_and_code_interleave(self):
-        lines = ["header 行"] + _bars(10) + ["中间散文"] + _bars(9)
-        blocks = cli_tui.segment_lines(lines, collapse_min=8)
-        kinds = [b.collapsible for b in blocks]
-        self.assertEqual(kinds, [False, True, False, True])
-
-    def test_no_code_is_all_prose(self):
-        blocks = cli_tui.segment_lines(["只有散文", "还是散文"], collapse_min=8)
-        self.assertEqual(len(blocks), 1)
+    def test_code_without_header_is_prose(self):
+        # 折叠关 / 普通 markdown 代码：没有块头 → 原样显示，不折
+        blocks = cli_tui.segment_lines(["  hi", "  │ a", "  │ b"])
+        self.assertEqual(1, len(blocks))
         self.assertFalse(blocks[0].collapsible)
+
+    def test_header_like_prose_without_code_is_prose(self):
+        blocks = cli_tui.segment_lines(["  统计 · 3 行", "  普通文字"])
+        self.assertFalse(any(b.collapsible for b in blocks))
+
+
+RUN_HEAD = "[🔧 run-x] · 55 行"
+EDIT_HEAD = "[📝 edit-x /etc/a.py] · 2 行"
 
 
 class MessageModelTests(unittest.TestCase):
-    def _model(self):
-        return cli_tui.MessageModel(Palette(False), preview_lines=3, collapse_min=8)
+    def setUp(self):
+        self.m = cli_tui.MessageModel(Palette(False))
+        self.m.upsert(1, _folded_lines(55))
 
-    def test_collapsed_shows_preview_plus_marker(self):
-        m = self._model()
-        m.upsert(1, ["header"] + _bars(12))
-        rows = m.render_rows()
-        texts = [t for t, _ in rows]
-        # header 散文 + 3 行预览 + 1 行"展开"标记。
-        self.assertIn("header", texts[0])
-        self.assertTrue(any("展开" in t for t in texts))
-        # 折叠态：12 行里只露 3 行预览。
-        self.assertEqual(sum(1 for t in texts if t.startswith("│ code")), 3)
+    def _idx(self, rows, head):
+        return [i for i, r in enumerate(rows) if r.endswith(head)][0]
 
-    def test_toggle_expands_full_body(self):
-        m = self._model()
-        m.upsert(1, ["header"] + _bars(12))
-        self.assertTrue(m.toggle(1, 1))  # block 0 是散文，block 1 是代码
-        texts = [t for t, _ in m.render_rows()]
-        self.assertEqual(sum(1 for t in texts if t.startswith("│ code")), 12)
-        self.assertTrue(any("收起" in t for t in texts))
+    def test_default_collapsed_shows_header_plus_3_line_preview(self):
+        rows = _plain(self.m.render_rows())
+        hi = self._idx(rows, RUN_HEAD)
+        self.assertEqual("  ▸ " + RUN_HEAD, rows[hi])
+        self.assertEqual(["  │ l0", "  │ l1", "  │ l2"], rows[hi + 1:hi + 4])
+        self.assertNotIn("  │ l3", rows)
+        self.assertFalse(any("已折叠" in r for r in rows))
 
-    def test_toggle_rejects_prose_block(self):
-        m = self._model()
-        m.upsert(1, ["header"] + _bars(12))
-        self.assertFalse(m.toggle(1, 0))  # 散文块不可折叠
+    def test_expand_shows_header_plus_50_lines_plus_label(self):
+        run = self.m.foldable_targets()[0]
+        self.assertTrue(self.m.toggle(*run))
+        rows = _plain(self.m.render_rows())
+        hi = self._idx(rows, RUN_HEAD)
+        self.assertEqual("  ▾ " + RUN_HEAD, rows[hi])
+        self.assertEqual("  │ l0", rows[hi + 1])
+        self.assertEqual("  │ l49", rows[hi + 50])
+        self.assertEqual("  ┄┄ 已折叠 5 行 ┄┄", rows[hi + 51])
+        self.assertFalse(any("l50" in r for r in rows))   # 第 51 行起永不显示
 
-    def test_upsert_preserves_expand_state_by_index(self):
-        m = self._model()
-        m.upsert(1, ["header"] + _bars(12))
-        m.toggle(1, 1)
-        # 流式重绘：同一 message_id 换内容，块序号对得上就保住展开态。
-        m.upsert(1, ["header"] + _bars(14))
-        blk = m._index[1].blocks[1]
-        self.assertTrue(blk.expanded)
-        texts = [t for t, _ in m.render_rows()]
-        self.assertEqual(sum(1 for t in texts if t.startswith("│ code")), 14)
+    def test_label_is_not_clickable(self):
+        run = self.m.foldable_targets()[0]
+        self.m.toggle(*run)
+        for text, target in self.m.render_rows():
+            plain = cli_tui._strip_ansi(text)
+            if "已折叠" in plain:
+                self.assertIsNone(target)
+            if plain.endswith(RUN_HEAD):
+                self.assertEqual(run, target)
 
-    def test_render_rows_carries_toggle_target(self):
-        m = self._model()
-        m.upsert(7, ["header"] + _bars(12))
-        targets = {tgt for _, tgt in m.render_rows() if tgt is not None}
-        self.assertEqual(targets, {(7, 1)})
+    def test_short_block_shown_whole_and_not_foldable(self):
+        self.assertEqual(1, len(self.m.foldable_targets()))
+        rows = _plain(self.m.render_rows())
+        hi = self._idx(rows, EDIT_HEAD)
+        self.assertEqual("  ■ " + EDIT_HEAD, rows[hi])
+        self.assertEqual(["  │ x", "  │ y"], rows[hi + 1:hi + 3])
+        bi = [i for i, b in enumerate(self.m.messages[0].blocks) if b.collapsible][1]
+        self.assertFalse(self.m.toggle(1, bi))
 
-    def test_leading_blank_between_messages_only(self):
-        m = self._model()
-        m.upsert(1, ["甲"])
-        m.upsert(2, ["乙"], leading_blank=True)
-        rows = m.render_rows()
-        # 第一条前面不留空行；第二条前留一行分隔。
-        self.assertEqual(rows[0][0], "甲")
-        self.assertEqual(rows[1][0], "")
-        self.assertEqual(rows[2][0], "乙")
+    def test_toggle_again_collapses(self):
+        run = self.m.foldable_targets()[0]
+        self.m.toggle(*run)
+        self.m.toggle(*run)
+        self.assertFalse(self.m.is_expanded(run))
 
-    def test_remove_and_has(self):
-        m = self._model()
-        m.upsert(1, ["x"])
-        self.assertTrue(m.has(1))
-        self.assertTrue(m.remove(1))
-        self.assertFalse(m.has(1))
-        self.assertFalse(m.remove(1))
+    def test_toggle_rejects_prose(self):
+        self.assertFalse(self.m.toggle(1, 0))
+        self.assertFalse(self.m.toggle(99, 0))
 
-    def test_set_all_expanded(self):
-        m = self._model()
-        m.upsert(1, ["h"] + _bars(12))
-        m.upsert(2, ["h"] + _bars(10))
-        m.set_all_expanded(True)
-        for msg in m.messages:
-            for blk in msg.blocks:
-                if blk.collapsible:
-                    self.assertTrue(blk.expanded)
-        m.set_all_expanded(False)
-        for msg in m.messages:
-            for blk in msg.blocks:
-                if blk.collapsible:
-                    self.assertFalse(blk.expanded)
+    def test_upsert_keeps_expand_state(self):
+        run = self.m.foldable_targets()[0]
+        self.m.toggle(*run)
+        self.m.upsert(1, _folded_lines(60))
+        self.assertTrue(self.m.is_expanded(self.m.foldable_targets()[0]))
 
-    def test_revision_bumps_on_change(self):
-        m = self._model()
-        before = m.revision
-        m.upsert(1, ["h"])
-        self.assertGreater(m.revision, before)
+    def test_counts_and_set_all(self):
+        self.assertEqual((1, 0), self.m.counts())
+        self.m.set_all_expanded(True)
+        self.assertEqual((1, 1), self.m.counts())
+        self.m.set_all_expanded(False)
+        self.assertEqual((1, 0), self.m.counts())
 
-    def test_foldable_targets_in_render_order(self):
-        m = self._model()
-        m.upsert(1, ["h"] + _bars(12))
-        m.upsert(None, ["纯散文 notice"])       # message_id=None 不参与浏览
-        m.upsert(3, ["h"] + _bars(9) + ["中间"] + _bars(10))
-        # 每条消息里可折叠块是 block 1（散文）之外的代码段。
-        self.assertEqual(m.foldable_targets(), [(1, 1), (3, 1), (3, 3)])
+    def test_selected_header_marked(self):
+        run = self.m.foldable_targets()[0]
+        rows = _plain(self.m.render_rows(run))
+        self.assertIn("❯ ▸ " + RUN_HEAD, rows)
 
-    def test_selected_marker_highlighted(self):
-        m = self._model()
-        m.upsert(1, ["h"] + _bars(12))
-        rows_plain = m.render_rows()
-        self.assertFalse(any("▶" in t for t, _ in rows_plain))
-        rows_sel = m.render_rows((1, 1))
-        hot = [t for t, _ in rows_sel if "▶" in t]
-        self.assertEqual(len(hot), 1)            # 唯一被选中的块标记高亮
-        self.assertIn("展开", hot[0])
+    def test_block_text_for_copy(self):
+        blk = [b for b in self.m.messages[0].blocks if b.collapsible][0]
+        code = cli_tui.block_text(blk, whole=False).split("\n")
+        self.assertEqual("l0", code[0])
+        self.assertEqual(50, len(code))                   # 不含「已折叠」标签
+        self.assertTrue(cli_tui.block_text(blk).startswith("🔧 run-x · 55 行\nl0"))
 
-    def test_marker_mentions_enter(self):
-        m = self._model()
-        m.upsert(1, ["h"] + _bars(12))
-        texts = [t for t, _ in m.render_rows()]
-        self.assertTrue(any("Enter" in t for t in texts))  # spec：CLI Enter 原地展开
+    def test_leading_blank_between_messages(self):
+        m = cli_tui.MessageModel()
+        m.upsert(None, ["a"], leading_blank=False)
+        m.upsert(None, ["b"])
+        m.upsert(None, ["c"], leading_blank=False)
+        self.assertEqual(["a", "", "b", "c"], _plain(m.render_rows()))
+
+    def test_revision_and_remove(self):
+        rev = self.m.revision
+        self.assertTrue(self.m.remove(1))
+        self.assertGreater(self.m.revision, rev)
+        self.assertFalse(self.m.has(1))
+        self.assertFalse(self.m.remove(1))
 
 
 class PtScreenTests(unittest.TestCase):
-    def _screen(self):
-        s = cli_tui.PtScreen(palette=Palette(False), width=80)
-        calls = {"n": 0}
-        s.on_change = lambda: calls.__setitem__("n", calls["n"] + 1)
-        return s, calls
+    def setUp(self):
+        self.s = cli_tui.PtScreen(palette=Palette(False), width=80)
+        self.calls = []
+        self.s.on_change = lambda: self.calls.append(1)
 
-    def test_print_block_fires_on_change(self):
-        s, calls = self._screen()
-        s.print_block(["hello"], message_id=1)
-        self.assertEqual(calls["n"], 1)
-        self.assertTrue(s.model.has(1))
+    def test_print_and_update(self):
+        self.s.print_block(["a"], message_id=5)
+        self.assertTrue(self.s.update_block(["b"], 5))
+        self.assertFalse(self.s.update_block(["c"], 6))
+        self.assertEqual(2, len(self.calls))
+        self.assertEqual(["b"], _plain(self.s.model.render_rows()))
 
-    def test_update_block_hits_known_id(self):
-        s, _ = self._screen()
-        s.print_block(["a"], message_id=5)
-        self.assertTrue(s.update_block(["b"], 5))
-
-    def test_update_block_misses_unknown_id(self):
-        s, _ = self._screen()
-        # legacy 只能改"最后一块"；PtScreen 记全量，未知 id 返回 False，
-        # CliBot 据此回退 print_block。
-        self.assertFalse(s.update_block(["b"], 999))
-
-    def test_print_plain_is_prose(self):
-        s, _ = self._screen()
-        s.print_plain("just text")
-        rows = s.model.render_rows()
-        self.assertEqual(rows[0][0], "just text")
-        self.assertIsNone(rows[0][1])
-
-    def test_notice_prefixes_marker(self):
-        s, _ = self._screen()
-        s.notice("done", "ok")
-        texts = [t for t, _ in s.model.render_rows()]
-        self.assertTrue(any("done" in t for t in texts))
+    def test_notice_marker(self):
+        self.s.notice("done", "ok")
+        self.assertEqual(["✓ done"], _plain(self.s.model.render_rows()))
 
     def test_width_forced(self):
-        s = cli_tui.PtScreen(palette=Palette(False), width=123)
-        self.assertEqual(s.width, 123)
+        self.assertEqual(80, self.s.width)
 
 
-class SlashCompletionTests(unittest.TestCase):
-    def test_prefix_filters_commands(self):
-        names = ["start", "stop", "status", "getchat"]
-        out = cli_tui.slash_completions("/st", names, lambda n: f"desc:{n}")
-        got = [full for full, _ in out]
-        self.assertEqual(got, ["/start", "/stop", "/status"])
-        self.assertIn(("/start", "desc:start"), out)
+class SlashAndHintTests(unittest.TestCase):
+    def test_slash_prefix(self):
+        out = cli_tui.slash_completions("/st", ["start", "stop", "help"], lambda n: n.upper())
+        self.assertEqual([("/start", "START"), ("/stop", "STOP")], out)
+        self.assertEqual([], cli_tui.slash_completions("st", ["start"], str))
+        self.assertEqual([], cli_tui.slash_completions("/start x", ["start"], str))
 
-    def test_no_slash_no_completion(self):
-        self.assertEqual(cli_tui.slash_completions("st", ["start"], lambda n: ""), [])
-
-    def test_space_stops_completion(self):
-        # 已经打了空格 = 在写参数，不再补命令名。
-        self.assertEqual(cli_tui.slash_completions("/getchat 5", ["getchat"], lambda n: ""), [])
+    def test_hints_per_mode(self):
+        self.assertIn("点击代码块展开", cli_tui.hint_text("input"))
+        self.assertIn("拖选自动复制", cli_tui.hint_text("input"))
+        self.assertIn("Enter 发送", cli_tui.hint_text("typing"))
+        self.assertIn("↑↓ 输入历史", cli_tui.hint_text("typing"))
+        self.assertIn("Ctrl+C 中断", cli_tui.hint_text("busy"))
+        self.assertIn("y 复制", cli_tui.hint_text("browse"))
+        self.assertIn("再按一次", cli_tui.hint_text("exit"))
 
 
 class TuiEnabledTests(unittest.TestCase):
-    def _patch(self, env, stdin_tty, stdout_tty, pt_ok):
-        return (
-            mock.patch.dict(os.environ, env, clear=True),
-            mock.patch("sys.stdin"),
-            mock.patch("sys.stdout"),
-            mock.patch.object(cli_tui, "_pt_available", return_value=pt_ok),
-        )
-
     def _run(self, env, stdin_tty=True, stdout_tty=True, pt_ok=True):
         with mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch("sys.stdin") as si, mock.patch("sys.stdout") as so, \
@@ -260,17 +228,126 @@ class TuiEnabledTests(unittest.TestCase):
             self.assertFalse(self._run({"XGENT_CLI_TUI": val}), val)
 
 
-class PtSmokeTests(unittest.TestCase):
-    """pt 装了才跑：能建起 App、按 Ctrl+C（空闲）能干净退出。"""
+class PtEndToEndTests(unittest.TestCase):
+    """pt 装了才跑：真 App + 管道输入，按键驱动整条交互链。"""
 
-    def test_build_and_exit(self):
-        import asyncio
-
-        pt = __import__("importlib").util.find_spec("prompt_toolkit")
-        if pt is None:
+    def setUp(self):
+        if importlib.util.find_spec("prompt_toolkit") is None:
             self.skipTest("prompt_toolkit 未安装")
 
+    def _run(self, scenario):
         from prompt_toolkit.application import create_app_session
+        from prompt_toolkit.application.current import get_app
+        from prompt_toolkit.input import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        screen = cli_tui.PtScreen(palette=Palette(True), width=80)
+        sent = []
+
+        async def _dispatch(text):
+            sent.append(text)
+            return False
+
+        hooks = cli_tui.TuiHooks(dispatch=_dispatch, command_names=lambda: ("help", "hide"))
+
+        async def _drive():
+            with create_pipe_input() as pinp:
+                with create_app_session(input=pinp, output=DummyOutput()):
+                    task = asyncio.ensure_future(cli_tui.run_tui(screen, hooks))
+                    await asyncio.sleep(0.3)
+                    app = get_app()
+                    win = [w for w in app.layout.find_all_windows() if hasattr(w, "scroll_by")][0]
+
+                    async def keys(text, wait=0.25):
+                        pinp.send_text(text)
+                        await asyncio.sleep(wait)
+
+                    await scenario(screen, app, win, keys, sent)
+                    await keys("\x03\x03")          # 空闲 Ctrl+C 两次退出
+                    await asyncio.wait_for(task, timeout=5)
+
+        asyncio.run(_drive())
+
+    def test_browse_expand_and_scroll(self):
+        async def scenario(screen, app, win, keys, sent):
+            for i in range(80):
+                screen.print_plain(f"history {i}")
+            screen.print_block(screen.renderer().render_text(
+                ProtocolParser.render_folded_html(
+                    "说明\n" + protocol_block("run-x", "\n".join(f"l{i}" for i in range(55)), NONCE_A),
+                    prose_renderer=lambda t: t), "HTML"), message_id=7)
+            await keys("")
+            self.assertTrue(win.follow)                       # 默认贴底
+            self.assertFalse(app.layout.has_focus(win))       # 一进来就聚焦输入框
+            await keys("\x1b", 0.8)                          # Esc 到输出区
+            await keys("\t")                                 # Tab 选中最新折叠块
+            await keys("\r")                                 # Enter 原地展开
+            target = screen.model.foldable_targets()[-1]
+            self.assertTrue(screen.model.is_expanded(target))
+            rows = _plain(screen.model.render_rows())
+            hi = [i for i, r in enumerate(rows) if "run-x" in r and "55 行" in r][0]
+            self.assertTrue(win.vertical_scroll <= hi < win.vertical_scroll + 30)  # 块头在视口里
+            await keys("\x1b", 0.8)                          # Esc 取消选中
+            before = win.vertical_scroll
+            await keys("\x1b[A")                             # ↑ 只管输入框：回到输入框，不翻页
+            self.assertFalse(app.layout.has_focus(win))
+            self.assertEqual(before, win.vertical_scroll)
+            await keys("\x1b[1;5F")                          # Ctrl+End 回底
+            await keys("\x1b[5~")                            # PgUp 翻页
+            self.assertFalse(win.follow)
+            top = win.vertical_scroll
+            screen.print_plain("new line")
+            await keys("")
+            self.assertEqual(top, win.vertical_scroll)        # 新内容不把人拽回底
+            await keys("\x1b[1;5F")                          # Ctrl+End 回底跟随
+            self.assertTrue(win.follow)
+            await keys("\x0f")                               # Ctrl+O 收起最新块
+            self.assertFalse(screen.model.is_expanded(target))
+
+        self._run(scenario)
+
+    def test_getchat_history_block_expands(self):
+        async def scenario(screen, app, win, keys, sent):
+            # /getchat 的历史行没有 message_id，照样能选中展开
+            screen.print_block(screen.renderer().render_text(
+                ProtocolParser.render_folded_html(
+                    protocol_block("run-x", "\n".join(f"l{i}" for i in range(10)), NONCE_A),
+                    prose_renderer=lambda t: t), "HTML"))
+            await keys("\x1b", 0.8)                          # Esc 到输出区
+            await keys("\t")
+            await keys("\r")
+            self.assertTrue(screen.model.is_expanded(screen.model.foldable_targets()[-1]))
+            await keys("", 0.8)                          # Esc 取消选中
+
+        self._run(scenario)
+
+    def test_typing_enters_input_and_submit_returns_to_browse(self):
+        async def scenario(screen, app, win, keys, sent):
+            self.assertFalse(app.layout.has_focus(win))       # 一进来就在输入框
+            await keys("/he", 0.4)
+            state = app.current_buffer.complete_state
+            self.assertEqual(["/help"], [c.text for c in state.completions])
+            await keys("\x15hello\x1b\r world", 0.8)       # Alt+Enter 换行
+            self.assertEqual("hello\n world", app.current_buffer.text)
+            await keys("\r", 0.3)
+            self.assertEqual(["hello\n world"], sent)
+            self.assertFalse(app.layout.has_focus(win))       # 发送后仍在输入框
+
+        self._run(scenario)
+
+
+
+
+class PtMouseTests(unittest.TestCase):
+    """真 App + 管道输入里的 SGR 鼠标序列：单击展开、拖选复制、滚轮滚动。"""
+
+    def setUp(self):
+        if importlib.util.find_spec("prompt_toolkit") is None:
+            self.skipTest("prompt_toolkit 未安装")
+
+    def _run(self, scenario):
+        from prompt_toolkit.application import create_app_session
+        from prompt_toolkit.application.current import get_app
         from prompt_toolkit.input import create_pipe_input
         from prompt_toolkit.output import DummyOutput
 
@@ -279,23 +356,86 @@ class PtSmokeTests(unittest.TestCase):
         async def _dispatch(_text):
             return False
 
-        hooks = cli_tui.TuiHooks(
-            dispatch=_dispatch,
-            banner=lambda: screen.print_plain("banner"),
-            prompt_text=lambda: "> ",
-            command_names=lambda: ("start", "stop"),
-            turn_active=lambda: False,
-        )
+        hooks = cli_tui.TuiHooks(dispatch=_dispatch)
+        copied = []
 
         async def _drive():
             with create_pipe_input() as pinp:
                 with create_app_session(input=pinp, output=DummyOutput()):
-                    pinp.send_text("\x03")  # 空闲态 Ctrl+C → 退出
-                    await asyncio.wait_for(cli_tui.run_tui(screen, hooks), timeout=5)
+                    task = asyncio.ensure_future(cli_tui.run_tui(screen, hooks))
+                    await asyncio.sleep(0.3)
+                    app = get_app()
+                    win = [w for w in app.layout.find_all_windows() if hasattr(w, "scroll_by")][0]
 
-        asyncio.run(_drive())
-        # 退出后 on_change 已复位为 no-op，不再抓着 app。
-        self.assertTrue(True)
+                    async def keys(text, wait=0.25):
+                        pinp.send_text(text)
+                        await asyncio.sleep(wait)
+
+                    def at(row):   # 内容行号 → 屏幕行（1 起，顶栏占第 1 行）
+                        top = win.max_top if win.follow else win.vertical_scroll
+                        return row - top + 2
+
+                    await scenario(screen, app, win, keys, at)
+                    await keys("\x1b", 0.8)
+                    await keys("\x03\x03")
+                    await asyncio.wait_for(task, timeout=5)
+
+        with mock.patch.object(cli_tui, "copy_to_clipboard",
+                               side_effect=lambda text, *a, **k: copied.append(text) or True):
+            asyncio.run(_drive())
+        return copied
+
+    def _block(self, screen, n=10, mid=7):
+        screen.print_block(screen.renderer().render_text(
+            ProtocolParser.render_folded_html(
+                "说明\n" + protocol_block("run-x", "\n".join(f"line{i}" for i in range(n)), NONCE_A),
+                prose_renderer=lambda t: t), "HTML"), message_id=mid)
+
+    def test_click_block_toggles_in_place(self):
+        async def scenario(screen, app, win, keys, at):
+            self._block(screen)
+            await keys("")
+            rows = _plain(screen.model.render_rows())
+            hi = [i for i, r in enumerate(rows) if "run-x" in r][0]
+            y = at(hi)
+            await keys(f"\x1b[<0;6;{y}M\x1b[<0;6;{y}m")     # 单击块头
+            target = screen.model.foldable_targets()[0]
+            self.assertTrue(screen.model.is_expanded(target))
+            y = at(hi + 5)
+            await keys(f"\x1b[<0;6;{y}M\x1b[<0;6;{y}m")     # 单击展开后的正文 → 收起
+            self.assertFalse(screen.model.is_expanded(target))
+
+        self._run(scenario)
+
+    def test_drag_select_copies_text(self):
+        async def scenario(screen, app, win, keys, at):
+            self._block(screen)
+            await keys("")
+            rows = _plain(screen.model.render_rows())
+            r0 = [i for i, r in enumerate(rows) if r.strip() == "│ line0"][0]
+            y0, y1 = at(r0), at(r0 + 1)
+            await keys(f"\x1b[<0;5;{y0}M\x1b[<32;9;{y0}M\x1b[<32;9;{y1}M\x1b[<0;9;{y1}m")
+            self.assertIsNone(screen.model.foldable_targets() and None)
+            self.assertFalse(screen.model.is_expanded(screen.model.foldable_targets()[0]))  # 拖选不触发折叠
+
+        copied = self._run(scenario)
+        self.assertEqual(1, len(copied))
+        self.assertTrue(copied[0].startswith("line0"))
+        self.assertIn("\nline1", copied[0])            # 第二行不带「  │ 」装饰
+
+    def test_wheel_scrolls_output(self):
+        async def scenario(screen, app, win, keys, at):
+            for i in range(120):
+                screen.print_plain(f"row {i}")
+            await keys("")
+            self.assertTrue(win.follow)
+            await keys("\x1b[<64;5;10M\x1b[<64;5;10M")      # 滚轮上滚两格
+            self.assertFalse(win.follow)
+            top = win.vertical_scroll
+            await keys("\x1b[<65;5;10M")                      # 下滚一格
+            self.assertEqual(top + 3, win.vertical_scroll)
+
+        self._run(scenario)
 
 
 if __name__ == "__main__":

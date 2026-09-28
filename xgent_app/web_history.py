@@ -199,7 +199,7 @@ def _folded_history_html(content: str) -> str | None:
         if not ns["_should_hide_protocol_blocks"]():
             return None
         folded = ProtocolParser.render_folded_html(
-            content, prose_renderer=ns["markdown_to_telegram_html"])
+            content, prose_renderer=ns["markdown_to_telegram_html"], raw_copy=True)
     except Exception:
         return None
     # 无协议块时 render_folded_html 原样返回输入——那种情况让 markdown 渲染器

@@ -411,7 +411,7 @@ block = "```run-x\n<<BEGIN_" + NONCE + "\ndf -h\ndu -sh /var\n<<END_" + NONCE + 
 content = "先看磁盘：\n" + block + "\n完成。"
 folded = xgent_cli._fold_ai_reply_for_cli(content)
 print(json.dumps({
-    "expandable": "<blockquote expandable>" in folded,
+    "expandable": "<blockquote expandable" in folded,
     "no_begin": "<<BEGIN_" not in folded,
     "no_nonce": NONCE not in folded,
     "no_fence": "```" not in folded,
