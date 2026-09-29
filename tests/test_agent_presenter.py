@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 
 from xgent_app.agent_presenter import (
@@ -8,23 +9,55 @@ from xgent_app.agent_presenter import (
     build_run_presentation,
     build_shell_presentation,
     build_standard_operation_presentation,
+    fold_output_block,
 )
 
 
 class AgentPresenterTests(unittest.TestCase):
-    def test_edit_presentation_matches_legacy_html(self):
+    def test_fold_output_block_wraps_pre_in_expandable_blockquote(self):
+        # 结果卡片里本来直接显示的 <pre> 代码块，被包成三端一致的可折叠块；
+        # 块头 "{icon} {kind}-x · N 行" 对齐 CLI 折叠识别形态，正文转义原样保留。
         self.assertEqual(
-            build_edit_presentation({"success": True, "notice": "a < b"}),
-            "✏️ <b>Agent Edit</b>\n<pre>a &lt; b</pre>",
+            fold_output_block("a < b\nc", kind="run", icon="⌨️"),
+            "<blockquote expandable><b>⌨️ run-x</b> · 2 行\n"
+            "<pre>a &lt; b\nc</pre></blockquote>",
         )
 
-    def test_grep_presentation_matches_legacy_html_and_limit(self):
+    def test_fold_header_matches_cli_fold_detection_regex(self):
+        # CLI 端（cli_tui._HEADER_RE / cli_render._FOLD_HEADER_RE）靠这个正则把块头
+        # 认成可折叠块。块头的纯文本（去掉 <b> 后）必须命中，否则 CLI 三端就不一致了。
+        cli_header_re = re.compile(r"^\S+\s+\S+-x\b.*·\s*\d+\s*行$")
+        for kind, icon in [
+            ("run", "⌨️"), ("shell", "🖥️"), ("grep", "🔎"),
+            ("search", "🌐"), ("fetch", "📄"), ("edit", "✏️"),
+        ]:
+            html = fold_output_block("l1\nl2\nl3\nl4", kind=kind, icon=icon)
+            header = re.sub(r"</?b>", "", html.split("\n", 1)[0])
+            header = header.replace("<blockquote expandable>", "")
+            self.assertRegex(header, cli_header_re)
+
+    def test_edit_presentation_folds_output_block(self):
+        self.assertEqual(
+            build_edit_presentation({"success": True, "notice": "a < b"}),
+            "✏️ <b>Agent Edit</b>\n"
+            "<blockquote expandable><b>✏️ edit-x</b> · 1 行\n"
+            "<pre>a &lt; b</pre></blockquote>",
+        )
+
+    def test_grep_presentation_folds_output_and_keeps_limit(self):
         result = {"success": False, "notice": "x" * 2100, "hits": 4}
         text = build_grep_presentation(result)
 
-        self.assertTrue(text.startswith("⚠️ <b>Agent Grep</b> 命中 4 处\n<pre>"))
-        self.assertEqual(text.count("x"), 2000)
-        self.assertTrue(text.endswith("</pre>"))
+        self.assertTrue(
+            text.startswith(
+                "⚠️ <b>Agent Grep</b> 命中 4 处\n"
+                "<blockquote expandable><b>🔎 grep-x</b> · 1 行\n<pre>"
+            )
+        )
+        # notice[:2000] 的截断没变：正好 2000 个连续 x（块头里的 x 不算进来）。
+        self.assertIn("x" * 2000, text)
+        self.assertNotIn("x" * 2001, text)
+        self.assertTrue(text.endswith("</pre></blockquote>"))
 
     def test_standard_presentation_dispatches_visible_kinds_only(self):
         result = {
@@ -60,11 +93,12 @@ class AgentPresenterTests(unittest.TestCase):
                 "会话: <code>abc&lt;1&gt;</code> · 运行中 · PTY\n"
                 "✅ 状态: <code>running&amp;ok</code>\n"
                 "本次等待/捕获耗时: 2 秒\n正在等待。\n"
-                "<pre>out</pre>"
+                "<blockquote expandable><b>🖥️ shell-x</b> · 1 行\n"
+                "<pre>out</pre></blockquote>"
             ),
         )
 
-    def test_run_presentation_matches_legacy_html(self):
+    def test_run_presentation_folds_output_block(self):
         self.assertEqual(
             build_run_presentation(
                 {
@@ -81,7 +115,9 @@ class AgentPresenterTests(unittest.TestCase):
                 # 而喂给模型的上下文里却是 "0"，两边对不上。
                 "✅ 返回码: <code>0</code>\n"
                 "完整输出: <code>/tmp/a&amp;b.log</code>\n"
-                "<pre>&lt;done&gt;</pre>"
+                # 返回码/完整输出留在块外原样不动，只有命令输出的代码块被折叠。
+                "<blockquote expandable><b>⌨️ run-x</b> · 1 行\n"
+                "<pre>&lt;done&gt;</pre></blockquote>"
             ),
         )
 

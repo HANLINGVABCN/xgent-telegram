@@ -24,20 +24,38 @@ def escape_html(value: Any) -> str:
     return html.escape(str(value))
 
 
+def fold_output_block(body: str, *, kind: str, icon: str) -> str:
+    """把结果卡片里本来直接显示的 <pre> 代码块，包成三端一致的可折叠 <blockquote expandable>。
+
+    只改这段命令/工具输出的呈现（可收起/展开）；返回码、完整输出路径、命中数等卡片其余
+    内容都在块外、原样不动。正文沿用调用方既有的截断与转义（不再二次删改），块头
+    ``{icon} {kind}-x · N 行`` 刻意对齐 protocols/CLI 的折叠识别形态，使 Telegram、
+    网页、CLI 三端拿同一份 HTML 折叠一致——协议块本就是这么折的（见 [[protocols]] 的
+    ``_render_block_blockquote`` 与 CLI 的 ``_HEADER_RE``）。
+
+    正文 ≤ 3 行时三端都直接展示、不出折叠箭头（与协议块一致），所以短输出无副作用。
+    """
+    line_count = 0 if not body else body.count("\n") + 1
+    header = f"<b>{escape_html(f'{icon} {kind}-x')}</b> · {line_count} 行"
+    return (
+        f"<blockquote expandable>{header}\n"
+        f"<pre>{escape_html(body)}</pre></blockquote>"
+    )
+
+
 def build_edit_presentation(result: Mapping[str, Any]) -> str:
     notice = str(result.get("notice") or result.get("output") or "")
     emoji = "✏️" if result.get("success") else "⚠️"
-    return f"{emoji} <b>Agent Edit</b>\n<pre>{escape_html(notice[:1500])}</pre>"
+    fold = fold_output_block(notice[:1500], kind="edit", icon="✏️")
+    return f"{emoji} <b>Agent Edit</b>\n{fold}"
 
 
 def build_grep_presentation(result: Mapping[str, Any]) -> str:
     notice = str(result.get("notice") or result.get("output") or "")
     emoji = "🔎" if result.get("success") else "⚠️"
     hits = result.get("hits", 0)
-    return (
-        f"{emoji} <b>Agent Grep</b> 命中 {hits} 处\n"
-        f"<pre>{escape_html(notice[:2000])}</pre>"
-    )
+    fold = fold_output_block(notice[:2000], kind="grep", icon="🔎")
+    return f"{emoji} <b>Agent Grep</b> 命中 {hits} 处\n{fold}"
 
 
 def build_run_presentation(result: Mapping[str, Any]) -> str:
@@ -51,11 +69,12 @@ def build_run_presentation(result: Mapping[str, Any]) -> str:
         f"完整输出: <code>{escape_html(output_path)}</code>\n"
         if output_path else "完整输出: <i>存档失败，仅保留上方内容</i>\n"
     )
+    fold = fold_output_block(display_output, kind="run", icon="⌨️")
     return (
         "⌨️ <b>Agent Run</b>\n"
         f"{status_emoji} 返回码: <code>{escape_html(result.get('return_code'))}</code>\n"
         f"{path_line}"
-        f"<pre>{escape_html(display_output)}</pre>"
+        f"{fold}"
     )
 
 
@@ -64,20 +83,16 @@ def build_search_presentation(result: Mapping[str, Any]) -> str:
     notice = str(result.get("notice") or result.get("output") or "")
     emoji = "🌐" if result.get("success") else "⚠️"
     hits = len(result.get("results") or [])
-    return (
-        f"{emoji} <b>Agent Search</b> 命中 {hits} 条\n"
-        f"<pre>{escape_html(notice[:2500])}</pre>"
-    )
+    fold = fold_output_block(notice[:2500], kind="search", icon="🌐")
+    return f"{emoji} <b>Agent Search</b> 命中 {hits} 条\n{fold}"
 
 
 def build_fetch_presentation(result: Mapping[str, Any]) -> str:
     notice = str(result.get("notice") or result.get("output") or "")
     emoji = "📄" if result.get("success") else "⚠️"
     pages = len(result.get("results") or [])
-    return (
-        f"{emoji} <b>Agent Fetch</b> 抓取 {pages} 个页面\n"
-        f"<pre>{escape_html(notice[:2500])}</pre>"
-    )
+    fold = fold_output_block(notice[:2500], kind="fetch", icon="📄")
+    return f"{emoji} <b>Agent Fetch</b> 抓取 {pages} 个页面\n{fold}"
 
 
 def build_standard_operation_presentation(
@@ -113,10 +128,11 @@ def build_shell_presentation(
     wait_note = ""
     if wait_seconds is not None:
         wait_note = f"\n本次等待/捕获耗时: {escape_html(wait_seconds)} 秒"
+    fold = fold_output_block(display_output, kind="shell", icon="🖥️")
     return (
         f"🖥️ <b>Agent Shell {escape_html(action_label)}</b>\n"
         f"会话: <code>{escape_html(session_id)}</code> · {escape_html(running_note)} · {escape_html(pty_note)}\n"
         f"{status_emoji} 状态: <code>{escape_html(shell_result.get('status') or shell_result.get('return_code') or '')}</code>"
         f"{wait_note}{escape_html(pause_note)}\n"
-        f"<pre>{escape_html(display_output)}</pre>"
+        f"{fold}"
     )
