@@ -123,11 +123,18 @@ class MessageRenderTests(unittest.TestCase):
         lines = self.renderer.render_text("1 < 2 & 3 > 0", parse_mode=None)
         self.assertIn("1 < 2 & 3 > 0", "\n".join(lines))
 
-    def test_pre_block_is_not_wrapped(self):
+    def test_pre_block_hard_cuts_with_continuation_bars(self):
+        # 表格按等宽对齐过，超过终端宽度时不靠终端软换行（续行会甩到行首、丢掉
+        # 左边框）；改为按列硬切、每条续行都补回 `│`，内容一字不丢、块边界保得住
+        # （B#3 / _render_pre）。61 列 > 渲染宽度，必被切成多行。
         table = "col_a | col_b | col_c | col_d | col_e | col_f | col_g | col_h"
         lines = self.renderer.render_text(f"<pre>{table}</pre>", parse_mode="HTML")
-        # 表格是按等宽对齐过的，折行会毁掉对齐，所以整行保持完整。
-        self.assertTrue(any(table in line for line in lines), lines)
+        self.assertGreaterEqual(len(lines), 2, lines)
+        for line in lines:
+            self.assertTrue(line.lstrip().startswith("│"), line)
+        # 去掉缩进 + 「│ 」边框后拼回，与原表格逐字一致（不丢不改）。
+        recovered = "".join(line.split("│ ", 1)[1] for line in lines)
+        self.assertEqual(recovered, table, lines)
 
     def test_buttons_are_numbered_in_order(self):
         buttons = [("添加", "a"), ("导出", "b"), ("导入", "c"), ("返回", "d")]

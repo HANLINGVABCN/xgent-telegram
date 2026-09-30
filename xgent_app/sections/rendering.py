@@ -165,12 +165,14 @@ async def rich_finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_i
 
 def _parse_markdown_table_row(line: str) -> Optional[List[str]]:
 
-    """把一行 `| a | b |` 解析成单元格列表；不是表格行返回 None。"""
+    """把一行 `| a | b |` 或无前导竖线的 `a | b` 解析成单元格列表；不是表格行返回 None。
+
+    不再强求以 `|` 开头：GFM 允许省略首尾竖线。误判风险由 _extract_markdown_tables
+    的「下一行必须是分隔行」强约束兜住——分隔行本身也得含 `|` 且全是 `:?-+:?`，
+    普通散文里的 `a | b` 后面几乎不可能恰好跟一行 `---|---`。
+    """
     stripped = line.strip()
     if '|' not in stripped:
-        return None
-    # 必须以 | 开头或结尾（表格行的典型特征）；也允许单列内含 | 但首尾有 | 的情况
-    if not stripped.startswith('|'):
         return None
     inner = stripped
     if inner.startswith('|'):
@@ -192,14 +194,60 @@ def _is_table_separator_row(cells: Optional[List[str]]) -> bool:
     return all(sep_re.match(c) and '-' in c for c in cells)
 
 
+def _list_indent_level(line: str, max_level: int = 3) -> int:
+    """按前导空格数换算列表缩进层级（每 2 空格一级，Tab 记 4 空格）。"""
+    n = 0
+    for ch in line:
+        if ch == ' ':
+            n += 1
+        elif ch == '\t':
+            n += 4
+        else:
+            break
+    return min(n // 2, max_level)
+
+
+def _cell_to_plain_text(cell: str) -> str:
+    """表格单元格进 <pre> 等宽块前剥成纯文字：去行内代码反引号、把 [t](u) 简化为 t、
+    剥掉成对的 ***/**/__/~~ 强调标记。单个 */_ 从严不动，免得误伤 a_b_c、3*4。"""
+    cell = re.sub(r'`([^`]*)`', r'\1', cell)                                    # 行内代码
+    cell = re.sub(r'\[([^\]]+)\]\([^()]*(?:\([^()]*\)[^()]*)*\)', r'\1', cell)  # 链接→纯文字
+    cell = re.sub(r'\*\*\*(.+?)\*\*\*', r'\1', cell)                            # 粗斜体
+    cell = re.sub(r'\*\*(.+?)\*\*', r'\1', cell)                                # 粗体
+    cell = re.sub(r'___(.+?)___', r'\1', cell)                                  # 粗斜体（下划线）
+    cell = re.sub(r'__(.+?)__', r'\1', cell)                                    # 粗体（下划线）
+    cell = re.sub(r'~~(.+?)~~', r'\1', cell)                                    # 删除线
+    return cell
+
+
+def _table_column_aligns(rows_cells: List[List[str]]) -> List[str]:
+    """从分隔行的 `:` 位置提取每列对齐：':--'→left,'--:'→right,':-:'→center。"""
+    for r in rows_cells:
+        if _is_table_separator_row(r):
+            aligns: List[str] = []
+            for c in r:
+                c = c.strip()
+                left, right = c.startswith(':'), c.endswith(':')
+                if left and right:
+                    aligns.append('center')
+                elif right:
+                    aligns.append('right')
+                else:
+                    aligns.append('left')
+            return aligns
+    return []
+
+
 def _build_table_pre_block(rows_cells: List[List[str]]) -> str:
     """把多行单元格渲染成等宽对齐的 <pre> 块。rows_cells 含表头+分隔占位+数据行。"""
+    aligns = _table_column_aligns(rows_cells)
     # 跳过分隔行本身（它是表格语法的分隔，不展示）
     display_rows = [r for r in rows_cells if not _is_table_separator_row(r)]
     if not display_rows:
         return ''
-    # 表格放进 <pre> 等宽块后，单元格内的行内代码反引号是多余的，去掉只保留内容
-    display_rows = [[re.sub(r'`([^`]*)`', r'\1', c) for c in row] for row in display_rows]
+    # 表格进 <pre> 等宽块后，单元格里的行内代码反引号、成对强调标记、链接语法都是
+    # 多余噪音，剥成纯文字只留内容（单 */_ 从严不动，见 _cell_to_plain_text）。
+    display_rows = [[_cell_to_plain_text(c) for c in row] for row in display_rows]
     num_cols = max(len(r) for r in display_rows)
     # 补齐每行列数
     for r in display_rows:
@@ -218,19 +266,25 @@ def _build_table_pre_block(rows_cells: List[List[str]]) -> str:
         for i, cell in enumerate(r):
             col_widths[i] = max(col_widths[i], _cell_width(cell))
 
-    # 拼接对齐后的文本（左对齐，右侧补空格），列间用 "  " 分隔
+    # 按分隔行声明的对齐补空格（缺省左对齐）
+    def _pad_cell(cell: str, i: int) -> str:
+        pad = max(0, col_widths[i] - _cell_width(cell))
+        align = aligns[i] if i < len(aligns) else 'left'
+        if align == 'right':
+            return ' ' * pad + cell
+        if align == 'center':
+            lp = pad // 2
+            return ' ' * lp + cell + ' ' * (pad - lp)
+        return cell + ' ' * pad
+
+    # 拼接对齐后的文本，列间用 "  " 分隔
     lines: List[str] = []
     for row_idx, r in enumerate(display_rows):
-        parts = []
-        for i, cell in enumerate(r):
-            pad = col_widths[i] - _cell_width(cell)
-            parts.append(cell + ' ' * max(0, pad))
+        parts = [_pad_cell(cell, i) for i, cell in enumerate(r)]
         lines.append('  '.join(parts).rstrip())
         # 在表头下方插入分隔线（ASCII 表格观感）
         if row_idx == 0:
-            sep_parts = []
-            for i in range(num_cols):
-                sep_parts.append('-' * col_widths[i])
+            sep_parts = ['-' * col_widths[i] for i in range(num_cols)]
             lines.append('  '.join(sep_parts))
 
     return f"<pre>{html.escape(chr(10).join(lines))}</pre>"
@@ -284,15 +338,32 @@ def _inline_markdown_to_html(text: str) -> str:
     # 先提取 Markdown 表格为 <pre> 占位符（表格内容整体等宽对齐，不再参与行内转换）
     text, table_blocks = _extract_markdown_tables(text)
 
-    # 再提取行内代码（保护其内容不被后续处理影响）
+    # 再提取行内代码（保护其内容不被后续处理影响）；支持多反引号定界
+    # `` `a`b` ``，先试 2+ 个反引号成对，再退回单反引号，末尾统一还原。
     inline_codes: List[str] = []
 
     def _save_inline(m: re.Match) -> str:
         idx = len(inline_codes)
-        inline_codes.append(f'<code>{html.escape(m.group(1))}</code>')
+        inline_codes.append(f'<code>{html.escape(m.group(2))}</code>')
         return f'\x01IC{idx}\x01'
 
-    text = re.sub(r'`([^`]+)`', _save_inline, text)
+    # (`+)(.+?)\1：开、闭定界的反引号串必须等长，故 ``a`b`` 内部单反引号不误切。
+    text = re.sub(r'(`+)(.+?)\1', _save_inline, text, flags=re.DOTALL)
+
+    # 反斜杠转义：\* \_ \` \# \[ 等 → 占位保护，最后还原成"去掉反斜杠的字面字符"，
+    # 使其不参与 **/_/# 等行内规则。必须放在行内代码提取之后（代码跨度内不转义）；
+    # 还原 < > & 时输出实体，杜绝注入。
+    escapes: List[str] = []
+
+    def _save_escape(m: re.Match) -> str:
+        ch = m.group(1)
+        out = {'<': '&lt;', '>': '&gt;', '&': '&amp;'}.get(ch, ch)
+        idx = len(escapes)
+        escapes.append(out)
+        return f'\x01ES{idx}\x01'
+
+    # ASCII 标点区间 0x21-0x2f / 0x3a-0x40 / 0x5b-0x60 / 0x7b-0x7e（含 * _ ` # [ ] 等）
+    text = re.sub(r'\\([\x21-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e])', _save_escape, text)
 
     # 提取链接 [text](url)，在 html.escape 之前保护 URL 不被双重转义
     # 正则支持 URL 中的一层嵌套括号（如 Wikipedia 链接）
@@ -301,15 +372,34 @@ def _inline_markdown_to_html(text: str) -> str:
     def _save_link(m: re.Match) -> str:
         idx = len(link_blocks)
         link_text = html.escape(m.group(1), quote=False)
+        raw_url = m.group(2).strip()
+        # 事后剥掉 URL 尾部可选 title：`url "title"` / `url 'title'` / `url (title)`
+        # 必须有空白分隔才剥，避免误伤含括号的 URL（如 Wikipedia ..._(bar)）。
+        title_m = re.match(r'^(\S+)\s+(?:"[^"]*"|\'[^\']*\'|\([^()]*\))$', raw_url)
+        clean_url = title_m.group(1) if title_m else raw_url
         # URL 必须转义：href 属性里的 & 要写成 &amp;，否则 Telegram 报
         # "can't parse entities"；URL 里的引号会直接闭合属性。
-        link_url = html.escape(m.group(2), quote=True)
+        link_url = html.escape(clean_url, quote=True)
         link_blocks.append(f'<a href="{link_url}">{link_text}</a>')
         return f'\x01LK{idx}\x01'
 
+    # 图片 ![alt](url)：Telegram 文本消息不能内嵌图片，去掉前导 ! 降级为指向图片的
+    # 链接（由下面的链接规则转成 <a>alt</a>），免得残留裸 ! 在链接前。
+    text = re.sub(r'!(?=\[[^\]]*\]\()', '', text)
     text = re.sub(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _save_link, text)
 
-    # HTML 转义剩余文本（行内代码、表格、链接已被提取为占位符，不受影响）
+    # 自动链接 <https://...>：在 html.escape 之前提取为 <a>，否则尖括号被转义成字面。
+    def _save_autolink(m: re.Match) -> str:
+        idx = len(link_blocks)
+        url = m.group(1)
+        link_blocks.append(
+            f'<a href="{html.escape(url, quote=True)}">{html.escape(url, quote=False)}</a>'
+        )
+        return f'\x01LK{idx}\x01'
+
+    text = re.sub(r'<(https?://[^\s<>]+)>', _save_autolink, text)
+
+    # HTML 转义剩余文本（行内代码、表格、链接、转义符已被提取为占位符，不受影响）
     text = html.escape(text, quote=False)
 
     # 逐行处理块级元素：标题、引用、列表
@@ -319,30 +409,57 @@ def _inline_markdown_to_html(text: str) -> str:
 
     for line in lines:
         stripped = line.strip()
+        indent_level = _list_indent_level(line)
+        pad = ' ' * (2 * indent_level)  # nbsp 缩进：Web 浏览器不折叠，三端一致
 
-        # 引用块（> 在 HTML 转义后变为 &gt;）
-        if stripped.startswith('&gt; '):
-            blockquote_buffer.append(stripped[5:])
+        # 引用块（> 在 HTML 转义后变为 &gt;）：允许 >、>（无空格）、多级 >>；多级折成
+        # 单层（Telegram 嵌套 blockquote 渲染未证实，不依赖），空引用行也纳入。
+        bq_m = re.match(r'^(&gt;\s?)+', stripped)
+        if bq_m:
+            blockquote_buffer.append(stripped[bq_m.end():])
             continue
         else:
             if blockquote_buffer:
                 processed.append(f'<blockquote>{chr(10).join(blockquote_buffer)}</blockquote>')
                 blockquote_buffer = []
 
-        # 标题：# ## ### 等 → 粗体
+        # 标题：#~###### → 按级给出可区分的强调（限 b/i/u 允许集内），三端都能分档，
+        # 而不是六级全塌成一个 <b>。CLI(标签→ANSI)、Web(Telegram-HTML) 直接按标签渲染。
         m = re.match(r'^(#{1,6})\s+(.+)$', stripped)
         if m:
-            processed.append(f'<b>{m.group(2)}</b>')
+            level, title_text = len(m.group(1)), m.group(2)
+            if level == 1:
+                processed.append(f'<b><u>{title_text}</u></b>')
+            elif level == 2:
+                processed.append(f'<b>{title_text}</b>')
+            elif level == 3:
+                processed.append(f'<b><i>{title_text}</i></b>')
+            else:
+                processed.append(f'<i>{title_text}</i>')
             continue
 
-        # 无序列表：- 或 * 开头 → 替换为 •
-        if re.match(r'^[\-\*]\s+', stripped):
-            processed.append(re.sub(r'^[\-\*]\s+', '\u2022 ', stripped))
+        # 水平分割线：--- / *** / ___（整行）→ 可见分隔线，否则原样字面外泄。
+        if re.match(r'^(-{3,}|\*{3,}|_{3,})$', stripped):
+            processed.append('─' * 20)
             continue
 
-        # 有序列表：保持原样
+        # 任务列表：- [ ] / - [x]（含 + 标记、按缩进分级）→ ☐/☑（纯 Unicode，无标签风险）
+        task_m = re.match(r'^[\-\*\+]\s+\[([ xX])\]\s+(.*)$', stripped)
+        if task_m:
+            box = '☑' if task_m.group(1) in ('x', 'X') else '☐'
+            processed.append(f'{pad}{box} {task_m.group(2)}')
+            continue
+
+        # 无序列表：-/*/+ → 按缩进层级换 •/◦/▪ 并保留缩进
+        um = re.match(r'^[\-\*\+]\s+(.*)$', stripped)
+        if um:
+            bullet = ('\u2022', '\u25e6', '\u25aa')[min(indent_level, 2)]
+            processed.append(f'{pad}{bullet} {um.group(1)}')
+            continue
+
+        # 有序列表：保留原样（含缩进）
         if re.match(r'^\d+\.\s+', stripped):
-            processed.append(stripped)
+            processed.append(f'{pad}{stripped}')
             continue
 
         processed.append(line)
@@ -377,6 +494,10 @@ def _inline_markdown_to_html(text: str) -> str:
     # 还原链接占位符
     for i, link_html in enumerate(link_blocks):
         text = text.replace(f'\x01LK{i}\x01', link_html)
+
+    # 还原反斜杠转义占位符（放在链接之后：转义符可能藏在已还原的链接文字里）
+    for i, esc_char in enumerate(escapes):
+        text = text.replace(f'\x01ES{i}\x01', esc_char)
 
     # 还原表格 <pre> 占位符（表格 HTML 已构建好，直接放回；不在表格内做行内转换）
     for i, pre_html in enumerate(table_blocks):
@@ -472,8 +593,8 @@ def markdown_to_telegram_html(text: str) -> str:
     if fence_count % 2 == 1:
         text = text + '\n```'
 
-    # 用正则分割代码块和非代码文本
-    segments = re.split(r'(```\w*\n?.*?```)', text, flags=re.DOTALL)
+    # 用正则分割代码块和非代码文本（info 串放宽到「非换行非反引号」，容纳 c++/c#/f#）
+    segments = re.split(r'(```[^\n`]*\n?.*?```)', text, flags=re.DOTALL)
 
     result: List[str] = []
     for seg in segments:
@@ -481,9 +602,12 @@ def markdown_to_telegram_html(text: str) -> str:
             continue
         if seg.startswith('```'):
             # 代码块
-            m = re.match(r'```(\w*)\n?(.*?)```', seg, re.DOTALL)
+            m = re.match(r'```([^\n`]*)\n?(.*?)```', seg, re.DOTALL)
             if m:
-                lang = m.group(1) or ''
+                # info 串可能是 c++ / c# / "py title=x"：语言取首个空白前 token，其余
+                # （title=、行号指令等）丢弃，避免符号漏进代码首行或污染 class。
+                info = m.group(1).strip()
+                lang = info.split()[0] if info else ''
                 code = m.group(2)
                 # 无语言标注（或 text/plain）的代码块：检查是否是伪装的文本表格
                 if not lang or lang.lower() in ('text', 'plain'):

@@ -484,6 +484,20 @@ _INLINE_TAGS = {
     "code": ("code",),
 }
 
+# 每种样式对应的**精确关闭码**，而不是全局 reset(\x1b[0m)。嵌套时
+# （<b><code>x</code></b>）内层收尾若用 reset，会把外层 bold 一起清掉，
+# 内层之后本属外层的文字就掉了样式；用 22/23/24/29（各属性单独关）、
+# 39（前景色恢复默认，行内代码/链接是前景色）只关本层，父层得以延续。
+_STYLE_OFF = {
+    "bold": "\x1b[22m",
+    "dim": "\x1b[22m",
+    "italic": "\x1b[23m",
+    "underline": "\x1b[24m",
+    "strike": "\x1b[29m",
+    "code": "\x1b[39m",
+    "link": "\x1b[39m",
+}
+
 
 def html_to_ansi(text: str, palette: Optional[Palette] = None) -> str:
     """把 Telegram HTML 子集渲染成带 ANSI 样式的纯文本。
@@ -508,26 +522,50 @@ def html_to_ansi(text: str, palette: Optional[Palette] = None) -> str:
 
     result = _A_RE.sub(_link, result)
 
+    # 普通引用块 <blockquote>…</blockquote>（markdown 的 > 引用，A#10 折成单层）：
+    # 每行冠一条 muted 竖标记 ▎，与代码块的 │ 区分——cli_tui._is_code_bar 靠 │
+    # 认代码条，引用复用 │ 会被误判成可折叠代码块。展开型协议块
+    # <blockquote expandable> 带属性、由折叠层单独处理，这里的无属性正则不会碰它。
+    def _blockquote(match: "re.Match[str]") -> str:
+        marker = pal.paint("▎", pal.muted) if pal.enabled else ">"
+        out_lines = []
+        for ln in match.group(1).strip("\n").split("\n"):
+            out_lines.append(f"{marker} {ln}" if ln.strip() else marker)
+        return "\n" + "\n".join(out_lines) + "\n"
+
+    result = re.sub(r"<blockquote>(.*?)</blockquote>", _blockquote,
+                    result, flags=re.I | re.S)
+
     # 块级标签换行化。
     result = re.sub(r"</(p|div|blockquote|li|h[1-6])\s*>", "\n", result, flags=re.I)
     result = re.sub(r"<br\s*/?>", "\n", result, flags=re.I)
-    result = re.sub(r"<blockquote>", "", result, flags=re.I)
+    result = re.sub(r"<blockquote[^>]*>", "", result, flags=re.I)
 
-    # 行内样式标签 -> ANSI。用栈式替换而不是一次性正则，保证嵌套
-    # （<b><code>x</code></b>）时内层 reset 不会把外层样式一起清掉。
+    # 行内样式标签 -> ANSI。由内向外逐层替换（inline_pattern 每轮吃掉最内层
+    # 已闭合的一对标签），配合 _STYLE_OFF 的精确关闭码，保证嵌套
+    # （<b><code>x</code></b>）时内层收尾不会把外层样式一起清掉。
     def _inline(match: "re.Match[str]") -> str:
         tag = match.group(1).lower()
         inner = match.group(2)
         styles = _INLINE_TAGS.get(tag)
         if not styles:
             return inner
-        codes = "".join(getattr(pal, name, "") for name in styles)
-        if not codes:
+        if not pal.enabled:
+            # 关色 / 重定向：颜色没了，但"这是代码""这里删过"的结构义不能一起
+            # 丢，否则落盘或管道后不可辨。行内代码回退反引号、删除线回退 ~~；
+            # 粗 / 斜 / 下划线对纯文本无损，保持裸字（test_cli_bridge 也锁定
+            # <b> 关色即裸文本）。
+            if "code" in styles:
+                return f"`{inner}`"
+            if "strike" in styles:
+                return f"~~{inner}~~"
             return inner
-        # 内层结束后重新开启外层可能仍需要的样式：结尾用 reset 再补回本层
-        # 之外的上下文由调用方（整段最后统一 reset）负责，这里保持简单：
-        # reset 之后不残留样式，嵌套场景由外层重新着色。
-        return f"{codes}{inner}{pal.reset}"
+        codes = "".join(getattr(pal, name, "") for name in styles)
+        # 内层收尾只关**本层**样式（逐层精确关闭码，见 _STYLE_OFF），不用全局
+        # reset——否则 <b><code>x</code></b> 里内层结束会把外层 bold 一并清掉，
+        # 内层之后本属外层的文字就掉了样式。
+        off = "".join(_STYLE_OFF.get(name, pal.reset) for name in reversed(styles))
+        return f"{codes}{inner}{off}"
 
     inline_pattern = re.compile(
         r"<(" + "|".join(_INLINE_TAGS) + r")>(.*?)</\1>", re.S | re.I
@@ -612,17 +650,30 @@ class MessageRenderer:
         return parts or [("text", text)]
 
     def _render_pre(self, raw: str, body_width: int) -> List[str]:
-        """代码块/表格：加左边框、不折行。
+        """代码块 / 表格：加左边框，超宽按列硬切、续行续补边框。
 
-        markdown_to_telegram_html 把 Markdown 表格也转成 <pre>，内容是按等宽
-        对齐过的——一旦折行对齐就全毁了。所以这里宁可让超宽内容被终端自己
-        软换行，也不主动折。
+        markdown_to_telegram_html 把 Markdown 表格也转成 <pre>，内容按等宽对齐
+        过。一旦超过终端宽度，靠终端自己软换行会把续行甩到行首、丢掉左边框
+        （`│`），整块看起来就"漏"了出去；所以这里按显示宽度硬切，每条续行都补
+        回 `│`，块边界在任意窄的终端上都保得住。围栏代码块的语言名（```lang）
+        作一行 dim 小标签放最上面——终端没有语法高亮，至少让人一眼知道这是
+        什么代码。
         """
         pal = self.palette
-        inner = _html.unescape(re.sub(r"<[^>]+>", "", raw)).strip("\n")
         bar = pal.paint("│", pal.muted)
-        lines = [f"{bar} {pal.paint(line, pal.code)}" for line in inner.split("\n")]
-        return lines or [f"{bar} "]
+        avail = max(1, body_width - 2)          # 让位给 "│ " 前缀
+        out: List[str] = []
+        # 语言名：<code class="language-xxx"> -> dim 小标签「│ xxx」。
+        lang = re.search(r'class="language-([^"]+)"', raw)
+        if lang:
+            out.append(f"{bar} {pal.paint(lang.group(1), pal.muted, pal.dim)}")
+        inner = _html.unescape(re.sub(r"<[^>]+>", "", raw)).strip("\n")
+        for line in inner.split("\n"):
+            # 先按纯文本硬切、再逐段上色：整行上色后再切会把色码留在首段，
+            # 续段丢色。
+            for seg in chunk_by_width(line, avail):
+                out.append(f"{bar} {pal.paint(seg, pal.code)}")
+        return out or [f"{bar} "]
 
     # -- 对外接口 --------------------------------------------------------
     def render_text(self, text: str, parse_mode: Any = None,

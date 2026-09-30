@@ -11,6 +11,7 @@ from xgent_app.agent_presenter import (
     build_standard_operation_presentation,
     fold_output_block,
 )
+from xgent_app.cli_render import _FOLD_HEADER_RE
 
 
 class AgentPresenterTests(unittest.TestCase):
@@ -24,9 +25,10 @@ class AgentPresenterTests(unittest.TestCase):
         )
 
     def test_fold_header_matches_cli_fold_detection_regex(self):
-        # CLI 端（cli_tui._HEADER_RE / cli_render._FOLD_HEADER_RE）靠这个正则把块头
-        # 认成可折叠块。块头的纯文本（去掉 <b> 后）必须命中，否则 CLI 三端就不一致了。
-        cli_header_re = re.compile(r"^\S+\s+\S+-x\b.*·\s*\d+\s*行$")
+        # CLI 端（cli_tui._HEADER_RE ← cli_render._FOLD_HEADER_RE 单一真源）靠这个
+        # 正则把块头认成可折叠块。直接引真源正则来断言，避免测试里再抄一份、
+        # 三处失步却测不出来。块头纯文本（去掉 <b> 后）必须命中，否则 CLI 三端
+        # 就不一致了。
         for kind, icon in [
             ("run", "⌨️"), ("shell", "🖥️"), ("grep", "🔎"),
             ("search", "🌐"), ("fetch", "📄"), ("edit", "✏️"),
@@ -34,7 +36,7 @@ class AgentPresenterTests(unittest.TestCase):
             html = fold_output_block("l1\nl2\nl3\nl4", kind=kind, icon=icon)
             header = re.sub(r"</?b>", "", html.split("\n", 1)[0])
             header = header.replace("<blockquote expandable>", "")
-            self.assertRegex(header, cli_header_re)
+            self.assertRegex(header, _FOLD_HEADER_RE)
 
     def test_edit_presentation_folds_output_block(self):
         self.assertEqual(

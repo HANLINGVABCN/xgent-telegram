@@ -389,8 +389,19 @@
   .bubble h1 { font-size: 18px; border-bottom: 1px solid var(--line); padding-bottom: 4px; }
   .bubble h2 { font-size: 16.5px; }
   .bubble h3 { font-size: 15px; }
+  /* h4 此前漏了字号，塌到默认值、和正文一样大，六级标题里唯独它没层次；
+     补到 h3(15) 与 h5(13.5) 之间，让六级标题在 Web 端也能逐级分档。 */
+  .bubble h4 { font-size: 14px; }
   .bubble h5 { font-size: 13.5px; }
   .bubble h6 { font-size: 13px; color: var(--text-2); }
+  /* Telegram 原生剧透：默认糊住，点一下（bindContentClicks 里加 .revealed）揭示。 */
+  .bubble tg-spoiler {
+    background: var(--surface-2); border-radius: 4px; padding: 0 2px;
+    color: transparent; cursor: pointer; transition: color var(--t), background var(--t);
+    -webkit-box-decoration-break: clone; box-decoration-break: clone;
+  }
+  .bubble tg-spoiler::selection { color: transparent; }
+  .bubble tg-spoiler.revealed { background: transparent; color: inherit; cursor: auto; }
   .bubble p { margin: 8px 0; }
   .bubble ul, .bubble ol { margin: 8px 0 8px 20px; padding: 0; }
   .bubble li { margin: 3px 0; }
@@ -1508,7 +1519,11 @@
   var ALLOWED = {
     B:1, STRONG:1, I:1, EM:1, U:1, INS:1, S:1, STRIKE:1, DEL:1, CODE:1, PRE:1, BR:1, A:1, BLOCKQUOTE:1,
     TABLE:1, THEAD:1, TBODY:1, TR:1, TH:1, TD:1, DIV:1, SPAN:1, P:1,
-    H1:1, H2:1, H3:1, H4:1, H5:1, H6:1, UL:1, OL:1, LI:1, HR:1
+    H1:1, H2:1, H3:1, H4:1, H5:1, H6:1, UL:1, OL:1, LI:1, HR:1,
+    // Telegram 原生剧透 / 自定义 emoji：渲染器当前不产出，但模型可能原样输出。
+    // 收进白名单后剧透文字才不会被“拆标签”直接摊开（配合 CSS 模糊 + 点击揭示）；
+    // 自定义元素在 HTML 文档里 tagName 会大写化，故键名写成 TG-SPOILER/TG-EMOJI。
+    "TG-SPOILER":1, "TG-EMOJI":1
   };
 
   // 把 marked 的标准输出对齐到本项目既有的 CSS，省得为了一个解析器去改整套样式。
@@ -1642,6 +1657,17 @@
     return sanitizeHtml(renderMarkdown(text));
   }
 
+  // 用户气泡永远按字面渲染：只转义 + 换行，绝不过 marked / HTML，免得输入里的
+  // *、`、#、| 之类被当 markdown 语法篡改显示（Telegram/CLI 两端都原样回显用户
+  // 输入，Web 对齐）。其余角色照常走 renderText。初始渲染(makeBubble)与流式/编辑
+  // 更新(putTextFrame)两处共用，避免规则失步。
+  function renderBubbleBody(role, text, parseMode) {
+    if (role === "user") {
+      return escapeHtml(text == null ? "" : String(text)).replace(/\n/g, "<br>");
+    }
+    return renderText(text, parseMode);
+  }
+
   function nowTime(timestamp) {
     var d = timestamp == null ? new Date() : new Date(Number(timestamp) * 1000);
     if (isNaN(d.getTime())) d = new Date();
@@ -1683,6 +1709,16 @@
       while (node && node !== pre) { title += node.textContent || ""; node = node.nextSibling; }
       title = title.replace(/\s+/g, " ").trim();
       var text = pre ? (pre.querySelector("code") || pre).textContent.replace(/\n$/, "") : "";
+      // 语言从 <code class="language-xxx"> 读真值：此前写死 "CODE" → 落到 // 词法，
+      // 对协议块这种命令执行输出是错的。没有语言类时按 shell（# 注释）兜底，而不是
+      // 通用 // 词法——协议块本就是命令上下文。必须在下面清空 bq 之前读，否则 code
+      // 元素连同 class 会被 removeChild 掉。
+      var pbCode = pre && pre.querySelector("code");
+      var pbLang = "shell";
+      if (pbCode && pbCode.className) {
+        var pbLm = /language-([a-zA-Z0-9_+#.-]+)/.exec(pbCode.className);
+        if (pbLm) pbLang = pbLm[1];
+      }
       var short = !label && text.split("\n").length <= 3;
 
       var head = document.createElement("div");
@@ -1701,7 +1737,7 @@
       bq.appendChild(head);
       if (pre) {
         pre.dataset.enhanced = "1";
-        pre.innerHTML = '<code>' + highlightCode(text, "CODE") + '</code>';
+        pre.innerHTML = '<code>' + highlightCode(text, pbLang) + '</code>';
         bq.appendChild(pre);
       }
       if (label) { label.className = "pb-folded"; bq.appendChild(label); }
@@ -1788,6 +1824,14 @@
           if (String(window.getSelection() || "").length) return;
           foldBq.classList.toggle("expanded");
         }, 250);
+        return;
+      }
+
+      // 剧透块：点一下揭示（露出后不再拦截，交回下面的选词/复制逻辑）。
+      var spoiler = e.target.closest("tg-spoiler");
+      if (spoiler && !spoiler.classList.contains("revealed")) {
+        spoiler.classList.add("revealed");
+        e.stopPropagation();
         return;
       }
 
@@ -1884,7 +1928,7 @@
 
     var body = document.createElement("div");
     body.className = "body";
-    body.innerHTML = renderText(text, parseMode);
+    body.innerHTML = renderBubbleBody(role, text, parseMode);
     enhanceBubbleContent(body);
 
     var ts = document.createElement("span");
@@ -2204,7 +2248,7 @@
     var newRole = classifyMessageText(role, frame.text, frame.msg_type);
     if (entry && entry.rawText !== undefined && entry.role === newRole) {
       entry.rawText = frame.text;
-      entry.body.innerHTML = renderText(frame.text, frame.parse_mode);
+      entry.body.innerHTML = renderBubbleBody(newRole, frame.text, frame.parse_mode);
       enhanceBubbleContent(entry.body);
     } else {
       var next = entry && entry.row.nextSibling;

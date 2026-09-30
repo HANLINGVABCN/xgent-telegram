@@ -35,11 +35,17 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from .cli_render import MessageRenderer, Palette, content_width, terminal_size
+from .cli_render import (
+    MessageRenderer,
+    Palette,
+    content_width,
+    terminal_size,
+    _FOLD_HEADER_RE as _HEADER_RE,
+)
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
-# 折叠块头：「{icon} {label}[ path] · {N} 行」（protocols._render_block_blockquote）
-_HEADER_RE = re.compile(r"^\S+\s+\S+-x\b.*·\s*\d+\s*行$")
+# 折叠块头正则单一真源在 cli_render._FOLD_HEADER_RE，这里直接复用（原先两处
+# 各自 re.compile 同一份字面，改一处漏一处就会失步）。
 # 「已折叠 K 行」纯文字标签
 _FOLDED_LABEL_RE = re.compile(r"^已折叠\s*\d+\s*行$")
 

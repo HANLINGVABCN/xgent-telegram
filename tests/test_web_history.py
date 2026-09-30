@@ -410,11 +410,13 @@ class HistoryReplayFoldTests(unittest.TestCase):
         self.assertIsNone(msg.get("parse_mode"))
         self.assertEqual(content, msg["content"])       # 原文，绝不折
 
-    def test_no_protocol_block_not_forced_into_html(self):
+    def test_no_protocol_block_unified_to_html(self):
+        # 无协议块的纯 markdown（折叠开关 ON）也统一走 markdown_to_telegram_html：
+        # live 与刷新后同源，前端 renderText 命中 HTML 分支、不再"变脸"（C 组统一）。
         content = "# 标题\n\n普通回复，没有协议块。"
         msg = self._build(content, hide=True)
-        self.assertIsNone(msg.get("parse_mode"))
-        self.assertEqual(content, msg["content"])       # 交回 markdown 渲染
+        self.assertEqual("HTML", msg["parse_mode"])
+        self.assertEqual("<p>" + content + "</p>", msg["content"])   # 假渲染器：<p>…</p>
 
     def test_display_metadata_takes_precedence(self):
         # 已有 display（live 落库的镜像）优先，不再二次折叠。

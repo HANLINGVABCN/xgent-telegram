@@ -207,6 +207,34 @@ def _folded_history_html(content: str) -> str | None:
     return folded if folded != content else None
 
 
+def _history_display_html(content: str) -> str | None:
+    """历史 AI 正文 -> 与 live 同源的 Telegram-HTML；取不到渲染器则 None（回退原始 markdown）。
+
+    live 的 AI 正文永远走服务端 markdown_to_telegram_html（parse_mode=HTML）；历史回放
+    此前没有 display 就直接落原始 markdown、由前端 marked 渲染，于是同一条消息 live 与
+    刷新后"变脸"（间距、表格、任务列表都不一样）。这里统一：
+      - 含协议块（折叠开关 ON）：折成 <blockquote expandable>（_folded_history_html）。
+      - 无协议块的纯 markdown（折叠开关 ON）：跑 markdown_to_telegram_html，使 live 与
+        刷新都命中前端 renderText 的 HTML 分支、三端一致，A 组对渲染器的增强也自动惠及 Web。
+      - 折叠开关 OFF：维持原始 markdown（老行为，交前端 marked）——不在本次统一范围内。
+      - 取不到 section 命名空间/渲染器：返回 None，交上层回退原文（宁可降级不可崩）。
+    """
+    if not content:
+        return None
+    folded = _folded_history_html(content)
+    if folded is not None:
+        return folded
+    ns = _section_ns()
+    if ns is None:
+        return None
+    try:
+        if not ns["_should_hide_protocol_blocks"]():
+            return None
+        return ns["markdown_to_telegram_html"](content)
+    except Exception:
+        return None
+
+
 def build_history_message(
     record: dict[str, Any], storage_root: str | Path, workspace_root: str | Path,
 ) -> dict[str, Any]:
@@ -236,12 +264,12 @@ def build_history_message(
     if isinstance(display, dict) and isinstance(display.get("content"), str):
         message.update(content=display["content"], parse_mode=display.get("parse_mode"))
     elif kind in {"ai_reply", "media_reply"}:
-        # 刷新/翻页的历史回放此前直接渲染原始 markdown——协议块整篇摊开、不折叠
-        # （live 靠镜像的 display 折，历史记录没有 display 就露了原文）。这里按开关
-        # 实时折成 <blockquote expandable>，与 live/Telegram/CLI 同源；无块则回退 markdown。
-        folded = _folded_history_html(content)
-        if folded is not None:
-            message.update(content=folded, parse_mode="HTML")
+        # 历史回放与 live 同源：含协议块折叠、纯 markdown 也转成 Telegram-HTML，
+        # 两条路都 parse_mode=HTML，刷新后不再"变脸"（详见 _history_display_html）。
+        # 取不到渲染器时 html 为 None，保持原始 markdown（老行为）。
+        html = _history_display_html(content)
+        if html is not None:
+            message.update(content=html, parse_mode="HTML")
     elif kind not in {"user_text", "user_file", "user_photo"} and _HTML_PRESENTATION.search(content):
         message["parse_mode"] = "HTML"
     task = metadata.get('compression_task')
