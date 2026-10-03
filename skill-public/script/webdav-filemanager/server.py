@@ -14,12 +14,15 @@ WebDAV 文件管理器 - 零依赖 Python 文件管理服务器
 """
 
 import os
+import errno
 import sys
 import json
 import shutil
 import argparse
 import urllib.parse
 import urllib.request
+import http.client
+import ssl
 import mimetypes
 import base64
 import hmac
@@ -56,6 +59,12 @@ AUTH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'filemanage
 MAX_TTL_SECONDS = 10 * 365 * 24 * 60 * 60
 MAX_SPARSE_FILE_SIZE = 100 * 1024 * 1024 * 1024
 MAX_TEXT_EDIT_SIZE = 10 * 1024 * 1024
+# JSON/auth requests are buffered; binary uploads remain streamed and are not
+# subject to the JSON cap. Idle socket timeout and worker count also bound reads.
+MAX_JSON_BODY_SIZE = int(os.environ.get('WEBDAV_MAX_JSON_BODY', 16 * 1024 * 1024))
+MAX_AUTH_BODY_SIZE = 16 * 1024
+REQUEST_READ_TIMEOUT = float(os.environ.get('WEBDAV_REQUEST_TIMEOUT', 30))
+MAX_REQUEST_WORKERS = int(os.environ.get('WEBDAV_MAX_WORKERS', 32))
 # 同一 IP 连续请求间隔若超过此值，视为一次新的下载会话。
 # 用于把多线程/Range 分块下载收敛成"1 次下载"，而非每个分片算 1 次。
 SHARE_SESSION_GAP = 30 * 60
@@ -75,12 +84,17 @@ UPLOAD_BATCH_TTL_SECONDS = 2 * 60 * 60
 # In-memory metadata for active chunked uploads (taskId -> {partPath, finalPath, size, ...})
 UPLOAD_TASKS = {}
 UPLOAD_TASKS_LOCK = threading.Lock()
+# Serialize operations on the same upload, without holding one global lock during
+# network reads. A fixed number of stripes avoids a growing per-task lock cache.
+UPLOAD_PATH_LOCKS = tuple(threading.RLock() for _ in range(64))
 
 # Login rate limiter: { ip: { 'fails': int, 'locked_until': float } }
 _login_attempts = {}
 _login_attempts_lock = threading.Lock()
 LOGIN_MAX_FAILS = 5
 LOGIN_LOCKOUT_SECONDS = 60
+LOGIN_ATTEMPT_TTL = 60 * 60
+MAX_LOGIN_TRACKED_IPS = 4096
 # 可信反向代理的 IP 列表（逗号分隔）。为空时一律忽略 X-Forwarded-For，
 # 只用真实对端地址做限速，否则伪造该头即可绕过登录锁定。
 TRUSTED_PROXIES = {
@@ -155,7 +169,7 @@ def get_file_info(root, rel_path, full_path):
 
 
 def _empty_state():
-    return {'shares': {}, 'shareTrash': {}, 'tempFiles': {}, 'tasks': {}, 'pinned': [], 'taskTrash': {}}
+    return {'shares': {}, 'shareTrash': {}, 'tempFiles': {}, 'tasks': {}, 'pinned': [], 'taskTrash': {}, 'taskDeleted': {}, 'taskRevision': 0}
 
 
 def load_state():
@@ -171,15 +185,35 @@ def load_state():
         data.setdefault('tasks', {})
         data.setdefault('pinned', [])
         data.setdefault('taskTrash', {})
+        data.setdefault('taskDeleted', {})
+        data.setdefault('taskRevision', 0)
         return data
 
 
 def save_state(data):
     with STATE_LOCK:
+        current = load_state()
+        incoming = dict(data)
+        task_keys = ('tasks', 'taskTrash', 'taskDeleted')
+        revision = current.get('taskRevision', 0)
+        # Share/statistics requests can retain an old whole-state snapshot while
+        # another request deletes a task. Never let those saves roll tasks back.
+        if incoming.get('taskRevision', 0) != revision:
+            for key in task_keys:
+                incoming[key] = current.get(key, {})
+        deleted = dict(current.get('taskDeleted', {}))
+        deleted.update(incoming.get('taskDeleted', {}))
+        incoming['taskDeleted'] = deleted
+        for key in ('tasks', 'taskTrash'):
+            incoming[key] = {tid: snap for tid, snap in incoming.get(key, {}).items()
+                             if tid not in deleted}
+        changed = any(incoming.get(key, {}) != current.get(key, {}) for key in task_keys)
+        incoming['taskRevision'] = revision + int(changed)
         tmp = STATE_FILE + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(incoming, f, ensure_ascii=False, indent=2)
         os.replace(tmp, STATE_FILE)
+        data.update(incoming)
 
 
 # ---- Task persistence helpers ----
@@ -206,46 +240,82 @@ def task_snapshot(task):
 
 
 def save_task(task):
-    """Persist a single task snapshot into state['tasks'][id] (atomic).
-
-    Uses STATE_LOCK across the entire read-check-write cycle to prevent
-    race conditions with concurrent delete operations. If the task has
-    already been soft-deleted (present in state['taskTrash']), skip writing.
-    """
+    """Persist progress unless trash/purge has already retired this task ID."""
     if not task or not task.get('id'):
         return
     snap = task_snapshot(task)
     task_id = snap['id']
     with STATE_LOCK:
-        try:
-            with open(STATE_FILE, 'r', encoding='utf-8') as f:
-                state = json.load(f)
-        except Exception:
-            state = {}
-        state.setdefault('tasks', {})
-        state.setdefault('taskTrash', {})
-        # 如果任务已在回收站，不再写回（防止 worker 线程复活已删除的任务）
-        if task_id in state.get('taskTrash', {}):
+        state = load_state()
+        if task_id in state.get('taskTrash', {}) or task_id in state.get('taskDeleted', {}):
             return
-        state['tasks'][task_id] = snap
-        tmp = STATE_FILE + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, STATE_FILE)
+        state.setdefault('tasks', {})[task_id] = snap
+        save_state(state)
 
 
 def delete_persisted_task(task_id):
     """Remove a task from the persistent state."""
     if not task_id:
         return
-    state = load_state()
-    if state.get('tasks', {}).pop(task_id, None) is not None:
-        save_state(state)
+    with STATE_LOCK:
+        state = load_state()
+        if state.get('tasks', {}).pop(task_id, None) is not None:
+            save_state(state)
 
 
 def load_persisted_tasks():
     """Return all persisted task snapshots as a dict id -> snapshot."""
-    return load_state().get('tasks', {}) or {}
+    state = load_state()
+    hidden = set(state.get('taskTrash', {})) | set(state.get('taskDeleted', {}))
+    return {tid: snap for tid, snap in state.get('tasks', {}).items() if tid not in hidden}
+
+
+def upload_path_lock(path):
+    key = os.path.normcase(os.path.realpath(path))
+    return UPLOAD_PATH_LOCKS[hash(key) % len(UPLOAD_PATH_LOCKS)]
+
+
+def load_upload_task(task_id):
+    """Use persisted records as authority; memory may be empty after a restart."""
+    snap = load_persisted_tasks().get(task_id)
+    if not snap or snap.get('kind') != 'upload':
+        return None, None
+    full = safe_join(ROOT_DIR, snap.get('path', ''))
+    if not full or full == os.path.realpath(ROOT_DIR):
+        return None, None
+    info = {
+        'partPath': full + '.part', 'finalPath': full,
+        'size': int(snap.get('size') or 0),
+        'createdAt': float(snap.get('createdAt') or time.time()),
+    }
+    return info, snap
+
+
+def publish_upload_file(part_path, final_path):
+    """Publish complete bytes without replacing another writer's file.
+
+    Hard links are atomic and avoid copying large uploads. Filesystems without
+    hard-link support fall back to exclusive creation, never to os.replace().
+    Leave the part in place until the completed task has been persisted.
+    """
+    try:
+        os.link(part_path, final_path)
+        return
+    except FileExistsError:
+        raise
+    except OSError as e:
+        if e.errno not in (errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS):
+            raise
+    created = False
+    try:
+        with open(final_path, 'xb') as out:
+            created = True
+            with open(part_path, 'rb') as src:
+                shutil.copyfileobj(src, out, 1024 * 1024)
+    except OSError:
+        if created:
+            os.remove(final_path)
+        raise
 
 
 def load_auth_cred():
@@ -527,48 +597,111 @@ class _RedirectTo(Exception):
         self.url = url
 
 
-def validate_remote_url(url):
-    """校验远程下载目标。返回 (ok, 错误文案)。
-
-    解析出真实 IP 后拒绝环回/私网/链路本地/保留地址，防止把这个下载器
-    当成打内网和云元数据服务的跳板。
-    """
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
-        return False, '请输入有效的 http/https 链接'
-    if ALLOW_PRIVATE_REMOTE:
-        return True, ''
-    host = parsed.hostname
-    if not host:
-        return False, '链接缺少主机名'
+def resolve_remote_target(url):
+    """Resolve once per hop; all returned addresses must pass the same policy."""
+    if not isinstance(url, str) or any(ord(c) < 32 or ord(c) == 127 for c in url):
+        raise ValueError('远程链接无效')
     try:
-        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == 'https' else 80),
-                                   proto=socket.IPPROTO_TCP)
-    except OSError:
-        return False, f'无法解析主机: {host}'
-    for info in infos:
-        addr = info[4][0]
+        parsed = urllib.parse.urlsplit(url)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError as e:
+        raise ValueError('远程链接的主机或端口无效') from e
+    if parsed.scheme not in ('http', 'https') or not host:
+        raise ValueError('请输入有效的 http/https 链接')
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError('远程链接不能包含用户名或密码')
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError('远程链接端口无效')
+    port = port or (443 if parsed.scheme == 'https' else 80)
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM,
+                                       proto=socket.IPPROTO_TCP)
+    except OSError as e:
+        raise ValueError(f'无法解析主机: {host}') from e
+    if not addresses:
+        raise ValueError(f'主机没有可连接的地址: {host}')
+    for family, socktype, proto, canonname, sockaddr in addresses:
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            raise ValueError('远程地址类型不支持')
         try:
-            ip = ipaddress.ip_address(addr)
-        except ValueError:
-            return False, f'无法识别的地址: {addr}'
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-            return False, (
-                f'拒绝访问内网/保留地址 ({addr})。'
-                '确需下载内网资源时，请设置环境变量 WEBDAV_ALLOW_PRIVATE_REMOTE=1 后重启。'
+            ip = ipaddress.ip_address(sockaddr[0])
+        except ValueError as e:
+            raise ValueError('无法识别的远程地址') from e
+        checked_ip = getattr(ip, 'ipv4_mapped', None) or ip
+        if not ALLOW_PRIVATE_REMOTE and (not checked_ip.is_global or checked_ip.is_multicast):
+            raise ValueError(
+                f'拒绝访问内网/保留地址 ({ip})。'
+                '确需下载内网资源时，请设置 WEBDAV_ALLOW_PRIVATE_REMOTE=1。'
             )
+    return tuple(addresses)
+
+
+def validate_remote_url(url):
+    try:
+        resolve_remote_target(url)
+    except ValueError as e:
+        return False, str(e)
     return True, ''
 
 
+def connect_remote_addresses(addresses, timeout, source_address=None):
+    """Connect to already checked sockaddrs, never resolve the hostname again."""
+    last_error = None
+    for family, socktype, proto, canonname, sockaddr in addresses:
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as e:
+            last_error = e
+            sock.close()
+    raise last_error or OSError('没有可用的远程地址')
+
+
+def pinned_connection_factory(connection_type, addresses):
+    def create(host, **kwargs):
+        connection = connection_type(host, **kwargs)
+        # Keep the original host on HTTPConnection: Host, HTTPS SNI and certificate
+        # hostname verification must not be changed to the pinned IP address.
+        connection._create_connection = lambda address, timeout, source_address=None: (
+            connect_remote_addresses(addresses, timeout, source_address)
+        )
+        return connection
+    return create
+
+
+class PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, addresses):
+        super().__init__()
+        self.addresses = addresses
+
+    def http_open(self, req):
+        return self.do_open(pinned_connection_factory(http.client.HTTPConnection, self.addresses), req)
+
+
+class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, addresses):
+        super().__init__(context=ssl.create_default_context())
+        self.addresses = addresses
+
+    def https_open(self, req):
+        return self.do_open(pinned_connection_factory(http.client.HTTPSConnection, self.addresses),
+                            req, context=self._context)
+
+
 def open_remote_url(url, headers, timeout=30, max_redirects=5):
-    """打开远程 URL，逐跳校验重定向目标，防止跳转绕过 SSRF 检查。"""
-    opener = urllib.request.build_opener(_NoRedirect)
+    """Pin each redirect hop's checked addresses; disable implicit env proxies."""
     current = url
     for _ in range(max_redirects + 1):
-        ok, err = validate_remote_url(current)
-        if not ok:
-            raise ValueError(err)
+        addresses = resolve_remote_target(current)
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRedirect,
+            PinnedHTTPHandler(addresses), PinnedHTTPSHandler(addresses),
+        )
         req = urllib.request.Request(current, headers=headers)
         try:
             return opener.open(req, timeout=timeout)
@@ -581,11 +714,14 @@ def remote_download_worker(task_id):
     temp_path = ''
     last_save = 0.0
     resp = None
+    worker_task = None
+    part_identity = None
     try:
         with REMOTE_TASKS_LOCK:
             task = REMOTE_TASKS.get(task_id)
             if not task:
                 return
+            worker_task = task
             task['status'] = 'downloading'
             if not task.get('startedAt'):
                 task['startedAt'] = time.time()
@@ -611,6 +747,9 @@ def remote_download_worker(task_id):
         if existing > 0:
             headers['Range'] = f'bytes={existing}-'
         resp = open_remote_url(url, headers, timeout=30)
+        with REMOTE_TASKS_LOCK:
+            if REMOTE_TASKS.get(task_id) is not worker_task or worker_task.get('retired'):
+                return
         status = getattr(resp, 'status', None) or resp.getcode()
         is_resume = (status == 206)
         content_total = int(resp.headers.get('Content-Length') or 0)
@@ -661,16 +800,21 @@ def remote_download_worker(task_id):
         written_total = existing if mode == 'ab' else 0
 
         with open(temp_path, mode) as out:
+            opened = os.fstat(out.fileno())
+            part_identity = (opened.st_dev, opened.st_ino)
             while True:
                 with REMOTE_TASKS_LOCK:
                     task = REMOTE_TASKS.get(task_id)
-                    if not task:
+                    if task is not worker_task:
                         return
                     if task.get('cancel'):
                         if task.get('pauseRequested'):
                             raise InterruptedError('paused')
                         raise InterruptedError('已取消')
                 chunk = resp.read(65536)
+                with REMOTE_TASKS_LOCK:
+                    if REMOTE_TASKS.get(task_id) is not worker_task or worker_task.get('retired'):
+                        return
                 if not chunk:
                     break
                 out.write(chunk)
@@ -693,8 +837,12 @@ def remote_download_worker(task_id):
                     except Exception:
                         pass
 
-        os.replace(temp_path, target)
-        with REMOTE_TASKS_LOCK:
+        with REMOTE_TASKS_LOCK, STATE_LOCK:
+            state = load_state()
+            if (REMOTE_TASKS.get(task_id) is not worker_task or worker_task.get('retired')
+                    or task_id in state.get('taskTrash', {}) or task_id in state.get('taskDeleted', {})):
+                return
+            os.replace(temp_path, target)
             task = REMOTE_TASKS.get(task_id)
             if task:
                 task['loaded'] = os.path.getsize(target)
@@ -745,6 +893,18 @@ def remote_download_worker(task_id):
                 resp.close()
             except Exception:
                 pass
+        # Windows may keep the part busy until the worker closes it. Retry only
+        # our own inode and only if another live task has not claimed the path.
+        if worker_task and worker_task.get('retired') and temp_path and part_identity:
+            with REMOTE_TASKS_LOCK:
+                claimed = any(t.get('tempPath') == temp_path for t in REMOTE_TASKS.values())
+                if not claimed:
+                    try:
+                        st = os.stat(temp_path)
+                        if (st.st_dev, st.st_ino) == part_identity:
+                            os.remove(temp_path)
+                    except OSError:
+                        pass
 
 
 def merge_remote_task_for_persist(task):
@@ -1030,6 +1190,12 @@ def make_dav_entry(href, full_path, name):
 # ============================================================
 # HTTP Request Handler
 # ============================================================
+class RequestBodyError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
 class FileManagerHandler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
     server_version = 'WebDAV-FileManager/1.0'
@@ -1208,20 +1374,58 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', '0')
         self.end_headers()
 
+    def request_body_length(self):
+        if self.headers.get('Transfer-Encoding'):
+            raise RequestBodyError(400, '不支持分块传输编码，请提供 Content-Length')
+        lengths = (self.headers.get_all('Content-Length', []) if hasattr(self.headers, 'get_all')
+                   else [self.headers.get('Content-Length', '0')])
+        if len(lengths) > 1:
+            raise RequestBodyError(400, '重复的 Content-Length')
+        raw = (lengths[0] if lengths else '0').strip()
+        if not raw.isascii() or not raw.isdecimal():
+            raise RequestBodyError(400, 'Content-Length 无效')
+        try:
+            return int(raw)
+        except ValueError as e:
+            raise RequestBodyError(400, 'Content-Length 无效') from e
+
     def read_body(self):
-        n = int(self.headers.get('Content-Length', 0))
-        return self.rfile.read(n) if n > 0 else b''
+        n = self.request_body_length()
+        path = urllib.parse.unquote(urllib.parse.urlsplit(getattr(self, 'path', '')).path)
+        limit = MAX_AUTH_BODY_SIZE if path.startswith('/api/auth/') else MAX_JSON_BODY_SIZE
+        if n > limit:
+            raise RequestBodyError(413, '请求体过大')
+        body = self.rfile.read(n) if n else b''
+        if len(body) != n:
+            raise RequestBodyError(400, '请求体未接收完整')
+        return body
 
     def read_json(self):
         try:
-            return json.loads(self.read_body().decode('utf-8'))
+            data = json.loads(self.read_body().decode('utf-8'))
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            self.send_error(400, f'Invalid JSON: {e}')
+            raise RequestBodyError(400, 'JSON 格式无效') from e
+        if not isinstance(data, dict):
+            raise RequestBodyError(400, 'JSON 请求体必须是对象')
+        return data
 
     # ----------------------------------------------------------
     # Routing
     # ----------------------------------------------------------
     def _route(self, method):
+        try:
+            self.request_body_length()
+            self._dispatch(method)
+        except RequestBodyError as e:
+            self.close_connection = True
+            self.send_err(e.status, str(e))
+        except TimeoutError:
+            self.close_connection = True
+            self.send_err(408, '请求读取超时')
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+
+    def _dispatch(self, method):
         parsed = urllib.parse.urlparse(self.path)
         path = urllib.parse.unquote(parsed.path)
         qs = urllib.parse.parse_qs(parsed.query)
@@ -1350,7 +1554,6 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         return peer
 
     def _check_login_rate(self, ip):
-        """Return True if login is allowed, False if rate-limited."""
         now = time.time()
         with _login_attempts_lock:
             rec = _login_attempts.get(ip)
@@ -1358,16 +1561,23 @@ class FileManagerHandler(BaseHTTPRequestHandler):
                 return True
             if rec['locked_until'] > now:
                 return False
-            if rec['fails'] >= LOGIN_MAX_FAILS:
-                rec['locked_until'] = now + LOGIN_LOCKOUT_SECONDS
-                return False
+            # An expired lock starts a fresh attempt window, not another lock.
+            if rec['locked_until'] or now - rec.get('updated', now) >= LOGIN_ATTEMPT_TTL:
+                _login_attempts.pop(ip, None)
             return True
 
     def _record_login_fail(self, ip):
         now = time.time()
         with _login_attempts_lock:
+            expired = [key for key, value in _login_attempts.items()
+                       if now - value.get('updated', now) >= LOGIN_ATTEMPT_TTL]
+            for key in expired:
+                _login_attempts.pop(key, None)
+            if ip not in _login_attempts and len(_login_attempts) >= MAX_LOGIN_TRACKED_IPS:
+                _login_attempts.pop(next(iter(_login_attempts)))
             rec = _login_attempts.setdefault(ip, {'fails': 0, 'locked_until': 0})
             rec['fails'] += 1
+            rec['updated'] = now
             if rec['fails'] >= LOGIN_MAX_FAILS:
                 rec['locked_until'] = now + LOGIN_LOCKOUT_SECONDS
 
@@ -1381,10 +1591,7 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         client_ip = self._get_client_ip()
         if not self._check_login_rate(client_ip):
             return self.send_err(429, '登录尝试过于频繁，请稍后再试')
-        try:
-            data = self.read_json()
-        except Exception:
-            return self.send_err(400, '请求格式不正确')
+        data = self.read_json()
         username = str(data.get('username', ''))
         password = str(data.get('password', ''))
         expected_user, expected_password = self._auth_parts()
@@ -1411,10 +1618,7 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             return self.send_err(400, '当前未启用登录认证')
         if not self._session_valid():
             return self.send_err(401, '登录已过期，请重新登录')
-        try:
-            data = self.read_json()
-        except Exception:
-            return self.send_err(400, '请求格式不正确')
+        data = self.read_json()
         old_password = str(data.get('oldPassword', ''))
         username, expected_password = self._auth_parts()
         if not self._safe_equal(old_password, expected_password):
@@ -1709,8 +1913,10 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         self.send_json({'success': True, 'item': self._share_detail_payload(token, meta, in_trash)})
 
     def _api_remote_downloads(self, qs=None):
+        state = load_state()
+        hidden = set(state.get('taskTrash', {})) | set(state.get('taskDeleted', {}))
         with REMOTE_TASKS_LOCK:
-            items = [remote_task_snapshot(task) for task in REMOTE_TASKS.values()]
+            items = [remote_task_snapshot(task) for tid, task in REMOTE_TASKS.items() if tid not in hidden]
         items.sort(key=lambda x: x.get('createdAt') or 0, reverse=True)
         self.send_json({'success': True, 'items': items})
 
@@ -1724,7 +1930,7 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         """
         state = load_state()
         persisted = state.get('tasks', {}) or {}
-        trash_ids = set(state.get('taskTrash', {}).keys())
+        trash_ids = set(state.get('taskTrash', {})) | set(state.get('taskDeleted', {}))
         items_by_id = {}
         # Start from persisted snapshots (covers upload/download history + remote)
         for task_id, snap in persisted.items():
@@ -1957,7 +2163,13 @@ class FileManagerHandler(BaseHTTPRequestHandler):
                 'conflict': conflict_type,
                 'name': top_name,
             }, 409)
-        content_length = int(self.headers.get('Content-Length', 0))
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return self.send_err(400, '上传长度无效')
+        created = False
         try:
             parent_dirs = rel_parts[:-1]
             current_dir = os.path.realpath(dir_path)
@@ -1975,6 +2187,7 @@ class FileManagerHandler(BaseHTTPRequestHandler):
                             UPLOAD_BATCH_DIRS.setdefault(batch_id, set()).add(current_dir)
                             UPLOAD_BATCH_UPDATED[batch_id] = time.time()
             with open(file_path, 'xb') as f:
+                created = True
                 remaining = content_length
                 while remaining > 0:
                     chunk = self.rfile.read(min(remaining, 65536))
@@ -1982,6 +2195,10 @@ class FileManagerHandler(BaseHTTPRequestHandler):
                         break
                     f.write(chunk)
                     remaining -= len(chunk)
+            if remaining:
+                os.remove(file_path)
+                self.close_connection = True
+                return self.send_err(400, '上传中断，收到的数据少于声明长度，请重新上传')
             self.send_ok('上传成功')
         except (FileExistsError, IsADirectoryError):
             if os.path.exists(top_path) and not top_created_by_batch:
@@ -1993,6 +2210,11 @@ class FileManagerHandler(BaseHTTPRequestHandler):
                 }, 409)
             return self.send_err(400, '上传失败: 目标路径已存在同名项目')
         except OSError as e:
+            if created:
+                try:
+                    os.remove(file_path)
+                except OSError:
+                    pass
             self.send_err(500, f'上传失败: {self._sanitize_error(e)}')
 
     # ---- Upload (resumable chunked) ----
@@ -2007,7 +2229,12 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         target_dir = data.get('path', '/')
         raw_filename = str(data.get('name', '')).strip()
         raw_relpath = str(data.get('relpath', '') or '')
-        size = int(data.get('size', 0) or 0)
+        try:
+            size = int(data.get('size', 0) or 0)
+            if size < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return self.send_err(400, '文件大小必须是非负整数')
         batch_id = str(data.get('batch', '') or '').strip()
         if batch_id:
             with UPLOAD_BATCH_DIRS_LOCK:
@@ -2031,230 +2258,228 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         root_real = os.path.realpath(ROOT_DIR)
         if not (file_path == root_real or file_path.startswith(root_real + os.sep)):
             return self.send_err(403, '路径非法')
-        # Conflict check: if final file already exists (and not part of current batch), 409
-        rel_parts = relpath.split('/')
-        top_name = rel_parts[0]
-        top_path = os.path.realpath(os.path.join(dir_path, top_name))
-        if not (top_path == root_real or top_path.startswith(root_real + os.sep)):
-            return self.send_err(403, '路径非法')
-        with UPLOAD_BATCH_DIRS_LOCK:
-            batch_dirs = UPLOAD_BATCH_DIRS.setdefault(batch_id, set()) if batch_id else set()
-            top_created_by_batch = top_path in batch_dirs
-        if os.path.exists(top_path) and not top_created_by_batch:
-            conflict_type = 'folder' if os.path.isdir(top_path) else 'file'
-            return self.send_json({
-                'error': '当前目录已存在同名文件或文件夹，请重命名后再上传',
-                'conflict': conflict_type,
-                'name': top_name,
-            }, 409)
-        # Ensure parent dirs exist
-        try:
-            parent_dirs = rel_parts[:-1]
-            current_dir = os.path.realpath(dir_path)
-            for part in parent_dirs:
-                current_dir = os.path.realpath(os.path.join(current_dir, part))
-                if not (current_dir == root_real or current_dir.startswith(root_real + os.sep)):
-                    return self.send_err(403, '路径非法')
-                if os.path.exists(current_dir):
-                    if not os.path.isdir(current_dir):
-                        return self.send_err(400, '目标路径已有同名文件，无法创建文件夹')
-                else:
-                    os.mkdir(current_dir)
-                    if batch_id:
-                        with UPLOAD_BATCH_DIRS_LOCK:
-                            UPLOAD_BATCH_DIRS.setdefault(batch_id, set()).add(current_dir)
-                            UPLOAD_BATCH_UPDATED[batch_id] = time.time()
-        except OSError as e:
-            return self.send_err(500, f'创建目录失败: {self._sanitize_error(e)}')
-        # Determine resume offset from existing .part
-        part_path = file_path + '.part'
-        offset = 0
-        if os.path.exists(part_path):
+        with upload_path_lock(file_path):
+            # Reuse an existing unfinished upload task for the same target path (avoids
+            # leaving zombie 'paused' records each time the user pauses & resumes).
+            rel_path = root_relative_path(file_path)
+            existing_task_id = None
+            for tid_key, snap in load_persisted_tasks().items():
+                if (snap.get('kind') == 'upload'
+                        and snap.get('path') == rel_path
+                        and snap.get('status') in ('queued', 'downloading', 'paused', 'error')):
+                    if int(snap.get('size') or 0) != size:
+                        return self.send_err(409, '续传文件大小与原任务不一致，请取消原任务或改名上传')
+                    existing_task_id = tid_key
+                    break
+            # Conflict check: if final file already exists (and not part of current batch), 409
+            rel_parts = relpath.split('/')
+            top_name = rel_parts[0]
+            top_path = os.path.realpath(os.path.join(dir_path, top_name))
+            if not (top_path == root_real or top_path.startswith(root_real + os.sep)):
+                return self.send_err(403, '路径非法')
+            with UPLOAD_BATCH_DIRS_LOCK:
+                batch_dirs = UPLOAD_BATCH_DIRS.setdefault(batch_id, set()) if batch_id else set()
+                top_created_by_batch = top_path in batch_dirs
+            resuming_folder = bool(existing_task_id and len(rel_parts) > 1)
+            if os.path.lexists(file_path) or (os.path.exists(top_path) and not top_created_by_batch and not resuming_folder):
+                conflict_type = 'folder' if os.path.isdir(top_path) else 'file'
+                return self.send_json({
+                    'error': '当前目录已存在同名文件或文件夹，请重命名后再上传',
+                    'conflict': conflict_type,
+                    'name': top_name,
+                }, 409)
+            if resuming_folder and batch_id:
+                with UPLOAD_BATCH_DIRS_LOCK:
+                    UPLOAD_BATCH_DIRS.setdefault(batch_id, set()).add(top_path)
+            # Ensure parent dirs exist
             try:
+                parent_dirs = rel_parts[:-1]
+                current_dir = os.path.realpath(dir_path)
+                for part in parent_dirs:
+                    current_dir = os.path.realpath(os.path.join(current_dir, part))
+                    if not (current_dir == root_real or current_dir.startswith(root_real + os.sep)):
+                        return self.send_err(403, '路径非法')
+                    if os.path.exists(current_dir):
+                        if not os.path.isdir(current_dir):
+                            return self.send_err(400, '目标路径已有同名文件，无法创建文件夹')
+                    else:
+                        os.mkdir(current_dir)
+                        if batch_id:
+                            with UPLOAD_BATCH_DIRS_LOCK:
+                                UPLOAD_BATCH_DIRS.setdefault(batch_id, set()).add(current_dir)
+                                UPLOAD_BATCH_UPDATED[batch_id] = time.time()
+            except OSError as e:
+                return self.send_err(500, f'创建目录失败: {self._sanitize_error(e)}')
+            # Determine resume offset from existing .part
+            part_path = file_path + '.part'
+            if os.path.lexists(part_path) and not existing_task_id:
+                return self.send_err(409, '同名 .part 文件不属于可续传任务，请保留并改名上传')
+            try:
+                # Zero-byte files need a real part too: the client sends no chunks.
+                if not os.path.exists(part_path):
+                    with open(part_path, 'xb'):
+                        pass
                 offset = os.path.getsize(part_path)
-            except OSError:
-                offset = 0
-        # Reuse an existing unfinished upload task for the same target path (avoids
-        # leaving zombie 'paused' records each time the user pauses & resumes).
-        rel_path = root_relative_path(file_path)
-        existing_task_id = None
-        for tid_key, snap in load_persisted_tasks().items():
-            if (snap.get('kind') == 'upload'
-                    and snap.get('path') == rel_path
-                    and snap.get('status') in ('queued', 'downloading', 'paused', 'error')):
-                existing_task_id = tid_key
-                break
-        if existing_task_id:
-            task_id = existing_task_id
-        else:
-            task_id = 'up:' + secrets.token_urlsafe(12)
-        now = time.time()
-        task = {
-            'id': task_id,
-            'kind': 'upload',
-            'name': os.path.basename(file_path),
-            'status': 'paused' if offset > 0 else 'queued',
-            'size': size,
-            'loaded': offset,
-            'error': '',
-            'url': '',
-            'path': rel_path,
-            'createdAt': now,
-            'startedAt': 0,
-            'finishedAt': 0,
-            'lastBps': 0,
-            'maxBps': 0,
-            'samples': [],
-        }
-        # Persist internal helper fields (not exposed in snapshot but kept in memory)
-        save_task(task)
-        # Keep an in-memory map for chunk handlers to find paths quickly
-        UPLOAD_TASKS[task_id] = {
-            'partPath': part_path,
-            'finalPath': file_path,
-            'size': size,
-            'createdAt': now,
-            'batchId': batch_id,
-        }
-        self.send_json({'success': True, 'taskId': task_id, 'offset': offset})
+            except OSError as e:
+                return self.send_err(500, f'初始化上传失败: {self._sanitize_error(e)}')
+            if offset > size:
+                return self.send_err(409, '已有分片超过文件大小，请取消原任务或改名上传')
+            if existing_task_id:
+                task_id = existing_task_id
+            else:
+                task_id = 'up:' + secrets.token_urlsafe(12)
+            now = time.time()
+            task = {
+                'id': task_id,
+                'kind': 'upload',
+                'name': os.path.basename(file_path),
+                'status': 'paused' if offset > 0 else 'queued',
+                'size': size,
+                'loaded': offset,
+                'error': '',
+                'url': '',
+                'path': rel_path,
+                'createdAt': now,
+                'startedAt': 0,
+                'finishedAt': 0,
+                'lastBps': 0,
+                'maxBps': 0,
+                'samples': [],
+            }
+            # Persist internal helper fields (not exposed in snapshot but kept in memory)
+            save_task(task)
+            # Keep an in-memory map for chunk handlers to find paths quickly
+            UPLOAD_TASKS[task_id] = {
+                'partPath': part_path,
+                'finalPath': file_path,
+                'size': size,
+                'createdAt': now,
+                'batchId': batch_id,
+            }
+            self.send_json({'success': True, 'taskId': task_id, 'offset': offset})
 
     def _api_upload_chunk(self, qs):
-        """Append a binary chunk to the .part file.
-        Query: taskId, offset, total
-        Body: raw bytes to append.
-        """
+        """Append only at the current offset, retaining short chunks for resume."""
         task_id = str(qs.get('taskId', [''])[0]).strip()
         try:
             offset = int(qs.get('offset', ['0'])[0])
-        except ValueError:
-            offset = 0
-        if not task_id:
-            return self.send_err(400, '缺少 taskId')
-        info = UPLOAD_TASKS.get(task_id)
+            length = int(self.headers.get('Content-Length', 0))
+            if offset < 0 or length < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return self.send_err(400, '分片偏移或长度无效')
+        info, _ = load_upload_task(task_id)
         if not info:
-            # Reconstruct from persisted state if possible
-            snap = load_persisted_tasks().get(task_id)
-            if not snap or snap.get('kind') != 'upload':
-                return self.send_err(404, '上传任务不存在（可能已重启服务）')
-            full = safe_join(ROOT_DIR, snap.get('path', ''))
-            if not full:
-                return self.send_err(404, '上传任务路径无效')
-            info = {
-                'partPath': full + '.part',
-                'finalPath': full,
-                'size': int(snap.get('size') or 0),
-                'createdAt': float(snap.get('createdAt') or time.time()),
-                'batchId': '',
-            }
-            UPLOAD_TASKS[task_id] = info
-        part_path = info['partPath']
-        # Verify offset matches current .part size (prevents race/corruption)
-        try:
+            return self.send_err(404, '上传任务不存在')
+        with upload_path_lock(info['finalPath']):
+            info, snap = load_upload_task(task_id)
+            if not info:
+                return self.send_err(404, '上传任务已取消或删除')
+            if snap.get('status') == 'done':
+                return self.send_err(409, '上传任务已完成')
+            part_path = info['partPath']
             current = os.path.getsize(part_path) if os.path.exists(part_path) else 0
-        except OSError:
-            current = 0
-        if current != offset:
-            # Drain the request body so the connection can be reused (keep-alive)
+            if current != offset:
+                self.close_connection = True
+                return self.send_json({
+                    'error': f'偏移不一致（请求 {offset}，实际 {current}）',
+                    'offset': current,
+                }, 409)
+            if current + length > info['size']:
+                self.close_connection = True
+                return self.send_err(400, '分片超过声明的文件大小')
+            remaining = length
+            write_error = None
             try:
-                cl = int(self.headers.get('Content-Length', 0))
-                while cl > 0:
-                    buf = self.rfile.read(min(cl, 65536))
-                    if not buf:
-                        break
-                    cl -= len(buf)
-            except OSError:
-                pass
-            return self.send_json({
-                'success': False,
-                'error': f'偏移不一致（期望 {offset}，实际 {current}）',
-                'offset': current,
-            }, 409)
-        content_length = int(self.headers.get('Content-Length', 0))
-        try:
-            with open(part_path, 'ab') as f:
-                remaining = content_length
-                while remaining > 0:
-                    chunk = self.rfile.read(min(remaining, 65536))
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    remaining -= len(chunk)
-            new_size = os.path.getsize(part_path)
-        except OSError as e:
-            return self.send_err(500, f'写入失败: {self._sanitize_error(e)}')
-        # Update persisted progress
-        snap = load_persisted_tasks().get(task_id)
-        if snap is None:
-            snap = {
-                'id': task_id, 'kind': 'upload', 'name': os.path.basename(info['finalPath']),
-                'status': 'downloading', 'size': info.get('size', 0), 'loaded': new_size,
-                'error': '', 'url': '', 'path': root_relative_path(info['finalPath']),
-                'createdAt': info.get('createdAt', time.time()), 'startedAt': 0,
-                'finishedAt': 0, 'lastBps': 0, 'maxBps': 0, 'samples': [],
-            }
-        snap['loaded'] = new_size
-        snap['status'] = 'downloading'
-        save_task(snap)
-        self.send_json({'success': True, 'offset': new_size, 'loaded': new_size})
+                with open(part_path, 'ab') as f:
+                    while remaining:
+                        chunk = self.rfile.read(min(remaining, 65536))
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        remaining -= len(chunk)
+            except OSError as e:
+                write_error = e
+            actual = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+            snap['loaded'] = actual
+            snap['status'] = 'error' if write_error or remaining else 'downloading'
+            snap['error'] = (self._sanitize_error(write_error) if write_error else
+                             '分片传输中断，可从已保存的位置继续' if remaining else '')
+            save_task(snap)
+            if write_error or remaining:
+                self.close_connection = True
+                return self.send_json({'error': snap['error'], 'offset': actual},
+                                      500 if write_error else 400)
+            self.send_json({'success': True, 'offset': actual, 'loaded': actual})
 
     def _api_upload_complete(self):
-        """Finalize a chunked upload: rename .part -> final path."""
+        """Only publish a complete file; retries must not replace existing data."""
         data = self.read_json()
         task_id = str(data.get('taskId', '')).strip()
-        if not task_id:
-            return self.send_err(400, '缺少 taskId')
-        info = UPLOAD_TASKS.get(task_id)
-        snap = load_persisted_tasks().get(task_id)
+        info, _ = load_upload_task(task_id)
         if not info:
-            if not snap or snap.get('kind') != 'upload':
-                return self.send_err(404, '上传任务不存在')
-            full = safe_join(ROOT_DIR, snap.get('path', ''))
-            if not full:
-                return self.send_err(404, '上传任务路径无效')
-            info = {'partPath': full + '.part', 'finalPath': full}
-        part_path = info['partPath']
-        final_path = info['finalPath']
-        if not os.path.exists(part_path):
-            return self.send_err(400, '未找到上传分片数据（.part 缺失）')
-        try:
-            os.replace(part_path, final_path)
-        except OSError as e:
-            return self.send_err(500, f'完成上传失败: {self._sanitize_error(e)}')
-        if snap:
-            snap['status'] = 'done'
-            snap['loaded'] = snap.get('size') or os.path.getsize(final_path)
-            snap['finishedAt'] = time.time()
-            snap['error'] = ''
+            return self.send_err(404, '上传任务不存在')
+        with upload_path_lock(info['finalPath']):
+            info, snap = load_upload_task(task_id)
+            if not info:
+                return self.send_err(404, '上传任务已取消或删除')
+            part_path, final_path = info['partPath'], info['finalPath']
+            if snap.get('status') == 'done':
+                if os.path.isfile(final_path) and os.path.getsize(final_path) == info['size']:
+                    return self.send_ok('上传已完成')
+                return self.send_err(409, '已完成文件已被移动、删除或修改')
+            if not os.path.isfile(part_path):
+                return self.send_err(400, '未找到上传分片数据，请重新初始化上传')
+            actual = os.path.getsize(part_path)
+            if actual != info['size']:
+                return self.send_json({'error': '文件尚未完整上传', 'offset': actual,
+                                       'size': info['size']}, 409)
+            try:
+                publish_upload_file(part_path, final_path)
+            except FileExistsError:
+                return self.send_err(409, '目标已存在同名文件，未覆盖；分片已保留')
+            except OSError as e:
+                return self.send_err(500, f'完成上传失败: {self._sanitize_error(e)}')
+            snap.update(status='done', loaded=actual, finishedAt=time.time(), error='')
             save_task(snap)
-        UPLOAD_TASKS.pop(task_id, None)
-        self.send_ok('上传完成')
+            UPLOAD_TASKS.pop(task_id, None)
+            try:
+                os.remove(part_path)
+            except OSError:
+                return self.send_ok('上传完成，但临时分片清理失败，请检查目录权限')
+            self.send_ok('上传完成')
 
     def _api_upload_cancel(self):
-        """Pause or cancel a chunked upload.
-        Body: { taskId, action } action in {'pause','cancel'}.
-        pause: keep .part; cancel: delete .part and task record.
-        """
+        """Pause keeps real progress; cancel removes persisted and partial data."""
         data = self.read_json()
         task_id = str(data.get('taskId', '')).strip()
         action = str(data.get('action', 'pause')).strip().lower()
-        info = UPLOAD_TASKS.get(task_id)
-        snap = load_persisted_tasks().get(task_id)
-        part_path = info.get('partPath') if info else None
-        if action == 'cancel':
-            if part_path and os.path.exists(part_path):
+        if not task_id or action not in ('pause', 'cancel'):
+            return self.send_err(400, 'taskId 或操作无效')
+        info, _ = load_upload_task(task_id)
+        if not info:
+            # Retrying a cancellation after losing the response is harmless.
+            return self.send_ok('上传任务已不存在')
+        with upload_path_lock(info['finalPath']):
+            info, snap = load_upload_task(task_id)
+            if not info:
+                return self.send_ok('上传任务已不存在')
+            if snap.get('status') == 'done':
+                return self.send_ok('上传已完成，无需暂停或取消')
+            part_path = info['partPath']
+            if action == 'cancel':
                 try:
-                    os.remove(part_path)
-                except OSError:
-                    pass
-            UPLOAD_TASKS.pop(task_id, None)
-            delete_persisted_task(task_id)
-            self.send_ok('上传已取消并删除')
-            return
-        # pause
-        if snap:
+                    if os.path.exists(part_path):
+                        os.remove(part_path)
+                except OSError as e:
+                    return self.send_err(500, f'取消失败，任务保留: {self._sanitize_error(e)}')
+                UPLOAD_TASKS.pop(task_id, None)
+                delete_persisted_task(task_id)
+                return self.send_ok('上传已取消并删除')
             snap['status'] = 'paused'
+            snap['loaded'] = os.path.getsize(part_path) if os.path.exists(part_path) else 0
             save_task(snap)
-        self.send_ok('上传已暂停')
+            self.send_ok('上传已暂停')
 
     def _api_tasks_delete(self):
         """Delete one or more task records.
@@ -2318,173 +2543,107 @@ class FileManagerHandler(BaseHTTPRequestHandler):
                 seen[rid] = it
         req_items = list(seen.values())
 
-        if not trash:
-            # Hard-delete from trash only.
-            with STATE_LOCK:
-                state = load_state()
-                trash_map = state.get('taskTrash', {})
-                changed = 0
-                for it in req_items:
-                    rid = it['id']
-                    # exact id
-                    if trash_map.pop(rid, None) is not None:
-                        changed += 1
-                        continue
-                    # (kind, path) fallback inside trash
-                    kind = it.get('kind')
-                    path = it.get('path')
-                    if kind and path:
-                        for tid, s in list(trash_map.items()):
-                            if s.get('kind') == kind and s.get('path') == path:
-                                trash_map.pop(tid, None)
-                                changed += 1
-                                break
-                if changed:
-                    state['taskTrash'] = trash_map
-                    save_state(state)
-            self.send_ok(f'已彻底删除 {changed} 个任务')
-            return
+        return self._delete_task_items(req_items, bool(trash))
 
-        # Soft-delete: stop live task, move snapshot into trash.
-        # 先在 REMOTE_TASKS_LOCK 内拍取所有 live task 快照（避免 STATE_LOCK → REMOTE_TASKS_LOCK 死锁）
-        live_tasks = {}
-        live_snaps = {}
+    def _delete_task_items(self, req_items, trash):
+        # Capture live tasks without nesting STATE_LOCK -> REMOTE_TASKS_LOCK.
         with REMOTE_TASKS_LOCK:
-            for it in req_items:
-                rid = it['id']
-                live_task = REMOTE_TASKS.get(rid)
-                if live_task:
-                    live_tasks[rid] = live_task
-                    live_snaps[rid] = task_snapshot(live_task)
-        # 然后在 STATE_LOCK 内完成 load-modify-save，防止 worker 的 save_task 在中间复活任务
-        temp_paths = []  # (task_id, kind, path) for post-lock .part/.temp cleanup
+            live_tasks = dict(REMOTE_TASKS)
+            live_snaps = {tid: task_snapshot(task) for tid, task in live_tasks.items()}
+        retired = []
         with STATE_LOCK:
             state = load_state()
-            tasks_map = state.get('tasks', {})
+            tasks = state.setdefault('tasks', {})
             trash_map = state.setdefault('taskTrash', {})
-            moved = 0
-            for it in req_items:
-                rid = it['id']
-                # 1. exact id match in persisted tasks
-                snap = tasks_map.get(rid)
-                matched_id = rid if snap is not None else None
-                # 2. (kind, path) fallback across persisted tasks
-                if snap is None:
-                    kind = it.get('kind')
-                    path = it.get('path')
-                    if kind and path:
-                        for tid, s in tasks_map.items():
-                            sk = s.get('kind') or 'remote'
-                            sp = s.get('path') or ''
-                            if sk == kind and sp and sp == path:
-                                snap = s
-                                matched_id = tid
-                                break
-                # 3. live snap (remote) fallback
-                if snap is None and rid in live_snaps:
-                    snap = live_snaps[rid]
-                    matched_id = rid
-                # 4. nothing on the server — adopt the client snapshot verbatim
-                #    (download tasks the server never persisted; upload tasks
-                #    whose server id we can't resolve) so the trash has an entry.
-                if snap is None:
-                    snap = {}
-                    for k in TASK_SNAPSHOT_FIELDS:
-                        if k in it and it[k] not in (None, ''):
-                            snap[k] = it[k]
-                    matched_id = rid
-                snap = dict(snap)
-                # 合并 live 中的实时信息，确保回收站条目有足够数据
-                snap.setdefault('id', matched_id or rid)
-                snap.setdefault('kind', it.get('kind') or 'remote')
-                live_task = live_tasks.get(rid)
-                if live_task:
-                    for key in ('name', 'status', 'size', 'url', 'path', 'error', 'loaded',
-                                'createdAt', 'startedAt', 'finishedAt', 'lastBps', 'maxBps'):
-                        if not snap.get(key) and live_task.get(key):
-                            snap[key] = live_task[key]
-                # 用客户端传来的字段补齐（download/未持久化 upload 任务的主要信息来源）
-                for key in ('name', 'kind', 'path', 'url', 'size', 'loaded', 'status', 'error',
-                            'createdAt', 'lastBps', 'maxBps'):
-                    if not snap.get(key) and it.get(key) not in (None, '', 0):
-                        snap[key] = it[key]
-                # 确保基本字段有默认值，避免回收站显示空白条目
-                snap.setdefault('name', it.get('name') or '')
-                snap.setdefault('status', it.get('status') or '')
-                snap.setdefault('size', int(it.get('size') or 0) or 0)
-                snap.setdefault('url', it.get('url') or '')
-                snap.setdefault('path', it.get('path') or '')
-                snap.setdefault('error', it.get('error') or '')
-                snap.setdefault('loaded', int(it.get('loaded') or 0) or 0)
-                snap.setdefault('createdAt', it.get('createdAt') or 0)
-                snap['deletedAt'] = time.time()
-                final_id = matched_id or rid
-                trash_map[final_id] = snap
-                if matched_id and tasks_map.pop(matched_id, None) is not None:
-                    moved += 1
-                temp_paths.append((final_id, snap.get('kind'), snap.get('path', '')))
-            state['tasks'] = tasks_map
-            state['taskTrash'] = trash_map
+            deleted = state.setdefault('taskDeleted', {})
+            for item in req_items:
+                rid = item['id']
+                if rid in deleted:
+                    # Retried deletes or late requests from another tab cannot
+                    # recreate purged trash, or delete a new task at the same path.
+                    continue
+                tid = rid
+                snap = tasks.get(tid) or trash_map.get(tid) or live_snaps.get(tid)
+                # Only uploads have different browser/server IDs. Remote IDs are
+                # stable: falling back by path could remove a later download.
+                if snap is None and item.get('kind') == 'upload' and item.get('path'):
+                    for candidate, record in list(tasks.items()) + list(trash_map.items()):
+                        if record.get('kind') == 'upload' and record.get('path') == item['path']:
+                            tid, snap = candidate, record
+                            break
+                if tid in deleted:
+                    continue
+                snap = dict(snap or task_snapshot(dict(item, id=tid)))
+                snap.update(id=tid, kind=snap.get('kind') or item.get('kind') or 'remote')
+                if item.get('localId'):
+                    snap['localId'] = item['localId']
+                if trash:
+                    snap.setdefault('deletedAt', time.time())
+                    if snap.get('status') in ('queued', 'downloading'):
+                        snap['status'] = 'paused'
+                    trash_map[tid] = snap
+                else:
+                    trash_map.pop(tid, None)
+                    # Persistent deletion markers also fence off writes from an
+                    # old worker after clear-trash or a service restart.
+                    deleted[tid] = time.time()
+                    if rid != tid:
+                        deleted[rid] = deleted[tid]
+                tasks.pop(tid, None)
+                retired.append((tid, snap, live_tasks.get(tid)))
             save_state(state)
-        # 然后再停止 live task（在 STATE_LOCK 外，避免嵌套锁导致死锁）
-        for final_id, kind, path in temp_paths:
-            rid_candidates = {final_id}
-            # also try the original request id (may differ from matched server id)
-            for it in req_items:
-                if it.get('kind') == kind and it.get('path') == path and it.get('path'):
-                    rid_candidates.add(it['id'])
-            for rid in rid_candidates:
-                live_task = live_tasks.get(rid)
-                with REMOTE_TASKS_LOCK:
-                    if live_task and REMOTE_TASKS.get(rid) is live_task:
-                        live_task['cancel'] = True
-                        live_task['pauseRequested'] = False
-                        if live_task.get('status') == 'downloading':
-                            live_task['status'] = 'canceled'
-                            live_task['finishedAt'] = time.time()
-                        temp_path = live_task.get('tempPath') or ''
-                        REMOTE_TASKS.pop(rid, None)
-                    else:
-                        temp_path = ''
-                if temp_path and os.path.exists(temp_path):
-                    try:
-                        os.remove(temp_path)
-                    except OSError:
-                        pass
-                UPLOAD_TASKS.pop(rid, None)
-            # Remove upload .part if any
-            if kind == 'upload' and path:
-                full = safe_join(ROOT_DIR, path)
-                if full and os.path.exists(full + '.part'):
-                    try:
-                        os.remove(full + '.part')
-                    except OSError:
-                        pass
-        self.send_ok(f'已删除 {len(req_items)} 个任务')
+
+        for tid, snap, captured in retired:
+            temp_paths = []
+            with REMOTE_TASKS_LOCK:
+                live = REMOTE_TASKS.get(tid)
+                if live is not None and live is captured:
+                    live['cancel'] = True
+                    live['retired'] = True
+                    live['pauseRequested'] = False
+                    if live.get('status') != 'done':
+                        if live.get('tempPath'):
+                            temp_paths.append(live['tempPath'])
+                        live['status'] = 'canceled'
+                    REMOTE_TASKS.pop(tid, None)
+            UPLOAD_TASKS.pop(tid, None)
+            # Keep completed user files. Only unfinished task data is disposable.
+            if snap.get('status') != 'done' and snap.get('kind') in ('upload', 'remote'):
+                full = safe_join(ROOT_DIR, snap.get('path', ''))
+                if full and full != os.path.realpath(ROOT_DIR):
+                    temp_paths.append(full + '.part')
+            for path in set(temp_paths):
+                if not root_relative_path(path):
+                    continue
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except OSError:
+                    pass  # A closing worker may still hold the partial file.
+        self.send_ok('任务已移入回收站' if trash else '任务已彻底删除')
 
     def _api_tasks_restore(self):
-        """Restore a soft-deleted task back into the active list.
-        Body: { id } -> restores state['taskTrash'][id] into state['tasks'].
-        The task is never auto-resumed; remote tasks come back as 'paused'.
-        """
         data = self.read_json()
         task_id = str(data.get('id', '') or '').strip()
         if not task_id:
             return self.send_err(400, '缺少任务 id')
-        state = load_state()
-        trash_map = state.get('taskTrash', {})
-        snap = trash_map.get(task_id)
-        if snap is None:
-            return self.send_err(404, '回收站中无此任务')
-        snap = dict(snap)
-        snap.pop('deletedAt', None)
-        # Force non-terminal remote tasks to 'paused' so they don't auto-resume.
-        if snap.get('kind', 'remote') == 'remote' and snap.get('status') not in ('done', 'canceled', 'error'):
-            snap['status'] = 'paused'
-        state.setdefault('tasks', {})[task_id] = snap
-        trash_map.pop(task_id, None)
-        state['taskTrash'] = trash_map
-        save_state(state)
+        with STATE_LOCK:
+            state = load_state()
+            if task_id in state.get('taskDeleted', {}):
+                return self.send_err(404, '任务已彻底删除，不能恢复')
+            snap = state.get('taskTrash', {}).get(task_id)
+            if snap is None:
+                # Compatibility: old pages only marked local storage as trash.
+                snap = state.get('tasks', {}).get(task_id)
+                if snap is None:
+                    return self.send_err(404, '回收站中无此任务')
+            snap = dict(snap)
+            snap.pop('deletedAt', None)
+            if snap.get('status') in ('queued', 'downloading', 'canceled'):
+                snap['status'] = 'paused'
+            state.setdefault('tasks', {})[task_id] = snap
+            state.setdefault('taskTrash', {}).pop(task_id, None)
+            save_state(state)
         self.send_json({'success': True, 'task': snap})
 
     def _api_tasks_trash(self, qs=None):
@@ -2758,7 +2917,8 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         data = self.read_json()
         task_id = str(data.get('id', '')).strip()
         # 检查任务是否已被软删除（在回收站中）
-        if task_id in load_state().get('taskTrash', {}):
+        hidden_state = load_state()
+        if task_id in hidden_state.get('taskTrash', {}) or task_id in hidden_state.get('taskDeleted', {}):
             return self.send_err(410, '任务已被删除，请先从回收站恢复')
         with REMOTE_TASKS_LOCK:
             task = REMOTE_TASKS.get(task_id)
@@ -2817,32 +2977,9 @@ class FileManagerHandler(BaseHTTPRequestHandler):
     def _api_remote_download_delete(self):
         data = self.read_json()
         task_id = str(data.get('id', '')).strip()
-        temp_path = ''
-        with REMOTE_TASKS_LOCK:
-            task = REMOTE_TASKS.get(task_id)
-            if not task:
-                # Still try to remove from persistent store
-                pass
-            else:
-                if task.get('status') == 'downloading':
-                    task['cancel'] = True
-                    task['pauseRequested'] = False
-                    task['status'] = 'canceled'
-                    task['finishedAt'] = time.time()
-                temp_path = task.get('tempPath') or ''
-                REMOTE_TASKS.pop(task_id, None)
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
-        delete_persisted_task(task_id)
-        # 也从 taskTrash 中移除（如果存在）
-        with STATE_LOCK:
-            state = load_state()
-            if state.get('taskTrash', {}).pop(task_id, None) is not None:
-                save_state(state)
-        self.send_ok('任务已删除')
+        if not task_id:
+            return self.send_err(400, '缺少任务 id')
+        return self._delete_task_items([{'id': task_id, 'kind': 'remote'}], False)
 
     def _api_save_text(self):
         data = self.read_json()
@@ -3527,6 +3664,45 @@ def _ensure_root_size_worker():
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def __init__(self, *args, max_workers=None, request_timeout=None, **kwargs):
+        workers = MAX_REQUEST_WORKERS if max_workers is None else max_workers
+        self.request_timeout = REQUEST_READ_TIMEOUT if request_timeout is None else request_timeout
+        if workers < 1 or self.request_timeout <= 0:
+            raise ValueError('请求并发数和超时必须大于零')
+        self._request_slots = threading.BoundedSemaphore(workers)
+        super().__init__(*args, **kwargs)
+
+    def get_request(self):
+        request, address = super().get_request()
+        request.settimeout(self.request_timeout)
+        return request, address
+
+    def process_request(self, request, client_address):
+        if not self._request_slots.acquire(blocking=False):
+            try:
+                body = json.dumps({'error': '服务繁忙，请稍后重试'}, ensure_ascii=False).encode('utf-8')
+                headers = (b'HTTP/1.1 503 Service Unavailable\r\n'
+                           b'Connection: close\r\nRetry-After: 1\r\n'
+                           b'Content-Type: application/json; charset=utf-8\r\n'
+                           + f'Content-Length: {len(body)}\r\n\r\n'.encode('ascii'))
+                request.sendall(headers + body)
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
 
 
 # ============================================================

@@ -16,24 +16,12 @@ SERVER = ROOT / 'skill-public' / 'script' / 'webdav-filemanager' / 'server.py'
 
 def _load_ssrf_helpers(allow_private=False):
     """只加载 SSRF 校验相关函数，不启动服务器。"""
-    import ipaddress
-    import socket
-    import urllib.parse
-    import urllib.request
-
-    source = SERVER.read_text(encoding='utf-8')
-    start = source.index('class _NoRedirect')
-    end = source.index('def remote_download_worker')
-
-    namespace = {
-        'urllib': urllib,
-        'socket': socket,
-        'ipaddress': ipaddress,
-        'os': os,
-        'ALLOW_PRIVATE_REMOTE': allow_private,
-    }
-    exec(compile(source[start:end], 'server.py', 'exec'), namespace)
-    return namespace
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('webdav_ssrf_helpers', SERVER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.ALLOW_PRIVATE_REMOTE = allow_private
+    return vars(module)
 
 
 class RemoteUrlValidationTests(unittest.TestCase):

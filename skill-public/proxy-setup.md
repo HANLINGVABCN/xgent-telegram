@@ -1,308 +1,104 @@
 ```!
-代理节点部署技能：支持 sing-box、Reality、Hysteria2、WARP 等。执行命令：sudo bash skill-public/script/proxy-setup/proxy_setup.sh。支持自由全协议组合安装。脚本会自动开放本机防火墙，云安全组需用户手动放行。如遇 WARP 异常或高级需求，请先 read 本文档全文。
+在用户指定的 Linux VPS 上部署或排查 sing-box 代理节点（Reality、SS2022、Hysteria2、TUIC、WS+TLS、SOCKS5、WARP）。脚本：skill-public/script/proxy-setup/proxy_setup.sh。执行前 read 本文，确认目标服务器及系统修改范围；只审查技能或查看配置时不要启动安装。不要自动重装、深度卸载或把 WARP 改成直连。
 ```
 
-# proxy_setup.sh 使用说明
+# Proxy Setup
 
-本文是 XGent for Telegram 项目内置 skill 文档，用于指导 Agent 模式在服务器上使用 `skill-public/script/proxy-setup/proxy_setup.sh` 部署代理节点。
+这是 XGent 项目技能，保留项目的 ` ```! ` 简介格式，不是 Codex 的 YAML frontmatter 技能。
 
-## 脚本位置
+## 先确定任务与边界
 
-```text
-skill-public/script/proxy-setup/proxy_setup.sh
-```
+- **审查技能/修改脚本**：只修改仓库文件、做隔离测试；不在当前开发机执行部署。
+- **查看或排障**：先检查版本、配置校验、服务状态、监听及网络；不要把重新安装当成诊断步骤。
+- **部署或重置**：确认目标 Linux VPS、root/sudo 权限、已有 sing-box/WARP 是否需要保留，以及安装软件、修改服务/网络/防火墙的授权。不要因为当前终端可用就假定它是目标服务器。
+- **卸载**：先说明下文的实际清理范围，由用户确认；不能由启动失败推导出卸载授权。
 
-脚本用途：
+部署会修改 `/etc/sing-box`、安装 sing-box 和系统依赖、写 systemd/OpenRC 服务、调整系统网络/文件描述符参数，并尝试开放本机端口。重置不是无损更新：脚本会备份旧 `config.json`，但二进制、证书、服务和系统参数**没有完整事务回滚**；保留现有部署时先做独立备份。
 
-- 安装并配置 `sing-box`。
-- 支持 NAT 小鸡、低配 VPS、标准 VPS 三种机器类型。
-- 支持 VLESS + Reality、Shadowsocks 2022、Hysteria2、TUIC v5、VLESS + WS + TLS、VMess + WS + TLS、SOCKS5。
-- **新增自由全协议模式**：一次性部署多个协议（最多8个节点：7种直连 + 1个WARP），每个协议单独询问是否安装。
-- 支持直连出站、WARP 出站、双节点模式。
-- WARP 出站支持两种方式：
-  - **WireGuard 直连（推荐）**：sing-box 原生 WireGuard 出站，无需安装 warp-cli，自动通过 WARP API 注册并获取密钥。
-  - **传统 SOCKS5**：需安装 Cloudflare WARP 客户端，通过本地 SOCKS5 中转。
-- 安装完成后输出分享链接、二维码和 Clash Meta / Mihomo 配置。
+## 执行与交互
 
-## 运行方法
-
-在项目根目录执行：
+从项目真实根目录执行；在 Agent 工具中先解析实际项目路径，不要写死用户目录。
 
 ```bash
-chmod +x skill-public/script/proxy-setup/proxy_setup.sh
+# 无副作用：无需 root，不创建日志，也不部署
+bash skill-public/script/proxy-setup/proxy_setup.sh --help
+
+# 仅在已确认的 Linux 目标服务器执行；已经是 root 时无需 sudo
 sudo bash skill-public/script/proxy-setup/proxy_setup.sh
 ```
 
-也可以直接在脚本目录执行：
+使用可持续交互的 PTY，逐次读取菜单后输入。不要拼接固定答案串：不同机器类型、协议、已有 WARP 状态会改变提示顺序。输入 EOF 会退出，而不是无限循环。脚本须使用 Bash，文件保持 LF 换行；不要用 `sh`。
+
+主菜单：`1` 安装/重置，`2` 显示已保存节点，`3` 重启，`4` 深度卸载，`5` WARP 向导，`6` WARP 状态，`7` 概念说明，`0` 退出。
+
+## 选择协议与出站
+
+遵循用户指定方案；没有要求时优先选择满足需要的单协议，而不是默认部署全部协议或双节点。
+
+| 场景 | 要点 |
+| --- | --- |
+| NAT 小鸡 | Reality / SS2022 / SOCKS5；公网映射端口和内部监听端口分别填写，不能混用 |
+| 低配或标准 VPS | 支持下表的全部协议；菜单 `8` 可选最多 7 个直连节点 + 1 个 Reality-WARP 节点 |
+| 只需服务器原生出口 | 选择直连，无需注册或安装 WARP |
+| 指定 WARP 出口 | 优先考虑原生 WireGuard；无需 warp-cli，但依赖 UDP 和注册 API 可用 |
+| 传统 WARP SOCKS5 | 先通过主菜单 `5` 安装/登录 warp-cli，确认本地代理端口（默认 40000）可用 |
+| 双节点 | 同时生成直连与 WARP；两个监听端口必须不同 |
+
+标准/低配协议菜单：`1` Reality、`2` SS2022、`3` Hysteria2、`4` TUIC、`5` VLESS-WS-TLS、`6` VMess-WS-TLS、`7` SOCKS5、`8` 自由组合。**NAT 菜单的 `3` 是 SOCKS5**，不要照抄标准 VPS 的序号。
+
+自由组合模式按提示选择协议，WS 域名可填 `skip` 跳过；选中节点从起始端口递增。脚本会拒绝无效端口、双节点端口重复以及递增超过 65535。WireGuard 注册失败会停止安装，不会自动更换出站。
+
+| 协议 | 网络和证书条件 |
+| --- | --- |
+| Reality | TCP；通常不需要自己的域名，SNI/握手目标必须可达，不能承诺不会被封锁 |
+| SS2022 | 按客户端需求放行 TCP/UDP；客户端须支持对应加密方法 |
+| Hysteria2 / TUIC | **UDP/QUIC**；仅放行 TCP 无法连接。脚本使用自签名证书，客户端跳过校验有安全代价 |
+| VLESS/VMess + WS + TLS | 域名、DNS 和 ACME 验证可达性；使用 Cloudflare 代理时还须核对支持的 HTTPS 端口及回源 TLS 设置 |
+| SOCKS5 | 用户名/密码认证**不等于传输加密**；不要把裸 SOCKS5 当作适合公网明文传输凭据的安全方案 |
+
+WS 多协议自动分配到的端口不一定是 CDN 支持端口；不要宣称填写一个域名就一定能用。ACME 的验证端口也不一定等于节点监听端口，证书失败时先核对验证方式、DNS 和防火墙。
+
+## 验收与排障
+
+先做只读检查（依目标系统选择 systemd 或 OpenRC）：
 
 ```bash
-cd skill-public/script/proxy-setup
-chmod +x proxy_setup.sh
-sudo bash proxy_setup.sh
-```
-
-必须使用 root 权限或 sudo 运行，因为脚本会安装系统依赖、写入 `/etc/sing-box`、创建 systemd/openrc 服务并开放端口。
-
-## 防火墙与安全组
-
-脚本会尝试自动开放本机防火墙端口：
-
-- 普通模式：开放主节点监听端口。
-- 双节点模式：开放直连节点端口和 WARP 节点端口。
-- 支持 `iptables`、`ufw`、`firewalld`。
-
-脚本无法修改云厂商控制台里的安全组/防火墙规则。若 VPS 位于 AWS、GCP、Azure、Oracle、阿里云、腾讯云、Vultr、Hetzner 等平台，仍需在控制台手动放行对应 TCP 端口。
-
-检查本机监听：
-
-```bash
-ss -lntup | grep sing-box
-```
-
-如果本机已监听但外部无法连接，优先检查云厂商安全组。
-
-## 推荐执行路线（WireGuard 模式）
-
-使用 WireGuard 模式时不需要提前安装 WARP 客户端，脚本会在安装 sing-box 后自动注册。
-
-### 一步到位流程
-
-进入主菜单后选择：
-
-```text
-1) 全新安装 / 重置
-```
-
-机器类型选择：
-
-```text
-3) 标准 VPS
-```
-
-协议选择：
-
-```text
-1) VLESS + Reality
-2) Shadowsocks 2022
-3) Hysteria2
-4) TUIC v5
-5) VLESS + WS + TLS
-6) VMess + WS + TLS
-7) SOCKS5
-8) 自由全协议模式  ← 新增：一次性部署多个协议
-```
-
-**如果选择 1-7 单个协议**，继续出站模式选择：
-
-```text
-1) 直连出站        ← 不需要 WARP
-3) 双节点模式      ← 推荐，同时生成直连和 WARP 节点
-```
-
-**如果选择 8 自由全协议模式**，会跳过出站模式选择，直接进入协议选择流程：
-
-- 逐个询问每个协议是否安装（y/n，默认 y）
-- 7种直连协议：Reality、SS2022、Hysteria2、TUIC、VLESS-WS、VMess-WS、SOCKS5
-- 1个WARP节点（使用VLESS+Reality协议，出站走WARP）
-- 需要域名的协议（VLESS-WS、VMess-WS）可以输入域名或输入 `skip` 跳过
-- 自动递增端口号（起始端口、起始+1、起始+2...）
-- 节点名称格式：`{节点名}-{协议名}`，例如 `MyProxy-Reality`、`MyProxy-WARP`
-
-如果选了 WARP 或双节点，会出现 WARP 出站方式选择：
-
-```text
-1) WireGuard 直连 (推荐)
-2) 传统 SOCKS5 代理
-```
-
-选 1 后脚本会自动完成 WireGuard 注册，无需额外操作。
-
-### 推荐一句话流程
-
-**单协议双节点（推荐）：**
-```text
-主菜单 1 -> 机器类型 3 -> 协议 1 -> 出站模式 3 -> WARP 方式 1 (WireGuard)
-```
-
-**多协议自由组合（新增）：**
-```text
-主菜单 1 -> 机器类型 3 -> 协议 8 -> 逐个选择要安装的协议 -> WARP 方式 1 (WireGuard)
-```
-
-### 传统 SOCKS5 流程（备选）
-
-如果选择传统 SOCKS5 方式，需要先安装 WARP 客户端：
-
-```text
-主菜单 5 -> WARP 菜单 1 (免费注册) -> 返回主菜单 -> 主菜单 1 -> ... -> WARP 方式 2 (SOCKS5)
-```
-
-## 自由全协议模式（第8个选项）
-
-自由全协议模式允许一次性部署多个协议节点，最多8个：
-
-- **7种直连协议**：Reality、SS2022、Hysteria2、TUIC、VLESS-WS、VMess-WS、SOCKS5
-- **1个WARP节点**：使用VLESS+Reality协议，出站走WARP
-
-### 使用流程
-
-1. 选择机器类型（标准VPS或低配VPS）
-2. 选择协议：`8) 自由全协议模式`
-3. 输入节点名称和起始端口（默认443）
-4. 逐个询问每个协议是否安装：
-   - VLESS + Reality：`y/n` [默认y]
-   - Shadowsocks 2022：`y/n` [默认y]
-   - Hysteria2：`y/n` [默认y]
-   - TUIC v5：`y/n` [默认y]
-   - VLESS + WS + TLS：`y/n` [默认y]，需要域名或输入 `skip` 跳过
-   - VMess + WS + TLS：`y/n` [默认y]，需要域名或输入 `skip` 跳过
-   - SOCKS5：`y/n` [默认y]
-   - WARP节点（VLESS+Reality）：`y/n` [默认y]，选择WireGuard或SOCKS5模式
-
-### 特点
-
-- **端口自动递增**：起始端口443，后续端口444、445、446...
-- **独立配置**：每个协议生成独立的UUID、密码、证书
-- **灵活组合**：可以只选部分协议安装，不需要全部安装
-- **域名可选**：VLESS-WS和VMess-WS如果没有域名可以输入 `skip` 跳过
-- **节点命名**：自动添加协议后缀，如 `MyProxy-Reality`、`MyProxy-WARP`
-
-### 输出结果
-
-- 所有节点的分享链接和二维码
-- 完整的Clash Meta/Mihomo配置文件（包含所有节点）
-- 配置文件路径：`/root/proxy_info/{节点名}_multi_clash.yaml`
-
-### 适用场景
-
-- 需要多种协议备用
-- 不同场景切换不同协议（高速、稳定、隐蔽等）
-- 测试各协议性能和兼容性
-- 为多个客户端提供不同协议选择
-
-### 注意事项
-
-- NAT 小鸡支持 Reality、SS2022、SOCKS5 三种协议；自由全协议模式需标准/低配 VPS
-- 需要域名的协议如果跳过，该协议不会安装
-- 建议至少安装3-4个协议
-- 所有协议共用同一个sing-box配置文件
-- 云厂商安全组需要放行所有使用的端口
-
-## WARP 安装向导
-
-主菜单第 5 项进入 WARP 安装向导，包含以下选项：
-
-- **1-5)** 传统 warp-cli 登录方式（免费注册、Zero Trust、Service Token 等）
-- **6)** 检查 WARP 状态（同时显示 WireGuard 和 warp-cli 状态）
-- **7)** WireGuard 模式注册（推荐，可提前注册或重新注册）
-
-## WARP WireGuard 排查
-
-WireGuard 模式不依赖 `warp-cli`，配置保存在：
-
-```text
-/etc/sing-box/warp_wg.json
-```
-
-若 WARP 节点无法访问，先重新运行脚本选择：
-
-```text
-6) WARP 状态检查
-```
-
-状态检查会临时启动一个本地测试代理，经 `out-warp` 访问 Cloudflare trace，并打印关键日志。重点看日志中是否出现：
-
-```text
-endpoint/wireguard[out-warp]: received handshake response
-endpoint/wireguard[out-warp]: outbound connection to ...
-```
-
-若已收到 `handshake response`，说明 WireGuard 隧道本身已握手，问题通常在 DNS、目标连接或 VPS 网络策略。若没有握手响应，优先检查 WARP endpoint、VPS 出站 UDP、机房是否限制 Cloudflare WARP。
-
-重新注册 WireGuard 配置：
-
-```bash
-rm -f /etc/sing-box/warp_wg.json
-sudo bash skill-public/script/proxy-setup/proxy_setup.sh
-```
-
-然后选择：
-
-```text
-5) WARP 安装向导 -> 7) WireGuard 模式注册
-```
-
-再重新部署或重启 `sing-box`。
-
-注意：新版 sing-box 使用顶层 `endpoints` 的 WireGuard 写法，路由可以指向 endpoint 的 `tag`。不要把 `gen_wg_endpoints_block` 生成的对象直接塞进 `outbounds`，否则新版 sing-box 可能配置校验失败。
-
-## 深度卸载
-
-主菜单第 4 项为深度卸载。卸载会清理：
-
-- `sing-box` 服务、systemd/openrc 单元、残留软链和失败状态。
-- `/usr/local/bin/sing-box`。
-- `/etc/sing-box`，包括 `config.json`、`warp_wg.json`、证书和临时配置。
-- `/root/proxy_info` 节点信息。
-- `/tmp/proxy_setup_logs`、`/var/log/sing-box`。
-- `/tmp/sing-box-warp-test-*`、`/tmp/singbox_install_*`。
-- 当前配置中记录的入站端口对应的本机防火墙放行规则。
-- Cloudflare WARP 客户端、`warp-svc` 服务、Cloudflare 源、keyring、缓存和 WARP 状态目录。
-
-卸载不会清理：
-
-- 当前脚本文件自身。
-- 云厂商控制台里的安全组规则。
-
-卸载时会询问是否强制清理通用依赖：
-
-```text
-ca-certificates wget tar curl openssl jq qrencode
-```
-
-强烈不建议删除这些通用依赖。它们可能被系统、SSH 运维脚本、证书更新、其他代理或自动化任务使用。默认直接回车保留；只有确认这台机器专门用于本脚本且不再使用时才输入 `y`。
-
-## Agent 使用注意
-
-当用户要求部署代理、安装 WARP、生成 Reality 节点、配置 sing-box、查看 Clash/Mihomo 配置时，应优先读取本文，再运行 `skill-public/script/proxy-setup/proxy_setup.sh`。
-
-执行前先确认：
-
-- 当前环境是否是 VPS。
-- 是否有 root 权限。
-- 是否允许改动系统网络、服务和防火墙。
-- 是否会影响当前 SSH 连接。
-
-优先推荐 WireGuard 出站模式，因为不需要安装额外软件，更轻量稳定。
-
-## 常用检查命令
-
-```bash
+/usr/local/bin/sing-box version
+/usr/local/bin/sing-box check -c /etc/sing-box/config.json
 systemctl status sing-box --no-pager
-systemctl restart sing-box
-cat /etc/sing-box/config.json
-cat /etc/sing-box/warp_wg.json   # WireGuard 配置
-ls -lah /root/proxy_info
+# OpenRC: rc-service sing-box status
+ss -lntup | grep sing-box
+# 需要错误详情时读取并脱敏，避免直接转发整段日志
+journalctl -u sing-box --no-pager -n 50
 ```
 
-查看 WARP 状态可以重新运行脚本并选择：
+脚本尝试通过 iptables、ufw、firewalld 放行**实际配置中的监听端口**，当前会同时尝试 TCP 和 UDP；这不证明防火墙规则成功生效或重启后持久存在。云安全组、NAT 端口映射要另行配置，脚本不会修改云控制台。
 
-```text
-6) WARP 状态检查
-```
+判定部署完成需要分开验证：
 
-## 输出文件
+1. `sing-box check` 成功、服务持续运行且监听端口正确。
+2. 客户端从服务器外部连接成功（含相应 TCP/UDP、安全组和 NAT 映射）。
+3. 实际出口 IP 符合直连/WARP 选择；双节点分别验证。
 
-脚本通常会把节点信息保存到：
+只验证了服务启动时，明确报告外部连接或 WARP 出口尚未验证。启动失败会保留配置和日志，不会自动深度清理；配置校验失败也不会打印含密钥的整份配置。
 
-```text
-/root/proxy_info
-```
+### WARP 专项
 
-其中 `_clash.yaml` 文件可以复制导入 FlClash、Clash Meta 或 Mihomo。
+- WireGuard 配置：`/etc/sing-box/warp_wg.json`；不依赖 warp-cli。
+- 主菜单 `6` 会检查 WireGuard/warp-cli，并可能临时启动测试代理、访问 Cloudflare trace；这不是纯离线检查。
+- 已收到 `received handshake response` 只说明握手成功；继续检查 DNS、目标连接及出口。没有响应时检查 endpoint、出站 UDP 和机房限制。
+- 不要先删除注册文件。确需重新注册时，备份私密配置并确认后，通过 `5 -> 7` 注册；运行中的 sing-box 不会自动读取新注册信息，需要重新生成相匹配的配置并校验。
+- 新版原生 WireGuard 使用顶层 `endpoints`，不要误放进 `outbounds`。下载器只使用官方最新稳定版；获取失败会停止，不自动走第三方镜像或回退旧版。脚本模板仍需与实际安装版本通过 `sing-box check` 验证，失败时检查配置迁移而非盲目降级。
 
-WireGuard 配置保存在：
+## 凭据与产物
 
-```text
-/etc/sing-box/warp_wg.json
-```
+- 服务配置/证书/注册信息：`/etc/sing-box/`。
+- 分享链接及 Clash Meta/Mihomo/FlClash 配置：`/root/proxy_info/`。主菜单 `2` 会显示完整凭据，仅在用户需要取回时使用。
+- 每次运行的私有日志目录：`${TMPDIR:-/tmp}/proxy_setup_logs.XXXXXXXX`（启动时显示实际路径）。默认关闭 xtrace；显式 `TRACE_ENABLED=1` 才开启调试跟踪。
+- 默认新建文件限制为所有者访问，但屏幕输出日志、节点链接、二维码和 YAML **仍含凭据**。不公开发送、不贴整份配置到排障记录；交付前确认接收渠道。
+
+## 深度卸载范围
+
+主菜单 `4` 再确认 `y` 后，会删除 sing-box 服务/二进制、`/etc/sing-box`（含备份、WireGuard 注册及证书）、`/root/proxy_info`、本次脚本日志和相关临时文件，并清理入站端口规则、**Cloudflare WARP 客户端及其源/keyring/状态**。既有、非本脚本创建的 WARP 也可能受到影响。
+
+不要在共享服务器上将其当作“仅删除一个节点”。卸载不删除脚本文件，也不会清理云安全组；历史日志目录可能仍需单独检查。通用依赖（curl、openssl、ca-certificates 等）默认保留，不能为了“清理干净”删除其他服务可能依赖的软件。

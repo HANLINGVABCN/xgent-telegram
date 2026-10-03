@@ -1,5 +1,4 @@
 #!/bin/bash
-[ -z "${__LF_FIXED:-}" ] && grep -q $'\r' "$0" 2>/dev/null && sed -i 's/\r$//' "$0" && export __LF_FIXED=1 && exec bash "$0" "$@" # self-heal CRLF
 # ==============================================================
 #  综合代理部署脚本 v3.0 — 多模式 / 多协议 / 多格式 / WARP+ZeroTrust
 #  机器类型：NAT小鸡 / 低配VPS / 标准VPS
@@ -43,14 +42,14 @@ ui_input_marker() {
 ui_read() {
     local prompt="$1" __var="$2"
     printf '%b%s%b' "$Y" "$prompt" "$W"
-    read -r "$__var"
+    read -r "$__var" || { printf "\n输入已结束，退出。\n" >&2; exit 1; }
     [ -t 0 ] || printf '\n'
 }
 
 ui_read_secret() {
     local prompt="$1" __var="$2"
     printf '%b%s%b' "$Y" "$prompt" "$W"
-    read -r -s "$__var"
+    read -r -s "$__var" || { printf "\n输入已结束，退出。\n" >&2; exit 1; }
     printf '\n'
 }
 
@@ -63,7 +62,8 @@ info()   { ui_log "$B" "$*"; }
 WORK_DIR="/etc/sing-box"
 CONFIG_FILE="$WORK_DIR/config.json"
 INFO_DIR="/root/proxy_info"
-LOG_DIR="/tmp/proxy_setup_logs"
+LOG_DIR=""
+TRACE_ENABLED="${TRACE_ENABLED:-0}"
 SCRIPT_LOG=""
 TRACE_LOG=""
 MACHINE_MODE=""    # nat / low / standard
@@ -90,11 +90,46 @@ WARP_PORT=""
 WARP_WG_MODE=""    # wireguard / socks5
 
 # ==================== 工具函数 ====================
-is_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+is_port() {
+    [[ "${1:-}" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+normalize_port() {
+    local var="$1" value="${!1}"
+    is_port "$value" || { red "$var 必须是 1-65535 的十进制端口"; return 1; }
+    printf -v "$var" '%d' "$((10#$value))"
+}
+
+validate_install_settings() {
+    normalize_port SERVER_PORT && normalize_port INTERNAL_PORT || return 1
+    if [ "$OUTBOUND_MODE" = "dual" ]; then
+        normalize_port DIRECT_PORT && normalize_port WARP_PORT || return 1
+        [ "$DIRECT_PORT" != "$WARP_PORT" ] || { red "直连和 WARP 端口不能相同"; return 1; }
+    fi
+    if [ "$WARP_WG_MODE" = "socks5" ]; then
+        normalize_port WARP_SOCKS_PORT || return 1
+    fi
+    if [ "$PROTOCOL" = "free-multi" ]; then
+        local port
+        for port in "${MULTI_PORTS[@]}"; do
+            is_port "$port" || { red "多协议端口超出 1-65535，请降低起始端口"; return 1; }
+        done
+    fi
+}
+
+reset_install_settings() {
+    # 菜单可重复进入，不能继承上次安装的出站、端口或密钥。
+    MACHINE_MODE=""; PROTOCOL=""; OUTBOUND_MODE=""; WARP_WG_MODE=""
+    SERVER_IP=""; SERVER_PORT=""; INTERNAL_PORT=""; DIRECT_PORT=""; WARP_PORT=""
+    DOMAIN=""; UUID=""; PASSWORD=""; OBFS_PASSWORD=""; PRIVATE_KEY=""; PUBLIC_KEY=""
+    SHORT_ID=""; TLS_CERT=""; TLS_KEY=""; NODE_NAME="MyProxy"; SNI="www.bing.com"
+    SOCKS5_USER="user"; WARP_SOCKS_PORT=40000
+    MULTI_PROTOCOLS=(); MULTI_PORTS=(); MULTI_DOMAINS=()
+}
 is_root() { [[ $EUID -eq 0 ]] || { red "请用 root 运行"; exit 1; }; }
 
 trace_pause() {
-    [ "${TRACE_ENABLED:-1}" = "1" ] || return 0
+    [ "${TRACE_ENABLED:-0}" = "1" ] || return 0
     __TRACE_PAUSE_DEPTH=$(( ${__TRACE_PAUSE_DEPTH:-0} + 1 ))
     if [ "${__TRACE_ACTIVE:-0}" = "1" ] && [ "${__TRACE_PAUSE_DEPTH:-0}" -eq 1 ]; then
         set +x
@@ -103,7 +138,7 @@ trace_pause() {
 }
 
 trace_resume() {
-    [ "${TRACE_ENABLED:-1}" = "1" ] || return 0
+    [ "${TRACE_ENABLED:-0}" = "1" ] || return 0
     if [ "${__TRACE_PAUSE_DEPTH:-0}" -gt 0 ]; then
         __TRACE_PAUSE_DEPTH=$(( ${__TRACE_PAUSE_DEPTH:-0} - 1 ))
     fi
@@ -115,13 +150,15 @@ trace_resume() {
 
 init_runtime_logging() {
     [ -n "${__LOGGING_READY:-}" ] && return 0
-    mkdir -p "$LOG_DIR"
-    chmod 700 "$LOG_DIR" 2>/dev/null || true
+    umask 077
+    LOG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/proxy_setup_logs.XXXXXXXX") || return 1
     SCRIPT_LOG="$LOG_DIR/proxy_setup_$(date +%Y%m%d_%H%M%S).log"
     TRACE_LOG="$LOG_DIR/proxy_setup_trace_$(date +%Y%m%d_%H%M%S).log"
     exec > >(tee -a "$SCRIPT_LOG") 2>&1
-    exec 9>>"$TRACE_LOG"
-    export BASH_XTRACEFD=9
+    if [ "$TRACE_ENABLED" = "1" ]; then
+        exec 9>>"$TRACE_LOG"
+        export BASH_XTRACEFD=9
+    fi
     chmod 600 "$SCRIPT_LOG" 2>/dev/null || true
     chmod 600 "$TRACE_LOG" 2>/dev/null || true
     export PS4='+ [${BASH_SOURCE##*/}:${LINENO}:${FUNCNAME[0]}] '
@@ -129,12 +166,13 @@ init_runtime_logging() {
     __TRACE_ACTIVE=0
     __TRACE_PAUSE_DEPTH=0
     green ">>> 实时日志已开启: $SCRIPT_LOG"
-    green ">>> 命令跟踪日志: $TRACE_LOG"
-    green ">>> 屏幕输出使用简洁文本；详细命令跟踪写入 trace 日志"
+    if [ "$TRACE_ENABLED" = "1" ]; then
+        yellow ">>> 调试跟踪已开启（可能含密钥，请勿分享）: $TRACE_LOG"
+    else
+        green ">>> 命令跟踪默认关闭；输出日志仍可能包含节点凭据，请勿公开"
+    fi
     trace_resume
 }
-
-init_runtime_logging
 
 detect_os() {
     if [ -f /etc/alpine-release ]; then
@@ -174,60 +212,50 @@ gen_self_signed_cert() {
 }
 
 # ==================== 安装 sing-box ====================
-install_singbox() {
+install_singbox() (
+    # 子 shell 隔离临时目录 trap；任何失败都不得继续使用残缺安装。
     green ">>> 安装依赖..."
-    if [ "$OS" = "alpine" ]; then
-        apk add --no-cache ca-certificates wget tar curl openssl jq
-        apk add --no-cache gcompat libc6-compat || true
-    elif [ "$OS" = "debian" ]; then
-        apt update -y
-        apt install -y ca-certificates wget tar curl openssl jq qrencode
-    elif [ "$OS" = "centos" ]; then
-        yum install -y ca-certificates wget tar curl openssl jq qrencode
-    fi
+    case "$OS" in
+        alpine)
+            apk add --no-cache ca-certificates wget tar curl openssl jq || return 1
+            apk add --no-cache gcompat libc6-compat || true ;;
+        debian)
+            apt update -y && apt install -y ca-certificates wget tar curl openssl jq qrencode || return 1 ;;
+        centos)
+            yum install -y ca-certificates wget tar curl openssl jq qrencode || return 1 ;;
+        *) red "不支持的发行版，停止安装"; return 1 ;;
+    esac
 
-    green ">>> 获取 sing-box 最新版..."
-    local ARCH=$(uname -m)
-    case "$ARCH" in x86_64) ARCH="amd64";; aarch64) ARCH="arm64";; armv7l) ARCH="armv7";; esac
+    local arch url tmp bin
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64) arch="amd64" ;;
+        aarch64) arch="arm64" ;;
+        armv7l) arch="armv7" ;;
+        *) red "不支持的架构: $arch"; return 1 ;;
+    esac
+    green ">>> 获取 sing-box 最新稳定版..."
+    url=$(curl -fsSL --connect-timeout 10 --max-time 30 \
+        https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+        | jq -r --arg suffix "linux-${arch}.tar.gz" \
+            '.assets[]? | select(.name | endswith($suffix)) | .browser_download_url' | head -1)
+    case "$url" in
+        https://github.com/SagerNet/sing-box/releases/download/*) ;;
+        *) red "无法获取官方下载地址，停止安装；不自动使用第三方镜像或旧版。"; return 1 ;;
+    esac
 
-    local URL=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest \
-        | grep "browser_download_url" | grep "linux-${ARCH}.tar.gz" \
-        | grep -v sha256 | grep -v sbom | head -1 | cut -d'"' -f4)
-
-    # GitHub API 失败时尝试使用镜像
-    if [ -z "$URL" ]; then
-        yellow ">>> GitHub API 访问失败，尝试使用镜像..."
-        URL=$(curl -s https://ghfast.top/https://api.github.com/repos/SagerNet/sing-box/releases/latest \
-            | grep "browser_download_url" | grep "linux-${ARCH}.tar.gz" \
-            | grep -v sha256 | grep -v sbom | head -1 | cut -d'"' -f4)
-    fi
-
-    # 最后兜底：使用已知稳定版本
-    if [ -z "$URL" ]; then
-        yellow ">>> 镜像也失败了，使用稳定版 v1.11.1..."
-        URL="https://github.com/SagerNet/sing-box/releases/download/v1.11.1/sing-box-1.11.1-linux-${ARCH}.tar.gz"
-    fi
-
-    # 如果是 GitHub 地址且直连不通，套镜像
-    if echo "$URL" | grep -q 'github.com'; then
-        if ! curl -sI --connect-timeout 3 "$URL" | head -1 | grep -q '200\|302\|301'; then
-            yellow ">>> GitHub 直连不通，使用镜像加速..."
-            URL="https://ghfast.top/${URL}"
-        fi
-    fi
-
-    local TMP="/tmp/singbox_install_$$"
-    mkdir -p "$TMP" "$WORK_DIR"
-    green ">>> 下载: $URL"
-    wget -O "$TMP/sb.tar.gz" "$URL"
-    tar -xzf "$TMP/sb.tar.gz" -C "$TMP"
-    local BIN=$(find "$TMP" -type f -name sing-box | head -1)
-    [ -z "$BIN" ] && { red "未找到 sing-box"; exit 1; }
-    install -m 755 "$BIN" /usr/local/bin/sing-box
-    cp /usr/local/bin/sing-box "$WORK_DIR/sing-box" 2>/dev/null || true
-    rm -rf "$TMP"
-    green ">>> sing-box $(sing-box version 2>/dev/null | head -1) 安装完成"
-}
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/singbox_install_XXXXXXXX") || return 1
+    trap 'rm -rf -- "$tmp"' EXIT
+    mkdir -p "$WORK_DIR" || return 1
+    curl -fL --connect-timeout 10 --max-time 300 -o "$tmp/sb.tar.gz" "$url" || return 1
+    tar -xzf "$tmp/sb.tar.gz" -C "$tmp" || return 1
+    bin=$(find "$tmp" -type f -name sing-box | head -1)
+    [ -n "$bin" ] || { red "下载包中未找到 sing-box"; return 1; }
+    "$bin" version >/dev/null 2>&1 || { red "下载的 sing-box 无法运行"; return 1; }
+    install -m 755 "$bin" /usr/local/bin/sing-box || return 1
+    cp /usr/local/bin/sing-box "$WORK_DIR/sing-box" || return 1
+    green ">>> sing-box $(/usr/local/bin/sing-box version | head -1) 安装完成"
+)
 
 # ==================== WARP WireGuard 原生出站 ====================
 warp_wg_config_file() { echo "$WORK_DIR/warp_wg.json"; }
@@ -270,7 +298,7 @@ warp_register_wireguard() {
     reg_data="{\"key\":\"${wg_pub}\",\"install_id\":\"\",\"fcm_token\":\"\",\"tos\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"model\":\"Linux\",\"serial_number\":\"\",\"locale\":\"en_US\"}"
 
     green ">>> 正在调用 Cloudflare WARP API..."
-    reg_resp=$(curl -sS -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+    reg_resp=$(curl -fsS --connect-timeout 10 --max-time 30 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
         -H "Content-Type: application/json" \
         -H "User-Agent: okhttp/3.12.1" \
         -d "$reg_data" 2>/dev/null)
@@ -296,8 +324,7 @@ warp_register_wireguard() {
     fi
 
     if [ -z "$peer_pub" ] || [ -z "$v4_addr" ]; then
-        red "WARP API 返回异常:"
-        printf '%s\n' "$reg_resp" | head -20 | ui_box "WARP API 原始返回" "$R"
+        red "WARP API 返回缺少必要字段，停止注册；不打印可能含令牌的原始响应。"
         return 1
     fi
 
@@ -1028,7 +1055,7 @@ check_warp_status() {
 # ==================== 服务管理 ====================
 setup_service() {
     if [ "$SVC" = "openrc" ]; then
-        cat > /etc/init.d/sing-box <<'EOSVC'
+        cat > /etc/init.d/sing-box <<'EOSVC' || return 1
 #!/sbin/openrc-run
 name="sing-box"
 description="sing-box proxy service"
@@ -1038,12 +1065,12 @@ command_background=true
 pidfile="/run/${RC_SVCNAME}.pid"
 depend() { need net; }
 EOSVC
-        chmod +x /etc/init.d/sing-box
+        chmod +x /etc/init.d/sing-box || return 1
         rc-update add sing-box default >/dev/null 2>&1 || true
         rc-service sing-box stop || true
-        rc-service sing-box start
+        rc-service sing-box start || { red "服务启动命令失败；未执行清理。"; return 1; }
     else
-        cat > /etc/systemd/system/sing-box.service <<EOSVC
+        cat > /etc/systemd/system/sing-box.service <<EOSVC || return 1
 [Unit]
 Description=sing-box proxy service
 After=network.target
@@ -1055,46 +1082,34 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOSVC
-        systemctl daemon-reload
-        systemctl enable sing-box
-        systemctl restart sing-box
+        systemctl daemon-reload && systemctl enable sing-box || return 1
+        systemctl restart sing-box || { red "服务启动命令失败；未执行清理。"; return 1; }
     fi
     
-    green ">>> 服务已尝试启动，正在进行 8 秒稳定性与证书申请安全验证，请稍候..."
+    green ">>> 服务已尝试启动，等待 8 秒后检查运行状态（不代表证书或外部连通性已验证）..."
     sleep 8
     
-    # 严格状态检查
+    check_service_health
+}
+
+check_service_health() {
+    # 失败只报告，不自动卸载或删除已有 WARP、配置、依赖和防火墙规则。
     if [ "$SVC" = "openrc" ]; then
-        if ! rc-service sing-box status | grep -q "started"; then
-            red "❌ [一票否决] sing-box 服务启动失败！正在自动清理所有节点和配置..."
-            cleanup_proxy_artifacts
-            red ">>> 清理完成。安装已终止。"
-            exit 1
-        fi
+        rc-service sing-box status >/dev/null 2>&1
     else
-        if ! systemctl is-active --quiet sing-box; then
-            red "❌ [一票否决] sing-box 服务启动失败！"
-            red "================== 失败原因分析 =================="
-            # 提取具体的错误信息或 FATAL 日志
-            journalctl -u sing-box --no-pager -n 20 | grep -E -i "fatal|error|failed" | sed 's/^/  /' || true
-            red "=================================================="
-            red ">>> 正在自动执行深度清理，不保留任何残余节点..."
-            
-            # 关闭并彻底清理
-            close_proxy_firewall
-            cleanup_proxy_artifacts
-            cleanup_warp_client
-            cleanup_common_dependencies
-            
-            red ">>> 深度清理完成。所有配置和节点已完全删除，安装已安全终止。"
-            exit 1
-        fi
+        systemctl is-active --quiet sing-box
     fi
-    green ">>> 服务已完美启动并成功通过安全验证！"
+    if [ $? -ne 0 ]; then
+        red "sing-box 服务启动失败；配置和日志已保留，未执行深度卸载。"
+        red "请检查服务日志并脱敏后再分享；安装尚未完成。"
+        return 1
+    fi
+    green ">>> 服务保持运行；仍需客户端测试连接和实际出站 IP。"
 }
 
 open_firewall() {
     local port=$1
+    is_port "$port" || return 1
     command -v iptables >/dev/null 2>&1 && {
         iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
         iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
@@ -1428,11 +1443,13 @@ collect_info() {
         esac
         INTERNAL_PORT="$SERVER_PORT"
     fi
-    [ -z "$SERVER_IP" ] && { red "IP 不能为空"; exit 1; }
+    [ -z "$SERVER_IP" ] && { red "IP 不能为空"; return 1; }
+    # 在任何端口算术和系统变更前校验，并消除前导零的八进制歧义。
+    normalize_port SERVER_PORT && normalize_port INTERNAL_PORT || return 1
 
     # 自由全协议模式
     if [ "$PROTOCOL" = "free-multi" ]; then
-        collect_free_multi_protocols
+        collect_free_multi_protocols && validate_install_settings
         return $?
     fi
 
@@ -1470,6 +1487,7 @@ EOWARPMODE
             2)
                 WARP_WG_MODE="socks5"
                 ui_read "WARP SOCKS5 本地端口 [40000]: " tmp; WARP_SOCKS_PORT="${tmp:-40000}"
+                normalize_port WARP_SOCKS_PORT || return 1
                 if ! (echo > /dev/tcp/127.0.0.1/$WARP_SOCKS_PORT) >/dev/null 2>&1; then
                     yellow "⚠️  WARP 端口 ${WARP_SOCKS_PORT} 未检测到"
                     yellow "请先用主菜单第5项安装 WARP"
@@ -1484,7 +1502,7 @@ EOWARPMODE
         esac
     fi
 
-    return 0
+    validate_install_settings
 }
 
 # 自由全协议模式：逐个询问协议
@@ -1596,6 +1614,7 @@ EOWARPMODE
             2)
                 WARP_WG_MODE="socks5"
                 ui_read "WARP SOCKS5 本地端口 [40000]: " tmp; WARP_SOCKS_PORT="${tmp:-40000}"
+                normalize_port WARP_SOCKS_PORT || return 1
                 ;;
             *)
                 WARP_WG_MODE="wireguard"
@@ -1685,8 +1704,15 @@ gen_inbound_tuic() {
 EOTUIC
 }
 gen_inbound_ss2022()    { local p=$1 t=$2; local k=$(echo "$PASSWORD"|sed 's/^2022-blake3-aes-256-gcm://'); echo '    { "type":"shadowsocks","tag":"'$t'","listen":"0.0.0.0","listen_port":'$p',"method":"2022-blake3-aes-256-gcm","password":"'$k'"}'; }
-gen_inbound_vless_ws()  { local p=$1 t=$2; local wp=$(cat "$WORK_DIR/ws_path.txt" 2>/dev/null); echo '    { "type":"vless","tag":"'$t'","listen":"0.0.0.0","listen_port":'$p',"users":[{"uuid":"'$UUID'"}],"transport":{"type":"ws","path":"'$wp'"},"tls":{"enabled":true,"server_name":"'$DOMAIN'","acme":{"domain":["'$DOMAIN'"],"email":"admin@'$DOMAIN'"}}}'; }
-gen_inbound_vmess_ws()  { local p=$1 t=$2; local wp=$(cat "$WORK_DIR/ws_path.txt" 2>/dev/null); echo '    { "type":"vmess","tag":"'$t'","listen":"0.0.0.0","listen_port":'$p',"users":[{"uuid":"'$UUID'","alterId":0}],"transport":{"type":"ws","path":"'$wp'"},"tls":{"enabled":true,"server_name":"'$DOMAIN'","acme":{"domain":["'$DOMAIN'"],"email":"admin@'$DOMAIN'"}}}'; }
+read_ws_path() {
+    if [ "${GENERATING_MULTI:-0}" = "1" ]; then
+        cat "$WORK_DIR/ws_path_${1}.txt"
+    else
+        cat "$WORK_DIR/ws_path.txt"
+    fi
+}
+gen_inbound_vless_ws()  { local p=$1 t=$2; local wp; wp=$(read_ws_path "$p"); echo '    { "type":"vless","tag":"'$t'","listen":"0.0.0.0","listen_port":'$p',"users":[{"uuid":"'$UUID'"}],"transport":{"type":"ws","path":"'$wp'"},"tls":{"enabled":true,"server_name":"'$DOMAIN'","acme":{"domain":["'$DOMAIN'"],"email":"admin@'$DOMAIN'"}}}'; }
+gen_inbound_vmess_ws()  { local p=$1 t=$2; local wp; wp=$(read_ws_path "$p"); echo '    { "type":"vmess","tag":"'$t'","listen":"0.0.0.0","listen_port":'$p',"users":[{"uuid":"'$UUID'","alterId":0}],"transport":{"type":"ws","path":"'$wp'"},"tls":{"enabled":true,"server_name":"'$DOMAIN'","acme":{"domain":["'$DOMAIN'"],"email":"admin@'$DOMAIN'"}}}'; }
 gen_inbound_socks5()    { local p=$1 t=$2; echo '    { "type":"socks","tag":"'$t'","listen":"0.0.0.0","listen_port":'$p',"users":[{"username":"'$SOCKS5_USER'","password":"'$PASSWORD'"}]}'; }
 
 gen_inbound() {
@@ -1769,9 +1795,10 @@ generate_config() {
 
     # 自由全协议模式
     if [ "$PROTOCOL" = "free-multi" ]; then
-        generate_free_multi_config
+        local result=0
+        generate_free_multi_config || result=$?
         trace_resume
-        return
+        return "$result"
     fi
 
     [ "$PROTOCOL" = "reality" ] && gen_reality_keys
@@ -1893,6 +1920,7 @@ EOCFG
 # 自由全协议模式：生成多协议配置
 generate_free_multi_config() {
     local ORIGINAL_PROTOCOL="$PROTOCOL"
+    local GENERATING_MULTI=1
     local inbounds_json=""
     local rules_json=""
     local use_wg="n"
@@ -1964,15 +1992,15 @@ generate_free_multi_config() {
         esac
 
         # 保存每个协议的密钥信息（用于后续输出）
-        eval "MULTI_UUID_${i}='$current_uuid'"
-        eval "MULTI_PASSWORD_${i}='$current_password'"
-        eval "MULTI_PRIVATE_KEY_${i}='$current_private_key'"
-        eval "MULTI_PUBLIC_KEY_${i}='$current_public_key'"
-        eval "MULTI_SHORT_ID_${i}='$current_short_id'"
-        eval "MULTI_OBFS_PASSWORD_${i}='$current_obfs_password'"
-        eval "MULTI_TLS_CERT_${i}='$current_tls_cert'"
-        eval "MULTI_TLS_KEY_${i}='$current_tls_key'"
-        eval "MULTI_DOMAIN_${i}='$current_domain'"
+        printf -v "MULTI_UUID_${i}" '%s' "$current_uuid"
+        printf -v "MULTI_PASSWORD_${i}" '%s' "$current_password"
+        printf -v "MULTI_PRIVATE_KEY_${i}" '%s' "$current_private_key"
+        printf -v "MULTI_PUBLIC_KEY_${i}" '%s' "$current_public_key"
+        printf -v "MULTI_SHORT_ID_${i}" '%s' "$current_short_id"
+        printf -v "MULTI_OBFS_PASSWORD_${i}" '%s' "$current_obfs_password"
+        printf -v "MULTI_TLS_CERT_${i}" '%s' "$current_tls_cert"
+        printf -v "MULTI_TLS_KEY_${i}" '%s' "$current_tls_key"
+        printf -v "MULTI_DOMAIN_${i}" '%s' "$current_domain"
 
         # 临时设置全局变量用于gen_inbound
         UUID="$current_uuid"
@@ -2449,13 +2477,13 @@ EOF
         green ">>> 正在处理节点 $((i+1))/${#MULTI_PROTOCOLS[@]}: ${proto} (端口 ${port})"
 
         # 恢复密钥
-        eval "UUID=\$MULTI_UUID_${i}"
-        eval "PASSWORD=\$MULTI_PASSWORD_${i}"
-        eval "PRIVATE_KEY=\$MULTI_PRIVATE_KEY_${i}"
-        eval "PUBLIC_KEY=\$MULTI_PUBLIC_KEY_${i}"
-        eval "SHORT_ID=\$MULTI_SHORT_ID_${i}"
-        eval "OBFS_PASSWORD=\$MULTI_OBFS_PASSWORD_${i}"
-        eval "DOMAIN=\$MULTI_DOMAIN_${i}"
+        local ref_UUID="MULTI_UUID_${i}"; UUID="${!ref_UUID}"
+        local ref_PASSWORD="MULTI_PASSWORD_${i}"; PASSWORD="${!ref_PASSWORD}"
+        local ref_PRIVATE_KEY="MULTI_PRIVATE_KEY_${i}"; PRIVATE_KEY="${!ref_PRIVATE_KEY}"
+        local ref_PUBLIC_KEY="MULTI_PUBLIC_KEY_${i}"; PUBLIC_KEY="${!ref_PUBLIC_KEY}"
+        local ref_SHORT_ID="MULTI_SHORT_ID_${i}"; SHORT_ID="${!ref_SHORT_ID}"
+        local ref_OBFS_PASSWORD="MULTI_OBFS_PASSWORD_${i}"; OBFS_PASSWORD="${!ref_OBFS_PASSWORD}"
+        local ref_DOMAIN="MULTI_DOMAIN_${i}"; DOMAIN="${!ref_DOMAIN}"
 
         # 设置协议特定变量
         local proto_clean="${proto%-warp}"
@@ -2518,13 +2546,13 @@ generate_free_multi_clash_config() {
         local port="${MULTI_PORTS[$i]}"
 
         # 恢复密钥
-        eval "UUID=\$MULTI_UUID_${i}"
-        eval "PASSWORD=\$MULTI_PASSWORD_${i}"
-        eval "PRIVATE_KEY=\$MULTI_PRIVATE_KEY_${i}"
-        eval "PUBLIC_KEY=\$MULTI_PUBLIC_KEY_${i}"
-        eval "SHORT_ID=\$MULTI_SHORT_ID_${i}"
-        eval "OBFS_PASSWORD=\$MULTI_OBFS_PASSWORD_${i}"
-        eval "DOMAIN=\$MULTI_DOMAIN_${i}"
+        local ref_UUID="MULTI_UUID_${i}"; UUID="${!ref_UUID}"
+        local ref_PASSWORD="MULTI_PASSWORD_${i}"; PASSWORD="${!ref_PASSWORD}"
+        local ref_PRIVATE_KEY="MULTI_PRIVATE_KEY_${i}"; PRIVATE_KEY="${!ref_PRIVATE_KEY}"
+        local ref_PUBLIC_KEY="MULTI_PUBLIC_KEY_${i}"; PUBLIC_KEY="${!ref_PUBLIC_KEY}"
+        local ref_SHORT_ID="MULTI_SHORT_ID_${i}"; SHORT_ID="${!ref_SHORT_ID}"
+        local ref_OBFS_PASSWORD="MULTI_OBFS_PASSWORD_${i}"; OBFS_PASSWORD="${!ref_OBFS_PASSWORD}"
+        local ref_DOMAIN="MULTI_DOMAIN_${i}"; DOMAIN="${!ref_DOMAIN}"
 
         local proto_display="${proto}"
         case "$proto" in
@@ -2858,8 +2886,13 @@ EOF
 }
 
 # ==================== 安装主流程（带返回功能） ====================
+check_generated_config() {
+    /usr/local/bin/sing-box check -c "$CONFIG_FILE"
+}
+
 do_full_install() {
     is_root; detect_os
+    reset_install_settings
 
     # 第一步：机器类型（可返回）
     select_machine_mode || return
@@ -2894,12 +2927,12 @@ do_full_install() {
     collect_info || return
 
     # 第五步：安装依赖 + sing-box
-    install_singbox
+    install_singbox || return 1
 
     # WireGuard 注册（需要 sing-box 已安装）
     if [ "$WARP_WG_MODE" = "wireguard" ]; then
         if ! warp_wg_config_exists; then
-            warp_register_wireguard || { red "WireGuard 注册失败，将回退到直连模式"; OUTBOUND_MODE="direct"; WARP_WG_MODE=""; }
+            warp_register_wireguard || { red "WireGuard 注册失败，停止安装；不会擅自改为直连或 SOCKS5。"; return 1; }
         else
             green ">>> 已检测到 WireGuard 配置: $(warp_wg_config_file)"
         fi
@@ -2919,19 +2952,44 @@ do_full_install() {
     optimize_system_limits
 
     # 第八步：生成配置
-    generate_config
-    /usr/local/bin/sing-box check -c "$CONFIG_FILE" || { red "配置校验失败"; cat "$CONFIG_FILE"; exit 1; }
-    setup_service
-    if [ "$PROTOCOL" = "free-multi" ] && [ ${#MULTI_PORTS[@]} -gt 0 ]; then
-        for port in "${MULTI_PORTS[@]}"; do
-            open_firewall "$port"
-        done
-    else
-        open_firewall "${INTERNAL_PORT:-$SERVER_PORT}"
+    if [ -f "$CONFIG_FILE" ]; then
+        local backup
+        backup=$(mktemp "$WORK_DIR/config.backup.XXXXXXXX") || return 1
+        cp "$CONFIG_FILE" "$backup" || return 1
+        chmod 600 "$backup"
+        yellow ">>> 原配置备份: $backup（非完整系统回滚）"
     fi
-    [ "$OUTBOUND_MODE" = "dual" ] && open_firewall "$WARP_PORT"
+    generate_config || return 1
+    check_generated_config || { red "配置校验失败，保留文件供排查；不会打印含密钥的完整配置。"; return 1; }
+    setup_service || return 1
+    # 以实际生成的监听端口为准，避免双节点自定义 DIRECT_PORT 后漏放行。
+    local port
+    while IFS= read -r port; do
+        [ -n "$port" ] && open_firewall "$port"
+    done < <(collect_proxy_ports)
     output_all
 }
 
 # ==================== 入口 ====================
-show_manage_menu
+main() {
+    case "${1:-}" in
+        -h|--help)
+            printf '%s\n' '用法: sudo bash proxy_setup.sh' \
+                '交互式部署/管理 sing-box；会修改服务、配置和本机防火墙。' \
+                '仅支持 Linux。--help 不需要 root，不创建日志，不修改系统。' \
+                '默认关闭命令跟踪；TRACE_ENABLED=1 可调试，但日志可能泄露密钥。'
+            return 0 ;;
+        '') ;;
+        *) printf '未知参数: %s\n' "$1" >&2; return 2 ;;
+    esac
+    [ "$(uname -s)" = "Linux" ] || { red "部署仅支持 Linux；未修改系统。"; return 1; }
+    is_root
+    umask 077
+    init_runtime_logging || return 1
+    show_manage_menu
+}
+
+# 可安全 source 以测试函数；不会自动启动菜单、日志或系统操作。
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

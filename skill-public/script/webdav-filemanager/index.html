@@ -1877,7 +1877,7 @@ body {
                 <button class="btn link-tab active" id="linkTabActive" onclick="setLinkTab('active')">有效链接</button>
                 <button class="btn link-tab" id="linkTabTrash" onclick="setLinkTab('trash')">回收站</button>
             </div>
-            <button class="btn btn-danger link-trash-action" id="clearTrashBtn" onclick="clearShareTrash()" style="display:none;">清空回收站</button>
+            <button class="btn btn-danger link-trash-action" id="clearShareTrashBtn" onclick="clearShareTrash()" style="display:none;">清空回收站</button>
         </div>
         <div class="link-list" id="linkList"></div>
     </section>
@@ -2349,7 +2349,7 @@ function loadLocalTasks() {
         snap.forEach(s => {
             if (downloadTasks.find(t => t.id === s.id)) return;  // already present
             // 跳过已被忽略（已删除）的远程任务
-            if ((s.kind === 'remote') && ignoredRemoteTaskIds.has(s.remoteId || s.id)) return;
+            if (ignoredRemoteTaskIds.has(s.serverTaskId || s.remoteId || s.id) || ignoredRemoteTaskIds.has(s.id)) return;
             const status = (s.kind === 'remote') ? s.status
                 : (s.status === 'downloading' ? 'paused' : s.status);
             downloadTasks.push({
@@ -2600,7 +2600,7 @@ function renderBreadcrumb() {
         p += '/' + part;
         const last = i === parts.length - 1;
         html += `<span class="crumb-sep">›</span>`;
-        html += `<button class="crumb${last ? ' active' : ''}" data-nav-path="${esc(p)}">${esc(part)}</button>`;
+        html += `<button class="crumb${last ? ' active' : ''}" data-nav-path="${escAttr(p)}">${esc(part)}</button>`;
     });
     el.innerHTML = html;
 }
@@ -5286,7 +5286,7 @@ async function startApp() {
         // the home listing in the background so going back to browser is instant.
         setAppVisible(true);
         showView(initialView, { replaceHistory: true });
-        loadFiles('/', { replaceHistory: true });
+        loadFiles('/', { replaceHistory: true, background: true });
     } else {
         setAppVisible(true);
         loadFiles(initialPath || '/', { replaceHistory: true });
@@ -5386,16 +5386,18 @@ function showBrowserPage(force = false, opts = {}) {
 }
 
 async function loadFiles(path, opts = {}) {
+    const viewAtRequest = currentView;
     showLoading(true);
     try {
         const data = await apiFetch('/api/list?path=' + encodeURIComponent(path));
         curPath = data.path;
         files = data.items;
         selected.clear();
-        if (currentView !== 'browser') showBrowserPage(true, { skipHistory: true });
+        const navigate = !opts.background && currentView === viewAtRequest;
+        if (navigate && currentView !== 'browser') showBrowserPage(true, { skipHistory: true });
         renderBreadcrumb();
         renderFiles();
-        pushAppHistory(!!opts.replaceHistory);
+        if (navigate) pushAppHistory(!!opts.replaceHistory);
     } catch (e) {
         toast(e.message, 'error');
     } finally {
@@ -5578,6 +5580,8 @@ var remotePollTimer = null;
 var currentTransferTab = 'remote';
 var currentTransferFilter = 'all';  // all | active | done | trash
 var ignoredRemoteTaskIds = new Set();
+var taskMutationVersion = 0;
+var taskMutationPending = 0;
 var trashedTasks = [];   // soft-deleted task snapshots (回收站)
 
 function transferTabText(tab = currentTransferTab) {
@@ -5770,8 +5774,11 @@ function stopRemotePollingIfIdle() {
 }
 
 async function pollAllTasks() {
+    if (taskMutationPending) return;
+    const version = taskMutationVersion;
     try {
         const data = await apiFetch('/api/tasks');
+        if (taskMutationPending || version !== taskMutationVersion) return;
         const serverIds = new Set();
         (data.items || []).forEach(raw => {
             if (!raw || !raw.id) return;
@@ -5814,8 +5821,11 @@ async function pollAllTasks() {
 
 async function loadAllTasks() {
     // Initial fetch of all persisted tasks (called once on page load / opening transfer center)
+    if (taskMutationPending) return;
+    const version = taskMutationVersion;
     try {
         const data = await apiFetch('/api/tasks');
+        if (taskMutationPending || version !== taskMutationVersion) return;
         const serverIds = new Set();
         (data.items || []).forEach(raw => {
             if (!raw || !raw.id) return;
@@ -5855,7 +5865,7 @@ function mergePersistedTask(raw) {
     // Merge an upload/download snapshot from /api/tasks into downloadTasks.
     // These are display-only records (no live execution after refresh); the live
     // upload/download tasks keep their own state and bypass this merge.
-    if (!raw || !raw.id) return;
+    if (!raw || !raw.id || ignoredRemoteTaskIds.has(raw.id)) return;
     // Match by id, or by (kind + path) to reconcile local-id vs server-taskId
     // differences after a page refresh.
     let task = downloadTasks.find(t => t.id === raw.id)
@@ -5871,6 +5881,12 @@ function mergePersistedTask(raw) {
         if (!task.serverTaskId && raw.kind === 'upload') task.serverTaskId = raw.id;
         return;
     }
+    // No browser controller means no local transfer is running. Persisted
+    // "downloading"/"queued" values must not strand the queue after refresh.
+    const rawStatus = normalizeTaskStatus(raw.status);
+    const status = ['downloading', 'queued'].includes(rawStatus) ? 'paused' : rawStatus;
+    const needsFile = raw.kind === 'upload' && !task?.file
+        && ['paused', 'error'].includes(status);
     if (task) {
         // Existing display record: refresh fields, adopt server id
         if (!task.serverTaskId && raw.kind === 'upload') task.serverTaskId = raw.id;
@@ -5879,10 +5895,11 @@ function mergePersistedTask(raw) {
             id: raw.id,
             kind: raw.kind || 'download',
             remoteId: raw.id,
+            serverTaskId: raw.kind === 'upload' ? raw.id : undefined,
             name: raw.name || (raw.kind === 'upload' ? '上传任务' : '下载任务'),
             path: raw.path || '',
             url: raw.url || '',
-            status: normalizeTaskStatus(raw.status),
+            status: status,
             loaded: Number(raw.loaded) || 0,
             size: Number(raw.size) || 0,
             controller: null,
@@ -5895,7 +5912,7 @@ function mergePersistedTask(raw) {
             lastBytes: 0,
             error: raw.error || '',
             // For upload tasks refreshed from server (no local file handle), mark as needing re-select to resume
-            needsFile: (raw.kind === 'upload' && ['paused', 'error', 'queued'].includes(normalizeTaskStatus(raw.status))),
+            needsFile: needsFile,
         };
         downloadTasks.push(task);
         if (!selectedDownloadId) selectedDownloadId = task.id;
@@ -5905,16 +5922,14 @@ function mergePersistedTask(raw) {
     task.name = raw.name || task.name;
     task.path = raw.path || task.path;
     task.url = raw.url || task.url;
-    task.status = normalizeTaskStatus(raw.status);
+    task.status = status;
     task.loaded = Number(raw.loaded) || 0;
     task.size = Number(raw.size) || task.size || 0;
     task.lastBps = Number(raw.lastBps) || 0;
     task.maxBps = Number(raw.maxBps) || task.maxBps || 0;
     task.samples = raw.samples || task.samples || [];
     task.error = raw.error || '';
-    if (task.kind === 'upload' && ['paused', 'error', 'queued'].includes(task.status)) {
-        task.needsFile = true;
-    }
+    if (task.kind === 'upload') task.needsFile = needsFile;
 }
 
 function mergeRemoteTask(raw) {
@@ -6225,8 +6240,8 @@ function addUploadTask(file, uid, relativePathOverride = '', uploadBatchId = '')
 }
 
 function processDownloadQueue() {
-    if (downloadTasks.some(t => ['download', 'upload'].includes(t.kind || 'download') && t.status === 'downloading')) return;
-    const next = downloadTasks.find(t => ['download', 'upload'].includes(t.kind || 'download') && t.status === 'queued');
+    if (downloadTasks.some(t => !t.trashed && ['download', 'upload'].includes(t.kind || 'download') && t.status === 'downloading')) return;
+    const next = downloadTasks.find(t => !t.trashed && ['download', 'upload'].includes(t.kind || 'download') && t.status === 'queued');
     if (!next) return updateTransferBadge();
     if ((next.kind || 'download') === 'upload') startUploadTask(next);
     else startDownloadTask(next);
@@ -6610,32 +6625,7 @@ async function pauseDownloadTask(id) {
 async function cancelDownloadTask(id) {
     const task = downloadTasks.find(t => t.id === id);
     if (!task) return;
-    // 取消 = 停掉实际传输 + 打 trashed 标记，任务留在数组里进回收站。
-    task.status = 'canceled';
-    if (task.kind === 'remote') {
-        try {
-            await apiFetch('/api/remote-download-cancel', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ id: task.remoteId || task.id, action: 'cancel' }),
-            });
-        } catch (e) {}
-    } else if (task.kind === 'upload') {
-        if (task.controller) { task._cancelRequested = true; task.controller.abort(); }
-        if (task.serverTaskId) {
-            try {
-                await apiFetch('/api/upload-cancel', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ taskId: task.serverTaskId, action: 'cancel' }),
-                });
-            } catch (e) {}
-        }
-    } else if (task.controller) {
-        task.controller.abort();
-    }
-    finishDownloadActivity(task);
-    trashTask(task);
+    if (await trashTask(task)) processDownloadQueue();
 }
 
 async function resumeDownloadTask(id) {
@@ -6691,6 +6681,7 @@ function pickFileForResume(task) {
     return new Promise(resolve => {
         const input = document.createElement('input');
         input.type = 'file';
+        input.oncancel = () => resolve(null);
         input.onchange = () => {
             const f = input.files && input.files[0];
             if (!f) return resolve(null);
@@ -6707,83 +6698,112 @@ function pickFileForResume(task) {
 async function deleteDownloadTask(id) {
     const task = downloadTasks.find(t => t.id === id);
     if (!task) return;
-    if (task.status === 'downloading') await pauseDownloadTask(id);
-    // 远程下载未完成时，通知服务器删除 .part 文件；已完成的保留。
-    if (task.kind === 'remote' && task.status !== 'done') {
-        try {
-            await apiFetch('/api/remote-download-cancel', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ id: task.remoteId || task.id, action: 'cancel' }),
-            });
-        } catch (e) {}
-        task.status = 'canceled';
-    }
-    trashTask(task);
+    if (await trashTask(task)) processDownloadQueue();
 }
 
 async function clearFinishedDownloads() {
-    // 清除完成 = 把当前 tab 里已完成/取消的任务打 trashed 标记，它们自动进回收站。
-    downloadTasks.forEach(t => {
-        if (taskKind(t) === currentTransferTab && !t.trashed && (t.status === 'done' || t.status === 'canceled')) {
-            trashTask(t, { reRender: false });
+    const items = downloadTasks.filter(t => taskKind(t) === currentTransferTab
+        && !t.trashed && ['done', 'canceled'].includes(t.status));
+    await mutateTaskRecords(items, 'trash');
+}
+
+/* Task mutations are persisted first. syncTrashActions only updates buttons;
+   it is NOT a network synchronization mechanism. */
+function taskRecordPayload(task) {
+    return {
+        id: task.kind === 'upload' ? (task.serverTaskId || task.id) : (task.remoteId || task.id),
+        localId: task.id,
+        kind: task.kind || 'download', name: task.name || '', path: task.path || '',
+        url: task.url || '', status: task.status || '', size: task.size || 0,
+        loaded: task.loaded || 0, createdAt: task.createdAt || 0,
+    };
+}
+
+async function mutateTaskRecords(items, action) {
+    items = items.filter(Boolean);
+    if (!items.length) return false;
+    if (items.some(t => t._taskMutationPending)) return false;
+    items.forEach(t => t._taskMutationPending = true);
+    taskMutationPending++;
+    taskMutationVersion++;
+    try {
+        let result;
+        if (action === 'restore') {
+            result = await apiFetch('/api/tasks-restore', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({id: taskRecordPayload(items[0]).id}),
+            });
+        } else {
+            result = await apiFetch('/api/tasks-delete', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({items: items.map(taskRecordPayload), trash: action === 'trash'}),
+            });
         }
-    });
-    persistLocalTasks();
-    renderDownloadQueue();
-    renderDownloadDetails(selectedDownloadTask());
+        if (result && result.success === false) throw new Error(result.error || '服务器未完成操作');
+        for (const task of items) {
+            const serverId = taskRecordPayload(task).id;
+            if (action === 'restore') {
+                ignoredRemoteTaskIds.delete(serverId);
+                ignoredRemoteTaskIds.delete(task.id);
+                task.trashed = false;
+                delete task.deletedAt;
+                task.status = result.task?.status || (task.status === 'done' ? 'done' : 'paused');
+                if (task.kind === 'upload' && !task.file) task.needsFile = task.status !== 'done';
+            } else {
+                // Stop a browser-owned stream after the server has retired its record.
+                if (task.controller) {
+                    task._pauseRequested = true;
+                    task.controller.abort();
+                }
+                finishDownloadActivity(task);
+                if (action === 'trash') {
+                    task.trashed = true;
+                    task.deletedAt = task.deletedAt || Date.now();
+                    if (['downloading', 'queued'].includes(task.status)) task.status = 'paused';
+                } else {
+                    ignoredRemoteTaskIds.add(serverId);
+                    ignoredRemoteTaskIds.add(task.id);
+                    const index = downloadTasks.indexOf(task);
+                    if (index >= 0) downloadTasks.splice(index, 1);
+                }
+            }
+        }
+        if (!downloadTasks.some(t => t.id === selectedDownloadId && !t.trashed)) selectedDownloadId = '';
+        persistLocalTasks();
+        renderDownloadQueue();
+        renderDownloadDetails(selectedDownloadTask());
+        syncTrashActions();
+        return true;
+    } catch (e) {
+        toast('操作未保存到服务器，请重试：' + (e.message || '请求失败'), 'error');
+        return false;
+    } finally {
+        items.forEach(t => delete t._taskMutationPending);
+        taskMutationPending--;
+        taskMutationVersion++;
+    }
 }
 
-/* ============================================================
-   Task Trash (回收站)
-   ============================================================ */
-// 统一状态切换：所有删除/取消/恢复/清空都走这三个函数，纯前端改 trashed 属性，
-// 任务始终留在 downloadTasks 里——主列表按 trashed=false 过滤，回收站按 trashed=true
-// 过滤。这样删除/恢复立即生效，不需要重新加载或等后端。
-function trashTask(task, opts) {
-    if (!task || task.trashed) return;
-    task.trashed = true;
-    task.deletedAt = task.deletedAt || Date.now();
-    // 移到队尾，回收站里最新删的在最上面（renderTrashList 会再排序）。
-    const idx = downloadTasks.indexOf(task);
-    if (idx >= 0) { downloadTasks.splice(idx, 1); downloadTasks.push(task); }
-    if (selectedDownloadId === task.id) selectedDownloadId = visibleTransferTasks()[0]?.id || '';
-    if (opts && opts.reRender === false) return;
-    persistLocalTasks();
-    renderDownloadQueue();
-    renderDownloadDetails(selectedDownloadTask());
-    syncTrashActions();
+async function trashTask(task) {
+    if (!task || task.trashed) return false;
+    return mutateTaskRecords([task], 'trash');
 }
 
-function restoreTask(task) {
-    if (!task || !task.trashed) return;
-    task.trashed = false;
-    delete task.deletedAt;
-    // 已取消的任务恢复后，状态重置为 paused，这样渲染时显示 ▶（继续）按钮
-    // 而非 ✕（已取消）按钮。
-    if (task.status === 'canceled') task.status = 'paused';
-    // 选中它，并切到它所属的 tab + 重置过滤，保证恢复后立即可见。
+async function restoreTask(task) {
+    if (!task || !task.trashed) return false;
+    if (!(await mutateTaskRecords([task], 'restore'))) return false;
     const kind = task.kind || 'download';
     const tab = kind === 'upload' ? 'upload' : (kind === 'remote' ? 'remote' : 'download');
     if (currentTransferTab !== tab) setTransferTab(tab);
     if (currentTransferFilter === 'trash') setTransferFilter('all');
     selectedDownloadId = task.id;
-    persistLocalTasks();
     renderDownloadQueue();
     renderDownloadDetails(task);
-    syncTrashActions();
+    return true;
 }
 
-function purgeTask(task) {
-    if (!task) return;
-    // 彻底删除 = 从数组里真正移除。
-    const idx = downloadTasks.indexOf(task);
-    if (idx >= 0) downloadTasks.splice(idx, 1);
-    if (selectedDownloadId === task.id) selectedDownloadId = '';
-    persistLocalTasks();
-    renderDownloadQueue();
-    renderDownloadDetails(selectedDownloadTask());
-    syncTrashActions();
+async function purgeTask(task) {
+    return task ? mutateTaskRecords([task], 'purge') : false;
 }
 
 function syncTrashActions() {
@@ -6794,22 +6814,25 @@ function syncTrashActions() {
     if (ct) ct.style.display = isTrash ? '' : 'none';
 }
 
-// 回收站现在直接复用主数组里 trashed=true 的任务，不再单独从后端拉。
-// 保留这个函数仅为兼容旧调用点（启动时同步一次后端，捡漏刷新前已删的任务）。
+// 回收站以服务器记录为准；本地数组用于渲染，删除/恢复必须先写入服务器。
+// 忽略操作前发出的旧请求，避免恢复或清空后又合并旧的回收站快照。
 async function loadTrashedTasks() {
+    if (taskMutationPending) return;
+    const version = taskMutationVersion;
     try {
         const data = await apiFetch('/api/tasks-trash');
+        if (taskMutationPending || version !== taskMutationVersion) return;
         const serverTrash = Array.isArray(data.items) ? data.items : [];
         // 用后端记录给本地 trashed 任务补齐（启动时本地数组可能还没这些条目）。
         serverTrash.forEach(snap => {
-            if (!snap || !snap.id) return;
+            if (!snap || !snap.id || ignoredRemoteTaskIds.has(snap.id)) return;
             const localId = snap.localId || snap.id;
             let t = downloadTasks.find(x => x.id === localId)
                   || downloadTasks.find(x => (x.serverTaskId || x.remoteId) === snap.id);
             if (t) {
                 // 已在数组里：只打标记，不覆盖实时数据。
                 t.trashed = true;
-                if (!t.deletedAt) t.deletedAt = snap.deletedAt || Date.now();
+                if (!t.deletedAt) t.deletedAt = (snap.deletedAt ? Number(snap.deletedAt) * (Number(snap.deletedAt) < 1e12 ? 1000 : 1) : Date.now());
             } else {
                 // 刷新前删的、本地数组没有的：补一条 display-only 记录。
                 downloadTasks.push({
@@ -6825,7 +6848,7 @@ async function loadTrashedTasks() {
                     loaded: Number(snap.loaded) || 0,
                     error: snap.error || '',
                     trashed: true,
-                    deletedAt: snap.deletedAt || Date.now(),
+                    deletedAt: (snap.deletedAt ? Number(snap.deletedAt) * (Number(snap.deletedAt) < 1e12 ? 1000 : 1) : Date.now()),
                     displayOnly: true,
                 });
             }
@@ -6892,27 +6915,20 @@ function renderTrashList() {
 }
 
 async function restoreTrashedTask(id) {
-    // 恢复 = 把 trashed 改回 false，任务自动回到主列表。纯前端，立即生效。
     const task = downloadTasks.find(t => t.id === id);
-    if (!task || !task.trashed) return;
-    restoreTask(task);
-    toast('已恢复', 'success');
+    if (await restoreTask(task)) toast('已恢复', 'success');
 }
 
 async function purgeTrashedTask(id) {
-    // 彻底删除 = 从数组里真正移除。
     const task = downloadTasks.find(t => t.id === id);
-    if (!task) return;
-    purgeTask(task);
-    toast('已彻底删除', 'success');
+    if (await purgeTask(task)) toast('已彻底删除', 'success');
 }
 
 async function clearTrash() {
     const items = downloadTasks.filter(t => t.trashed);
     if (!items.length) return toast('回收站为空', 'info');
     showConfirm('🗑️ 清空回收站', `确定要彻底删除回收站里的 ${items.length} 个记录吗？此操作不可恢复。`, async () => {
-        items.forEach(purgeTask);
-        toast('回收站已清空', 'success');
+        if (await mutateTaskRecords(items, 'purge')) toast('回收站已清空', 'success');
     });
 }
 
@@ -6932,7 +6948,7 @@ function setLinkTab(tab) {
     currentLinkTab = tab === 'trash' ? 'trash' : 'active';
     document.getElementById('linkTabActive')?.classList.toggle('active', currentLinkTab === 'active');
     document.getElementById('linkTabTrash')?.classList.toggle('active', currentLinkTab === 'trash');
-    const clearBtn = document.getElementById('clearTrashBtn');
+    const clearBtn = document.getElementById('clearShareTrashBtn');
     if (clearBtn) clearBtn.style.display = currentLinkTab === 'trash' ? 'inline-flex' : 'none';
     renderShareList();
 }

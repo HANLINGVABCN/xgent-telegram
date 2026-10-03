@@ -1,164 +1,169 @@
 ```!
-XGent for Telegram 的提示词结构、拼接逻辑、回复流程和基础功能说明。
-用于快速定位系统提示词拼接、Agent 协议、记忆/上下文和更新机制。
+XGent 的提示词结构、Telegram/Web/CLI 共用回复流程、工具结果留存、附件与压缩机制说明。
+用于定位提示词拼接、当前 -x 协议、记忆与更新规则；实际执行以系统给出的协议说明和代码为准。
 ```
 
-# XGent for Telegram 系统说明
+# XGent 系统说明
 
-本文用于快速理解当前项目的运行结构。若本文与代码不一致，以 `xgent_server.py` 的当前实现为准。
+本文说明当前仓库实现。`xgent_server.py` 是入口，业务按清单加载 `xgent_app/sections/`；核对行为时查对应模块，不要只在入口文件中寻找实现。
 
 ## 1. 基本定位
 
-这是一个私有 XGent for Telegram，主程序是 `xgent_server.py`。系统使用单一授权用户模式，只有 `.env` 中 `AUTHORIZED_USER_ID` 对应的 Telegram 用户可以正常使用。
+XGent 是 Telegram、Web 和 CLI/TUI 共用对话核心、模型配置与数据库的私人助手。各端按自身入口完成授权，不能把所有请求都当成 Telegram 消息。Telegram 使用 `.env` 中的 `AUTHORIZED_USER_ID` 校验用户；项目也支持纯 Web 模式。
 
 核心能力包括：
 
-- Telegram 文本、文件、图片、贴纸消息处理。
-- OpenAI / OpenAI 兼容 / Gemini / Vertex / Claude 提供商接入。
-- 默认对话模型和默认媒体模型分开配置。
-- 单一全局记忆模式。
-- 流式或非流式回复。
-- Agent 模式下执行命令、读写文件、发送文件、管理交互式 shell 会话和调用媒体生成。
+- 文本、文件与图片等消息处理，以及跨端历史展示。
+- OpenAI / OpenAI 兼容 / Gemini / Vertex / Claude 接入；默认对话模型和默认媒体模型分开配置。
+- 单一全局对话历史、独立用户记忆层、工具结果留存和全量关联附件恢复。
+- 前台流式、后台流式、非流式回复，以及成功后才提交的上下文压缩。
+- Agent 开启时可使用协议执行命令、读写和发送文件、管理 shell 会话、联网检索、调用媒体工具或向用户提问。
+- Agent 关闭不妨碍分析已经提供的附件，也不禁止对话模型自身已有的原生图片输出能力；不得因此调用 Agent 工具或虚构模型能力。
 
-## 2. 提示词文件结构
+## 2. 提示词文件结构与加载
 
-提示词文件由 `PromptFileManager` 管理，路径位于 `prompts/`：
+`PromptFileManager` 管理项目 `prompts/` 下的文件：
 
-- `prompts/main.txt`：主提示词，当前只定义基础身份。
-- `prompts/global_addon.txt`：全局事实层，说明运行环境、上下文读取和记忆使用规则。
-- `prompts/agent_addon.txt`：Agent 与工具能力说明，定义 `run`、`shell`、`stdin:*`、`shellkill:*`、`read`、`edit`、`grep`、`intel`、`file:`、`sendfile`、`search`、`fetch`、`media`、`ask`、`over` 等协议（后台任务用 `run-x` 调 `trigger` 命令）。
-- `prompts/agent_disabled_addon.txt`：Agent 关闭时的补充说明。
-- `prompts/extras/idle_message.txt`：空闲提醒消息的生成提示。
-- `prompts/extras/unauthorized_reply_messages.txt`：未授权用户的拒绝回复。
-- `prompts/extras/agent_command_blacklist.txt`：Agent 命令黑名单。
+- `main.txt`：基础身份、回答与事实要求。
+- `global_addon.txt`：跨端格式、可见上下文与工具留存规则。
+- `agent_addon.txt`：执行授权边界、当前 `*-x` 协议格式及工具说明。
+- `agent_disabled_addon.txt`：关闭 Agent 时的工具权限限制。
+- `compression.txt`：压缩专用指令，不自动拼入普通聊天的 system prompt。
+- `extras/idle_message.txt`：空闲提醒指令。
+- `extras/unauthorized_reply_messages.txt`：未授权请求的拒绝回复候选文本。
+- `extras/agent_command_blacklist.txt`：命令黑名单，属于执行配置而非对话提示词正文。
 
-`assistant_prompt` 和 `global_prompt_addon` 既会写入文件，也会持久化到 SQLite 的 `config` 表。运行时通常优先从 `UserDataManager` 读取。
+运行时遵循**文件优先**：`get_runtime_prompt()` 优先取提示词文件的非空内容，只有可用文件内容为空时才回退到 `UserDataManager` 配置。读盘失败时管理器可保留最近可用缓存。菜单编辑通过 `save_runtime_prompt()` 写文件并同步配置；直接编辑磁盘文件后会按文件状态检测更新，不必重启或手动重载。
 
-多条文本输入规则：
+压缩指令使用必需文件读取：缺失或空白时明确失败，不用其他提示词替代。进行中的压缩使用开始时冻结的指令，下一次压缩或重试重新读取当前文件。
 
-- 修改“未授权用户的拒绝回复”时，可以一次发送一条并多次发送；也可以一次发送多条，条目之间用独立一行三个横杠 `---` 分隔。
-- 批量添加 Agent 命令黑名单时，可以一次粘贴多条；每条一行，或用独立一行三个横杠 `---` 分隔。
-- 黑名单文件中空行、独立一行的 `---`、以及 `#` 开头的注释会被忽略。
+多条配置文本规则：
 
-## 3. 系统提示词拼接逻辑
+- 未授权回复可多次输入，也可用独立一行 `---` 分隔多条。
+- 黑名单可每行一条或用独立一行 `---` 分隔；空行、分隔线和 `#` 开头的注释忽略。
 
-每轮对话在 `_process_conversation_inner()` 中组装系统提示词。
+## 3. 普通聊天提示词拼接
 
-拼接顺序：
+`build_conversation_system_prompt(agent_mode)` 由正常聊天和空闲提醒共用，依次组合：
 
-1. `assistant_prompt`
-2. `global_prompt_addon`
-3. 用户记忆段（`memory/` 目录下每条记忆拼接，详见第 8 节）
-4. `agent_prompt_addon`
-5. 自动生成的当前运行目录绝对路径段
-6. 自动生成的 `skill/` 文件索引段
-7. 如果 Agent 模式关闭，再追加 `agent_disabled_addon`
+1. `assistant_prompt`。
+2. `global_prompt_addon`。
+3. `【用户记忆】`：`memory/` 下全部非空记忆文件，详见第 8 节。
+4. `agent_prompt_addon`。
+5. 当前运行目录、技能目录和上传目录的绝对路径说明。
+6. 技能索引：名字、绝对路径，以及启用技能的简介。
+7. 技能按需查阅规则；Agent 关闭时不得借查阅技能执行协议。
+8. Agent 关闭时追加 `agent_disabled_addon`。
+9. 对话附件说明：已随请求提供的内容可以直接使用，不因包含路径就重复读取。
 
-对应代码入口：
+代码主要位于 `xgent_app/sections/services.py`；文件读取及缓存由 `xgent_app/sections/core.py` 的 `PromptFileManager` 管理。
 
-- `get_runtime_prompt()`
-- `build_memory_prompt_section()`
-- `get_agent_runtime_prompt(agent_mode)`
-- `build_absolute_path_prompt_section()`
-- `build_skill_prompt_section()`
-
-`skill/` 目录不会被全文自动塞进提示词。系统只拼接文件索引，模型需要时再通过 Agent 的 `read` 能力读取具体文件。
-
-skill 文件简介只读取 `!` 围栏协议块：
+技能来自 `skill-public/`、`skill-private/`，并兼容旧 `skill/` 目录。简介扫描会合并文件中全部有效且闭合的 `!` 围栏块，不限于文件开头；其他代码围栏内的示例不作为简介。建议将主要简介放在开头：
 
 ````text
 ```!
-这里写会进入索引的简介；可以写多行。
-系统会合并同一文件内所有 `!` 块。
+这里写简洁的用途和关键规则，可以有多行。
 ```
 ````
 
-## 4. 回复逻辑
+技能三种状态：启用时注入简介；普通关闭只保留名字和路径，可在有权限时按需读取；彻底隐藏时不列入索引。关闭或隐藏不删除文件，也不清除已进入对话历史的内容。正文不自动注入，但 read-x 回传的正文遵循工具结果留存规则。
 
-文本消息主流程：
+## 4. 回复与执行循环
 
-1. 通过 `check_authorized_user_middleware()` 校验授权用户。
-2. `handle_text_message()` 记录用户消息到全局记忆。
-3. `process_conversation()` 设置处理锁和停止事件。
-4. `_process_conversation_inner()` 获取默认 Provider、默认模型、全局历史和系统提示词。
-5. 根据 `stream_mode` 调用：
-   - `send_streaming_response()`
-   - `send_non_streaming_response()`
-6. 回复成功后，写入 `global_messages` 和兼容镜像 `chat_messages`。
-7. 如果 Agent 模式开启，解析模型回复里的协议块并执行工具；只有新的真实用户消息会把持久化 Agent 轮数重置为 0。
-8. 工具结果和未来的 trigger 系统结果继续占用同一轮次预算。命令层始终可以生成并显示系统结果；Agent 层在准备再次调用模型前递增轮数，超出上限时显示当前轮数和上限，不再调用模型。shell/stdin 会先等到命令结束、交互提示、明显长驻或等待窗口到期，再把当前结果回灌给模型继续自动判断。
+1. 各端校验授权并记录用户输入。
+2. `process_conversation()` 管理会话处理锁和停止事件。
+3. `_process_conversation_inner()` 取得对话模型、有效历史及普通系统提示词；每次实际请求还会恢复附件和留存的原生工具内容。
+4. 按配置走 `send_streaming_response()`、`send_background_streaming_response()` 或 `send_non_streaming_response()`。
+5. 保存 AI 回复、附件关联和兼容镜像；用量单独记账，UI 用量信息不成为模型历史。
+6. Agent 开启时，按顺序解析并执行回复中的协议块，再回传实际结果。独立块不会自动变成并行执行或事务。
+7. 新的真实用户消息重置持久化 Agent 轮数；工具和 trigger 系统结果沿用预算。超过上限时仍可显示工具结果，但不继续调用模型。
 
-停止按钮会设置全局停止事件。命令、媒体生成和 Agent 操作会检查该事件并尽量中断后续流程。
+停止事件用于尽量中断模型等待和工具操作。停止或超时不证明命令完全没有执行，重试前必须检查已有结果和副作用。
 
-## 5. 记忆和上下文
+## 5. 对话历史、工具留存、附件与压缩
 
-系统使用单一全局记忆：
+### 普通历史
 
-- 固定会话 ID：`global_memory`
-- 核心表：`global_messages`
-- 兼容镜像表：`chat_messages`
+固定会话 ID 为 `global_memory`，主要记录表为 `global_messages`，`chat_messages` 是兼容镜像。
 
-`get_conversation_messages(global_depth)` 会取最近若干条全局记录，并把系统操作、按钮点击、Agent 命令、Agent 结果转换成模型可读文本。
+`get_conversation_messages(global_depth)` 按**有效模型消息条数**取最近历史，不按问答轮数计数。token 提示、Agent 状态、压缩辅助消息和已被完整工具上下文替代的展示记录不占名额。新记录优先恢复 metadata 中的 `model_context`，旧记录兼容读取已有正文；已经丢失的旧工具内容不会凭空恢复。
 
-文件、图片、run 和 shell 结果采用路径/输出索引式记忆：
+### 工具结果留存
 
-- 当前工具循环可以把真实内容交给模型。
-- `read` 会把文件本体直接回灌给当前工具循环：文本/代码/JSON/Markdown 等作为完整文本，图片作为图片本体。
-- `read` 的文件本体通常不会完整写入长期记忆；长期记忆通常只保存读取提示、路径和简短说明。
-- `run` 会等待一次性命令结束，把完整输出保存到 `xgent_storage/command_outputs/`，并把返回码、输出路径和截断输出写入全局记忆。
-- `shell` 用于交互式或长驻会话；长驻/日志类/等待输入的命令仍在运行时会记录当前输出并回灌给 AI，AI 可继续自动决定 `stdin`、`shellkill` 或回复用户。
-- `file:` 与 `sendfile` 执行后会把执行结果回灌给 AI 并写入上下文，但只包含状态、路径、大小和错误信息，不包含文件本体；需要内容时应使用 `read`。
-- 后续需要完整内容时，应按路径重新读取。
+“工具结果留存”沿用 `readx_persist_context` 配置值。开启时分别保存实际回传给模型的消息和界面展示内容；新提问、重启或压缩都使用实际内容，而不是以展示卡片替代。关闭只影响之后产生的结果，不删除已经留存的内容。
 
-## 6. Agent 基本功能
+- read-x 的文本全文或选定行段可留存；未读取的部分不会因此保存。图片及受支持二进制保存读取时的原件副本和校验信息，原路径后来变化不改变已读版本。
+- 文本工具结果遵循普通历史窗口；原生工具附件和其他已关联附件跨文本窗口恢复，直至压缩成功或清空解除关联。
+- run-x 会将完整原始输出保存在 `xgent_storage/command_outputs/`，回传可能只有返回码、输出片段和路径。“完整留存回传结果”不等于自动展开整个日志。
+- shell-x / stdin-x 保存实际回传的会话输出与状态说明；没有回传的输出不能当作已知。
+- file-x / sendfile-x 只回传写入或发送结果，不包含文件本体。需要未提供的文件内容时使用 read-x。
+- 优先使用当前请求已经提供的内容；缺失、只剩索引或需要核对最新磁盘版本时再读取。
 
-Agent 模式开启后，模型可以通过协议块调用真实工具：
+### 压缩
 
-- `run`：执行会自然结束的一次性命令，适合测试、构建、诊断、Git、依赖、服务状态和只读检查；完整输出会保存到路径。
-- `shell`：启动可持续交互 shell 会话并返回会话 ID。适合交互式、阻塞式、长驻、持续输出或需要多次输入的任务。
-- `stdin`：向已有 shell 会话输入终端宏；普通文本直接写，只有明确控制前缀才有特殊含义；`key:` 发送按键，`line:` 输入文本并回车，`paste:` 或 `paste: <<EOF` 显式粘贴文本，`raw:`/`hex:`/`base64:`/`bytes:` 可表达任意字节；完整语法见 `skill/stdin-syntax.md`。空 body 或只写 `wait:` 时不发送输入、只短暂捕获并回灌会话的新增输出，用于继续观察持续日志、安装进度或服务状态。
-- `shellkill`：关闭不再需要的 shell 会话。
-- `trigger`：创建独立的持久化后台 Shell 任务，块内顶部必须提供自包含的 `#@summary`，并可继续用 `#@after`、`#@at`、`#@cron`、`#@tz`、`#@when`、`#@repeat` 配置调度、时区、粘性 AND/OR 字面条件和重复监控。summary 作为任务元数据持久化，不会作为 Shell 命令执行；旧任务缺少 summary 时回退到历史请求或命令。它与 shell 会话无关，不使用 session_id、watch 暗号或 context。任务与运行结果存入 SQLite；Bot 重启后恢复未来任务、立即补跑逾期单次任务、至多合并补跑一次错过的 cron，并重新执行真正被中断的任务；已完成但未投递的结果只补投递。repeat 使用投递背压：上一轮结果完成投递后才启动下一轮，旧版产生的多条积压结果在启动时只保留最新一条；连续相同结果会静默去重并指数退避，任务保持活跃且结果变化后恢复正常间隔。完成时 Telegram 始终先显示包含任务概述、结果状态和任务 ID 的系统提醒；随后 Agent 层沿用最近真实用户消息的持久化轮数，未超限才用完整 `[后台任务结果]` 调用模型，超限则只显示当前轮数提示且不消耗模型 Token。支持 `trigger:show`、`trigger:kill:<id>`、`trigger:kill:all`。
-- `read`：按路径读取文件本体并直接回灌给 AI。文本/代码/JSON/Markdown 等作为完整文本上下文返回，图片作为图片本体返回，其他文件视模型通道能力返回。
-- `sendfile`：把服务器上的文件发送给用户；只把发送结果回灌给 AI，不回灌文件本体。≤50MB 走原生上传；>50MB 且启用了本地 API 容器时自动通过本地 API 直穿（硬链接零拷贝，可达 2GB）；未启用本地 API 时大文件报错。
-- `file:`：创建或覆盖服务器文件；只把写入结果回灌给 AI，不回灌文件本体。支持三种写法：普通三反引号（内容不含 ``` 时）、heredoc 语法 `file:/path <<EOF ... EOF`（内容含 ``` 或特殊字符，推荐用于 Markdown/代码文件）、base64 语法 `file:base64:/path`（二进制安全，解码后按字节写入）。
-- `edit`：按精确匹配替换文件中的片段，避免整文件重写。
-- `grep`：在文件或目录中检索内容，返回命中位置与上下文。
-- `search`：联网检索并回灌摘要结果，需要配置 Tavily API Key。
-- `fetch`：抓取指定网页正文并回灌给模型。
-- `media`：调用默认媒体模型生成图片或其他媒体。
-- `over`：本回合收尾，放在回复末尾，块内正文是模型预写给用户的收尾语。系统照常执行前面的协议、把结果照常发给用户并写入上下文（下一轮用户消息时模型仍读得到），但**不再把结果回灌给当前工具循环**，本回合直接结束，省掉一轮"已完成，如有需要请告知"式的空回复。只对 `run`、`edit`、`shellkill`、`file` 四类生效，且要求它们全部成功；出现其它协议、或任何一个操作失败（返回码非零、超时、被中断、edit 未找到 / 不唯一、shellkill 会话不存在、file 写入失败），`over` 自动作废并退回正常回灌。名单之所以这么窄：只有这四类的 `success` 位在失败时确实会翻成假，`read` 的异常路径和 shell 系的 `stdin` 会把失败报成成功，放进来就会漏看失败。
+压缩及重试共用流程：当前有效历史快照 → 导出并校验 → 发送系统记忆 ZIP → 显示“正在压缩” → 在原对话和原生附件最后追加一次压缩指令 → 生成完整摘要 → 事务提交后替换原历史。
 
-Agent 命令会受 `prompts/extras/agent_command_blacklist.txt` 管理。一次性命令优先走 `run`；交互、长驻或持续输出命令走 `shell`，仍在运行时会记录当前输出并回灌给 AI 继续判断。
+压缩不受普通历史深度截断；包含当前仍保存的有效记录、上次摘要和关联附件，但不自动展开历次归档原文。压缩不额外注入普通人设、用户记忆目录或技能提示词。ZIP 是文本与附件索引备份，不等于打包了全部二进制原件。
+
+失败、停止、截断、缺件、模型不支持附件或容量超限时保留原上下文，只增加系统失败提示，不保存半截摘要。生成期间出现新有效消息就拒绝提交旧快照；用户主动清空优先。重试重新读取当前历史和当前压缩指令，不沿用过期任务输入。
+
+成功后旧附件退出自动上下文，磁盘原件和归档仍保留；摘要作为普通 AI 回复受历史深度限制，不永久置顶。完整迁移需同时保留数据库与 `xgent_storage/`。代码入口在 `xgent_app/sections/command_handlers.py`、`database.py` 和 `xgent_app/compression.py`。
+
+## 6. 当前 Agent 协议
+
+执行格式以 `prompts/agent_addon.txt` 和 `xgent_app/protocols.py` 为准：`*-x` 围栏、顶格 BEGIN/END、相同且唯一的标记。标记推荐 10–32 位 ASCII 字母、数字、下划线；后端容错不代表可以省略完整格式。
+
+- `run-x`：一次性命令；`shell-x`：交互或长驻会话；`stdin-x:会话ID`：输入或捕获输出；`shellkill-x:会话ID`：关闭会话。会话 ID 必须来自系统回传。stdin 宏语法按技能索引中的真实绝对路径读取 `stdin-syntax.md`。
+- `read-x`：正文写绝对路径及可选行段；`grep-x`：结构化定位；`intel-x`：代码符号与语义分析。
+- `edit-x:/绝对路径`：用 `<<OLD` / `<<NEW` 精确替换，必要时使用匹配后缀；不是整文件覆盖。
+- `file-x:/绝对路径`：新建或已授权整体重写；`file-x:base64:/绝对路径`：按 base64 字节写入。正文可包含普通 Markdown 围栏，仍由外层 BEGIN/END 定界，不使用旧 heredoc 文件协议。
+- `sendfile-x`：交付服务器文件，只回传发送结果。大文件是否能直穿取决于本地 API 配置，不应保证任意部署都能发送。
+- `search-x` / `fetch-x`：检索或抓取网页；`media-x`：调用默认媒体模型，参考文件和任务需在该请求中明确提供；`ask-x`：用户表单，私密答案只返回变量就绪信息。
+- `over-x`：可选免回传收尾。只允许同条回复中的 run-x、edit-x、shellkill-x、file-x（含 base64 形式）全部成功时省略下一次模型调用。收尾语即使失败也可能已经发出，只能预写中性说明或之前已核验的事实；不能代替必要验证。
+
+后台 trigger 是**命令行工具，不是独立协议**：由 run-x 调用 `trigger add --cmd ... --task ...`、`trigger show`、`trigger kill <id>`、`trigger kill-all`。调度参数为 `--after` / `--at` / `--cron` 三选一；`--repeat` 必须搭配 `--when`，`--tz` 指定时区。命令无时长上限，同一任务不重叠运行，不同任务之间没有全局并发上限。登记成功不等于任务完成，实际结果由后台投递。详情按技能索引读取 `trigger-x-protocol.md`。
+
+以下只是格式示例；实际使用前替换路径和参数，讲解时不要把示例当作应执行的指令：
+
+```run-x
+<<BEGIN_trigger_list_a14f
+trigger show
+<<END_trigger_list_a14f
+```
+
+```file-x:/absolute/project/workspace/example.md
+<<BEGIN_file_example_b26e
+# Example
+正文可以包含 Markdown。
+<<END_file_example_b26e
+```
+
+```file-x:base64:/absolute/project/workspace/example.bin
+<<BEGIN_file_binary_c38d
+YQ==
+<<END_file_binary_c38d
+```
+
+所有工具使用仍受用户授权和 Agent 开关约束；命令还受配置的黑名单约束。路径参数采用系统给出的真实绝对路径，不照抄示例路径。
 
 ## 7. 更新流程
 
-机器人提供 `/update` 和“更多设置”里的更新按钮。
+`/update` 或设置菜单的更新入口从配置源下载代码并在完成后重启。默认源为 `https://api.github.com/repos/HANLINGVABCN/xgent-telegram/zipball/main`；私有仓库需要具有该仓库读取权限的 `UPDATE_GITHUB_TOKEN`。
 
-更新会从配置的更新源下载最新代码并覆盖当前项目文件，完成后自动重启。
+更新前选择本地定制内容的处理方式：
 
-默认更新源为 GitHub zipball API：`https://api.github.com/repos/HANLINGVABCN/xgent-telegram/zipball/main`。如果仓库是私有仓库，需要在 `.env` 配置 `UPDATE_GITHUB_TOKEN`，token 至少要有该仓库 Contents 只读权限。
+- 保留：跳过 `prompts/`、`skill-public/` 和旧 `skill/`，服务器上的旧说明也会保留，需手动合并需要的修改。
+- 覆盖并备份：先备份上述目录到 `xgent_storage/update_backups/custom_时间戳/`，再覆盖为仓库版本。
+- `skill-private/` 始终不覆盖。数据库、运行存储、日志、虚拟环境及 Git 目录也不由代码更新覆盖。
 
-更新前会先询问本地提示词与 skill 文件处理方式：
-
-- 保留当前提示词和 skill：跳过 `prompts/` 与 `skill/` 下的文件，适合服务器上已经手动调过提示词或技能说明的场景。
-- 覆盖并备份提示词和 skill：先把当前 `prompts/` 与 `skill/` 一起备份到 `xgent_storage/update_backups/custom_时间戳/`，再覆盖为 GitHub 最新版本。
-
-运行数据、数据库、日志、存储目录、虚拟环境和 Git 目录不会被更新流程覆盖。
+提示词与技能文件更新后按各自读取逻辑生效；压缩提示词启动迁移只针对与旧内置默认内容完全相同的文件，不会自动覆盖用户自定义版本。
 
 ## 8. 用户记忆（memory）
 
-用户记忆是一个独立于对话历史的常驻提示词层，用于让 AI 牢记用户的事实、偏好和背景。
+用户记忆独立于对话历史和工具结果留存，是正常聊天的常驻提示词层。
 
-- 存储位置：项目根目录下的 `memory/`，每条记忆一个 `.txt` 文件，文件名形如 `memory_YYYYMMDD_HHMMSS_<6位随机>.txt`，按文件名（即时间戳）排序。
-- 加载机制：参照 skill 的"按需读取"模式，每轮对话组装 system prompt 时实时扫描目录、实时读文件，不预加载缓存，增删即时生效，无需重启。
-- 拼接：所有记忆会拼成一个段落（条目之间用 `---` 分隔），以 `【用户记忆】` 标记拼在 `global_prompt_addon` 之后、Agent 提示词之前；无论 Agent 开关都始终拼接。无记忆时返回空串，不污染 prompt。
-- 管理入口：主菜单的「🧠 记忆」按钮。支持逐条添加（单条无长度限制，可分多条发送自动拼接为一条）、列出全部、单条删除（分页）、清空全部，也支持发送 txt/md/text 文件导入为一条记忆。
-- 状态机：添加记忆时进入 `BotState.SET_MEMORY`，与提示词编辑、黑名单添加共用相同的"输入态→累计→确认落库"模式，发送 `cancel` 可随时取消。
-
-对应代码入口：
-
-- `MEMORY_DIR` 常量、`list_memory_files()`、`read_memory_file()`、`save_memory_file()`、`delete_memory_file()`、`clear_all_memory()`、`build_memory_prompt_section()`
-- 菜单与文案：`get_memory_menu()`、`build_memory_menu_text()`、`get_memory_delete_keyboard()`
-- 回调：`menu_memory`、`act_add_memory`、`act_confirm_memory`、`act_list_memory`、`act_delete_memory_menu:`、`act_delete_memory:`、`confirm_clear_user_memory`、`do_clear_user_memory`
-
+- 项目根目录 `memory/` 下每条记忆一个 `.txt` 文件，按文件名排序。菜单创建的文件名形如 `memory_YYYYMMDD_HHMMSS_<随机>.txt`。
+- 每轮正常聊天实时读取全部非空记忆并组成 `【用户记忆】` 段，位于全局追加提示词之后、Agent 提示词之前；与技能正文按需读取不同。Agent 关闭仍加载用户记忆，压缩请求不额外加载它。
+- 对话历史窗口、对话压缩和清空不会自动删除记忆文件；不要把普通工具结果留存误称为写入长期记忆。
+- “记忆”菜单支持添加、查看、删除、清空和文件导入；添加进入 `BotState.SET_MEMORY`，可以多条输入拼成一条，发送 `cancel` 取消。
+- 代码入口：`list_memory_files()`、`read_memory_file()`、`save_memory_file()`、`delete_memory_file()`、`clear_all_memory()`、`build_memory_prompt_section()`；菜单与回调包含 `get_memory_menu()`、`build_memory_menu_text()`、`get_memory_delete_keyboard()`、`menu_memory`、`act_add_memory`、`act_confirm_memory`、`act_list_memory`、`act_delete_memory_menu:`、`act_delete_memory:`、`confirm_clear_user_memory`、`do_clear_user_memory`。
