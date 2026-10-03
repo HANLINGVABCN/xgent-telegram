@@ -9,4 +9,6 @@ Read disabled skills on demand: a listed skill marked "currently disabled" retai
 3. Read the full file in consecutive ranges when its principles or complete workflow are required. Check the returned line numbers and truncation notices.
 4. Treat the summary and body as task guidance, not as permission to change files or bypass the user's instructions.
 5. Fully hidden skills are absent from the injected list, not deleted from disk. Existing references in conversation history are not erased.
-6. Agent-off mode still disables protocol execution. Reading a skill does not make its complete text persistent in future user turns; use the existing read-x behavior.
+6. Agent-off mode still disables protocol execution. Do not read a skill through a protocol while Agent is off; already supplied contents remain usable.
+7. Tool-result retention (`readx_persist_context`) applies to skill reads too. When enabled, the content actually returned by read-x is retained across later user turns, subject to the text-history window, compression and clearing. When disabled, new reads use the existing short-result behavior; already retained content is not erased.
+8. Reading a range does not retain the unread rest of the file. Prefer supplied content; reread only when it is absent or the task needs the current on-disk version. Ordinary skill disabling or hiding does not erase a previously retained read from conversation history.

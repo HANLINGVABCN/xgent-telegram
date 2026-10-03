@@ -76,11 +76,11 @@ wait: 15s
 trigger add --cmd "systemctl status nginx" --after 30s --task "检查 nginx"
 <<END_run_trigger_ce27
 ```
-`trigger add` 参数：`--cmd`（必填，要跑的命令）、`--after 30s/2h`、`--at "2026-01-01 09:00"`、`--cron "0 * * * *"`（三者互斥）、`--when "<条件>"`、`--repeat`、`--tz Asia/Shanghai`、`--task "概述"`。管理：`trigger show`、`trigger kill <id>`、`trigger kill-all`。
-命令无时长上限：`tail -f`、长时数据迁移等可长跑常驻，系统按有界并发调度，不会因耗时杀任务。`--cron` 按固定周期重跑。登记成功仅表示已调度，实际结果等 `[后台任务结果]` 系统消息。
+`trigger add` 参数：`--cmd`（必填，要跑的命令）、`--after 30s/2h`、`--at "<未来日期与时间>"`（填真实的 ISO 8601 时间）、`--cron "0 * * * *"`（三者互斥）、`--when "<条件>"`、`--repeat`、`--tz Asia/Shanghai`、`--task "概述"`。管理：`trigger show`、`trigger kill <id>`、`trigger kill-all`。
+命令无时长上限：`tail -f`、长时数据迁移等可长跑常驻，不会因耗时杀任务。同一任务上次未结束时跳过重叠调度；不同任务之间没有全局并发上限，应按服务器资源控制任务数量，不要假定系统会自动限流。`--cron` 按固定周期重跑。登记成功仅表示已调度，实际结果等 `[后台任务结果]` 系统消息。
 `--when` 条件表达式（字面量 `READY`、正则 `/error/i`、逻辑 `A AND B`、括号分组）与更多细节，先 read `skill-public/trigger-x-protocol.md`（换成实际绝对路径）。
 
-6. read-x：读取文件并返回行号。块内写绝对路径，可加区间：`路径:10-20`、`路径:10:+15`、`路径:100-`、`路径:42`；不带区间读取全文。大文件只读相关片段。
+6. read-x：按绝对路径读取文件。文本返回带行号的所选内容，可加区间：`路径:10-20`、`路径:10:+15`、`路径:100-`、`路径:42`；不带区间读取全文，大文件只读相关片段。图片及其他二进制按模型通道能力作为原生内容回传。工具结果留存开启时，实际读到的内容会跨提问保留；优先复用本次请求已提供的版本，需要最新磁盘内容时再读取。
 ```read-x
 <<BEGIN_read_handler_02f5
 /app/handler.py:10-20
