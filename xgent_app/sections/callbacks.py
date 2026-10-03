@@ -1173,16 +1173,16 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
         elif data == "toggle_readx_persist_context":
-            # read 留存：开启后 read 读到的完整内容跨轮持久化进上下文
+            # 工具结果留存：开启后 所有工具回传的完整内容跨轮持久化进上下文
             # （文本走普通消息、图片/二进制走持久附件），关闭时只存摘要。
             on = not normalize_bool(UserDataManager.get('readx_persist_context', False), False)
             UserDataManager.set('readx_persist_context', on)
             await UserDataManager.save_config('readx_persist_context', on)
             await GlobalRecorder.record_system_op(
-                f"read 内容留存{'开启' if on else '关闭'}",
+                f"工具结果留存{'开启' if on else '关闭'}",
                 {"readx_persist_context": on}
             )
-            await query.answer(f"已{'开启' if on else '关闭'} read 留存", show_alert=False)
+            await query.answer(f"已{'开启' if on else '关闭'} 工具结果留存", show_alert=False)
             await query.message.edit_text(
                 build_settings_menu_text(),
                 reply_markup=get_more_settings_menu(),

@@ -111,6 +111,8 @@ class BotMemoryDB:
             )
         ''')
         
+        await conn.execute("CREATE TABLE IF NOT EXISTS context_compression_jobs "
+                           "(job_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS context_compressions (
                 sequence INTEGER PRIMARY KEY,
@@ -453,6 +455,8 @@ class BotMemoryDB:
             if compression:
                 from xgent_app.compression import CompressionError
                 entry = await self._require_compression_job(conn, compression, metadata.get('compression_attempt'))
+                if entry.get('version', 1) >= 3:
+                    raise CompressionError('新版压缩只能通过原子提交接口保存完整摘要。')
                 if entry['status'] != 'running':
                     raise CompressionError('恢复任务已结束，本次未重复写入回复。')
                 if metadata.get('compression_complete') and stop_event is not None and stop_event.is_set():
@@ -556,13 +560,22 @@ class BotMemoryDB:
     
     async def get_conversation_messages(self, limit: int = 50) -> List[Dict]:
         """获取所有消息（用于AI上下文）- 包含对话和系统操作"""
+        # Filter before applying the model-message limit: UI rows do not consume it.
         conn = await self._get_conn()
-        cursor = await conn.execute('''
-            SELECT role, content, timestamp, msg_type, metadata FROM global_messages
-            ORDER BY timestamp DESC, id DESC LIMIT ?
-        ''', (limit,))
-        rows = await cursor.fetchall()
-        return self.conversation_records_to_messages(reversed(rows))
+        cursor = await conn.execute("SELECT id, role, content, timestamp, msg_type, metadata "
+                                    "FROM global_messages ORDER BY timestamp DESC, id DESC")
+        result = []
+        while True:
+            rows = await cursor.fetchmany(max(128, min(limit, 1024)))
+            if not rows:
+                break
+            for row in rows:
+                result.extend(reversed(self.conversation_records_to_messages([row])))
+                if len(result) >= limit:
+                    await cursor.close()
+                    return list(reversed(result[:limit]))
+        await cursor.close()
+        return list(reversed(result))
 
     @staticmethod
     def conversation_records_to_messages(rows, *, include_all: bool = False) -> List[Dict]:
@@ -572,7 +585,14 @@ class BotMemoryDB:
         result = []
         for row in rows:
             msg = dict(row)
-            if not include_all and metadata_of(msg).get('compression_auxiliary'):
+            metadata = metadata_of(msg)
+            if not include_all and metadata.get('model_context_superseded'):
+                continue
+            if not include_all and metadata.get('model_context') is not None:
+                from xgent_app.tool_context import messages_from_metadata
+                result.extend(messages_from_metadata(metadata, msg.get('id')))
+                continue
+            if not include_all and metadata.get('compression_auxiliary'):
                 continue
             msg_type = msg.get('msg_type')
             if not include_all and is_redundant_agent_command_record(msg_type, msg.get('content')):
@@ -644,6 +664,43 @@ class BotMemoryDB:
         return [record for row in await cursor.fetchall()
                 if is_attachment_record(record := dict(row))]
 
+    async def get_tool_context_records(self) -> List[Dict]:
+        conn = await self._get_conn()
+        cursor = await conn.execute("SELECT * FROM global_messages WHERE metadata LIKE '%model_context%' "
+                                    "ORDER BY timestamp, id")
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def persist_tool_context(self, row_ids, payload, chat_id, generation):
+        from xgent_app.compression import metadata_of
+        from xgent_app.attachments import AttachmentContextError
+        async with self._transaction() as conn:
+            cursor = await conn.execute("SELECT value FROM config WHERE key = 'attachment_generation'")
+            generation_row = await cursor.fetchone()
+            if (int(json.loads(generation_row['value'])) if generation_row else 0) != generation:
+                raise AttachmentContextError('对话已清空，工具结果未写入新对话。')
+            records = []
+            for row_id in dict.fromkeys(row_ids):
+                cursor = await conn.execute('SELECT id, metadata FROM global_messages WHERE id = ?', (row_id,))
+                row = await cursor.fetchone()
+                if row is not None:
+                    records.append(dict(row))
+            if len(records) != len(set(row_ids)):
+                raise AttachmentContextError('工具展示记录已变化，未调用下一轮模型。')
+            if not records:
+                row_id = await self._insert_global_record(
+                    conn, chat_id, 0, MessageType.AGENT_RESULT, 'system', '[工具结果]',
+                    time.time(), SINGLE_MEMORY_SESSION_ID, {'model_context': payload})
+                return row_id
+            for record in records:
+                metadata = metadata_of(record)
+                if record is records[-1]:
+                    metadata['model_context'] = payload
+                else:
+                    metadata['model_context_superseded'] = True
+                await conn.execute('UPDATE global_messages SET metadata = ? WHERE id = ?',
+                                   (json.dumps(metadata, ensure_ascii=False), record['id']))
+            return records[-1]['id']
+
     async def get_attachment_generation(self) -> int:
         return int(await self.get_config_fresh('attachment_generation', 0))
 
@@ -676,66 +733,107 @@ class BotMemoryDB:
         row = await cursor.fetchone()
         return json.loads(row['payload']) if row else None
 
+    @classmethod
+    def _compression_identity(cls, snapshot, ignore_job=None):
+        from xgent_app.compression import metadata_of
+        records = [r for r in snapshot['records']
+                   if not (ignore_job and metadata_of(r).get('compression_task', {}).get('id') == ignore_job)]
+        return (snapshot['generation'], cls.conversation_records_to_messages(records),
+                [(r['id'], metadata_of(r).get('attachments')) for r in records
+                 if metadata_of(r).get('attachments')])
+
     async def begin_compression(self, snapshot: Dict, bundle: Dict, chat_id: int,
                                 provider: str, model: str, source: str,
                                 stop_event: asyncio.Event) -> Dict:
         from xgent_app.compression import CompressionError
         async with self._transaction() as conn:
             if stop_event.is_set():
-                raise CompressionError('用户已停止压缩，尚未清空原上下文。')
-            if await self._compression_snapshot(conn) != snapshot:
-                raise CompressionError('导出期间对话已变化或被清空，本次未清空上下文，请重试。')
-            await self._clear_conversation_memory(conn, preserve_compressions=True)
+                raise CompressionError('用户已停止压缩，原上下文已保留。')
+            if self._compression_identity(await self._compression_snapshot(conn)) != self._compression_identity(snapshot):
+                raise CompressionError('导出期间对话已变化或清空，原上下文未替换，请重试。')
             entry = {
-                **bundle, 'sequence': len(snapshot['compressions']) + 1,
+                **bundle, 'version': 3, 'sequence': len(snapshot['compressions']) + 1,
                 'job_id': uuid.uuid4().hex, 'created_at': time.time(), 'status': 'pending',
-                'generation': snapshot['generation'] + 1, 'summary': '', 'error': '',
+                'generation': snapshot['generation'], 'summary': '', 'error': '',
                 'source_records': snapshot['records'], 'mirror_records': snapshot['mirror_records'],
                 'sessions': snapshot['sessions'], 'chat_id': chat_id, 'src': source,
                 'provider': provider, 'model': model,
             }
-            notice, metadata = self._compression_notice(entry)
-            entry['notice_row_id'] = await self._insert_global_record(
-                conn, chat_id, 0, MessageType.SYSTEM_OP, 'system', notice,
-                time.time(), SINGLE_MEMORY_SESSION_ID, metadata,
-            )
-            await conn.execute(
-                'INSERT INTO context_compressions (sequence, payload) VALUES (?, ?)',
-                (entry['sequence'], json.dumps(entry, ensure_ascii=False)),
-            )
-            if stop_event.is_set():
-                raise CompressionError('用户已停止压缩，尚未清空原上下文。')
+            await conn.execute('INSERT INTO context_compression_jobs (job_id, payload) VALUES (?, ?)',
+                               (entry['job_id'], json.dumps(entry, ensure_ascii=False)))
         return entry
+
+    async def commit_compression(self, entry, summary, stop_event):
+        from xgent_app.compression import CompressionError, validate_summary
+        summary = validate_summary(summary)
+        async with self._transaction() as conn:
+            current = await self._require_compression_job(conn, entry['job_id'], entry.get('attempt'))
+            if current['status'] != 'running' or stop_event.is_set():
+                raise CompressionError('压缩已停止或已提交，原上下文未替换。')
+            live = await self._compression_snapshot(conn)
+            source = {'generation': current['generation'], 'records': current['source_records']}
+            if self._compression_identity(live, current['job_id']) != self._compression_identity(source):
+                raise CompressionError('压缩期间出现新消息或内容变化，原上下文已保留，请重试。')
+            await self._clear_conversation_memory(conn, preserve_compressions=True)
+            now = time.time()
+            current.update(status='completed', summary=summary, completed_at=now, error='',
+                           generation=current['generation'] + 1)
+            metadata = {'compression_job_id': current['job_id'], 'compression_complete': True,
+                        'generated_media_processed': True,
+                        'compression_sequence': current['sequence'],
+                        'attachment_generation': current['generation'], 'src': current.get('src')}
+            row_id = await self._insert_global_record(
+                conn, current['chat_id'], 0, MessageType.AI_REPLY, 'assistant', summary,
+                now, SINGLE_MEMORY_SESSION_ID, metadata)
+            await conn.execute('INSERT INTO chat_messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)',
+                               (SINGLE_MEMORY_SESSION_ID, 'assistant', summary, now))
+            current['response_row_id'] = row_id
+            notice, metadata = self._compression_notice(current)
+            current['notice_row_id'] = await self._insert_global_record(
+                conn, current['chat_id'], 0, MessageType.SYSTEM_OP, 'system', notice,
+                now, SINGLE_MEMORY_SESSION_ID, metadata)
+            await conn.execute('INSERT INTO context_compressions (sequence, payload) VALUES (?, ?)',
+                               (current['sequence'], json.dumps(current, ensure_ascii=False)))
+            await self._save_compression_job(conn, current)
+            if stop_event.is_set():
+                raise CompressionError('用户已停止压缩，原上下文已保留。')
+        return current
 
     async def _require_compression_job(self, conn, job_id: str, attempt: Optional[str] = None) -> Dict:
         from xgent_app.compression import CompressionError
-        cursor = await conn.execute('SELECT payload FROM context_compressions ORDER BY sequence DESC LIMIT 1')
+        cursor = await conn.execute('SELECT payload FROM context_compression_jobs WHERE job_id = ?', (job_id,))
         row = await cursor.fetchone()
+        if row is None:
+            cursor = await conn.execute('SELECT payload FROM context_compressions ORDER BY sequence DESC LIMIT 1')
+            row = await cursor.fetchone()
         entry = json.loads(row['payload']) if row else {}
         cursor = await conn.execute("SELECT value FROM config WHERE key = 'attachment_generation'")
         generation_row = await cursor.fetchone()
         generation = int(json.loads(generation_row['value'])) if generation_row else 0
         if (entry.get('job_id') != job_id or entry.get('generation') != generation
                 or attempt is not None and entry.get('attempt') != attempt):
-            raise CompressionError('该恢复任务已被清空或新的压缩替代，旧结果不会写回当前对话。')
+            raise CompressionError('该压缩任务已失效，旧结果不会写回当前对话。')
         return entry
 
     @staticmethod
     async def _save_compression_job(conn, entry):
-        await conn.execute('UPDATE context_compressions SET payload = ? WHERE sequence = ?',
-                           (json.dumps(entry, ensure_ascii=False), entry['sequence']))
+        table = 'context_compression_jobs' if entry.get('version', 1) >= 3 else 'context_compressions'
+        key = 'job_id' if table == 'context_compression_jobs' else 'sequence'
+        await conn.execute(f'UPDATE {table} SET payload = ? WHERE {key} = ?',
+                           (json.dumps(entry, ensure_ascii=False), entry[key]))
 
     @staticmethod
     def _compression_notice(entry):
         from xgent_app.web_history import display_media_reference
-        states = {'pending': '已导出并清空，等待恢复', 'running': '正在恢复',
-                  'completed': '恢复完成', 'failed': '恢复失败', 'stopped': '用户已手动停止恢复'}
+        states = {'pending': '备份已保存，原上下文保留', 'running': '正在压缩，原上下文保留',
+                  'completed': '压缩完成', 'failed': '压缩失败，原上下文已保留',
+                  'stopped': '压缩已停止，原上下文已保留'}
         text = (f"上下文归档（第 {entry['sequence']} 段）：{states.get(entry['status'], entry['status'])}。\n"
                 f"归档：{entry['archive_path']}\n文本记录：{entry['text_dir']}")
         if entry.get('error'):
             text += '\n' + entry['error']
         metadata = {
-            'src': entry.get('src'), 'compression_auxiliary': True,
+            'src': entry.get('src'), 'compression_auxiliary': entry['status'] not in {'failed', 'stopped'},
             'compression_task': {'id': entry['job_id'], 'status': entry['status'], 'sequence': entry['sequence']},
             'display_media': [display_media_reference(entry['archive_path'], '系统记忆.zip')],
         }
@@ -743,8 +841,9 @@ class BotMemoryDB:
 
     async def _update_compression_notice(self, conn, entry):
         text, metadata = self._compression_notice(entry)
-        await conn.execute('UPDATE global_messages SET content = ?, metadata = ?, timestamp = ? WHERE id = ?',
-                           (text, json.dumps(metadata, ensure_ascii=False), time.time(), entry['notice_row_id']))
+        if entry.get('notice_row_id') is not None:
+            await conn.execute('UPDATE global_messages SET content = ?, metadata = ?, timestamp = ? WHERE id = ?',
+                               (text, json.dumps(metadata, ensure_ascii=False), time.time(), entry['notice_row_id']))
 
     async def start_compression_attempt(self, job_id: str, provider: str, model: str) -> Dict:
         from xgent_app.compression import CompressionError
@@ -766,6 +865,11 @@ class BotMemoryDB:
                 return None
             if current['status'] != 'completed':
                 current.update(status=status, error=error)
+                if current.get('notice_row_id') is None:
+                    notice, metadata = self._compression_notice(current)
+                    current['notice_row_id'] = await self._insert_global_record(
+                        conn, current['chat_id'], 0, MessageType.SYSTEM_OP, 'system', notice,
+                        time.time(), SINGLE_MEMORY_SESSION_ID, metadata)
                 await self._save_compression_job(conn, current)
                 await self._update_compression_notice(conn, current)
             return current
@@ -1232,6 +1336,7 @@ class BotMemoryDB:
         await conn.execute('DELETE FROM ui_messages')
         if not preserve_compressions:
             await conn.execute('DELETE FROM context_compressions')
+            await conn.execute('DELETE FROM context_compression_jobs')
         await conn.execute('''
             INSERT INTO config (key, value) VALUES ('attachment_generation', '1')
             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1

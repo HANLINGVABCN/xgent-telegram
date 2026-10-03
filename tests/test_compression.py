@@ -176,11 +176,15 @@ class CompressionReplyTests(unittest.IsolatedAsyncioTestCase):
     async def test_partial_and_stopped_replies_never_count_as_complete(self):
         for stopped in (False, True):
             reply = CompressionReply(AsyncMock())
-            await reply.prepare('partial', partial=True, stopped=stopped)
-            self.assertTrue(reply.recorded and reply.partial)
+            with self.assertRaises(CompressionError):
+                await reply.prepare('partial', partial=True, stopped=stopped)
+            self.assertFalse(reply.recorded)
+            reply.persist.assert_not_awaited()
+            self.assertTrue(reply.partial)
             self.assertFalse(reply.completed)
         empty = CompressionReply(AsyncMock())
-        await empty.prepare('', stopped=True)
+        with self.assertRaises(CompressionError):
+            await empty.prepare('', stopped=True)
         self.assertFalse(empty.recorded or empty.completed)
 
     async def test_empty_media_or_failed_persistence_cannot_be_success(self):
@@ -198,3 +202,25 @@ class CompressionReplyTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class CompressionPromptMigrationTests(unittest.TestCase):
+    def test_exact_legacy_default_updates_but_customizations_are_preserved(self):
+        import hashlib
+        from unittest.mock import patch
+        from xgent_app.compression import migrate_default_compression_prompt
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'compression.txt'
+            legacy = 'old shipped fixture'
+            with patch('xgent_app.compression.LEGACY_COMPRESSION_PROMPT_SHA256',
+                       hashlib.sha256(legacy.encode()).hexdigest()):
+                path.write_text(legacy + '\n', encoding='utf-8')
+                self.assertTrue(migrate_default_compression_prompt(path))
+                self.assertEqual(DEFAULT_COMPRESSION_PROMPT, path.read_text(encoding='utf-8').strip())
+                path.write_text('user customized prompt', encoding='utf-8')
+                self.assertFalse(migrate_default_compression_prompt(path))
+                self.assertEqual('user customized prompt', path.read_text(encoding='utf-8'))
+
+    def test_default_describes_native_attachments_without_claiming_unseen_content(self):
+        self.assertIn('原生文件内容', DEFAULT_COMPRESSION_PROMPT)
+        self.assertNotIn('本轮没有重新读取附件原件', DEFAULT_COMPRESSION_PROMPT)

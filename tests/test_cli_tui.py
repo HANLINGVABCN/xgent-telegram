@@ -228,6 +228,42 @@ class TuiEnabledTests(unittest.TestCase):
             self.assertFalse(self._run({"XGENT_CLI_TUI": val}), val)
 
 
+class FragmentCacheTests(unittest.TestCase):
+    def setUp(self):
+        if importlib.util.find_spec("prompt_toolkit") is None:
+            self.skipTest("prompt_toolkit 未安装")
+        cli_tui._line_fragments.cache_clear()
+
+    def test_ansi_characters_are_coalesced_without_losing_styles(self):
+        text = "\x1b[31m" + "中x" * 1000 + "\x1b[0m tail"
+        fragments = cli_tui._line_fragments(text)
+        self.assertEqual("中x" * 1000 + " tail", "".join(t for _, t in fragments))
+        self.assertLessEqual(len(fragments), 3)
+        self.assertNotEqual(fragments[0][0], fragments[-1][0])
+        self.assertIs(fragments, cli_tui._line_fragments(text))
+
+    def test_cache_is_bounded_without_wholesale_eviction(self):
+        for i in range(5000):
+            cli_tui._line_fragments(f"line {i}")
+        info = cli_tui._line_fragments.cache_info()
+        self.assertEqual(4096, info.currsize)
+        cli_tui._line_fragments("line 4999")
+        self.assertEqual(info.hits + 1, cli_tui._line_fragments.cache_info().hits)
+
+    def test_fold_counts_are_cached_until_model_revision_changes(self):
+        model = cli_tui.MessageModel()
+        model.upsert(1, _folded_lines(10))
+        with mock.patch.object(cli_tui.Block, "foldable", new_callable=mock.PropertyMock,
+                               return_value=True) as foldable:
+            expected = model.counts()
+            calls = foldable.call_count
+            self.assertEqual(expected, model.counts())
+            self.assertEqual(calls, foldable.call_count)
+            model.upsert(2, ["new message"])
+            model.counts()
+            self.assertGreater(foldable.call_count, calls)
+
+
 class PtEndToEndTests(unittest.TestCase):
     """pt 装了才跑：真 App + 管道输入，按键驱动整条交互链。"""
 
@@ -338,6 +374,45 @@ class PtEndToEndTests(unittest.TestCase):
 
 
 
+    def test_f2_native_mode_supports_arrows_pages_and_preserves_drafts(self):
+        async def scenario(screen, app, win, keys, sent):
+            for i in range(200):
+                screen.print_plain(f"history {i}")
+            await keys("")
+            input_window = app.layout.current_window
+            input_buffer = app.current_buffer
+            input_buffer.history.append_string("previous input")
+            with mock.patch.object(app.output, "write_raw", wraps=app.output.write_raw) as raw:
+                await keys("\x1bOQ")
+                self.assertFalse(app.mouse_support())
+                self.assertTrue(app.layout.has_focus(win))
+                self.assertIn(mock.call("\x1b[?1007h"), raw.call_args_list)
+                top = win.vertical_scroll
+                await keys("\x1b[A")
+                self.assertEqual(top - 1, win.vertical_scroll)
+                top = win.vertical_scroll
+                await keys("\x1b[5~")
+                self.assertLess(win.vertical_scroll, top)
+                top = win.vertical_scroll
+                await keys("\x1b[6~")
+                self.assertGreater(win.vertical_scroll, top)
+                await keys("unsent draft")
+                self.assertTrue(app.layout.has_focus(input_window))
+                top = win.vertical_scroll
+                await keys("\x1bOA")
+                self.assertEqual(top - 1, win.vertical_scroll)
+                self.assertEqual("unsent draft", input_buffer.text)
+                await keys("\x1bOB")
+                self.assertEqual(top, win.vertical_scroll)
+                await keys("\x1bOQ")
+                self.assertTrue(app.mouse_support())
+                self.assertIn(mock.call("\x1b[?1007l"), raw.call_args_list)
+                self.assertEqual("unsent draft", input_buffer.text)
+            input_buffer.reset()  # End-to-end harness exits with two idle Ctrl+C keys.
+
+        self._run(scenario)
+
+
 class PtMouseTests(unittest.TestCase):
     """真 App + 管道输入里的 SGR 鼠标序列：单击展开、拖选复制、滚轮滚动。"""
 
@@ -345,7 +420,7 @@ class PtMouseTests(unittest.TestCase):
         if importlib.util.find_spec("prompt_toolkit") is None:
             self.skipTest("prompt_toolkit 未安装")
 
-    def _run(self, scenario):
+    def _run(self, scenario, turn_active=lambda: False):
         from prompt_toolkit.application import create_app_session
         from prompt_toolkit.application.current import get_app
         from prompt_toolkit.input import create_pipe_input
@@ -356,7 +431,7 @@ class PtMouseTests(unittest.TestCase):
         async def _dispatch(_text):
             return False
 
-        hooks = cli_tui.TuiHooks(dispatch=_dispatch)
+        hooks = cli_tui.TuiHooks(dispatch=_dispatch, turn_active=turn_active)
         copied = []
 
         async def _drive():
@@ -436,6 +511,87 @@ class PtMouseTests(unittest.TestCase):
             self.assertEqual(top + 3, win.vertical_scroll)
 
         self._run(scenario)
+
+
+    def test_drag_wheel_and_spinner_never_rebuild_unchanged_history(self):
+        activity = {"busy": False}
+        async def scenario(screen, app, win, keys, at):
+            lines = [f"\x1b[32mrow {i}: 中文 mixed text\x1b[0m" for i in range(10000)]
+            screen.print_block(lines, message_id=901)
+            await keys("")
+            with mock.patch.object(screen.model, "render_rows", wraps=screen.model.render_rows) as flatten, \
+                 mock.patch.object(cli_tui, "_line_fragments", wraps=cli_tui._line_fragments) as parse:
+                await keys("\x1b[<0;5;6M")
+                self.assertFalse(win.follow)
+                await keys("\x1b[<32;12;7M\x1b[<32;15;8M")
+                await keys("\x1b[<64;5;10M")
+                top = win.vertical_scroll
+                activity["busy"] = True
+                await keys("", 0.35)
+                self.assertEqual(top, win.vertical_scroll)
+                await keys("\x1b[<0;15;8m")
+                activity["busy"] = False
+                await keys("")
+                flatten.assert_not_called()
+                parsed_lines = {call.args[0] for call in parse.call_args_list}
+                self.assertLess(len(parsed_lines), 200)
+                self.assertTrue(parsed_lines)
+            with mock.patch.object(screen.model, "render_rows", wraps=screen.model.render_rows) as flatten:
+                screen.update_block(lines + ["new tail"], message_id=901)
+                await keys("")
+                flatten.assert_called_once()
+
+        self._run(scenario, turn_active=lambda: activity["busy"])
+
+    def test_slow_clipboard_does_not_block_scrolling(self):
+        import threading
+        started, release = threading.Event(), threading.Event()
+        async def scenario(screen, app, win, keys, at):
+            screen.print_block([f"row {i}" for i in range(200)], message_id=902)
+            await keys("")
+            def slow_copy(text):
+                started.set()
+                release.wait(timeout=3)
+                return True
+            with mock.patch.object(cli_tui, "copy_to_clipboard", side_effect=slow_copy):
+                try:
+                    await keys("\x1b[<0;3;6M\x1b[<32;6;7M\x1b[<0;6;7m", 0.1)
+                    self.assertTrue(started.is_set())
+                    top = win.vertical_scroll
+                    await keys("\x1b[<64;5;10M", 0.1)
+                    self.assertLess(win.vertical_scroll, top)
+                    self.assertFalse(release.is_set())
+                finally:
+                    release.set()
+                    await keys("")
+
+        self._run(scenario)
+
+
+    def test_chinese_drag_selection_keeps_character_boundaries(self):
+        async def scenario(screen, app, win, keys, at):
+            screen.print_block(["  中文 abc", "second line"], message_id=903)
+            await keys("")
+            y = at(0)
+            await keys(f"\x1b[<0;3;{y}M\x1b[<32;5;{y}M\x1b[<0;5;{y}m")
+        self.assertEqual(["中文"], self._run(scenario))
+
+    def test_wrapped_line_drag_does_not_trigger_spurious_edge_scroll(self):
+        async def scenario(screen, app, win, keys, at):
+            screen.print_block(["0123456789" * 40, "next row"], message_id=904)
+            await keys("")
+            info = win.render_info
+            wrapped = [(screen_y, column) for screen_y, (row, column)
+                       in info.visible_line_to_row_col.items() if row == 0 and screen_y > 0]
+            self.assertGreaterEqual(len(wrapped), 2)
+            screen_y, column = wrapped[0]
+            y = screen_y + 2
+            await keys(f"\x1b[<0;3;{y}M\x1b[<32;8;{y}M", 0.15)
+            await keys(f"\x1b[<0;8;{y}m")
+            return column
+        copied = self._run(scenario)
+        self.assertEqual(1, len(copied))
+        self.assertEqual(6, len(copied[0]))
 
 
 if __name__ == "__main__":

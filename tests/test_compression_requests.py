@@ -1,97 +1,77 @@
 import tempfile
 import unittest
 from pathlib import Path
-
 from tests.test_thinking_params import run_in_app
 
 
-def probe(name, root):
+def probe(name, root, module="compression_request_probe"):
     return run_in_app(
-        'import asyncio\nfrom tests import compression_request_probe as probe\n'
+        'import asyncio\nfrom tests import ' + module + ' as probe\n'
         f'print(json.dumps(asyncio.run(probe.{name}(bot, {str(root)!r}))))'
     )
 
 
 class CompressionRequestTests(unittest.TestCase):
-    def test_input_isolation_across_all_providers_and_renderers(self):
+    def check(self, name, module="compression_request_probe", count=None):
         with tempfile.TemporaryDirectory() as directory:
-            results = probe('input_isolation', Path(directory))
-            self.assertEqual(15, len(results))
-            self.assertTrue(all(results.values()))
+            result = probe(name, Path(directory), module)
+            self.assertTrue(all(result.values()))
+            if count is not None:
+                self.assertEqual(count, len(result))
 
-    def test_all_providers_round_trips_and_fresh_process(self):
-        with tempfile.TemporaryDirectory() as directory:
-            results = probe('round_trips', Path(directory))
-            self.assertEqual(5, len(results))
-            self.assertTrue(all(results.values()))
-            self.assertTrue(all(probe('restart', Path(directory)).values()))
+    def test_native_context_and_prompt_isolation_across_all_providers_and_renderers(self):
+        self.check('provider_matrix', 'lossless_context_probe', 15)
 
-    def test_failures_preserve_context_before_clear_and_archive_after_clear(self):
-        with tempfile.TemporaryDirectory() as directory:
-            results = probe('failures', Path(directory))
-            self.assertEqual(19, len(results))
-            self.assertTrue(all(results.values()))
+    def test_all_failures_preserve_context_and_add_one_system_notice(self):
+        self.check('failures', 'lossless_context_probe', 14)
 
-    def test_stop_clear_write_and_delivery_races(self):
+    def test_atomic_commit_stop_clear_concurrent_messages_and_delivery(self):
+        self.check('races', 'lossless_context_probe', 5)
+
+    def test_retry_after_restart_uses_latest_history_and_instruction(self):
         with tempfile.TemporaryDirectory() as directory:
-            results = probe('races', Path(directory))
-            self.assertEqual(11, len(results))
-            self.assertTrue(all(results.values()))
+            self.assertTrue(all(probe('retry_saved', directory, 'lossless_context_probe').values()))
+            self.assertTrue(all(probe('retry_restarted', directory, 'lossless_context_probe').values()))
 
     def test_sse_fallback_rejects_truncation_errors_and_incomplete_responses(self):
-        with tempfile.TemporaryDirectory() as directory:
-            results = probe('sse_compression', Path(directory))
-            self.assertEqual(5, len(results))
-            self.assertTrue(all(results.values()))
+        self.check('sse_compression', count=5)
 
     def test_clear_discards_chain_but_keeps_files(self):
-        with tempfile.TemporaryDirectory() as directory:
-            self.assertTrue(all(probe('clear_chain', Path(directory)).values()))
+        self.check('clear_chain')
 
-    def test_generated_images_and_agent_do_not_execute_summary(self):
-        with tempfile.TemporaryDirectory() as directory:
-            self.assertTrue(all(probe('generated_and_agent', Path(directory)).values()))
+    def test_generated_images_are_supplied_but_summary_protocols_never_execute(self):
+        self.check('generated_and_agent')
 
     def test_all_three_reply_modes_across_providers(self):
-        with tempfile.TemporaryDirectory() as directory:
-            results = probe('stream_modes', Path(directory))
-            self.assertEqual(15, len(results))
-            self.assertTrue(all(results.values()))
-
-    def test_failed_restore_survives_restart_and_retries_without_clearing(self):
-        with tempfile.TemporaryDirectory() as directory:
-            self.assertTrue(all(probe('retry_saved', Path(directory)).values()))
-            self.assertTrue(all(probe('retry_restarted', Path(directory)).values()))
+        self.check('stream_modes', count=15)
 
     def test_manual_export_and_compression_share_identical_archive_contents(self):
-        with tempfile.TemporaryDirectory() as directory:
-            self.assertTrue(all(probe('export_equivalence', Path(directory)).values()))
+        self.check('export_equivalence')
 
     def test_legacy_summary_migration_is_idempotent_and_preserves_archive_chain(self):
         with tempfile.TemporaryDirectory() as directory:
-            self.assertTrue(all(probe('legacy_saved', Path(directory)).values()))
-            self.assertTrue(all(probe('legacy_restarted', Path(directory)).values()))
+            self.assertTrue(all(probe('legacy_saved', directory).values()))
+            self.assertTrue(all(probe('legacy_restarted', directory).values()))
 
-    def test_pending_and_running_tasks_require_manual_retry_after_restart(self):
+    def test_pending_and_running_tasks_keep_history_and_require_manual_retry_after_restart(self):
         with tempfile.TemporaryDirectory() as directory:
-            self.assertTrue(all(probe('pending_saved', Path(directory)).values()))
-            self.assertTrue(all(probe('pending_restarted', Path(directory)).values()))
-
-    def test_partial_streams_remain_ordinary_incomplete_messages(self):
-        with tempfile.TemporaryDirectory() as directory:
-            self.assertEqual(8, len(probe('partial_streams', Path(directory))))
-
-    def test_stop_clear_and_failure_during_durable_reply_handoff(self):
-        with tempfile.TemporaryDirectory() as directory:
-            self.assertEqual(4, len(probe('handoff_races', Path(directory))))
+            self.assertTrue(all(probe('pending_saved', directory).values()))
+            self.assertTrue(all(probe('pending_restarted', directory).values()))
 
     def test_manual_export_reports_a_failed_download_association(self):
-        with tempfile.TemporaryDirectory() as directory:
-            self.assertTrue(all(probe('export_association_failure', Path(directory)).values()))
+        self.check('export_association_failure')
 
-    def test_provider_stream_end_markers_and_truncation_are_checked(self):
-        with tempfile.TemporaryDirectory() as directory:
-            self.assertEqual(40, len(probe('stream_wire_termination', Path(directory))))
+    def test_provider_stream_end_markers_and_truncation_never_commit_partial_output(self):
+        self.check('stream_wire_termination', count=40)
+
+    def test_unsupported_binary_is_not_degraded_to_a_filename(self):
+        self.check('blocked_binary', 'lossless_context_probe')
+
+    def test_live_stream_stop_and_timeout_do_not_show_or_persist_partial_summaries(self):
+        self.check('live_stop', 'lossless_context_probe', 2)
+
+    def test_archive_is_sent_before_compression_status_including_retry(self):
+        self.check('export_before_compression_status', 'lossless_context_probe', 5)
 
 
 if __name__ == '__main__':

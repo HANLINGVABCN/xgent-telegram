@@ -1288,6 +1288,13 @@ class PromptFileManager:
                     logger.warning(f"提示词文件不存在，已创建: {filename}")
                 except FileExistsError:
                     pass
+            elif key == 'compression_prompt':
+                try:
+                    from xgent_app.compression import migrate_default_compression_prompt
+                    if migrate_default_compression_prompt(filepath):
+                        logger.info('已更新原版压缩提示词以支持原生附件；自定义提示词保持不变。')
+                except Exception as exc:
+                    logger.warning('默认压缩提示词迁移失败（原文件保留）: %s', exc)
         cls.reload_all()
     
     @classmethod

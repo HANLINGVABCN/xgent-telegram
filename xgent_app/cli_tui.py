@@ -2,7 +2,8 @@
 
 交互：单击代码块任意行原地展开/收起；按住拖选高亮，拖到上下边缘自动翻页，
 松开自动复制到剪贴板（OSC 52 + 本机剪贴板命令）；滚轮滚动输出；点输出区退出
-输入框，直接打字自动回到输入框。F2 可把鼠标让给终端原生选择。
+输入框，直接打字自动回到输入框。F2 切换终端原生选择；原生模式下 ↑↓/PgUp/PgDn 翻页，
+支持 DECSET 1007 的终端也可用滚轮。选区只重画可见行，剪贴板命令不阻塞输入。
 
 折叠语义与 Telegram / 网页完全一致（spec）
 ----------------------------------------
@@ -33,6 +34,8 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from functools import lru_cache
+from itertools import groupby
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .cli_render import (
@@ -59,6 +62,22 @@ _PREVIEW_LINES = 3
 
 def _strip_ansi(line: str) -> str:
     return _ANSI_RE.sub("", line)
+
+
+@lru_cache(maxsize=4096)
+def _line_fragments(text: str) -> tuple:
+    """Parse only requested lines, coalescing ANSI's per-character fragments.
+
+    A bounded LRU avoids the old 50k-entry wholesale cache eviction. Keeping
+    prompt_toolkit imports lazy preserves the legacy CLI fallback.
+    """
+    if not text:
+        return ()
+    if "\x1b" not in text:
+        return (("", text),)
+    from prompt_toolkit.formatted_text import ANSI, to_formatted_text
+    return tuple((style, "".join(item[1] for item in items))
+                 for style, items in groupby(to_formatted_text(ANSI(text)), key=lambda item: item[0]))
 
 
 def _is_code_bar(line: str) -> bool:
@@ -168,6 +187,8 @@ class MessageModel:
         self._keyed: Dict[int, TuiMessage] = {}   # 内部 key → 消息
         self._next_anon = -1
         self.revision = 0  # 每次变更自增，渲染层据此复用缓存
+        self._counts_revision = -1
+        self._counts_cache = (0, 0)
 
     def _touch(self) -> None:
         self.revision += 1
@@ -263,13 +284,17 @@ class MessageModel:
 
     def counts(self) -> Tuple[int, int]:
         """(折叠块总数, 已展开数)，给状态栏用。"""
+        if self._counts_revision == self.revision:
+            return self._counts_cache
         total = opened = 0
         for msg in self.messages:
             for blk in msg.blocks:
                 if blk.foldable:
                     total += 1
                     opened += blk.expanded
-        return total, opened
+        self._counts_revision = self.revision
+        self._counts_cache = (total, opened)
+        return self._counts_cache
 
     def _header_row(self, blk: Block, selected: bool) -> str:
         """块头特殊显示：箭头 + 反色协议名（file-x 路径）+ 灰色「· N 行」。"""
@@ -509,6 +534,7 @@ def hint_text(mode: str) -> str:
         "exit": "再按一次 Ctrl+C 退出",
         "input": "直接打字或 ↑↓ 回到输入框 · 点击代码块展开/收起 · 拖选自动复制 · 滚轮/PgUp/PgDn 翻页"
                  " · Tab 选块 · F2 改用终端原生选择",
+        "native": "终端原生拖选 · ↑↓ / PgUp / PgDn 翻页 · Ctrl+Home/End 首尾 · F2 恢复 TUI 鼠标",
         "typing": "Enter 发送 · Alt+Enter 换行 · ↑↓ 输入历史 · / 命令补全 · 滚轮/PgUp/PgDn 翻页"
                   " · 点击代码块展开 · 拖选自动复制",
     }.get(mode, "")
@@ -530,7 +556,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
         from prompt_toolkit.layout import Layout
         from prompt_toolkit.layout.containers import (
             Float, FloatContainer, HSplit, Window)
-        from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+        from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl, UIContent, UIControl
         from prompt_toolkit.layout.dimension import D
         from prompt_toolkit.layout.margins import ScrollbarMargin
         from prompt_toolkit.layout.menus import CompletionsMenu
@@ -565,13 +591,32 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
         except Exception:
             return state["busy"]
 
+    copy_lock = _asyncio.Lock()
+
     def _copy(text: str, what: str) -> None:
-        try:
-            out = app_ref[0].output
-            ok = copy_to_clipboard(text, lambda raw: (out.write_raw(raw), out.flush()))
-        except Exception:
-            ok = copy_to_clipboard(text)
-        _flash(f"已复制{what}（{len(text)} 字）" if ok else "复制失败：终端不支持 OSC52 且没有剪贴板命令")
+        # Clipboard commands may block for seconds. Never run them on the input
+        # event loop; serialize copies so the newest selection wins in order.
+        async def perform():
+            import base64
+            async with copy_lock:
+                ok = False
+                try:
+                    encoded = await _asyncio.to_thread(
+                        lambda: base64.b64encode(text.encode("utf-8")).decode("ascii"))
+                    out = app_ref[0].output
+                    out.write_raw(f"\x1b]52;c;{encoded}\x07")
+                    out.flush()
+                    ok = True
+                except Exception:
+                    pass
+                try:
+                    ok = await _asyncio.to_thread(copy_to_clipboard, text) or ok
+                except Exception:
+                    pass
+                _flash(f"已复制{what}（{len(text)} 字）" if ok
+                       else "复制失败：终端不支持 OSC52 且没有剪贴板命令")
+        if app_ref:
+            app_ref[0].create_background_task(perform())
 
     # -- 输出区：自管滚动的 Window ----------------------------------------
     class _ScrollWindow(Window):
@@ -605,7 +650,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
                 self.vertical_scroll = top
             else:
                 self.vertical_scroll = max(0, min(self.vertical_scroll, top))
-                if self.vertical_scroll >= top:
+                if self.vertical_scroll >= top and not drag["active"]:
                     self.follow = True
 
         def scroll_by(self, delta: int) -> None:
@@ -627,18 +672,9 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
         def _scroll_down(self) -> None:
             self.scroll_by(3)
 
-    # -- 输出区内容（带缓存：只在模型/选中变化时重建） --------------------
-    ansi_cache: Dict[str, list] = {}
-    frag_cache: Dict[str, Any] = {"key": None, "frags": [], "rows": []}
-
-    def _ansi(text: str) -> list:
-        frags = ansi_cache.get(text)
-        if frags is None:
-            frags = to_formatted_text(ANSI(text)) if text else []
-            if len(ansi_cache) > 50000:
-                ansi_cache.clear()
-            ansi_cache[text] = frags
-        return frags
+    # Cache only structural rows. Selection/spinner changes must not flatten
+    # the entire conversation or split all its fragments for mouse hit testing.
+    frag_cache: Dict[str, Any] = {"key": None, "rows": []}
 
     # 拖选：anchor/end 是 (内容行号, 行内字符下标)；pt 把点击位置换算成的正是这个坐标。
     drag: Dict[str, Any] = {"anchor": None, "end": None, "active": False,
@@ -655,12 +691,27 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
         top = output_window.max_top if output_window.follow else output_window.vertical_scroll
         return top, (info.window_height if info else 10)
 
+    def _drag_edge(pos) -> int:
+        # Mouse positions are logical (row, character), not physical screen
+        # lines. A wrapped line can occupy the whole viewport: do not mistake
+        # every move within it for a drag at the top/bottom edge.
+        info = output_window.render_info
+        if info is None:
+            return 0
+        candidates = [(column, screen_row)
+                      for screen_row, (row, column) in info.visible_line_to_row_col.items()
+                      if row == pos[0] and column <= pos[1]]
+        if not candidates:
+            return 0
+        screen_row = max(candidates)[1]
+        return -1 if screen_row <= 0 else (1 if screen_row >= info.window_height - 1 else 0)
+
     def _selected_text() -> str:
         rng = _sel_range()
         if rng is None:
             return ""
         (r0, c0), (r1, c1) = rng
-        rows = frag_cache["rows"]
+        rows = _rows()["rows"]
         out: List[str] = []
         for r in range(r0, min(r1, len(rows) - 1) + 1):
             plain = _strip_ansi(rows[r][0])
@@ -682,13 +733,17 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
                 output_window.scroll_by(3)
             elif et == MouseEventType.MOUSE_DOWN and ev.button == MouseButton.LEFT:
                 drag.update(anchor=pos, end=pos, active=True, moved=False, edge=0)
+                if output_window.follow:
+                    output_window.vertical_scroll = output_window.max_top
+                    output_window.follow = False
                 if app_ref:  # 点输出区 → 退出输入框（打字会自动回来）
                     app_ref[0].layout.focus(output_window)
             elif et == MouseEventType.MOUSE_MOVE and drag["active"]:
+                if drag["end"] == pos:
+                    return None
                 drag["end"] = pos
                 drag["moved"] = drag["moved"] or pos != drag["anchor"]
-                top, height = _visible_top_height()
-                drag["edge"] = -1 if pos[0] <= top else (1 if pos[0] >= top + height - 1 else 0)
+                drag["edge"] = _drag_edge(pos)
             elif et == MouseEventType.MOUSE_UP:
                 was_drag = drag["active"] and drag["moved"] and _sel_range() is not None
                 drag.update(active=False, edge=0)
@@ -746,40 +801,71 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
         return out
 
     def _rows():
-        busy = _busy()
-        frame = _SPINNER[int(time.monotonic() * 10) % len(_SPINNER)] if busy else ""
-        rng = _sel_range()
-        key = (model.revision, state["sel"], frame, rng)
+        key = (model.revision, state["sel"])
         if frag_cache["key"] != key:
-            rows = model.render_rows(state["sel"])
-            if busy:
-                pal = model.palette
-                rows = rows + [("", None), ("  " + pal.paint(f"{frame} 输出中…", pal.accent), None)]
-            out: list = []
-            for r, (text, target) in enumerate(rows):
-                handler = plain_handler if target is None else handler_cache.setdefault(
-                    target, _make_handler(target))
-                line = [(style, t, handler) for style, t, *_ in _ansi(text)]
-                if rng is not None and rng[0][0] <= r <= rng[1][0]:
-                    plain_len = len(_strip_ansi(text))
-                    a = rng[0][1] if r == rng[0][0] else 0
-                    b = rng[1][1] + 1 if r == rng[1][0] else max(plain_len, 1)
-                    if not line:
-                        line = [("", " ", handler)]
-                    line = _highlight(line, a, b)
-                out.extend(line)
-                out.append(("", "\n", handler))
-            if out:
-                out.pop()
-            frag_cache.update(key=key, frags=out, rows=rows)
+            frag_cache.update(key=key, rows=model.render_rows(state["sel"]))
         return frag_cache
 
+    class _OutputControl(UIControl):
+        """Lazy rows and O(1) row hit testing instead of one huge fragment list."""
+
+        def is_focusable(self):
+            return True
+
+        def create_content(self, width, height):
+            rows = _rows()["rows"]
+            count = len(rows)
+            busy = _busy()
+            frame = _SPINNER[int(time.monotonic() * 10) % len(_SPINNER)] if busy else ""
+            rng = _sel_range()
+
+            def get_line(row):
+                if row < 0:
+                    return []
+                if row >= count:
+                    if busy and row == count + 1:
+                        return list(_line_fragments(
+                            "  " + model.palette.paint(f"{frame} 输出中…", model.palette.accent)))
+                    return []
+                text = rows[row][0]
+                line = _line_fragments(text)
+                if rng is not None and rng[0][0] <= row <= rng[1][0]:
+                    a = rng[0][1] if row == rng[0][0] else 0
+                    b = rng[1][1] + 1 if row == rng[1][0] else max(len(_strip_ansi(text)), 1)
+                    return _highlight(line or (("", " "),), a, b)
+                return list(line)
+
+            return UIContent(get_line=get_line, line_count=max(1, count + (2 if busy else 0)),
+                             show_cursor=False)
+
+        def preferred_height(self, width, max_available_height, wrap_lines, get_line_prefix):
+            content = self.create_content(width, max_available_height)
+            if not wrap_lines:
+                return min(content.line_count, max_available_height)
+            if width <= 0 or max_available_height <= 0:
+                return 0
+            height = 0
+            for row in range(content.line_count):
+                height += content.get_height_for_line(row, width, get_line_prefix)
+                if height >= max_available_height:
+                    return max_available_height
+            return height
+
+        def mouse_handler(self, ev):
+            rows = _rows()["rows"]
+            row = ev.position.y
+            target = rows[row][1] if 0 <= row < len(rows) else None
+            if target is None:
+                return plain_handler(ev)
+            handler = handler_cache.get(target)
+            if handler is None:
+                handler = handler_cache[target] = _make_handler(target)
+            return handler(ev)
+
     output_window = _ScrollWindow(
-        content=FormattedTextControl(lambda: _rows()["frags"], focusable=True,
-                                     show_cursor=False),
+        content=_OutputControl(),
         wrap_lines=True,
         right_margins=[ScrollbarMargin(display_arrows=False)],
-        # 内容少时只占内容高度（输入框紧跟在内容下面），多余高度给最底下的 filler。
         dont_extend_height=True,
     )
 
@@ -880,6 +966,8 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
     def _mode() -> str:
         if state["exit_armed"] and time.monotonic() - state["exit_armed"] < 2.0:
             return "exit"
+        if not state["mouse"]:
+            return "native"
         if state["sel"] is not None:
             return "browse"
         if app_ref and app_ref[0].layout.has_focus(input_window):
@@ -907,11 +995,9 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
     hint_window = Window(FormattedTextControl(_hint_bar), height=1, style="class:hint")
 
     # -- 键位 --------------------------------------------------------------
-    # 两种焦点：
-    #   浏览（默认，焦点在输出区）：↑↓/滚轮滚动、PgUp/PgDn 翻页、Tab 选折叠块、
-    #     Enter 展开/收起、y/Y 复制；直接打字 → 自动进入输入框。
-    #   输入（光标在输入框）：↑↓ 翻输入历史/移动光标、Enter 发送、Esc 回浏览。
-    # 这样滚轮（终端把它转成 ↑↓）只滚输出，只有光标进了输入框才动输入历史。
+    # 默认聚焦输入框。TUI 鼠标模式下 ↑↓ 操作输入历史/光标，滚轮及 PgUp/PgDn 滚动输出。
+    # F2 原生模式下终端可把滚轮转换为 ↑↓，因此该模式专门把 ↑↓ 路由到输出滚动。
+    # Tab 选折叠块、Enter 展开/收起、y/Y 复制；浏览时直接打字仍会回到输入框。
     kb = KeyBindings()
     in_input = has_focus(input_window)
     in_out = has_focus(output_window)
@@ -1053,8 +1139,13 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
     @kb.add("f2")
     def _mouse_toggle(event):
         state["mouse"] = not state["mouse"]
+        drag.update(anchor=None, end=None, active=False, moved=False, edge=0)
+        _alt_scroll(not state["mouse"])
+        if not state["mouse"]:
+            state["sel"] = None
+            event.app.layout.focus(output_window)
         _flash("已接管鼠标：点击展开、滚轮滚动、拖选自动复制（F2 切到终端原生选择）"
-               if state["mouse"] else "已切到终端原生选择：鼠标拖选由终端处理，滚轮变 ↑↓（F2 切回）")
+               if state["mouse"] else "终端原生选择：↑↓/PgUp/PgDn 翻页；支持备用滚动的终端也可用滚轮（F2 切回）")
 
     # 滚动
     def _page() -> int:
@@ -1071,8 +1162,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
         output_window.scroll_by(_page())
         _invalidate()
 
-    # ↑↓ 只管输入框（历史 / 光标），从不翻页：焦点在输出区时也先回到输入框再处理。
-    # 翻页交给滚轮 / PgUp / PgDn。
+    # 默认 TUI 模式保持 ↑↓ 回输入框；下面的原生模式绑定具有更高优先级。
     @kb.add("up", filter=in_out)
     def _up_to_input(event):
         _to_input(event)
@@ -1082,6 +1172,21 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
     def _down_to_input(event):
         _to_input(event)
         input_buffer.auto_down()
+
+    # Native mouse selection disables mouse reports. Terminals supporting
+    # DECSET 1007 translate the wheel to arrows; route these to output scrolling,
+    # even after typing a draft, rather than unexpectedly changing input history.
+    native_mouse = Condition(lambda: not state["mouse"])
+
+    @kb.add("up", filter=native_mouse)
+    def _native_up(event):
+        output_window.scroll_by(-1)
+        _invalidate()
+
+    @kb.add("down", filter=native_mouse)
+    def _native_down(event):
+        output_window.scroll_by(1)
+        _invalidate()
 
     @kb.add("home", filter=in_out)
     @kb.add("c-home")
@@ -1213,7 +1318,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
             layout=Layout(body, focused_element=input_window),   # 一进来就聚焦输入框
             key_bindings=kb, style=style, full_screen=True,
             mouse_support=Condition(lambda: state["mouse"]),
-            min_redraw_interval=0.03,
+            min_redraw_interval=1 / 60,
         )
     except Exception as exc:
         raise TuiUnavailable(str(exc)) from exc
@@ -1224,17 +1329,20 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
         app.invalidate()
 
     async def _ticker():
-        # 生成中 / 临时提示期间定时重画（转圈 + 提示过期），空闲不耗 CPU。
+        # 拖到边缘时 30Hz 滚动；转圈仍为 10Hz，空闲不重绘。
+        last_frame = None
         while True:
-            await _asyncio.sleep(0.1)
+            await _asyncio.sleep(1 / 30)
             if drag["active"] and drag["edge"]:
                 output_window.scroll_by(drag["edge"])
                 top, height = _visible_top_height()
-                last = max(0, len(frag_cache["rows"]) - 1)
+                last = max(0, len(_rows()["rows"]) - 1)
                 row = max(0, top) if drag["edge"] < 0 else min(last, top + height - 1)
                 drag["end"] = (row, 0 if drag["edge"] < 0 else 10 ** 6)
                 app.invalidate()
-            if _busy() or state["flash"] or state["exit_armed"]:
+            frame = int(time.monotonic() * 10)
+            if (_busy() or state["flash"] or state["exit_armed"]) and frame != last_frame:
+                last_frame = frame
                 if state["flash"] and time.monotonic() >= state["flash_until"]:
                     state["flash"] = ""
                 if state["exit_armed"] and time.monotonic() - state["exit_armed"] >= 2.0:
@@ -1250,7 +1358,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
 
     def _pre_run():
         output_window.follow = True
-        # 不开终端「备用滚动」：否则 F2 让出鼠标后滚轮会变成 ↑↓ 去翻输入历史
+        # 默认由 TUI 接管鼠标；F2 原生模式才打开备用滚动，并专门路由 ↑↓。
         _alt_scroll(False)
         app.layout.focus(input_window)
         app.create_background_task(_ticker())

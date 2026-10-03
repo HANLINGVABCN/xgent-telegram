@@ -149,10 +149,19 @@ class GlobalRecorder:
                 raise
             if 'compression_job_id' in stamped_metadata:
                 raise CompressionError(f"恢复回复写入失败：{e}") from e
-            if 'attachments' in stamped_metadata:
+            if 'attachments' in stamped_metadata or 'model_context' in stamped_metadata:
                 raise AttachmentContextError(f"附件关联写入失败，未调用模型：{e}") from e
             logger.error(f"全局消息记录失败（已忽略，不中断主流程）: {e}")
 
+        from xgent_app.tool_context import active_tool_result
+        tool_scope = active_tool_result.get()
+        if tool_scope is not None and msg_type in {
+            MessageType.AGENT_RESULT, MessageType.MEDIA_REPLY,
+            MessageType.USER_FILE, MessageType.USER_PHOTO,
+        }:
+            if rowid is None:
+                raise AttachmentContextError('工具结果留存失败，未调用下一轮模型。')
+            tool_scope.row_ids.append(rowid)
         if msg_type == MessageType.AI_REPLY:
             return rowid
         try:
@@ -1290,6 +1299,10 @@ async def build_model_conversation_history(history: List[Dict]) -> List[Dict]:
                 + "\n".join(errors)
                 + "\n请恢复原件，或清空当前对话后重新上传/生成。"
             )
+        from xgent_app.tool_context import restore_tool_context, deduplicate_attachment_parts
+        history = await asyncio.to_thread(restore_tool_context, history,
+                                         await db.get_tool_context_records(), ArtifactManager.UPLOAD_DIR)
+        parts = deduplicate_attachment_parts(history, parts)
         return with_attachment_context(with_archive_reference(history, latest_compression), parts)
     except AttachmentContextError:
         raise

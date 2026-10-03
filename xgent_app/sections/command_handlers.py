@@ -75,12 +75,95 @@ def compression_retry_keyboard(entry: Dict) -> Optional[InlineKeyboardMarkup]:
     if entry.get('status') == 'completed':
         return None
     return InlineKeyboardMarkup([[InlineKeyboardButton(
-        '重试恢复', callback_data=f"retry_compress:{entry['job_id']}",
+        '重试压缩', callback_data=f"retry_compress:{entry['job_id']}",
     )]])
 
 
 async def cmd_compress(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await run_context_compression(update, context)
+
+
+async def build_compression_history(snapshot, instruction):
+    """Freeze exactly this conversation, including native payloads, without addons."""
+    from xgent_app.attachments import is_attachment_record
+    from xgent_app.tool_context import restore_tool_context, deduplicate_attachment_parts
+    from xgent_app.compression import metadata_of
+    history = BotMemoryDB.conversation_records_to_messages(snapshot['records'])
+    history = await asyncio.to_thread(restore_tool_context, history, snapshot['records'],
+                                     ArtifactManager.UPLOAD_DIR)
+    records = [r for r in snapshot['records'] if is_attachment_record(r)]
+    parts, updates, errors = await asyncio.to_thread(
+        prepare_attachment_context, records, ArtifactManager.UPLOAD_DIR,
+        ArtifactManager.GENERATED_MEDIA_DIR,
+    )
+    for metadata in [metadata_of(r) for r in records] + [item[2] for item in updates]:
+        for reference in metadata.get('attachments', []):
+            if reference.get('kind') == 'invalid':
+                errors.append(f"无法完整读取附件：{reference.get('name')}")
+    if errors:
+        raise CompressionError('压缩无法完整提供附件：\n' + '\n'.join(errors))
+    parts = deduplicate_attachment_parts(history, parts)
+    history = with_attachment_context(history, parts)
+    # Unlike ordinary historical fallback, compression must never omit a binary.
+    for message in history:
+        if isinstance(message.get('content'), list):
+            for part in message['content']:
+                part.pop('degrade_if_unsupported', None)
+    history.append({'role': 'user', 'content': instruction})
+    return FrozenConversation(history, snapshot['generation'])
+
+
+async def generate_compression_summary(provider, data, model, history, stop_event, usage_sink):
+    """Buffer uncommitted output. No partial summary can become a chat message."""
+    from xgent_app.compression import validate_summary
+    args = (provider, get_next_api_key(provider, data['api_key']), data['base_url'],
+            model, '', history)
+    kwargs = dict(api_format=data.get('api_format', 'openai'), usage_sink=usage_sink,
+                  trace_id=uuid.uuid4().hex, conversation_context=True)
+    stop_task = asyncio.create_task(stop_event.wait())
+    pending = None
+    stream = None
+
+    async def wait_result(awaitable, timeout):
+        nonlocal pending
+        if stop_event.is_set():
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            raise CompressionError('用户已停止压缩。')
+        pending = asyncio.ensure_future(awaitable)
+        done, _ = await asyncio.wait({pending, stop_task}, timeout=timeout,
+                                     return_when=asyncio.FIRST_COMPLETED)
+        if stop_event.is_set():
+            raise CompressionError('用户已停止压缩。')
+        if pending not in done:
+            raise CompressionError('压缩请求超时。')
+        result = pending.result()
+        pending = None
+        return result
+
+    try:
+        if normalize_bool(UserDataManager.get('stream_mode', True), True):
+            stream = ModelClient.think_and_reply_stream(*args, **kwargs).__aiter__()
+            chunks = []
+            while True:
+                try:
+                    chunk = await wait_result(stream.__anext__(), _stream_chunk_idle_timeout_seconds())
+                except StopAsyncIteration:
+                    break
+                chunks.append(chunk)
+            text = ''.join(chunks)
+        else:
+            text, error = await wait_result(ModelClient.think_and_reply(*args, **kwargs),
+                                            _nonstream_hard_timeout_seconds())
+            if error:
+                raise CompressionError(error)
+        return validate_summary(text)
+    finally:
+        await cancel_task_quietly(pending, timeout=1.0)
+        await cancel_task_quietly(stop_task, timeout=0.2)
+        if stream is not None and hasattr(stream, 'aclose'):
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(stream.aclose(), timeout=1.0)
 
 
 @without_ui_history
@@ -97,10 +180,11 @@ async def run_context_compression(update: Update, context: ContextTypes.DEFAULT_
     async with _conversation_processing_lock:
         _is_processing = _compression_running = True
         stop_event = _stop_generation_event = asyncio.Event()
-        status = db = entry = reply = None
-        token_text = []
+        status = db = entry = snapshot = None
+        usage_sink = []
         model = ''
         changed = False
+        started = time.monotonic()
         restore_mirror = lambda: None
         typing_stop = asyncio.Event()
         typing_task = None
@@ -111,141 +195,104 @@ async def run_context_compression(update: Update, context: ContextTypes.DEFAULT_
                     restore_mirror = install_tg_to_web_mirror(get_web_real_bot(), outbox)
             publish_conversation_event(context, {'type': 'compression_state', 'busy': True})
             typing_task = asyncio.create_task(keep_typing_while_waiting(
-                context, update.effective_chat.id, typing_stop, max_duration=TYPING_MAX_DURATION_SECONDS,
-            ))
+                context, update.effective_chat.id, typing_stop, max_duration=TYPING_MAX_DURATION_SECONDS))
             db = await BotMemoryDB.get_instance()
             _, session = await get_or_create_chat_session()
             provider, data = get_current_provider()
-            model = resolve_effective_chat_model(
-                session.get('model'), UserDataManager.get('default_model'), data,
-            )
+            model = resolve_effective_chat_model(session.get('model'), UserDataManager.get('default_model'), data)
             if not data or not model:
                 raise CompressionError('请先配置对话模型。')
-            if retry_job_id is None:
-                snapshot = await db.get_compression_snapshot()
-                if not has_new_content(snapshot['records']):
-                    latest = snapshot['compressions'][-1] if snapshot['compressions'] else None
-                    await message.reply_text('没有新的对话内容需要压缩。', reply_markup=(
-                        compression_retry_keyboard(latest) if latest and latest.get('job_id') else None))
-                    return
+            # Retry deliberately takes the same path as a fresh compression.
+            # Validate stale callbacks, but never restore/clear using an old source.
+            if retry_job_id is not None:
+                async with db._transaction() as conn:
+                    old = await db._require_compression_job(conn, retry_job_id)
+                    if old.get('status') == 'completed':
+                        raise CompressionError('该任务已完成，不会重复压缩。')
+            snapshot = await db.get_compression_snapshot()
+            if not has_new_content(snapshot['records']):
+                await message.reply_text('没有新的对话内容需要压缩。')
+                return
+            _, bundle = await create_conversation_export(snapshot)
+            entry = await db.begin_compression(snapshot, bundle, update.effective_chat.id,
+                                               provider, model, _RECORDER_SOURCE_ID, stop_event)
+            warning = await deliver_conversation_export(context, update.effective_chat.id, bundle)
+            if warning:
                 with contextlib.suppress(Exception):
-                    status = await message.reply_text('正在导出上下文...', reply_markup=build_stop_keyboard())
-                _, bundle = await create_conversation_export(snapshot)
-                entry = await db.begin_compression(
-                    snapshot, bundle, update.effective_chat.id, provider, model, _RECORDER_SOURCE_ID, stop_event,
-                )
-                changed = True
-                cancel_pending_album_conversations()
-                UserDataManager.set('current_chat_id', SINGLE_MEMORY_SESSION_ID)
-                publish_conversation_event(context, {'type': 'history_reset'})
-                warning = await deliver_conversation_export(context, update.effective_chat.id, bundle)
-                if warning:
-                    with contextlib.suppress(Exception):
-                        await message.reply_text(warning)
-                retry_job_id = entry['job_id']
-            entry = await db.start_compression_attempt(retry_job_id, provider, model)
+                    await message.reply_text(warning)
+            # Create this message only after archive delivery: editing an earlier
+            # placeholder would leave the compression status above the ZIP in chat.
+            with contextlib.suppress(Exception):
+                status = await message.reply_text('正在压缩，成功前保留原上下文...', reply_markup=build_stop_keyboard())
+            entry = await db.start_compression_attempt(entry['job_id'], provider, model)
+            await asyncio.to_thread(verify_export, entry)
+            history = await build_compression_history(snapshot, entry['instruction'])
+            summary = await generate_compression_summary(provider, data, model, history, stop_event, usage_sink)
+            await asyncio.to_thread(verify_export, entry)
+            entry = await db.commit_compression(entry, summary, stop_event)
             changed = True
-            await asyncio.to_thread(verify_export, entry)
-            history = []
-            for path in (entry['memory_path'],):
-                if stop_event.is_set():
-                    raise CompressionError('用户已手动停止恢复。')
-                read_result = await AgentExecutor.read_file_ranged(path)
-                if read_result.get('start') != 1 or read_result.get('end') != read_result.get('total_lines'):
-                    raise CompressionError('归档未被完整读取，本次未调用模型。')
-                history.append(read_result['message'])
-            await asyncio.to_thread(verify_export, entry)
-            history.append({'role': 'user', 'content': entry['instruction']})
+            cancel_pending_album_conversations()
+            UserDataManager.set('current_chat_id', SINGLE_MEMORY_SESSION_ID)
             await get_or_create_chat_session()
-
-            async def persist_restore(text, _artifacts, stopped):
-                partial = reply.partial or stopped
-                content = text if not partial else text + '\n\n[本次恢复回复未完成，不是完整压缩结果。]'
-                row_id = await GlobalRecorder.record_ai_reply(content, update.effective_chat.id, metadata={
-                    'compression_job_id': entry['job_id'], 'compression_attempt': entry['attempt'],
-                    'compression_sequence': entry['sequence'], 'compression_complete': not partial,
-                    'attachment_generation': entry['generation'],
-                }, stop_event=None if partial else stop_event)
-                if row_id is None:
-                    raise CompressionError('恢复回复没有成功保存。')
-
-            reply = CompressionReply(persist_restore)
-            stream_mode = normalize_bool(UserDataManager.get('stream_mode', True), True)
-            stream_style = normalize_stream_style(UserDataManager.get('stream_style', DEFAULT_STREAM_STYLE))
-            renderer = (send_non_streaming_response if not stream_mode else
-                        send_background_streaming_response if stream_style == STREAM_STYLE_BACKGROUND else
-                        send_streaming_response)
-            if stop_event.is_set():
-                raise CompressionError('用户已手动停止恢复。')
-            if status is not None:
-                with contextlib.suppress(Exception):
-                    await status.delete()
-                status = None
-            response = await renderer(
-                update, context, provider, data, model,
-                '',
-                FrozenConversation(history, entry['generation']), generated_reply=reply,
-                token_text_sink=token_text,
-            )
-            if not reply.completed:
-                if stop_event.is_set() and reply.text and not reply.recorded:
-                    reply.partial = True
-                    await persist_restore(reply.text, [], True)
-                    reply.recorded = True
-                raise CompressionError(reply.error or response or '未得到完整恢复回复，可从归档重试。')
-            latest = await db.get_latest_compression()
-            if latest is not None and latest['job_id'] == entry['job_id']:
-                entry = latest
+            publish_conversation_event(context, {'type': 'history_reset'})
+            # Delivery is after commit; a Telegram outage cannot undo the summary.
+            with contextlib.suppress(Exception):
+                await safe_send_message(context, update.effective_chat.id, summary)
                 notice, _ = db._compression_notice(entry)
-                with contextlib.suppress(Exception):
-                    await message.reply_text(notice)
+                await message.reply_text(notice)
         except asyncio.CancelledError:
-            if entry is not None:
+            if entry is not None and not changed:
                 with contextlib.suppress(Exception):
-                    await db.fail_compression_attempt(entry, 'stopped', '恢复任务已中断，归档保留，可手动重试。')
+                    await db.fail_compression_attempt(entry, 'stopped', '压缩任务中断，可重试。')
             raise
         except Exception as exc:
-            logger.warning('Context restore failed (cleared=%s): %s', changed, exc)
+            logger.warning('Context compression failed (committed=%s): %s', changed, exc)
+            if changed:
+                return
             detail = redact_sensitive_text(str(exc))
+            result = '压缩失败，原上下文已保留。\n' + detail
             if entry is not None:
                 state = 'stopped' if stop_event.is_set() else 'failed'
                 try:
                     entry = await db.fail_compression_attempt(entry, state, detail)
                 except Exception as failure:
-                    logger.error('Unable to save restore failure state: %s', failure)
-                    entry = {**entry, 'status': state, 'error': detail}
-                if entry is not None:
-                    result, _ = db._compression_notice(entry)
-                    with contextlib.suppress(Exception):
-                        await message.reply_text(result, reply_markup=compression_retry_keyboard(entry))
-            else:
-                result = '本次未清空原有上下文。\n' + detail
-                with contextlib.suppress(Exception):
-                    if status is not None:
-                        await safe_edit_text(status, result, reply_markup=None)
-                    else:
-                        await message.reply_text(result)
+                    logger.error('Unable to save compression failure: %s', failure)
+                if entry is None:
+                    return  # User cleared the conversation; do not resurrect a notice.
+                result, _ = db._compression_notice(entry)
+            elif db is not None and snapshot is not None:
+                # Export/preflight failures also get one model-visible system notice.
+                if snapshot['generation'] != await db.get_attachment_generation():
+                    return
+                await db.record_global_message(
+                    update.effective_chat.id, 0, MessageType.SYSTEM_OP, 'system', result,
+                    SINGLE_MEMORY_SESSION_ID, {'attachment_generation': snapshot['generation'],
+                                               'src': _RECORDER_SOURCE_ID})
+            with contextlib.suppress(Exception):
+                if status is not None:
+                    await safe_edit_text(status, result, reply_markup=compression_retry_keyboard(entry) if entry else None)
+                    status = None
+                else:
+                    await message.reply_text(result, reply_markup=compression_retry_keyboard(entry) if entry else None)
         finally:
             typing_stop.set()
             try:
                 await cancel_task_quietly(typing_task)
-                if db is not None and entry is not None and entry.get('generation') == await db.get_attachment_generation():
-                    for usage in token_text:
+                if status is not None:
+                    with contextlib.suppress(Exception):
+                        await status.delete()
+                if (db is not None and entry is not None
+                        and entry.get('generation') == await db.get_attachment_generation()):
+                    for usage in usage_sink:
                         with contextlib.suppress(Exception):
                             await GlobalRecorder.record_token_usage(
-                                usage.get('text', '') if isinstance(usage, dict) else usage,
-                                update.effective_chat.id, usage=usage.get('usage') if isinstance(usage, dict) else None,
-                                model=model,
-                            )
-            except Exception as exc:
-                logger.warning('Restore cleanup failed: %s', exc)
+                                build_token_usage_message(usage, time.monotonic() - started) or '',
+                                update.effective_chat.id, usage=usage, model=model)
             finally:
                 _stop_generation_event = None
                 _is_processing = _compression_running = False
                 try:
-                    publish_conversation_event(context, {
-                        'type': 'compression_state', 'busy': False, 'committed': changed,
-                    })
+                    publish_conversation_event(context, {'type': 'compression_state', 'busy': False, 'committed': changed})
                 finally:
                     restore_mirror()
 

@@ -1943,6 +1943,26 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 )
             )
 
+            from xgent_app.tool_context import (
+                active_tool_result, ToolResultScope, freeze_tool_message, TOOL_CONTEXT,
+            )
+            retain_tools = normalize_bool(UserDataManager.get('readx_persist_context', False), False)
+            scope_token = active_tool_result.set(None)
+
+            async def add_tool_context(message):
+                message = dict(message)
+                if retain_tools:
+                    payload = await asyncio.to_thread(
+                        freeze_tool_message, message, ArtifactManager.save_binary_upload,
+                    )
+                    scope = active_tool_result.get()
+                    row_id = await db.persist_tool_context(
+                        scope.row_ids if scope else [], payload,
+                        update.effective_chat.id, attachment_generation,
+                    )
+                    message[TOOL_CONTEXT] = row_id
+                round_state.add_context(message)
+
             try:
                 def _smart_match_notice(blk: Dict[str, Any]) -> str:
                     """协议块 nonce 智能匹配时的提示文本（用户与 AI 共用）。"""
@@ -1960,13 +1980,16 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     if not notice:
                         return msg
                     out = dict(msg)
-                    out['content'] = str(out.get('content', '')) + "\n\n" + notice
+                    content = out.get('content', '')
+                    out['content'] = ([*content, {'type': 'text', 'text': notice}]
+                                      if isinstance(content, list) else str(content) + '\n\n' + notice)
                     return out
 
                 for block in protocol_blocks:
                     if is_stop_requested():
                         round_state.should_continue = False
                         break
+                    active_tool_result.set(ToolResultScope() if retain_tools else None)
                     smart_notice = _smart_match_notice(block)
                     block_type = block['type']
                     round_state.note_over_eligibility(block_type)
@@ -2025,63 +2048,14 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                 operation_presentation,
                                 parse_mode=constants.ParseMode.HTML,
                             )
-                        # read 留存开关：开启且本次是成功的 read 时，把完整内容跨轮持久化。
-                        # 文本 → 完整正文作为模型可见内容落库（普通窗口消息，且能被压缩捕获）；
-                        # 图片/二进制 → 登记持久附件，每轮由 build_model_conversation_history 恢复。
-                        # 关闭或非 read → 维持现状，只落摘要 notice。
-                        readx_persist = normalize_bool(
-                            UserDataManager.get('readx_persist_context', False), False
+                        await persist_standard_operation_result(
+                            recorder=GlobalRecorder,
+                            message_type=MessageType.AGENT_RESULT,
+                            database=db, conversation_id=cid,
+                            chat_id=update.effective_chat.id,
+                            operation=standard_operation, presentation=operation_presentation,
                         )
-                        _ctx_msg = standard_operation.get('context_message')
-                        _ctx_content = _ctx_msg.get('content') if isinstance(_ctx_msg, dict) else None
-                        _is_readx = (
-                            standard_operation.get('kind') == 'read'
-                            and standard_operation.get('success')
-                        )
-                        if readx_persist and _is_readx and isinstance(_ctx_content, str):
-                            await persist_agent_result(
-                                recorder=GlobalRecorder,
-                                message_type=MessageType.AGENT_RESULT,
-                                database=db,
-                                conversation_id=cid,
-                                chat_id=update.effective_chat.id,
-                                notice=standard_operation['notice'],
-                                display_content=_ctx_content,
-                            )
-                        else:
-                            await persist_standard_operation_result(
-                                recorder=GlobalRecorder,
-                                message_type=MessageType.AGENT_RESULT,
-                                database=db,
-                                conversation_id=cid,
-                                chat_id=update.effective_chat.id,
-                                operation=standard_operation,
-                                presentation=operation_presentation,
-                            )
-                            if readx_persist and _is_readx and isinstance(_ctx_content, list):
-                                _src = standard_operation.get('source') or {}
-                                _raw, _base = _src.get('raw_content'), _src.get('basename')
-                                _mime = _src.get('mime_type') or ''
-                                if _raw and _base:
-                                    try:
-                                        _saved = ArtifactManager.save_binary_upload(_base, _raw)
-                                        _is_img = _mime.startswith('image/')
-                                        _ref = ArtifactManager.attachment_reference(
-                                            _saved, _base, _raw,
-                                            context_prefix="（模型通过 read 读入的文件）",
-                                            mime_type=_mime, expected_image=_is_img,
-                                            expected_binary=(not _is_img),
-                                        )
-                                        await GlobalRecorder.record_attachment_message(
-                                            content=standard_operation['notice'],
-                                            msg_type=(MessageType.USER_PHOTO if _is_img
-                                                      else MessageType.USER_FILE),
-                                            chat_id=update.effective_chat.id,
-                                            attachments=[_ref],
-                                        )
-                                    except Exception as exc:
-                                        logger.warning(f"read 留存：附件登记失败（已忽略）: {exc}")
-                        round_state.add_context(
+                        await add_tool_context(
                             _ctx_with_notice(standard_operation['context_message'], smart_notice)
                         )
                         round_state.should_continue = True
@@ -2111,7 +2085,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                 chat_id=update.effective_chat.id,
                                 notice=sendfile_notice,
                             )
-                            round_state.add_context(
+                            await add_tool_context(
                                 _ctx_with_notice(build_sendfile_context_message(sendfile_notice), smart_notice)
                             )
                             round_state.should_continue = True
@@ -2153,7 +2127,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                 chat_id=update.effective_chat.id,
                                 notice=file_notice,
                             )
-                            round_state.add_context(
+                            await add_tool_context(
                                 _ctx_with_notice(build_file_context_message(file_notice), smart_notice)
                             )
                             round_state.should_continue = True
@@ -2195,7 +2169,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                 chat_id=update.effective_chat.id,
                                 notice=file_notice,
                             )
-                            round_state.add_context(
+                            await add_tool_context(
                                 _ctx_with_notice(build_file_context_message(file_notice, protocol="file:base64"), smart_notice)
                             )
                             round_state.should_continue = True
@@ -2216,7 +2190,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                 chat_id=update.effective_chat.id,
                                 notice=f"[ask结果] {ask_err}",
                             )
-                            round_state.add_context(
+                            await add_tool_context(
                                 _ctx_with_notice(build_ask_context_message(f"[ask结果] {ask_err}"), smart_notice)
                             )
                             round_state.should_continue = True
@@ -2320,14 +2294,14 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             }},
                         )
                         if shell_result.get('running'):
-                            round_state.add_context(
+                            await add_tool_context(
                                 _ctx_with_notice(build_shell_context_message(shell_notice, running=True), smart_notice)
                             )
                             round_state.should_continue = True
                             # 会话仍在运行不代表本次回复的后续协议无效；继续按原顺序处理，
                             # 这样同一回复中的 stdin/shellkill 不会被静默跳过。
                             continue
-                        round_state.add_context(
+                        await add_tool_context(
                             _ctx_with_notice(build_shell_context_message(shell_notice, running=False), smart_notice)
                         )
                         round_state.should_continue = True
@@ -2406,12 +2380,13 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             logger=logger,
                         )
 
-                        round_state.add_context(
+                        await add_tool_context(
                             _ctx_with_notice(await build_media_continuation_message(media_result, media_prompt), smart_notice)
                         )
                         round_state.should_continue = True
             
             finally:
+                active_tool_result.reset(scope_token)
                 # 放进 finally：run 分支抛错时（磁盘满等）如果不清理，
                 # typing 状态会空转到 max_duration 才停。
                 typing_stop.set()
@@ -2615,6 +2590,16 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             agent_turn_history.append({'role': 'assistant', 'content': response})
 
 
+async def persist_ask_answer(text, chat_id, generation):
+    answer = build_ask_context_message(text)
+    metadata = {'attachment_generation': generation}
+    if normalize_bool(UserDataManager.get('readx_persist_context', False), False):
+        from xgent_app.tool_context import freeze_tool_message
+        metadata['model_context'] = freeze_tool_message(answer, ArtifactManager.save_binary_upload)
+    await GlobalRecorder.record_user_message(text, MessageType.USER_TEXT, chat_id, metadata=metadata)
+    return answer
+
+
 async def resume_from_ask(ask_id: str) -> str:
     """用户提交（或取消）ask 表单后恢复 Agent 循环。
 
@@ -2634,9 +2619,7 @@ async def resume_from_ask(ask_id: str) -> str:
     answer_text = pending.form.assemble_answer(pending.draft)
 
     # 记录一条用户消息（表单回答，不含明文密钥）到全局记忆，供三端展示与后续历史。
-    await GlobalRecorder.record_user_message(
-        answer_text, MessageType.USER_TEXT, pending.chat_id,
-    )
+    answer_message = await persist_ask_answer(answer_text, pending.chat_id, pending.generation)
 
     # 走 trigger 同款投递：MirrorBot（TG + 网页双通道），与哪个端点了提交无关。
     bot = build_trigger_delivery_bot(int(pending.chat_id))
@@ -2644,7 +2627,7 @@ async def resume_from_ask(ask_id: str) -> str:
     context = _SelfTriggerContext(bot)
     resume_state = {
         'turn_history_snapshot': pending.turn_history_snapshot,
-        'answer_message': build_ask_context_message(answer_text),
+        'answer_message': answer_message,
     }
     asyncio.create_task(process_conversation(
         update,
@@ -2669,13 +2652,13 @@ async def cancel_ask(ask_id: str) -> str:
         return "上下文已清空，这个表单已失效。"
 
     notice = "[用户已取消表单] 用户没有作答，请不要再等待表单结果，自行决定如何收尾或改用其它方式。"
-    await GlobalRecorder.record_user_message(notice, MessageType.USER_TEXT, pending.chat_id)
+    answer_message = await persist_ask_answer(notice, pending.chat_id, pending.generation)
     bot = build_trigger_delivery_bot(int(pending.chat_id))
     update = _SelfTriggerUpdate(bot, int(pending.chat_id))
     context = _SelfTriggerContext(bot)
     resume_state = {
         'turn_history_snapshot': pending.turn_history_snapshot,
-        'answer_message': build_ask_context_message(notice),
+        'answer_message': answer_message,
     }
     asyncio.create_task(process_conversation(
         update, context, notice,

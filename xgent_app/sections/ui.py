@@ -330,7 +330,7 @@ def get_more_settings_menu():
         [InlineKeyboardButton("🔐 凭据" + _credentials_badge(), callback_data="menu_credentials"),
          InlineKeyboardButton("🧹 清空上下文", callback_data="cmd_delete")],
         [InlineKeyboardButton(f"🔇 静默未授权:{'🟢 开' if normalize_bool(UserDataManager.get('silent_unauthorized', False), False) else '🔴 关'}", callback_data="toggle_silent_unauthorized")],
-        [InlineKeyboardButton(f"📎 read留存:{'🟢 开' if normalize_bool(UserDataManager.get('readx_persist_context', False), False) else '🔴 关'}", callback_data="toggle_readx_persist_context")],
+        [InlineKeyboardButton(f"📎 工具结果留存:{'🟢 开' if normalize_bool(UserDataManager.get('readx_persist_context', False), False) else '🔴 关'}", callback_data="toggle_readx_persist_context")],
         [InlineKeyboardButton(f"🗂 折叠代码块:{'🟢 开' if normalize_bool(UserDataManager.get('hide_protocol_blocks', True), True) else '🔴 关'}", callback_data="toggle_hide_protocol_blocks")],
         [InlineKeyboardButton("ℹ️ 状态", callback_data="cmd_info"),
          InlineKeyboardButton("🧩 Skill 管理", callback_data="menu_skills")],
@@ -571,7 +571,7 @@ def build_timeout_settings_text() -> str:
         f"⌨️ 命令等待窗口：<b>{_fmt_command_timeout(command_timeout)}</b>\n"
         f"🔁 Agent最大轮数：<b>{_fmt_agent_max_iterations(agent_max_iterations)}</b>\n"
         f"💭 空闲提醒间隔：<b>{_fmt_idle_message_interval(idle_interval)}</b>\n\n"
-        "记忆深度控制系统能回顾多少条历史；智能匹配阈值控制协议块 nonce 相似度达到多少时容错执行（100% = 只精确匹配）；"
+        "记忆深度按模型可见消息计数（不含 token 提示和轮次状态），不是问答轮数；智能匹配阈值控制协议块 nonce 相似度达到多少时容错执行（100% = 只精确匹配）；"
         "AI回复超时控制等待模型响应的时间；命令等待窗口控制 run 的最长等待，也是 shell 状态判断的硬上限；"
         "Agent最大轮数控制从最近一条真实用户消息开始，系统结果继续调用 AI 的累计次数；"
         "空闲提醒间隔控制用户多久没发消息后自动生成一条提醒回复。"
