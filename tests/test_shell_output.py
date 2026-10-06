@@ -22,6 +22,12 @@ class ShellOutputTests(unittest.TestCase):
         self.assertIn("latest", result)
         self.assertIn("最新 shell 输出", result)
 
+    def test_truncated_archive_notice_is_explicit(self):
+        notice = build_run_notice({"output": "summary", "output_path": "/tmp/output.txt",
+                                   "archive_truncated": True})
+        self.assertIn("输出存档（已截断）文件", notice)
+        self.assertNotIn("完整输出文件", notice)
+
     def test_context_and_result_are_separate_formats(self):
         context = format_shell_context_output("x" * 13000, False, 12000)
         notice = build_run_notice({

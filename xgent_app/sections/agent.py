@@ -1600,25 +1600,35 @@ class AgentExecutor:
     @classmethod
     async def run_command(cls, command: str,
                           stop_event: Optional[asyncio.Event] = None) -> Dict[str, Any]:
-        """执行一次性命令，等待结束并保存完整输出。"""
+        """执行一次性命令；输出流式落盘，取消/超时都必须回收进程和等待任务。"""
         command = command.strip()
         if not command:
             return {'success': False, 'output': 'run 命令为空', 'return_code': -1}
 
         blocked, pattern = AgentCommandBlacklist.check(command)
         if blocked:
-            # 命中的规则只写日志，不回灌给模型：告诉它具体匹配了哪一条，
-            # 等于直接指导它改写命令来绕过。
             logger.warning(f"run 命令被黑名单拦截，命中规则: {pattern} | 命令: {command[:200]}")
-            return {
-                'success': False,
-                'output': BLACKLIST_BLOCKED_NOTICE,
-                'return_code': -1,
-            }
+            return {'success': False, 'output': BLACKLIST_BLOCKED_NOTICE, 'return_code': -1}
 
         timeout = cls.get_timeout()
         process = None
+        tasks = []
+        capture = RunOutputCapture(command)
         started_at = time.monotonic()
+        stopped = timed_out = failed = False
+        notice = ''
+
+        async def cleanup():
+            try:
+                if process is not None and process.returncode is None:
+                    await terminate_async_process(process)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.to_thread(capture.finish, notice)
+
         try:
             kwargs: Dict[str, Any] = {}
             if os.name != 'nt':
@@ -1628,111 +1638,104 @@ class AgentExecutor:
                 kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
 
             run_env = {**os.environ, 'LANG': 'en_US.UTF-8'}
-            # 把当前对话上下文透传给子进程：xgent_trigger.py 用它登记任务并
-            # 把结果投递回正确对话。仅在已知时注入，避免污染无关命令。
             if cls._current_chat_id is not None:
                 run_env['XGENT_CHAT_ID'] = str(cls._current_chat_id)
             if cls._current_conversation_id is not None:
                 run_env['XGENT_CONVERSATION_ID'] = str(cls._current_conversation_id)
 
-            process = await asyncio.create_subprocess_shell(
-                command,
-                cwd=cls.WORK_DIR,
-                env=run_env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                **kwargs
-            )
+            # 创建进程途中也可能收到取消，先取回句柄再让 finally 回收它。
+            spawn_task = asyncio.create_task(asyncio.create_subprocess_shell(
+                command, cwd=cls.WORK_DIR, env=run_env,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **kwargs,
+            ))
+            cancelled_during_spawn = False
+            while not spawn_task.done():
+                try:
+                    await asyncio.shield(spawn_task)
+                except asyncio.CancelledError:
+                    cancelled_during_spawn = True
+            process = spawn_task.result()
+            if cancelled_during_spawn:
+                raise asyncio.CancelledError
 
-            communicate_task = asyncio.create_task(process.communicate())
-            stop_task = asyncio.create_task(stop_event.wait()) if stop_event else None
+            readers = [
+                asyncio.create_task(capture.read_stream(process.stdout, 'stdout')),
+                asyncio.create_task(capture.read_stream(process.stderr, 'stderr')),
+                asyncio.create_task(process.wait()),
+            ]
+            tasks.extend(readers)
+
+            async def wait_command():
+                await asyncio.gather(*readers)
+
+            completion = asyncio.create_task(wait_command())
             timeout_task = asyncio.create_task(asyncio.sleep(timeout))
-            wait_tasks = {communicate_task, timeout_task}
+            stop_task = asyncio.create_task(stop_event.wait()) if stop_event else None
+            wait_tasks = {completion, timeout_task}
             if stop_task:
                 wait_tasks.add(stop_task)
-
-            done, pending = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
-
-            stopped = bool(stop_task and stop_task in done and stop_event and stop_event.is_set())
-            timed_out = timeout_task in done
-            if stopped or timed_out:
+            tasks.extend(wait_tasks)
+            done, _ = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
+            # 完成与计时器同一轮就绪时，以已完成的命令结果为准。
+            if completion not in done:
+                stopped = bool(stop_task and stop_task in done)
+                timed_out = not stopped and timeout_task in done
                 await terminate_async_process(process)
-
-            for task in (timeout_task, stop_task):
-                if task and not task.done():
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
-
-            stdout = b''
-            stderr = b''
-            if communicate_task.done():
-                with contextlib.suppress(Exception):
-                    stdout, stderr = communicate_task.result()
-            elif stopped or timed_out:
-                with contextlib.suppress(Exception):
-                    stdout, stderr = await asyncio.wait_for(communicate_task, timeout=2)
-                if not communicate_task.done():
-                    communicate_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await communicate_task
+                try:
+                    await asyncio.wait_for(asyncio.shield(completion), timeout=2)
+                except asyncio.TimeoutError:
+                    # 有子进程继承管道时不要无限等 EOF；finally 会取消读任务。
+                    pass
             else:
-                communicate_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await communicate_task
+                await completion  # 不吞掉管道读取异常。
 
-            stdout_text = stdout.decode('utf-8', errors='replace') if isinstance(stdout, (bytes, bytearray)) else (stdout or '')
-            stderr_text = stderr.decode('utf-8', errors='replace') if isinstance(stderr, (bytes, bytearray)) else (stderr or '')
-            output = stdout_text
-            if stderr_text:
-                output += ("\n--- stderr ---\n" + stderr_text) if output else stderr_text
             if stopped:
-                output = (output + "\n" if output else "") + "⏹️ 命令已被用户手动停止"
+                notice = '⏹️ 命令已被用户手动停止'
             elif timed_out:
-                output = (output + "\n" if output else "") + f"⏰ 命令超过等待窗口 ({timeout}秒)，已停止。需要长驻/日志/交互任务时请使用 shell。"
-            elif process is not None and process.returncode in (-15, -9):
-                hint = diagnose_signal_death(command, process.returncode)
-                if hint:
-                    output = (output + "\n" if output else "") + hint
-            output = output or '(无输出)'
+                notice = f'⏰ 命令超过等待窗口 ({timeout}秒)，已停止。需要长驻/日志/交互任务时请使用 shell。'
+            elif process.returncode in (-15, -9):
+                notice = diagnose_signal_death(command, process.returncode) or ''
+        except asyncio.CancelledError:
+            notice = '⏹️ 命令任务已取消'
+            raise
+        except Exception as exc:
+            failed = True
+            logger.error('run 命令执行异常: %s', exc)
+            notice = f'执行异常: {str(exc)[:200]}'
+        finally:
+            # 清理独立于父任务；即使在清理期间再收到取消，也先回收资源再传播。
+            cleanup_task = asyncio.create_task(cleanup())
+            cancelled = False
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    cancelled = True
+            await cleanup_task
+            if cancelled:
+                raise asyncio.CancelledError
 
-            elapsed_seconds = round(max(0.0, time.monotonic() - started_at), 2)
-            saved = await save_command_output_async(command, output)
-            await memory_maintenance.trim_after_large_command(elapsed_seconds, saved['bytes'])
-            rc = process.returncode if process else -1
-            return {
-                'success': bool(not stopped and not timed_out and rc == 0),
-                'command': command,
-                'output': output,
-                'display_output': format_shell_context_output(output, running=False),
-                'return_code': rc if rc is not None else -1,
-                'timed_out': timed_out,
-                'stopped': stopped,
-                'output_path': saved['path'],
-                'output_bytes': saved['bytes'],
-                'elapsed_seconds': elapsed_seconds,
-            }
-        except Exception as e:
-            if process is not None:
-                await terminate_async_process(process)
-            logger.error(f"run 命令执行异常: {e}")
-            output = f"执行异常: {str(e)[:200]}"
-            elapsed_seconds = round(max(0.0, time.monotonic() - started_at), 2)
-            saved = await save_command_output_async(command, output)
-            await memory_maintenance.trim_after_large_command(elapsed_seconds, saved['bytes'])
-            return {
-                'success': False,
-                'command': command,
-                'output': output,
-                'display_output': output,
-                'return_code': -1,
-                'timed_out': False,
-                'stopped': False,
-                'output_path': saved['path'],
-                'output_bytes': saved['bytes'],
-                'elapsed_seconds': elapsed_seconds,
-            }
-    
+        output = capture.output()
+        if notice:
+            output += ('\n' if output else '') + notice
+        output = output or '(无输出)'
+        elapsed_seconds = round(max(0.0, time.monotonic() - started_at), 2)
+        await memory_maintenance.trim_after_large_command(elapsed_seconds, capture.bytes)
+        rc = process.returncode if process else -1
+        return {
+            'success': bool(not failed and not stopped and not timed_out and rc == 0),
+            'command': command,
+            'output': output,
+            'display_output': format_shell_context_output(output, running=False),
+            'return_code': -1 if failed or rc is None else rc,
+            'timed_out': timed_out,
+            'stopped': stopped,
+            'output_path': capture.path,
+            'output_bytes': capture.bytes if capture.path else 0,
+            'archive_truncated': capture.archive_truncated,
+            'elapsed_seconds': elapsed_seconds,
+        }
+
     @classmethod
     def get_clean_response_all(cls, ai_response: str) -> str:
         """获取 AI 回复中除命令块、文件块、发送块以外的文本。

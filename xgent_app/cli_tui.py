@@ -5,19 +5,12 @@
 输入框，直接打字自动回到输入框。F2 切换终端原生选择；原生模式下 ↑↓/PgUp/PgDn 翻页，
 支持 DECSET 1007 的终端也可用滚轮。选区只重画可见行，剪贴板命令不阻塞输入。
 
-折叠语义与 Telegram / 网页完全一致（spec）
-----------------------------------------
-折叠开时，每个 `*-x` 协议块经 render_folded_html 变成
-``<blockquote expandable>块头 · N 行 <pre>前 50 行</pre> [已折叠 K 行]</blockquote>``，
-MessageRenderer 把它画成：
-
-    🔧 run · 55 行          ← 块头行
-    │ l0 … │ l49           ← 代码条（最多 50 行）
-    已折叠 5 行              ← 仅正文 > 50 行时存在，纯文字
-
-TUI 把这一组识别成一个折叠块：**默认收起 = 只显示「▸ 块头」一行**；
-Enter / 点击 → 原地展开成「▾ 块头 + 前 50 行 (+ 已折叠 K 行)」，再点收起。
-「已折叠 K 行」只是文字，不可点。折叠关时没有块头行，一切按原文显示。
+折叠与完整输出
+--------------
+Web/TUI 收到完整标准 HTML，默认收起大块，展开显示完整正文；Telegram 独立限长。
+复制代码使用原始正文，不使用按终端宽度换行后的文字。
+旧预览若携带 data-raw，可无执行地恢复；缺少原文的旧数据不伪造内容。
+F3 打开当前/最近的命令输出存档，F5/F6 每次读取一页；不把超大日志读进内存。
 
 架构：只换绘制/输入半边
 ------------------------
@@ -30,10 +23,12 @@ opt-in + 兜底：`tui_enabled()` 为假或 pt 起不来 → xgent_cli 走 legac
 from __future__ import annotations
 
 import os
+import copy
+import html
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from itertools import groupby
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -43,6 +38,8 @@ from .cli_render import (
     Palette,
     content_width,
     terminal_size,
+    wrap_line,
+    split_control_buttons,
     _FOLD_HEADER_RE as _HEADER_RE,
 )
 
@@ -113,15 +110,27 @@ class Block:
     expanded: bool = False
     header: str = ""
 
+    _code_lines: List[str] = field(init=False, repr=False)
+    _foldable: bool = field(init=False, repr=False)
+    total_lines: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        # Block 的正文在 upsert 时整体替换；展开/选择只改状态，不应重跑正则。
+        self._code_lines = [line for line in self.lines if not _is_folded_label(line)]
+        self.source_body = next((getattr(line, 'source_body', None) for line in self.lines
+                                 if getattr(line, 'source_body', None) is not None), None)
+        self._foldable = self.collapsible and (
+            len(self._code_lines) > _PREVIEW_LINES or len(self._code_lines) != len(self.lines))
+        match = re.search(r"·\s*(\d+)\s*行$", _strip_ansi(self.header).strip())
+        self.total_lines = int(match.group(1)) if match else len(self._code_lines)
+
     @property
     def code_lines(self) -> List[str]:
-        return [ln for ln in self.lines if not _is_folded_label(ln)]
+        return self._code_lines
 
     @property
     def foldable(self) -> bool:
-        """协议块但正文不超过 3 行且无标签：不折叠，整块直接显示，无箭头。"""
-        return self.collapsible and (
-            len(self.code_lines) > _PREVIEW_LINES or len(self.code_lines) != len(self.lines))
+        return self._foldable
 
 
 @dataclass
@@ -130,7 +139,12 @@ class TuiMessage:
     blocks: List[Block]
     leading_blank: bool = True
     key: int = 0          # 模型内部唯一键：无 message_id 的消息（/getchat 历史）也能被选中/展开
-    committed: bool = False  # 已写进终端滚动区（之后只能在 Ctrl+T 记录页里展开）
+    committed: bool = False  # 兼容旧滚动区接口；全屏 TUI 保留全部消息。
+    attention: bool = False
+    output_path: Optional[str] = None
+    rows_key: Any = field(default=None, repr=False, compare=False)
+    rows_cache: List[Tuple[str, ToggleTarget]] = field(default_factory=list, repr=False, compare=False)
+    fold_counts: Tuple[int, int] = field(default=(0, 0), repr=False, compare=False)
 
 
 def segment_lines(lines: Sequence[str]) -> List[Block]:
@@ -180,32 +194,60 @@ def segment_lines(lines: Sequence[str]) -> List[Block]:
 class MessageModel:
     """全量消息 + 每个折叠块的展开态（以 message_id 为键，历史消息也能原地改）。"""
 
-    def __init__(self, palette: Optional[Palette] = None) -> None:
+    def __init__(self, palette: Optional[Palette] = None, preview_lines: int = _PREVIEW_LINES) -> None:
         self.palette = palette or Palette(False)
+        self.preview_lines = max(0, preview_lines)
         self.messages: List[TuiMessage] = []
         self._index: Dict[int, TuiMessage] = {}   # message_id → 消息
         self._keyed: Dict[int, TuiMessage] = {}   # 内部 key → 消息
         self._next_anon = -1
         self.revision = 0  # 每次变更自增，渲染层据此复用缓存
-        self._counts_revision = -1
         self._counts_cache = (0, 0)
+        self._targets_revision = -1
+        self._targets_cache: List[Tuple[int, int]] = []
 
     def _touch(self) -> None:
         self.revision += 1
+
+    def _changed_message(self, msg: TuiMessage) -> None:
+        folds = [block for block in msg.blocks if block.foldable]
+        counts = (len(folds), sum(block.expanded for block in folds))
+        self._counts_cache = tuple(
+            old + new - previous
+            for old, new, previous in zip(self._counts_cache, counts, msg.fold_counts))
+        msg.fold_counts = counts
+        msg.rows_key = None
+        msg.rows_cache = []
 
     def upsert(self, message_id: Optional[int], lines: Sequence[str],
                leading_blank: bool = True) -> None:
         """新增或原地替换；替换时按「第几个折叠块」保留展开态（流式编辑不把
         用户展开的块收回去）。message_id 为 None 一律追加。"""
         blocks = segment_lines(lines)
+        attention = any(_strip_ansi(line).lstrip().startswith(("❌", "⚠")) for line in lines)
+        output_path = next((getattr(line, 'output_path', None) for line in lines
+                            if getattr(line, 'output_path', None)), None)
+        if not output_path:
+            # 旧结果只有可见路径行；仍需通过 command_outputs 白名单才能读取。
+            for line in lines:
+                match = re.match(r'^\s*(?:完整输出|输出存档（已截断）):\s*`?(.+?)`?\s*$', _strip_ansi(line))
+                if match and match[1].strip('`').endswith('.txt'):
+                    output_path = match[1].strip('`')
+                    break
         old = self._index.get(message_id) if message_id is not None else None
         if old is not None:
             old_folds = [b for b in old.blocks if b.foldable]
             new_folds = [b for b in blocks if b.foldable]
             for ob, nb in zip(old_folds, new_folds):
                 nb.expanded = ob.expanded
+            if attention and not old.attention:
+                for block in new_folds:
+                    block.expanded = True
+            old.attention = attention
+            old.output_path = output_path
             old.blocks = blocks
             old.leading_blank = leading_blank
+            self._changed_message(old)
             if old.committed:
                 # 已写进滚动区的消息又被编辑（少见：旧菜单被点）：滚动区改不了，
                 # 挪到末尾重新进实时区，稍后作为新的一份写出。
@@ -220,8 +262,13 @@ class MessageModel:
                 key = message_id
             else:
                 key, self._next_anon = self._next_anon, self._next_anon - 1
-            msg = TuiMessage(message_id, blocks, leading_blank, key)
+            msg = TuiMessage(message_id, blocks, leading_blank, key, attention=attention, output_path=output_path)
+            if attention:
+                for block in blocks:
+                    if block.foldable:
+                        block.expanded = True
             self.messages.append(msg)
+            self._changed_message(msg)
             self._keyed[key] = msg
             if message_id is not None:
                 self._index[message_id] = msg
@@ -235,6 +282,7 @@ class MessageModel:
         if msg is None:
             return False
         self._keyed.pop(msg.key, None)
+        self._counts_cache = tuple(a - b for a, b in zip(self._counts_cache, msg.fold_counts))
         try:
             self.messages.remove(msg)
         except ValueError:
@@ -256,6 +304,7 @@ class MessageModel:
         if blk is None:
             return False
         blk.expanded = not blk.expanded
+        self._changed_message(self._keyed[message_id])
         self._touch()
         return True
 
@@ -268,15 +317,20 @@ class MessageModel:
             for blk in msg.blocks:
                 if blk.foldable:
                     blk.expanded = expanded
+            self._changed_message(msg)
         self._touch()
 
     def foldable_targets(self) -> List[Tuple[int, int]]:
         """按显示顺序列出全部折叠块（只含有 message_id 的消息）。"""
+        if self._targets_revision == self.revision:
+            return self._targets_cache
         out: List[Tuple[int, int]] = []
         for msg in self.messages:
             for bi, blk in enumerate(msg.blocks):
                 if blk.foldable:
                     out.append((msg.key, bi))
+        self._targets_revision = self.revision
+        self._targets_cache = out
         return out
 
     def message_of(self, target: ToggleTarget) -> Optional[TuiMessage]:
@@ -284,20 +338,10 @@ class MessageModel:
 
     def counts(self) -> Tuple[int, int]:
         """(折叠块总数, 已展开数)，给状态栏用。"""
-        if self._counts_revision == self.revision:
-            return self._counts_cache
-        total = opened = 0
-        for msg in self.messages:
-            for blk in msg.blocks:
-                if blk.foldable:
-                    total += 1
-                    opened += blk.expanded
-        self._counts_revision = self.revision
-        self._counts_cache = (total, opened)
         return self._counts_cache
 
     def _header_row(self, blk: Block, selected: bool) -> str:
-        """块头特殊显示：箭头 + 反色协议名（file-x 路径）+ 灰色「· N 行」。"""
+        """单行块头：箭头 + 协议名 + 次要行数；不用背景色标签。"""
         pal = self.palette
         plain = _strip_ansi(blk.header)
         indent = plain[:len(plain) - len(plain.lstrip(" "))]
@@ -307,7 +351,7 @@ class MessageModel:
             name, rest = text, ""
         arrow = ("▾" if blk.expanded else "▸") if blk.foldable else "■"
         lead = indent[:-2] + pal.paint("❯ ", pal.accent, pal.bold) if selected else indent
-        tag = pal.paint(f" {name} ", pal.bold, "\x1b[48;5;60m", "\x1b[38;5;231m") if pal.enabled else f"[{name}]"
+        tag = pal.paint(name, pal.accent, pal.bold if selected else "") if pal.enabled else f"[{name}]"
         tail = pal.paint(f" · {rest}", pal.muted) if rest else ""
         mark = pal.paint(arrow, pal.accent, pal.bold) if selected else pal.paint(arrow, pal.accent)
         return f"{lead}{mark} {tag}{tail}"
@@ -317,11 +361,8 @@ class MessageModel:
         indent = _strip_ansi(blk.header)[:2]
         return indent + pal.paint(f"┄┄ {_strip_ansi(ln).strip()} ┄┄", pal.muted, pal.italic)
 
-    @staticmethod
-    def _hidden_count(blk: Block) -> int:
-        m = re.search(r"·\s*(\d+)\s*行$", _strip_ansi(blk.header).strip())
-        total = int(m.group(1)) if m else len(blk.code_lines)
-        return max(0, total - _PREVIEW_LINES)
+    def _hidden_count(self, blk: Block) -> int:
+        return max(0, blk.total_lines - self.preview_lines)
 
     def _message_rows(self, msg: TuiMessage, selected: ToggleTarget,
                       hint: Optional[str]) -> List[Tuple[str, ToggleTarget]]:
@@ -334,7 +375,7 @@ class MessageModel:
             target: ToggleTarget = (msg.key, bi) if blk.foldable else None
             rows.append((self._header_row(blk, target is not None and target == selected), target))
             if blk.foldable and not blk.expanded:
-                rows.extend((ln, target) for ln in blk.code_lines[:_PREVIEW_LINES])
+                rows.extend((ln, target) for ln in blk.code_lines[:self.preview_lines])
                 if hint:
                     indent = _strip_ansi(blk.header)[:2]
                     rows.append((indent + pal.paint(
@@ -353,7 +394,7 @@ class MessageModel:
         """摊平成 (行文本, 折叠目标)。
 
         可折叠块：收起 = 块头 + 前 3 行预览（hint 给了就再加一行「… 还有 N 行 · hint」）；
-        展开 = 块头 + 前 50 行 + 「已折叠 K 行」。≤3 行的块整块显示、不带目标。
+        展开 = 块头 + 完整正文；旧预览的「已折叠 K 行」只作缺失说明。≤3 行的块整块显示、不带目标。
         「已折叠 K 行」只是文字，不带目标。
         """
         msgs = self.messages if messages is None else list(messages)
@@ -361,7 +402,13 @@ class MessageModel:
         for mi, msg in enumerate(msgs):
             if mi > 0 and msg.leading_blank:
                 rows.append(("", None))
-            rows.extend(self._message_rows(msg, selected, hint))
+            # 选中块只影响所在消息；流式更新也只使对应消息的布局失效。
+            local_selected = selected if selected is not None and selected[0] == msg.key else None
+            key = (local_selected, hint)
+            if msg.rows_key != key:
+                msg.rows_cache = self._message_rows(msg, local_selected, hint)
+                msg.rows_key = key
+            rows.extend(msg.rows_cache)
         return rows
 
     def commit_rows(self, msg: TuiMessage, first: bool = False) -> List[str]:
@@ -373,14 +420,89 @@ class MessageModel:
         return [m for m in self.messages if not m.committed]
 
 
+
+@lru_cache(maxsize=1024)
+def _cached_paragraph(text: str, width: int) -> tuple:
+    return tuple(wrap_line(text, width))
+
+
+def _tui_wrap_text(text: str, width: int) -> Sequence[str]:
+    # 累计流式文本的旧段落保持不变；只重排新段落。巨段落不进入缓存。
+    return _cached_paragraph(text, width) if len(text) <= 2048 else wrap_line(text, width)
+
+
+class _SourceCodeLine(str):
+    def __new__(cls, text: str, source_body: str):
+        value = super().__new__(cls, text)
+        value.source_body = source_body
+        return value
+
+
+class _ArchiveLine(str):
+    """Carry display-only archive metadata through the existing list-of-lines API."""
+    def __new__(cls, text: str, output_path: str):
+        value = super().__new__(cls, text)
+        value.output_path = output_path
+        return value
+
+
+class TuiMessageRenderer(MessageRenderer):
+    """只供全屏 TUI 使用：无双横线气泡/整行底色，legacy 和其他通道不变。"""
+
+    def __init__(self, palette: Palette, width: int):
+        super().__init__(palette, width, wrap_text=_tui_wrap_text)
+
+    def _render_pre(self, raw: str, body_width: int) -> List[str]:
+        lines = super()._render_pre(raw, body_width)
+        if lines:
+            lines[0] = _SourceCodeLine(lines[0], html.unescape(re.sub(r"<[^>]+>", "", raw)))
+        return lines
+
+    def _indent_pre_line(self, line: str, indent: str) -> str:
+        if hasattr(line, 'source_body'):
+            return _SourceCodeLine(indent + line, line.source_body)
+        return indent + line
+
+    def render_text(self, text: str, parse_mode: Any = None, indent: str = "  ") -> List[str]:
+        lines = super().render_text(text, parse_mode, indent)
+        if lines and parse_mode is not None and "html" in str(parse_mode).lower():
+            match = re.search(r'<blockquote\b[^>]*\bdata-output-path="([^"]+)"', str(text))
+            if match:
+                lines[0] = _ArchiveLine(lines[0], html.unescape(match[1]))
+        return lines
+
+    def render_message(self, text: str, buttons: Sequence[Tuple[str, str]] = (),
+                       parse_mode: Any = None, title: str = "XGent",
+                       marker: str = "◆", style: str = "ai") -> List[str]:
+        lines = self.render_text(text, parse_mode, indent="  ")
+        menu_buttons, hints = split_control_buttons(buttons)
+        button_lines = self.render_buttons(menu_buttons, indent="  ")
+        if button_lines:
+            if lines:
+                lines.append("")
+            lines.extend(button_lines)
+        lines.extend(self.render_hints(hints, indent="  "))
+        if not any(line.strip() for line in lines):
+            return []
+        pal = self.palette
+        if style == "token":
+            return [pal.paint(_strip_ansi(line), pal.muted) for line in lines]
+        color = pal.accent if style == "ai" else ""
+        return [pal.paint(title, color, pal.bold)] + lines
+
+
 class PtScreen:
     """与 `cli_render.TerminalScreen` 同接口，但写进 `MessageModel`。"""
 
     def __init__(self, palette: Optional[Palette] = None,
                  width: Optional[int] = None) -> None:
-        self.palette = palette if palette is not None else Palette(True)
+        self.palette = copy.copy(palette) if palette is not None else Palette(True)
+        if self.palette.enabled:
+            # 终端默认背景/正文色，只保留一个强调色和必要的成功/错误色。
+            self.palette.accent = self.palette.ai = "\x1b[38;5;75m"
+            self.palette.user = self.palette.code = ""
         self._forced_width = width
-        self.model = MessageModel(self.palette)
+        self.model = MessageModel(self.palette, preview_lines=0)
         # 挂上 App 后指向重画回调；未挂时空操作，便于单测。
         self.on_change: Callable[[], None] = lambda: None
 
@@ -396,7 +518,7 @@ class PtScreen:
         return terminal_size()[1]
 
     def renderer(self) -> MessageRenderer:
-        return MessageRenderer(self.palette, content_width(self.width))
+        return TuiMessageRenderer(self.palette, content_width(self.width))
 
     def print_block(self, lines: Sequence[str], message_id: Optional[int] = None,
                     leading_blank: bool = True) -> None:
@@ -445,6 +567,7 @@ class TuiHooks:
     request_stop: Callable[[], bool] = lambda: False
     remember_history: Callable[[str], None] = lambda _line: None
     history_file: Optional[str] = None
+    status_text: Callable[[], str] = lambda: ""
     menu_message_id: Callable[[], Optional[int]] = lambda: None   # 当前菜单留在实时区原地更新
 
 
@@ -480,8 +603,11 @@ def slash_completions(text: str, names: Sequence[str],
     if not text.startswith("/") or " " in text:
         return []
     prefix = text[1:].lower()
-    return [("/" + name, describe(name)) for name in names
-            if str(name).lower().startswith(prefix)]
+    matches = [name for name in names if str(name).lower().startswith(prefix)]
+    # /s、/st 等候选优先主菜单；裸 / 和其他候选的相对顺序保持不变。
+    if prefix:
+        matches.sort(key=lambda name: str(name).lower() != "start")
+    return [("/" + name, describe(name)) for name in matches]
 
 
 def copy_to_clipboard(text: str, write_raw: Optional[Callable[[str], None]] = None) -> bool:
@@ -518,6 +644,8 @@ def copy_to_clipboard(text: str, write_raw: Optional[Callable[[str], None]] = No
 
 def block_text(blk: "Block", whole: bool = True) -> str:
     """折叠块可复制的纯文本：块头 + 代码，去掉竖条与缩进。"""
+    if blk.source_body is not None:
+        return (_strip_ansi(blk.header).strip() + "\n" if whole else "") + blk.source_body
     out = [_strip_ansi(blk.header).strip()] if whole else []
     for ln in blk.code_lines:
         plain = _strip_ansi(ln)
@@ -540,6 +668,16 @@ def hint_text(mode: str) -> str:
     }.get(mode, "")
 
 
+def compact_hint_text(mode: str) -> str:
+    return {
+        "archive": "F3 返回 · F5/F6 翻页 · y 复制本页",
+        "browse": "Enter 展开 · y 复制 · F3 存档 · F1 帮助",
+        "busy": "Ctrl+C 中断 · 可编辑草稿 · F1 帮助",
+        "exit": "再按一次 Ctrl+C 退出",
+        "native": "F2 恢复鼠标 · F1 帮助",
+    }.get(mode, "Enter 发送 · Alt+Enter 换行 · F1 帮助")
+
+
 async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
     """跑全屏 App。pt 导入或建 App 失败抛 `TuiUnavailable`（调用方回退 legacy）。"""
     try:
@@ -547,6 +685,8 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
 
         from prompt_toolkit.application import Application
         from prompt_toolkit.buffer import Buffer
+        from prompt_toolkit.document import Document
+        from prompt_toolkit.widgets import TextArea
         from prompt_toolkit.completion import Completer, Completion
         from prompt_toolkit.filters import Condition, has_focus
         from prompt_toolkit.formatted_text import ANSI, to_formatted_text
@@ -555,10 +695,10 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
         from prompt_toolkit.key_binding import KeyBindings
         from prompt_toolkit.layout import Layout
         from prompt_toolkit.layout.containers import (
-            Float, FloatContainer, HSplit, Window)
+            ConditionalContainer, Float, FloatContainer, HSplit, Window)
         from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl, UIContent, UIControl
         from prompt_toolkit.layout.dimension import D
-        from prompt_toolkit.layout.margins import ScrollbarMargin
+        from prompt_toolkit.layout.margins import ConditionalMargin, ScrollbarMargin
         from prompt_toolkit.layout.menus import CompletionsMenu
         from prompt_toolkit.mouse_events import MouseButton, MouseEventType
         from prompt_toolkit.styles import Style
@@ -574,6 +714,8 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
         "mouse": True,        # 接管鼠标：点击展开、滚轮滚动、自制拖选复制；F2 让给终端原生选择
         "flash": "",          # 底栏临时提示
         "flash_until": 0.0,
+        "help": False,
+        "archive": False,
     }
 
     def _invalidate() -> None:
@@ -815,17 +957,12 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
         def create_content(self, width, height):
             rows = _rows()["rows"]
             count = len(rows)
-            busy = _busy()
-            frame = _SPINNER[int(time.monotonic() * 10) % len(_SPINNER)] if busy else ""
             rng = _sel_range()
 
             def get_line(row):
                 if row < 0:
                     return []
                 if row >= count:
-                    if busy and row == count + 1:
-                        return list(_line_fragments(
-                            "  " + model.palette.paint(f"{frame} 输出中…", model.palette.accent)))
                     return []
                 text = rows[row][0]
                 line = _line_fragments(text)
@@ -835,7 +972,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
                     return _highlight(line or (("", " "),), a, b)
                 return list(line)
 
-            return UIContent(get_line=get_line, line_count=max(1, count + (2 if busy else 0)),
+            return UIContent(get_line=get_line, line_count=max(1, count),
                              show_cursor=False)
 
         def preferred_height(self, width, max_available_height, wrap_lines, get_line_prefix):
@@ -865,8 +1002,12 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
     output_window = _ScrollWindow(
         content=_OutputControl(),
         wrap_lines=True,
-        right_margins=[ScrollbarMargin(display_arrows=False)],
-        dont_extend_height=True,
+        right_margins=[ConditionalMargin(
+            ScrollbarMargin(display_arrows=False),
+            filter=Condition(lambda: output_window.max_top > 0),
+        )],
+        height=D(min=1, weight=1),
+        dont_extend_height=False,
     )
 
     # -- 选块（浏览态） ----------------------------------------------------
@@ -932,7 +1073,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
 
     input_window = Window(
         content=BufferControl(buffer=input_buffer),
-        height=D(min=1, max=8), get_line_prefix=_prefix, wrap_lines=True,
+        height=D(min=1, max=6), get_line_prefix=_prefix, wrap_lines=True,
         dont_extend_height=True)
 
     # -- 顶栏 / 分隔 / 底栏 ---------------------------------------------------
@@ -943,47 +1084,54 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
             return 80
 
     def _status_bar():
-        left = [("class:title.name", " ◆ xgent "), ("class:title", " ")]
+        columns = _columns()
+        left = [("class:title.name", " xgent ")]
+        if columns >= 60:
+            try:
+                context = str(hooks.status_text() or "").replace("\n", " ")[:40]
+            except Exception:
+                context = ""
+            if context:
+                left.append(("class:title", " · " + context + " "))
         if _busy():
             frame = _SPINNER[int(time.monotonic() * 10) % len(_SPINNER)]
-            left.append(("class:title.busy", f"{frame} 生成中"))
+            right = [("class:title.busy", f"{frame} 生成中 ")]
         else:
-            left.append(("class:title.ok", "● 就绪"))
-        right: list = []
-        total, opened = model.counts()
-        if total:
-            right.append(("class:title", f"折叠块 {opened}/{total} 展开  "))
-        if not output_window.follow:
-            below = max(0, output_window.max_top - output_window.vertical_scroll)
-            right.append(("class:title.warn", f"↓ 下方还有 {below} 行 · Ctrl+End 回底 "))
-        else:
-            right.append(("class:title", "跟随最新 "))
-        if not state["mouse"]:
-            right.append(("class:title.warn", " 终端原生选择(F2 切回) "))
-        pad = max(1, _columns() - fragment_list_width(left) - fragment_list_width(right))
+            right = [("class:title.ok", "● 就绪 ")]
+        if not output_window.follow and columns >= 50:
+            right.insert(0, ("class:title", "Ctrl+End 回到最新  "))
+        if not state["mouse"] and columns >= 70:
+            right.insert(0, ("class:title", "原生选择  "))
+        # 状态不能挤掉右侧的运行/停止反馈。
+        while len(left) > 1 and fragment_list_width(left + right) >= columns:
+            left.pop()
+        pad = max(1, columns - fragment_list_width(left + right))
         return left + [("class:title", " " * pad)] + right
 
     def _mode() -> str:
+        if state["archive"]:
+            return "archive"
         if state["exit_armed"] and time.monotonic() - state["exit_armed"] < 2.0:
             return "exit"
         if not state["mouse"]:
             return "native"
         if state["sel"] is not None:
             return "browse"
-        if app_ref and app_ref[0].layout.has_focus(input_window):
-            return "typing"
         if _busy():
             return "busy"
+        if app_ref and app_ref[0].layout.has_focus(input_window):
+            return "typing"
         return "input"
 
     def _hint_bar():
         if state["flash"] and time.monotonic() < state["flash_until"]:
             return [("class:hint.flash", " " + state["flash"])]
-        return [("class:hint", " " + hint_text(_mode()))]
+        return [("class:hint", " " + compact_hint_text(_mode()))]
 
     def _input_rule():
         typing = bool(app_ref) and app_ref[0].layout.has_focus(input_window)
-        label = " 输入中 · Esc 回到浏览 " if typing else " 输入（直接打字即可） "
+        label = (" 消息草稿（F3 返回编辑） " if state["archive"] else
+                 " 草稿（生成中） " if _busy() else (" 消息 " if typing else " 消息 · 直接打字即可 "))
         rest = max(0, _columns() - fragment_list_width([("", label)]) - 2)
         return [("class:rule", "──"), ("class:rule.label", label), ("class:rule", "─" * rest)]
 
@@ -993,6 +1141,74 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
     rule_window = Window(FormattedTextControl(
         lambda: [(st, t, down_edge) for st, t, *_ in _input_rule()]), height=1)
     hint_window = Window(FormattedTextControl(_hint_bar), height=1, style="class:hint")
+    help_window = ConditionalContainer(
+        Window(FormattedTextControl(
+            " 操作帮助 · F1 关闭\n"
+            " Enter 发送 · Alt+Enter 换行\n"
+            " Ctrl+C 中断/退出 · Esc 浏览\n"
+            " Tab / Shift+Tab 补全或选块\n"
+            " 浏览：Enter 折叠 · y/Y 复制\n"
+            " PgUp/PgDn 翻页 · Ctrl+Home/End 首尾\n"
+            " Ctrl+O 最近工具 · F2 原生选择\n"
+            " F3 输出存档 · F5/F6 存档翻页\n"
+            " 鼠标：滚轮翻页 · 拖选复制"),
+            height=D(min=1, max=10), dont_extend_height=True,
+            wrap_lines=True, style="class:hint"),
+        filter=Condition(lambda: state["help"]),
+    )
+
+    archive_state = {"path": "", "page": None, "previous": [], "loading": False, "generation": 0}
+    archive_area = TextArea(text="", read_only=True, scrollbar=True, wrap_lines=True)
+    viewing_archive = Condition(lambda: state["archive"])
+
+    def archive_title():
+        page = archive_state["page"]
+        if archive_state["loading"]:
+            return " 读取存档中… · F3 关闭"
+        if not page:
+            return " 输出存档 · F3 关闭"
+        filename = page['filename']
+        if len(filename) > 28:
+            filename = filename[:12] + '…' + filename[-12:]
+        return f" {filename} · {page['offset']}–{page['next_offset']}/{page['size']} bytes"
+
+    archive_window = ConditionalContainer(HSplit([
+        Window(FormattedTextControl(archive_title), height=1, style="class:hint"),
+        archive_area,
+    ]), filter=viewing_archive)
+
+    def close_archive():
+        state["archive"] = False
+        state["sel"] = None
+        archive_state["generation"] += 1
+        archive_state.update(loading=False, page=None, previous=[])
+        archive_area.buffer.set_document(Document(""), bypass_readonly=True)
+        app_ref[0].layout.focus(input_window)
+        _invalidate()
+
+    def load_archive(offset, previous):
+        if archive_state["loading"]:
+            return
+        archive_state["loading"] = True
+        generation = archive_state["generation"]
+        path = archive_state["path"]
+        async def read():
+            from .output_archive import read_output_page, OutputArchiveError
+            try:
+                page = await _asyncio.to_thread(read_output_page, path, offset)
+                if generation != archive_state["generation"]:
+                    return
+                archive_state.update(page=page, previous=previous)
+                archive_area.buffer.set_document(Document(page["text"]), bypass_readonly=True)
+            except OutputArchiveError as exc:
+                if generation == archive_state["generation"]:
+                    _flash(str(exc))
+            finally:
+                if generation == archive_state["generation"]:
+                    archive_state["loading"] = False
+                    _invalidate()
+        app_ref[0].create_background_task(read())
+        _invalidate()
 
     # -- 键位 --------------------------------------------------------------
     # 默认聚焦输入框。TUI 鼠标模式下 ↑↓ 操作输入历史/光标，滚轮及 PgUp/PgDn 滚动输出。
@@ -1121,7 +1337,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
         elif event.app.layout.has_focus(input_window):
             input_buffer.delete()
 
-    @kb.add("c-o")
+    @kb.add("c-o", filter=~viewing_archive)
     def _toggle_latest(event):
         targets = model.foldable_targets()
         if not targets:
@@ -1136,7 +1352,52 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
     def _redraw(event):
         event.app.renderer.clear()
 
-    @kb.add("f2")
+    @kb.add("f3", eager=True)
+    def open_archive(event):
+        if state["archive"]:
+            close_archive()
+            return
+        message = model.message_of(state["sel"])
+        if message is None:
+            message = next((msg for msg in reversed(model.messages) if msg.output_path), None)
+        if message is None or not message.output_path:
+            _flash("此结果没有输出存档；已截掉且未保存的旧内容无法恢复")
+            return
+        archive_state.update(path=message.output_path, page=None, previous=[], loading=False)
+        archive_state["generation"] += 1
+        state["archive"] = True
+        event.app.layout.focus(archive_area)
+        load_archive(0, [])
+
+    @kb.add("y", filter=viewing_archive, eager=True)
+    def copy_archive_page(event):
+        if archive_state["page"]:
+            _copy(archive_state["page"]["text"], "本页输出")
+
+    @kb.add("f5", filter=viewing_archive, eager=True)
+    def previous_archive_page(event):
+        previous = archive_state["previous"]
+        if previous:
+            load_archive(previous[-1], previous[:-1])
+
+    @kb.add("f6", filter=viewing_archive, eager=True)
+    def next_archive_page(event):
+        page = archive_state["page"]
+        if page and not page["eof"]:
+            load_archive(page["next_offset"], archive_state["previous"] + [page["offset"]])
+
+    @kb.add("escape", filter=viewing_archive, eager=True)
+    @kb.add("c-c", filter=viewing_archive, eager=True)
+    @kb.add("c-d", filter=viewing_archive, eager=True)
+    def exit_archive(event):
+        close_archive()
+
+    @kb.add("f1")
+    def _toggle_help(event):
+        state["help"] = not state["help"]
+        _invalidate()
+
+    @kb.add("f2", filter=~viewing_archive)
     def _mouse_toggle(event):
         state["mouse"] = not state["mouse"]
         drag.update(anchor=None, end=None, active=False, moved=False, edge=0)
@@ -1154,12 +1415,18 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
 
     @kb.add("pageup")
     def _pgup(event):
-        output_window.scroll_by(-_page())
+        if state["archive"]:
+            archive_area.buffer.cursor_up(count=_page())
+        else:
+            output_window.scroll_by(-_page())
         _invalidate()
 
     @kb.add("pagedown")
     def _pgdn(event):
-        output_window.scroll_by(_page())
+        if state["archive"]:
+            archive_area.buffer.cursor_down(count=_page())
+        else:
+            output_window.scroll_by(_page())
         _invalidate()
 
     # 默认 TUI 模式保持 ↑↓ 回输入框；下面的原生模式绑定具有更高优先级。
@@ -1176,7 +1443,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
     # Native mouse selection disables mouse reports. Terminals supporting
     # DECSET 1007 translate the wheel to arrows; route these to output scrolling,
     # even after typing a draft, rather than unexpectedly changing input history.
-    native_mouse = Condition(lambda: not state["mouse"])
+    native_mouse = Condition(lambda: not state["mouse"] and not state["archive"])
 
     @kb.add("up", filter=native_mouse)
     def _native_up(event):
@@ -1191,12 +1458,18 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
     @kb.add("home", filter=in_out)
     @kb.add("c-home")
     def _top(event):
+        if state["archive"]:
+            archive_area.buffer.cursor_position = 0
+            return
         output_window.scroll_to(0)
         _invalidate()
 
     @kb.add("end", filter=in_out)
     @kb.add("c-end")
     def _bottom(event):
+        if state["archive"]:
+            archive_area.buffer.cursor_position = len(archive_area.buffer.text)
+            return
         output_window.follow = True
         _invalidate()
 
@@ -1286,31 +1559,32 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
     body = FloatContainer(
         HSplit([
             status_window,
-            output_window,
+            ConditionalContainer(output_window, filter=~viewing_archive),
+            archive_window,
+            help_window,
             rule_window,
             input_window,
             hint_window,
-            Window(),          # filler：内容少时空白只在最底下（内容贴顶，像普通终端）
         ]),
         floats=[Float(xcursor=True, ycursor=True,
                       content=CompletionsMenu(max_height=10, scroll_offset=1))],
     )
     style = Style.from_dict({
-        "title": "bg:#1e2230 #a9b1d6",
-        "title.name": "bg:#7aa2f7 #1a1b26 bold",
-        "title.ok": "bg:#1e2230 #9ece6a",
-        "title.busy": "bg:#1e2230 #e0af68 bold",
-        "title.warn": "bg:#1e2230 #ff9e64",
-        "rule": "#3b4261",
-        "rule.label": "#7aa2f7",
-        "hint": "#7f849c",
-        "hint.flash": "#e0af68 bold",
-        "completion-menu": "bg:#24283b #c0caf5",
-        "completion-menu.completion.current": "bg:#7aa2f7 #1a1b26",
-        "completion-menu.meta.completion": "bg:#1f2335 #7f849c",
-        "completion-menu.meta.completion.current": "bg:#3d59a1 #c0caf5",
-        "scrollbar.background": "bg:#1e2230",
-        "scrollbar.button": "bg:#565f89",
+        "title": "#808080",
+        "title.name": "#5fafff bold",
+        "title.ok": "#5faf87",
+        "title.busy": "#d7af5f",
+        "title.warn": "#d7af5f",
+        "rule": "#585858",
+        "rule.label": "#808080",
+        "hint": "#808080",
+        "hint.flash": "#d7af5f bold",
+        "completion-menu": "",
+        "completion-menu.completion.current": "reverse",
+        "completion-menu.meta.completion": "#808080",
+        "completion-menu.meta.completion.current": "reverse",
+        "scrollbar.background": "",
+        "scrollbar.button": "#585858",
     })
 
     try:
@@ -1318,7 +1592,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
             layout=Layout(body, focused_element=input_window),   # 一进来就聚焦输入框
             key_bindings=kb, style=style, full_screen=True,
             mouse_support=Condition(lambda: state["mouse"]),
-            min_redraw_interval=1 / 60,
+            min_redraw_interval=1 / 30,
         )
     except Exception as exc:
         raise TuiUnavailable(str(exc)) from exc

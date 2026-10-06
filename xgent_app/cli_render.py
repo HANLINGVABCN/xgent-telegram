@@ -631,9 +631,11 @@ class MessageRenderer:
     给定 HTML 进去，断言渲染出的行长什么样。
     """
 
-    def __init__(self, palette: Optional[Palette] = None, width: int = 80):
+    def __init__(self, palette: Optional[Palette] = None, width: int = 80,
+                 wrap_text: Optional[Callable[[str, int], Sequence[str]]] = None):
         self.palette = palette or Palette(False)
         self.width = width
+        self._wrap_text = wrap_text or wrap_line
 
     # -- 分块 ------------------------------------------------------------
     def _split_pre_blocks(self, text: str) -> List[Tuple[str, str]]:
@@ -675,18 +677,24 @@ class MessageRenderer:
                 out.append(f"{bar} {pal.paint(seg, pal.code)}")
         return out or [f"{bar} "]
 
+    def _indent_pre_line(self, line: str, indent: str) -> str:
+        return indent + line
+
     # -- 对外接口 --------------------------------------------------------
     def render_text(self, text: str, parse_mode: Any = None,
                     indent: str = "  ") -> List[str]:
         """消息正文 -> 终端行。"""
         raw = str(text)
         is_html = parse_mode is not None and "html" in str(parse_mode).lower()
+        if is_html and 'data-raw="' in raw:
+            from .protocols import ProtocolParser
+            raw = ProtocolParser.restore_folded_html(raw)
         body_width = max(20, self.width - display_width(indent))
         lines: List[str] = []
 
         for kind, chunk in self._split_pre_blocks(raw) if is_html else [("text", raw)]:
             if kind == "pre":
-                lines.extend(indent + line for line in self._render_pre(chunk, body_width))
+                lines.extend(self._indent_pre_line(line, indent) for line in self._render_pre(chunk, body_width))
                 continue
             rendered = html_to_ansi(chunk, self.palette) if is_html else chunk
             for paragraph in rendered.split("\n"):
@@ -698,7 +706,7 @@ class MessageRenderer:
                     # TUI 软换行，保证它永远是一行，TUI 才能稳定识别成可折叠块。
                     lines.append(indent + paragraph.rstrip())
                     continue
-                for wrapped in wrap_line(paragraph.rstrip(), body_width):
+                for wrapped in self._wrap_text(paragraph.rstrip(), body_width):
                     lines.append(indent + wrapped)
 
         # 去掉首尾多余空行，并把连续空行压成一行——Telegram HTML 里

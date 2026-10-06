@@ -125,6 +125,7 @@ def get_shell_pause_messages(pause_reason: str) -> Tuple[str, str]:
 def build_run_notice(run_result: Dict[str, Any]) -> str:
     output = str(run_result.get('output') or '(无输出)')
     stored_output = format_shell_context_output(output, running=False)
+    archive_label = '输出存档（已截断）' if run_result.get('archive_truncated') else '完整输出'
     return _redactor(
         "[Agent run]\n"
         f"命令: {run_result.get('command') or ''}\n"
@@ -133,8 +134,8 @@ def build_run_notice(run_result: Dict[str, Any]) -> str:
         f"超时: {run_result.get('timed_out')}\n"
         f"停止: {run_result.get('stopped')}\n"
         f"耗时: {run_result.get('elapsed_seconds')} 秒\n"
-        f"完整输出文件: {run_result.get('output_path') or '(存档失败)'}\n"
-        f"完整输出大小: {run_result.get('output_bytes')} bytes\n"
+        f"{archive_label}文件: {run_result.get('output_path') or '(存档失败)'}\n"
+        f"{archive_label}大小: {run_result.get('output_bytes')} bytes\n"
         f"上下文输出:\n{stored_output}"
     )
 

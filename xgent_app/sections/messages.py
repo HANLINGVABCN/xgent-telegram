@@ -912,8 +912,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         UserDataManager.set('state', BotState.IDLE)
         await GlobalRecorder.record_system_op("设置 Web 访问密码")
-        # 密码变了要让在跑的服务用上新哈希。托管进程立刻就地换掉；CLI 只写库，由
-        # 服务进程的对账任务几秒内换过去。以前这里无条件 restart_web_chat(
+        # 密码变化由托管进程重启 Web 并撤销旧会话；CLI 只写库，由服务进程的
+        # 对账任务几秒内应用。以前这里无条件 restart_web_chat(
         # context.application)，而 CLI 的 application 是 None——于是 CLI 去 bind
         # 服务进程占着的端口，拿一个 EADDRINUSE 被日志吞掉，用户那边看到的就是
         # "密码怎么改都不生效"。
@@ -2245,9 +2245,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         session_id = shell_execution['session_id']
                         command = shell_execution['command']
                         output = shell_execution['output']
-                        display_output = format_shell_display_output(
-                            output, bool(shell_result.get('running'))
-                        )
+                        # 人看的结果保留本次捕获内容；模型上下文仍由 build_shell_notice 限长。
+                        display_output = output
 
                         action_label = {
                             'shell': '启动会话',

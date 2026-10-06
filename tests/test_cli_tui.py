@@ -38,8 +38,8 @@ class SegmentLinesTests(unittest.TestCase):
         folds = [b for b in blocks if b.collapsible]
         self.assertEqual(2, len(folds))
         self.assertIn("run-x · 55 行", cli_tui._strip_ansi(folds[0].header))  # 保留 -x
-        self.assertEqual(51, len(folds[0].lines))           # 50 行代码 + 标签
-        self.assertEqual("已折叠 5 行", cli_tui._strip_ansi(folds[0].lines[-1]).strip())
+        self.assertEqual(55, len(folds[0].lines))
+        self.assertEqual("│ l54", cli_tui._strip_ansi(folds[0].lines[-1]).strip())
         self.assertTrue(folds[0].foldable)
         self.assertEqual(2, len(folds[1].lines))            # ≤3 行：无标签、不折叠
         self.assertFalse(folds[1].foldable)
@@ -79,7 +79,7 @@ class MessageModelTests(unittest.TestCase):
         self.assertNotIn("  │ l3", rows)
         self.assertFalse(any("已折叠" in r for r in rows))
 
-    def test_expand_shows_header_plus_50_lines_plus_label(self):
+    def test_expand_shows_complete_body(self):
         run = self.m.foldable_targets()[0]
         self.assertTrue(self.m.toggle(*run))
         rows = _plain(self.m.render_rows())
@@ -87,8 +87,9 @@ class MessageModelTests(unittest.TestCase):
         self.assertEqual("  ▾ " + RUN_HEAD, rows[hi])
         self.assertEqual("  │ l0", rows[hi + 1])
         self.assertEqual("  │ l49", rows[hi + 50])
-        self.assertEqual("  ┄┄ 已折叠 5 行 ┄┄", rows[hi + 51])
-        self.assertFalse(any("l50" in r for r in rows))   # 第 51 行起永不显示
+        self.assertEqual("  │ l50", rows[hi + 51])
+        self.assertEqual("  │ l54", rows[hi + 55])
+        self.assertFalse(any("已折叠" in r for r in rows))
 
     def test_label_is_not_clickable(self):
         run = self.m.foldable_targets()[0]
@@ -141,7 +142,7 @@ class MessageModelTests(unittest.TestCase):
         blk = [b for b in self.m.messages[0].blocks if b.collapsible][0]
         code = cli_tui.block_text(blk, whole=False).split("\n")
         self.assertEqual("l0", code[0])
-        self.assertEqual(50, len(code))                   # 不含「已折叠」标签
+        self.assertEqual(55, len(code))                   # 完整复制，不继承 TG 50 行上限
         self.assertTrue(cli_tui.block_text(blk).startswith("🔧 run-x · 55 行\nl0"))
 
     def test_leading_blank_between_messages(self):
@@ -186,6 +187,20 @@ class SlashAndHintTests(unittest.TestCase):
         self.assertEqual([("/start", "START"), ("/stop", "STOP")], out)
         self.assertEqual([], cli_tui.slash_completions("st", ["start"], str))
         self.assertEqual([], cli_tui.slash_completions("/start x", ["start"], str))
+
+    def test_start_is_first_for_s_prefix_without_reordering_other_commands(self):
+        names = ["search", "skills", "start", "stats", "stop", "help"]
+        for prefix in ("/s", "/S", "/st", "/sta"):
+            with self.subTest(prefix=prefix):
+                result = cli_tui.slash_completions(prefix, names, lambda name: name.upper())
+                self.assertEqual(("/start", "START"), result[0])
+                expected_rest = ["/" + name for name in names
+                                 if name != "start" and name.startswith(prefix[1:].lower())]
+                self.assertEqual(expected_rest, [name for name, _ in result[1:]])
+        self.assertEqual(names, [name[1:] for name, _ in cli_tui.slash_completions("/", names, str)])
+        self.assertEqual([("/stats", "stats")], cli_tui.slash_completions("/stat", names, str))
+        self.assertEqual([("/search", "search"), ("/skills", "skills")],
+                         cli_tui.slash_completions("/s", ["search", "skills"], str))
 
     def test_hints_per_mode(self):
         self.assertIn("点击代码块展开", cli_tui.hint_text("input"))
@@ -342,6 +357,76 @@ class PtEndToEndTests(unittest.TestCase):
 
         self._run(scenario)
 
+    def test_input_stays_at_bottom_and_help_preserves_draft(self):
+        from prompt_toolkit.layout.controls import BufferControl
+        from prompt_toolkit.data_structures import Size
+
+        async def scenario(screen, app, win, keys, sent):
+            input_window = app.layout.current_window
+            self.assertIsInstance(input_window.content, BufferControl)
+            def cursor_y():
+                return app.renderer._last_screen.cursor_positions[input_window].y
+            def snapshot_text():
+                return "\n".join("".join(cell.char for _, cell in sorted(row.items()))
+                                  for _, row in sorted(app.renderer._last_screen.data_buffer.items()))
+            screen.print_block(["short conversation"], message_id=910)
+            await keys("")
+            self.assertEqual(app.output.get_size().rows - 2, cursor_y())
+            await keys("draft text")
+            screen.print_block([f"history line {i}" for i in range(200)], message_id=911)
+            await keys("")
+            self.assertEqual(app.output.get_size().rows - 2, cursor_y())
+            await keys("\x1bOP")  # F1
+            self.assertIn("操作帮助", snapshot_text())
+            self.assertEqual("draft text", input_window.content.buffer.text)
+            self.assertEqual(app.output.get_size().rows - 2, cursor_y())
+            with mock.patch.object(app.output, "get_size", return_value=Size(rows=18, columns=48)):
+                await keys("")
+                app.invalidate()
+                await keys("")
+                self.assertEqual(16, cursor_y())
+                self.assertEqual("draft text", input_window.content.buffer.text)
+            await keys("\x1bOP")
+            self.assertNotIn("操作帮助", snapshot_text())
+            self.assertEqual("draft text", input_window.content.buffer.text)
+            input_window.content.buffer.reset()  # 测试完草稿保留后，交还退出夹具。
+
+        self._run(scenario)
+
+    def test_output_archive_pages_preserve_draft_and_do_not_execute_content(self):
+        import tempfile
+        from pathlib import Path
+        from xgent_app import output_archive
+        from xgent_app.agent_presenter import build_run_presentation
+
+        with tempfile.TemporaryDirectory(prefix="xgent-tui-archive-") as temp:
+            root = Path(temp)
+            archive = root / "result.txt"
+            text = "FIRST_PAGE\n" + "中" * 30000 + "\nLAST_PAGE <script>not executed</script>"
+            archive.write_text(text, encoding="utf-8")
+            async def scenario(screen, app, win, keys, sent):
+                draft = app.current_buffer
+                await keys("draft preserved")
+                result = build_run_presentation({"output": "summary", "output_path": str(archive)})
+                screen.print_block(screen.renderer().render_message(result, parse_mode="HTML"), message_id=51)
+                await keys("\x1bOR", .4)  # F3
+                self.assertIsNot(app.current_buffer, draft)
+                self.assertIn("FIRST_PAGE", app.current_buffer.text)
+                self.assertNotIn("LAST_PAGE", app.current_buffer.text)
+                await keys("\x1b[17~", .4)  # F6
+                self.assertIn("LAST_PAGE", app.current_buffer.text)
+                self.assertNotIn("FIRST_PAGE", app.current_buffer.text)
+                await keys("\x1b[15~", .4)  # F5
+                self.assertIn("FIRST_PAGE", app.current_buffer.text)
+                self.assertLessEqual(len(app.current_buffer.text.encode("utf-8")), output_archive.OUTPUT_PAGE_BYTES)
+                await keys("\x1bOR")
+                self.assertIs(app.current_buffer, draft)
+                self.assertEqual("draft preserved", draft.text)
+                self.assertEqual([], sent)
+                draft.reset()
+            with mock.patch.object(output_archive, 'DEFAULT_OUTPUT_ROOT', root):
+                self._run(scenario)
+
     def test_getchat_history_block_expands(self):
         async def scenario(screen, app, win, keys, sent):
             # /getchat 的历史行没有 message_id，照样能选中展开
@@ -485,13 +570,14 @@ class PtMouseTests(unittest.TestCase):
     def test_drag_select_copies_text(self):
         async def scenario(screen, app, win, keys, at):
             self._block(screen)
+            screen.model.toggle(*screen.model.foldable_targets()[0])  # 紧凑模式先展开再拖选
             await keys("")
             rows = _plain(screen.model.render_rows())
             r0 = [i for i, r in enumerate(rows) if r.strip() == "│ line0"][0]
             y0, y1 = at(r0), at(r0 + 1)
             await keys(f"\x1b[<0;5;{y0}M\x1b[<32;9;{y0}M\x1b[<32;9;{y1}M\x1b[<0;9;{y1}m")
             self.assertIsNone(screen.model.foldable_targets() and None)
-            self.assertFalse(screen.model.is_expanded(screen.model.foldable_targets()[0]))  # 拖选不触发折叠
+            self.assertTrue(screen.model.is_expanded(screen.model.foldable_targets()[0]))  # 拖选不触发折叠
 
         copied = self._run(scenario)
         self.assertEqual(1, len(copied))

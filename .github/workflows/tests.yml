@@ -23,10 +23,16 @@ jobs:
       - run: python -m pip install pytest pytest-xdist pytest-split
       - run: python tools/check_split_integrity.py
       - run: python -m compileall -q xgent_server.py xgent_app
-      # skill/script 下的脚本也要过编译检查，此前完全没被覆盖
-      - run: python -m compileall -q tools tests skill/script
+      # compileall 对不存在的目录也可能返回 0，先显式确认目录存在。
+      - run: test -d skill-public/script && python -m compileall -q tools tests skill-public/script
       - run: pytest --splits 4 --group ${{ matrix.shard }}
-      - run: bash -n install.sh skill/script/mailu-helper/mailu-helper.sh skill/script/notes/install.sh skill/script/proxy-setup/proxy_setup.sh skill/script/webdav-filemanager/install.sh
+      # bash -n 只解析第一个脚本，其余参数不会被检查。
+      - run: |
+          set -e
+          for script in install.sh skill-public/script/mailu-helper/mailu-helper.sh skill-public/script/notes/install.sh skill-public/script/proxy-setup/proxy_setup.sh skill-public/script/webdav-filemanager/install.sh; do
+            test -f "$script"
+            bash -n "$script"
+          done
 
   lint:
     runs-on: ubuntu-latest

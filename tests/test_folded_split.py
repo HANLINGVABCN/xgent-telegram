@@ -138,7 +138,7 @@ result = {
     "long_path": probe_chunks("看长路径块：\n" + block_path("/srv/" + "deep/" * 1200 + "app/x.py", 20, 40) + "\n"),
     "long_path_full_body": probe_chunks(block_path("/srv/" + "seg/" * 260 + "very_long_component_name.py", 60, 48) + "\n"),
     # 直接断言块头被中段省略：超长 path 渲染后必含 … 且整块 tg < 4000
-    "head_elided": (lambda f: {"has_ellipsis": ("…" in f), "tg_len": tg_len(f)})(
+    "head_elided": (lambda f: {"has_ellipsis": ("…" in ProtocolParser.to_telegram_html(f)), "tg_len": tg_len(f)})(
         render("看：\n" + block_path("/srv/" + "deep/" * 1200 + "app/x.py", 20, 40) + "\n")),
     # 端到端：超长 path 块 + 一个普通块合计超限，强制切成 ≥2 段并走 safe_send + 出口适配器
     "send_long_path": probe_send_path(

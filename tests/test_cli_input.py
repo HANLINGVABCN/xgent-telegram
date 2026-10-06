@@ -238,6 +238,23 @@ print(json.dumps({"first": first, "second": second}))
 
 
 class CompletionTests(CliProbeMixin, unittest.TestCase):
+    def test_s_prefix_prioritizes_start_in_all_cli_completion_paths(self):
+        result = self.run_probe("""
+names = xgent_cli._command_names()
+xgent_cli._readline = None
+print(json.dumps({
+    "tui": [name for name, _ in xgent_cli.cli_tui.slash_completions("/s", names, str)],
+    "palette": xgent_cli._matching_commands("s"),
+    "readline_first": xgent_cli._command_completer("/s", 0),
+    "all": xgent_cli._matching_commands(""),
+    "original": names,
+}))
+""")
+        self.assertEqual("/start", result["readline_first"])
+        self.assertEqual("start", result["palette"][0])
+        self.assertEqual(["/" + name for name in result["palette"]], result["tui"])
+        self.assertEqual(result["original"], result["all"])
+
     def test_completer_lists_commands_for_slash(self):
         result = self.run_probe("""
 matches = []

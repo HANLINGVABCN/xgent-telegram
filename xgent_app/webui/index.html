@@ -496,6 +496,12 @@
   }
   .bubble blockquote.pb.expanded pre,
   .bubble blockquote.pb.pb-short pre { max-height: none; overflow-x: auto; }
+  .output-pages { border-top: 1px solid var(--code-border); cursor: auto; }
+  .output-pages .pb-head { flex-wrap: wrap; }
+  .output-page-label { flex: 1 1 100%; overflow-wrap: anywhere; }
+  .bubble blockquote.pb .output-pages pre.output-page-text {
+    max-height: 60vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; padding: 10px;
+  }
   /* 「已折叠 N 行」：标注不是正文——虚线胶囊、斜体、不可选，只在展开态出现 */
   .bubble blockquote.pb i.pb-folded {
     display: none; margin: 1px 10px 5px; padding: 0 8px;
@@ -1587,7 +1593,7 @@
           if (c.tagName === "A" && a.name === "href") {
             if (!/^(https?:|mailto:)/i.test(a.value)) c.removeAttribute(a.name);
           } else if (c.tagName === "A" && (a.name === "target" || a.name === "rel")) {
-          } else if (c.tagName === "BLOCKQUOTE" && (a.name === "expandable" || a.name === "data-raw")) {
+          } else if (c.tagName === "BLOCKQUOTE" && (a.name === "expandable" || a.name === "data-raw" || a.name === "data-output-path")) {
             // 保留：服务端 render_folded_html 用 <blockquote expandable> 标记
             // 「可展开折叠的协议代码块」（与电报原生 expandable 同源），网页据此做
             // 折叠交互（CSS blockquote[expandable] + bindContentClicks 里的点击切换）。
@@ -1697,6 +1703,53 @@
     btn._t = setTimeout(function () { btn.innerHTML = old; btn.classList.remove("done"); }, 1400);
   }
 
+  function paintProtocolBody(bq) {
+    var pre = bq.querySelector("pre");
+    if (!pre || bq._pbText === undefined) return;
+    var expanded = bq.classList.contains("expanded") || bq.classList.contains("pb-short");
+    var text = bq._pbText;
+    if (!expanded) {
+      // 收起时只构建三行 DOM；这不是内容删除，复制和展开都使用完整 _pbText。
+      var end = 0;
+      for (var i = 0; i < 3; i++) { end = text.indexOf("\n", end); if (end < 0) break; end++; }
+      if (end >= 0) text = text.slice(0, end);
+    }
+    // 大正文不做语法高亮膨胀，不为每个 token 创建 span。
+    if (text.length > 20000) pre.textContent = text;
+    else pre.innerHTML = '<code>' + highlightCode(text, bq._pbLang || "shell") + '</code>';
+  }
+
+  function showOutputPage(bq, offset, previous) {
+    if (bq._outputLoading) return;
+    bq._outputLoading = true;
+    var area = bq.querySelector('.output-pages');
+    if (!area) {
+      area = document.createElement('div'); area.className = 'output-pages'; bq.appendChild(area);
+    }
+    var oldLabel = area.querySelector('.output-page-label');
+    if (oldLabel) oldLabel.textContent = '读取存档中…';
+    api('/api/output/page', {method: 'POST', body: JSON.stringify({
+      path: bq.getAttribute('data-output-path'), offset: offset
+    })}).then(function (page) {
+      bq._outputPage = page; bq._outputPrevious = previous;
+      while (area.firstChild) area.removeChild(area.firstChild);
+      var controls = document.createElement('div'); controls.className = 'pb-head';
+      var label = document.createElement('span'); label.className = 'output-page-label';
+      label.textContent = page.filename + ' · ' + page.offset + '–' + page.next_offset + ' / ' + page.size + ' bytes';
+      controls.appendChild(label);
+      [['prev', '上一页', !previous.length], ['next', '下一页', page.eof], ['copy', '复制本页', false], ['close', '关闭', false]].forEach(function (item) {
+        var button = document.createElement('button'); button.type = 'button';
+        button.className = 'code-btn btn-output-' + item[0]; button.textContent = item[1];
+        button.disabled = item[2]; controls.appendChild(button);
+      });
+      var pre = document.createElement('pre'); pre.className = 'output-page-text'; pre.dataset.enhanced = '1';
+      // 存档是不可信文本，不走 innerHTML、不执行其中的协议/脚本。
+      pre.textContent = page.text;
+      area.appendChild(controls); area.appendChild(pre);
+    }).catch(function (err) { toast('读取输出失败：' + err.message, true); })
+      .finally(function () { bq._outputLoading = false; });
+  }
+
   function enhanceProtocolBlocks(container) {
     var bqs = container.querySelectorAll("blockquote[expandable]");
     Array.prototype.forEach.call(bqs, function (bq) {
@@ -1708,7 +1761,7 @@
       var node = bq.firstChild;
       while (node && node !== pre) { title += node.textContent || ""; node = node.nextSibling; }
       title = title.replace(/\s+/g, " ").trim();
-      var text = pre ? (pre.querySelector("code") || pre).textContent.replace(/\n$/, "") : "";
+      var text = pre ? (pre.querySelector("code") || pre).textContent : "";
       // 语言从 <code class="language-xxx"> 读真值：此前写死 "CODE" → 落到 // 词法，
       // 对协议块这种命令执行输出是错的。没有语言类时按 shell（# 注释）兜底，而不是
       // 通用 // 词法——协议块本就是命令上下文。必须在下面清空 bq 之前读，否则 code
@@ -1733,16 +1786,24 @@
                '<button class="code-btn btn-copy" type="button" title="复制显示的代码">' + svgIcon("copy") + '<span>复制</span></button>' : '') +
         (bq.getAttribute("data-raw") ? '<button class="code-btn btn-copy-all" type="button" title="复制整个协议块（BEGIN 到 END 原文）">' + svgIcon("copy") + '<span>复制全部</span></button>' : '');
 
+      head.title = title;
+      if (bq.getAttribute('data-output-path')) {
+        var archive = document.createElement('button'); archive.type = 'button';
+        archive.className = 'code-btn btn-output'; archive.textContent = '查看存档';
+        head.appendChild(archive);
+      }
+      bq._pbText = text; bq._pbLang = pbLang;
       while (bq.firstChild) bq.removeChild(bq.firstChild);
       bq.appendChild(head);
       if (pre) {
         pre.dataset.enhanced = "1";
-        pre.innerHTML = '<code>' + highlightCode(text, pbLang) + '</code>';
+        pre.textContent = '';
         bq.appendChild(pre);
       }
       if (label) { label.className = "pb-folded"; bq.appendChild(label); }
       bq.classList.add("pb");
       if (short) bq.classList.add("pb-short");
+      paintProtocolBody(bq);
     });
   }
 
@@ -1775,7 +1836,8 @@
             '<button class="code-btn btn-copy" type="button" title="复制代码">' + svgIcon("copy") + '<span>复制</span></button>' +
           '</div>';
 
-        pre.innerHTML = '<code>' + highlightCode(rawCode, lang) + '</code>';
+        if (rawCode.length > 20000) pre.textContent = rawCode;
+        else pre.innerHTML = '<code>' + highlightCode(rawCode, lang) + '</code>';
         wrap.appendChild(header);
         wrap.appendChild(pre);
       }
@@ -1795,6 +1857,28 @@
         var wrap = btn.closest(".code-block-wrap, blockquote.pb");
         var pre = wrap && wrap.querySelector("pre");
         e.stopPropagation();
+        if (btn.classList.contains('btn-output')) {
+          showOutputPage(wrap, 0, []); return;
+        }
+        if (btn.classList.contains('btn-output-copy')) {
+          if (wrap._outputPage) copyText(wrap._outputPage.text)
+            .then(function () { flashCopied(btn, true); }).catch(function () { toast('复制失败'); });
+          return;
+        }
+        if (btn.classList.contains('btn-output-close')) {
+          var pages = wrap.querySelector('.output-pages'); if (pages) pages.remove();
+          wrap._outputPage = null; wrap._outputPrevious = []; return;
+        }
+        if (btn.classList.contains('btn-output-next')) {
+          var page = wrap._outputPage;
+          if (page && !page.eof) showOutputPage(wrap, page.next_offset, (wrap._outputPrevious || []).concat([page.offset]));
+          return;
+        }
+        if (btn.classList.contains('btn-output-prev')) {
+          var previous = (wrap._outputPrevious || []).slice();
+          if (previous.length) showOutputPage(wrap, previous.pop(), previous);
+          return;
+        }
         if (btn.classList.contains("btn-copy-all")) {
           copyText(wrap.getAttribute("data-raw") || "").then(function () { flashCopied(btn, true); })
                                                       .catch(function () { toast("复制失败，请手动选中"); });
@@ -1803,7 +1887,7 @@
         if (!pre) return;
         if (btn.classList.contains("btn-copy")) {
           var codeEl = pre.querySelector("code") || pre;
-          copyText(codeEl.textContent).then(function () { flashCopied(btn, true); })
+          copyText(wrap._pbText === undefined ? codeEl.textContent : wrap._pbText).then(function () { flashCopied(btn, true); })
                                       .catch(function () { toast("复制失败，请手动选中"); });
         } else if (btn.classList.contains("btn-wrap")) {
           pre.classList.toggle("wrapped");
@@ -1817,12 +1901,13 @@
       var foldBq = e.target.closest("blockquote.pb");
       if (foldBq) {
         e.stopPropagation();
-        if (foldBq.classList.contains("pb-short") || e.target.closest(".pb-folded")) return;
+        if (foldBq.classList.contains("pb-short") || e.target.closest(".pb-folded, .output-pages")) return;
         clearTimeout(foldBq._ft);
         if (e.detail > 1) return;
         foldBq._ft = setTimeout(function () {
           if (String(window.getSelection() || "").length) return;
           foldBq.classList.toggle("expanded");
+          paintProtocolBody(foldBq);
         }, 250);
         return;
       }

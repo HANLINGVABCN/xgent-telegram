@@ -24,6 +24,7 @@ import logging
 import mimetypes
 import os
 import re
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import socketserver
 import threading
 import time
@@ -32,6 +33,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from xgent_app import web_auth
 from xgent_app import web_terminal
+from xgent_app.output_archive import OutputArchiveError, read_output_page
 from xgent_app.web_bridge import MEDIA_TOKEN_REGISTRY, WebOutbox, build_web_conversation_objects
 
 logger = logging.getLogger(__name__)
@@ -66,6 +68,10 @@ VENDOR_ASSETS: Dict[str, Any] = {
 
 # SSE 心跳间隔。低于常见反代的 60s 空闲超时。
 SSE_HEARTBEAT_SECONDS = 10.0
+
+
+class WebOperationTimeout(TimeoutError):
+    """HTTP 等待超时；已请求取消，但已提交的写入不保证回滚。"""
 
 
 class WebChatConfig:
@@ -307,6 +313,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     # --- 认证 ---
 
     def _is_authenticated(self) -> bool:
+        if self.server.shutdown_event.is_set():  # type: ignore[attr-defined]
+            return False
         cookies = web_auth.parse_cookie_header(self.headers.get("Cookie", ""))
         value = cookies.get(web_auth.SESSION_COOKIE_NAME, "")
         return web_auth.verify_session_cookie(self.server.session_key, value)  # type: ignore[attr-defined]
@@ -331,7 +339,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _run_coro(self, coro: Any, timeout: float = 30.0) -> Any:
         """把协程丢回 PTB 的事件循环执行并等结果。"""
         future = asyncio.run_coroutine_threadsafe(coro, self.config.loop)
-        return future.result(timeout=timeout)
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeoutError as exc:
+            future.cancel()
+            raise WebOperationTimeout(
+                "请求等待超时，已请求取消；操作可能已完成，请刷新确认后再重试"
+            ) from exc
 
     # --- 路由 ---
 
@@ -368,6 +382,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"error": "not found"}, status=404)
         except ConnectionError:
             pass
+        except WebOperationTimeout as exc:
+            self._send_json({"error": str(exc)}, status=504)
         except Exception:
             logger.exception("web GET %s 失败", path)
             with contextlib.suppress(Exception):
@@ -392,6 +408,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._handle_command()
             elif path == "/api/stop":
                 self._handle_stop()
+            elif path == "/api/output/page":
+                self._handle_output_page()
             elif path == "/api/media/resolve":
                 self._handle_media_resolve()
             elif path == "/api/config":
@@ -408,6 +426,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"error": "not found"}, status=404)
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except WebOperationTimeout as exc:
+            self._send_json({"error": str(exc)}, status=504)
         except Exception:
             logger.exception("web POST %s 失败", path)
             with contextlib.suppress(Exception):
@@ -765,6 +785,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
                 while not stop_event.is_set():
                     frame = stream.get(timeout=SSE_HEARTBEAT_SECONDS)
+                    if not self._is_authenticated():
+                        break
                     if frame is None:
                         # 超时或队列关闭：发送可观察的心跳，检测代理是否仍在转发。
                         self.wfile.write(b"event: ping\ndata: {}\n\n")
@@ -777,6 +799,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         except (ConnectionError, ValueError):
             # 浏览器关页面就是这条路径，属正常。
             pass
+        finally:
+            self.close_connection = True
 
     # --- 终端 ---
 
@@ -791,6 +815,22 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._send_html(b"<h1>terminal.html missing</h1>", status=500)
             return
         self._send_html(body)
+
+    def _handle_output_page(self) -> None:
+        if not self._require_auth() or not self._require_web_enabled():
+            return
+        data = self._read_json()
+        if data is None:
+            return
+        # 不沿用 workspace 的宽白名单；只认配置中 xgent_storage 下的 command_outputs。
+        roots = [os.path.join(root, "command_outputs") for root in self.config.media_allowed_roots
+                 if os.path.basename(os.path.normpath(root)) == "xgent_storage"]
+        try:
+            page = read_output_page(str(data.get("path") or ""), data.get("offset", 0), roots=roots)
+        except OutputArchiveError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        self._send_json(page, extra_headers={"Cache-Control": "private, no-store"})
 
     def _handle_media_resolve(self) -> None:
         """按服务器路径换一个下载 token（POST /api/media/resolve）。
@@ -1049,6 +1089,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         try:
             while not stop_event.is_set():
                 chunk = manager.read(session_id, timeout=SSE_HEARTBEAT_SECONDS)
+                if not self._is_authenticated():
+                    break
                 if chunk is None:
                     # 会话结束（子进程退出 / EOF）。发 close 事件并回收。
                     self.wfile.write(b"event: close\ndata: \n\n")
@@ -1069,6 +1111,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ValueError):
             # 浏览器关页面属正常。
             pass
+        finally:
+            self.close_connection = True
 
 
 class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):

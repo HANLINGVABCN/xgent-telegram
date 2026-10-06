@@ -499,7 +499,7 @@ class RenderFoldedTests(unittest.TestCase):
       - 协议标记 / 围栏 / nonce 绝不泄漏到显示层；
       - 散文经注入的 prose_renderer（生产里是 markdown_to_telegram_html）；
       - 未闭合尾巴的两种语义（流式=生成中占位、定稿=原样不折，防吞）；
-      - 幂等、空输入/无块原样；正文按「前 50 行 + 已折叠 N 行」封顶，第 51 行永不外泄。
+      - 幂等、空输入/无块原样；标准正文完整，只有 Telegram 出口按「前 50 行 + 已折叠 N 行」封顶。
     """
 
     def test_single_block_becomes_expandable_blockquote(self):
@@ -625,18 +625,20 @@ class RenderFoldedTests(unittest.TestCase):
         plain = "就是一段普通文字\n没有任何协议块\n\n结束"
         self.assertEqual(plain, ProtocolParser.render_folded_html(plain))
 
-    def test_body_over_50_lines_capped_with_fold_label(self):
-        # spec ②：正文 > 50 行 → 只显示前 50 行 + 一行「已折叠 N 行」(N=总行数−50)，
-        # 第 51 行起永不渲染。
+    def test_only_telegram_caps_body_over_50_lines(self):
+        # 标准 HTML 完整；Telegram 展开预览仍受独立长度限制。
         body = "\n".join(f"line{i}" for i in range(1, 61))   # 60 行
         response = protocol_block("read-x", body, NONCE_A)
         out = ProtocolParser.render_folded_html(response)
         self.assertIn("<blockquote expandable>", out)
         self.assertIn("· 60 行", out)          # header 标总行数
-        self.assertIn("已折叠 10 行", out)      # ② 标签：60 − 50
-        self.assertIn("line50", out)            # 第 50 行仍在
-        self.assertNotIn("line51", out)         # 第 51 行起永不外泄
-        self.assertNotIn("line60", out)
+        self.assertNotIn("已折叠", out)
+        self.assertIn("line60", out)  # 标准 HTML / Web / TUI 完整保留。
+        telegram = ProtocolParser.to_telegram_html(out)
+        self.assertIn("已折叠 10 行", telegram)
+        self.assertIn("line50", telegram)
+        self.assertNotIn("line51", telegram)
+        self.assertNotIn("line60", telegram)
 
     def test_body_at_50_lines_no_fold_label(self):
         body = "\n".join(f"L{i}" for i in range(1, 51))      # 正好 50 行

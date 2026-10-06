@@ -7,8 +7,9 @@ ROOT = Path(__file__).resolve().parents[1]
 class MemoryMaintenanceWiringTests(unittest.TestCase):
     def test_agent_trims_success_and_exception_results(self):
         source = (ROOT / "xgent_app/sections/agent.py").read_text(encoding="utf-8")
-        self.assertEqual(2, source.count("memory_maintenance.trim_after_large_command"))
-        self.assertIn("elapsed_seconds, saved['bytes']", source)
+        # 成功和异常结果现在共用收尾路径；具体两条路径由生命周期测试执行验证。
+        self.assertEqual(1, source.count("memory_maintenance.trim_after_large_command"))
+        self.assertIn("elapsed_seconds, capture.bytes", source)
 
     def test_trigger_uses_complete_output_file_size(self):
         source = (ROOT / "xgent_app/sections/shell_triggers.py").read_text(encoding="utf-8")

@@ -151,7 +151,8 @@ async def _sleep_or_stop(delay: float) -> bool:
     if delay <= 0:
         return stop_event.is_set()
     try:
-        await asyncio.wait_for(asyncio.shield(stop_event.wait()), timeout=delay)
+        # 取消一次 wait 不会取消 Event；shield 会把每次超时的等待任务遗留到停机。
+        await asyncio.wait_for(stop_event.wait(), timeout=delay)
     except asyncio.TimeoutError:
         return False
     return True

@@ -4,7 +4,8 @@
 ``<pre>``），网页 / CLI / 历史回放 / 镜像帧都直接用它——多端与刷新前后因此一致。
 Telegram 不认这种形态（blockquote 内嵌 pre 报 400、data-raw 非法属性），所以在
 bot **类**上把 send_message / edit_message_text 包一层：parse_mode 为 HTML 时经
-``ProtocolParser.to_telegram_html`` 转换。
+``ProtocolParser.to_telegram_html`` 转换，并仅在此裁剪块头及正文预览。
+标准 HTML 保留全部协议内容，Web/TUI 的展开和复制不继承 Telegram 长度限制。
 
 装在类上而不是散落在各调用点，是因为 Telegram 出口不止一条：直连会话的
 msg.edit_text、网页→TG 的 fanout 投递（deliver_op_to_bot）、TG→网页镜像补丁

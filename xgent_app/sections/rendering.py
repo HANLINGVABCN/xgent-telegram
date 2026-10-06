@@ -8,7 +8,7 @@ def _should_hide_protocol_blocks() -> bool:
     """当前会话是否开启「折叠协议代码块」。
 
     只影响「显示」这一层：开启后把 AI 回复正文里的 *-x 协议块折成可展开控件
-    （收起→块头；展开→块头+前 50 行+「已折叠 N 行」），绝不触碰被落库 /
+    （Web/TUI 展开完整正文；Telegram 出口单独限制预览长度），绝不触碰被落库 /
     执行 / 镜像的原始文本。默认 True（开）。
     """
     return normalize_bool(UserDataManager.get('hide_protocol_blocks', True), True)
@@ -844,7 +844,7 @@ def split_html_for_telegram(html_text: str, limit: int = 4000) -> List[str]:
     先按标签嵌套深度把 HTML 拆成一串顶层单元——每个 <blockquote> 折叠块整体是一个
     单元，深度回到 0 的散文行各自是一个单元——再把整块单元贪心装箱进 ≤limit 的段。
     单元永远整进整出，只有【单个单元自身就超限】（如超长散文行）才退到
-    split_text_for_telegram 硬切；折叠块正文已在 protocols 层截到安全长度，正常进不来。
+    split_text_for_telegram 硬切；折叠块按 Telegram 出口的裁剪结果计长，正常进不来。
 
     这样修好了老 bug：两个各自不超限、合起来超限的折叠块，曾因分段判断只看「当前累计
     + 下一【行】」，而块的开头行很短、判断通过后整块又在 depth>0 里被吸进来无从再切，
@@ -890,8 +890,8 @@ def split_html_for_telegram(html_text: str, limit: int = 4000) -> List[str]:
     if cur:
         chunks.append("\n".join(cur))
 
-    # ③ 仅当单个单元自身仍超限（超长散文行等）才硬切——折叠块已在 protocols 层截到
-    #    安全长度，永远进不了这条兜底。
+    # ③ 仅当单个单元自身仍超限（超长散文行等）才硬切；标准折叠正文不裁剪，
+    #    只以出口适配后的长度分段。
     final: List[str] = []
     for chunk in chunks:
         if _tg_len(chunk) <= limit:
@@ -903,9 +903,8 @@ def split_html_for_telegram(html_text: str, limit: int = 4000) -> List[str]:
 
 def _tg_len(html_text: str) -> int:
     """这段 HTML 打到 Telegram 时的实际长度（经出口适配后）。"""
-    if "<blockquote expandable" not in html_text:
-        return len(html_text)
-    return len(ProtocolParser.to_telegram_html(html_text))
+    telegram = ProtocolParser.to_telegram_html(html_text)
+    return len(telegram.encode('utf-16-le', errors='surrogatepass')) // 2
 
 
 @without_ui_history

@@ -1532,29 +1532,26 @@ async def reconcile_web_config_once() -> None:
         state.set(COMPONENT_DISABLED, reason="未开启或未设置访问密码")
         return
 
-    # 3) 在跑着：只有端口变了才值得重启——重启会换掉 session_key，把所有已登录的
-    #    浏览器踢下线。密码变了就地换哈希：它只在登录那一刻被读（web_server
-    #    _handle_login），没必要为此断开在线连接。
+    # 3) 端口或密码变化都重启 Web：复用停服清理，撤销旧 Cookie、SSE 和终端。
+    #    只换密码哈希会让已泄漏的会话继续有效，用户改密码无法收回访问权限。
     server = _web_chat_server
     if server is None:
         return
-    if int(getattr(server.config, 'port', port) or port) != int(port):
-        logger.info("Web 端口已改为 %s，重启服务生效", port)
+    password_changed = str(getattr(server.config, 'password_hash', '') or '') != password_hash
+    if int(getattr(server.config, 'port', port) or port) != int(port) or password_changed:
+        logger.info("Web 端口或访问密码已变更，重启 Web 并撤销已有登录与终端会话")
         error = await restart_web_chat(_web_application)
         if error:
             state.set(COMPONENT_DOWN, error=error)
         else:
             state.set(COMPONENT_UP, host=DEFAULT_WEB_HOST, port=port)
         return
-    if str(getattr(server.config, 'password_hash', '') or '') != password_hash:
-        server.config.password_hash = password_hash
-        logger.info("Web 访问密码已更新，就地生效（未重启，在线会话不受影响）")
 
 
 async def apply_web_config_change(app: Optional[Any] = None) -> str:
     """刚把 Web 配置写进库之后调它。返回一句给用户看的说明（不需要说就是空串）。
 
-    托管 Web 的进程立刻对账一次：该起就起、该停就停、端口变了才重启、密码就地换。
+    托管 Web 的进程立刻对账一次：该起就起、该停就停、端口或密码变化时重启 Web，撤销旧会话。
     非托管进程（xgent CLI）什么都不做——服务进程的对账任务几秒内会做同样的事，而
     CLI 自己动手只会去抢服务进程占着的端口。
     """

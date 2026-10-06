@@ -56,9 +56,7 @@ class AgentPresenterTests(unittest.TestCase):
                 "<blockquote expandable><b>🔎 grep-x</b> · 1 行\n<pre>"
             )
         )
-        # notice[:2000] 的截断没变：正好 2000 个连续 x（块头里的 x 不算进来）。
-        self.assertIn("x" * 2000, text)
-        self.assertNotIn("x" * 2001, text)
+        self.assertIn("x" * 2100, text)  # 非 Telegram 通道不继承结果卡片的显示截断。
         self.assertTrue(text.endswith("</pre></blockquote>"))
 
     def test_standard_presentation_dispatches_visible_kinds_only(self):
@@ -118,10 +116,18 @@ class AgentPresenterTests(unittest.TestCase):
                 "✅ 返回码: <code>0</code>\n"
                 "完整输出: <code>/tmp/a&amp;b.log</code>\n"
                 # 返回码/完整输出留在块外原样不动，只有命令输出的代码块被折叠。
-                "<blockquote expandable><b>⌨️ run-x</b> · 1 行\n"
+                '<blockquote expandable data-output-path="/tmp/a&amp;b.log"><b>⌨️ run-x</b> · 1 行\n'
                 "<pre>&lt;done&gt;</pre></blockquote>"
             ),
         )
+
+    def test_truncated_archive_is_not_described_as_complete(self):
+        rendered = build_run_presentation({
+            "success": True, "output": "summary", "return_code": 0,
+            "output_path": "/tmp/output.txt", "archive_truncated": True,
+        })
+        self.assertIn("输出存档（已截断）", rendered)
+        self.assertNotIn("完整输出:", rendered)
 
     def test_run_presentation_reports_archive_failure(self):
         """存档失败时 output_path 是 None，不能显示成空白。"""

@@ -167,6 +167,117 @@ async def save_command_output_async(command: str, output: str) -> Dict[str, Any]
         return {'path': None, 'bytes': 0}
 
 
+
+# run-x 的内存摘要与单次存档分别有界；不能先 communicate() 再截断展示。
+RUN_OUTPUT_PREVIEW_CHARS = 256 * 1024  # 每个流保留头尾，共最多约 512K 字符。
+RUN_OUTPUT_ARCHIVE_BYTES = 64 * 1024 * 1024
+RUN_OUTPUT_CHUNK_BYTES = 64 * 1024
+
+
+class RunOutputCapture:
+    """分块读取 stdout/stderr，完整输出流式存档，内存只留有界头尾。"""
+
+    def __init__(self, command: str):
+        self.command = command
+        self.preview_limit = RUN_OUTPUT_PREVIEW_CHARS
+        self.archive_limit = RUN_OUTPUT_ARCHIVE_BYTES
+        self._head = {'stdout': '', 'stderr': ''}
+        self._tail = {'stdout': '', 'stderr': ''}
+        self._chars = {'stdout': 0, 'stderr': 0}
+        self._lock = threading.RLock()
+        self._handle = None
+        self._closed = False
+        self._failed = False
+        self._last_stream = 'stdout'
+        self.path = None
+        self.bytes = 0
+        self.archive_truncated = False
+
+    def _write_bytes(self, data: bytes) -> None:
+        if self.archive_truncated:
+            return
+        marker = '\n[存档已达大小上限，后续输出已省略]\n'.encode('utf-8')
+        available = max(0, self.archive_limit - self.bytes - len(marker))
+        if len(data) > available:
+            # 不截断 UTF-8 码点；预留位置保证告警也不突破存档上限。
+            data = data[:available].decode('utf-8', errors='ignore').encode('utf-8')
+            data += marker[:max(0, self.archive_limit - self.bytes - len(data))]
+            self.archive_truncated = True
+        self._handle.write(data)
+        self.bytes += len(data)
+
+    def _write_chunk(self, stream: str, text: str) -> None:
+        # 两个读取协程的磁盘写入在线程池中执行，锁也保护取消时的 close。
+        with self._lock:
+            if self._closed or self._failed or self.archive_truncated:
+                return
+            try:
+                if self._handle is None:
+                    now = datetime.now()
+                    dated_dir = os.path.join(COMMAND_OUTPUT_DIR, now.strftime('%Y-%m-%d'))
+                    os.makedirs(dated_dir, exist_ok=True)
+                    path = os.path.join(dated_dir, f"{now.strftime('%H%M%S')}_{uuid.uuid4().hex[:8]}.txt")
+                    self._handle = open(path, 'xb')
+                    self.path = to_display_path(path)
+                    header = f"Command:\n{self.command}\n\nCaptured at: {now.isoformat(timespec='seconds')}\n\nOutput:\n"
+                    self._write_bytes(header.encode('utf-8', errors='replace'))
+                if stream and stream != self._last_stream and text:
+                    self._write_bytes(f'\n--- {stream} ---\n'.encode('utf-8'))
+                    self._last_stream = stream
+                self._write_bytes(text.encode('utf-8', errors='replace'))
+            except OSError as exc:
+                self._failed = True
+                self.path = None
+                logger.error('run 命令输出存档失败: %s', exc)
+                if self._handle is not None:
+                    with contextlib.suppress(OSError):
+                        self._handle.close()
+                    self._handle = None
+
+    async def read_stream(self, reader: asyncio.StreamReader, stream: str) -> None:
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        while True:
+            chunk = await reader.read(RUN_OUTPUT_CHUNK_BYTES)
+            text = decoder.decode(chunk, final=not chunk)
+            if text:
+                self._chars[stream] += len(text)
+                head_limit = self.preview_limit // 2
+                take = max(0, head_limit - len(self._head[stream]))
+                self._head[stream] += text[:take]
+                self._tail[stream] = (self._tail[stream] + text[take:])[-(self.preview_limit - head_limit):]
+                await asyncio.to_thread(self._write_chunk, stream, text)
+            if not chunk:
+                return
+
+    def output(self) -> str:
+        parts = {}
+        for stream in ('stdout', 'stderr'):
+            gap = '\n[中间输出已省略；请查看输出存档]\n' if self._chars[stream] > self.preview_limit else ''
+            parts[stream] = self._head[stream] + gap + self._tail[stream]
+        output = parts['stdout']
+        if parts['stderr']:
+            output += ('\n--- stderr ---\n' if output else '') + parts['stderr']
+        if self.archive_truncated:
+            output += f'\n[输出存档达到 {self.archive_limit} 字节上限，存档不完整]'
+        if self._failed:
+            output += '\n[输出存档失败，仅保留内存中的头尾摘要]'
+        return output
+
+    def finish(self, notice: str = '') -> None:
+        with self._lock:
+            try:
+                if not self._closed:
+                    self._write_chunk('', ('\n' + notice) if notice else '')
+                    if self._handle is not None:
+                        self._handle.close()
+            except OSError as exc:
+                self.path = None
+                self._failed = True
+                logger.error('关闭 run 输出存档失败: %s', exc)
+            finally:
+                self._closed = True
+
+
 async def terminate_async_process(process: Any):
     if process is None or process.returncode is not None:
         return

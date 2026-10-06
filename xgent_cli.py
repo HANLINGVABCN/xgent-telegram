@@ -259,8 +259,9 @@ def _describe_command(name: str) -> str:
 
 
 def _matching_commands(prefix: str) -> List[str]:
-    prefix = prefix.lower()
-    return [name for name in _command_names() if name.startswith(prefix)]
+    # TUI、传统命令面板和 readline 共用候选顺序。
+    return [command[1:] for command, _ in cli_tui.slash_completions(
+        "/" + prefix, _command_names(), lambda _name: "")]
 
 
 # --------------------------------------------------------------------------
@@ -623,9 +624,7 @@ def _command_completer(text: str, state: int) -> Optional[str]:
             except Exception:
                 pass
             prefix = text[1:].lower()
-            _completion_matches = [
-                f"/{name}" for name in _command_names() if name.startswith(prefix)
-            ]
+            _completion_matches = [f"/{name}" for name in _matching_commands(prefix)]
         return _completion_matches[state]
     except IndexError:
         return None
@@ -1463,9 +1462,17 @@ def _run_tui_main() -> None:
     SCREEN = pt_screen
     PALETTE = pt_screen.palette
 
+    def _tui_banner():
+        pt_screen.print_block([
+            PALETTE.paint("开始对话", PALETTE.bold),
+            "  直接输入消息，或输入 / 选择命令。",
+            PALETTE.paint("  F1 查看操作帮助 · /getchat 同步跨端历史", PALETTE.muted),
+        ])
+
     hooks = cli_tui.TuiHooks(
         dispatch=_dispatch_submitted,
-        banner=_banner,
+        banner=_tui_banner,
+        status_text=lambda: str(UserDataManager.get('default_model') or ''),
         prompt_text=_prompt_plain,
         command_names=_command_names,
         describe_command=_describe_command,

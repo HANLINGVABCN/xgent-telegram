@@ -6,7 +6,8 @@ import sys as _sys
 import time as _time
 import traceback as _traceback
 
-_CRASH_LOG = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), 'xgent_crash.log')
+# sections 共享入口的 __file__；PROJECT_ROOT 已由 core.py 按入口位置计算。
+_CRASH_LOG = _os.path.join(PROJECT_ROOT, 'xgent_crash.log')
 
 
 def _write_crash(reason: str, exc_type=None, exc_value=None, exc_tb=None) -> None:
@@ -21,8 +22,12 @@ def _write_crash(reason: str, exc_type=None, exc_value=None, exc_tb=None) -> Non
             line += f"（无异常栈，{reason}）\n"
         with open(_CRASH_LOG, 'a', encoding='utf-8') as f:
             f.write(line)
-    except Exception:
-        pass
+    except Exception as error:
+        # 不再静默丢掉唯一的崩溃证据；stderr 仍可由 systemd/PM2 收集。
+        try:
+            print(f"无法写入崩溃日志 {_CRASH_LOG}: {error}", file=_sys.stderr)
+        except Exception:
+            pass
 
 
 _orig_excepthook = _sys.excepthook
@@ -45,7 +50,10 @@ def _crash_asyncio_handler(loop, context):
     reason = f"asyncio 游离任务异常: {msg}"
     if exc is not None:
         reason += f"\n  异常类型: {type(exc).__name__}: {exc}"
-    _write_crash(reason)
+    if exc is not None:
+        _write_crash(reason, type(exc), exc, exc.__traceback__)
+    else:
+        _write_crash(reason)
 
 
 if __name__ == '__main__':

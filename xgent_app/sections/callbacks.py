@@ -838,7 +838,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "━━━━━━━━━━━━━━\n"
                 "请发送新密码（至少 6 位）。\n\n"
                 "密码只以 PBKDF2 哈希形式存进数据库，聊天记录里不会保留原文。\n"
-                "保存后会自动重启 Web 服务使其生效。\n"
+                "保存后会自动重启 Web 服务；所有网页登录失效，现有网页终端会话关闭。\n"
                 "━━━━━━━━━━━━━━\n"
                 "<i>发送 cancel 取消。</i>",
                 parse_mode=constants.ParseMode.HTML

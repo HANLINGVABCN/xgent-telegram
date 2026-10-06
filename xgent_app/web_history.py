@@ -262,7 +262,10 @@ def build_history_message(
         message["media_error"] = "\u5386\u53f2\u9644\u4ef6\u5143\u6570\u636e\u635f\u574f"
     display = metadata.get("display")
     if isinstance(display, dict) and isinstance(display.get("content"), str):
-        message.update(content=display["content"], parse_mode=display.get("parse_mode"))
+        from .protocols import ProtocolParser
+        from .output_archive import attach_archive_path
+        message.update(content=attach_archive_path(ProtocolParser.restore_folded_html(display["content"])),
+                       parse_mode=display.get("parse_mode"))
     elif kind in {"ai_reply", "media_reply"}:
         # 历史回放与 live 同源：含协议块折叠、纯 markdown 也转成 Telegram-HTML，
         # 两条路都 parse_mode=HTML，刷新后不再"变脸"（详见 _history_display_html）。
