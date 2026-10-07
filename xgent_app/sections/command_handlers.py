@@ -60,14 +60,18 @@ async def create_conversation_export(snapshot: Optional[Dict] = None) -> Tuple[D
     return snapshot, bundle
 
 
-async def deliver_conversation_export(context, chat_id: int, bundle: Dict) -> Optional[str]:
+async def deliver_conversation_export(context, chat_id: int, bundle: Dict, *, record_failure: bool = True) -> Optional[str]:
     try:
         with open(bundle['archive_path'], 'rb') as archive:
             await context.bot.send_document(chat_id=chat_id, document=archive,
                                             filename='系统记忆.zip', caption='导出完成。')
     except Exception as exc:
         logger.warning('Conversation export delivery failed: %s', exc)
-        return f"归档已保存，但文件投递失败：{redact_sensitive_text(str(exc))}\n服务器文件路径：{bundle['archive_path']}"
+        from xgent_app.error_reporting import error_text
+        detail = error_text(f"归档已保存，但文件投递失败：{format_provider_exception(exc)}\n服务器文件路径：{bundle['archive_path']}")
+        if not record_failure:
+            return detail  # Compression records this after its frozen snapshot commit.
+        return await GlobalRecorder.record_error(exc, chat_id, source='export_delivery', detail=detail)
     return None
 
 
@@ -181,6 +185,7 @@ async def run_context_compression(update: Update, context: ContextTypes.DEFAULT_
         _is_processing = _compression_running = True
         stop_event = _stop_generation_event = asyncio.Event()
         status = db = entry = snapshot = None
+        warning = None
         usage_sink = []
         model = ''
         changed = False
@@ -216,7 +221,7 @@ async def run_context_compression(update: Update, context: ContextTypes.DEFAULT_
             _, bundle = await create_conversation_export(snapshot)
             entry = await db.begin_compression(snapshot, bundle, update.effective_chat.id,
                                                provider, model, _RECORDER_SOURCE_ID, stop_event)
-            warning = await deliver_conversation_export(context, update.effective_chat.id, bundle)
+            warning = await deliver_conversation_export(context, update.effective_chat.id, bundle, record_failure=False)
             if warning:
                 with contextlib.suppress(Exception):
                     await message.reply_text(warning)
@@ -249,7 +254,8 @@ async def run_context_compression(update: Update, context: ContextTypes.DEFAULT_
             logger.warning('Context compression failed (committed=%s): %s', changed, exc)
             if changed:
                 return
-            detail = redact_sensitive_text(str(exc))
+            from xgent_app.error_reporting import error_text
+            detail = error_text(redact_sensitive_text(str(exc)))
             result = '压缩失败，原上下文已保留。\n' + detail
             if entry is not None:
                 state = 'stopped' if stop_event.is_set() else 'failed'
@@ -275,6 +281,10 @@ async def run_context_compression(update: Update, context: ContextTypes.DEFAULT_
                 else:
                     await message.reply_text(result, reply_markup=compression_retry_keyboard(entry) if entry else None)
         finally:
+            if warning and db is not None:
+                with contextlib.suppress(Exception):
+                    if changed or snapshot is not None and snapshot['generation'] == await db.get_attachment_generation():
+                        await GlobalRecorder.record_error(warning, update.effective_chat.id, source='export_delivery')
             typing_stop.set()
             try:
                 await cancel_task_quietly(typing_task)
@@ -368,7 +378,9 @@ async def cmd_export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if warning:
             await message.reply_text(warning)
     except Exception as exc:
-        await message.reply_text('导出失败，原有上下文未清除：\n' + redact_sensitive_text(str(exc)))
+        failure = await GlobalRecorder.record_error(exc, update.effective_chat.id, source='export',
+            detail='导出失败，原有上下文未清除：\n' + format_provider_exception(exc))
+        await message.reply_text(failure)
     finally:
         with contextlib.suppress(Exception):
             await status_msg.delete()

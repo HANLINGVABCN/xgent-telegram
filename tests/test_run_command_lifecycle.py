@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, patch
 import uuid
 
 from xgent_app.shell_output import format_shell_context_output
+from xgent_app.error_reporting import error_text
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -28,6 +29,7 @@ def load_run_namespace(directory):
               logging=logging, logger=logging.getLogger('run-test'), os=os,
               subprocess=subprocess, threading=threading, time=time, uuid=uuid,
               Any=Any, Dict=Dict, Optional=Optional, COMMAND_OUTPUT_DIR=directory,
+              error_text=error_text, redact_sensitive_text=lambda s: s,
               to_display_path=lambda p: p, format_shell_context_output=format_shell_context_output,
               AgentCommandBlacklist=SimpleNamespace(check=lambda c: (False, '')),
               memory_maintenance=SimpleNamespace(trim_after_large_command=AsyncMock()),

@@ -155,13 +155,13 @@ async def process_incoming_document(
             )
         except ValueError as e:
             await status_msg.edit_text(
-                f"❌ 导入失败：{safe_text(str(e))}\n\n请修正文件后重试，或发送 cancel 取消。",
+                f"❌ 导入失败：{safe_text(await GlobalRecorder.record_error(e, update.effective_chat.id, source='message_handler'))}\n\n请修正文件后重试，或发送 cancel 取消。",
                 parse_mode=constants.ParseMode.HTML
             )
         except Exception as e:
             logger.exception("Provider config import failed")
             await status_msg.edit_text(
-                f"❌ 导入失败：{safe_text(format_provider_exception(e))}\n\n请检查日志后重试。",
+                f"❌ 导入失败：{safe_text(await GlobalRecorder.record_error(e, update.effective_chat.id, source='message_handler'))}\n\n请检查日志后重试。",
                 parse_mode=constants.ParseMode.HTML
             )
         return
@@ -304,7 +304,7 @@ async def process_incoming_document(
     except Exception as e:
         logger.error(f"File save/process error: {e}")
         await update.message.reply_text(
-            f"文件 {safe_text(doc_name)} 未能完整交给模型：{safe_text(str(e))}"
+            f"文件 {safe_text(doc_name)} 未能完整交给模型：{safe_text(await GlobalRecorder.record_error(e, update.effective_chat.id, source='message_handler'))}"
         )
 
 
@@ -799,13 +799,13 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         except ValueError as e:
             await status_msg.edit_text(
-                f"❌ 导入失败：{safe_text(str(e))}\n\n请重新发送完整 JSON，或发送 cancel 取消。",
+                f"❌ 导入失败：{safe_text(await GlobalRecorder.record_error(e, update.effective_chat.id, source='message_handler'))}\n\n请重新发送完整 JSON，或发送 cancel 取消。",
                 parse_mode=constants.ParseMode.HTML
             )
         except Exception as e:
             logger.exception("Provider config text import failed")
             await status_msg.edit_text(
-                f"❌ 导入失败：{safe_text(format_provider_exception(e))}",
+                f"❌ 导入失败：{safe_text(await GlobalRecorder.record_error(e, update.effective_chat.id, source='message_handler'))}",
                 parse_mode=constants.ParseMode.HTML
             )
         return
@@ -821,7 +821,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             logger.exception("保存更新 token 失败")
             await update.message.reply_text(
-                f"❌ 保存 GitHub Token 失败：<code>{safe_text(format_provider_exception(e))}</code>",
+                f"❌ 保存 GitHub Token 失败：<code>{safe_text(await GlobalRecorder.record_error(e, update.effective_chat.id, source='message_handler'))}</code>",
                 parse_mode=constants.ParseMode.HTML
             )
             return
@@ -867,7 +867,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             logger.exception("保存搜索 API Key 失败")
             await update.message.reply_text(
-                f"❌ 保存失败：<code>{safe_text(format_provider_exception(e))}</code>",
+                f"❌ 保存失败：<code>{safe_text(await GlobalRecorder.record_error(e, update.effective_chat.id, source='message_handler'))}</code>",
                 parse_mode=constants.ParseMode.HTML
             )
             return
@@ -887,7 +887,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             result = await run_search("hello world\nmax: 1", BotConfig.TAVILY_API_KEY)
         except Exception as e:
             logger.exception("搜索 Key 验证失败")
-            result = {"success": False, "output": format_provider_exception(e)}
+            result = {"success": False, "output": await GlobalRecorder.record_error(e, update.effective_chat.id, source='message_handler')}
         if result.get('success'):
             await status_msg.edit_text(
                 "✅ 搜索 API Key 已保存并验证通过。\n"
@@ -1266,7 +1266,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             await db.rename_provider(old_name, new_name)
         except ValueError as e:
-            await update.message.reply_text(f"⚠️ {safe_text(str(e))}", parse_mode=constants.ParseMode.HTML)
+            await update.message.reply_text(f"⚠️ {safe_text(await GlobalRecorder.record_error(e, update.effective_chat.id, source='message_handler'))}", parse_mode=constants.ParseMode.HTML)
             return
         PortalManager.remove_portal(old_name)
         if UserDataManager.get('active_provider_key') == old_name:
@@ -1669,20 +1669,23 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
             _is_processing = True
             _stop_generation_event = asyncio.Event()
 
+            from xgent_app.error_reporting import runtime_error_scope
             try:
-                await _process_conversation_inner(
-                    update,
-                    context,
-                    text,
-                    content_override,
-                    force_agent_mode,
-                    reset_agent_iterations,
-                    agent_origin,
-                    resume_state,
-                )
+                db = await BotMemoryDB.get_instance()
+                generation = await db.get_attachment_generation()
+                with runtime_error_scope(update.effective_chat.id, generation):
+                    try:
+                        await _process_conversation_inner(
+                            update, context, text, content_override, force_agent_mode,
+                            reset_agent_iterations, agent_origin, resume_state,
+                        )
+                    except Exception as exc:
+                        await GlobalRecorder.record_error(exc, update.effective_chat.id, source='conversation')
+                        raise
             finally:
                 _stop_generation_event = None
                 _is_processing = False
+                publish_conversation_event(context, {'type': 'generation_end'})
     finally:
         restore_mirror()
 
@@ -1853,11 +1856,13 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     
     # 保存 AI 回复。
     if not generated_reply.recorded:
-        await GlobalRecorder.record_ai_reply(
+        generated_reply.record_id = await GlobalRecorder.record_ai_reply(
             response, update.effective_chat.id,
-            metadata=await generated_image_metadata(generated_reply.artifacts, attachment_generation),
+            metadata={**(await generated_image_metadata(generated_reply.artifacts, attachment_generation) or {}),
+                      **live_reply_metadata(generated_reply)},
         )
         await db.add_chat_message(cid, 'assistant', response)
+    await publish_saved_reply(context, getattr(generated_reply, 'record_id', None), generated_reply)
     # token 用量在正文落库之后落库，保证 timestamp 晚于正文，刷新后顺序为「输出 + tokens」。
     if token_text:
         _entry = token_text[0]
@@ -2111,12 +2116,10 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         except Exception as e:
                             logger.error(f"Agent写入文件失败: {e}")
                             round_state.over_blocked = True
-                            file_notice = f"[file结果] 写入失败: {filename}。错误: {str(e)[:200]}"
-                            await safe_send_message(
-                                context,
-                                update.effective_chat.id,
-                                f"❌ 文件写入失败: {safe_text(str(e)[:200])}"
-                            )
+                            from xgent_app.error_reporting import error_text
+                            file_notice = error_text(f"[file结果] 写入失败: {filename}。错误: {redact_sensitive_text(str(e))}")
+                            await safe_send_message(context, update.effective_chat.id,
+                                                    html.escape(file_notice), parse_mode=constants.ParseMode.HTML)
 
                         if file_notice:
                             await persist_agent_result(
@@ -2153,12 +2156,10 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         except Exception as e:
                             logger.error(f"Agent base64 写入文件失败: {e}")
                             round_state.over_blocked = True
-                            file_notice = f"[file:base64结果] 写入失败: {filename}。错误: {str(e)[:200]}"
-                            await safe_send_message(
-                                context,
-                                update.effective_chat.id,
-                                f"❌ base64 文件写入失败: {safe_text(str(e)[:200])}"
-                            )
+                            from xgent_app.error_reporting import error_text
+                            file_notice = error_text(f"[file:base64结果] 写入失败: {filename}。错误: {redact_sensitive_text(str(e))}")
+                            await safe_send_message(context, update.effective_chat.id,
+                                                    html.escape(file_notice), parse_mode=constants.ParseMode.HTML)
 
                         if file_notice:
                             await persist_agent_result(
@@ -2245,6 +2246,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         session_id = shell_execution['session_id']
                         command = shell_execution['command']
                         output = shell_execution['output']
+                        if not shell_result.get('success'):
+                            from xgent_app.error_reporting import error_text
+                            output = error_text(output)
                         # 人看的结果保留本次捕获内容；模型上下文仍由 build_shell_notice 限长。
                         display_output = output
 
@@ -2355,9 +2359,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                 finalize_result=finalize_media_result,
                             )
                         except AttachmentContextError as exc:
-                            await safe_edit_text(
-                                agent_stop_msg, f"图片持久化失败：{exc}", reply_markup=None,
-                            )
+                            failure = await GlobalRecorder.record_error(exc, update.effective_chat.id, source='media_save')
+                            await safe_edit_text(agent_stop_msg, failure, reply_markup=None)
                             return
                         if media_execution['stopped']:
                             round_state.should_continue = False
@@ -2572,11 +2575,13 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 break
 
             if not generated_reply.recorded:
-                await GlobalRecorder.record_ai_reply(
+                generated_reply.record_id = await GlobalRecorder.record_ai_reply(
                     response, update.effective_chat.id,
-                    metadata=await generated_image_metadata(generated_reply.artifacts, attachment_generation),
+                    metadata={**(await generated_image_metadata(generated_reply.artifacts, attachment_generation) or {}),
+                      **live_reply_metadata(generated_reply)},
                 )
                 await db.add_chat_message(cid, 'assistant', response)
+            await publish_saved_reply(context, getattr(generated_reply, 'record_id', None), generated_reply)
             if token_text:
                 _entry = token_text[0]
                 await GlobalRecorder.record_token_usage(

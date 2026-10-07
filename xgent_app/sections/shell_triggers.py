@@ -25,6 +25,7 @@ from apscheduler.triggers.date import DateTrigger
 from telegram.ext import Application
 
 from xgent_app.text_utils import clip_middle_text
+from xgent_app.error_reporting import error_text
 from xgent_app.agent_status import AgentTurnOrigin
 
 # 以下这些符号需要从共享命名空间获取（由 xgent_server.py 注入）
@@ -2327,7 +2328,7 @@ class SelfTriggerManager:
                 result = {
                     'status': 'failed', 'trigger_reason': 'execution_error',
                     'matched_conditions': [], 'exit_code': -1, 'output': '',
-                    'output_path': None, 'error': str(exc)[:2000],
+                    'output_path': None, 'error': error_text(redact_sensitive_text(str(exc))),
                 }
             finally:
                 output_path = cls._process_output_paths.pop(task_id, None)
@@ -2520,6 +2521,9 @@ class SelfTriggerManager:
             status = 'completed' if exit_code == 0 else 'failed'
             trigger_reason = 'process_exit'
             error = None if exit_code == 0 else f'命令退出码为 {exit_code}'
+        if status in {'failed', 'condition_unmatched'}:
+            output = error_text(output)
+            error = error_text(error) if error else None
         return {
             'status': status,
             'trigger_reason': trigger_reason,

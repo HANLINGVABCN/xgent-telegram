@@ -125,3 +125,39 @@ validation, rendering, triggers, provider adapters, and Telegram handlers.
    mutable globals.
 5. Replace the ordered compatibility loader once no section relies on a
    shared global namespace.
+
+
+## Web workbench
+
+The browser workbench is served directly from `webui/assets/` as native JavaScript
+modules and CSS. There is no npm build step or runtime CDN. The old chat renderer
+and its protocol/media/menu handling live in `chat.js`; the workbench shell owns
+hash navigation, responsive management screens, native forms and detail panels.
+`components.js` supplies DOM-safe components and authenticated JSON requests.
+Assets are routed through a filename whitelist with ETag and revalidation.
+
+`Workbench` is an application-side service initialized with the compatibility
+namespace. `WebChatConfig.workbench` delegates authenticated `/api/workbench/*`
+requests to it; the HTTP server does not import section global state. Existing
+HTTP endpoints remain supported. History and search use SQL cursors and display
+records with their existing identities, revisions and generation. Additive
+indexes and `workbench_requests` provide bounded retrieval and task-creation
+idempotency; they do not change shared-memory scope or remove old records.
+
+Provider management reuses existing model validation, client factories and
+configuration caches. Keys are write-only on normal APIs and redacted exports;
+secret export requires explicit confirmation. Task creation and cancellation
+reuse the existing scheduler, never a second execution implementation. Usage
+reuses existing merge and price rules; unpriced models have null cost rather
+than a misleading zero. File screens only expose associated attachments and
+command output archives.
+
+Terminal sessions now have one reader per PTY and a 2 MiB sequence-numbered
+ring buffer. Each HTTP/SSE client owns its cursor, so multiple clients cannot
+consume each other's output. Reconnect gaps are explicit, session lifetimes are
+independent of browser tabs, and closing/expiry reaps the process and reader.
+No Windows pseudo-terminal fallback is silently enabled.
+
+`tools/workbench_fixture.py` and `tools/workbench_smoke.py` seed temporary data,
+exercise real workbench read APIs, and capture desktop/tablet/mobile themes
+without starting Telegram, model requests, or background task execution.

@@ -404,11 +404,12 @@ class HistoryReplayFoldTests(unittest.TestCase):
         self.assertNotIn("```", visible)
         self.assertEqual("ai_reply", msg["msg_type"])  # 记录本身不变
 
-    def test_switch_off_keeps_raw_markdown(self):
+    def test_switch_off_uses_same_html_prose_renderer_as_live(self):
         content = "先看磁盘：\n" + self._block() + "\n完成。"
         msg = self._build(content, hide=False)
-        self.assertIsNone(msg.get("parse_mode"))
-        self.assertEqual(content, msg["content"])       # 原文，绝不折
+        self.assertEqual("HTML", msg.get("parse_mode"))
+        self.assertEqual("<p>" + content + "</p>", msg["content"])
+        self.assertNotIn("<blockquote expandable", msg["content"])
 
     def test_no_protocol_block_unified_to_html(self):
         # 无协议块的纯 markdown（折叠开关 ON）也统一走 markdown_to_telegram_html：

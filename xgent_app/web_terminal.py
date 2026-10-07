@@ -20,14 +20,15 @@
 
 线程模型
 --------
-每个终端输出 SSE 连接占用一个 WebChatServer 工作线程，在该线程里 select+
-read master_fd 并推帧。输入是独立的 POST 请求写 master_fd。两者通过 session_id
-关联，共享同一个 master_fd（一个写者 + 一个读者，无需额外锁）。
+每个 PTY 只有一个后台读取器，持续写入最多 2 MiB 的带序号缓冲。
+每条 SSE 连接有独立游标并广播读取，不竞争 master_fd；断线可补发保留窗口内输出。
+窗口之外的输出明确报告 gap，不伪装成完整终端恢复。关闭会话回收读取线程和子进程。
 """
 
 from __future__ import annotations
 
 import contextlib
+from collections import deque
 import logging
 import os
 import secrets
@@ -56,7 +57,8 @@ class TerminalSession:
 
     __slots__ = (
         "id", "pid", "master_fd", "cols", "rows",
-        "created_at", "last_activity", "closed",
+        "created_at", "last_activity", "closed", "condition", "chunks", "sequence",
+        "buffer_bytes", "reader", "legacy_cursor", "write_lock", "reaped",
     )
 
     def __init__(self, session_id: str, pid: int, master_fd: int,
@@ -69,6 +71,14 @@ class TerminalSession:
         self.created_at = time.time()
         self.last_activity = time.time()
         self.closed = False
+        self.condition = threading.Condition()
+        self.chunks = deque()
+        self.sequence = 0
+        self.buffer_bytes = 0
+        self.reader = None
+        self.legacy_cursor = 0
+        self.write_lock = threading.Lock()
+        self.reaped = False
 
 
 class TerminalManager:
@@ -129,6 +139,10 @@ class TerminalManager:
             self._sessions[session_id] = session
 
         self._ioctl_winsize(master_fd, rows, cols)
+        os.set_blocking(master_fd, False)
+        session.reader = threading.Thread(target=self._pump, args=(session,), daemon=True,
+                                          name="xgent-pty-reader")
+        session.reader.start()
         logger.info(
             "终端开启 sid=%s pid=%s shell=%s %sx%s",
             session_id[:_LOG_SID_LEN], pid, shell, cols, rows,
@@ -164,7 +178,7 @@ class TerminalManager:
         expired = []
         with self._lock:
             for sid, session in self._sessions.items():
-                if now - session.last_activity > self.idle_timeout:
+                if session.closed or now - session.last_activity > self.idle_timeout:
                     expired.append(sid)
         for sid in expired:
             self.close(sid)
@@ -173,50 +187,83 @@ class TerminalManager:
 
     # --- 数据通道 ---
 
-    def read(self, session_id: str, timeout: float = 1.0) -> Optional[bytes]:
-        """读取终端输出。
+    def list_sessions(self):
+        self.cleanup_idle()
+        with self._lock:
+            return [{"id": s.id, "pid": s.pid, "cols": s.cols, "rows": s.rows,
+                     "created_at": s.created_at, "last_activity": s.last_activity,
+                     "closed": s.closed, "sequence": s.sequence}
+                    for s in self._sessions.values()]
 
-        返回值约定：
-          - bytes：实际读到的输出
-          - b""：select 超时，无数据（调用方发 SSE 心跳）
-          - None：会话不存在 / 已关闭 / 子进程已退出（调用方结束 SSE）
-        """
-        session = self._sessions.get(session_id) if session_id else None
-        if session is None or session.closed:
-            return None
+    def _append(self, session, data):
+        with session.condition:
+            session.sequence += 1
+            session.chunks.append((session.sequence, data))
+            session.buffer_bytes += len(data)
+            while session.buffer_bytes > 2 * 1024 * 1024:
+                _, dropped = session.chunks.popleft()
+                session.buffer_bytes -= len(dropped)
+            session.last_activity = time.time()
+            session.condition.notify_all()
+
+    def _pump(self, session):
         try:
-            readable, _, _ = select.select([session.master_fd], [], [], timeout)
+            while not session.closed:
+                if time.time() - session.last_activity > self.idle_timeout:
+                    break
+                readable, _, _ = select.select([session.master_fd], [], [], .5)
+                if not readable: continue
+                with session.write_lock:
+                    if session.closed: break
+                    try: data = os.read(session.master_fd, 65536)
+                    except BlockingIOError: continue
+                if not data: break
+                self._append(session, data)
         except (OSError, ValueError):
-            # master_fd 已关闭等，视为会话结束。
-            self._mark_closed(session)
-            return None
-        if not readable:
-            return b""
-        try:
-            data = os.read(session.master_fd, 65536)
-        except OSError:
-            # Linux 上 slave 全部关闭后，master 端 read 会抛 EIO 而非返回 b''。
-            self._mark_closed(session)
-            return None
-        if not data:
-            # EOF：子进程关闭了写端。
-            self._mark_closed(session)
-            return None
-        session.last_activity = time.time()
-        return data
+            pass
+        finally:
+            self._terminate(session)
+
+    def read_frames(self, session_id, after=0, timeout=1.0):
+        session = self.get(session_id)
+        if session is None: return {"closed": True, "frames": [], "gap": False}
+        with session.condition:
+            session.condition.wait_for(lambda: session.closed or session.sequence > after, timeout)
+            oldest = session.chunks[0][0] if session.chunks else session.sequence + 1
+            return {"closed": session.closed, "gap": after < oldest - 1 or after > session.sequence,
+                    "frames": [(seq, data) for seq, data in session.chunks if seq > after][:16],
+                    "sequence": session.sequence}
+
+    def read(self, session_id: str, timeout: float = 1.0) -> Optional[bytes]:
+        # Compatibility for callers without cursors; HTTP uses independent read_frames cursors.
+        session = self.get(session_id)
+        if session is None: return None
+        batch = self.read_frames(session_id, session.legacy_cursor, timeout)
+        if batch["frames"]:
+            session.legacy_cursor = batch["frames"][-1][0]
+            return b"".join(data for _, data in batch["frames"])
+        return None if batch["closed"] else b""
 
     def write(self, session_id: str, data: bytes) -> bool:
-        """写入终端输入。成功返回 True。"""
-        session = self._sessions.get(session_id) if session_id else None
-        if session is None or session.closed:
-            return False
+        session = self.get(session_id)
+        if session is None or session.closed: return False
         try:
-            os.write(session.master_fd, data)
+            deadline = time.monotonic() + 3
+            with session.write_lock:
+                view = memoryview(data)
+                while view:
+                    if session.closed or time.monotonic() >= deadline: return False
+                    try:
+                        written = os.write(session.master_fd, view[:4096])
+                    except BlockingIOError:
+                        select.select([], [session.master_fd], [], .05)
+                        continue
+                    if written <= 0: return False
+                    view = view[written:]
+                session.last_activity = time.time()
+            return True
         except OSError:
-            self._mark_closed(session)
             return False
-        session.last_activity = time.time()
-        return True
 
     def resize(self, session_id: str, cols: int, rows: int) -> bool:
         """调整终端窗口大小。"""
@@ -241,15 +288,31 @@ class TerminalManager:
         session.closed = True
 
     def _terminate(self, session: TerminalSession) -> None:
-        session.closed = True
-        with contextlib.suppress(OSError):
-            os.close(session.master_fd)
-        # SIGHUP 是终端关闭的标准信号，shell 会自己退出。
-        with contextlib.suppress(ProcessLookupError, OSError):
-            os.kill(session.pid, signal.SIGHUP)
-        # 非阻塞回收，避免工作线程卡在 waitpid 上。
-        with contextlib.suppress(ChildProcessError):
-            os.waitpid(session.pid, os.WNOHANG)
+        with session.condition:
+            session.closed = True
+            session.condition.notify_all()
+            already_reaping = session.reaped
+            session.reaped = True
+        if already_reaping:
+            if session.reader and session.reader is not threading.current_thread():
+                session.reader.join(timeout=4)
+            return
+        with session.write_lock:
+            with contextlib.suppress(OSError): os.close(session.master_fd)
+        with contextlib.suppress(OSError): os.killpg(session.pid, signal.SIGHUP)
+        # Nonblocking wait in a bounded loop, then force termination and reap once.
+        try:
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                pid, _ = os.waitpid(session.pid, os.WNOHANG)
+                if pid: break
+                time.sleep(.02)
+            else:
+                with contextlib.suppress(OSError): os.killpg(session.pid, signal.SIGKILL)
+                os.waitpid(session.pid, 0)
+        except (ChildProcessError, OSError): pass
+        if session.reader and session.reader is not threading.current_thread():
+            session.reader.join(timeout=2)
 
     def _ioctl_winsize(self, fd: int, rows: int, cols: int) -> None:
         import fcntl  # type: ignore

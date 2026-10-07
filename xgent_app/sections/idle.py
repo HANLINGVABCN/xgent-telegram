@@ -80,10 +80,9 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
             )
             return
         except AttachmentContextError as exc:
-            await context.bot.send_message(
-                chat_id=BotConfig.AUTHORIZED_USER_ID,
-                text=f"空闲提醒失败：{exc}",
-            )
+            failure = await GlobalRecorder.record_error(exc, BotConfig.AUTHORIZED_USER_ID, source='idle',
+                                                       detail='空闲提醒失败：' + format_provider_exception(exc))
+            await context.bot.send_message(chat_id=BotConfig.AUTHORIZED_USER_ID, text=failure)
             await db.set_config('last_idle_notice_time', time.time())
             return
 
@@ -396,7 +395,7 @@ async def _replay_relay_op_with_presentation(mirror: Any, op: str, payload: Dict
 
     if op == 'conversation_event':
         frame = payload.get('frame')
-        if (isinstance(frame, dict) and frame.get('type') in {'history_reset', 'compression_state'}
+        if (isinstance(frame, dict) and frame.get('type') in {'history_reset', 'compression_state', 'generation_end', 'record_snapshot'}
                 and _web_external_outbox is not None):
             _web_external_outbox.put(frame)
         return
@@ -687,7 +686,7 @@ async def _web_read_settings() -> Dict[str, Any]:
             'idle_message_interval': normalize_idle_message_interval(
                 UserDataManager.get('idle_message_interval', DEFAULT_IDLE_MESSAGE_INTERVAL)
             ),
-            'smart_match_threshold': int(UserDataManager.get('smart_match_threshold', 90) or 90),
+            'smart_match_threshold': normalize_smart_match_threshold(UserDataManager.get('smart_match_threshold', 90)),
             'chat_model': f"{prov_name}|{current_model}" if prov_name and current_model else '',
             'disabled_skills': disabled_skills,
             'hidden_skills': sorted(get_hidden_skills()),
@@ -861,7 +860,8 @@ async def _web_run_conversation(text: str, outbox: Any) -> None:
             await handle_text_message(update, context)
         except Exception as e:
             logger.exception("Web 状态处理失败")
-            outbox.put({"type": "turn_error", "text": redact_sensitive_text(str(e))[:300]})
+            outbox.put({"type": "turn_error", "text": await GlobalRecorder.record_error(e, BotConfig.AUTHORIZED_USER_ID, source='web'),
+                    "record_id": getattr(e, '_xgent_error_record', (None, None, None))[2]})
         else:
             outbox.put({"type": "turn_end"})
         return
@@ -876,7 +876,8 @@ async def _web_run_conversation(text: str, outbox: Any) -> None:
         outbox.put({"type": "turn_end"})
     except Exception as e:
         logger.exception("Web 对话失败")
-        outbox.put({"type": "turn_error", "text": redact_sensitive_text(str(e))[:300]})
+        outbox.put({"type": "turn_error", "text": await GlobalRecorder.record_error(e, BotConfig.AUTHORIZED_USER_ID, source='web'),
+                    "record_id": getattr(e, '_xgent_error_record', (None, None, None))[2]})
 
 
 async def _web_handle_callback(callback_data: str, message_id: int, outbox: Any) -> None:
@@ -893,7 +894,8 @@ async def _web_handle_callback(callback_data: str, message_id: int, outbox: Any)
         outbox.put({"type": "callback_done"})
     except Exception as e:
         logger.exception("Web 回调失败")
-        outbox.put({"type": "turn_error", "text": redact_sensitive_text(str(e))[:300]})
+        outbox.put({"type": "turn_error", "text": await GlobalRecorder.record_error(e, BotConfig.AUTHORIZED_USER_ID, source='web'),
+                    "record_id": getattr(e, '_xgent_error_record', (None, None, None))[2]})
 
 
 async def _web_handle_ui_callback(ui_message_id: str, revision: int, button_id: str, outbox: Any) -> None:
@@ -910,10 +912,12 @@ async def _web_handle_ui_callback(ui_message_id: str, revision: int, button_id: 
             async with ui_operation(capture_text=True, binding=row, message_id=message_id):
                 await handle_button_click(update, context)
     except UiHistoryError as exc:
-        outbox.put({'type': 'callback_answer', 'text': str(exc), 'show_alert': True})
-    except Exception:
+        failure = await GlobalRecorder.record_error(exc, BotConfig.AUTHORIZED_USER_ID, source='web_menu')
+        outbox.put({'type': 'callback_answer', 'text': failure, 'show_alert': True})
+    except Exception as exc:
         logger.exception('Web saved-menu callback failed')
-        outbox.put({'type': 'callback_answer', 'text': '菜单操作失败，请重新打开菜单。', 'show_alert': True})
+        failure = await GlobalRecorder.record_error(exc, BotConfig.AUTHORIZED_USER_ID, source='web_menu')
+        outbox.put({'type': 'callback_answer', 'text': failure, 'show_alert': True})
     finally:
         outbox.put({'type': 'callback_done', 'resync': True})
 
@@ -946,7 +950,8 @@ async def _web_handle_command(command: str, outbox: Any) -> None:
         outbox.put({"type": "turn_end"})
     except Exception as e:
         logger.exception("Web 命令失败: %s", command)
-        outbox.put({"type": "turn_error", "text": redact_sensitive_text(str(e))[:300]})
+        outbox.put({"type": "turn_error", "text": await GlobalRecorder.record_error(e, BotConfig.AUTHORIZED_USER_ID, source='web'),
+                    "record_id": getattr(e, '_xgent_error_record', (None, None, None))[2]})
 
 
 # 网页可用的 /命令 -> cmd_* 处理函数映射，与 main.py 的 CommandHandler 注册一致。
@@ -1117,7 +1122,8 @@ async def _web_deliver_file_to_tg(abs_path: str, filename: str, caption: str) ->
         if server_obj is not None:
             server_obj.outbox.put({
                 "type": "message",
-                "text": f"⚠️ 文件 {filename} 同步到 Telegram 失败：{str(exc)[:120]}",
+                "text": await GlobalRecorder.record_error(exc, BotConfig.AUTHORIZED_USER_ID, source='file_delivery',
+                    detail=f"文件 {filename} 同步到 Telegram 失败：{format_provider_exception(exc)}"),
                 "ts": time.time(),
             })
 
@@ -1162,7 +1168,8 @@ async def _web_run_file_conversation(filename: str, content: bytes,
         outbox.put({"type": "turn_end"})
     except Exception as e:
         logger.exception("Web 文件对话失败")
-        outbox.put({"type": "turn_error", "text": redact_sensitive_text(str(e))[:300]})
+        outbox.put({"type": "turn_error", "text": await GlobalRecorder.record_error(e, BotConfig.AUTHORIZED_USER_ID, source='web'),
+                    "record_id": getattr(e, '_xgent_error_record', (None, None, None))[2]})
 
 
 async def _web_run_photo_conversation(filename: str, content: bytes,
@@ -1193,7 +1200,8 @@ async def _web_run_photo_conversation(filename: str, content: bytes,
         outbox.put({"type": "turn_end"})
     except Exception as e:
         logger.exception("Web 图片对话失败")
-        outbox.put({"type": "turn_error", "text": redact_sensitive_text(str(e))[:300]})
+        outbox.put({"type": "turn_error", "text": await GlobalRecorder.record_error(e, BotConfig.AUTHORIZED_USER_ID, source='web'),
+                    "record_id": getattr(e, '_xgent_error_record', (None, None, None))[2]})
 
 
 # 此白名单只决定入口；文档入口也会按原始字节识别图片并持久化。
@@ -1402,6 +1410,8 @@ async def start_web_chat_if_enabled(app: Optional[Any] = None, *,
             else (lambda: normalize_bool(UserDataManager.get('web_enabled', False), False))
         ),
     )
+    from xgent_app.workbench import Workbench
+    config.workbench = Workbench(globals()).handle
     server = WebChatServer(config)
     try:
         await asyncio.to_thread(server.start)

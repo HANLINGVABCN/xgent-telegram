@@ -179,6 +179,43 @@ class GlobalRecorder:
         return rowid
 
     @staticmethod
+    async def record_error(error, chat_id=None, *, source='runtime', detail=None, display_metadata=None):
+        """Persist user-visible failures before delivery; don't record them as AI replies.
+
+        Same exception propagation is recorded once per chat. Its normalized text
+        is reused by outer transport handlers. Raw/omitted details never enter the row.
+        """
+        from xgent_app.error_reporting import error_text, error_context
+        context = error_context()
+        chat_id = chat_id or (context[0] if context else BotConfig.AUTHORIZED_USER_ID)
+        saved = getattr(error, '_xgent_error_record', None)
+        if isinstance(saved, tuple) and saved[0] == chat_id:
+            return saved[1]
+        raw = detail if detail is not None else (format_provider_exception(error) if isinstance(error, BaseException) else str(error))
+        text = error_text(redact_sensitive_text(str(raw)))
+        if not text.startswith('⚠️ '):
+            text = '⚠️ ' + text
+        metadata = {**(display_metadata or {}), 'error_source': source, 'error_type': type(error).__name__ if isinstance(error, BaseException) else 'reported_error',
+                    'display': {'content': '<pre>' + html.escape(text) + '</pre>', 'parse_mode': 'HTML'}}
+        if context and context[0] == chat_id:
+            metadata['ui_generation'] = context[1]
+        try:
+            row_id = await GlobalRecorder.record(MessageType.RUNTIME_ERROR, 'user', text,
+                                                  chat_id=chat_id, metadata=metadata)
+            if row_id is not None and isinstance(error, BaseException):
+                try: error._xgent_error_record = (chat_id, text, row_id)
+                except Exception: pass
+        except UiHistoryError:
+            # A concurrent clear must not put an old failed turn into new memory,
+            # including a second report in the outer transport after scope exit.
+            if isinstance(error, BaseException):
+                try: error._xgent_error_record = (chat_id, text, None)
+                except Exception: pass
+        except Exception as record_exc:
+            logger.error('错误记录写入失败: %s', redact_sensitive_text(str(record_exc)))
+        return text
+
+    @staticmethod
     async def record_user_message(content: str, msg_type: str = MessageType.USER_TEXT,
                                    chat_id: Optional[int] = None,
                                    metadata: Optional[Dict[str, Any]] = None):
@@ -220,13 +257,18 @@ class GlobalRecorder:
     async def record_ai_reply(content: str, chat_id: Optional[int] = None,
                               metadata: Optional[Dict[str, Any]] = None,
                               stop_event: Optional[asyncio.Event] = None):
-        """记录AI回复。"""
+        """Keep a display snapshot separate from the original model-visible text."""
+        metadata = {'generated_media_processed': True, **(metadata or {})}
+        if 'display' not in metadata:
+            display = (_folded_display_html(content) if _should_hide_protocol_blocks()
+                       else markdown_to_telegram_html(content))
+            metadata['display'] = {'content': display, 'parse_mode': 'HTML'}
         return await GlobalRecorder.record(
             msg_type=MessageType.AI_REPLY,
             role='assistant',
             content=content,
             chat_id=chat_id,
-            metadata={'generated_media_processed': True, **(metadata or {})},
+            metadata=metadata,
             **({'stop_event': stop_event} if stop_event is not None else {}),
         )
 
@@ -1321,6 +1363,44 @@ def publish_conversation_event(context, frame: Dict[str, Any]) -> None:
         relay_conversation_event(frame)
 
 
+async def publish_saved_reply(context, row_id, reply=None):
+    """Finalize one Web bubble from the same durable view used on refresh.
+
+    Telegram keeps its own split messages. This event touches only the target
+    reply and never reloads the transcript or recreates unrelated messages.
+    """
+    if row_id is None:
+        return
+    outbox = getattr(context.bot, 'outbox', None) or get_web_outbox()
+    cli_relay = getattr(context.bot, '_is_xgent_cli_bot', False)
+    if outbox is None and not cli_relay:
+        return
+    try:
+        db = await BotMemoryDB.get_instance()
+        generation = await db.get_attachment_generation()
+        row = await db.get_display_message(row_id)
+        if row is None:
+            return
+        message = await asyncio.to_thread(
+            build_history_message, row, ArtifactManager.ROOT_DIR,
+            os.path.join(AgentExecutor.WORK_DIR, 'workspace'),
+        )
+        if generation != await db.get_attachment_generation():
+            return
+        frame = {**message, 'type': 'record_snapshot', 'record_id': row_id,
+                 'text': message['content'], 'ui_generation': generation,
+                 'reply_markup': message.get('reply_markup'),
+                 'replace_message_ids': list(getattr(reply, 'presentation_message_ids', []))}
+        frame.pop('content', None)  # The event carries text once, not two full copies.
+        if outbox is not None:
+            outbox.put(frame)
+        if cli_relay:
+            from xgent_app.cli_bridge import relay_conversation_event
+            relay_conversation_event(frame)
+    except Exception:
+        logger.warning('网页回复定稿同步失败，历史记录仍可读取', exc_info=True)
+
+
 class ArtifactManager:
     ROOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'xgent_storage')
     UPLOAD_DIR = os.path.join(ROOT_DIR, 'uploads')
@@ -2012,7 +2092,9 @@ def make_generated_reply_persistence(db, conversation_id, chat_id: int,
         content = record_prefix + text
         if stopped:
             content = (content.rstrip() + "\n\n⏹️ 当前回复已被用户手动停止").strip()
+        metadata = {**(metadata or {}), **live_reply_metadata(reply)}
         row_id = await GlobalRecorder.record_ai_reply(content, chat_id, metadata=metadata)
+        reply.record_id = row_id
         if row_id is None:
             raise AttachmentContextError("生成图片关联未成功保存，未调用后续模型。")
         reply.recorded = True

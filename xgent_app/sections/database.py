@@ -595,6 +595,10 @@ class BotMemoryDB:
             if not include_all and metadata.get('compression_auxiliary'):
                 continue
             msg_type = msg.get('msg_type')
+            if msg_type == 'runtime_error':
+                from xgent_app.error_reporting import error_text
+                result.append({'role': 'user', 'content': error_text(msg['content'])})
+                continue
             if not include_all and is_redundant_agent_command_record(msg_type, msg.get('content')):
                 continue
             # token 用量提示是给用户看的 UI 信息，不喂给模型，否则「↑ N tokens」这类
@@ -857,6 +861,8 @@ class BotMemoryDB:
         return entry
 
     async def fail_compression_attempt(self, entry: Dict, status: str, error: str) -> Optional[Dict]:
+        from xgent_app.error_reporting import error_text
+        error = error_text(error)
         from xgent_app.compression import CompressionError
         async with self._transaction() as conn:
             try:
@@ -1923,6 +1929,9 @@ class UserDataManager:
             'assistant_prompt': await cls._require_db().get_config('assistant_prompt', PromptFileManager.get('assistant_prompt')),
             'global_prompt_addon': await cls._require_db().get_config('global_prompt_addon', PromptFileManager.get('global_prompt_addon')),
             'global_depth': await cls._require_db().get_config('global_depth', 30),
+            'smart_match_threshold': normalize_smart_match_threshold(
+                await cls._require_db().get_config('smart_match_threshold', 90)
+            ),
             'model_request_limits': await cls._require_db().get_config('model_request_limits', {}),
             'discovered_model_limits': await cls._require_db().get_config('discovered_model_limits', {}),
             'agent_mode': await cls._require_db().get_config('agent_mode', False),

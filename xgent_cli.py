@@ -800,9 +800,11 @@ def _echo_submitted(text: str, *, conversation: bool) -> None:
 # 一轮处理
 # --------------------------------------------------------------------------
 
-def _report_failure(what: str) -> None:
+async def _report_failure(what: str) -> None:
     logger.exception("CLI %s 失败", what)
-    SCREEN.notice(f"{what}失败，详情见 xgent_server.log（或设 XGENT_CLI_DEBUG=1 看实时日志）。", "err")
+    failure = await GlobalRecorder.record_error(sys.exc_info()[1] or f'{what}失败',
+                                                BotConfig.AUTHORIZED_USER_ID, source='cli')
+    SCREEN.notice(failure, "err")
 
 
 async def _run_conversation(text: str) -> None:
@@ -824,7 +826,7 @@ async def _run_conversation(text: str) -> None:
         try:
             await handle_text_message(update, context)
         except Exception:
-            _report_failure("状态处理")
+            await _report_failure("状态处理")
         return
 
     set_turn_kind("chat")
@@ -842,7 +844,7 @@ async def _run_conversation(text: str) -> None:
         relay_user_message(text)
         await process_conversation(update, context, text)
     except Exception:
-        _report_failure("对话")
+        await _report_failure("对话")
 
 
 async def _run_command(command: str) -> None:
@@ -867,7 +869,7 @@ async def _run_command(command: str) -> None:
             async with _ns['ui_operation'](capture_text=True):
                 await handler(update, context)
     except Exception:
-        _report_failure(f"命令 /{name}")
+        await _report_failure(f"命令 /{name}")
 
 
 async def _run_callback(callback_data: str) -> None:
@@ -881,7 +883,7 @@ async def _run_callback(callback_data: str) -> None:
         async with _ns['ui_operation'](capture_text=True):
             await handle_button_click(update, context)
     except Exception:
-        _report_failure("按钮")
+        await _report_failure("按钮")
 
 
 # --------------------------------------------------------------------------

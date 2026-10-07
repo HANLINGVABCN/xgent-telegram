@@ -23,6 +23,7 @@ from xgent_app.agent_results import (
     normalize_search_result,
 )
 from xgent_app.agent_search import run_fetch, run_search
+from xgent_app.error_reporting import error_text
 from xgent_app.code_intel import INTEL_SUBCOMMANDS, run_intel
 
 
@@ -61,7 +62,7 @@ async def dispatch_standard_protocol(
                 )
         except Exception as exc:
             logger.error(f"Agent读取路径失败: {read_path} ({exc})")
-            notice = f"[read结果] 读取失败: {read_path}。错误: {str(exc)[:200]}"
+            notice = f"[read结果] 读取失败: {read_path}。错误: {error_text(exc)}"
             raw_result = {
                 "notice": notice,
                 "message": {"role": "user", "content": notice},
@@ -74,7 +75,7 @@ async def dispatch_standard_protocol(
         except Exception as exc:
             logger.error(f"Agent edit 执行异常: {exc}")
             raw_result = failed_result(
-                "edit", f"[edit结果] 执行异常: {str(exc)[:200]}"
+                "edit", f"[edit结果] 执行异常: {error_text(exc)}"
             )
         return normalize_edit_result(raw_result)
 
@@ -84,7 +85,7 @@ async def dispatch_standard_protocol(
         except Exception as exc:
             logger.error(f"Agent grep 执行异常: {exc}")
             raw_result = failed_result(
-                "grep", f"[grep结果] 执行异常: {str(exc)[:200]}"
+                "grep", f"[grep结果] 执行异常: {error_text(exc)}"
             )
         return normalize_grep_result(raw_result)
 
@@ -94,7 +95,7 @@ async def dispatch_standard_protocol(
         except Exception as exc:
             logger.error(f"Agent search 执行异常: {exc}")
             raw_result = failed_result(
-                "search", f"[search结果] 执行异常: {str(exc)[:200]}"
+                "search", f"[search结果] 执行异常: {error_text(exc)}"
             )
         return normalize_search_result(raw_result)
 
@@ -104,7 +105,7 @@ async def dispatch_standard_protocol(
         except Exception as exc:
             logger.error(f"Agent fetch 执行异常: {exc}")
             raw_result = failed_result(
-                "fetch", f"[fetch结果] 执行异常: {str(exc)[:200]}"
+                "fetch", f"[fetch结果] 执行异常: {error_text(exc)}"
             )
         return normalize_fetch_result(raw_result)
 
@@ -114,7 +115,7 @@ async def dispatch_standard_protocol(
             argv = shlex.split(raw_body)
         except ValueError as exc:
             return failed_result(
-                "intel", f"[intel结果] 参数解析失败（引号不匹配？）: {str(exc)[:200]}"
+                "intel", f"[intel结果] 参数解析失败（引号不匹配？）: {error_text(exc)}"
             )
         if not argv:
             return failed_result(
@@ -133,7 +134,7 @@ async def dispatch_standard_protocol(
         except Exception as exc:
             logger.error(f"Agent intel 执行异常: {exc}")
             return failed_result(
-                "intel", f"[intel结果] 执行异常: {str(exc)[:200]}"
+                "intel", f"[intel结果] 执行异常: {error_text(exc)}"
             )
         if len(output) > _INTEL_OUTPUT_LIMIT:
             output = (
@@ -150,6 +151,6 @@ async def dispatch_standard_protocol(
     except Exception as exc:
         logger.error(f"Agent run 执行异常: {exc}")
         raw_result = failed_result(
-            "run", f"[run结果] 执行异常: {str(exc)[:200]}"
+            "run", f"[run结果] 执行异常: {error_text(exc)}"
         )
     return normalize_run_result(raw_result)

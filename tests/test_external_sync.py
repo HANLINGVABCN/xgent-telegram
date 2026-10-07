@@ -579,8 +579,9 @@ async def main():
         "no_raw_fence": "```" not in all_display,
         "no_media_prompt": "Please generate" not in all_display,
         "token_gray": token_web and token_web[0]["role"] == "system",
-        "ai_reply_markdown": any(r["content"] == "正文回复 **加粗**"
-                                 and r.get("parse_mode") != "HTML" for r in web),
+        "ai_reply_html": any(r["content"] == ns["markdown_to_telegram_html"]("正文回复 **加粗**")
+                                 and r.get("parse_mode") == "HTML" for r in web),
+        "ai_context_raw": "正文回复 **加粗**" in all_ctx,
         "display_ids": all(r.get("id") and r.get("timestamp") for r in web),
         "status_not_in_ctx": "Agent 第 1 轮" not in all_ctx,
         "cmd_prefixed_in_ctx": "[命令] /restart" in all_ctx or "[命令]" in all_ctx,
@@ -596,7 +597,8 @@ asyncio.run(main())
         self.assertTrue(result["no_raw_fence"], "刷新后的显示里不允许出现协议围栏原文")
         self.assertTrue(result["no_media_prompt"], "媒体生成的完整提示词不该出现在显示里")
         self.assertTrue(result["token_gray"], "token 统计行要降级成 system 灰条")
-        self.assertTrue(result["ai_reply_markdown"], "历史必须保留 Markdown 原文，由网页统一渲染")
+        self.assertTrue(result["ai_reply_html"], "历史使用与实时回复相同的 HTML 呈现")
+        self.assertTrue(result["ai_context_raw"], "模型上下文仍保留原始 Markdown")
         self.assertTrue(result["display_ids"], "历史必须保留原始记录 ID 和时间")
 
 

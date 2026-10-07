@@ -377,6 +377,7 @@ def register_provider_secrets(providers: Optional[Dict[str, Any]]) -> None:
             register_runtime_secret(provider.get('api_key'))
 
 def format_provider_exception(e: Exception) -> str:
+    from xgent_app.error_reporting import error_text
     response = getattr(e, "response", None)
     if response is not None:
         status_code = getattr(response, "status_code", None)
@@ -388,9 +389,9 @@ def format_provider_exception(e: Exception) -> str:
             prefix = f"{type(e).__name__}"
             if status_code is not None:
                 prefix += f" ({status_code})"
-            return f"{prefix}: {redact_sensitive_text(body)}"
+            return error_text(f"{prefix}: {redact_sensitive_text(body)}")
 
-    return f"{type(e).__name__}: {redact_sensitive_text(str(e))}"
+    return error_text(f"{type(e).__name__}: {redact_sensitive_text(str(e))}")
 
 def normalize_bool(value: Any, default: bool = False) -> bool:
     if value is None:
@@ -415,6 +416,20 @@ def normalize_stream_timeout(value: Any, default: float = 0) -> float:
     if seconds <= 0:
         return 0
     return seconds
+
+def normalize_smart_match_threshold(value: Any) -> int:
+    """Use the established 90% default for unset/invalid values; zero is explicit.
+
+    The parser clamps this percentage to [0, 1]. Retain the existing UI contract
+    allowing nonnegative integer percentages rather than silently changing values.
+    """
+    if isinstance(value, bool):
+        return 90
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 90
+
 
 def normalize_command_timeout(value: Any, default: int = DEFAULT_AGENT_COMMAND_TIMEOUT) -> int:
     if isinstance(value, str) and value.strip().lower() in {"∞", "inf", "infinite", "none", "no", "unlimited", "无限"}:
@@ -906,6 +921,7 @@ class MessageType:
     USER_PHOTO = 'user_photo'
     USER_STICKER = 'user_sticker'
     AI_REPLY = 'ai_reply'
+    RUNTIME_ERROR = 'runtime_error'  # 系统/请求失败，进上下文但绝不当作模型回答执行。
     MEDIA_REPLY = 'media_reply'       # 外部媒体模块回复，和聊天AI分开记
     SYSTEM_OP = 'system_op'
     BUTTON_CLICK = 'button_click'

@@ -54,26 +54,15 @@ def command_description(name: str) -> str:
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("全局错误处理捕获异常", exc_info=context.error)
 
-    # 尝试记录错误。必须脱敏：SYSTEM_OP 记录会被重新注入模型上下文
-    # （见 get_conversation_messages），异常串里的密钥会被持续外发给
-    # 第三方 provider。
+    # Only the authorized user's failures enter shared memory, never attacker input.
+    effective_user = getattr(update, 'effective_user', None)
+    effective_chat = getattr(update, 'effective_chat', None)
+    if effective_user is not None and effective_user.id != BotConfig.AUTHORIZED_USER_ID:
+        return
+    chat_id = effective_chat.id if effective_chat else BotConfig.AUTHORIZED_USER_ID
+    failure = await GlobalRecorder.record_error(context.error, chat_id, source='telegram')
     try:
-        await GlobalRecorder.record_system_op(
-            redact_sensitive_text(f"错误: {str(context.error)[:200]}"),
-            {"traceback": redact_sensitive_text(traceback.format_exc()[:500])}
-        )
-    except Exception as record_err:
-        logger.warning(f"记录错误信息失败: {record_err}")
-
-    # 尝试通知用户。异常原文可能带文件路径、provider 名、URL 里的密钥，
-    # 这里只给固定文案，详情去日志看。
-    try:
-        if update and hasattr(update, 'effective_chat') and update.effective_chat:
-            await safe_send_message(
-                context,
-                update.effective_chat.id,
-                "系统处理时出现异常，请稍后重试。详细错误已写入日志。",
-            )
+        await safe_send_message(context, chat_id, html.escape(failure), parse_mode=constants.ParseMode.HTML)
     except Exception:
         pass
 

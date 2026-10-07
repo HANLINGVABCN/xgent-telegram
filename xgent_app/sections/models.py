@@ -101,10 +101,7 @@ class ModelClient:
                 parts = [part for msg in history if isinstance(msg.get('content'), list)
                          for part in msg['content']]
                 detail = redact_media_data(detail, parts)
-            raise AttachmentContextError(
-                "完整上下文请求失败，未获得有效回复，也没有自动减少附件：\n"
-                + redact_sensitive_text(detail)
-            )
+            raise AttachmentContextError(redact_sensitive_text(detail))
 
     @classmethod
     async def _get_http_client(cls) -> Any:

@@ -21,6 +21,7 @@ from xgent_app.agent_context import (
     build_search_context_message,
 )
 from xgent_app.shell_output import build_run_notice
+from xgent_app.error_reporting import error_text
 
 
 class AgentOperationResult(TypedDict, total=False):
@@ -64,6 +65,21 @@ def _normalize(
             "metadata": metadata if metadata is not None else {},
         }
     )
+    if not result['success']:
+        bounded_output = error_text(output)
+        # Once an error requires permanent elision, use exactly that summary for
+        # display and model continuation (not different header-dependent cutoffs).
+        if bounded_output != output:
+            result['notice'] = bounded_output
+            if isinstance(result.get('context_message'), dict) and isinstance(result['context_message'].get('content'), str):
+                result['context_message'] = {**result['context_message'], 'content': bounded_output}
+        for key in ('output', 'notice', 'display_output', 'error', 'user_message'):
+            if isinstance(result.get(key), str):
+                result[key] = error_text(result[key])
+        for key in ('message', 'context_message'):
+            message = result.get(key)
+            if isinstance(message, dict) and isinstance(message.get('content'), str):
+                result[key] = {**message, 'content': error_text(message['content'])}
     return result
 
 

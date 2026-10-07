@@ -7,6 +7,7 @@ from xgent_app.agent_context import (
     build_read_text_context_message,
 )
 from xgent_app.protocols import ProtocolParser
+from xgent_app.error_reporting import error_text
 from xgent_app import memory_maintenance
 from xgent_app.media_inputs import MediaInputError, native_binary_kind
 class AgentExecutor:
@@ -851,8 +852,8 @@ class AgentExecutor:
     @classmethod
     def extract_protocol_blocks(cls, ai_response: str) -> List[Dict[str, Any]]:
         """兼容入口：协议解析委托给纯解析模块。"""
-        pct = UserDataManager.get('smart_match_threshold', 90)
-        threshold = max(0.0, min(1.0, int(pct) / 100.0))
+        pct = normalize_smart_match_threshold(UserDataManager.get('smart_match_threshold', 90))
+        threshold = min(1.0, pct / 100.0)
         return ProtocolParser.extract_protocol_blocks(
             ai_response, smart_match_threshold=threshold
         )
@@ -1701,7 +1702,7 @@ class AgentExecutor:
         except Exception as exc:
             failed = True
             logger.error('run 命令执行异常: %s', exc)
-            notice = f'执行异常: {str(exc)[:200]}'
+            notice = error_text(f'执行异常: {redact_sensitive_text(str(exc))}')
         finally:
             # 清理独立于父任务；即使在清理期间再收到取消，也先回收资源再传播。
             cleanup_task = asyncio.create_task(cleanup())
@@ -1722,6 +1723,8 @@ class AgentExecutor:
         elapsed_seconds = round(max(0.0, time.monotonic() - started_at), 2)
         await memory_maintenance.trim_after_large_command(elapsed_seconds, capture.bytes)
         rc = process.returncode if process else -1
+        if failed or timed_out or (not stopped and rc != 0):
+            output = error_text(output)
         return {
             'success': bool(not failed and not stopped and not timed_out and rc == 0),
             'command': command,

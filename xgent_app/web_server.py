@@ -19,6 +19,7 @@ import asyncio
 import base64
 import contextlib
 import http.server
+import hashlib
 import json
 import logging
 import mimetypes
@@ -34,6 +35,7 @@ from typing import Any, Callable, Dict, List, Optional
 from xgent_app import web_auth
 from xgent_app import web_terminal
 from xgent_app.output_archive import OutputArchiveError, read_output_page
+from xgent_app.workbench import WorkbenchError
 from xgent_app.web_bridge import MEDIA_TOKEN_REGISTRY, WebOutbox, build_web_conversation_objects
 
 logger = logging.getLogger(__name__)
@@ -105,7 +107,9 @@ class WebChatConfig:
         read_health: Optional[Callable[[], Any]] = None,
         read_history_message: Optional[Callable[[int], Any]] = None,
         submit_ui_callback: Optional[Callable[[str, int, str, WebOutbox], Any]] = None,
+        workbench: Optional[Callable[..., Any]] = None,
     ):
+        self.workbench = workbench
         self.host = host
         self.port = port
         self.password_hash = password_hash
@@ -186,6 +190,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _send_html(self, body: bytes, status: int = 200) -> None:
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
         # WebApp 需要能被 Telegram 内嵌，所以不发 X-Frame-Options: DENY。
@@ -352,7 +357,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
         try:
-            if path == "/":
+            if path.startswith("/assets/"):
+                self._serve_workbench_asset(path)
+            elif path.startswith("/api/workbench/"):
+                self._handle_workbench("GET", path[len("/api/workbench/"):])
+            elif path == "/api/term/sessions":
+                self._handle_term_sessions()
+            elif path == "/":
                 self._serve_index()
             elif path == "/terminal":
                 self._serve_terminal()
@@ -394,7 +405,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         try:
             if not self._require_same_origin():
                 return
-            if path == "/api/login":
+            if path.startswith("/api/workbench/"):
+                self._handle_workbench("POST", path[len("/api/workbench/"):])
+            elif path == "/api/login":
                 self._handle_login()
             elif path == "/api/logout":
                 self._handle_logout()
@@ -434,6 +447,76 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"error": "internal error"}, status=500)
 
     # --- 处理器 ---
+
+    def _serve_workbench_asset(self, path: str) -> None:
+        allowed = {"chat.js", "chat.css", "workbench.js", "workbench.css", "components.js", "page-cache.js", "settings.js", "usage.js", "terminal.js", "terminal.css"}
+        name = path.removeprefix("/assets/")
+        if name not in allowed:
+            self._send_json({"error": "not found"}, status=404)
+            return
+        try:
+            with open(os.path.join(STATIC_DIR, "assets", name), "rb") as handle:
+                body = handle.read()
+        except OSError:
+            self._send_json({"error": "asset missing"}, status=404)
+            return
+        etag = '"' + hashlib.sha256(body).hexdigest() + '"'
+        self.send_response(304 if self.headers.get('If-None-Match') == etag else 200)
+        self.send_header('ETag', etag)
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Content-Type', 'text/javascript; charset=utf-8' if name.endswith('.js') else 'text/css; charset=utf-8')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        if self.headers.get('If-None-Match') != etag:
+            self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        if self.headers.get('If-None-Match') != etag:
+            with contextlib.suppress(ConnectionError): self.wfile.write(body)
+
+    def _handle_workbench(self, method: str, resource: str) -> None:
+        if not self._require_auth() or not self._require_web_enabled(): return
+        data = self._read_json() if method == 'POST' else {
+            k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).items()}
+        if data is None: return
+        if not isinstance(data, dict):
+            self._send_json({'error': 'JSON object required'}, status=400); return
+        try:
+            # Capture the live cursor BEFORE querying persisted history. Every change
+            # after this watermark is replayable even when DB/HTTP reads are slow.
+            live = self.server.outbox.snapshot() if method == 'GET' and resource == 'history' else None
+            if self.config.workbench is not None:
+                result = self._run_coro(self.config.workbench(method, resource, data), timeout=45)
+            elif method == 'GET' and resource == 'bootstrap':
+                result = {'settings': self._run_coro(self.config.read_settings()), 'commands': [],
+                          'capabilities': {}, 'timezone': 'Asia/Shanghai'}
+            elif method == 'GET' and resource == 'history':
+                # Older embeddings/test fixtures can still use the new shell without admin APIs.
+                history = self._run_coro(self.config.read_history(50))
+                result = {'messages': history, 'next_cursor': None,
+                          'ui_generation': getattr(history, 'generation', None),
+                          'ui_tombstones': getattr(history, 'tombstones', []),
+                          'busy': self.config.is_busy()}
+            else:
+                raise WorkbenchError('此服务尚未提供该管理功能', 503)
+            if live is not None and not data.get('before') and not data.get('after') and not data.get('anchor'):
+                if self.server.outbox.snapshot()['epoch'] != live['epoch']:
+                    raise WorkbenchError('对话已清空或切换，请重新同步', 409)
+                finalized = {mid for item in result.get('messages', [])
+                             if item.get('web_live', {}).get('epoch') == live['epoch']
+                             for mid in item['web_live']['message_ids']}
+                live['frames'] = [frame for frame in live['frames'] if frame.get('message_id') not in finalized]
+                result['live'] = live
+                result['busy'] = bool(result.get('busy') or live['frames'])
+            if resource == 'bootstrap':
+                result['capabilities'].update(terminal=self.config.is_terminal_enabled(),
+                                               terminal_supported=web_terminal.is_terminal_supported())
+            self._send_json(result, extra_headers={'Cache-Control': 'private, no-store'})
+        except WorkbenchError as exc:
+            self._send_json({'error': str(exc)}, status=exc.status)
+        except WebOperationTimeout: raise
+        except Exception:
+            # Do not echo provider credentials or imported config through exceptions/logs.
+            logger.warning('workbench operation failed: %s %s', method, resource)
+            self._send_json({'error': '操作失败，请检查配置或稍后重试；写入结果可在对应列表确认'}, status=500)
 
     def _serve_index(self) -> None:
         if not self.config.is_web_enabled():
@@ -757,9 +840,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._send_json({'error': 'invalid event cursor'}, status=400)
             return
         epoch = (query.get('epoch') or [''])[0]
+        try:
+            wait = min(20, max(0, int((query.get('wait') or ['0'])[0])))
+        except ValueError:
+            self._send_json({'error': 'invalid wait'}, status=400); return
         payload = self.server.outbox.read_events(  # type: ignore[attr-defined]
-            int(raw_cursor) if raw_cursor is not None else None, epoch,
+            int(raw_cursor) if raw_cursor is not None else None, epoch, wait_seconds=wait,
         )
+        if not self._require_auth() or not self._require_web_enabled(): return
         self._send_json(payload, extra_headers={'Cache-Control': 'private, no-store, no-transform'})
 
     def _handle_stream(self) -> None:
@@ -980,7 +1068,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         # 静态资源内容按文件名固定，可以放心长期缓存；改版本号（文件名或加
         # query）时浏览器会当新资源处理，不用担心缓存吃到旧内容。
-        self.send_header("Cache-Control", "public, max-age=604800")
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             self.wfile.write(body)
@@ -996,6 +1084,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return True
         self._send_json({"error": "Web Chat 未开启"}, status=403)
         return False
+
+    def _handle_term_sessions(self) -> None:
+        if not self._require_auth() or not self._require_terminal_enabled(): return
+        manager = web_terminal.get_terminal_manager()
+        self._send_json({"sessions": manager.list_sessions(), "supported": web_terminal.is_terminal_supported(),
+                         "max_sessions": manager.max_sessions, "idle_timeout": manager.idle_timeout})
 
     def _handle_term_open(self) -> None:
         """创建一个独立终端会话。"""
@@ -1087,32 +1181,27 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
         stop_event = self.server.shutdown_event  # type: ignore[attr-defined]
         try:
+            raw_cursor = self.headers.get('Last-Event-ID') or (query.get('after') or ['0'])[0]
+            after = max(0, int(raw_cursor))
+        except ValueError:
+            after = 0
+        try:
             while not stop_event.is_set():
-                chunk = manager.read(session_id, timeout=SSE_HEARTBEAT_SECONDS)
-                if not self._is_authenticated():
-                    break
-                if chunk is None:
-                    # 会话结束（子进程退出 / EOF）。发 close 事件并回收。
-                    self.wfile.write(b"event: close\ndata: \n\n")
-                    self.wfile.flush()
-                    manager.close(session_id)
-                    break
-                if chunk == b"":
-                    # select 超时，发注释行保活并探测连接。
-                    self.wfile.write(b": ping\n\n")
-                    self.wfile.flush()
-                    continue
-                payload = json.dumps(
-                    {"data": base64.b64encode(chunk).decode("ascii")},
-                    ensure_ascii=False,
-                )
-                self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                batch = manager.read_frames(session_id, after, timeout=SSE_HEARTBEAT_SECONDS)
+                if not self._is_authenticated(): break
+                if batch['gap']:
+                    self.wfile.write(b'event: gap\ndata: {"message":"terminal output gap"}\n\n')
+                    if after > batch.get('sequence', after): after = 0
+                for sequence, chunk in batch['frames']:
+                    payload = json.dumps({'data': base64.b64encode(chunk).decode('ascii')})
+                    self.wfile.write(f'id: {sequence}\ndata: {payload}\n\n'.encode('utf-8'))
+                    after = sequence
+                if batch['closed'] and not batch['frames']:
+                    self.wfile.write(b'event: close\ndata: {}\n\n'); self.wfile.flush(); break
+                if not batch['frames']: self.wfile.write(b': ping\n\n')
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, ValueError):
-            # 浏览器关页面属正常。
-            pass
-        finally:
-            self.close_connection = True
+        except (BrokenPipeError, ConnectionResetError, ValueError): pass
+        finally: self.close_connection = True
 
 
 class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):

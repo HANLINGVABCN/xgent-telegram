@@ -2,6 +2,7 @@
 # Keep cross-section names available through the loader until the next decoupling phase.
 
 from xgent_app.protocols import ProtocolParser
+from xgent_app.reply_presentation import track_reply_presentation, bind_reply_message_ids, remember_reply_messages
 
 
 def _should_hide_protocol_blocks() -> bool:
@@ -817,7 +818,8 @@ async def finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     )
     await safe_edit_text(msg, chunks[0], reply_markup=None, parse_mode=constants.ParseMode.HTML)
     for extra_chunk in chunks[1:]:
-        await safe_send_message(context, chat_id, extra_chunk, limit=limit, parse_mode=constants.ParseMode.HTML)
+        sent = await safe_send_message(context, chat_id, extra_chunk, limit=limit, parse_mode=constants.ParseMode.HTML)
+        remember_reply_messages(sent)
 
 
 def _folded_display_html(response: str, hide_unclosed: bool = False, monospace: bool = True,
@@ -922,7 +924,8 @@ async def finalize_html_response(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     )
     await safe_edit_text(msg, chunks[0], reply_markup=None, parse_mode=constants.ParseMode.HTML)
     for extra_chunk in chunks[1:]:
-        await safe_send_message(context, chat_id, extra_chunk, limit=limit, parse_mode=constants.ParseMode.HTML)
+        sent = await safe_send_message(context, chat_id, extra_chunk, limit=limit, parse_mode=constants.ParseMode.HTML)
+        remember_reply_messages(sent)
 
 
 def _retry_after_seconds(exc: RetryAfter) -> float:
@@ -1387,6 +1390,20 @@ async def _ensure_generated_reply(generated_reply, chat_id, provider_name, model
     )
 
 
+def _remember_live_reply(reply, context, message_ids):
+    bind_reply_message_ids(message_ids)
+    if reply is not None:
+        reply.presentation_message_ids = message_ids
+    outbox = getattr(context.bot, 'outbox', None) or get_web_outbox()
+    if reply is not None and outbox is not None:
+        reply.web_live = {'epoch': outbox.snapshot()['epoch'], 'message_ids': message_ids}
+
+
+def live_reply_metadata(reply):
+    live = getattr(reply, 'web_live', None)
+    return {'web_live': live} if live else {}
+
+
 async def _preserve_media_after_error(generated_reply, raw, *, stopped=False):
     if generated_reply is None:
         return "", None
@@ -1401,6 +1418,7 @@ async def _preserve_media_after_error(generated_reply, raw, *, stopped=False):
 
 
 @without_ui_history
+@track_reply_presentation
 async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                    prov_name: str, prov_data: Dict, model: str,
                                    system_prompt: str, history: List[Dict],
@@ -1443,6 +1461,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             reply_markup=stop_kb
         )
         renderer = TelegramStreamRenderer(context, chat_id, msg, stop_kb, TELEGRAM_MSG_LIMIT, stop_event)
+        _remember_live_reply(generated_reply, context, renderer.message_ids)
         renderer.start()
         typing_stop = asyncio.Event()
         typing_task = asyncio.create_task(
@@ -1680,13 +1699,13 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             )
             return full_response
 
-        empty_text = "模型未返回有效内容。"
+        empty_text = await GlobalRecorder.record_error('模型未返回有效内容。', chat_id, source='model_empty')
         try:
             await safe_edit_text(msg, empty_text, reply_markup=None)
         except Exception as e:
             logger.warning(f"空回复提示发送失败: {e}")
             await context.bot.send_message(chat_id=chat_id, text=empty_text)
-        return empty_text
+        return None
 
     except asyncio.CancelledError:
         if renderer:
@@ -1713,7 +1732,8 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
         )
         if media_error is not None:
             e = media_error
-        error_text = format_provider_exception(e)
+        error_text = await GlobalRecorder.record_error(e, chat_id, source='model_stream',
+                                                        display_metadata=live_reply_metadata(generated_reply))
         write_model_trace("model_error", {
             "trace_id": trace_id,
             "provider": prov_name,
@@ -1736,20 +1756,20 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
         try:
             if target_msg:
                 try:
-                    await rich_finalize_text_response(context, chat_id, target_msg, fallback_text, TELEGRAM_MSG_LIMIT)
+                    await finalize_html_response(context, chat_id, target_msg, html.escape(fallback_text), 3900)
                 except Exception as e1:
                     logger.warning(f"Rich 兜底发送失败，降级为 HTML edit: {e1}")
-                    await safe_edit_text(target_msg, fallback_text[:4000], reply_markup=None,
+                    await safe_edit_text(target_msg, html.escape(fallback_text), reply_markup=None,
                                          parse_mode=constants.ParseMode.HTML)
             else:
-                await context.bot.send_message(chat_id=chat_id, text=fallback_text[:4000])
+                await safe_send_message(context, chat_id, html.escape(fallback_text), parse_mode=constants.ParseMode.HTML)
         except Exception as edit_err:
             logger.warning(f"兜底 edit 失败，最后退到 send_message: {edit_err}")
             try:
-                await context.bot.send_message(chat_id=chat_id, text=fallback_text[:4000])
+                await safe_send_message(context, chat_id, html.escape(fallback_text), parse_mode=constants.ParseMode.HTML)
             except Exception as last_err:
                 logger.error(f"连 send_message 都失败了，UI 可能卡住: {last_err}")
-        return None if isinstance(e, AttachmentContextError) else error_text
+        return None
     finally:
         if typing_stop:
             typing_stop.set()
@@ -1762,6 +1782,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
 
 
 @without_ui_history
+@track_reply_presentation
 async def send_background_streaming_response(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                               prov_name: str, prov_data: Dict, model: str,
                                               system_prompt: str, history: List[Dict],
@@ -1808,6 +1829,7 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
             text="后台流式输出中...",
             reply_markup=stop_kb
         )
+        _remember_live_reply(generated_reply, context, [getattr(msg, 'message_id', None)])
         typing_stop = asyncio.Event()
         typing_task = asyncio.create_task(
             keep_typing_while_waiting(
@@ -2011,13 +2033,13 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
             )
             return partial
 
-        empty_text = "模型未返回有效内容。"
+        empty_text = await GlobalRecorder.record_error('模型未返回有效内容。', chat_id, source='model_empty')
         try:
             await safe_edit_text(msg, empty_text, reply_markup=None)
         except Exception as e:
             logger.warning(f"空回复提示发送失败: {e}")
             await context.bot.send_message(chat_id=chat_id, text=empty_text)
-        return empty_text
+        return None
 
     except asyncio.CancelledError:
         partial, media_error = await _preserve_media_after_error(
@@ -2026,7 +2048,7 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
         if media_error is not None:
             logger.error(f"取消后台流式回复时保存已完成图片失败: {media_error}")
             with contextlib.suppress(Exception):
-                await safe_edit_text(msg, format_provider_exception(media_error), reply_markup=None)
+                await safe_edit_text(msg, await GlobalRecorder.record_error(media_error, chat_id, source='media_save'), reply_markup=None)
         if stopped_partial_sink is not None:
             stopped_partial_sink.append(partial)
         raise
@@ -2039,7 +2061,8 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
         )
         if media_error is not None:
             e = media_error
-        error_text = format_provider_exception(e)
+        error_text = await GlobalRecorder.record_error(e, chat_id, source='model_background',
+                                                        display_metadata=live_reply_metadata(generated_reply))
         write_model_trace("model_error", {
             "trace_id": trace_id,
             "provider": prov_name,
@@ -2055,20 +2078,20 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
         try:
             if msg:
                 try:
-                    await rich_finalize_text_response(context, chat_id, msg, fallback_text, TELEGRAM_MSG_LIMIT)
+                    await finalize_html_response(context, chat_id, msg, html.escape(fallback_text), 3900)
                 except Exception as e1:
                     logger.warning(f"Rich 兜底发送失败，降级为 HTML edit: {e1}")
-                    await safe_edit_text(msg, fallback_text[:4000], reply_markup=None,
+                    await safe_edit_text(msg, html.escape(fallback_text), reply_markup=None,
                                          parse_mode=constants.ParseMode.HTML)
             else:
-                await context.bot.send_message(chat_id=chat_id, text=fallback_text[:4000])
+                await safe_send_message(context, chat_id, html.escape(fallback_text), parse_mode=constants.ParseMode.HTML)
         except Exception as edit_err:
             logger.warning(f"兜底 edit 失败，最后退到 send_message: {edit_err}")
             try:
-                await context.bot.send_message(chat_id=chat_id, text=fallback_text[:4000])
+                await safe_send_message(context, chat_id, html.escape(fallback_text), parse_mode=constants.ParseMode.HTML)
             except Exception as last_err:
                 logger.error(f"连 send_message 都失败了，UI 可能卡住: {last_err}")
-        return None if isinstance(e, AttachmentContextError) else error_text
+        return None
     finally:
         if typing_stop:
             typing_stop.set()
@@ -2097,6 +2120,7 @@ def _nonstream_hard_timeout_seconds() -> float:
 
 
 @without_ui_history
+@track_reply_presentation
 async def send_non_streaming_response(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                        prov_name: str, prov_data: Dict, model: str,
                                        system_prompt: str, history: List[Dict],
@@ -2132,6 +2156,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
             text="非流式输出中...",
             reply_markup=stop_kb
         )
+        _remember_live_reply(generated_reply, context, [getattr(msg, 'message_id', None)])
         typing_stop = asyncio.Event()
         typing_task = asyncio.create_task(
             keep_typing_while_waiting(
@@ -2189,11 +2214,12 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
                 "usage": usage_sink[0] if usage_sink else None,
                 "elapsed_seconds": time.monotonic() - generation_started_at,
             })
+            timeout_text = await GlobalRecorder.record_error(timeout_text, chat_id, source='model_timeout')
             try:
                 await safe_edit_text(msg, timeout_text, reply_markup=None)
             except Exception:
                 pass
-            return timeout_text
+            return None
         if stop_task in done and stop_event.is_set():
             partial = ""
             await cancel_task_quietly(response_task, timeout=1.0)
@@ -2246,6 +2272,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
             return None
 
         if error:
+            error = await GlobalRecorder.record_error(error, chat_id, source='model_nonstream')
             write_model_trace("model_error", {
                 "trace_id": trace_id,
                 "provider": prov_name,
@@ -2258,10 +2285,10 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
                 "elapsed_seconds": time.monotonic() - generation_started_at,
             })
             try:
-                await rich_finalize_text_response(context, chat_id, msg, error, TELEGRAM_MSG_LIMIT)
+                await finalize_html_response(context, chat_id, msg, html.escape(error), 3900)
             except Exception:
                 pass
-            return error
+            return None
 
         if response:
             response, media_artifacts = await generated_reply.prepare(response)
@@ -2308,12 +2335,12 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
             )
             return response
 
-        empty_text = "模型未返回有效内容。"
+        empty_text = await GlobalRecorder.record_error("模型未返回有效内容。", chat_id, source='model_empty')
         try:
             await safe_edit_text(msg, empty_text, reply_markup=None)
         except Exception:
             await context.bot.send_message(chat_id=chat_id, text=empty_text)
-        return empty_text
+        return None
 
     except asyncio.CancelledError:
         await cancel_task_quietly(response_task, timeout=1.0)
@@ -2328,7 +2355,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
         if media_error is not None:
             logger.error(f"取消非流式回复时保存已完成图片失败: {media_error}")
             with contextlib.suppress(Exception):
-                await safe_edit_text(msg, format_provider_exception(media_error), reply_markup=None)
+                await safe_edit_text(msg, await GlobalRecorder.record_error(media_error, chat_id, source='media_save'), reply_markup=None)
         if stopped_partial_sink is not None:
             stopped_partial_sink.append(partial)
         raise
@@ -2339,7 +2366,8 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
         _partial, media_error = await _preserve_media_after_error(generated_reply, response or "")
         if media_error is not None:
             e = media_error
-        error_text = format_provider_exception(e)
+        error_text = await GlobalRecorder.record_error(e, chat_id, source='model_nonstream',
+                                                        display_metadata=live_reply_metadata(generated_reply))
         write_model_trace("model_error", {
             "trace_id": trace_id,
             "provider": prov_name,
@@ -2352,12 +2380,12 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
         })
         try:
             if msg:
-                await rich_finalize_text_response(context, chat_id, msg, error_text, TELEGRAM_MSG_LIMIT)
+                await finalize_html_response(context, chat_id, msg, html.escape(error_text), 3900)
             else:
-                await context.bot.send_message(chat_id=chat_id, text=error_text)
+                await safe_send_message(context, chat_id, html.escape(error_text), parse_mode=constants.ParseMode.HTML)
         except Exception:
             pass
-        return None if isinstance(e, AttachmentContextError) else error_text
+        return None
     finally:
         await cancel_task_quietly(response_task, timeout=1.0)
         await cancel_task_quietly(stop_task, timeout=0.2)

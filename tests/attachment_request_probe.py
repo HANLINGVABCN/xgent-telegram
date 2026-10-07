@@ -666,7 +666,10 @@ async def check_idle_requests(bot, root):
             assert "payload too large" in frames
             assert "\u672a\u8c03\u7528\u6a21\u578b" not in frames
             rows = await h.db.get_conversation_messages(100)
-            assert not any("payload too large" in row["content"] for row in rows)
+            assert any("payload too large" in row["content"] for row in rows)
+            stored = await h.db.get_global_messages(100)
+            assert any(row['msg_type'] == 'runtime_error' and 'payload too large' in row['content'] for row in stored)
+            assert not any(row['msg_type'] == bot.MessageType.AI_REPLY and 'payload too large' in row['content'] for row in stored)
         return {"full_idle_request": True, "upstream_failure_reported": True}
 
 

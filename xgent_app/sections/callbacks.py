@@ -537,7 +537,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             except Exception as e:
                 logger.exception("搜索测试失败")
                 await status_msg.edit_text(
-                    f"❌ 测试失败：<code>{safe_text(format_provider_exception(e))}</code>",
+                    f"❌ 测试失败：<code>{safe_text(await GlobalRecorder.record_error(e, update.effective_chat.id, source='callback'))}</code>",
                     parse_mode=constants.ParseMode.HTML
                 )
                 return

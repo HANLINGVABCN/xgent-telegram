@@ -218,6 +218,9 @@ class WebOutbox:
         self._sequence = 0
         self._epoch = secrets.token_hex(16)
         self._lock = threading.Lock()
+        self._changed = threading.Condition(self._lock)
+        self._inflight = collections.OrderedDict()
+        self._inflight_bytes = 0
         self._queues: Dict["queue.Queue[Optional[Dict[str, Any]]]", bool] = {}
         self._closed = threading.Event()
 
@@ -248,9 +251,13 @@ class WebOutbox:
         with self._lock:
             if saved.get('type') == 'history_reset':
                 self._events.clear()
+                self._inflight.clear()
+                self._inflight_bytes = 0
                 self._event_bytes = self._sequence = 0
                 self._epoch = secrets.token_hex(16)
             self._sequence += 1
+            self._track_inflight(saved)
+            self._changed.notify_all()
             event = {'epoch': self._epoch, 'id': self._sequence, 'frame': saved}
             self._events.append((event, size))
             self._event_bytes += size
@@ -261,10 +268,52 @@ class WebOutbox:
             for q, numbered in self._queues.items():
                 _offer(q, event if numbered else saved)
 
-    def read_events(self, after: Optional[int] = None, epoch: str = '',
-                    limit: int = 100) -> Dict[str, Any]:
-        """A finite, repeatable event batch; reading never consumes another tab's events."""
+    @staticmethod
+    def _has_stop_button(frame):
+        return any((button.get('callback_action') or button.get('callback_data')) == 'act_stop_generation'
+                   for row in (frame.get('reply_markup') or []) for button in row)
+
+    def _track_inflight(self, frame):
+        """Materialize active messages, not their edit log; refresh never waits for another token.
+
+        Called under the event lock. Completed/deleted frames leave this transient
+        view; their durable counterpart is served by display history.
+        """
+        kind = frame.get('type')
+        if kind in {'turn_end', 'turn_error', 'generation_end'}:
+            self._inflight.clear(); self._inflight_bytes = 0
+            return
+        key = frame.get('message_id')
+        if key is None or kind not in {'message', 'edit', 'edit_markup', 'delete'}:
+            return
+        previous = self._inflight.pop(key, None)
+        if previous:
+            self._inflight_bytes -= previous[1]
+        if kind == 'delete': return
+        active = self._has_stop_button(frame)
+        if not active and 'reply_markup' in frame: return
+        if not active and previous is None: return
+        merged = {**(previous[0] if previous else {}), **frame, 'type': 'message'}
+        if 'text' not in merged: return
+        size = len(json.dumps(merged, ensure_ascii=False).encode('utf-8'))
+        self._inflight[key] = (merged, size)
+        self._inflight_bytes += size
+        # Active snapshots are independently bounded; replay eviction must not lose the spinner.
+        while self._inflight and (len(self._inflight)>64 or self._inflight_bytes>8*1024*1024):
+            self._inflight_bytes -= self._inflight.popitem(last=False)[1][1]
+
+    def snapshot(self):
         with self._lock:
+            return {'epoch': self._epoch, 'cursor': self._sequence,
+                    'frames': [copy.deepcopy(frame) for frame, _ in self._inflight.values()]}
+
+    def read_events(self, after: Optional[int] = None, epoch: str = '',
+                    limit: int = 100, wait_seconds: float = 0) -> Dict[str, Any]:
+        """A finite, repeatable event batch; reading never consumes another tab's events."""
+        with self._changed:
+            if after is not None and epoch == self._epoch and after == self._sequence and wait_seconds > 0:
+                self._changed.wait_for(lambda: self._closed.is_set() or self._sequence != after or self._epoch != epoch,
+                                       timeout=min(20.0, max(0.0, wait_seconds)))
             oldest = self._events[0][0]['id'] if self._events else self._sequence + 1
             reset = after is not None and (
                 epoch != self._epoch or after < oldest - 1 or after > self._sequence
@@ -289,6 +338,9 @@ class WebOutbox:
         self._closed.set()
         # 给每个订阅者塞一个 None，唤醒可能正在阻塞的消费者
         with self._lock:
+            self._changed.notify_all()
+            self._inflight.clear()
+            self._inflight_bytes = 0
             targets = list(self._queues)
             self._events.clear()
             self._event_bytes = 0
@@ -444,8 +496,10 @@ def _present_media_frame(frame: Dict[str, Any]) -> Dict[str, Any]:
         else:
             item['error'] = '原件不存在或无法读取'
         media.append(item)
-    return {**frame, 'type': 'message', 'text': presentation['text'],
-            'parse_mode': None, 'msg_type': 'ai_reply',
+    from xgent_app.web_history import _history_display_html
+    display = _history_display_html(presentation['text'])
+    return {**frame, 'type': 'message', 'text': display if display is not None else presentation['text'],
+            'parse_mode': 'HTML' if display is not None else None, 'msg_type': 'ai_reply',
             'media_group_id': presentation['media_group_id'], 'media': media,
             'replace_message_ids': presentation.get('replace_message_ids', [])}
 

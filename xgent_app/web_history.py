@@ -208,16 +208,11 @@ def _folded_history_html(content: str) -> str | None:
 
 
 def _history_display_html(content: str) -> str | None:
-    """历史 AI 正文 -> 与 live 同源的 Telegram-HTML；取不到渲染器则 None（回退原始 markdown）。
+    """Match the live HTML renderer regardless of the protocol-fold preference.
 
-    live 的 AI 正文永远走服务端 markdown_to_telegram_html（parse_mode=HTML）；历史回放
-    此前没有 display 就直接落原始 markdown、由前端 marked 渲染，于是同一条消息 live 与
-    刷新后"变脸"（间距、表格、任务列表都不一样）。这里统一：
-      - 含协议块（折叠开关 ON）：折成 <blockquote expandable>（_folded_history_html）。
-      - 无协议块的纯 markdown（折叠开关 ON）：跑 markdown_to_telegram_html，使 live 与
-        刷新都命中前端 renderText 的 HTML 分支、三端一致，A 组对渲染器的增强也自动惠及 Web。
-      - 折叠开关 OFF：维持原始 markdown（老行为，交前端 marked）——不在本次统一范围内。
-      - 取不到 section 命名空间/渲染器：返回 None，交上层回退原文（宁可降级不可崩）。
+    Folding controls protocol blocks, not whether prose is parsed by a different
+    Markdown engine. Stored display metadata takes precedence over this legacy
+    fallback; standalone readers without the app renderer still receive raw text.
     """
     if not content:
         return None
@@ -228,8 +223,6 @@ def _history_display_html(content: str) -> str | None:
     if ns is None:
         return None
     try:
-        if not ns["_should_hide_protocol_blocks"]():
-            return None
         return ns["markdown_to_telegram_html"](content)
     except Exception:
         return None
@@ -243,7 +236,7 @@ def build_history_message(
     if kind == 'ui_message':
         return dict(record)
     role = record.get("role") or "user"
-    if kind in {"agent_result", "media_reply", "agent_status"}:
+    if kind in {"agent_result", "media_reply", "agent_status", "runtime_error"}:
         role = "assistant"
     elif kind == "token_usage":
         role = "system"
@@ -260,6 +253,10 @@ def build_history_message(
     except (ValueError, TypeError):
         metadata = {}
         message["media_error"] = "\u5386\u53f2\u9644\u4ef6\u5143\u6570\u636e\u635f\u574f"
+    live = metadata.get('web_live')
+    if (isinstance(live, dict) and isinstance(live.get('epoch'), str)
+            and isinstance(live.get('message_ids'), list)):
+        message['web_live'] = {'epoch': live['epoch'], 'message_ids': [mid for mid in live['message_ids'] if type(mid) is int]}
     display = metadata.get("display")
     if isinstance(display, dict) and isinstance(display.get("content"), str):
         from .protocols import ProtocolParser

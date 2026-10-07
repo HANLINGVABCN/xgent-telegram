@@ -198,7 +198,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await process_conversation(update, context, memory_text)
     except Exception as e:
         logger.error(f"Photo multimodal processing error: {e}")
-        await update.message.reply_text(f"图片未能完整交给模型：{safe_text(str(e))}")
+        await update.message.reply_text(f"图片未能完整交给模型：{safe_text(await GlobalRecorder.record_error(e, update.effective_chat.id, source='media_input'))}")
 
 async def handle_sticker_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
@@ -343,7 +343,7 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         logger.error(f"Native media save/process error: {e}")
         await msg.reply_text(
-            f"文件 {safe_text(doc_name)} 未能完整交给模型：{safe_text(str(e))}"
+            f"文件 {safe_text(doc_name)} 未能完整交给模型：{safe_text(await GlobalRecorder.record_error(e, update.effective_chat.id, source='media_input'))}"
         )
 
 
