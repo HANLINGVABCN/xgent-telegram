@@ -19,8 +19,12 @@ ROOT = Path(__file__).resolve().parents[1]
 def run_in_app(body: str) -> dict:
     """在加载了完整应用的子进程里执行 body，把它 print 的 JSON 取回来。"""
     script = (
-        "import json\n"
+        "import json, os, sys\n"
+        "def _fail_fast(kind, value, tb):\n    sys.__excepthook__(kind,value,tb)\n    sys.stderr.flush()\n    os._exit(1)\n"
+        "sys.excepthook = _fail_fast\n"
         "import xgent_server as bot\n"
+        "from xgent_app.conversations import ConversationScope, bind_conversation\n"
+        "_scope_guard = bind_conversation(ConversationScope('global_memory', 0))\n_scope_guard.__enter__()\n"
         f"{body}\n"
     )
     env = dict(os.environ)
@@ -28,13 +32,14 @@ def run_in_app(body: str) -> dict:
         "BOT_TOKEN": "123456:test-token",
         "AUTHORIZED_USER_ID": "1",
         "PYTHONIOENCODING": "utf-8",
+        "PYTHONPATH": str(ROOT),
     })
     with tempfile.TemporaryDirectory() as temp_dir:
         # trace 日志重定向到临时目录，避免污染项目根目录
         env["XGENT_TRACE_LOG_FILE"] = str(Path(temp_dir) / "trace.log")
         proc = subprocess.run(
             [sys.executable, "-c", script],
-            cwd=str(ROOT),
+            cwd=temp_dir,
             env=env,
             capture_output=True,
             text=True,

@@ -13,7 +13,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-async def serve(port, count):
+async def serve(port, count, conversation_count=0):
     from xgent_app.bootstrap import load_sections
     from xgent_app.web_auth import hash_password
     from xgent_app.web_server import WebChatConfig, WebChatServer
@@ -45,7 +45,7 @@ async def serve(port, count):
     now=time.time()
     conn=await db._get_conn()
     for i in range(max(0,count-4)):
-        await conn.execute('INSERT INTO global_messages(chat_id,user_id,msg_type,role,content,timestamp) VALUES(1,1,?,?,?,?)',
+        await conn.execute("INSERT INTO global_messages(chat_id,user_id,msg_type,role,content,timestamp,session_id) VALUES(1,1,?,?,?,?,'global_memory')",
                            ('user_text' if i%2==0 else 'ai_reply','user' if i%2==0 else 'assistant',f'历史记录 {i}：开发过程与验证结果。',now-10000+i))
     raw='```run-x\n<<BEGIN_PREVIEW1234\n'+'\n'.join('test_case_%03d ... passed'%i for i in range(85))+'\n<<END_PREVIEW1234\n```'
     records=[('user_text','user','帮我检查项目的部署状态，整理需要关注的问题。',None),
@@ -53,11 +53,11 @@ async def serve(port, count):
              ('agent_result','assistant','[Agent run]\n检查完成',{'display':{'content':build_run_presentation({'success':True,'return_code':0,'output':'85 checks passed · no critical issues','output_path':str(log)}),'parse_mode':'HTML'}}),
              ('ai_reply','assistant','所有检查已经结束。完整日志保存在输出中心，你可以继续检查细节，或创建一个定时健康检查任务。',None)]
     for i,(kind,role,text,meta) in enumerate(records):
-        await conn.execute('INSERT INTO global_messages(chat_id,user_id,msg_type,role,content,timestamp,metadata) VALUES(1,1,?,?,?,?,?)',(kind,role,text,now-240+i*30,json.dumps(meta) if meta else None))
+        await conn.execute("INSERT INTO global_messages(chat_id,user_id,msg_type,role,content,timestamp,metadata,session_id) VALUES(1,1,?,?,?,?,?,'global_memory')",(kind,role,text,now-240+i*30,json.dumps(meta) if meta else None))
     storage=Path(ns['ArtifactManager'].ROOT_DIR);uploads=storage/'uploads';uploads.mkdir(parents=True,exist_ok=True)
     document=uploads/'部署报告.md';document.write_text('# 检查报告\n\n所有服务正常。\n'+'中文测试报告\n'*12000,encoding='utf-8')
     meta={'attachments':[{'version':1,'path':'部署报告.md','filename':'部署报告.md','mime_type':'text/markdown','storage':'uploads'}]}
-    await conn.execute('INSERT INTO global_messages(chat_id,user_id,msg_type,role,content,timestamp,metadata) VALUES(1,1,?,?,?,?,?)',('user_file','user','报告附件',now-300,json.dumps(meta)))
+    await conn.execute("INSERT INTO global_messages(chat_id,user_id,msg_type,role,content,timestamp,metadata,session_id) VALUES(1,1,?,?,?,?,?,'global_memory')",('user_file','user','报告附件',now-300,json.dumps(meta)))
     for i,(summary,status) in enumerate([('每日服务健康检查','scheduled'),('日志异常持续监控','running'),('生成项目备份','completed'),('外部接口连接检查','failed')]):
         await db.create_trigger_task({'id':f'trg_fixture{i}','chat_id':1,'conversation_id':'global_memory','command':'echo preview-only',
            'summary':summary,'schedule_type':'cron','schedule_expr':'0 9 * * *','timezone':'Asia/Shanghai','next_run_at':now+3600*(i+1),
@@ -66,8 +66,24 @@ async def serve(port, count):
         for i in range(12+day*2):
             await db.add_token_stat(['gpt-4.1','claude-sonnet-4','qwen3'][i%3], {'input_tokens':2400+day*100,'output_tokens':1300+day*50,'total_tokens':3700+day*150},now-day*86400-i*120)
     await ns['UserDataManager'].save_config('model_price_table',{'default':{'input':2,'output':8,'cached':.5}})
+    if conversation_count:
+        await db.update_session('global_memory', name='检查项目部署状态')
+        titles = ['排查 Telegram 网络连接', '给 Python 项目补充测试', '整理本周的开发任务',
+                  '设计多对话管理界面', '更新服务器备份策略', '优化消息同步的延迟',
+                  '分析上周的模型调用成本', '整理项目发布说明', '配置自动化健康检查',
+                  '讨论数据库迁移方案', '阅读部署日志中的错误', '编写文件上传功能',
+                  '规划下一阶段的开发', '一些随手记下的想法']
+        for index in range(conversation_count):
+            name = titles[index % len(titles)] + ((' · ' + str(index + 1)) if index >= len(titles) else '')
+            cid = (await db.manage_conversation('create', name=name))['conversation_id']
+            at = now - ((0, 0, 1, 1, 2, 3, 5, 6, 9, 15, 20, 35, 40, 50)[index % 14] * 86400) - index * 300 - 600
+            await conn.execute('UPDATE chat_sessions SET created_at=?,last_active=? WHERE id=?', (at, at, cid))
+            await conn.execute("INSERT INTO global_messages(chat_id,user_id,msg_type,role,content,timestamp,session_id) VALUES(1,1,'user_text','user',?,?,?)", (name, at, cid))
+            if index >= conversation_count - 2:
+                await db.manage_conversation('archive', cid)
+        await db.manage_conversation('switch', 'global_memory')
     service=Workbench(ns)
-    async def history(limit):return (await service.history({'limit':limit}))['messages']
+    async def history(limit):return (await service.handle('GET','history',{'limit':limit}))['messages']
     config=WebChatConfig(host='127.0.0.1',port=port,password_hash=hash_password('preview-only'),bot_token='',authorized_user_id=1,
         loop=asyncio.get_running_loop(),submit_message=lambda *args:None,read_history=history,
         read_settings=ns['_web_read_settings'],write_setting=ns['_web_write_setting'],request_stop=lambda:None,is_busy=lambda:False,
@@ -80,8 +96,9 @@ async def serve(port, count):
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--port',type=int,default=0);parser.add_argument('--messages',type=int,default=4)
+    parser.add_argument('--conversations',type=int,default=0)
     args=parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='xgent-workbench-') as temporary:
         os.chdir(temporary)
-        try:asyncio.run(serve(args.port,args.messages))
+        try:asyncio.run(serve(args.port,args.messages,args.conversations))
         except KeyboardInterrupt:pass

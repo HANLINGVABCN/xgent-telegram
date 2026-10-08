@@ -372,7 +372,8 @@ class AgentShellSession:
         self.pty_enabled = os.name != 'nt'
 
     def start(self):
-        env = {**os.environ, 'LANG': 'en_US.UTF-8', 'TERM': os.environ.get('TERM') or 'xterm-256color'}
+        from xgent_app.conversations import conversation_secret_environment
+        env = {**os.environ, **conversation_secret_environment(), 'LANG': 'en_US.UTF-8', 'TERM': os.environ.get('TERM') or 'xterm-256color'}
         if self.pty_enabled:
             import pty
 
@@ -2469,7 +2470,8 @@ class SelfTriggerManager:
         process = await asyncio.create_subprocess_shell(
             command,
             cwd=AgentExecutor.WORK_DIR,
-            env={**os.environ, 'LANG': 'en_US.UTF-8'},
+            env={**os.environ, **SECRET_STORE.environment(task['conversation_id']), 'LANG': 'en_US.UTF-8',
+                 'XGENT_CHAT_ID': str(task['chat_id']), 'XGENT_CONVERSATION_ID': str(task['conversation_id'])},
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -2556,6 +2558,19 @@ class SelfTriggerManager:
 
     @classmethod
     async def _deliver_run(cls, run_id: str):
+        db = await BotMemoryDB.get_instance()
+        run = await db.get_trigger_run(run_id)
+        if run is None:
+            return
+        task = await db.get_trigger_task(run['task_id'])
+        if task is None:
+            return
+        async with conversation_operation(task['conversation_id'], execution=True, wait=True,
+                                          allow_archived=True, fresh=True):
+            await cls._deliver_run_inner(run_id)
+
+    @classmethod
+    async def _deliver_run_inner(cls, run_id: str):
         db = await BotMemoryDB.get_instance()
         run = await db.get_trigger_run(run_id)
         if run is None or run.get('delivered_at') is not None or run.get('finished_at') is None:

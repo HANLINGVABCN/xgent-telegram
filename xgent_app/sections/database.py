@@ -2,9 +2,11 @@
 # Keep cross-section names available through the loader until the next decoupling phase.
 
 import inspect
+from xgent_app.conversation_store import ConversationStore
+from xgent_app.conversations import current_scope, advance_generation, ConversationError, ConversationScope, bind_conversation
 from xgent_app.ui_history import UiHistoryError, UiHistorySnapshot, hide_audit_record, ui_record, EXPIRED, CHANGED
 
-class BotMemoryDB:
+class BotMemoryDB(ConversationStore):
     """Bot的永久记忆系统 - 异步SQLite + 连接池"""
     
     _instance = None
@@ -54,7 +56,12 @@ class BotMemoryDB:
         async with cls._lock:
             if cls._instance is None:
                 cls._instance = BotMemoryDB(BotConfig.DB_FILE)
-                await cls._instance._init_db()
+                try:
+                    await cls._instance._init_db()
+                except BaseException:
+                    await cls._instance.close()
+                    cls._instance = None
+                    raise
             return cls._instance
     
     async def _get_conn(self) -> aiosqlite.Connection:
@@ -96,6 +103,8 @@ class BotMemoryDB:
             
         conn = await self._get_conn()
         
+        await self.backup_legacy_conversations()
+
         # 全局消息记录表（用于全知模式）- 记录所有操作
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS global_messages (
@@ -429,7 +438,10 @@ class BotMemoryDB:
         except Exception as e:
             logger.warning(f"token 用量统计历史迁移失败（下次启动重试）: {e}")
 
-        await self._migrate_compression_seed()
+        await self.migrate_conversations()
+        default_session = await self.get_session('global_memory')
+        with bind_conversation(ConversationScope('global_memory', default_session['generation'])):
+            await self._migrate_compression_seed()
         self._initialized = True
         logger.info("📚 系统记忆数据库初始化完成")
     
@@ -441,13 +453,16 @@ class BotMemoryDB:
         """记录一条全局消息，返回新行 rowid（供 token 统计双写关联去重）。"""
         compression = (metadata or {}).get('compression_job_id')
         ui_scoped = metadata is not None and 'ui_generation' in metadata
-        async with (self._transaction() if compression or ui_scoped else self._write()) as conn:
+        auto_title = msg_type == 'user_text' and role == 'user' and not str(content).startswith(('[后台任务结果]', '[用户已取消表单]', '/'))
+        async with (self._transaction() if compression or ui_scoped or auto_title else self._write()) as conn:
+            try:
+                session_id = await self._validate_conversation_write(conn, session_id)
+            except ConversationError as exc:
+                if ui_scoped:
+                    raise UiHistoryError(EXPIRED) from exc
+                raise
             if metadata and ('attachments' in metadata or 'attachment_generation' in metadata or ui_scoped):
-                cursor = await conn.execute(
-                    "SELECT value FROM config WHERE key = 'attachment_generation'"
-                )
-                row = await cursor.fetchone()
-                generation = int(json.loads(row['value'])) if row else 0
+                generation = await self._conversation_generation(conn)
                 if ui_scoped and metadata['ui_generation'] != generation:
                     raise UiHistoryError(EXPIRED)
                 if metadata.get('attachment_generation', generation) != generation:
@@ -465,6 +480,14 @@ class BotMemoryDB:
             row_id = await self._insert_global_record(
                 conn, chat_id, user_id, msg_type, role, content, now, session_id, metadata,
             )
+            if auto_title:
+                # Persist the first real prompt as a compact title, without another
+                # model call. Custom names win; compression/clearing retains it.
+                title = ' '.join(str(content or '').split()).strip()
+                if title:
+                    title = title[:32] + ('…' if len(title) > 32 else '')
+                    await conn.execute("UPDATE chat_sessions SET name=? WHERE id=? AND (name IS NULL OR name='新对话')",
+                                       (title, session_id))
             if compression:
                 await conn.execute('''
                     INSERT INTO chat_messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)
@@ -540,16 +563,16 @@ class BotMemoryDB:
             query = f'''
                 SELECT msg_type, role, content, timestamp, session_id, metadata 
                 FROM global_messages
-                WHERE msg_type IN ({placeholders})
+                WHERE session_id = ? AND msg_type IN ({placeholders})
                 ORDER BY timestamp DESC LIMIT ?
             '''
-            cursor = await conn.execute(query, (*include_types, limit))
+            cursor = await conn.execute(query, (self._conversation_id(), *include_types, limit))
         else:
             cursor = await conn.execute('''
                 SELECT msg_type, role, content, timestamp, session_id, metadata 
-                FROM global_messages
+                FROM global_messages WHERE session_id = ?
                 ORDER BY timestamp DESC LIMIT ?
-            ''', (limit,))
+            ''', (self._conversation_id(), limit,))
         
         rows = await cursor.fetchall()
         messages = [dict(row) for row in reversed(rows)]
@@ -563,7 +586,8 @@ class BotMemoryDB:
         # Filter before applying the model-message limit: UI rows do not consume it.
         conn = await self._get_conn()
         cursor = await conn.execute("SELECT id, role, content, timestamp, msg_type, metadata "
-                                    "FROM global_messages ORDER BY timestamp DESC, id DESC")
+                                    "FROM global_messages WHERE session_id = ? ORDER BY timestamp DESC, id DESC",
+                                    (self._conversation_id(),))
         result = []
         while True:
             rows = await cursor.fetchmany(max(128, min(limit, 1024)))
@@ -659,32 +683,31 @@ class BotMemoryDB:
         conn = await self._get_conn()
         cursor = await conn.execute('''
             SELECT id, chat_id, msg_type, role, content, timestamp, metadata FROM global_messages
-            WHERE (role = 'user' AND msg_type IN (?, ?))
+            WHERE session_id = ? AND ((role = 'user' AND msg_type IN (?, ?))
                OR (role = 'assistant' AND msg_type = ?)
-               OR (role = 'media_module' AND msg_type = ?)
+               OR (role = 'media_module' AND msg_type = ?))
             ORDER BY id
-        ''', (MessageType.USER_FILE, MessageType.USER_PHOTO,
+        ''', (self._conversation_id(), MessageType.USER_FILE, MessageType.USER_PHOTO,
               MessageType.AI_REPLY, MessageType.MEDIA_REPLY))
         return [record for row in await cursor.fetchall()
                 if is_attachment_record(record := dict(row))]
 
     async def get_tool_context_records(self) -> List[Dict]:
         conn = await self._get_conn()
-        cursor = await conn.execute("SELECT * FROM global_messages WHERE metadata LIKE '%model_context%' "
-                                    "ORDER BY timestamp, id")
+        cursor = await conn.execute("SELECT * FROM global_messages WHERE session_id = ? AND metadata LIKE '%model_context%' "
+                                    "ORDER BY timestamp, id", (self._conversation_id(),))
         return [dict(row) for row in await cursor.fetchall()]
 
     async def persist_tool_context(self, row_ids, payload, chat_id, generation):
         from xgent_app.compression import metadata_of
         from xgent_app.attachments import AttachmentContextError
         async with self._transaction() as conn:
-            cursor = await conn.execute("SELECT value FROM config WHERE key = 'attachment_generation'")
-            generation_row = await cursor.fetchone()
-            if (int(json.loads(generation_row['value'])) if generation_row else 0) != generation:
+            await self._validate_conversation_write(conn)
+            if await self._conversation_generation(conn) != generation:
                 raise AttachmentContextError('对话已清空，工具结果未写入新对话。')
             records = []
             for row_id in dict.fromkeys(row_ids):
-                cursor = await conn.execute('SELECT id, metadata FROM global_messages WHERE id = ?', (row_id,))
+                cursor = await conn.execute('SELECT id, metadata FROM global_messages WHERE id = ? AND session_id = ?', (row_id, self._conversation_id()))
                 row = await cursor.fetchone()
                 if row is not None:
                     records.append(dict(row))
@@ -693,7 +716,7 @@ class BotMemoryDB:
             if not records:
                 row_id = await self._insert_global_record(
                     conn, chat_id, 0, MessageType.AGENT_RESULT, 'system', '[工具结果]',
-                    time.time(), SINGLE_MEMORY_SESSION_ID, {'model_context': payload})
+                    time.time(), self._conversation_id(), {'model_context': payload})
                 return row_id
             for record in records:
                 metadata = metadata_of(record)
@@ -706,21 +729,20 @@ class BotMemoryDB:
             return records[-1]['id']
 
     async def get_attachment_generation(self) -> int:
-        return int(await self.get_config_fresh('attachment_generation', 0))
+        return await self._conversation_generation(await self._get_conn())
 
     async def _compression_snapshot(self, conn) -> Dict[str, Any]:
-        cursor = await conn.execute('SELECT * FROM global_messages ORDER BY timestamp, id')
+        cursor = await conn.execute('SELECT * FROM global_messages WHERE session_id = ? ORDER BY timestamp, id', (self._conversation_id(),))
         records = [dict(row) for row in await cursor.fetchall()]
-        cursor = await conn.execute('SELECT * FROM chat_messages ORDER BY id')
+        cursor = await conn.execute('SELECT * FROM chat_messages WHERE session_id = ? ORDER BY id', (self._conversation_id(),))
         mirror = [dict(row) for row in await cursor.fetchall()]
-        cursor = await conn.execute('SELECT * FROM chat_sessions ORDER BY id')
+        cursor = await conn.execute('SELECT * FROM chat_sessions WHERE id = ?', (self._conversation_id(),))
         sessions = [dict(row) for row in await cursor.fetchall()]
-        cursor = await conn.execute('SELECT payload FROM context_compressions ORDER BY sequence')
+        cursor = await conn.execute('SELECT payload FROM context_compressions WHERE session_id = ? ORDER BY sequence', (self._conversation_id(),))
         rounds = [json.loads(row['payload']) for row in await cursor.fetchall()]
-        cursor = await conn.execute("SELECT value FROM config WHERE key = 'attachment_generation'")
-        row = await cursor.fetchone()
         return {
-            'generation': int(json.loads(row['value'])) if row else 0,
+            'conversation_id': self._conversation_id(),
+            'generation': await self._conversation_generation(conn),
             'records': records, 'mirror_records': mirror, 'sessions': sessions,
             'compressions': rounds,
         }
@@ -732,7 +754,8 @@ class BotMemoryDB:
     async def get_latest_compression(self) -> Optional[Dict[str, Any]]:
         conn = await self._get_conn()
         cursor = await conn.execute(
-            'SELECT payload FROM context_compressions ORDER BY sequence DESC LIMIT 1'
+            'SELECT payload FROM context_compressions WHERE session_id = ? ORDER BY sequence DESC LIMIT 1',
+            (self._conversation_id(),)
         )
         row = await cursor.fetchone()
         return json.loads(row['payload']) if row else None
@@ -756,15 +779,15 @@ class BotMemoryDB:
             if self._compression_identity(await self._compression_snapshot(conn)) != self._compression_identity(snapshot):
                 raise CompressionError('导出期间对话已变化或清空，原上下文未替换，请重试。')
             entry = {
-                **bundle, 'version': 3, 'sequence': len(snapshot['compressions']) + 1,
+                **bundle, 'conversation_id': self._conversation_id(), 'version': 3, 'sequence': len(snapshot['compressions']) + 1,
                 'job_id': uuid.uuid4().hex, 'created_at': time.time(), 'status': 'pending',
                 'generation': snapshot['generation'], 'summary': '', 'error': '',
                 'source_records': snapshot['records'], 'mirror_records': snapshot['mirror_records'],
                 'sessions': snapshot['sessions'], 'chat_id': chat_id, 'src': source,
                 'provider': provider, 'model': model,
             }
-            await conn.execute('INSERT INTO context_compression_jobs (job_id, payload) VALUES (?, ?)',
-                               (entry['job_id'], json.dumps(entry, ensure_ascii=False)))
+            await conn.execute('INSERT INTO context_compression_jobs (job_id, payload, session_id) VALUES (?, ?, ?)',
+                               (entry['job_id'], json.dumps(entry, ensure_ascii=False), self._conversation_id()))
         return entry
 
     async def commit_compression(self, entry, summary, stop_event):
@@ -781,39 +804,38 @@ class BotMemoryDB:
             await self._clear_conversation_memory(conn, preserve_compressions=True)
             now = time.time()
             current.update(status='completed', summary=summary, completed_at=now, error='',
-                           generation=current['generation'] + 1)
+                           generation=await self._conversation_generation(conn))
             metadata = {'compression_job_id': current['job_id'], 'compression_complete': True,
                         'generated_media_processed': True,
                         'compression_sequence': current['sequence'],
                         'attachment_generation': current['generation'], 'src': current.get('src')}
             row_id = await self._insert_global_record(
                 conn, current['chat_id'], 0, MessageType.AI_REPLY, 'assistant', summary,
-                now, SINGLE_MEMORY_SESSION_ID, metadata)
+                now, self._conversation_id(), metadata)
             await conn.execute('INSERT INTO chat_messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)',
-                               (SINGLE_MEMORY_SESSION_ID, 'assistant', summary, now))
+                               (self._conversation_id(), 'assistant', summary, now))
             current['response_row_id'] = row_id
             notice, metadata = self._compression_notice(current)
             current['notice_row_id'] = await self._insert_global_record(
                 conn, current['chat_id'], 0, MessageType.SYSTEM_OP, 'system', notice,
-                now, SINGLE_MEMORY_SESSION_ID, metadata)
-            await conn.execute('INSERT INTO context_compressions (sequence, payload) VALUES (?, ?)',
-                               (current['sequence'], json.dumps(current, ensure_ascii=False)))
+                now, self._conversation_id(), metadata)
+            await conn.execute('INSERT INTO context_compressions (session_id, sequence, payload) VALUES (?, ?, ?)',
+                               (self._conversation_id(), current['sequence'], json.dumps(current, ensure_ascii=False)))
             await self._save_compression_job(conn, current)
             if stop_event.is_set():
                 raise CompressionError('用户已停止压缩，原上下文已保留。')
+        advance_generation(current['generation'])
         return current
 
     async def _require_compression_job(self, conn, job_id: str, attempt: Optional[str] = None) -> Dict:
         from xgent_app.compression import CompressionError
-        cursor = await conn.execute('SELECT payload FROM context_compression_jobs WHERE job_id = ?', (job_id,))
+        cursor = await conn.execute('SELECT payload FROM context_compression_jobs WHERE job_id = ? AND session_id = ?', (job_id, self._conversation_id()))
         row = await cursor.fetchone()
         if row is None:
-            cursor = await conn.execute('SELECT payload FROM context_compressions ORDER BY sequence DESC LIMIT 1')
+            cursor = await conn.execute('SELECT payload FROM context_compressions WHERE session_id = ? ORDER BY sequence DESC LIMIT 1', (self._conversation_id(),))
             row = await cursor.fetchone()
         entry = json.loads(row['payload']) if row else {}
-        cursor = await conn.execute("SELECT value FROM config WHERE key = 'attachment_generation'")
-        generation_row = await cursor.fetchone()
-        generation = int(json.loads(generation_row['value'])) if generation_row else 0
+        generation = await self._conversation_generation(conn)
         if (entry.get('job_id') != job_id or entry.get('generation') != generation
                 or attempt is not None and entry.get('attempt') != attempt):
             raise CompressionError('该压缩任务已失效，旧结果不会写回当前对话。')
@@ -823,8 +845,8 @@ class BotMemoryDB:
     async def _save_compression_job(conn, entry):
         table = 'context_compression_jobs' if entry.get('version', 1) >= 3 else 'context_compressions'
         key = 'job_id' if table == 'context_compression_jobs' else 'sequence'
-        await conn.execute(f'UPDATE {table} SET payload = ? WHERE {key} = ?',
-                           (json.dumps(entry, ensure_ascii=False), entry[key]))
+        await conn.execute(f'UPDATE {table} SET payload = ? WHERE {key} = ? AND session_id = ?',
+                           (json.dumps(entry, ensure_ascii=False), entry[key], entry.get('conversation_id', 'global_memory')))
 
     @staticmethod
     def _compression_notice(entry):
@@ -875,7 +897,7 @@ class BotMemoryDB:
                     notice, metadata = self._compression_notice(current)
                     current['notice_row_id'] = await self._insert_global_record(
                         conn, current['chat_id'], 0, MessageType.SYSTEM_OP, 'system', notice,
-                        time.time(), SINGLE_MEMORY_SESSION_ID, metadata)
+                        time.time(), self._conversation_id(), metadata)
                 await self._save_compression_job(conn, current)
                 await self._update_compression_notice(conn, current)
             return current
@@ -883,12 +905,12 @@ class BotMemoryDB:
     async def _migrate_compression_seed(self):
         """Materialize only the active legacy seed, once, without relinking its paths."""
         async with self._transaction() as conn:
-            cursor = await conn.execute('SELECT payload FROM context_compressions ORDER BY sequence DESC LIMIT 1')
+            cursor = await conn.execute('SELECT payload FROM context_compressions WHERE session_id=? ORDER BY sequence DESC LIMIT 1', (self._conversation_id(),))
             row = await cursor.fetchone()
             entry = json.loads(row['payload']) if row else {}
             if not entry.get('summary') or entry.get('version', 1) >= 2 or entry.get('seed_materialized'):
                 return
-            cursor = await conn.execute('SELECT MIN(timestamp) AS ts FROM global_messages')
+            cursor = await conn.execute('SELECT MIN(timestamp) AS ts FROM global_messages WHERE session_id=?', (self._conversation_id(),))
             first = await cursor.fetchone()
             timestamp = min(float(entry.get('created_at') or time.time()),
                             float(first['ts'] or time.time()) - 0.000001)
@@ -897,10 +919,10 @@ class BotMemoryDB:
                         'compression_complete': True, 'compression_legacy_seed': True}
             entry['response_row_id'] = await self._insert_global_record(
                 conn, BotConfig.AUTHORIZED_USER_ID, 0, MessageType.AI_REPLY, 'assistant', entry['summary'],
-                timestamp, SINGLE_MEMORY_SESSION_ID, metadata,
+                timestamp, self._conversation_id(), metadata,
             )
             await conn.execute('INSERT INTO chat_messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)',
-                               (SINGLE_MEMORY_SESSION_ID, 'assistant', entry['summary'], timestamp))
+                               (self._conversation_id(), 'assistant', entry['summary'], timestamp))
             entry.update(seed_materialized=True, status='completed')
             await self._save_compression_job(conn, entry)
 
@@ -908,10 +930,11 @@ class BotMemoryDB:
                                            metadata: Dict[str, Any]) -> bool:
         """只更新仍存在且未被其他协程修改的记录，绝不复活已清空的关联。"""
         async with self._write() as conn:
+            await self._validate_conversation_write(conn)
             cursor = await conn.execute('''
                 UPDATE global_messages SET metadata = ?
-                WHERE id = ? AND metadata IS ?
-            ''', (json.dumps(metadata, ensure_ascii=False), row_id, previous))
+                WHERE id = ? AND metadata IS ? AND session_id = ?
+            ''', (json.dumps(metadata, ensure_ascii=False), row_id, previous, self._conversation_id()))
             return cursor.rowcount == 1
 
     async def get_display_history(self, limit: int = 50) -> List[Dict]:
@@ -926,14 +949,12 @@ class BotMemoryDB:
         async with self._transaction() as conn:
             cursor = await conn.execute('''
                 SELECT id, role, content, timestamp, msg_type, metadata FROM global_messages
-                ORDER BY timestamp ASC, id ASC
-            ''')
+                WHERE session_id = ? ORDER BY timestamp ASC, id ASC
+            ''', (self._conversation_id(),))
             rows = await cursor.fetchall()
             cursor = await conn.execute('SELECT * FROM ui_messages ORDER BY timestamp, ui_message_id')
             ui_rows = [dict(row) for row in await cursor.fetchall()]
-            cursor = await conn.execute("SELECT value FROM config WHERE key = 'attachment_generation'")
-            generation_row = await cursor.fetchone()
-            generation = int(json.loads(generation_row['value'])) if generation_row else 0
+            generation = await self._conversation_generation(conn)
 
         result = []
         for row in rows:
@@ -967,7 +988,8 @@ class BotMemoryDB:
 
     async def get_ui_message(self, ui_message_id: str) -> Optional[Dict]:
         conn = await self._get_conn()
-        cursor = await conn.execute('SELECT * FROM ui_messages WHERE ui_message_id = ?', (ui_message_id,))
+        cursor = await conn.execute('SELECT * FROM ui_messages WHERE ui_message_id = ? AND generation = ?',
+                                    (ui_message_id, await self.get_attachment_generation()))
         row = await cursor.fetchone()
         return dict(row) if row else None
 
@@ -976,9 +998,7 @@ class BotMemoryDB:
                              ui_message_id: Optional[str] = None,
                              expected_revision: Optional[int] = None) -> Optional[Dict]:
         async with self._transaction() as conn:
-            cursor = await conn.execute("SELECT value FROM config WHERE key = 'attachment_generation'")
-            generation_row = await cursor.fetchone()
-            current_generation = int(json.loads(generation_row['value'])) if generation_row else 0
+            current_generation = await self._conversation_generation(conn)
             if generation != current_generation:
                 raise UiHistoryError(EXPIRED)
             if ui_message_id:
@@ -1030,8 +1050,8 @@ class BotMemoryDB:
         conn = await self._get_conn()
         cursor = await conn.execute('''
             SELECT id, role, content, timestamp, msg_type, metadata FROM global_messages
-            WHERE id = ?
-        ''', (row_id,))
+            WHERE id = ? AND session_id = ?
+        ''', (row_id, self._conversation_id()))
         row = await cursor.fetchone()
         return dict(row) if row else None
 
@@ -1271,22 +1291,23 @@ class BotMemoryDB:
         conn = await self._get_conn()
         cursor = await conn.execute('''
             SELECT MAX(timestamp) as last_time FROM global_messages
-            WHERE role = 'user'
-        ''')
+            WHERE role = 'user' AND session_id = ?
+        ''', (self._conversation_id(),))
         row = await cursor.fetchone()
         return row['last_time'] if row and row['last_time'] else None
     
     # --- 会话管理 ---
     async def create_session(self, session_id: str, model: Optional[str] = None) -> str:
-        """创建新会话"""
-        now = time.time()
-        async with self._write() as conn:
-            await conn.execute('''
-                INSERT OR REPLACE INTO chat_sessions (id, name, model, last_active, created_at)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (session_id, None, model, now, now))
+        """Compatibility creation; never replace a session or reset its version."""
+        async with self._transaction() as conn:
+            cursor = await conn.execute('SELECT id FROM chat_sessions WHERE id=?', (session_id,))
+            if await cursor.fetchone() is None:
+                generation = await self._allocate_conversation_generation(conn)
+                now = time.time()
+                await conn.execute('INSERT INTO chat_sessions (id,name,created_at,last_active,generation) VALUES(?,?,?,?,?)',
+                                   (session_id, '新对话', now, now, generation))
         return session_id
-    
+
     async def get_session(self, session_id: str) -> Optional[Dict]:
         """获取会话信息"""
         conn = await self._get_conn()
@@ -1306,11 +1327,33 @@ class BotMemoryDB:
                 await conn.execute(f'UPDATE chat_sessions SET {key} = ? WHERE id = ?', (value, session_id))
     
     async def get_all_sessions(self) -> List[Dict]:
-        """获取所有会话"""
+        """List titles are presentation-only; selecting a chat must not reorder it."""
         conn = await self._get_conn()
-        cursor = await conn.execute('SELECT * FROM chat_sessions ORDER BY last_active DESC')
+        cursor = await conn.execute('''
+            SELECT s.*,
+                (SELECT substr(m.content, 1, 160) FROM global_messages m
+                 WHERE m.session_id=s.id AND m.role='user' AND m.msg_type='user_text'
+                   AND m.content NOT LIKE '[后台任务结果]%'
+                   AND m.content NOT LIKE '[用户已取消表单]%'
+                   AND m.content NOT LIKE '/%'
+                 ORDER BY m.timestamp, m.id LIMIT 1) AS first_user_text,
+                COALESCE((SELECT m.timestamp FROM global_messages m
+                          WHERE m.session_id=s.id AND m.msg_type IN
+                            ('user_text','user_file','user_photo','ai_reply','media_reply')
+                          ORDER BY m.timestamp DESC, m.id DESC LIMIT 1),
+                         s.created_at, s.last_active, 0) AS activity_at
+            FROM chat_sessions s ORDER BY activity_at DESC, s.id
+        ''')
         rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+        await cursor.close()
+        result = []
+        for row in rows:
+            item = dict(row)
+            first = ' '.join(str(item.pop('first_user_text') or '').split()).strip()
+            name = item.get('name') or '新对话'
+            item['display_title'] = (first[:32] + ('…' if len(first) > 32 else '')) if name == '新对话' and first else name
+            result.append(item)
+        return result
     
     async def delete_session(self, session_id: str, delete_global_messages: bool = False) -> int:
         """删除会话及其消息，可选同时删除关联的全局记忆"""
@@ -1331,35 +1374,34 @@ class BotMemoryDB:
     async def clear_all_conversation_memory(self) -> Dict[str, int]:
         """清空对话相关记忆，保留 providers、config、prompts 等配置"""
         async with self._transaction() as conn:
-            return await self._clear_conversation_memory(conn, preserve_compressions=False)
-
-    async def _clear_conversation_memory(self, conn, *, preserve_compressions: bool) -> Dict[str, int]:
-        counts = {}
-        for table in ('global_messages', 'chat_messages', 'chat_sessions'):
-            cursor = await conn.execute(f'SELECT COUNT(*) AS count FROM {table}')
-            counts[table] = int((await cursor.fetchone())['count'])
-            await conn.execute(f'DELETE FROM {table}')
-        await conn.execute('DELETE FROM ui_messages')
-        if not preserve_compressions:
-            await conn.execute('DELETE FROM context_compressions')
-            await conn.execute('DELETE FROM context_compression_jobs')
-        await conn.execute('''
-            INSERT INTO config (key, value) VALUES ('attachment_generation', '1')
-            ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1
-        ''')
+            counts = await self._clear_conversation_memory(conn, preserve_compressions=False)
+            generation = await self._conversation_generation(conn)
+        advance_generation(generation)
         return counts
 
-    # --- 内部兼容镜像消息 ---
+    async def _clear_conversation_memory(self, conn, *, preserve_compressions: bool) -> Dict[str, int]:
+        cid = self._conversation_id()
+        old_generation = await self._conversation_generation(conn)
+        counts = {'chat_sessions': 0}
+        for table in ('global_messages', 'chat_messages'):
+            cursor = await conn.execute(f'SELECT COUNT(*) AS count FROM {table} WHERE session_id=?', (cid,))
+            counts[table] = int((await cursor.fetchone())['count'])
+            await conn.execute(f'DELETE FROM {table} WHERE session_id=?', (cid,))
+        await conn.execute('DELETE FROM ui_messages WHERE generation=?', (old_generation,))
+        if not preserve_compressions:
+            await conn.execute('DELETE FROM context_compressions WHERE session_id=?', (cid,))
+            await conn.execute('DELETE FROM context_compression_jobs WHERE session_id=?', (cid,))
+        generation = await self._allocate_conversation_generation(conn)
+        await conn.execute('UPDATE chat_sessions SET generation=?,agent_iteration=0 WHERE id=?', (generation, cid))
+        return counts
+
     async def add_chat_message(self, session_id: str, role: str, content: str,
                                *, attachment_generation: Optional[int] = None):
         """添加消息到内部兼容镜像"""
         async with self._transaction() as conn:
+            session_id = await self._validate_conversation_write(conn, session_id)
             if attachment_generation is not None:
-                cursor = await conn.execute(
-                    "SELECT value FROM config WHERE key = 'attachment_generation'"
-                )
-                row = await cursor.fetchone()
-                generation = int(json.loads(row['value'])) if row else 0
+                generation = await self._conversation_generation(conn)
                 if attachment_generation != generation:
                     raise ValueError("对话已在附件处理期间清空，旧回复未写回新对话。")
             await conn.execute('''
@@ -1371,6 +1413,7 @@ class BotMemoryDB:
     
     async def get_chat_messages(self, session_id: str, limit: Optional[int] = None) -> List[Dict]:
         """获取内部兼容镜像消息"""
+        session_id = self._conversation_id(session_id)
         conn = await self._get_conn()
         if limit:
             cursor = await conn.execute('''
@@ -1390,6 +1433,7 @@ class BotMemoryDB:
     async def remove_last_chat_message(self, session_id: str):
         """移除最后一条消息"""
         async with self._write() as conn:
+            session_id = await self._validate_conversation_write(conn, session_id)
             await conn.execute('''
                 DELETE FROM chat_messages WHERE id = (
                     SELECT id FROM chat_messages WHERE session_id = ? 

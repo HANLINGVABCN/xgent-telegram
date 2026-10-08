@@ -260,6 +260,7 @@ class PendingAsk:
     agent_iteration: int
     chat_id: int
     origin: Any = None                     # AgentTurnOrigin，用于恢复时标记来源
+    conversation_id: str = 'global_memory'
     draft: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     form_message_id: Optional[int] = None  # 表单消息 id，供录入自定义/密钥后原地重画键盘
 
@@ -299,40 +300,36 @@ class PendingAskStore:
 # ---- 密钥存储（明文只在这里）------------------------------------------------
 
 class SecretStore:
-    """进程内密钥：{generation: {VAR: 明文}}。
-
-    ``set`` 写 os.environ（供后续 shell ``$VAR`` 引用）并调用注册钩子把明文
-    登进脱敏名单；``purge`` 反之。明文只在本类内部与 os.environ，绝不进 draft/模型/库。
-
-    ``register_hook`` / ``unregister_hook`` 由命名空间侧接上 core 的脱敏名单
-    （直接登记原始值，绕过 register_runtime_secret 的长度下限与逗号切分，
-    确保短密钥、含逗号的密钥也能被脱敏）。测试时留空即为纯逻辑。
-    """
-
+    """Process-local, conversation-private values; never mutate os.environ."""
     def __init__(self) -> None:
-        self._by_gen: Dict[int, Dict[str, str]] = {}
+        self._by_gen: Dict[Any, Dict[str, str]] = {}
         self.register_hook: Optional[Callable[[str], None]] = None
         self.unregister_hook: Optional[Callable[[str], None]] = None
 
-    def set(self, generation: int, name: str, value: str) -> None:
-        self._by_gen.setdefault(generation, {})[name] = value
-        os.environ[name] = value
+    def _still_used(self, value):
+        return any(value in values.values() for values in self._by_gen.values())
+
+    def set(self, conversation_id, name: str, value: str) -> None:
+        values = self._by_gen.setdefault(conversation_id, {})
+        previous = values.get(name)
+        values[name] = value
+        if previous and previous != value and not self._still_used(previous) and self.unregister_hook:
+            self.unregister_hook(previous)
         if self.register_hook and value:
             self.register_hook(value)
 
-    def has(self, generation: int, name: str) -> bool:
-        return name in self._by_gen.get(generation, {})
+    def has(self, conversation_id, name: str) -> bool:
+        return name in self._by_gen.get(conversation_id, {})
 
-    def purge(self, generation: int) -> List[str]:
-        """清掉某 generation 的全部密钥（环境变量 + 脱敏名单），返回被清的变量名。"""
-        removed = self._by_gen.pop(generation, {})
-        for name, value in removed.items():
-            # 只在环境变量仍是我们写进去的值时才删，避免误删别处覆盖的同名变量。
-            if os.environ.get(name) == value:
-                os.environ.pop(name, None)
-            if self.unregister_hook and value:
+    def environment(self, conversation_id) -> Dict[str, str]:
+        return dict(self._by_gen.get(conversation_id, {}))
+
+    def purge(self, conversation_id) -> List[str]:
+        removed = self._by_gen.pop(conversation_id, {})
+        for value in set(removed.values()):
+            if value and not self._still_used(value) and self.unregister_hook:
                 self.unregister_hook(value)
-        return list(removed.keys())
+        return list(removed)
 
 
 # 模块级单例：命名空间侧（core/messages/callbacks）引用这两个。

@@ -75,11 +75,11 @@ $('wb-detail-close').onclick=closeDetail;
 function errorOr(node,fn){return async()=>{try{await fn();}catch(e){showError(node,e);}};}
 async function outputViewer(path,title='输出存档',onBack){let current=0,previous=[];const area=el('div');detail(title,area);const signal=state.detailRequest.signal;async function load(offset,back){area.replaceChildren(message('正在读取存档…','loading'));try{const page=await api('/api/output/page',{data:{path,offset},signal});current=offset;previous=back;area.replaceChildren(el('p',{class:'wb-note'},`${page.filename} · ${bytes(page.offset)} — ${bytes(page.next_offset)} / ${bytes(page.size)}`),actions(button('上一页',()=>load(previous.at(-1),previous.slice(0,-1))),button('下一页',()=>load(page.next_offset,[...previous,current])),button('复制本页',()=>copyText(page.text).catch(e=>showError(area,e)))),el('pre',{class:'wb-pre'},page.text));area.querySelectorAll('button')[0].disabled=!previous.length;area.querySelectorAll('button')[1].disabled=page.eof;if(onBack)area.prepend(button('返回任务详情',onBack));}catch(e){area.replaceChildren(message(e.message),button('重试读取',()=>load(offset,back)),onBack?button('返回任务详情',onBack):null);}}await load(0,[]);}
 async function refreshBootstrap(){const epoch=state.authEpoch;const boot=await wb('bootstrap');if(epoch!==state.authEpoch)throw new DOMException('登录状态已改变','AbortError');state.boot=boot;window.XGentChat?.commands(state.boot.commands||[]);chatControls();return state.boot;}
-function chatControls(){if(!state.boot)return;const data=state.boot.settings;const options=data.options?.chat_model||[];const sel=el('select',{'aria-label':'对话模型'},el('option',{value:''},'选择模型'),options.map(o=>el('option',{value:o.value,selected:o.value===data.values.chat_model},o.label)));sel.onchange=()=>changeQuick('chat_model',sel.value);const agent=button(data.values.agent_mode?'Agent 开启':'Agent 关闭',()=>changeQuick('agent_mode',!data.values.agent_mode),data.values.agent_mode?'primary':'');const levels=data.options?.thinking_level||['auto','low','medium','high'];const thinking=el('select',{'aria-label':'思考深度'},levels.map(v=>el('option',{value:v.value??v,selected:(v.value??v)===data.values.thinking_level},v.label??v)));thinking.onchange=()=>changeQuick('thinking_level',thinking.value);$('wb-chat-controls').replaceChildren(sel,thinking,agent);}
+function chatControls(){if(!state.boot)return;window.XGentConversations?.accept(state.boot.conversations);const data=state.boot.settings;const options=data.options?.chat_model||[];const sel=el('select',{'aria-label':'对话模型'},el('option',{value:''},'选择模型'),options.map(o=>el('option',{value:o.value,selected:o.value===data.values.chat_model},o.label)));sel.onchange=()=>changeQuick('chat_model',sel.value);const agent=button(data.values.agent_mode?'Agent 开启':'Agent 关闭',()=>changeQuick('agent_mode',!data.values.agent_mode),data.values.agent_mode?'primary':'');const levels=data.options?.thinking_level||['auto','low','medium','high'];const thinking=el('select',{'aria-label':'思考深度'},levels.map(v=>el('option',{value:v.value??v,selected:(v.value??v)===data.values.thinking_level},v.label??v)));thinking.onchange=()=>changeQuick('thinking_level',thinking.value);$('wb-chat-controls').replaceChildren(sel,thinking,agent);}
 async function changeQuick(key,value){try{await wb('settings',{data:{key,value}});await refreshBootstrap();}catch(e){$('wb-history-state').textContent=e.message;}}
 function logout(){return window.XGentChat?.logout();}
 async function searchMessages(){
-  const input=el('input',{type:'search',placeholder:'搜索全部共享历史…','aria-label':'搜索全部历史'});
+  const input=el('input',{type:'search',placeholder:'搜索当前会话历史…','aria-label':'搜索当前会话历史'});
   const results=el('div');const box=el('div',{},el('label',{class:'wb-field'},input),results);
   let controller,timer;
   async function run(before){controller?.abort();controller=new AbortController();results.replaceChildren(message('搜索中…','loading'));try{
@@ -89,7 +89,7 @@ async function searchMessages(){
     if(!data.messages.length)results.append(empty('未找到消息','换一个关键词试试。'));
     if(data.next_cursor)results.append(button('更多结果',()=>run(data.next_cursor)));
   }catch(e){if(e.name!=='AbortError')results.replaceChildren(message(e.message));}}
-  input.oninput=()=>{clearTimeout(timer);timer=setTimeout(()=>run(),250);};dialog('搜索共享历史',box);
+  input.oninput=()=>{clearTimeout(timer);timer=setTimeout(()=>run(),250);};dialog('搜索当前会话历史',box);
 }
 $('btn-search').addEventListener('click',e=>{e.stopImmediatePropagation();searchMessages();},true);
 document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='f'){e.preventDefault();e.stopImmediatePropagation();searchMessages();}},true);
@@ -490,3 +490,9 @@ window.XGentWorkbench={
   beforeLogout:()=>{if(state.submitting)return false;if(state.dirty&&!confirm('尚有未保存修改，确定退出登录？'))return false;state.dirty=false;return true;}
 };
 window.dispatchEvent(new Event('xgent-workbench-ready'));
+
+window.addEventListener('xgent-conversation-changed',()=>{
+  state.request?.abort();state.detailRequest?.abort();state.renderSequence++;
+  pageCache.clear();state.pageKey=null;state.pendingKey=null;state.retryAfter=0;
+  closeDetail();if(state.route!=='chat'&&state.authenticated)render();
+});

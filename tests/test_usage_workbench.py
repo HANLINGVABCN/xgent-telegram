@@ -80,11 +80,11 @@ def test_usage_range_buttons_always_show_dates_and_detail_paging(browser_context
 def test_menu_all_entries_and_busy_feedback_preserve_draft(browser_context,workspace_url):
     expect=pytest.importorskip('playwright.sync_api').expect
     page=browser_context.new_page();page.set_viewport_size({'width':390,'height':844});ready(page,workspace_url['url'])
-    for selector in ['#btn-menu','#btn-composer-menu']:
+    for selector in ['#btn-composer-menu']:
         page.locator('#input').fill('保留草稿');page.locator(selector).click()
         expect(page.locator('#composer-commands')).to_be_visible()
         expect(page.locator('#composer-commands .composer-command strong').first).to_have_text('/start')
-        assert 'open' not in page.locator('#menu-panel').get_attribute('class')
+        assert page.locator('#btn-menu,#menu-panel').count() == 0
         page.keyboard.press('Escape');assert page.locator('#input').input_value()=='保留草稿'
     page.evaluate('document.getElementById("btn-send").disabled=true')
     # Pending attachment is a real blocked-command state, not a fake disabled attribute.

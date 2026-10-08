@@ -74,6 +74,13 @@ from telegram.ext import (
 
 load_dotenv()
 
+from xgent_app.conversations import (
+    ConversationScope, ConversationError, ConversationBusy, ConversationChanged,
+    bind_conversation, current_scope, conversation_snapshot, replay_conversation,
+    stamp_frame, conversation_operation, conversation_entry, get_conversations,
+    configure_conversations, configure_callback_encoder, decode_conversation_callback, conversation_secret_environment,
+)
+
 # --- ☆ 全局控制状态 ☆ ---
 _stop_generation_event: Optional[asyncio.Event] = None   # 停止生成事件
 _is_processing = False                                    # 处理中锁
@@ -96,8 +103,10 @@ def is_stop_requested() -> bool:
 
 
 def build_stop_keyboard() -> InlineKeyboardMarkup:
+    scope = current_scope(required=False)
+    action = 'act_stop_generation' + (':' + scope.run_id if scope and scope.run_id else '')
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ 停止回答", callback_data="act_stop_generation")]
+        [InlineKeyboardButton("❌ 停止回答", callback_data=action)]
     ])
 
 # --- ☆ 访问配置 ☆ ---
@@ -954,6 +963,7 @@ class PendingTextConversation:
         self.update = update
         self.context = context
         self.parts: List[str] = [text]
+        self.conversation_context = conversation_snapshot()
         self.first_at = time.monotonic()
         self.last_at = self.first_at
         self.prompt_message: Optional[Any] = None
@@ -1050,7 +1060,8 @@ def should_stitch_text_message(text: str, mode: Optional[str] = None) -> bool:
 def get_text_conversation_buffer_key(update: Update) -> Tuple[int, int]:
     chat_id = update.effective_chat.id if update.effective_chat else BotConfig.AUTHORIZED_USER_ID
     user_id = update.effective_user.id if update.effective_user else BotConfig.AUTHORIZED_USER_ID
-    return chat_id, user_id
+    scope = current_scope(required=False)
+    return (scope.conversation_id, scope.generation, chat_id, user_id) if scope else (chat_id, user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1210,6 +1221,7 @@ class PendingAlbumConversation:
         self.update = update  # representative update (caption-bearing, falls back to first)
         self.context = context
         self.media_group_id = media_group_id
+        self.conversation_context = conversation_snapshot()
         self.photos: List[Dict[str, Any]] = []
         self.caption: str = ""
         self.flush_task: Optional[Any] = None
@@ -1237,11 +1249,14 @@ _pending_album_conversations_lock = threading.RLock()
 
 def cancel_pending_album_conversations() -> None:
     with _pending_album_conversations_lock:
-        for pending in _pending_album_conversations.values():
+        cid = current_scope().conversation_id
+        for key, pending in list(_pending_album_conversations.items()):
+            if (pending.conversation_context or {}).get('conversation_id') != cid:
+                continue
             pending.closed = True
             if pending.flush_task is not None:
                 pending.flush_task.cancel()
-        _pending_album_conversations.clear()
+            _pending_album_conversations.pop(key, None)
 
 
 REDUNDANT_AGENT_COMMAND_PREFIXES: Tuple[str, ...] = ()
@@ -1597,3 +1612,79 @@ def get_default_agent_addon():
     return PromptFileManager.get('agent_prompt_addon')
 
 # --- ☆ 异步 SQLite 数据库管理（优化版）☆ ---
+
+
+# Album handlers return after durable ingestion; one supervisor owns the execution
+# slot until the quiet-window flush has finished. Concurrent parts join that
+# admission instead of becoming independent competing model turns.
+from types import SimpleNamespace
+from functools import wraps
+
+_album_admissions = {}
+
+
+def finish_album_admission(key):
+    admission = _album_admissions.get(key)
+    if admission is not None:
+        admission.finished.set()
+
+
+async def _supervise_album(key, admission):
+    try:
+        async with conversation_operation(execution=True):
+            admission.ready.set_result(current_scope())
+            stopped = asyncio.create_task(get_conversations().stop_event().wait())
+            finished = asyncio.create_task(admission.finished.wait())
+            try:
+                done, _ = await asyncio.wait({stopped, finished}, return_when=asyncio.FIRST_COMPLETED)
+                if stopped in done and not admission.finished.is_set():
+                    if getattr(admission, 'flushing', False):
+                        await admission.finished.wait()
+                    pending = _pending_album_conversations.get(key)
+                    if pending is not None:
+                        pending.closed = True
+                        if pending.flush_task is not None:
+                            pending.flush_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await pending.flush_task
+                        _pending_album_conversations.pop(key, None)
+            finally:
+                for task in (stopped, finished):
+                    task.cancel()
+                await asyncio.gather(stopped, finished, return_exceptions=True)
+    except BaseException as exc:
+        if not admission.ready.done():
+            admission.ready.set_exception(exc)
+        elif not isinstance(exc, asyncio.CancelledError):
+            logger.exception('Album supervision failed')
+    finally:
+        if _album_admissions.get(key) is admission:
+            _album_admissions.pop(key, None)
+
+
+async def authorize_before_conversation(update, context, *args, **kwargs):
+    if getattr(getattr(update, 'effective_user', None), 'id', None) == BotConfig.AUTHORIZED_USER_ID:
+        return True
+    return await check_authorized_user_middleware(update, context)
+
+
+def media_conversation_entry(function):
+    @wraps(function)
+    async def wrapped(update, *args, **kwargs):
+        if not await authorize_before_conversation(update, *args, **kwargs):
+            return None
+        group = getattr(getattr(update, 'message', None), 'media_group_id', None)
+        if not group:
+            async with conversation_operation(execution=True):
+                return await function(update, *args, **kwargs)
+        key = (update.effective_chat.id, group)
+        admission = _album_admissions.get(key)
+        if admission is None:
+            admission = SimpleNamespace(ready=asyncio.get_running_loop().create_future(), finished=asyncio.Event())
+            _album_admissions[key] = admission
+            task = asyncio.create_task(_supervise_album(key, admission))
+            get_conversations().track_background(task)
+        scope = await asyncio.shield(admission.ready)
+        with bind_conversation(scope):
+            return await function(update, *args, **kwargs)
+    return wrapped

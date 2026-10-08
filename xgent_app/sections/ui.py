@@ -24,7 +24,13 @@ class CallbackDataStore:
     @classmethod
     def get(cls, short_id: str) -> str:
         """获取原始数据"""
-        return cls._store.get(short_id, short_id)
+        value = short_id
+        for _ in range(8):
+            resolved = decode_conversation_callback(cls._store.get(value, value))
+            if resolved == value:
+                return resolved
+            value = resolved
+        raise ConversationError('按钮关联无效，请重新打开菜单。')
 
 # --- ☆ UI 构建 ☆ ---
 def build_magic_keyboard(items: List[str], page: int, callback_prefix: str, back_callback: str,

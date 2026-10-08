@@ -105,6 +105,9 @@ class Harness:
         bot.ModelClient._discovered_model_limits = {}
         bot.ModelClient._thinking_unsupported.clear()
         self.db = await bot.BotMemoryDB.get_instance()
+        from xgent_app.conversations import configure_conversations, bind_conversation
+        manager = configure_conversations(lambda: bot.BotMemoryDB.get_instance(), bot.BotConfig.DB_FILE, bot._conversation_state_changed)
+        self.stack.enter_context(bind_conversation(await manager.resolve()))
         await self.db.save_provider("p", URL, "test-key", [MODEL], api_format="openai")
         for name, value in (
             ("active_provider", "p"), ("default_model", MODEL), ("global_depth", 2),
@@ -130,6 +133,7 @@ class Harness:
         self.bot.cancel_pending_album_conversations()
         await self.http.aclose()
         await self.sdk.close()
+        await self.bot.get_conversations().close()
         await self.db.close()
         self.bot.BotMemoryDB._instance = None
         self.bot.UserDataManager._initialized = False
@@ -207,8 +211,10 @@ class Harness:
         return await self.bot.ModelClient.think_and_reply(*args, **kwargs)
 
     async def turn(self, question):
-        await self.bot.GlobalRecorder.record_user_message(question, chat_id=1)
-        await self.bot.process_conversation(self.update, self.context, question)
+        from xgent_app.conversations import bind_conversation
+        with bind_conversation(await self.bot.get_conversations().resolve()):
+            await self.bot.GlobalRecorder.record_user_message(question, chat_id=1)
+            await self.bot.process_conversation(self.update, self.context, question)
 
     def drain_frames(self):
         frames = []
@@ -596,13 +602,21 @@ async def check_concurrent_upload_order(bot, root):
                 task = asyncio.create_task(handler(*upload_update(h, kind, 101, first)))
                 try:
                     await asyncio.wait_for(started.wait(), 10)
-                    await handler(*upload_update(h, kind, 102, second))
+                    from xgent_app.conversations import ConversationBusy
+                    try:
+                        await handler(*upload_update(h, kind, 102, second))
+                    except ConversationBusy:
+                        pass
+                    else:
+                        raise AssertionError('busy media request was admitted')
                 finally:
                     release.set()
                     await asyncio.wait_for(task, 10)
+            with patch.object(bot, 'download_telegram_file', AsyncMock(return_value=second)), patch.object(bot, 'process_conversation', AsyncMock()):
+                await handler(*upload_update(h, kind, 102, second))
             rows = await h.db.get_attachment_records()
             refs = [json.loads(row["metadata"])["attachments"][0] for row in rows]
-            assert [ref["source_message_id"] for ref in refs] == [102, 101]
+            assert [ref["source_message_id"] for ref in refs] == [101, 102]
             await h.call()
             assert unpack_request(h.requests[-1])[1] == [first, second]
             result[kind] = True
@@ -681,6 +695,16 @@ async def seed_pending_albums(bot, root):
                 await bot.handle_photo_message(*upload_update(
                     h, "photo", i, image_bytes("PNG", (i, 20, 30)), "pending-photos",
                 ))
+            # A second album is a separate request: explicitly stop the first
+            # pending group without clearing its durable uploads before admitting it.
+            manager = bot.get_conversations()
+            running = (await manager.state())['running']
+            await manager.request_stop(running['run_id'])
+            async def stopped():
+                while manager.lock.busy():
+                    await asyncio.sleep(0.01)
+            await asyncio.wait_for(stopped(), 5)
+            assert len(await h.db.get_attachment_records()) == 3
             for i, data in ((203, image_bytes("JPEG")), (201, image_bytes("WEBP")),
                             (202, LONG_TEXT.encode())):
                 await bot.handle_document_message(*upload_update(
@@ -688,7 +712,7 @@ async def seed_pending_albums(bot, root):
                 ))
         assert len(await h.db.get_attachment_records()) == 6
         assert not h.requests
-        assert len(bot._pending_album_conversations) == 2
+        assert len(bot._pending_album_conversations) == 1
         return {"persisted_before_any_flush": True}
 
 

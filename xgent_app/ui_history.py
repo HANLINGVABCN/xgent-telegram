@@ -170,7 +170,7 @@ def normalize_markup(rows: Any) -> list:
 def durable_markup(rows: list) -> bool:
     return any(button.get('url') or button.get('unavailable') or (
         button.get('callback_data') and button['callback_data'] not in _TRANSIENT_ACTIONS
-        and not button['callback_data'].startswith('retry_compress:')
+        and not button['callback_data'].startswith(('retry_compress:', 'act_stop_generation:'))
     ) for row in rows for button in row)
 
 

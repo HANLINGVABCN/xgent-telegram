@@ -708,7 +708,7 @@ async def check_generated_clear_races(bot, root):
                 assert cleared
                 delivery.assert_not_awaited()
                 assert not await h.db.get_attachment_records(), (media, phase)
-                assert not await h.db.get_chat_messages(bot.UserDataManager.get("current_chat_id"))
+                assert not await h.db.get_chat_messages(bot.UserDataManager.get("current_chat_id")), (media, phase, await h.db.get_chat_messages(bot.UserDataManager.get("current_chat_id")))
                 assert "data:image/" not in json.dumps(await h.db.get_global_messages(1000))
                 h.replies.clear()
                 await h.call()

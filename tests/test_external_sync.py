@@ -31,8 +31,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 PROBE_PREAMBLE = """
-import json, sys
+import json, sys, os
 sys.path.insert(0, %r)
+def _fail_fast(kind, value, tb):
+    sys.__excepthook__(kind, value, tb)
+    sys.stderr.flush()
+    os._exit(1)
+sys.excepthook = _fail_fast
 """ % str(ROOT)
 
 
@@ -70,6 +75,9 @@ class SectionsProbeMixin(ProbeMixin):
 from xgent_app.bootstrap import load_sections
 ns = {"__file__": "xgent_server.py"}
 load_sections(ns)
+from xgent_app.conversations import ConversationScope, bind_conversation
+_default_scope_guard = bind_conversation(ConversationScope('global_memory', 0))
+_default_scope_guard.__enter__()
 """
 
 
@@ -187,10 +195,12 @@ async def main():
     sends = [c for c in calls if c[0] == "send"]
     edits = [c for c in calls if c[0] == "edit"]
     deletes = [c for c in calls if c[0] == "delete"]
-    placeholder = [c for c in sends if c[1] == "流式输出中..."]
+    from xgent_app.conversations import conversation_labelled_text
+    # Native Telegram gets the conversation label; the relayed body stays exact.
+    placeholder = [c for c in sends if c[1] == conversation_labelled_text("流式输出中...")]
     print(json.dumps({
         "user_echo_once": sum(1 for c in sends if "帮我看下这个 bug" in c[1]) == 1,
-        "user_echo_marked": any(c[1].startswith("🖥 [CLI]") for c in sends),
+        "user_echo_marked": any(c[1] == conversation_labelled_text("🖥 [CLI]" + chr(10) + "帮我看下这个 bug") for c in sends),
         "only_user_marked": sum(1 for c in sends if "[CLI]" in c[1]) == 1,
         "placeholder_verbatim": len(placeholder) == 1,
         "placeholder_has_stop_button": bool(placeholder) and placeholder[0][2] != [],
@@ -209,9 +219,9 @@ asyncio.run(main())
         self.assertTrue(result["user_echo_once"], "用户消息必须恰好同步一次")
         self.assertTrue(result["user_echo_marked"], "用户自己的话要带 🖥 [CLI] 来源标识")
         self.assertTrue(result["only_user_marked"],
-                        "**只有**用户消息带来源标识——其余任何一条都不该被加标记或改写")
+                        "只有用户消息带 CLI 来源标识；会话标签不应改变消息正文")
         self.assertTrue(result["placeholder_verbatim"],
-                        "占位提示必须是原生那条『流式输出中...』本身，一字不改，"
+                        "除会话标签外，占位正文必须是原生那条『流式输出中...』，一字不改，"
                         "不能替换成另编的提示语")
         self.assertTrue(result["placeholder_has_stop_button"],
                         "占位提示要带着停止按钮到 Telegram——这正是用户要的那条『带暂停按钮的提示』")

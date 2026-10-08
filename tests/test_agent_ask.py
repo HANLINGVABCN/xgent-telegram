@@ -117,13 +117,14 @@ class KeyboardAndAnswerTests(unittest.TestCase):
 
 
 class SecretStoreTests(unittest.TestCase):
-    def test_set_writes_env_and_calls_register_hook(self):
+    def test_set_keeps_environment_private_and_calls_register_hook(self):
         reg = []
         store = SecretStore()
         store.register_hook = reg.append
         store.set(7, "TEST_ASK_SECRET_VAR", "sup3r,s3cret")  # 含逗号：整串登记
         self.addCleanup(lambda: os.environ.pop("TEST_ASK_SECRET_VAR", None))
-        self.assertEqual(os.environ.get("TEST_ASK_SECRET_VAR"), "sup3r,s3cret")
+        self.assertIsNone(os.environ.get("TEST_ASK_SECRET_VAR"))
+        self.assertEqual(store.environment(7)["TEST_ASK_SECRET_VAR"], "sup3r,s3cret")
         self.assertEqual(reg, ["sup3r,s3cret"])
         self.assertTrue(store.has(7, "TEST_ASK_SECRET_VAR"))
 

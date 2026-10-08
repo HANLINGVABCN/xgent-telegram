@@ -7,6 +7,8 @@
 # 是哪个客户端。
 TELEGRAM_COMMAND_DESCRIPTIONS = (
     ("start", "打开主菜单"),
+    ("chats", "管理与切换会话"),
+    ("new", "新建会话"),
     ("config", "打开设置面板"),
     ("update", "更新代码并重启"),
     ("providers", "管理提供商与模型列表"),
@@ -52,6 +54,26 @@ def command_description(name: str) -> str:
 
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = getattr(update, 'effective_user', None)
+    if user is not None and user.id != BotConfig.AUTHORIZED_USER_ID:
+        return
+    error = context.error
+    if isinstance(error, (ConversationError, UiHistoryError)):
+        # Callback admission can also fail in an outer scope/menu wrapper. Always
+        # answer the original query rather than leaving its spinner running.
+        query = getattr(update, 'callback_query', None)
+        with contextlib.suppress(Exception):
+            if query is not None:
+                await query.answer(str(error), show_alert=True, cache_time=0)
+            else:
+                await context.bot.send_message(chat_id=BotConfig.AUTHORIZED_USER_ID, text=str(error))
+        return
+    with replay_conversation(getattr(error, 'conversation_context', None)):
+        async with conversation_operation():
+            await _scoped_global_error_handler(update, context)
+
+
+async def _scoped_global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("全局错误处理捕获异常", exc_info=context.error)
 
     # Only the authorized user's failures enter shared memory, never attacker input.
@@ -76,8 +98,10 @@ async def boot_core() -> None:
     """
     await UserDataManager.init()
     await BotMemoryDB.get_instance()
+    get_conversations().start()
 
 
+@conversation_entry()
 async def telegram_ready(app) -> None:
     """Telegram 通道真的就绪之后才做的事：同步 /命令 菜单 + 发启动主菜单。
 
@@ -199,6 +223,7 @@ async def telegram_ready(app) -> None:
 
 
 async def on_shutdown(app: Optional[Any] = None):
+    await get_conversations().close()
     """应用关闭时清理资源。唯一的停机清理路径。
 
     ``app`` 只是为了兼容历史调用点，函数体本身不需要它——PTB 的拆卸由

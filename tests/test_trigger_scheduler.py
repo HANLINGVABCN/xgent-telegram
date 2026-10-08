@@ -58,6 +58,9 @@ SECTIONS_PREAMBLE = """
 from xgent_app.bootstrap import load_sections
 ns = {"__file__": "xgent_server.py"}
 load_sections(ns)
+from xgent_app.conversations import ConversationScope, bind_conversation
+_scope_guard = bind_conversation(ConversationScope('global_memory', 0))
+_scope_guard.__enter__()
 """
 
 YAML_BODY = """

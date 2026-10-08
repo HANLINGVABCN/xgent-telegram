@@ -11,6 +11,11 @@
 
   var log = document.getElementById("log");
   var input = document.getElementById("input");
+  var selectedConversationId = null;
+  var conversationDrafts = Object.create(null);
+  var conversationFiles = Object.create(null);
+  function draftKey(cid) { return 'xgent-draft:' + (cid || selectedConversationId || 'global_memory'); }
+
   var btnSend = document.getElementById("btn-send");
   var btnStop = document.getElementById("btn-stop");
   var btnAttach = document.getElementById("btn-attach");
@@ -23,8 +28,6 @@
   var loginSub = document.getElementById("login-sub");
   var settings = document.getElementById("settings");
   var settingsRows = document.getElementById("settings-rows");
-  var menuPanel = document.getElementById("menu-panel");
-  var overlay = document.getElementById("overlay");
   var suggest = document.getElementById("cmd-suggest");
   var toastEl = document.getElementById("toast");
   var scrollBtn = document.getElementById("scroll-bottom");
@@ -149,13 +152,24 @@
 
   function api(path, options) {
     options = options || {};
+    var requestPath = path;
+    var cid = selectedConversationId || window.XGentConversations?.current;
+    if (cid && ['history','search','tasks','artifacts'].some(name=>path.startsWith('/api/workbench/'+name))) requestPath += (path.includes('?')?'&':'?') + 'conversation_id=' + encodeURIComponent(cid);
+    if (cid && options.method === 'POST' && ['/api/chat','/api/command','/api/callback','/api/stop'].includes(path)) {
+      var payload = options.body ? JSON.parse(options.body) : {};
+      if(path === '/api/stop') {
+        var running = window.XGentConversations?.running;
+        payload = {conversation_id:running?.conversation_id || cid, run_id:running?.run_id, ...payload};
+      } else payload = {conversation_id:cid, ...payload};
+      options.body = JSON.stringify(payload);
+    }
     var notifyWorkbench = function(){
       if(options.method === 'POST' && path === '/api/config')window.dispatchEvent(new CustomEvent('xgent-workbench-change',{detail:{pages:['settings','models','usage']}}));
     };
     options.credentials = "same-origin";
     options.headers = Object.assign({ "Content-Type": "application/json" }, options.headers || {});
     notifyWorkbench();
-    return fetch(path, options).then(function (r) {
+    return fetch(requestPath, options).then(function (r) {
       return r.json().catch(function () { return {}; }).then(function (body) {
         if (!r.ok) { throw new Error(body.error || ("HTTP " + r.status)); }
         return body;
@@ -1017,7 +1031,8 @@
     btnStop.classList.toggle("hidden", !busy);
     botAvatar.classList.toggle("pulsing", busy);
     setConnState(currentConnState);
-    if (busy) showTyping(); else hideTyping();
+    var running=window.XGentConversations?.running;
+    if (busy && (!running || running.conversation_id===selectedConversationId)) showTyping(); else hideTyping();
   }
   function showTyping() { typing.classList.remove("hidden"); if (isNearBottom()) scrollDown(); }
   function hideTyping() { typing.classList.add("hidden"); }
@@ -1138,6 +1153,36 @@
   }
 
   function handleFrame(frame) {
+    if(frame.type === 'conversation_state') {
+      window.XGentConversations?.accept(frame);
+      setBusy(!!frame.running);
+      return;
+    }
+    if(frame.type === 'turn_rejected') {
+      var rejectedCid=frame.conversation_id || selectedConversationId;
+      if(frame.rejected_text) {
+        conversationDrafts[rejectedCid]=frame.rejected_text;
+        try{sessionStorage.setItem(draftKey(rejectedCid),frame.rejected_text);}catch(e){}
+        if(rejectedCid===selectedConversationId&&!input.value)input.value=frame.rejected_text;
+      }
+      if(uploadQueue&&uploadQueue.conversation_id===rejectedCid&&uploadQueue.finish){uploadQueue.rejected=true;uploadQueue.error=frame.text;uploadQueue.awaitingTurn=false;uploadQueue.finish(frame.text);}
+      toast(frame.text||'请求未提交',true);
+      setBusy(!!window.XGentConversations?.running);
+      return;
+    }
+    if(frame.conversation_id && selectedConversationId && frame.conversation_id !== selectedConversationId) {
+      if(uploadQueue?.conversation_id===frame.conversation_id && ['turn_end','turn_error'].includes(frame.type) && uploadQueue.finish){
+        uploadQueue.awaitingTurn=false;uploadQueue.finish(frame.type==='turn_error'?frame.text:null);
+      }
+      return;
+    }
+    if(frame.generation!=null && uiGeneration!=null && frame.generation<uiGeneration)return;
+    var running=window.XGentConversations?.running;
+    var completion=['turn_end','turn_error','generation_end'].includes(frame.type)||(frame.type==='compression_state'&&!frame.busy);
+    if(completion&&running&&(!frame.run_id||frame.run_id!==running.run_id)){
+      if(!frame.run_id&&frame.type==='turn_error'&&frame.text)toast(frame.text,true);
+      return;
+    }
     if(frame.type==='turn_end'||frame.type==='turn_error')window.dispatchEvent(new Event('xgent-turn-finished'));
     if(viewingPast && ['message','edit','user_message','document','photo','record_snapshot'].includes(frame.type) &&
        (!frame.ui_generation || frame.ui_generation===uiGeneration)) {
@@ -1248,16 +1293,19 @@
     btnSend.disabled=conversationBusy||!!uploadQueue||!!currentConnState;
   }
 
-  function resync() {
-    if(historyRequest)return historyRequest;
+  function resync(force) {
+    if(historyRequest&&!force)return historyRequest;
     historyReady=false;btnSend.disabled=true;
-    historyRequest=loadHistory().then(function(){flushPending();}).catch(function(err){
+    var requestGeneration=historyGen+1;
+    var request=loadHistory().then(function(){if(requestGeneration===historyGen)flushPending();}).catch(function(err){
+      if(requestGeneration!==historyGen)return;
       toast('历史加载失败：'+err.message,true);
       setConnState('disconnected');
       // Do not call flushPending after failed history: the baseline is unknown.
       throw err;
-    }).finally(function(){historyRequest=null;});
-    return historyRequest;
+    }).finally(function(){if(historyRequest===request)historyRequest=null;});
+    historyRequest=request;
+    return request;
   }
 
   function setConnState(state) {
@@ -1489,11 +1537,13 @@
   document.getElementById('wb-latest').onclick=function(){historyAnchor=null;viewingPast=false;newFrames=0;resync().catch(function(){});};
   function loadHistory() {
     historyGen++;
-    var gen=historyGen;
+    var gen=historyGen, requestedCid=selectedConversationId;
     var wasNearBottom=isNearBottom();
     var top=log.scrollTop;
     return api(historyUrl()).then(function(data){
-      if(gen!==historyGen)return;
+      if(gen!==historyGen || requestedCid!==selectedConversationId)return;
+      if(data.conversation_id && requestedCid && data.conversation_id!==requestedCid)return;
+      if(!selectedConversationId && data.conversation_id)selectedConversationId=data.conversation_id;
       historyControls(data);
       const sameGeneration=uiGeneration===null || data.ui_generation==null || uiGeneration===data.ui_generation;
       if(!sameGeneration){
@@ -1513,7 +1563,7 @@
       if(live&&Number.isSafeInteger(live.cursor)&&live.epoch){
         snapshotWatermark={epoch:streamEpoch,cursor:streamCursor};
         streamEpoch=live.epoch;streamCursor=live.cursor;
-        (live.frames||[]).forEach(function(frame){
+        (live.frames||[]).filter(frame=>!frame.conversation_id||frame.conversation_id===selectedConversationId).forEach(function(frame){
           const entry=putTextFrame('ai',frame);retained.add(entry);log.appendChild(entry.row);
         });
       }
@@ -1526,7 +1576,7 @@
       const retainedRows=new Set();retained.forEach(entry=>{retainedRows.add(entry.row);(entry.mediaEntries||[]).forEach(child=>retainedRows.add(child.row));});
       Array.from(log.children).forEach(row=>{if(!retainedRows.has(row))row.remove();});
       if(typeof data.busy==='boolean')setBusy(data.busy);
-      if(data.busy && !(live?.frames||[]).length)showTyping();else hideTyping();
+      if(data.busy && !(live?.frames||[]).length && (!data.running || data.running.conversation_id===selectedConversationId))showTyping();else hideTyping();
       updateEmptyState();boundMessages(false);
       if(wasNearBottom||historyAnchor)scrollDown();else log.scrollTop=top;
       if(historyAnchor){const entry=byMessageId[historyAnchor];if(entry){entry.row.classList.add('wb-focus');setTimeout(()=>entry.row.classList.remove('wb-focus'),2000);}}
@@ -1571,7 +1621,7 @@
 
     if (!hasFiles) makeBubble("user", text);
     input.value = "";
-    try { sessionStorage.removeItem("xgent-draft"); } catch(e) {}
+    try { sessionStorage.removeItem(draftKey()); } catch(e) {}
     input.style.height = "auto";
     syncSendState();
     hideSuggest();
@@ -1585,10 +1635,16 @@
 
     var isCmd = text.charAt(0) === "/";
     var path = isCmd ? "/api/command" : "/api/chat";
-    var body = isCmd ? { command: text } : { text: text };
+    var submittedCid=selectedConversationId;
+    var body = isCmd ? { command: text, conversation_id:submittedCid } : { text: text, conversation_id:submittedCid };
     api(path, { method: "POST", body: JSON.stringify(body) }).catch(function (err) {
+      if(submittedCid!==selectedConversationId){
+        conversationDrafts[submittedCid]=text;
+        try{sessionStorage.setItem(draftKey(submittedCid),text);}catch(e){}
+        toast(err.message,true);return;
+      }
       makeBubble("sys", "⚠️ " + err.message);
-      if (!input.value) { input.value = text; if(!text.startsWith('/')){try { sessionStorage.setItem("xgent-draft", text); } catch(e) {}} }
+      if (!input.value) { input.value = text; if(!text.startsWith('/')){try { sessionStorage.setItem(draftKey(), text); } catch(e) {}} }
       syncSendState(); setBusy(false);
     });
   }
@@ -1600,7 +1656,7 @@
   }
 
   async function sendFiles(text, selected) {
-    var batch = { files: selected || pendingFiles.slice(), next: 0, cancelled: false, finish: null, awaitingTurn: false };
+    var batch = { conversation_id:selectedConversationId, files: selected || pendingFiles.slice(), next: 0, cancelled: false, finish: null, awaitingTurn: false };
     uploadQueue = batch;
     if (selected) { pendingFiles=pendingFiles.filter(function(f){return selected.indexOf(f)<0;});renderPendingFiles(); }
     else clearPendingFiles();
@@ -1624,10 +1680,12 @@
         setBusy(true);
         // HTTP 只确认接收，turn_end 才允许下一份上传进入对话核心。
         batch.awaitingTurn = true;
+        batch.rejected = false;
         var turnDone = new Promise(function (resolve) { batch.finish = resolve; });
         var fd = new FormData();
         fd.append("file", f, f.name);
         fd.append("text", caption);
+        if(batch.conversation_id)fd.append("conversation_id",batch.conversation_id);
         try {
           var response = await fetch("/api/upload", {
             method: "POST", credentials: "same-origin", body: fd
@@ -1641,13 +1699,22 @@
           batch.error = f.name + " 上传失败：" + err.message;
           break;
         }
+        if(batch.rejected){fileStatuses.set(f,'未提交：'+batch.error);break;}
         fileStatuses.set(f,"已接收，处理中");
         batch.next = i + 1;
-        if (await turnDone) break;
+        var turnError=await turnDone;
+        if(batch.rejected){batch.next=i;fileStatuses.set(f,'未提交：'+batch.error);break;}
+        if (turnError) break;
         batch.finish = null;
       }
     } finally {
       var remaining = batch.files.slice(batch.next);
+      if(batch.conversation_id!==selectedConversationId){
+        conversationFiles[batch.conversation_id]=remaining.concat(conversationFiles[batch.conversation_id]||[]);
+        if(batch.next===0)conversationDrafts[batch.conversation_id]=text;
+        uploadQueue=null;
+        return;
+      }
       pendingFiles = remaining.concat(pendingFiles);
       if (remaining.length) {
         if (batch.next === 0 && !input.value) input.value = text;
@@ -2204,70 +2271,10 @@
     });
   }
 
-  function buildMenu(filterText) {
-    var list = document.getElementById("cmd-list");
-    if (!list) return;
-    list.innerHTML = "";
-    var q = (filterText || "").toLowerCase().trim();
-
-    var renderedCount = 0;
-    COMMAND_GROUPS.forEach(function (g) {
-      var filtered = g.items.filter(function (it) {
-        return !q || it.cmd.toLowerCase().indexOf(q) >= 0 || it.desc.toLowerCase().indexOf(q) >= 0;
-      });
-      if (!filtered.length) return;
-      var lbl = document.createElement("div");
-      lbl.className = "group-label";
-      lbl.textContent = g.group;
-      list.appendChild(lbl);
-
-      filtered.forEach(function (c) {
-        renderedCount++;
-        var item = document.createElement("div");
-        item.className = "menu-item";
-        item.innerHTML = '<span class="m-cmd">' + escapeHtml(c.cmd) + '</span><span class="m-desc">' + escapeHtml(c.desc) + '</span>';
-        item.addEventListener("click", function () {
-          closeMenu();
-          input.value = c.cmd + " ";
-          input.focus();
-          input.style.height = "auto";
-          input.style.height = Math.min(input.scrollHeight, 180) + "px";
-          syncSendState();
-        });
-        list.appendChild(item);
-      });
-    });
-
-    if (renderedCount === 0) {
-      var emptyEl = document.createElement("div");
-      emptyEl.style.cssText = "color:var(--text-3);font-size:13px;text-align:center;padding:24px 10px;";
-      emptyEl.textContent = "未找到匹配的命令或技能";
-      list.appendChild(emptyEl);
-    }
-  }
-
-  function openMenu() {
-    var searchInput = document.getElementById("menu-search");
-    if (searchInput) searchInput.value = "";
-    buildMenu();
-    menuPanel.classList.add("open");
-    overlay.classList.remove("hidden");
-    if (searchInput) searchInput.focus();
-  }
-  function closeMenu() {
-    menuPanel.classList.remove("open");
-    overlay.classList.add("hidden");
-  }
-  document.getElementById("menu-search").addEventListener("input", function (e) { buildMenu(e.target.value); });
-
-  // 页面加载时立即初始化菜单列表
-  buildMenu();
-
   function boot() {
     loggedOut=false;
     window.dispatchEvent(new CustomEvent("xgent-authenticated"));
     loginDlg.close();
-    buildMenu();
     resync().catch(function(){});
     connectStream();
   }
@@ -2414,7 +2421,7 @@
   function actionButton(text,fn,cls){var node=actionNode('button',text,'wb-btn '+(cls||''));node.type='button';node.addEventListener('click',fn);return node;}
   function actionMessage(text,error){var node=actionNode('div',text,error?'wb-error':'wb-loading');node.setAttribute('role',error?'alert':'status');return node;}
   function showAction(title,content){
-    closeCommands(false);closeMenu();hideSuggest();
+    closeCommands(false);hideSuggest();
     if(window.XGentWorkbench){window.XGentWorkbench.dialog(title,content);return;}
     actionReturn=document.activeElement;actionDialog.dataset.chatFallback='1';
     document.getElementById('wb-dialog-title').textContent=title;
@@ -2456,7 +2463,7 @@
     if(!commandPanel||commandPanel.hidden)return;
     commandSequence++;commandPanel.hidden=true;
     if(actionRequestPath==='/api/workbench/bootstrap'&&actionRequest){actionRequest.abort();actionRequest=null;actionRequestPath=null;}
-    ['btn-menu','btn-composer-menu','wb-command'].forEach(id=>document.getElementById(id)?.setAttribute('aria-expanded','false'));
+    ['btn-composer-menu'].forEach(id=>document.getElementById(id)?.setAttribute('aria-expanded','false'));
     if(restoreFocus&&commandTrigger?.isConnected)commandTrigger.focus({preventScroll:true});
   }
   async function openCommands(){
@@ -2465,10 +2472,10 @@
     commandTrigger=document.activeElement;
     if(window.XGentWorkbench){if(!await window.XGentWorkbench.prepareChat())return;}
     else {document.body.dataset.page='chat';location.hash='/chat';}
-    closeMenu();hideSuggest();
+    hideSuggest();
     const sequence=++commandSequence;
     commandPanel.hidden=false;
-    ['btn-menu','btn-composer-menu','wb-command'].forEach(id=>document.getElementById(id)?.setAttribute('aria-expanded','true'));
+    ['btn-composer-menu'].forEach(id=>document.getElementById(id)?.setAttribute('aria-expanded','true'));
     var list=actionNode('div',null,'composer-command-list'),feedback=actionNode('div');feedback.setAttribute('aria-live','polite');
     var header=actionNode('div',null,'composer-command-head');
     var dismiss=actionButton('×',()=>closeCommands(true));dismiss.id='composer-commands-close';dismiss.setAttribute('aria-label','收起命令列表');
@@ -2508,7 +2515,7 @@
     commandPanel.style.maxHeight=Math.max(0,Math.min(320,available))+'px';
   }
   document.addEventListener('pointerdown',function(e){
-    if(commandPanel.hidden||commandPanel.contains(e.target)||e.target.closest('#btn-menu,#btn-composer-menu,#wb-command'))return;
+    if(commandPanel.hidden||commandPanel.contains(e.target)||e.target.closest('#btn-composer-menu'))return;
     closeCommands(false);
   },true);
   document.addEventListener('keydown',function(e){
@@ -2524,14 +2531,12 @@
   window.addEventListener('hashchange',()=>{if(location.hash!=='#/chat'&&location.hash!=='#chat'&&location.hash!=='')closeCommands(false);});
   window.addEventListener('resize',positionCommands);window.visualViewport?.addEventListener('resize',positionCommands);window.visualViewport?.addEventListener('scroll',positionCommands);
   if(window.ResizeObserver)new ResizeObserver(positionCommands).observe(document.getElementById('composer'));
-  ['btn-menu','btn-composer-menu','wb-command'].forEach(id=>document.getElementById(id)?.addEventListener('click',function(e){e.preventDefault();e.stopImmediatePropagation();openCommands().catch(err=>toast('菜单打开失败：'+err.message,true));},true));
+  ['btn-composer-menu'].forEach(id=>document.getElementById(id)?.addEventListener('click',function(e){e.preventDefault();e.stopImmediatePropagation();openCommands().catch(err=>toast('菜单打开失败：'+err.message,true));},true));
   ['wb-logout','btn-logout'].forEach(id=>document.getElementById(id)?.addEventListener('click',function(e){e.preventDefault();e.stopImmediatePropagation();logoutAction().catch(err=>toast('退出失败：'+err.message,true));},true));
   document.getElementById('wb-dialog-close').addEventListener('click',function(e){if(actionDialog.dataset.chatFallback){e.preventDefault();e.stopImmediatePropagation();closeAction();}},true);
   actionDialog.addEventListener('cancel',function(e){if(actionDialog.dataset.chatFallback){e.preventDefault();e.stopImmediatePropagation();closeAction();}},true);
   document.addEventListener('keydown',function(e){if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'){e.preventDefault();openCommands().catch(err=>toast(err.message,true));}});
 
-  document.getElementById("btn-close-menu").addEventListener("click", closeMenu);
-  overlay.addEventListener("click", closeMenu);
 
   document.getElementById("btn-terminal").addEventListener("click", function () {
     var modal = document.getElementById("terminal-modal");
@@ -2573,11 +2578,30 @@
         document.getElementById("terminal-modal").classList.remove("open");
       } else if (settings.classList.contains("open")) {
         settings.classList.remove("open");
-      } else if (menuPanel.classList.contains("open")) {
-        closeMenu();
       }
     }
   });
+  window.addEventListener('xgent-conversation-changed',function(event){
+    var next=event.detail.conversation_id;
+    if(next===selectedConversationId)return;
+    if(selectedConversationId){
+      conversationDrafts[selectedConversationId]=input.value;
+      conversationFiles[selectedConversationId]=pendingFiles.slice();
+      try{sessionStorage.setItem(draftKey(),input.value);}catch(e){}
+    }
+    if(uploadQueue)uploadQueue.cancelled=true;
+    selectedConversationId=next;
+    input.value=conversationDrafts[next]||'';
+    try{input.value=input.value||sessionStorage.getItem(draftKey(next))||'';}catch(e){}
+    pendingFiles=(conversationFiles[next]||[]).slice();renderPendingFiles();
+    historyGen++;historyAnchor=null;historyCursor=null;viewingPast=false;newFrames=0;newerAvailable=false;
+    uiGeneration=null;uiRevisions={};uiDeleted={};pendingFrames=[];
+    Array.from(new Set(Object.values(byMessageId))).forEach(removeEntry);
+    byMessageId={};log.replaceChildren();msgCount=0;lastStreamEntry=null;
+    updateEmptyState();syncSendState();
+    if(!loggedOut)resync(true).catch(function(){});
+  });
+  window.addEventListener('xgent-conversation-state',function(event){setBusy(!!event.detail.running);});
   window.XGentChat = {
     openCommands:openCommands,logout:logoutAction,
     commandError: function(){
@@ -2601,17 +2625,17 @@
     render: function(text,mode){return renderText(text,mode);},
     enhance: enhanceBubbleContent
   };
-  try { input.value=sessionStorage.getItem("xgent-draft")||""; syncSendState(); } catch(e) {}
-  input.addEventListener("input",function(){try{sessionStorage.setItem("xgent-draft",input.value);}catch(e){}});
+  try { input.value=sessionStorage.getItem(draftKey())||""; syncSendState(); } catch(e) {}
+  input.addEventListener("input",function(){try{sessionStorage.setItem(draftKey(),input.value);}catch(e){}});
   window.addEventListener('xgent-auth-expired',function(){
     closeCommands(false);
     if(actionRequest){actionRequest.abort();actionRequest=null;}
     if(actionDialog.open)closeAction();
     loggedOut=true;stopLiveTransport();historyGen++;historyReady=false;pendingFrames=[];
-    cancelUploads('已退出登录');clearPendingFiles();input.value='';try { sessionStorage.removeItem('xgent-draft'); } catch(e) {}
+    cancelUploads('已退出登录');clearPendingFiles();input.value='';try { sessionStorage.removeItem(draftKey()); } catch(e) {}
     Array.from(new Set(Object.values(byMessageId))).forEach(removeEntry);
     log.replaceChildren();byMessageId={};uiRevisions={};uiDeleted={};uiGeneration=null;streamEpoch=null;streamCursor=null;
-    closeMenu();hideSuggest();setBusy(false);document.getElementById('terminal-iframe').src='about:blank';
+    hideSuggest();setBusy(false);document.getElementById('terminal-iframe').src='about:blank';
     delete document.getElementById('terminal-iframe').dataset.loaded;
     document.getElementById('terminal-modal').classList.remove('open');
     if(!loginDlg.open)loginDlg.showModal();

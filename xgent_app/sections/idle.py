@@ -2,6 +2,16 @@
 # Keep cross-section names available through the loader until the next decoupling phase.
 
 async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
+    if get_conversations().lock.busy():
+        return
+    try:
+        async with conversation_operation(execution=True, fresh=True):
+            await _check_and_send_idle_message(context)
+    except ConversationBusy:
+        return
+
+
+async def _check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
     """检查是否需要发送提醒消息"""
     try:
         await UserDataManager.init()
@@ -160,6 +170,7 @@ WEB_EDITABLE_SETTINGS = {
 }
 
 
+@conversation_entry()
 async def _web_read_history(limit: int) -> List[Dict[str, Any]]:
     db = await BotMemoryDB.get_instance()
     rows = await db.get_display_history(limit)
@@ -167,10 +178,13 @@ async def _web_read_history(limit: int) -> List[Dict[str, Any]]:
         lambda: [build_history_message(row, ArtifactManager.ROOT_DIR, os.path.join(AgentExecutor.WORK_DIR, 'workspace'))
                  for row in rows]
     )
-    return UiHistorySnapshot(messages, generation=getattr(rows, 'generation', None),
-                             tombstones=getattr(rows, 'tombstones', ()))
+    result = UiHistorySnapshot(messages, generation=getattr(rows, 'generation', None),
+                               tombstones=getattr(rows, 'tombstones', ()))
+    result.conversation_id = current_scope().conversation_id
+    return result
 
 
+@conversation_entry()
 async def _web_read_history_message(row_id: int) -> Optional[Dict[str, Any]]:
     db = await BotMemoryDB.get_instance()
     row = await db.get_display_message(row_id)
@@ -363,7 +377,12 @@ def _relay_mirror_for(session_id: str, chat_id: int) -> Any:
 
 
 async def _replay_relay_op(mirror: Any, op: str, payload: Dict[str, Any]) -> None:
-    with media_presentation_scope(payload.get('media_presentation')), replay_ui_context(payload.get('ui_context')):
+    if 'conversation_context' not in payload:
+        db = await BotMemoryDB.get_instance()
+        session = await db.get_session('global_memory')
+        payload = {**payload, 'conversation_context': {'conversation_id': 'global_memory',
+                   'generation': session['generation'], 'run_id': None, 'name': session['name']}}
+    with replay_conversation(payload.get('conversation_context')), media_presentation_scope(payload.get('media_presentation')), replay_ui_context(payload.get('ui_context')):
         await _replay_relay_op_with_presentation(mirror, op, payload)
 
 
@@ -604,6 +623,7 @@ async def start_external_sync_watcher(outbox: Any = None, app: Any = None) -> No
         _web_external_watch_task = asyncio.create_task(_web_external_record_watcher())
 
 
+@conversation_entry()
 async def _web_read_settings() -> Dict[str, Any]:
     """返回当前值 + 下拉框选项，供网页渲染设置面板。"""
     await UserDataManager.init()
@@ -715,6 +735,7 @@ async def _web_read_settings() -> Dict[str, Any]:
     }
 
 
+@conversation_entry()
 async def _web_write_setting(key: str, value: Any) -> Dict[str, Any]:
     """写入前一律过 normalize_*，与 Telegram 菜单走同一套校验。"""
     if key not in WEB_EDITABLE_SETTINGS:
@@ -964,6 +985,8 @@ def _ensure_web_command_map() -> None:
         return
     pairs = [
         ("start", "cmd_start"),
+        ("chats", "cmd_chats"),
+        ("new", "cmd_new_chat"),
         ("config", "cmd_settings_menu"),
         ("update", "cmd_update_system"),
         ("restart", "cmd_restart_system"),
@@ -995,7 +1018,7 @@ def _ensure_web_command_map() -> None:
             _WEB_COMMAND_MAP[cmd_name] = fn
 
 
-def _web_submit_message(text: str, outbox: Any) -> None:
+def _web_submit_message(text: str, outbox: Any, *, conversation_id=None) -> None:
     """HTTP 线程调用：把对话丢进事件循环，不等它跑完。
 
     一轮 Agent 对话可能跑几分钟，HTTP 请求不能挂在那里等。
@@ -1004,7 +1027,7 @@ def _web_submit_message(text: str, outbox: Any) -> None:
     if loop is None:
         outbox.put({"type": "turn_error", "text": "服务未就绪"})
         return
-    asyncio.run_coroutine_threadsafe(_web_run_conversation(text, outbox), loop)
+    asyncio.run_coroutine_threadsafe(_web_scoped_call(_web_run_conversation(text, outbox), conversation_id, outbox, execution=UserDataManager.get('state') == BotState.IDLE, rejected_text=text), loop)
 
 
 async def _web_deliver_file_to_tg(abs_path: str, filename: str, caption: str) -> None:
@@ -1208,7 +1231,7 @@ async def _web_run_photo_conversation(filename: str, content: bytes,
 _WEB_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
 
-def _web_submit_upload(filename: str, content: bytes, caption: str, outbox: Any) -> None:
+def _web_submit_upload(filename: str, content: bytes, caption: str, outbox: Any, *, conversation_id=None) -> None:
     """HTTP 线程调用：把网页上传文件的对话丢进事件循环，不等它跑完。
 
     按文件名后缀分流：图片走 _web_run_photo_conversation（AI 能看懂图片
@@ -1226,7 +1249,7 @@ def _web_submit_upload(filename: str, content: bytes, caption: str, outbox: Any)
             outbox.put({"type": "turn_error", "text": "服务未就绪"})
             return
         asyncio.run_coroutine_threadsafe(
-            _web_run_photo_conversation(filename, content, caption, outbox), loop,
+            _web_scoped_call(_web_run_photo_conversation(filename, content, caption, outbox), conversation_id, outbox, execution=True), loop,
         )
         return
 
@@ -1235,39 +1258,40 @@ def _web_submit_upload(filename: str, content: bytes, caption: str, outbox: Any)
         outbox.put({"type": "turn_error", "text": "服务未就绪"})
         return
     asyncio.run_coroutine_threadsafe(
-        _web_run_file_conversation(filename, content, caption, outbox), loop,
+        _web_scoped_call(_web_run_file_conversation(filename, content, caption, outbox), conversation_id, outbox, execution=True), loop,
     )
 
 
-def _web_submit_callback(callback_data: str, message_id: int, outbox: Any) -> None:
+def _web_submit_callback(callback_data: str, message_id: int, outbox: Any, *, conversation_id=None) -> None:
     """HTTP 线程调用：把网页按钮点击丢进事件循环。"""
     loop = _web_chat_server.config.loop if _web_chat_server else None
     if loop is None:
         outbox.put({"type": "turn_error", "text": "服务未就绪"})
         return
     asyncio.run_coroutine_threadsafe(
-        _web_handle_callback(callback_data, message_id, outbox), loop,
+        _web_scoped_call(_web_handle_callback(callback_data, message_id, outbox), None if callback_data.startswith('act_stop_generation') else conversation_id, outbox), loop,
     )
 
 
-def _web_submit_ui_callback(ui_message_id: str, revision: int, button_id: str, outbox: Any) -> None:
+def _web_submit_ui_callback(ui_message_id: str, revision: int, button_id: str, outbox: Any, *, conversation_id=None) -> None:
     loop = _web_chat_server.config.loop if _web_chat_server else None
     if loop is None:
         outbox.put({'type': 'callback_answer', 'text': '服务未就绪', 'show_alert': True})
         return
     asyncio.run_coroutine_threadsafe(
-        _web_handle_ui_callback(ui_message_id, revision, button_id, outbox), loop,
+        _web_scoped_call(_web_handle_ui_callback(ui_message_id, revision, button_id, outbox), conversation_id, outbox), loop,
     )
 
 
-def _web_submit_command(command: str, outbox: Any) -> None:
+def _web_submit_command(command: str, outbox: Any, *, conversation_id=None) -> None:
     """HTTP 线程调用：把网页 /命令丢进事件循环。"""
     _ensure_web_command_map()
     loop = _web_chat_server.config.loop if _web_chat_server else None
     if loop is None:
         outbox.put({"type": "turn_error", "text": "服务未就绪"})
         return
-    asyncio.run_coroutine_threadsafe(_web_handle_command(command, outbox), loop)
+    name = command.strip().split(' ', 1)[0].lstrip('/').split('@', 1)[0].lower()
+    asyncio.run_coroutine_threadsafe(_web_scoped_call(_web_handle_command(command, outbox), conversation_id, outbox, execution=name == 'compress' or name not in _WEB_COMMAND_MAP, rejected_text=command), loop)
 
 
 def get_web_outbox() -> Optional[Any]:
@@ -1295,13 +1319,14 @@ def mirror_to_web(handler):
 
     Web 未运行时仍保存菜单状态，之后开启网页可恢复。重入安全由镜像计数保证。
     """
+    @conversation_entry(guard=authorize_before_conversation)
     async def wrapped(update, context):
         from xgent_app.web_bridge import install_tg_to_web_mirror
         outbox = get_web_outbox() or _web_external_outbox
         real_bot = get_web_real_bot() or context.bot
         restore = install_tg_to_web_mirror(real_bot, outbox)
         try:
-            if getattr(getattr(update, 'callback_query', None), 'data', None) == 'act_stop_generation':
+            if str(getattr(getattr(update, 'callback_query', None), 'data', '') or '').startswith('act_stop_generation'):
                 return await handler(update, context)
             authorized = getattr(getattr(update, 'effective_user', None), 'id', None) == BotConfig.AUTHORIZED_USER_ID
             async with ui_operation(capture_text=authorized):
@@ -1312,15 +1337,12 @@ def mirror_to_web(handler):
     return wrapped
 
 
-def _web_request_stop() -> None:
-    """复用 Telegram 侧的停止语义——全局只有一个停止事件。"""
-    event = _stop_generation_event
-    if event is not None and not event.is_set():
-        event.set()
+async def _web_request_stop(run_id=None, conversation_id=None):
+    return await get_conversations().request_stop(run_id, conversation_id)
 
 
 def _web_is_busy() -> bool:
-    return _conversation_processing_lock.locked()
+    return _conversation_processing_lock.locked() or get_conversations().lock.busy()
 
 
 async def start_web_chat_if_enabled(app: Optional[Any] = None, *,
@@ -1383,6 +1405,7 @@ async def start_web_chat_if_enabled(app: Optional[Any] = None, *,
             else 50 * 1024 * 1024
         ),
         read_history=_web_read_history,
+        read_conversations=get_conversations().state,
         read_history_message=_web_read_history_message,
         read_settings=_web_read_settings,
         write_setting=_web_write_setting,
@@ -1602,3 +1625,19 @@ async def stop_web_config_reconciler() -> None:
         await task
 
 # --- ☆ 其他类型消息处理 ☆ ---
+
+
+async def _web_scoped_call(coro, conversation_id, outbox, *, execution=False, rejected_text=None):
+    started = False
+    try:
+        async with conversation_operation(conversation_id, execution=execution,
+                                          expected=conversation_id is not None, fresh=True):
+            started = True
+            await coro
+    except ConversationError as exc:
+        outbox.put({'type': 'turn_rejected', 'conversation_id': conversation_id,
+                    'generation': None, 'run_id': None, 'conversation_name': None,
+                    'text': str(exc), 'rejected_text': rejected_text})
+    finally:
+        if not started:
+            coro.close()

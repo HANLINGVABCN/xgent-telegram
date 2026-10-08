@@ -15,6 +15,7 @@ xgent_memory.db-*
 *.db-journal
 *.db-shm
 *.db-wal
+*.turn.lock
 xgent_storage/
 .xgent-version
 

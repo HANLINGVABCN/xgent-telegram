@@ -23,6 +23,7 @@ async def main():
         {'type': 'compression_state', 'busy': True}, {'type': 'history_reset'},
         {'type': 'compression_state', 'busy': False, 'committed': True},
     ]
+    expected = [ns['stamp_frame'](frame) for frame in expected]
     for frame in expected:
         ns['publish_conversation_event'](context, frame)
     cli_bridge.relay_conversation_event({'type': 'unapproved-frame'})

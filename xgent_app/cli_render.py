@@ -612,7 +612,12 @@ def split_control_buttons(
     menu: List[Tuple[str, str]] = []
     hints: List[Tuple[str, str]] = []
     for text, data in buttons:
-        hint = CONTROL_BUTTON_HINTS.get(data)
+        action = str(data)
+        if action.startswith('cv:'):
+            action = action.split(':', 2)[2]
+        if action.startswith('act_stop_generation:'):
+            action = 'act_stop_generation'
+        hint = CONTROL_BUTTON_HINTS.get(action)
         if hint is None:
             menu.append((text, data))
         elif hint not in hints:

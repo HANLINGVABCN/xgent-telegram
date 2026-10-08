@@ -1638,7 +1638,8 @@ class AgentExecutor:
             else:
                 kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
 
-            run_env = {**os.environ, 'LANG': 'en_US.UTF-8'}
+            from xgent_app.conversations import conversation_secret_environment
+            run_env = {**os.environ, **conversation_secret_environment(), 'LANG': 'en_US.UTF-8'}
             if cls._current_chat_id is not None:
                 run_env['XGENT_CHAT_ID'] = str(cls._current_chat_id)
             if cls._current_conversation_id is not None:

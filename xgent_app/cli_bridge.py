@@ -84,7 +84,22 @@ def _allocate_cli_message_id() -> int:
 #
 # 按内容识别是这里的既定做法：token 行本来就是这么认的，Web 前端
 # （index.html 的 isTokenUsageText）用的也是同一个判据，两端永远一致。
-_turn_kind = "chat"
+import contextvars
+from xgent_app.conversations import current_scope, stamp_frame, bind_callback_markup, defer_completion
+
+_turn_kind = contextvars.ContextVar('cli_turn_kind', default='chat')
+_visible_conversation_id = None
+
+def set_visible_conversation(conversation_id):
+    global _visible_conversation_id
+    changed = _visible_conversation_id != conversation_id
+    _visible_conversation_id = conversation_id
+    if changed:
+        dismiss_menu()
+
+def conversation_visible():
+    scope = current_scope(required=False)
+    return not scope or not _visible_conversation_id or scope.conversation_id == _visible_conversation_id
 
 # token 用量行："↑ X tokens … · ⚡ R tokens/s"（build_token_usage_message）。
 _TOKEN_LINE_RE = re.compile(r"tokens\s*/\s*s\b")
@@ -102,12 +117,11 @@ _AGENT_RESULT_RE = re.compile(r"<b>\s*Agent\s+\w+\s*</b>", re.I)
 
 def set_turn_kind(kind: str) -> None:
     """登记当前轮的显示分类：chat=对话 / cmd=命令返回 / system=系统提示。"""
-    global _turn_kind
-    _turn_kind = kind if kind in ("chat", "cmd", "system") else "chat"
+    _turn_kind.set(kind if kind in ("chat", "cmd", "system") else "chat")
 
 
 def current_turn_kind() -> str:
-    return _turn_kind
+    return _turn_kind.get()
 
 
 def _render_kind_for(text: str) -> str:
@@ -122,7 +136,7 @@ def _render_kind_for(text: str) -> str:
         return "cmd"
     if _AGENT_STATUS_RE.search(text):
         return "system"
-    return _turn_kind
+    return _turn_kind.get()
 
 
 # --------------------------------------------------------------------------
@@ -215,6 +229,9 @@ class _CliRelay:
     # -- 生产端 --
 
     def emit(self, op: str, **payload: Any) -> None:
+        from xgent_app.conversations import conversation_snapshot
+        snapshot = conversation_snapshot()
+        payload['conversation_context'] = snapshot
         from xgent_app.ui_history import relay_ui_context
         ui_context = relay_ui_context()
         if ui_context is not None:
@@ -360,8 +377,10 @@ def relay_user_message(text: str) -> None:
 
 
 def relay_conversation_event(frame: dict) -> None:
-    if frame.get('type') in {'history_reset', 'compression_state'}:
-        _RELAY.emit('conversation_event', frame=dict(frame))
+    if frame.get('type') in {'history_reset', 'compression_state', 'generation_end', 'record_snapshot', 'conversation_state'}:
+        frame = stamp_frame(frame)
+        if not defer_completion(frame, lambda: _RELAY.emit('conversation_event', frame=frame)):
+            _RELAY.emit('conversation_event', frame=frame)
 
 
 atexit.register(close_relay)
@@ -404,6 +423,8 @@ def _register_menu(message_id: Optional[int], buttons: Sequence[Tuple[str, str]]
     敲个裸数字本来是想点别的，结果打到了 act_stop_generation。
     """
     global _active_menu_message_id, _menu_top
+    if not conversation_visible():
+        return
     with _MENU_LOCK:
         if buttons:
             if message_id is not None:
@@ -594,6 +615,8 @@ class CliBot:
         编辑那一刻从"◇ 命令 + 灰底"翻成"◆ XGent 双横线块"，中途换皮。
         """
         kind = _render_kind_for(text)
+        if not conversation_visible():
+            return [], kind
         renderer = self._renderer()
         if kind == "token":
             return renderer.render_message(text, buttons, parse_mode, style="token"), kind
@@ -610,6 +633,7 @@ class CliBot:
     async def send_message(self, chat_id: int, text: str, reply_markup: Any = None,
                            parse_mode: Any = None, **kwargs: Any) -> CliMessage:
         message_id = self._allocate_message_id()
+        reply_markup = bind_callback_markup(reply_markup)
         buttons = buttons_from_markup(reply_markup)
         lines, kind = self._render_by_kind(str(text), buttons, parse_mode)
         if not lines:
@@ -649,6 +673,7 @@ class CliBot:
         编辑的，照常发 edit——终端画不出来的东西不该拉低另外两端。
         """
         target_id = int(message_id or 0)
+        reply_markup = bind_callback_markup(reply_markup)
         buttons = buttons_from_markup(reply_markup)
         lines, _kind = self._render_by_kind(str(text), buttons, parse_mode)
         if lines and not self.screen.update_block(lines, target_id):
@@ -666,12 +691,13 @@ class CliBot:
                                         reply_markup: Any = None, **kwargs: Any) -> bool:
         """只换按钮。终端没法单独重画消息尾部，所以把新按钮作为独立一块打印。"""
         target_id = int(message_id or 0)
+        reply_markup = bind_callback_markup(reply_markup)
         buttons = buttons_from_markup(reply_markup)
         menu_buttons, hints = split_control_buttons(buttons)
         _register_menu(target_id, menu_buttons, is_edit=True)
         _RELAY.emit("edit_message_reply_markup", message_id=target_id,
                     reply_markup=_markup_to_frame(reply_markup))
-        if not buttons:
+        if not buttons or not conversation_visible():
             return True
         renderer = self._renderer()
         lines = renderer.render_buttons(menu_buttons) + renderer.render_hints(hints)

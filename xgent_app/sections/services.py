@@ -140,12 +140,12 @@ class GlobalRecorder:
                 msg_type=msg_type,
                 role=role,
                 content=content,
-                session_id=session_id or UserDataManager.get('current_chat_id'),
+                session_id=session_id or current_scope().conversation_id,
                 metadata=stamped_metadata,
                 **({'stop_event': stop_event} if stop_event is not None else {}),
             )
         except Exception as e:
-            if isinstance(e, UiHistoryError):
+            if isinstance(e, (UiHistoryError, ConversationError)):
                 raise
             if 'compression_job_id' in stamped_metadata:
                 raise CompressionError(f"恢复回复写入失败：{e}") from e
@@ -170,7 +170,7 @@ class GlobalRecorder:
                 "role": role,
                 "chat_id": chat_id or BotConfig.AUTHORIZED_USER_ID,
                 "user_id": user_id or 0,
-                "session_id": session_id or UserDataManager.get('current_chat_id'),
+                "session_id": session_id or current_scope().conversation_id,
                 "content": content,
                 "metadata": metadata,
             })
@@ -912,8 +912,9 @@ async def sync_chat_session_model(model_name: Optional[str]) -> None:
     UPDATE 对不存在的会话行是 no-op，早于首次对话调用也安全。
     """
     db = await BotMemoryDB.get_instance()
-    cid = UserDataManager.get('current_chat_id') or SINGLE_MEMORY_SESSION_ID
-    await db.update_session(cid, model=model_name)
+    # Global model selection; the legacy session.model column is not an override.
+    async with db._write() as conn:
+        await conn.execute('UPDATE chat_sessions SET model=NULL')
 
 
 def resolve_effective_chat_model(
@@ -2119,7 +2120,7 @@ def get_current_provider() -> Tuple[Optional[str], Optional[Dict]]:
 
 async def get_or_create_chat_session() -> Tuple[str, Dict]:
     db = await BotMemoryDB.get_instance()
-    cid = SINGLE_MEMORY_SESSION_ID
+    cid = current_scope().conversation_id
     session = await db.get_session(cid)
 
     if not session:
@@ -2127,13 +2128,10 @@ async def get_or_create_chat_session() -> Tuple[str, Dict]:
         await db.update_session(cid, name=SINGLE_MEMORY_SESSION_NAME)
         session = await db.get_session(cid)
 
-    UserDataManager.set('current_chat_id', cid)
-    await UserDataManager.save_config('current_chat_id', cid)
-
     messages = await db.get_chat_messages(cid)
     return cid, {
         'name': session['name'] if session else SINGLE_MEMORY_SESSION_NAME,
-        'model': (session['model'] if session else None) or UserDataManager.get('default_model'),
+        'model': UserDataManager.get('default_model'),
         'last_active': session['last_active'] if session else time.time(),
         'history': messages
     }
@@ -2164,3 +2162,84 @@ def short_hash(s: str) -> str:
     return hashlib.md5(s.encode()).hexdigest()[:8]
 
 # --- ☆ Callback Data 管理（解决64字节限制）☆ ---
+
+
+async def _conversation_state_changed(state):
+    previous = UserDataManager.get('current_chat_id')
+    UserDataManager.set('current_chat_id', state['current_chat_id'])
+    if previous and previous != state['current_chat_id']:
+        UserDataManager.set('state', BotState.IDLE)
+        for key in list(UserDataManager._data):
+            if key.startswith(('temp_', 'editing_')) or key.endswith('_buffer') or key == 'ask_input_target':
+                UserDataManager._data.pop(key, None)
+    db = await BotMemoryDB.get_instance()
+    frame = {'type': 'conversation_state', **state, 'items': await db.get_all_sessions()}
+    outbox = get_web_outbox() if 'get_web_outbox' in globals() else None
+    outbox = outbox or globals().get('_web_external_outbox')
+    if outbox is not None:
+        outbox.put(frame)
+    notifier = globals().get('_cli_conversation_notifier')
+    if notifier is not None:
+        notifier(frame)
+    if previous and previous != state['current_chat_id']:
+        bot = globals().get('_web_real_bot')
+        if bot is not None:
+            scope = await get_conversations().resolve()
+            with bind_conversation(scope):
+                await _announce_conversation_switch(bot, scope.name)
+
+
+@without_ui_history
+async def _announce_conversation_switch(bot, name):
+    with contextlib.suppress(Exception):
+        mirror_user_line_to_telegram(f'🗂 当前会话：{name}（三端已同步；未提交的设置输入已取消）')
+
+
+configure_conversations(lambda: BotMemoryDB.get_instance(), BotConfig.DB_FILE, _conversation_state_changed)
+configure_callback_encoder(lambda value: CallbackDataStore.store(value), lambda value: CallbackDataStore.get(value))
+
+
+async def clear_current_conversation():
+    # Stopping can cancel the model task that happens to be awaiting this clear.
+    # Complete the atomic invalidation/cleanup before propagating cancellation.
+    task = asyncio.create_task(_clear_current_conversation_inner())
+    try:
+        counts = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        task.result()
+        raise
+    from xgent_app.conversations import advance_generation
+    db = await BotMemoryDB.get_instance()
+    advance_generation(await db.get_attachment_generation())
+    await advance_ui_generation()
+    return counts
+
+
+async def _clear_current_conversation_inner():
+    manager = get_conversations()
+    scope = current_scope()
+    state = await manager.state()
+    running = state.get('running')
+    if running and running['conversation_id'] == scope.conversation_id:
+        # Stop is requested before the atomic generation change. Do not wait on
+        # a blocked upload/network read (or on our own task): stale writes are
+        # rejected by the version guard and the execution slot remains occupied
+        # until the old task really exits.
+        await manager.request_stop(running['run_id'], scope.conversation_id)
+    db = await BotMemoryDB.get_instance()
+    old_generation = await db.get_attachment_generation()
+    counts = await db.clear_all_conversation_memory()
+    SECRET_STORE.purge(scope.conversation_id)
+    PENDING_ASKS.purge_generation(old_generation)
+    cancel_pending_album_conversations()
+    with _pending_text_conversations_lock:
+        for key, pending in list(_pending_text_conversations.items()):
+            if (pending.conversation_context or {}).get('conversation_id') == scope.conversation_id:
+                _pending_text_conversations.pop(key, None)
+    await advance_ui_generation()
+    return counts

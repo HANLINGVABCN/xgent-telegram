@@ -82,6 +82,10 @@ async def _dispatch_ask_callback(update: Any, context: Any, data: str) -> None:
             await query.answer("这个表单已失效，请让 AI 重新发起。")
         return
 
+    if pending.conversation_id != current_scope().conversation_id:
+        await query.answer('请先切回该表单所属会话。', show_alert=True)
+        return
+
     qid = parts[2] if len(parts) > 2 else ""
     question = pending.form.question(qid)
     if question is None:
@@ -128,26 +132,49 @@ async def _dispatch_ask_callback(update: Any, context: Any, data: str) -> None:
         )
 
 
+@conversation_entry()
 async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await check_authorized_user_middleware(update, context):
         return
 
     # 停止按钮必须绕过普通菜单/记忆流程，尽快唤醒正在等待的生成或工具任务。
-    data = CallbackDataStore.get(query.data or "")
-    if data == "act_stop_generation":
-        global _stop_generation_event
-        if _stop_generation_event and not _stop_generation_event.is_set():
-            _event_id = id(_stop_generation_event)
-            _stop_generation_event.set()
-            logger.info(f"[停止诊断] 点击停止: event id={_event_id}, 已 set")
-            logger.info("用户手动停止了AI回答")
-            await query.answer("已收到停止请求")
-        else:
-            _event_id = id(_stop_generation_event) if _stop_generation_event else None
-            _is_set = _stop_generation_event.is_set() if _stop_generation_event else None
-            logger.info(f"[停止诊断] 点击停止但无活跃事件: event={_stop_generation_event}, is_set={_is_set}, id={_event_id}")
-            await query.answer("当前没有正在生成的回答")
+    try:
+        data = CallbackDataStore.get(query.data or "")
+    except (ConversationError, UiHistoryError) as exc:
+        # Reject before acknowledging success, recording the click or mutating
+        # any setting. answerCallbackQuery ends Telegram's spinner and shows
+        # the reason without sending a new chat message or editing the old card.
+        await query.answer(str(exc), show_alert=True, cache_time=0)
+        return
+    if data == 'act_stop_generation' or data.startswith('act_stop_generation:'):
+        run_id = data.partition(':')[2]
+        accepted = await get_conversations().request_stop(run_id) if run_id else False
+        await query.answer('已收到停止请求' if accepted else '该回合已结束，停止按钮已失效。')
+        return
+
+    if data.startswith('conv_') or data in {'cmd_new_chat', 'cmd_list_chats', 'cmd_rename_chat'}:
+        await query.answer()
+        manager = get_conversations()
+        if data in {'conv_create', 'cmd_new_chat'}:
+            await manager.manage('create')
+        elif data.startswith('conv_switch:'):
+            await manager.manage('switch', data.split(':', 1)[1])
+        elif data.startswith('conv_restore:'):
+            cid = data.split(':', 1)[1]
+            await manager.manage('restore', cid)
+            await manager.manage('switch', cid)
+        elif data == 'conv_archive':
+            await manager.manage('archive', current_scope().conversation_id)
+        elif data in {'conv_rename', 'cmd_rename_chat'}:
+            UserDataManager.set('state', BotState.RENAME_CHAT)
+            await context.bot.send_message(chat_id=update.effective_chat.id, text='请输入当前会话的新名称（1–80 字），或 cancel 取消。')
+            return
+        archived, page = data == 'conv_archived', 1
+        if data.startswith('conv_page:'):
+            _, archived_flag, page_number = data.split(':', 2)
+            archived, page = archived_flag == '1', int(page_number)
+        await show_conversation_menu(update, context, archived=archived, page=page)
         return
 
     if data == 'cmd_compress':
@@ -2144,10 +2171,10 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif data == "cmd_delete":
             db = await BotMemoryDB.get_instance()
             global_count = len(await db.get_global_messages(10000))
-            mirror_count = len(await db.get_chat_messages(SINGLE_MEMORY_SESSION_ID))
+            mirror_count = len(await db.get_chat_messages(current_scope().conversation_id))
             await query.message.edit_text(
-                "⚠️ <b>确认清空全局记忆吗？</b>\n\n"
-                f"这会删除当前所有对话记忆。\n"
+                "⚠️ <b>确认清空当前会话吗？</b>\n\n"
+                f"这只删除当前会话的上下文，其他会话不受影响。\n"
                 f"🌐 全局记忆记录: <b>{global_count}</b> 条\n"
                 f"🪞 内部镜像消息: <b>{mirror_count}</b> 条\n\n"
                 "不会删除 Provider 配置、.env、提示词文件，token 用量统计（/stats）也会保留。",

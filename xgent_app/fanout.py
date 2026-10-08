@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+from xgent_app.conversations import conversation_snapshot, replay_conversation
 import contextlib
 import json
 import logging
@@ -176,7 +177,7 @@ class Op:
     """
 
     __slots__ = ("kind", "logical_id", "chat_id", "payload", "transient",
-                 "durable", "seq", "created_at", "row_id", "attempts", "superseded")
+                 "durable", "seq", "created_at", "row_id", "attempts", "superseded", "conversation_context")
 
     def __init__(self, kind: str, *, logical_id: Optional[int] = None,
                  chat_id: Optional[int] = None,
@@ -188,7 +189,8 @@ class Op:
         self.kind = kind
         self.logical_id = logical_id
         self.chat_id = chat_id
-        self.payload = payload or {}
+        self.payload = dict(payload or {})
+        self.conversation_context = self.payload.pop('_conversation_context', conversation_snapshot())
         self.transient = transient or {}
         self.durable = bool(durable)
         self.seq = seq
@@ -213,7 +215,7 @@ class Op:
             "kind": self.kind,
             "logical_id": self.logical_id,
             "chat_id": self.chat_id,
-            "payload": json.dumps(self.payload, ensure_ascii=False),
+            "payload": json.dumps({**self.payload, '_conversation_context': self.conversation_context}, ensure_ascii=False),
             "created_at": self.created_at,
             "seq": self.seq,
             "attempts": int(self.attempts or 0),
@@ -231,6 +233,8 @@ class Op:
             attempts = int(row.get("attempts") or 0)
         except (TypeError, ValueError):
             attempts = 0
+        if isinstance(payload, dict):
+            payload.setdefault('_conversation_context', None)
         return cls(
             str(row.get("kind") or ""),
             logical_id=row.get("logical_id"),
@@ -634,9 +638,10 @@ class ChannelWorker:
         self._deferred_rows += 1
 
     async def _deliver_one(self, op: Op, native: Optional[int]) -> Any:
-        if op.kind in UPLOAD_KINDS:
-            return await self._deliver(op, native)
-        return await asyncio.wait_for(self._deliver(op, native), timeout=self._timeout)
+        with replay_conversation(op.conversation_context):
+            if op.kind in UPLOAD_KINDS:
+                return await self._deliver(op, native)
+            return await asyncio.wait_for(self._deliver(op, native), timeout=self._timeout)
 
     async def _drain_store(self, skipped: int) -> None:
         """通道恢复后按序补投待发库。

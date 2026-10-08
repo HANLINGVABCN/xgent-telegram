@@ -796,3 +796,59 @@ async def cmd_skills_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # --- ☆ 按钮回调处理 ☆ ---
+
+
+@conversation_entry()
+async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_authorized_user_middleware(update, context):
+        return
+    await show_conversation_menu(update, context)
+
+
+@conversation_entry()
+async def cmd_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_authorized_user_middleware(update, context):
+        return
+    text = str(getattr(getattr(update, 'message', None), 'text', '') or '')
+    parts = text.split(maxsplit=1)
+    name = parts[1].strip() if len(parts) > 1 else None
+    await get_conversations().manage('create', name=name)
+    await show_conversation_menu(update, context)
+
+
+async def show_conversation_menu(update, context, *, archived=False, page=1):
+    manager = get_conversations()
+    state = await manager.state()
+    scope = await manager.resolve()
+    db = await BotMemoryDB.get_instance()
+    sessions = [item for item in await db.get_all_sessions() if bool(item['archived']) == archived]
+    pages = max(1, (len(sessions) + 7) // 8)
+    page = max(1, min(pages, int(page)))
+    rows = []
+    for session in sessions[(page - 1) * 8:page * 8]:
+        cid = session['id']
+        marker = '✓ ' if cid == state['current_chat_id'] else ''
+        action = 'restore' if archived else 'switch'
+        rows.append([InlineKeyboardButton(marker + str(session['name'] or '新对话')[:40],
+                                          callback_data=f'conv_{action}:{cid}')])
+    navigation = []
+    if page > 1:
+        navigation.append(InlineKeyboardButton('◀ 上一页', callback_data=f'conv_page:{int(archived)}:{page-1}'))
+    if page < pages:
+        navigation.append(InlineKeyboardButton('下一页 ▶', callback_data=f'conv_page:{int(archived)}:{page+1}'))
+    if navigation:
+        rows.append(navigation)
+    rows.extend([
+        [InlineKeyboardButton('➕ 新建会话', callback_data='conv_create'),
+         InlineKeyboardButton('🏷 重命名当前会话', callback_data='conv_rename')],
+        [InlineKeyboardButton('📦 归档当前会话', callback_data='conv_archive'),
+         InlineKeyboardButton('🗃 已归档' if not archived else '🗂 未归档',
+                              callback_data='conv_archived' if not archived else 'conv_list')],
+    ])
+    running = state.get('running')
+    note = f"\n⏳ {running.get('name') or running['conversation_id']} 正在执行；切换不会中断。" if running else ''
+    with bind_conversation(scope):
+        await advance_ui_generation()
+        await context.bot.send_message(chat_id=update.effective_chat.id,
+                                       text=f'🗂 当前会话：{scope.name} · 第 {page}/{pages} 页{note}',
+                                       reply_markup=InlineKeyboardMarkup(rows))

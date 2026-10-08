@@ -106,6 +106,7 @@ class WebChatConfig:
         media_allowed_roots: Optional[List[str]] = None,
         read_health: Optional[Callable[[], Any]] = None,
         read_history_message: Optional[Callable[[int], Any]] = None,
+        read_conversations: Optional[Callable[[], Any]] = None,
         submit_ui_callback: Optional[Callable[[str, int, str, WebOutbox], Any]] = None,
         workbench: Optional[Callable[..., Any]] = None,
     ):
@@ -138,6 +139,7 @@ class WebChatConfig:
         # 这个接口存在的意义就是"事件循环忙住时也能问出状态"，把它做成
         # run_coroutine_threadsafe 就白搭了。
         self.read_health = read_health or (lambda: {})
+        self.read_conversations = read_conversations
         self.read_history = read_history
         self.read_history_message = read_history_message
         self.read_settings = read_settings
@@ -307,8 +309,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     return None
                 result["file"] = content
                 result["filename"] = filename or "upload"
-            elif name == "text":
-                result["text"] = content.decode("utf-8", errors="replace").strip()
+            elif name in {"text", "conversation_id"}:
+                result[name] = content.decode("utf-8", errors="replace").strip()
 
         if result["file"] is None:
             self._send_json({"error": "缺少文件"}, status=400)
@@ -449,7 +451,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     # --- 处理器 ---
 
     def _serve_workbench_asset(self, path: str) -> None:
-        allowed = {"chat.js", "chat.css", "workbench.js", "workbench.css", "components.js", "page-cache.js", "settings.js", "usage.js", "terminal.js", "terminal.css"}
+        allowed = {"chat.js", "chat.css", "conversations.js", "conversations.css", "workbench.js", "workbench.css", "components.js", "page-cache.js", "settings.js", "usage.js", "terminal.js", "terminal.css"}
         name = path.removeprefix("/assets/")
         if name not in allowed:
             self._send_json({"error": "not found"}, status=404)
@@ -503,7 +505,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 finalized = {mid for item in result.get('messages', [])
                              if item.get('web_live', {}).get('epoch') == live['epoch']
                              for mid in item['web_live']['message_ids']}
-                live['frames'] = [frame for frame in live['frames'] if frame.get('message_id') not in finalized]
+                live['frames'] = [frame for frame in live['frames'] if frame.get('message_id') not in finalized
+                                  and (not result.get('conversation_id') or frame.get('conversation_id') == result['conversation_id'])]
                 result['live'] = live
                 result['busy'] = bool(result.get('busy') or live['frames'])
             if resource == 'bootstrap':
@@ -666,9 +669,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             limit_val = 0
         limit = limit_val if limit_val > 0 else 1000000
-        messages = self._run_coro(self.config.read_history(limit))
+        cid = (query.get('conversation_id') or [None])[0]
+        options = {'conversation_id': cid} if cid and self.config.read_conversations is not None else {}
+        messages = self._run_coro(self.config.read_history(limit, **options))
         self._send_json(
             {"messages": messages, "busy": bool(self.config.is_busy()),
+             "conversation_id": getattr(messages, "conversation_id", None),
              "ui_generation": getattr(messages, "generation", None),
              "ui_tombstones": getattr(messages, "tombstones", [])},
             extra_headers={"Cache-Control": "no-store"},
@@ -682,7 +688,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 or self.config.read_history_message is None):
             self._send_json({"error": "附件关联不存在"}, status=404)
             return
-        message = self._run_coro(self.config.read_history_message(int(match[1])))
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        cid = (query.get('conversation_id') or [None])[0]
+        options = {'conversation_id': cid} if cid and self.config.read_conversations is not None else {}
+        message = self._run_coro(self.config.read_history_message(int(match[1]), **options))
         media = message.get("media", []) if message else []
         index = int(match[2])
         if index >= len(media):
@@ -716,6 +725,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         self._send_json({"ok": True, "settings": result})
 
+    def _conversation_arguments(self, data, *, background=False):
+        if self.config.read_conversations is None:
+            return {}
+        cid = str(data.get('conversation_id') or '')
+        state = self._run_coro(self.config.read_conversations())
+        if not cid or (not background and cid != state['current_chat_id']):
+            self._send_json({'error': '当前会话已变化，请刷新会话后重新提交；输入未发送。',
+                             'current_chat_id': state['current_chat_id']}, status=409)
+            return None
+        return {'conversation_id': cid}
+
     def _handle_chat(self) -> None:
         if not self._require_auth():
             return
@@ -723,6 +743,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         data = self._read_json()
         if data is None:
+            return
+        options = self._conversation_arguments(data)
+        if options is None:
             return
         text = str(data.get("text") or "").strip()
         if not text:
@@ -737,7 +760,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         outbox = self.server.outbox  # type: ignore[attr-defined]
         # submit_message 只负责把任务丢进事件循环，不等对话跑完——一轮 Agent
         # 对话可能跑好几分钟，HTTP 请求不能挂在那里。
-        self.config.submit_message(text, outbox)
+        self.config.submit_message(text, outbox, **options)
         self._send_json({"ok": True})
 
     def _handle_upload(self) -> None:
@@ -754,6 +777,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if data is None:
             return
 
+        options = self._conversation_arguments(data)
+        if options is None:
+            return
+
         # 全局对话锁被占用时直接拒绝，语义与 /api/chat 的「仍在处理」一致。
         if self.config.is_busy():
             self._send_json({"error": "系统仍在处理上一个请求，请稍后再发送"}, status=409)
@@ -763,7 +790,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         filename = str(data.get("filename") or "upload")
         content = data["file"]   # _read_multipart 已保证非 None
         caption = str(data.get("text") or "")
-        self.config.submit_upload(filename, content, caption, outbox)
+        self.config.submit_upload(filename, content, caption, outbox, **options)
         self._send_json({"ok": True})
 
     def _handle_stop(self) -> None:
@@ -771,8 +798,19 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         if not self._require_web_enabled():
             return
-        self.config.request_stop()
-        self._send_json({"ok": True})
+        if self.config.read_conversations is None:
+            self.config.request_stop()
+            self._send_json({'ok': True})
+            return
+        data = self._read_json()
+        if data is None:
+            return
+        try:
+            accepted = self._run_coro(self.config.request_stop(data.get('run_id'), data.get('conversation_id')))
+        except ValueError as exc:
+            self._send_json({'error': str(exc)}, status=409)
+            return
+        self._send_json({'ok': bool(accepted)}, status=200 if accepted else 409)
 
     def _handle_callback(self) -> None:
         """网页内联按钮点击。复用 Telegram 的回调路由，结果经 SSE 推回。"""
@@ -782,6 +820,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         data = self._read_json()
         if data is None:
+            return
+        options = self._conversation_arguments(data, background=str(data.get('callback_data') or '').startswith('act_stop_generation'))
+        if options is None:
             return
         outbox = self.server.outbox  # type: ignore[attr-defined]
         if any(key in data for key in ('ui_message_id', 'revision', 'button_id')):
@@ -796,7 +837,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if self.config.submit_ui_callback is None:
                 self._send_json({'error': '菜单已失效，请重新打开菜单。'}, status=409)
                 return
-            self.config.submit_ui_callback(ui_message_id, revision, button_id, outbox)
+            self.config.submit_ui_callback(ui_message_id, revision, button_id, outbox, **options)
             self._send_json({'ok': True})
             return
         callback_data = str(data.get("callback_data") or "")
@@ -808,7 +849,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             message_id = 0
 
-        self.config.submit_callback(callback_data, message_id, outbox)
+        self.config.submit_callback(callback_data, message_id, outbox, **options)
         self._send_json({"ok": True})
 
     def _handle_command(self) -> None:
@@ -820,6 +861,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         data = self._read_json()
         if data is None:
             return
+        options = self._conversation_arguments(data)
+        if options is None:
+            return
         command = str(data.get("command") or "").strip()
         if not command:
             self._send_json({"error": "命令不能为空"}, status=400)
@@ -828,7 +872,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             command = "/" + command
 
         outbox = self.server.outbox  # type: ignore[attr-defined]
-        self.config.submit_command(command, outbox)
+        self.config.submit_command(command, outbox, **options)
         self._send_json({"ok": True})
 
     def _handle_events(self) -> None:

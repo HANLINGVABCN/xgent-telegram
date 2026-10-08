@@ -236,6 +236,8 @@ def build_application() -> Any:
     # mirror_to_web 让 TG 端命令/按钮的输出（菜单切换、按钮变化）同步到 web 端。
     app.add_handler(CommandHandler("start", mirror_to_web(cmd_start)))
     for cmd, handler in (
+        ("chats", cmd_chats),
+        ("new", cmd_new_chat),
         ("config", cmd_settings_menu),
         ("update", cmd_update_system),
         ("restart", cmd_restart_system),

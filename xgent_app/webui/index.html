@@ -8,6 +8,7 @@
 <script src="/vendor/marked.umd.js"></script>
 <link rel="stylesheet" href="/assets/chat.css">
 <link rel="stylesheet" href="/assets/workbench.css">
+<link rel="stylesheet" href="/assets/conversations.css">
 </head>
 <body data-page="chat">
 
@@ -39,16 +40,29 @@
   </defs>
 </svg>
 
-<aside id="wb-nav" aria-label="工作台导航">
-  <a class="wb-brand" href="#/chat"><span class="wb-mark">x</span><span>XGent<small>AGENT WORKSPACE</small></span></a>
-  <button class="wb-command" id="wb-command">搜索命令 <kbd>⌘ K</kbd></button>
-  <span class="wb-nav-caption">工作空间</span>
-  <nav id="wb-nav-links"></nav>
-  <div class="wb-nav-bottom"><span class="wb-server-dot"></span><span>私有工作台<small>三端共享 · 一份记忆</small></span></div>
+<aside id="wb-nav" aria-label="对话与工作台">
+  <div class="conv-brand-row">
+    <a class="wb-brand" href="#/chat"><span class="wb-mark">x</span><span>XGent</span></a>
+    <button id="conversation-drawer-close" class="conv-icon-button" type="button" aria-label="关闭对话列表" title="关闭对话列表"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-close"/></svg></button>
+  </div>
+  <button id="conversation-new" class="conv-new" type="button" disabled><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M13.5 5.5 18.5.5l5 5-5 5M16 3 5 14l-1 6 6-1L21 8M12 4H5a2 2 0 0 0-2 2v15a2 2 0 0 0 2 2h15a2 2 0 0 0 2-2v-7" transform="translate(1 0) scale(.86)"/></svg><span>新对话</span></button>
+  <div class="conv-search-wrap">
+    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-search"/></svg>
+    <input id="conversation-search" type="search" aria-label="搜索对话" placeholder="搜索对话" autocomplete="off" spellcheck="false">
+    <button id="conversation-search-clear" class="conv-icon-button" type="button" aria-label="清除对话搜索" hidden><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-close"/></svg></button>
+  </div>
+  <div class="conv-section-head"><h2 id="conversation-list-title">最近对话</h2><button id="conversation-view-back" type="button" hidden>返回最近</button></div>
+  <div id="conversation-sync-error" class="conv-sync-error" role="status" hidden></div>
+  <div id="conversation-scroll" class="conv-scroll">
+    <div id="conversation-list" aria-labelledby="conversation-list-title" aria-busy="true"><p class="conv-list-hint">正在加载对话…</p></div>
+  </div>
+  <button id="conversation-archive-view" class="conv-archive-link" type="button"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h16v12H4zM3 4h18v4H3zM10 12h4"/></svg><span>已归档</span><span id="conversation-archive-count" class="conv-count" hidden></span></button>
+  <div class="conv-workspace"><span class="wb-nav-caption">工作台</span><nav id="wb-nav-links" aria-label="工作台导航"></nav></div>
+  <div class="wb-nav-bottom"><span class="wb-server-dot"></span><span>私有工作台<small>三端同步 · 独立对话</small></span></div>
 </aside>
+<div id="conversation-backdrop" aria-hidden="true" hidden></div>
 <div id="wb-shell">
 <div id="header">
-  <button id="btn-menu" class="icon-btn" title="命令菜单" aria-label="命令菜单"><svg class="icon" viewBox="0 0 24 24"><use href="#i-menu"/></svg></button>
   <div class="header-info">
     <div class="bot-avatar" id="bot-avatar">X</div>
     <div class="header-text">
@@ -81,7 +95,12 @@
 </div>
 
 <section id="wb-chat" aria-label="对话">
-<div id="wb-chat-intro"><div><span class="wb-eyebrow">WORKSPACE / CHAT</span><h1>对话<span>共享记忆</span></h1></div><div id="wb-chat-controls"></div></div>
+<div id="wb-chat-intro">
+  <div class="conv-chat-heading"><h1 id="wb-conversation-title" title="新对话">新对话</h1><span id="conversation-current-status" class="conv-title-status" hidden>正在生成</span></div>
+  <button id="conversation-drawer-toggle" class="conv-drawer-toggle" type="button" aria-label="查看对话列表" aria-controls="wb-nav" aria-expanded="false"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v12H9l-5 4zM8 8h8M8 12h5"/></svg><span>对话记录</span></button>
+  <div id="wb-chat-controls"></div>
+</div>
+<div id="conversation-running" class="conv-running" role="status" hidden></div>
 <div id="wb-history-controls"><button id="wb-earlier">↑ 加载更早记录</button><button id="wb-newer" disabled>加载较新记录 ↓</button><span id="wb-history-state" role="status"></span><button id="wb-latest">回到最新 ↓</button></div>
 <main id="log" aria-label="消息记录"></main>
 
@@ -149,19 +168,6 @@
   </div>
 </footer>
 
-<!-- 命令菜单侧栏 -->
-<aside id="menu-panel" class="side-panel">
-  <div class="panel-header">
-    命令与技能
-    <button id="btn-close-menu" class="icon-btn" aria-label="关闭"><svg class="icon" viewBox="0 0 24 24"><use href="#i-close"/></svg></button>
-  </div>
-  <div class="panel-search">
-    <input type="text" id="menu-search" placeholder="筛选命令…">
-  </div>
-  <div class="cmd-list" id="cmd-list"></div>
-</aside>
-<div id="overlay" class="hidden"></div>
-
 <!-- 终端内嵌模态层 -->
 <div id="terminal-modal">
   <div class="term-head">
@@ -189,6 +195,17 @@
 <aside id="wb-detail" aria-label="详情" hidden><div id="wb-resizer" role="separator" aria-label="调整详情宽度" tabindex="0"></div><header><span id="wb-detail-title">详情</span><button id="wb-detail-close" aria-label="关闭详情">×</button></header><div id="wb-detail-body"></div></aside>
 <nav id="wb-mobile-nav" aria-label="底部导航"></nav>
 <dialog id="wb-dialog" aria-labelledby="wb-dialog-title"><header><h2 id="wb-dialog-title"></h2><button id="wb-dialog-close" aria-label="关闭">×</button></header><div id="wb-dialog-body"></div></dialog>
+<div id="conversation-item-menu" class="conv-item-menu" role="menu" aria-label="对话操作" hidden></div>
+<dialog id="conversation-rename-dialog" class="conv-dialog" aria-labelledby="conversation-rename-title">
+  <form id="conversation-rename-form">
+    <div class="conv-dialog-heading"><h2 id="conversation-rename-title">重命名对话</h2><button id="conversation-rename-close" class="conv-icon-button" type="button" aria-label="关闭重命名"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-close"/></svg></button></div>
+    <label for="conversation-rename-input">对话名称</label>
+    <input id="conversation-rename-input" name="name" type="text" maxlength="80" required autocomplete="off">
+    <p id="conversation-rename-error" role="alert" hidden></p>
+    <div class="conv-dialog-actions"><button id="conversation-rename-cancel" type="button">取消</button><button id="conversation-rename-save" class="conv-save" type="submit">保存</button></div>
+  </form>
+</dialog>
+<div id="conversation-feedback" class="conv-feedback" role="status" aria-live="polite" hidden></div>
 <!-- 登录弹窗 -->
 <dialog id="login">
   <div class="login-card">
@@ -205,6 +222,7 @@
 <div id="toast"></div>
 
 <script type="module" src="/assets/chat.js"></script>
+<script type="module" src="/assets/conversations.js"></script>
 <script type="module" src="/assets/workbench.js"></script>
 </body>
 </html>

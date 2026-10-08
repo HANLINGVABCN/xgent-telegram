@@ -118,6 +118,52 @@ process_conversation = _ns["process_conversation"]
 handle_button_click = _ns["handle_button_click"]
 handle_text_message = _ns["handle_text_message"]
 logger = _ns["logger"]
+from xgent_app.conversations import conversation_operation, ConversationError, get_conversations
+from xgent_app.cli_bridge import set_visible_conversation
+
+_submitted_conversation_id = None
+_conversation_name = ''
+_interactive_conversations = False
+_pending_conversation_read = None
+_exit_after_turn = False
+
+
+def _cli_conversation_notifier(frame):
+    global _conversation_name
+    cid = frame['current_chat_id']
+    selected = next((item for item in frame.get('items', []) if item['id'] == cid), {})
+    name = selected.get('name') or '新对话'
+    changed = bool(_conversation_name and _conversation_name != name)
+    _conversation_name = name
+    set_visible_conversation(cid)
+    if changed:
+        SCREEN.notice('当前会话：' + name + '（已同步；旧输入不会改投新会话）', 'info')
+    box = attached_input_box()
+    if box is not None:
+        box.set_prompt(_prompt_plain(), _input_box_ansi())
+
+
+_ns['_cli_conversation_notifier'] = _cli_conversation_notifier
+
+
+def _cli_operation(*, execution=False):
+    def decorate(function):
+        async def wrapped(*args, **kwargs):
+            text = str(args[0]) if args else ''
+            navigation = function.__name__ == '_run_command' and text.split(' ', 1)[0] in {'/chats','/new','/getchat'}
+            cid = None if navigation else _submitted_conversation_id
+            execute = execution() if callable(execution) else execution
+            if function.__name__ == '_run_command':
+                command_name = text.strip().split(' ', 1)[0].lstrip('/').split('@', 1)[0].lower()
+                execute = command_name == 'compress' or _resolve_command(command_name) is None
+            try:
+                async with conversation_operation(cid, execution=execute, expected=cid is not None, fresh=True):
+                    return await function(*args, **kwargs)
+            except ConversationError as exc:
+                SCREEN.notice(str(exc), 'warn')
+        return wrapped
+    return decorate
+
 
 SCREEN = get_screen()
 PALETTE = SCREEN.palette
@@ -405,11 +451,12 @@ def _prompt_color_name() -> str:
 
 def _prompt_plain() -> str:
     """给命令面板用的提示符：带颜色，但不带 readline 的 \\001..\\002 标记。"""
+    label = f'[{_conversation_name[:24]}] ' if _conversation_name else ''
     pal = PALETTE
     if not pal.enabled:
-        return "❯ "
+        return label + "❯ "
     color = getattr(pal, _prompt_color_name())
-    return f"{color}{pal.bold}❯{pal.reset} "
+    return label + f"{color}{pal.bold}❯{pal.reset} "
 
 
 def _palette_enabled() -> bool:
@@ -807,6 +854,7 @@ async def _report_failure(what: str) -> None:
     SCREEN.notice(failure, "err")
 
 
+@_cli_operation(execution=lambda: UserDataManager.get('state') == BotState.IDLE)
 async def _run_conversation(text: str) -> None:
     """跑一轮完整对话。对照 idle.py 的 _web_run_conversation，但没有
     outbox/turn_end 帧这些 SSE 概念——CLI 是同步等待打印，跑完就是跑完。
@@ -847,6 +895,7 @@ async def _run_conversation(text: str) -> None:
         await _report_failure("对话")
 
 
+@_cli_operation()
 async def _run_command(command: str) -> None:
     """路由 /命令 到对应的 cmd_* 处理函数。对照 idle.py 的 _web_handle_command。"""
     name = command.strip().split(" ", 1)[0].lstrip("/").split("@", 1)[0].lower()
@@ -872,6 +921,7 @@ async def _run_command(command: str) -> None:
         await _report_failure(f"命令 /{name}")
 
 
+@_cli_operation()
 async def _run_callback(callback_data: str) -> None:
     """按编号触发的按钮点击等价操作。对照 idle.py 的 _web_handle_callback。"""
     # 菜单点击产生的回复（进一层菜单/执行动作的结果）按命令返回呈现。
@@ -1179,11 +1229,12 @@ def _prompt_text() -> str:
     空闲青绿——终端只有一个输入通道，用户分不清"这行字会进状态机、点按钮
     还是发给 AI"，颜色就是这个模式的显式信号；Ctrl+C 语义跟着颜色走。
     """
+    label = f'[{_conversation_name[:24]}] ' if _conversation_name else ''
     pal = PALETTE
     if not pal.enabled:
-        return "❯ "
+        return label + "❯ "
     color = getattr(pal, _prompt_color_name())
-    return f"\001{color}{pal.bold}\002❯\001{pal.reset}\002 "
+    return label + f"\001{color}{pal.bold}\002❯\001{pal.reset}\002 "
 
 
 # --------------------------------------------------------------------------
@@ -1249,32 +1300,94 @@ def _install_sigint_handler() -> None:
         logger.debug("无法安装 SIGINT 处理器", exc_info=True)
 
 
+async def _read_conversation_line():
+    global _pending_conversation_read, _submitted_conversation_id
+    if _pending_conversation_read is None:
+        await get_conversations().poll_once()
+        cid = (await get_conversations().state())['current_chat_id']
+        _pending_conversation_read = (asyncio.create_task(_READER.read(_prompt_text())), cid)
+    task, cid = _pending_conversation_read
+    line = await task
+    _pending_conversation_read = None
+    _submitted_conversation_id = cid
+    return line
+
+
+def _management_input(line):
+    if line in (_EXIT, _EOF, _CANCEL, _MENU_DISMISS):
+        return True
+    text = str(line).strip()
+    if text.split(' ', 1)[0] in {'/chats', '/new', '/getchat', '/menu', '/help'}:
+        return True
+    if UserDataManager.get('state') == BotState.RENAME_CHAT:
+        return True
+    pick = text[1:] if text.startswith(':') else text
+    if pick.isdigit():
+        options = get_last_menu_options()
+        index = int(pick) - 1
+        if not 0 <= index < len(options):
+            return False
+        action = str(options[index])
+        for _ in range(8):
+            resolved = _ns['CallbackDataStore']._store.get(action, action)
+            if resolved.startswith('cv:'):
+                resolved = resolved.split(':', 2)[2]
+            if resolved == action:
+                break
+            action = resolved
+        return action.startswith('conv_')
+    return False
+
+
 async def _run_turn(coro) -> None:
-    """跑一轮，期间允许 Ctrl+C 转成停止请求而不是杀掉进程。"""
-    global _turn_active
+    global _turn_active, _pending_conversation_read, _submitted_conversation_id, _exit_after_turn
+    if _turn_active:
+        await coro  # Read-only conversation management while the owner turn runs.
+        return
     _turn_active = True
     task = asyncio.ensure_future(coro)
     try:
-        while True:
+        while not task.done():
             try:
-                await asyncio.shield(task)
-                return
+                if not _interactive_conversations:
+                    await asyncio.shield(task)
+                    break
+                if _pending_conversation_read is None:
+                    cid = (await get_conversations().state())['current_chat_id']
+                    _pending_conversation_read = (asyncio.create_task(_READER.read(_prompt_text())), cid)
+                reader, cid = _pending_conversation_read
+                ready, _ = await asyncio.wait({task, reader}, return_when=asyncio.FIRST_COMPLETED)
+                if reader in ready:
+                    line = reader.result()
+                    _pending_conversation_read = None
+                    _submitted_conversation_id = cid
+                    if line in (_EXIT, _EOF):
+                        _exit_after_turn = True
+                        _request_stop()
+                        await task
+                        break
+                    if line is _CANCEL:
+                        _request_stop()
+                    elif line is _MENU_DISMISS:
+                        dismiss_menu()
+                    elif _management_input(line):
+                        await _dispatch_submitted(line)
+                    else:
+                        SCREEN.notice('正在执行；此时可用 /chats 切换查看、/new 新建或 Ctrl+C 停止。新消息未提交。', 'warn')
             except KeyboardInterrupt:
-                # handler 里已经发过停止请求，这里继续等这一轮自己收尾。
                 if not _request_stop():
                     task.cancel()
                     raise
+        await task
     finally:
         _turn_active = False
 
 
-# --------------------------------------------------------------------------
-# 输入循环
-# --------------------------------------------------------------------------
-
 async def _init_runtime() -> None:
     await UserDataManager.init()
     await BotMemoryDB.get_instance()
+    await get_conversations().poll_once()
+    get_conversations().start()
     # 启动跨端中继：从这里起，对话核心在 CLI 里对 bot 的每一次调用都会被
     # 服务端原样回放到 Telegram 和网页。必须在 BotMemoryDB 之后——中继线程
     # 自己开一条 sqlite 连接，建表要等主库初始化完，免得两边同时建。
@@ -1287,6 +1400,7 @@ async def _init_runtime() -> None:
 
 
 async def _shutdown_runtime() -> None:
+    await get_conversations().close()
     # 先排空中继再关库：本轮最后几条操作还在队列里，直接退出就是"最后几条
     # 消息没同步"（历史上 create_task 发完即忘留下的老毛病）。
     try:
@@ -1386,13 +1500,17 @@ async def _dispatch_submitted(line: Any) -> bool:
 
 
 async def _main_loop() -> None:
+    global _interactive_conversations
+    _interactive_conversations = True
     _banner()
 
     while True:
         SCREEN.invalidate()  # 提示符一打出来，屏幕最后一块就不再是消息块
         SCREEN.print_plain("")  # 提示符前留一行；不并进提示符是因为 readline
                                 # 处理不好含换行的提示符（重绘会错位）
-        line = await _READER.read(_prompt_text())
+        if _exit_after_turn:
+            break
+        line = await _read_conversation_line()
         if line is _EXIT or line is _EOF:
             break
         if line is _MENU_DISMISS:

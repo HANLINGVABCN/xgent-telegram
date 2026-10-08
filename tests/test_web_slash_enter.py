@@ -23,7 +23,7 @@ def test_slash_defaults_to_start_and_enter_sends_immediately(browser_context,wor
     assert first.locator('.c-cmd').text_content()=='/start'
     page.locator('#input').press('Enter')
     page.wait_for_timeout(100)
-    assert sent==[{'command':'/start'}]
+    assert sent==[{'conversation_id':'global_memory','command':'/start'}]
     assert page.locator('#input').input_value()==''
 
 
@@ -34,7 +34,7 @@ def test_prefix_arrow_selection_executes_exact_selected_command(browser_context,
     choice=page.locator('#cmd-suggest .cmd-item.active .c-cmd').text_content()
     page.locator('#input').press('Enter')
     page.wait_for_timeout(100)
-    assert sent==[{'command':choice}]
+    assert sent==[{'conversation_id':'global_memory','command':choice}]
 
 
 def test_tab_completion_and_multiline_modifiers_do_not_send(browser_context,workspace_url):
@@ -69,7 +69,7 @@ def test_touch_slash_enter_sends_but_normal_text_enter_is_newline(browser_contex
     page.locator('#input').fill('/')
     page.locator('#input').press('Enter')
     page.wait_for_timeout(100)
-    assert sent==[{'command':'/start'}]
+    assert sent==[{'conversation_id':'global_memory','command':'/start'}]
 
 
 @pytest.mark.parametrize('width,height',[(390,844),(768,1024),(1440,900)])
@@ -110,5 +110,5 @@ def test_composer_menu_keyboard_selection_executes_once(browser_context,workspac
     first=page.locator('#composer-commands .composer-command').first
     first.focus();first.press('Enter')
     page.wait_for_function('document.getElementById("composer-commands").hidden')
-    assert sent==[{'command':'/start'}]
+    assert sent==[{'conversation_id':'global_memory','command':'/start'}]
     assert page.locator('#input').input_value()==''

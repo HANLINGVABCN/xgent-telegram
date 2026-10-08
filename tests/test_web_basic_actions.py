@@ -29,7 +29,8 @@ def test_touch_menu_and_logout_do_not_depend_on_workbench(touch_context,workspac
     page.goto(workspace_url['url']);page.wait_for_function('!!window.XGentChat && !document.getElementById("btn-send").disabled')
     assert not page.evaluate('!!window.XGentWorkbench')
     draft='基础按钮必须能用';page.locator('#input').fill(draft)
-    for selector in ['#btn-composer-menu','#btn-menu']:
+    assert page.locator('#btn-menu,#menu-panel').count() == 0
+    for selector in ['#btn-composer-menu']:
         page.locator(selector).tap()
         expect(page.locator('#composer-commands')).to_be_visible()
         assert not page.locator('#wb-dialog').is_visible()
@@ -38,7 +39,7 @@ def test_touch_menu_and_logout_do_not_depend_on_workbench(touch_context,workspac
         page.locator('#composer-commands-close').tap()
         expect(page.locator('#composer-commands')).not_to_be_visible()
     page.locator('#btn-composer-menu').tap();page.locator('#composer-commands .composer-command').first.tap()
-    assert sent==[{'command':'/start'}]
+    assert sent==[{'conversation_id':'global_memory','command':'/start'}]
     page.locator('#wb-logout').tap()
     expect(page.locator('#login')).to_be_visible()
     assert not touch_context.request.get(workspace_url['url']+'/api/session').json()['authenticated']
@@ -57,7 +58,7 @@ def test_optional_page_import_failure_is_local_to_that_page(touch_context,worksp
     page.locator('#btn-composer-menu').tap();expect(page.locator('#composer-commands')).to_be_visible();page.keyboard.press('Escape')
     page.evaluate('(name)=>location.hash="/"+name',module)
     expect(page.locator('#wb-page')).to_contain_text('管理页面脚本加载失败')
-    page.locator('#btn-menu').tap();expect(page.locator('#composer-commands .composer-command strong').first).to_have_text('/start')
+    page.keyboard.press('Control+k');expect(page.locator('#composer-commands .composer-command strong').first).to_have_text('/start')
     page.locator('#wb-logout').tap()
     expect(page.locator('#login')).to_be_visible()
 

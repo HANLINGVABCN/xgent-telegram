@@ -23,8 +23,8 @@ export async function settingsView({logout,boot,health,state,render,dialog,close
     form.onsubmit=e=>{e.preventDefault();submit(form,async d=>{for(const [key,,type] of fields)await wb('settings',{data:{key,value:type==='number'?Number(d[key]):d[key]}});feedback.replaceChildren(message('设置已保存','success'));await refreshBootstrap();});};
     grid.append(card(active==='agent'?'执行行为':'对话行为',form));
     if(active==='conversation'){
-      const danger=card('一份共享记忆',el('p',{},'当前不是独立多会话。清空将同时影响网页、Telegram 和 CLI 的共享上下文与显示记录；模型价格和用量统计不受影响。'),
-        button('清空共享记忆',()=>confirmAction('清空共享记忆','清空后无法恢复，先确认不再需要当前上下文。',async()=>{await wb('memory/clear',{data:{confirm:'清空共享记忆'}});await window.XGentChat?.reload();},'清空共享记忆'),'danger'));danger.classList.add('wb-danger-zone');grid.append(danger);
+      const danger=card('当前会话上下文',el('p',{},'只清空当前会话在网页、Telegram 和 CLI 共用的上下文与显示记录；其他会话、手工用户记忆、模型配置和用量统计不受影响。'),
+        button('清空当前会话',()=>confirmAction('清空当前会话','清空后无法恢复，先确认不再需要当前上下文。',async()=>{await wb('memory/clear',{data:{confirm:'清空当前会话'}});await window.XGentChat?.reload();},'清空当前会话'),'danger'));danger.classList.add('wb-danger-zone');grid.append(danger);
     }else grid.append(card('执行权限说明',el('div',{class:'wb-callout'},el('strong',{},'这不是沙箱'),el('p',{},'Agent 与网页终端拥有运行账号的实际权限。命令黑名单不是安全隔离。请只执行你信任的任务。')),button('管理命令黑名单',()=>{location.hash='/chat';window.XGentChat?.command('/blacklist');})));
   }
   if(active==='web'){

@@ -55,7 +55,7 @@ def _load_db_class():
 
     source = (ROOT / 'xgent_app' / 'sections' / 'database.py').read_text(encoding='utf-8')
     # 只取 BotMemoryDB 类定义，后面的 UserDataManager 等依赖更多外部符号。
-    start = source.index('class BotMemoryDB')
+    start = 0  # Include the database section's explicit imports/mixins.
     end = source.index('# --- ☆ 用户数据管理')
     exec(compile(source[start:end], 'database.py', 'exec'), namespace)
     return namespace['BotMemoryDB']
@@ -77,7 +77,9 @@ class WriteSerializationTests(unittest.TestCase):
             pass
 
     def _run(self, coro):
-        return asyncio.run(coro)
+        from xgent_app.conversations import ConversationScope, bind_conversation
+        with bind_conversation(ConversationScope('global_memory', 0)):
+            return asyncio.run(coro)
 
     def test_concurrent_write_survives_transaction_rollback(self):
         """事务回滚不能连带抹掉并发协程在此期间写入的数据。"""

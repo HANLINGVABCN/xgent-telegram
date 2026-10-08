@@ -149,10 +149,14 @@ async def flush_album_conversation(key: Tuple[int, str]):
         if pending is None or pending.closed or pending.downloading:
             return
         _pending_album_conversations.pop(key, None)
+        admission = _album_admissions.get(key)
+        if admission is not None:
+            admission.flushing = True
         pending.closed = True
         if pending.flush_task is not None and pending.flush_task is not asyncio.current_task():
             pending.flush_task.cancel()
     if not pending.photos or pending.failed:
+        finish_album_admission(key)
         return
     context_prefix = build_incoming_context_prefix(pending.update.message)
     memory_text, _multimodal_content = build_album_message(
@@ -160,12 +164,16 @@ async def flush_album_conversation(key: Tuple[int, str]):
     )
     try:
         logger.info(f"Flushed album: photos={len(pending.photos)}, chat_id={key[0]}")
-        await process_conversation(pending.update, pending.context, memory_text)
+        with replay_conversation(pending.conversation_context):
+            await process_conversation(pending.update, pending.context, memory_text)
     except Exception as exc:
         logger.exception("Album persistence/processing failed")
         await pending.update.message.reply_text(f"相册未能完整交给模型：{safe_text(str(exc))}")
+    finally:
+        finish_album_admission(key)
 
 
+@media_conversation_entry
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     received_at_ns = time.time_ns()
     if not await check_authorized_user_middleware(update, context):
@@ -200,6 +208,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Photo multimodal processing error: {e}")
         await update.message.reply_text(f"图片未能完整交给模型：{safe_text(await GlobalRecorder.record_error(e, update.effective_chat.id, source='media_input'))}")
 
+@conversation_entry(execution=True, guard=authorize_before_conversation)
 async def handle_sticker_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
         return
@@ -271,6 +280,7 @@ def _native_media_filename(media, kind: str, message_id) -> str:
     return f"{kind}_{suffix}{ext}"
 
 
+@media_conversation_entry
 async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """原生音视频直发（非文件、非转发文本）：下载落盘、保留路径、送入对话。
 
@@ -514,6 +524,7 @@ def build_incoming_context_prefix(msg) -> str:
     return "\n".join(parts)
 
 
+@conversation_entry(execution=True, guard=authorize_before_conversation)
 async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
         return

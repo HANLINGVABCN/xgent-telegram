@@ -30,12 +30,18 @@ export function check(label,name,value=false){return el('label',{class:'wb-check
 export function table(headings,rows){return el('div',{class:'wb-table-wrap'},el('table',{class:'wb-table'},el('thead',{},el('tr',{},headings.map(x=>el('th',{},x)))),el('tbody',{},rows.map(row=>el('tr',{},row.map(x=>el('td',{},x)))))));}
 export function formData(form){const data=Object.fromEntries(new FormData(form));form.querySelectorAll('input[type=checkbox]').forEach(x=>data[x.name]=x.checked);return data;}
 export async function api(path,{data,signal,...options}={}) {
+  const cid=window.XGentConversations?.current;
+  let requestPath=path;
+  if(cid&&path.startsWith('/api/workbench/')&&!path.includes('/conversations')){
+    if(data===undefined){if(['history','search','tasks','artifacts'].some(name=>path.startsWith('/api/workbench/'+name)))requestPath+= (path.includes('?')?'&':'?')+'conversation_id='+encodeURIComponent(cid);}
+    else data={conversation_id:cid,...data};
+  }
   const affected=data===undefined?[]:affectedPages(path,data?.key);
   const changed=()=>{if(affected.length)window.dispatchEvent(new CustomEvent('xgent-workbench-change',{detail:{pages:affected}}));};
   // Invalidate both before and after: an in-flight read cannot make partial/late writes fresh.
   changed();
   try {
-    const response=await fetch(path,{credentials:'same-origin',...options,signal,method:data===undefined?'GET':'POST',headers:{'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)});
+    const response=await fetch(requestPath,{credentials:'same-origin',...options,signal,method:data===undefined?'GET':'POST',headers:{'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)});
     let body={};try{body=await response.json();}catch{}
     if(!response.ok||body.ok===false){const err=new Error(body.error||`请求失败 (${response.status})`);err.status=response.status;if(response.status===401)window.dispatchEvent(new Event('xgent-auth-expired'));throw err;}
     if(path==='/api/logout')window.dispatchEvent(new Event('xgent-auth-expired'));

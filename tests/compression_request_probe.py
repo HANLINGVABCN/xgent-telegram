@@ -218,7 +218,7 @@ async def legacy_saved(bot, root):
                                      'timestamp': 1, 'content': 'LEGACY-ORIGINAL-END'}],
                  'attachments': [], 'mirror_records': [], 'sessions': []}
         async with h.db._transaction() as conn:
-            await conn.execute('INSERT INTO context_compressions (sequence, payload) VALUES (?, ?)',
+            await conn.execute("INSERT INTO context_compressions (session_id, sequence, payload) VALUES ('global_memory', ?, ?)",
                                (1, json.dumps(entry)))
         await bot.GlobalRecorder.record_user_message('LEGACY-ACTIVE-CONVERSATION')
         return {'legacy_seed_saved': True}

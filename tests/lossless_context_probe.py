@@ -168,6 +168,8 @@ async def provider_matrix(bot, root):
                     assert archive.testzip() is None
                 frames = h.drain_frames()
                 events = [f for f in frames if f['type'] in {'history_reset', 'compression_state'}]
+                assert all(f.get('conversation_id') == 'global_memory' for f in events)
+                events = [{k:v for k,v in f.items() if k not in {'conversation_id','generation','run_id','conversation_name'}} for f in events]
                 assert events == [{'type': 'compression_state', 'busy': True}, {'type': 'history_reset'},
                                   {'type': 'compression_state', 'busy': False, 'committed': True}]
                 await h.call(fmt)

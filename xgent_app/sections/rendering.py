@@ -77,6 +77,8 @@ class TelegramRichAPI:
         由 Telegram 服务端自行解析 Markdown 为原生 RichBlock（表格/标题/列表等），
         无需客户端自行构建 block_tree。
         """
+        from xgent_app.conversations import conversation_labelled_text
+        text = conversation_labelled_text(text, 'MarkdownV2', limit=RICH_MESSAGE_CHAR_LIMIT)
         payload: Dict[str, Any] = {
             "chat_id": chat_id,
             "rich_message": {"markdown": text or " "},
@@ -102,6 +104,8 @@ class TelegramRichAPI:
         完成后必须调用 send_rich_message 发送最终消息以持久化。
         API 返回 True（非 Message 对象），draft_id 由调用方生成。
         """
+        from xgent_app.conversations import conversation_labelled_text
+        text = conversation_labelled_text(text, 'MarkdownV2', limit=RICH_MESSAGE_CHAR_LIMIT)
         payload: Dict[str, Any] = {
             "chat_id": chat_id,
             "draft_id": draft_id,

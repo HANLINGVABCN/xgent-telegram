@@ -142,7 +142,7 @@
     border: 2px solid transparent; background-clip: content-box;
   }
   *::-webkit-scrollbar-thumb:hover { background: var(--scroll-h); background-clip: content-box; }
-  #log, .cmd-list, .cmd-suggest, #settings { scrollbar-width: thin; scrollbar-color: var(--scroll) transparent; }
+  #log, .cmd-suggest, #settings { scrollbar-width: thin; scrollbar-color: var(--scroll) transparent; }
 
   .icon {
     width: 20px; height: 20px; display: block; flex-shrink: 0;
@@ -910,44 +910,6 @@
   }
 
   /* ---- 侧滑抽屉与浮层 ---- */
-  .side-panel {
-    position: fixed; top: 0; left: 0; bottom: 0; width: min(340px, 88vw); z-index: 40;
-    background: var(--surface); border-right: 1px solid var(--line);
-    transform: translateX(-101%); transition: transform 0.26s var(--ease);
-    display: flex; flex-direction: column;
-  }
-  .side-panel.open { transform: none; box-shadow: 24px 0 60px rgba(0, 0, 0, 0.25); }
-  #overlay {
-    position: fixed; inset: 0; z-index: 35; background: var(--scrim);
-    backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
-    animation: fadeIn 0.2s var(--ease);
-  }
-  .panel-header {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: max(14px, env(safe-area-inset-top)) 12px 14px 18px;
-    border-bottom: 1px solid var(--line);
-    font-size: 16px; font-weight: 650; letter-spacing: -0.015em;
-  }
-  .panel-search { padding: 10px 14px; border-bottom: 1px solid var(--line); }
-  .panel-search input {
-    width: 100%; padding: 7px 10px; border-radius: var(--r-sm);
-    border: 1px solid var(--line); background: var(--surface-2);
-    color: var(--text); font-size: 13.5px; outline: none;
-  }
-  .cmd-list { flex: 1; overflow-y: auto; padding: 10px 10px 28px; }
-  .cmd-list .group-label {
-    font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
-    color: var(--text-3); padding: 14px 10px 6px;
-  }
-  .menu-item {
-    display: flex; flex-direction: column; gap: 2px;
-    padding: 10px 12px; border-radius: var(--r-sm); cursor: pointer;
-    transition: background var(--t);
-  }
-  .menu-item:hover { background: var(--surface-2); }
-  .menu-item .m-cmd { font: 600 13.5px var(--mono); color: var(--accent); }
-  .menu-item .m-desc { color: var(--text-3); font-size: 12.5px; }
-
   /* ---- 设置面板 (Settings) ---- */
   #settings {
     position: fixed; inset: 0; z-index: 50; overflow-y: auto;

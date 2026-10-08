@@ -37,6 +37,9 @@ def _unpack(value):
         return data
     except Exception: raise WorkbenchError('历史游标无效，请重新加载') from None
 
+from xgent_app.conversations import conversation_operation, current_scope, get_conversations, stamp_frame, ConversationError
+
+
 class Workbench:
     def __init__(self, namespace):
         self.ns = namespace
@@ -69,14 +72,26 @@ class Workbench:
         return task
 
     async def handle(self, method, resource, data):
+        navigation = resource == 'conversations' or resource.startswith('conversations/')
+        cid = None if navigation else data.get('conversation_id')
+        if method != 'GET' and resource in {'memory/clear','tasks/create','tasks/cancel'} and not cid:
+            raise WorkbenchError('缺少目标会话，请刷新后重试。', 409)
+        try:
+            async with conversation_operation(cid, expected=method != 'GET' and not navigation, fresh=True):
+                return await self._handle_scoped(method, resource, data)
+        except ConversationError as exc:
+            raise WorkbenchError(str(exc), exc.status) from exc
+
+    async def _handle_scoped(self, method, resource, data):
         await self.db()
         if method == 'GET':
-            operations = {'bootstrap': self.bootstrap, 'history': self.history, 'search': self.search,
+            operations = {'conversations': self.conversations, 'bootstrap': self.bootstrap, 'history': self.history, 'search': self.search,
                           'tasks': self.tasks, 'artifacts': self.artifacts, 'providers': self.providers,
                           'skills': self.skills, 'usage': self.usage, 'usage/records': self.usage_records,
                           'artifacts/preview': self.artifact_preview, 'settings': self.read_settings}
         else:
-            operations = {'tasks/create': self.create_task, 'tasks/cancel': self.cancel_tasks,
+            operations = {**{f'conversations/{action}': self.conversation_action for action in ('create','switch','rename','archive','restore')},
+                          'tasks/create': self.create_task, 'tasks/cancel': self.cancel_tasks,
                           'providers/save': self.save_provider, 'providers/delete': self.delete_provider,
                           'providers/fetch': self.fetch_models, 'providers/select': self.select_model,
                           'providers/import': self.import_providers, 'providers/export': self.export_providers,
@@ -85,6 +100,8 @@ class Workbench:
         operation = operations.get(resource)
         if operation is None: raise WorkbenchError('工作台接口不存在', 404)
         try:
+            if resource.startswith('conversations/'):
+                data = {**data, 'action': resource.split('/', 1)[1]}
             return await operation(data)
         except asyncio.CancelledError:
             raise
@@ -114,6 +131,7 @@ class Workbench:
         commands = [{'cmd': '/' + name, 'desc': self.ns['command_description'](name)}
                     for name in sorted(self.ns['_WEB_COMMAND_MAP'], key=lambda n: (n != 'start', n))]
         return {'settings': settings, 'commands': commands,
+                'conversations': await self.conversations({}),
                 'capabilities': {'tasks': True, 'providers': True, 'skills': True, 'usage': True, 'artifacts': True, 'shared_memory': True},
                 'timezone': self.ns['SelfTriggerManager'].DEFAULT_TIMEZONE,
                 'version': self.ns.get('RUNTIME_CODE_VERSION', self.ns.get('CODE_VERSION', '')),
@@ -124,13 +142,13 @@ class Workbench:
     async def history(self, data):
         db = await self.db()
         conn = await db._get_conn()
-        generation = int(await db.get_config_fresh('attachment_generation', 0))
+        generation = await db.get_attachment_generation()
         limit = _integer(data.get('limit'))
         forward = bool(data.get('after'))
         token = data.get('after') or data.get('before')
         boundary = _unpack(token) if token else None
         reset = {'messages': [], 'ui_generation': generation, 'ui_tombstones': [],
-                 'reset': True, 'next_cursor': None, 'first_cursor': None, 'last_cursor': None}
+                 'conversation_id': current_scope().conversation_id, 'reset': True, 'next_cursor': None, 'first_cursor': None, 'last_cursor': None}
         if boundary and boundary[3] != generation:
             return reset
         query = str(data.get('q') or '').strip()[:200]
@@ -138,8 +156,8 @@ class Workbench:
         if anchor:
             kind, _, key = anchor.partition(':')
             sql = ('SELECT timestamp FROM ui_messages WHERE ui_message_id=? AND generation=?'
-                   if kind == 'ui' else 'SELECT timestamp FROM global_messages WHERE id=?')
-            cur = await conn.execute(sql, (key, generation) if kind == 'ui' else (key,))
+                   if kind == 'ui' else 'SELECT timestamp FROM global_messages WHERE id=? AND session_id=?')
+            cur = await conn.execute(sql, (key, generation) if kind == 'ui' else (key, current_scope().conversation_id))
             row = await cur.fetchone()
             await cur.close()
             if row is None: raise WorkbenchError('消息已不存在', 404)
@@ -157,7 +175,7 @@ class Workbench:
                 table = 'ui_messages' if source else 'global_messages'
                 key_column = 'ui_message_id' if source else 'id'
                 text_column = 'payload' if source else 'content'
-                where, params = (['generation=?'], [generation]) if source else (["msg_type<>?"], [str(self.ns['MessageType'].AGENT_CMD)])
+                where, params = (['generation=?'], [generation]) if source else (["session_id=?", "msg_type<>?"], [current_scope().conversation_id, str(self.ns['MessageType'].AGENT_CMD)])
                 if boundary:
                     ts, boundary_source, key, _ = boundary
                     if source == boundary_source:
@@ -206,11 +224,13 @@ class Workbench:
         found = found[:limit]
         cursor = found[-1]['history_cursor'] if found and more else (_pack(boundary) if more else None)
         if not forward: found.reverse()
-        if int(await db.get_config_fresh('attachment_generation', 0)) != generation: return reset
+        if await db.get_attachment_generation() != generation: return reset
         return {'messages': found, 'next_cursor': cursor,
                 'first_cursor': found[0]['history_cursor'] if found else None,
                 'last_cursor': found[-1]['history_cursor'] if found else None,
-                'ui_generation': generation, 'ui_tombstones': tombstones, 'busy': self.ns['_web_is_busy']()}
+                'conversation_id': current_scope().conversation_id,
+                'ui_generation': generation, 'ui_tombstones': tombstones, 'busy': self.ns['_web_is_busy'](),
+                'running': (await get_conversations().state()).get('running')}
 
     async def search(self, data):
         if not str(data.get('q') or '').strip(): return {'messages': [], 'next_cursor': None}
@@ -220,7 +240,7 @@ class Workbench:
         db = await self.db(); conn = await db._get_conn(); task_id = str(data.get('id') or '')
         if task_id:
             task = await db.get_trigger_task(task_id)
-            if task is None: raise WorkbenchError('任务不存在', 404)
+            if task is None or task['conversation_id'] != current_scope().conversation_id: raise WorkbenchError('任务不存在', 404)
             before = data.get('before')
             boundary = json.loads(before) if before else [time.time()+1, '\uffff']
             if not isinstance(boundary,list) or len(boundary)!=2: raise WorkbenchError('运行记录游标无效')
@@ -234,7 +254,7 @@ class Workbench:
             offset = max(0, int(data.get('offset') or 0))
         except (ValueError, TypeError, OverflowError):
             raise WorkbenchError('任务分页位置无效') from None
-        clauses, params = [], []
+        clauses, params = ['conversation_id=?'], [current_scope().conversation_id]
         if status:
             clauses.append('status=?'); params.append(status)
         if kind == 'condition':
@@ -255,7 +275,7 @@ class Workbench:
         offset = min(offset, max(0, (total - 1) // 50 * 50))
         cur = await conn.execute(f'SELECT * FROM trigger_tasks {condition} ORDER BY created_at DESC, id DESC LIMIT 51 OFFSET ?', (*params, offset))
         rows = [dict(r) for r in await cur.fetchall()]; await cur.close()
-        cur = await conn.execute('SELECT status, COUNT(*) AS count FROM trigger_tasks GROUP BY status')
+        cur = await conn.execute('SELECT status, COUNT(*) AS count FROM trigger_tasks WHERE conversation_id=? GROUP BY status', (current_scope().conversation_id,))
         counts = {r['status']: r['count'] for r in await cur.fetchall()}; await cur.close()
         return {'items': rows[:50], 'offset': offset, 'total': total, 'counts': counts,
                 'next_offset': offset+50 if len(rows)>50 else None,
@@ -268,7 +288,7 @@ class Workbench:
         if not isinstance(fields.get('command'), str) or not fields['command'].strip(): raise WorkbenchError('命令不能为空')
         if 'repeat' in fields and not isinstance(fields['repeat'],bool): raise WorkbenchError('重复监控必须是布尔值')
         if any(not isinstance(v,str) for k,v in fields.items() if k!='repeat'): raise WorkbenchError('任务参数必须是文本')
-        fingerprint = hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest(); db = await self.db()
+        fingerprint = hashlib.sha256(json.dumps({'conversation_id': current_scope().conversation_id, **fields}, sort_keys=True).encode()).hexdigest(); db = await self.db()
         async with self._mutation_lock:
             async with db._transaction() as conn:
                 cur = await conn.execute('SELECT * FROM workbench_requests WHERE request_id=?', (request_id,))
@@ -281,7 +301,7 @@ class Workbench:
             async def perform():
                 try:
                     result = await self.ns['SelfTriggerManager'].register_from_fields(**fields,
-                        chat_id=self.ns['BotConfig'].AUTHORIZED_USER_ID, conversation_id=self.ns['SINGLE_MEMORY_SESSION_ID'])
+                        chat_id=self.ns['BotConfig'].AUTHORIZED_USER_ID, conversation_id=current_scope().conversation_id)
                     response = {'ok': True, 'message': result}
                 except Exception as exc:
                     failure = await self.ns['GlobalRecorder'].record_error(exc, source='task_create')
@@ -295,6 +315,11 @@ class Workbench:
         if data.get('confirm') is not True: raise WorkbenchError('取消任务需要确认')
         ids = data.get('ids')
         if not isinstance(ids, list) or not 1 <= len(ids) <= 100: raise WorkbenchError('请选择 1–100 个任务')
+        db = await self.db()
+        for task_id in ids:
+            task = await db.get_trigger_task(str(task_id))
+            if task is None or task['conversation_id'] != current_scope().conversation_id:
+                raise WorkbenchError('任务不属于当前会话', 404)
         results = [await self.ns['SelfTriggerManager'].cancel(str(task_id)) for task_id in ids]
         return {'ok': True, 'messages': results}
 
@@ -621,12 +646,14 @@ class Workbench:
             await asyncio.sleep(.5); await self.ns['apply_web_config_change']()
         self.background(apply()); return {'ok':True,'requires_login':True}
 
-    async def clear_memory(self,data):
-        if data.get('confirm') != '清空共享记忆': raise WorkbenchError('请输入“清空共享记忆”确认三端共同清空')
-        if self.ns['_web_is_busy'](): raise WorkbenchError('请先停止当前生成再清空',409)
-        async with self.ns['_conversation_processing_lock']:
-            db=await self.db()
-            return {'ok':True,'result':await db.clear_all_conversation_memory()}
+    async def clear_memory(self, data):
+        if data.get('confirm') != '清空当前会话':
+            raise WorkbenchError('请输入“清空当前会话”确认；其他会话不会受影响。')
+        result = await self.ns['clear_current_conversation']()
+        outbox = self.ns['get_web_outbox']()
+        if outbox is not None:
+            outbox.put(stamp_frame({'type': 'history_reset'}))
+        return {'ok': True, 'result': result}
 
     async def artifacts(self,data):
         kind=data.get('kind','files'); q=str(data.get('q') or '').lower()[:200]
@@ -650,8 +677,8 @@ class Workbench:
             return await asyncio.to_thread(scan)
         db=await self.db(); conn=await db._get_conn(); before=int(data.get('before') or 2**63-1)
         search_sql = " AND (instr(lower(content),?)>0 OR instr(lower(COALESCE(metadata,'')),?)>0 OR instr(lower(COALESCE(metadata,'')),?)>0)" if q else ''
-        params = (before,q,q,json.dumps(q,ensure_ascii=True)[1:-1]) if q else (before,)
-        cur=await conn.execute("SELECT * FROM global_messages WHERE id<? AND (metadata LIKE '%attachments%' OR metadata LIKE '%display_media%' OR msg_type IN ('user_file','user_photo','media_reply'))" + search_sql + " ORDER BY id DESC LIMIT 51",params)
+        params = (current_scope().conversation_id,before,q,q,json.dumps(q,ensure_ascii=True)[1:-1]) if q else (current_scope().conversation_id,before,)
+        cur=await conn.execute("SELECT * FROM global_messages WHERE session_id=? AND id<? AND (metadata LIKE '%attachments%' OR metadata LIKE '%display_media%' OR msg_type IN ('user_file','user_photo','media_reply'))" + search_sql + " ORDER BY id DESC LIMIT 51",params)
         rows=[dict(r) for r in await cur.fetchall()]; await cur.close(); items=[]
         for row in rows[:50]:
             message=await asyncio.to_thread(build_history_message,row,self.ns['ArtifactManager'].ROOT_DIR,str(Path(self.ns['AgentExecutor'].WORK_DIR)/'workspace'))
@@ -661,3 +688,14 @@ class Workbench:
                 items.append({**item,'id':f"{row['id']}:{index}",'source_id':row['id'],'timestamp':row['timestamp']})
             if message.get('media_error'): items.append({'id':str(row['id']),'filename':'附件记录','error':message['media_error'],'source_id':row['id']})
         return {'items':items,'next_cursor':rows[49]['id'] if len(rows)>50 else None}
+
+
+    async def conversations(self, data):
+        db = await self.db()
+        return {**await get_conversations().state(), 'items': await db.get_all_sessions()}
+
+    async def conversation_action(self, data):
+        if data['action'] != 'create' and not data.get('id'):
+            raise WorkbenchError('缺少目标会话。', 409)
+        await get_conversations().manage(data['action'], data.get('id'), data.get('name'))
+        return await self.conversations({})

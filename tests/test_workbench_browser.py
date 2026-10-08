@@ -114,7 +114,7 @@ def test_history_is_paged_search_locates_unloaded_messages_and_draft_survives(br
     page.wait_for_timeout(100)
     assert page.locator('#log').inner_text()!=before
     page.locator('#btn-search').click()
-    page.get_by_placeholder('搜索全部共享历史…').fill('历史记录 1234：')
+    page.get_by_placeholder('搜索当前会话历史…').fill('历史记录 1234：')
     page.locator('#wb-dialog .wb-command-result').first.wait_for()
     page.locator('#wb-dialog .wb-command-result').first.click()
     page.wait_for_function('document.querySelector("#log").textContent.includes("历史记录 1234：")')

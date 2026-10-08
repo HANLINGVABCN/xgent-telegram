@@ -161,3 +161,16 @@ No Windows pseudo-terminal fallback is silently enabled.
 `tools/workbench_fixture.py` and `tools/workbench_smoke.py` seed temporary data,
 exercise real workbench read APIs, and capture desktop/tablet/mobile themes
 without starting Telegram, model requests, or background task execution.
+
+
+## Logical conversations
+
+The multi-conversation layer keeps one execution engine and one cross-process
+execution slot. `xgent_app/conversations.py` owns immutable operation scopes,
+selection synchronization and OS locking; `xgent_app/conversation_store.py` owns
+metadata and the idempotent SQLite migration. Existing database methods filter
+conversation data explicitly; global configuration remains shared.
+
+A selection change never mutates an active operation identity. Serialized
+outbound envelopes and trigger records restore that identity at worker/process
+boundaries. See [the Chinese usage and migration guide](multi-conversation.md).

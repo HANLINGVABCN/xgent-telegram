@@ -188,6 +188,9 @@ def _offer(q: "queue.Queue[Optional[Dict[str, Any]]]", item: Optional[Dict[str, 
             pass
 
 
+from xgent_app.conversations import stamp_frame, bind_callback_markup, conversation_labelled_text, defer_completion
+
+
 class WebOutbox:
     """帧广播总线：asyncio 侧生产，N 个 SSE 线程各自消费一份**完整**的帧流。
 
@@ -246,10 +249,12 @@ class WebOutbox:
         """非阻塞广播给当前所有订阅者。"""
         if self._closed.is_set():
             return
-        saved = copy.deepcopy(frame)
+        saved = copy.deepcopy(stamp_frame(frame))
+        if defer_completion(saved, lambda: self.put(saved)):
+            return
         size = len(json.dumps(saved, ensure_ascii=False).encode('utf-8'))
         with self._lock:
-            if saved.get('type') == 'history_reset':
+            if saved.get('type') == 'history_reset' and not saved.get('conversation_id'):
                 self._events.clear()
                 self._inflight.clear()
                 self._inflight_bytes = 0
@@ -270,7 +275,7 @@ class WebOutbox:
 
     @staticmethod
     def _has_stop_button(frame):
-        return any((button.get('callback_action') or button.get('callback_data')) == 'act_stop_generation'
+        return any(str(button.get('callback_action') or button.get('callback_data') or '').split(':', 1)[0] == 'act_stop_generation'
                    for row in (frame.get('reply_markup') or []) for button in row)
 
     def _track_inflight(self, frame):
@@ -280,12 +285,19 @@ class WebOutbox:
         view; their durable counterpart is served by display history.
         """
         kind = frame.get('type')
-        if kind in {'turn_end', 'turn_error', 'generation_end'}:
-            self._inflight.clear(); self._inflight_bytes = 0
+        if kind in {'turn_end', 'turn_error', 'generation_end', 'history_reset'}:
+            cid, run_id = frame.get('conversation_id'), frame.get('run_id')
+            for key, (saved, size) in list(self._inflight.items()):
+                if (not cid or saved.get('conversation_id') == cid) and (
+                    kind == 'history_reset' or saved.get('run_id') == run_id
+                ):
+                    self._inflight.pop(key, None)
+                    self._inflight_bytes -= size
             return
         key = frame.get('message_id')
         if key is None or kind not in {'message', 'edit', 'edit_markup', 'delete'}:
             return
+        key = (frame.get('conversation_id'), frame.get('run_id'), key)
         previous = self._inflight.pop(key, None)
         if previous:
             self._inflight_bytes -= previous[1]
@@ -302,10 +314,11 @@ class WebOutbox:
         while self._inflight and (len(self._inflight)>64 or self._inflight_bytes>8*1024*1024):
             self._inflight_bytes -= self._inflight.popitem(last=False)[1][1]
 
-    def snapshot(self):
+    def snapshot(self, conversation_id=None):
         with self._lock:
             return {'epoch': self._epoch, 'cursor': self._sequence,
-                    'frames': [copy.deepcopy(frame) for frame, _ in self._inflight.values()]}
+                    'frames': [copy.deepcopy(frame) for frame, _ in self._inflight.values()
+                               if conversation_id is None or frame.get('conversation_id') == conversation_id]}
 
     def read_events(self, after: Optional[int] = None, epoch: str = '',
                     limit: int = 100, wait_seconds: float = 0) -> Dict[str, Any]:
@@ -424,6 +437,7 @@ def _markup_to_frame(reply_markup: Any) -> Optional[List[List[Dict[str, Any]]]]:
     """
     if reply_markup is None:
         return None
+    reply_markup = bind_callback_markup(reply_markup)
     keyboard = getattr(reply_markup, "inline_keyboard", None)
     if not keyboard:
         return None
@@ -698,7 +712,15 @@ async def deliver_op_to_bot(bot: Any, op: Op, native_id: Optional[int], *,
         if fn is None:
             # 垫片 bot 少一个方法不是网络故障，不该把整条通道判成断线。
             raise OpNotDeliverable(f"bot 没有方法 {name}")
-        return fn
+        if name not in {'send_message', 'edit_message_text', 'send_document', 'send_photo'} or getattr(fn, '_xgent_native_labelled', False):
+            return fn
+        async def native_call(*args, **kwargs):
+            if 'text' in kwargs:
+                kwargs['text'] = conversation_labelled_text(kwargs['text'], kwargs.get('parse_mode'))
+            if 'caption' in kwargs:
+                kwargs['caption'] = conversation_labelled_text(kwargs['caption'], kwargs.get('parse_mode'), limit=1024)
+            return await fn(*args, **kwargs)
+        return native_call
 
     try:
         if kind == OP_SEND:
@@ -966,10 +988,13 @@ class MirrorBot:
 
     @staticmethod
     def _passthrough(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        return {
+        result = {
             name: kwargs[name] for name in _PASSTHROUGH_KWARGS
             if isinstance(kwargs.get(name), (int, float))
         }
+        if isinstance(kwargs.get('disable_notification'), bool):
+            result['disable_notification'] = kwargs['disable_notification']
+        return result
 
     async def send_message(self, chat_id: Optional[int] = None, text: str = "",
                            reply_markup: Any = None, parse_mode: Any = None,
@@ -1306,9 +1331,23 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
             return str(args[0])
         return ""
 
+    def native_arguments(args, kwargs, *, send=False):
+        native = dict(kwargs)
+        positional = list(args)
+        if 'text' in native:
+            native['text'] = conversation_labelled_text(native['text'], native.get('parse_mode'))
+        else:
+            index = 1 if send else 0
+            if len(positional) > index:
+                positional[index] = conversation_labelled_text(positional[index], native.get('parse_mode'))
+        return positional, native
+
     # send_message
     async def send_message(*args: Any, **kwargs: Any) -> Any:
-        result = await saved["send_message"](real_bot, *args, **kwargs)
+        if 'reply_markup' in kwargs:
+            kwargs['reply_markup'] = bind_callback_markup(kwargs['reply_markup'])
+        native_args, native_kwargs = native_arguments(args, kwargs, send=True)
+        result = await saved["send_message"](real_bot, *native_args, **native_kwargs)
         try:
             await emit_ui_frame(outbox, int(getattr(result, 'chat_id', None) or kwargs.get('chat_id')
                                            or (args[0] if args else 0)),
@@ -1319,11 +1358,15 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
         except Exception:  # noqa: BLE001
             pass
         return result
+    send_message._xgent_native_labelled = True
     _patch("send_message", send_message)
 
     # edit_message_text(text, chat_id=None, message_id=None, ...)
     async def edit_message_text(*args: Any, **kwargs: Any) -> Any:
-        result = await saved["edit_message_text"](real_bot, *args, **kwargs)
+        if 'reply_markup' in kwargs:
+            kwargs['reply_markup'] = bind_callback_markup(kwargs['reply_markup'])
+        native_args, native_kwargs = native_arguments(args, kwargs)
+        result = await saved["edit_message_text"](real_bot, *native_args, **native_kwargs)
         try:
             mid = kwargs.get("message_id")
             if mid is None and len(args) >= 3:
@@ -1336,10 +1379,13 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
         except Exception:  # noqa: BLE001
             pass
         return result
+    edit_message_text._xgent_native_labelled = True
     _patch("edit_message_text", edit_message_text)
 
     # edit_message_reply_markup
     async def edit_message_reply_markup(*args: Any, **kwargs: Any) -> Any:
+        if 'reply_markup' in kwargs:
+            kwargs['reply_markup'] = bind_callback_markup(kwargs['reply_markup'])
         result = await saved["edit_message_reply_markup"](real_bot, *args, **kwargs)
         try:
             mid = kwargs.get("message_id")

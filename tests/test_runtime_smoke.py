@@ -303,7 +303,7 @@ async def main():
                              "default_model": "model-new"})).encode("utf-8"))
     await bot.apply_provider_config_import(providers, defaults, mode='replace')
     session = await db.get_session(bot.SINGLE_MEMORY_SESSION_ID)
-    replace_synced = session['model'] == 'model-new'
+    replace_synced = session['model'] is None and bot.UserDataManager.get('default_model') == 'model-new'
 
     # replace 导入但 defaults 的模型无效 → 会话绑定清空，不留悬空引用
     await db.create_session(bot.SINGLE_MEMORY_SESSION_ID, 'model-old')
@@ -321,12 +321,12 @@ async def main():
                              "default_model": "model-new"})).encode("utf-8"))
     await bot.apply_provider_config_import(providers, defaults, mode='merge')
     session = await db.get_session(bot.SINGLE_MEMORY_SESSION_ID)
-    merge_synced = session['model'] == 'model-new'
+    merge_synced = session['model'] is None and bot.UserDataManager.get('default_model') == 'model-new'
 
     # Web 设置 chat_model：会话绑定同步
     await bot._web_write_setting('chat_model', 'newprov|model-new')
     session = await db.get_session(bot.SINGLE_MEMORY_SESSION_ID)
-    web_synced = session['model'] == 'model-new'
+    web_synced = session['model'] is None and bot.UserDataManager.get('default_model') == 'model-new'
 
     # merge 导入覆盖同名提供商、新模型列表不含当前模型、defaults 为空：
     # 悬空的全局选择连同会话绑定必须一起清掉，并在结果里汇报。这是上一轮
@@ -378,11 +378,11 @@ asyncio.run(main())
 ''')
         data = json.loads(output.strip().splitlines()[-1])
         self.assertTrue(data["replace_synced"],
-                        "replace 导入恢复默认模型后，会话绑定必须同步成新模型")
+                        "replace 导入恢复默认模型后，各会话必须使用新的全局默认模型，不保留独立覆盖")
         self.assertTrue(data["replace_invalid_cleared"],
                         "replace 导入删掉旧提供商后，悬空的会话绑定必须清空")
         self.assertTrue(data["merge_synced"],
-                        "merge 导入恢复默认模型后，会话绑定必须同步成新模型")
+                        "merge 导入恢复默认模型后，各会话必须使用新的全局默认模型，不保留独立覆盖")
         self.assertTrue(data["web_synced"],
                         "Web 设置 chat_model 后，会话绑定必须同步")
         self.assertTrue(data["merge_dangling_cleared"],

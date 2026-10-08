@@ -9,13 +9,13 @@ import asyncio
 from xgent_app.workbench import Workbench
 async def run():
     w=Workbench(ns);db=await w.db();conn=await db._get_conn()
-    await conn.executemany("INSERT INTO global_messages(chat_id,user_id,msg_type,role,content,timestamp) VALUES(1,1,'user_text','user',?,100)",[(f'message {i}',) for i in range(10000)])
+    await conn.executemany("INSERT INTO global_messages(chat_id,user_id,msg_type,role,content,timestamp,session_id) VALUES(1,1,'user_text','user',?,100,'global_memory')",[(f'message {i}',) for i in range(10000)])
     page=await w.history({'limit':50}); first=[m['id'] for m in page['messages']]
     second=await w.history({'limit':50,'before':page['next_cursor']})
     forward=await w.history({'after':second['last_cursor']})
     search=await w.search({'q':'message 9876'})
     location=await w.history({'anchor':search['messages'][0]['history_key']})
-    await db.set_config('attachment_generation',1)
+    await db.clear_all_conversation_memory()
     reset=await w.history({'before':page['next_cursor']})
     print(json.dumps({'first':len(first),'max':max(first),'second':len(second['messages']),
           'forward':[m['id'] for m in forward['messages']]==first,
@@ -112,7 +112,7 @@ import asyncio,time
 from xgent_app.workbench import Workbench,WorkbenchError
 async def run():
     await ns['UserDataManager'].init();w=Workbench(ns);db=await w.db();conn=await db._get_conn()
-    await conn.executemany("INSERT INTO global_messages(chat_id,user_id,msg_type,role,content,timestamp) VALUES(1,1,'user_text','user',?,100)",[(str(i),) for i in range(260)])
+    await conn.executemany("INSERT INTO global_messages(chat_id,user_id,msg_type,role,content,timestamp,session_id) VALUES(1,1,'user_text','user',?,100,'global_memory')",[(str(i),) for i in range(260)])
     for i in range(160):
         await conn.execute("INSERT INTO ui_messages(ui_message_id,source,chat_id,message_id,generation,revision,timestamp,payload) VALUES(?, 'test',1,?,0,1,100,?)",(f'{i:032x}',i,json.dumps({'content':'menu '+str(i)})))
     cursor=None;ids=[]
