@@ -200,14 +200,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             self.wfile.write(body)
 
-    def _read_json(self) -> Optional[Dict[str, Any]]:
+    def _read_json(self, max_bytes: int = MAX_REQUEST_BODY) -> Optional[Dict[str, Any]]:
         """读请求体。超限或格式错误时直接回错误响应并返回 None。"""
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except (TypeError, ValueError):
             self._send_json({"error": "bad content-length"}, status=400)
             return None
-        if length < 0 or length > MAX_REQUEST_BODY:
+        if length < 0 or length > max_bytes:
             self._send_json({"error": "请求体过大"}, status=413)
             return None
         raw = self.rfile.read(length) if length else b""
@@ -451,7 +451,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     # --- 处理器 ---
 
     def _serve_workbench_asset(self, path: str) -> None:
-        allowed = {"appearance.js", "reading.css", "chat.js", "chat.css", "conversations.js", "conversations.css", "workbench.js", "workbench.css", "components.js", "page-cache.js", "settings.js", "usage.js", "terminal.js", "terminal.css"}
+        allowed = {"knowledge.js", "knowledge.css", "appearance.js", "reading.css", "chat.js", "chat.css", "conversations.js", "conversations.css", "workbench.js", "workbench.css", "components.js", "page-cache.js", "settings.js", "usage.js", "terminal.js", "terminal.css"}
         name = path.removeprefix("/assets/")
         if name not in allowed:
             self._send_json({"error": "not found"}, status=404)
@@ -476,7 +476,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def _handle_workbench(self, method: str, resource: str) -> None:
         if not self._require_auth() or not self._require_web_enabled(): return
-        data = self._read_json() if method == 'POST' else {
+        from xgent_app.knowledge import MAX_DOCUMENT_BYTES
+        # JSON can expand control characters sixfold; document bytes are checked again by the store.
+        maximum = MAX_DOCUMENT_BYTES * 6 + 4096 if resource in {'skills/update','memories/update'} else MAX_REQUEST_BODY
+        data = self._read_json(maximum) if method == 'POST' else {
             k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).items()}
         if data is None: return
         if not isinstance(data, dict):

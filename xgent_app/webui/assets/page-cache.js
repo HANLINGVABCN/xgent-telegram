@@ -41,7 +41,7 @@ export function affectedPages(path,key) {
     return /\/(fetch|export)$/.test(path)?[]:['models','settings','usage'];
   }
   if(path.startsWith('/api/workbench/tasks/'))return ['tasks','files','usage'];
-  if(path==='/api/workbench/skills/state')return ['models','settings'];
+  if(path.startsWith('/api/workbench/skills/')||path.startsWith('/api/workbench/memories/'))return ['models','settings'];
   if(path==='/api/workbench/memory/clear')return ['tasks','files','usage','settings'];
   if(path==='/api/workbench/settings') {
     if(['model_price_table','model_merge_map','stats_auto_merge','stats_metric'].includes(key))return ['settings','usage'];

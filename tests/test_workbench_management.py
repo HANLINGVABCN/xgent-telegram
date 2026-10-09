@@ -34,8 +34,8 @@ def test_skill_controls_are_outside_details_and_filters_do_not_fetch(browser_con
     expect(search).to_have_value('代码')
     expect(page.get_by_label('技能状态筛选')).to_have_value('hidden')
     expect(card).to_be_visible()
-    card.get_by_role('button',name='查看说明',exact=True).click()
-    expect(page.locator('#wb-detail .wb-pre')).to_contain_text('检查实际缺陷')
+    card.get_by_role('button',name='管理',exact=True).click()
+    expect(page.locator('#wb-detail .knowledge-editor-content')).to_contain_text('检查实际缺陷')
     assert page.locator('#wb-detail').get_by_role('button',name='保存状态').count()==0
     page.keyboard.press('Escape')
     card.get_by_role('button',name='启用',exact=True).click()

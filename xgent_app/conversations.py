@@ -100,7 +100,7 @@ def replay_conversation(snapshot):
 
 def stamp_frame(frame: dict) -> dict:
     scope = current_scope(required=False)
-    if scope is None or frame.get('type') in {'conversation_state', 'settings_state'}:
+    if scope is None or frame.get('type') in {'conversation_state', 'settings_state', 'knowledge_state'}:
         return dict(frame)
     return {'conversation_id': scope.conversation_id, 'generation': scope.generation,
             'run_id': scope.run_id, 'conversation_name': scope.name, **frame}

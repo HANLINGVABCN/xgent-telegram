@@ -168,7 +168,7 @@ def test_mobile_drawer_keyboard_backdrop_and_resize(conversation_page, tmp_path)
     page.evaluate('document.body.classList.add("dark")')
     page.wait_for_timeout(250)
     assert page.locator('#wb-nav').is_hidden()
-    toggle = page.get_by_role('button', name='查看对话列表', exact=True)
+    toggle = page.get_by_role('button', name='对话记录', exact=True)
     toggle.click()
     drawer = page.get_by_role('dialog', name='对话与工作台', exact=True)
     assert drawer.is_visible()
@@ -289,7 +289,7 @@ def test_long_title_and_dialog_fit_both_themes(browser_context, workspace_url, w
     for dark in (False, True):
         page.evaluate('(dark)=>document.body.classList.toggle("dark",dark)', dark)
         page.wait_for_timeout(220)
-        if width < 768: page.get_by_role('button', name='查看对话列表', exact=True).click()
+        if width < 768: page.get_by_role('button', name='对话记录', exact=True).click()
         row(page, target).locator('.conv-more').click()
         box = page.locator('#conversation-item-menu').bounding_box()
         assert box['x'] >= 0 and box['x'] + box['width'] <= width + 1

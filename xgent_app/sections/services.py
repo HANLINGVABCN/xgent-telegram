@@ -1194,12 +1194,16 @@ def get_skill_state(path: str) -> str:
 
 
 async def save_skill_state(path: str, state: str) -> None:
-    if path not in list_skill_files():
-        raise ValueError('技能文件已不存在，请重新打开技能菜单。')
+    from xgent_app.knowledge import document_operation
     db = await BotMemoryDB.get_instance()
-    values = await db.set_skill_state(path, state)
-    for key, items in values.items():
-        UserDataManager.set(key, items)
+    async with document_operation(db.db_path):
+        if path not in list_skill_files():
+            raise ValueError('技能文件已不存在，请重新打开技能菜单。')
+        values = await db.set_skill_state(path, state)
+        for key, items in values.items():
+            UserDataManager.set(key, items)
+    if '_sync_knowledge_state' in globals():
+        await _sync_knowledge_state(db, force=True)
 
 def build_absolute_path_prompt_section() -> str:
     project_root = to_display_path(os.path.dirname(os.path.abspath(__file__)))
@@ -2296,6 +2300,7 @@ async def _conversation_maintenance():
     db = await BotMemoryDB.get_instance()
     if '_sync_web_appearance' in globals():
         await _sync_web_appearance(db)
+    await _sync_knowledge_state(db)
     for cid in await db.pending_conversation_deletions():
         previous = _conversation_delete_tasks.get(cid)
         if previous is not None and not previous.done():
@@ -2330,3 +2335,21 @@ async def reset_conversation_context(cid):
     return result
 
 get_conversations().maintenance = _conversation_maintenance
+
+
+_knowledge_seen_revision = None
+
+async def _sync_knowledge_state(db, force=False):
+    global _knowledge_seen_revision
+    from xgent_app.knowledge import read_knowledge_state
+    snapshot = await read_knowledge_state(db)
+    revision = snapshot['revision']
+    if not force and revision == _knowledge_seen_revision:
+        return
+    _knowledge_seen_revision = revision
+    for key in ('disabled_skills','hidden_skills'):
+        UserDataManager.set(key, snapshot[key])
+    frame = {'type':'knowledge_state', 'revision':revision}
+    for outbox in dict.fromkeys((get_web_outbox(),globals().get('_web_external_outbox'))):
+        if outbox is not None:
+            outbox.put(frame)

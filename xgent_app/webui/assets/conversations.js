@@ -407,11 +407,11 @@ $('conversation-rename-form').addEventListener('submit', async event => {
 
 function setDrawer(open, restoreFocus = true) {
   open = !!open && mobile.matches;
-  if (open === drawerOpen) return;
+  if (open === drawerOpen) { syncConversationToggle(); return; }
   drawerOpen = open;
   document.body.classList.toggle('conv-drawer-open', open);
   $('conversation-backdrop').hidden = !open;
-  $('conversation-drawer-toggle').setAttribute('aria-expanded', String(open));
+  syncConversationToggle();
   const shell = $('wb-shell'), bottom = $('wb-mobile-nav');
   if (open) {
     drawerReturn = document.activeElement;
@@ -426,7 +426,10 @@ function setDrawer(open, restoreFocus = true) {
   }
 }
 $('conversation-new').addEventListener('click', createConversation);
-$('conversation-drawer-toggle').addEventListener('click', () => setDrawer(true));
+$('conversation-drawer-toggle').addEventListener('click', () => {
+  if(mobile.matches)setDrawer(!drawerOpen);
+  else {const collapsed=document.body.classList.toggle('conv-sidebar-collapsed');try{localStorage.setItem('xgent-conversation-sidebar-collapsed',collapsed?'1':'0');}catch{}syncConversationToggle();}
+});
 $('conversation-drawer-close').addEventListener('click', () => setDrawer(false));
 $('conversation-backdrop').addEventListener('click', () => setDrawer(false));
 $('conversation-archive-view').addEventListener('click', () => setView(view === 'archived' ? 'recent' : 'archived'));
@@ -498,3 +501,10 @@ window.addEventListener('xgent-auth-expired', () => {
 api('/api/session').then(data => { if (data.authenticated) start(); }).catch(() => {});
 setInterval(() => { if (authenticated && !document.hidden) refresh(); }, 3000);
 document.addEventListener('visibilitychange', () => { if (authenticated && !document.hidden) refresh(); });
+
+function syncConversationToggle(){
+  $('conversation-drawer-toggle').setAttribute('aria-expanded',String(mobile.matches?drawerOpen:!document.body.classList.contains('conv-sidebar-collapsed')));
+}
+try{document.body.classList.toggle('conv-sidebar-collapsed',localStorage.getItem('xgent-conversation-sidebar-collapsed')==='1');}catch{}
+syncConversationToggle();
+mobile.addEventListener('change',syncConversationToggle);

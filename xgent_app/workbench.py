@@ -1,5 +1,7 @@
 """Application-facing workbench service; HTTP delegates here, not a second agent engine."""
 from __future__ import annotations
+import contextlib
+from xgent_app.knowledge import KnowledgeDocuments, DocumentError, document_operation, compose_skill_text, bump_knowledge_revision, update_skill_references, read_knowledge_state
 import asyncio
 import base64
 from collections import defaultdict
@@ -72,7 +74,7 @@ class Workbench:
         return task
 
     async def handle(self, method, resource, data):
-        navigation = resource == 'conversations' or resource.startswith('conversations/') or resource in {'tasks','tasks/cancel'}
+        navigation = resource == 'conversations' or resource.startswith('conversations/') or resource in {'tasks','tasks/cancel','skills','memories'} or resource.startswith(('skills/','memories/'))
         cid = None if navigation else data.get('conversation_id')
         if method != 'GET' and resource in {'memory/clear','tasks/create'} and not cid:
             raise WorkbenchError('缺少目标会话，请刷新后重试。', 409)
@@ -85,12 +87,12 @@ class Workbench:
     async def _handle_scoped(self, method, resource, data):
         await self.db()
         if method == 'GET':
-            operations = {'conversations': self.conversations, 'conversations/delete_info': self.conversation_delete_info, 'bootstrap': self.bootstrap, 'history': self.history, 'search': self.search,
+            operations = {'conversations': self.conversations, 'conversations/delete_info': self.conversation_delete_info, 'conversations/search': self.search_conversations, 'bootstrap': self.bootstrap, 'history': self.history, 'search': self.search,
                           'tasks': self.tasks, 'artifacts': self.artifacts, 'providers': self.providers,
-                          'skills': self.skills, 'usage': self.usage, 'usage/records': self.usage_records,
+                          'skills': self.skills, 'memories': self.memories, 'usage': self.usage, 'usage/records': self.usage_records,
                           'artifacts/preview': self.artifact_preview, 'settings': self.read_settings}
         else:
-            operations = {**{f'conversations/{action}': self.conversation_action for action in ('create','switch','rename','archive','restore','reset_context','delete')},
+            operations = {**{f'{kind}/{action}': self.document_action for kind in ('skills','memories') for action in ('create','update','rename','delete')}, **{f'conversations/{action}': self.conversation_action for action in ('create','switch','rename','archive','restore','reset_context','delete')},
                           'tasks/create': self.create_task, 'tasks/cancel': self.cancel_tasks,
                           'providers/save': self.save_provider, 'providers/delete': self.delete_provider,
                           'providers/fetch': self.fetch_models, 'providers/select': self.select_model,
@@ -102,6 +104,9 @@ class Workbench:
         try:
             if resource.startswith('conversations/'):
                 data = {**data, 'action': resource.split('/', 1)[1]}
+            if resource.startswith(('skills/','memories/')) and resource != 'skills/state':
+                kind, action = resource.split('/',1)
+                data = {**data, 'kind':kind, 'action':action}
             return await operation(data)
         except asyncio.CancelledError:
             raise
@@ -111,7 +116,7 @@ class Workbench:
                 if isinstance(data.get(key), str) and (key != 'repeat' or resource == 'password'):
                     self.ns['register_runtime_secret'](str(data.get(key) or ''))
             failure = await self.ns['GlobalRecorder'].record_error(exc, source='workbench')
-            status = exc.status if isinstance(exc, WorkbenchError) else (400 if isinstance(exc, (ValueError, TypeError)) else 500)
+            status = exc.status if isinstance(exc, (WorkbenchError, DocumentError)) else (400 if isinstance(exc, (ValueError, TypeError)) else 500)
             raise WorkbenchError(failure, status) from None
 
     async def bootstrap(self, data):
@@ -453,18 +458,112 @@ class Workbench:
         await db.import_providers(result,replace=False); await self.refresh_providers(list(result))
         return {'ok':True,'count':len(result)}
 
-    async def skills(self,data):
-        files=self.ns['list_skill_files'](); selected=str(data.get('path') or '')
+    def _documents(self):
+        return KnowledgeDocuments(self.ns)
+
+    async def _refresh_skill_state(self):
+        db = await self.db()
+        snapshot = await read_knowledge_state(db)
+        for key in ('disabled_skills','hidden_skills'):
+            self.ns['UserDataManager'].set(key, snapshot[key])
+
+    def _skill_record(self, record):
+        return {**record, 'state': self.ns['get_skill_state'](record['path'])}
+
+    async def skills(self, data):
+        await self._refresh_skill_state()
+        selected = str(data.get('path') or '')
+        store = self._documents()
         if selected:
-            if selected not in files: raise WorkbenchError('技能不存在',404)
-            text=await asyncio.to_thread(self.ns['read_skill_text'],self.ns['resolve_skill_abs_path'](selected))
-            return {'path':selected,'state':self.ns['get_skill_state'](selected),'content':text}
-        return {'items':[{'path':p,'name':Path(p).stem,'state':self.ns['get_skill_state'](p), 'source':'private' if p.startswith('private/') else 'public'} for p in files]}
+            return self._skill_record(await asyncio.to_thread(store.read, 'skills', selected))
+        return {'items':[self._skill_record(item) for item in await asyncio.to_thread(store.list, 'skills')]}
+
+    async def memories(self, data):
+        store = self._documents()
+        selected = str(data.get('path') or '')
+        if selected:
+            return await asyncio.to_thread(store.read, 'memories', selected)
+        return {'items':await asyncio.to_thread(store.list, 'memories'), 'shared':True}
+
+    async def document_action(self, data):
+        db = await self.db()
+        kind, action = data['kind'], data['action']
+        store = self._documents()
+        logical, revision = data.get('path'), data.get('revision')
+        warning = None
+        async with document_operation(db.db_path):
+            if action == 'create':
+                item = await asyncio.to_thread(store.create, kind)
+                try:
+                    if kind == 'skills':
+                        await self.ns['save_skill_state'](item['path'], 'disabled')
+                except Exception:
+                    ticket = await asyncio.to_thread(store.stage_delete, kind, item['path'], item['revision'])
+                    await asyncio.to_thread(store.finish_delete, ticket)
+                    raise
+            elif action == 'update':
+                content = (compose_skill_text(data.get('summary'), data.get('body'))
+                           if kind == 'skills' and data.get('mode') == 'sections' else data.get('content'))
+                item = await asyncio.to_thread(store.write, kind, logical, revision, content)
+            elif action == 'rename':
+                _, old_file, _, new_logical = await asyncio.to_thread(store.rename_target, kind, logical, revision, data.get('name'))
+                if new_logical == logical:
+                    item = await asyncio.to_thread(store.read, kind, logical)
+                else:
+                    if kind == 'skills':
+                        # Prime the destination state before exposing its filename.
+                        await update_skill_references(db, logical, new_logical, keep_old=True)
+                        await self._refresh_skill_state()
+                    renamed = None
+                    try:
+                        renamed = await asyncio.to_thread(store.rename, kind, logical, revision, data.get('name'))
+                        if kind == 'skills':
+                            await update_skill_references(db, logical)
+                        item = renamed
+                    except Exception:
+                        rolled_back = renamed is None
+                        if renamed is not None:
+                            try:
+                                await asyncio.to_thread(store.rename, kind, renamed['path'], renamed['revision'], old_file.name)
+                                rolled_back = True
+                            except Exception:
+                                pass  # Never overwrite an externally-created file to roll back.
+                        if kind == 'skills' and rolled_back:
+                            with contextlib.suppress(Exception):
+                                await update_skill_references(db, new_logical)
+                        raise
+            elif action == 'delete':
+                if data.get('confirm') is not True:
+                    raise WorkbenchError('请确认删除这份文档。')
+                ticket = await asyncio.to_thread(store.stage_delete, kind, logical, revision)
+                try:
+                    if kind == 'skills':
+                        await update_skill_references(db, logical)
+                except Exception:
+                    await asyncio.to_thread(store.finish_delete, ticket, rollback=True)
+                    raise
+                try:
+                    await asyncio.to_thread(store.finish_delete, ticket)
+                except OSError:
+                    warning = '文档已从列表移除，但临时文件清理失败；请检查文件权限。'
+                item = None
+            else:
+                raise WorkbenchError('未知文档操作。')
+            async with db._transaction() as conn:
+                version = await bump_knowledge_revision(conn)
+            await self._refresh_skill_state()
+        notify = self.ns.get('_sync_knowledge_state')
+        if notify is not None:
+            await notify(db, force=True)
+        return {'ok':True, 'item':self._skill_record(item) if item is not None and kind=='skills' else item,
+                'knowledge_revision':version, 'warning':warning}
 
     async def skill_state(self,data):
-        path=str(data.get('path') or ''); state=data.get('state')
-        if path not in self.ns['list_skill_files']() or state not in ('enabled','disabled','hidden'): raise WorkbenchError('技能或状态无效')
-        await self.ns['save_skill_state'](path,state); return {'ok':True}
+        logical=str(data.get('path') or ''); state=data.get('state')
+        if logical not in self.ns['list_skill_files']() or state not in ('enabled','disabled','hidden'):
+            raise WorkbenchError('技能或状态无效')
+        await self.ns['save_skill_state'](logical,state)
+        return {'ok':True}
 
     async def usage(self, data):
         start, end = await self.usage_range(data)
@@ -731,3 +830,24 @@ class Workbench:
     async def conversation_delete_info(self, data):
         db = await self.db()
         return await db.conversation_delete_info(str(data.get('id') or ''))
+
+    async def search_conversations(self, data):
+        query = str(data.get('q') or '').strip()[:200]
+        db = await self.db(); conn = await db._get_conn()
+        # Search is a management read, never a cross-conversation model context.
+        sql = """SELECT s.id,s.name,s.archived,s.last_active,
+            (SELECT substr(m.content, max(1,instr(lower(m.content),lower(?))-40),180)
+             FROM global_messages m WHERE m.session_id=s.id AND ?<>''
+             AND m.msg_type IN ('user_text','ai_reply','user_file','user_photo','media_reply')
+             AND instr(lower(m.content),lower(?))>0 ORDER BY m.timestamp DESC,m.id DESC LIMIT 1) snippet
+            FROM chat_sessions s WHERE s.deleting=0 AND (?='' OR instr(lower(s.name),lower(?))>0 OR EXISTS
+              (SELECT 1 FROM global_messages m WHERE m.session_id=s.id
+               AND m.msg_type IN ('user_text','ai_reply','user_file','user_photo','media_reply')
+               AND instr(lower(m.content),lower(?))>0))
+            ORDER BY s.last_active DESC,s.id LIMIT 30"""
+        cursor = await conn.execute(sql, (query,)*6)
+        items = [dict(row) for row in await cursor.fetchall()]
+        await cursor.close()
+        for item in items:
+            item['snippet'] = ' '.join((item['snippet'] or '').split())
+        return {'items':items}

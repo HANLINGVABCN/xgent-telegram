@@ -1526,10 +1526,13 @@ class BotMemoryDB(ConversationStore):
         # 先落库再更新缓存：反过来的话写库失败会让缓存与 DB 一直不一致，
         # 直到进程重启为止。
         json_value = json.dumps(value)
-        async with self._write() as conn:
+        async with (self._transaction() if key in {'disabled_skills','hidden_skills'} else self._write()) as conn:
             await conn.execute('''
                 INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)
             ''', (key, json_value))
+            if key in {'disabled_skills','hidden_skills'}:
+                from xgent_app.knowledge import bump_knowledge_revision
+                await bump_knowledge_revision(conn)
         self._config_cache[key] = value
 
     async def set_skill_state(self, path: str, state: str) -> Dict[str, List[str]]:
@@ -1550,6 +1553,8 @@ class BotMemoryDB(ConversationStore):
                     values['disabled_skills'].add(path)
                 else:
                     values['disabled_skills'].discard(path)
+            from xgent_app.knowledge import bump_knowledge_revision
+            await bump_knowledge_revision(conn)
             values = {key: sorted(items) for key, items in values.items()}
             await conn.executemany(
                 'INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)',

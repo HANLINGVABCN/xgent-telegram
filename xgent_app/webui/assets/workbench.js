@@ -70,9 +70,9 @@ function closeDialog(){if(state.submitting&&state.dirty)return;if(state.dirty&&!
 function dialog(title,content){state.dialogReturn=document.activeElement;$('wb-dialog-title').textContent=title;$('wb-dialog-body').replaceChildren(content);$('wb-dialog').showModal();requestAnimationFrame(()=>content.querySelector('input,select,textarea,button')?.focus());}
 $('wb-dialog-close').onclick=closeDialog;$('wb-dialog').addEventListener('cancel',e=>{e.preventDefault();closeDialog();});
 async function confirmAction(title,explanation,fn,phrase,after){const form=el('form',{},el('p',{class:'wb-note'},explanation));if(phrase)form.append(field(`输入「${phrase}」以确认`,'phrase'));form.append(actions(button('取消',closeDialog),el('button',{class:'wb-btn danger',type:'submit'},'确认操作')));form.onsubmit=e=>{e.preventDefault();submit(form,async data=>{if(phrase&&data.phrase!==phrase)throw new Error('确认文字不匹配');await fn();state.dirty=false;closeDialog();if(after)await after();else await render();});};dialog(title,form);}
-function detail(title,content){state.detailReturn=document.activeElement;state.detailRequest?.abort();state.detailRequest=new AbortController();$('wb-detail-title').textContent=title;$('wb-detail-body').replaceChildren(content);$('wb-detail').hidden=false;$('wb-detail').setAttribute('role',innerWidth<1200?'dialog':'complementary');$('wb-detail').setAttribute('aria-modal',String(innerWidth<1200));if(innerWidth<1200)$('wb-shell').inert=true;document.body.classList.add('wb-detail-open');$('wb-detail-close').focus();}
-function closeDetail(){state.detailRequest?.abort();$('wb-detail').hidden=true;$('wb-shell').inert=false;document.body.classList.remove('wb-detail-open');state.detailReturn?.focus();}
-$('wb-detail-close').onclick=closeDetail;
+function detail(title,content){if(!$('wb-detail').hidden&&!closeDetail())return false;state.detailReturn=document.activeElement;state.detailRequest?.abort();state.detailRequest=new AbortController();state.detailDirty=false;state.detailDocument=null;$('wb-detail-title').textContent=title;$('wb-detail-body').replaceChildren(content);$('wb-detail').hidden=false;$('wb-detail').setAttribute('role',innerWidth<1200?'dialog':'complementary');$('wb-detail').setAttribute('aria-modal',String(innerWidth<1200));if(innerWidth<1200)$('wb-shell').inert=true;document.body.classList.add('wb-detail-open');$('wb-detail-close').focus();return true;}
+function closeDetail(force=false){if(!force&&state.detailSaving)return false;if(!force&&state.detailDirty&&!confirm('文档有未保存修改，确定放弃？'))return false;state.detailDirty=false;state.detailDocument=null;state.detailRequest?.abort();$('wb-detail').hidden=true;$('wb-shell').inert=false;document.body.classList.remove('wb-detail-open');state.detailReturn?.focus();return true;}
+$('wb-detail-close').onclick=()=>closeDetail();
 function errorOr(node,fn){return async()=>{try{await fn();}catch(e){showError(node,e);}};}
 async function outputViewer(path,title='输出存档',onBack){let current=0,previous=[];const area=el('div');detail(title,area);const signal=state.detailRequest.signal;async function load(offset,back){area.replaceChildren(message('正在读取存档…','loading'));try{const page=await api('/api/output/page',{data:{path,offset},signal});current=offset;previous=back;area.replaceChildren(el('p',{class:'wb-note'},`${page.filename} · ${bytes(page.offset)} — ${bytes(page.next_offset)} / ${bytes(page.size)}`),actions(button('上一页',()=>load(previous.at(-1),previous.slice(0,-1))),button('下一页',()=>load(page.next_offset,[...previous,current])),button('复制本页',()=>copyText(page.text).catch(e=>showError(area,e)))),el('pre',{class:'wb-pre'},page.text));area.querySelectorAll('button')[0].disabled=!previous.length;area.querySelectorAll('button')[1].disabled=page.eof;if(onBack)area.prepend(button('返回任务详情',onBack));}catch(e){area.replaceChildren(message(e.message),button('重试读取',()=>load(offset,back)),onBack?button('返回任务详情',onBack):null);}}await load(0,[]);}
 async function refreshBootstrap(){const epoch=state.authEpoch;const boot=await wb('bootstrap');if(epoch!==state.authEpoch)throw new DOMException('登录状态已改变','AbortError');state.boot=boot;window.XGentAppearance?.accept(boot.settings);window.XGentChat?.commands(state.boot.commands||[]);chatControls();return state.boot;}
@@ -96,7 +96,7 @@ $('btn-search').addEventListener('click',e=>{e.stopImmediatePropagation();search
 document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='f'){e.preventDefault();e.stopImmediatePropagation();searchMessages();}},true);
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('wb-dialog').open)closeDetail();});
 // Protect form drafts only; ordinary chat drafts survive route changes automatically.
-window.addEventListener('beforeunload',e=>{if(state.dirty){e.preventDefault();e.returnValue='';}});
+window.addEventListener('beforeunload',e=>{if(state.dirty||state.detailDirty){e.preventDefault();e.returnValue='';}});
 async function route(){
   const requested=routeName();
   const next=pages.some(p=>p[0]===requested)?requested:'chat';
@@ -104,13 +104,14 @@ async function route(){
     if(state.authenticated&&next!=='chat'&&!pageCache.get(pageKey()))await render({reuse:true});
     return;
   }
-  if(state.dirty){
+  if(state.detailSaving){history.replaceState(null,'','#/'+state.route);return;}
+  if(state.dirty||state.detailDirty){
     if(!confirm('尚有未保存修改，放弃并切换页面？')){history.replaceState(null,'','#/'+state.route);return;}
     pageCache.delete(state.pageKey); // Do not resurrect a discarded edit as a clean form.
   }
   rememberPage();
   state.request?.abort();state.renderSequence++;state.pendingKey=null;
-  state.dirty=false;
+  state.dirty=false;state.detailDirty=false;
   if(state.route==='settings'&&next!=='settings')window.XGentAppearance?.cancelPreview();
   state.route=next;state.retryAfter=0;
   state.routed=true;document.body.dataset.page=next;
@@ -234,7 +235,8 @@ async function taskPage(read){
   const kindSelect=selectFilter('trigger',[{value:'',label:'全部触发方式'},{value:'once',label:'单次执行'},{value:'cron',label:'Cron 定时'},{value:'condition',label:'条件触发'},{value:'immediate',label:'立即执行'}],'',change);
   const sourceSelect=selectFilter('source',[{value:'',label:'全部来源对话'},...(data.sources||[]).map(c=>({value:c.id,label:(c.name||'新对话')+' · '+c.id.slice(0,6)+(c.archived?'（已归档）':'')}))],'',change);
    sourceSelect.setAttribute('aria-label','任务来源对话');
-   page.append(toolbar(searchFilter('搜索任务名称、命令或 ID',change),sourceSelect,statusSelect,kindSelect,button('刷新',()=>render())));
+   const sourceSearch=button('',()=>taskSourceSearch());sourceSearch.classList.add('wb-source-search');sourceSearch.setAttribute('aria-label','搜索对话记录');sourceSearch.title='搜索对话名称或历史内容';sourceSearch.innerHTML='<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-search"/></svg>';
+   page.append(toolbar(searchFilter('搜索任务名称、命令或 ID',change),el('div',{class:'wb-source-picker'},sourceSelect,sourceSearch),statusSelect,kindSelect,button('刷新',()=>render())));
   page.append(el('div',{class:'wb-selection-bar'},el('label',{class:'wb-check'},all,'全选本页'),selection,cancel));
   all.disabled=!data.items.some(activeTask);
   if(!data.items.length){
@@ -362,8 +364,8 @@ async function fileDetail(file) {
   }
 }
 
-async function modelPage(read){const mode=filter('mode')||'providers';const page=el('div',{},heading('模型与技能','连接你的模型，让 Agent 具备所需的能力。',mode==='providers'?[button('导入 / 导出',importExport),button('添加提供商',()=>providerForm(null),'primary')]:[]));const tabs=el('div',{class:'wb-tabs'},button('模型提供商',()=>{filter('mode','providers');render();},mode==='providers'?'active':''),button('技能库',()=>{filter('mode','skills');render();},mode==='skills'?'active':''));page.append(tabs);
- if(mode==='skills'){await skillsPage(page,await read('skills'));return page;}
+async function modelPage(read){const mode=filter('mode')||'providers';const page=el('div',{},heading('模型与技能','连接你的模型，让 Agent 具备所需的能力。',mode==='providers'?[button('导入 / 导出',importExport),button('添加提供商',()=>providerForm(null),'primary')]:[]));const tabs=el('div',{class:'wb-tabs'},button('模型提供商',()=>{filter('mode','providers');render();},mode==='providers'?'active':''),button('技能库',()=>{filter('mode','skills');render();},mode==='skills'?'active':''),button('记忆',()=>{filter('mode','memories');render();},mode==='memories'?'active':''));page.append(tabs);
+ if(mode==='skills'||mode==='memories'){const {knowledgePage}=await managementModule('knowledge');await knowledgePage(page,await read(mode),mode,{state,filter,localFilters,render,detail,closeDetail,confirmAction,refreshBootstrap,toolbar});return page;}
  const [boot,data]=await Promise.all([read('bootstrap'),read('providers')]);state.boot=boot;chatControls();state.providerFormats=data.formats;const grid=el('div',{class:'wb-grid'});for(const p of data.items){const c=card(p.name,el('p',{},p.base_url),actions(tag(p.api_format),tag(p.has_key?'已配置密钥':'未配置密钥'),state.boot.settings.values.chat_model?.startsWith(p.name+'|')?el('span',{class:'wb-tag good'},'当前对话'):null,state.boot.media_model?.provider===p.name?el('span',{class:'wb-tag good'},'当前媒体'):null),el('p',{},`${p.models.length} 个已保存模型`));const current=state.boot.settings.values.chat_model?.split('|');const choices=el('select',{'aria-label':p.name+' 模型'},p.models.map(m=>el('option',{value:m,selected:current?.[0]===p.name&&current?.[1]===m},m)));c.append(el('label',{class:'wb-field'},el('span',{},'选择模型'),choices),actions(button('用于对话',errorOr(c,async()=>{await wb('providers/select',{data:{target:'chat',provider:p.name,model:choices.value}});await refreshBootstrap();inlineState(c,'已设置为对话模型');render();})),button('用于媒体',errorOr(c,async()=>{await wb('providers/select',{data:{target:'media',provider:p.name,model:choices.value}});await refreshBootstrap();inlineState(c,'已设置为媒体模型');render();}))),el('div',{class:'wb-card-footer'},button('编辑配置',()=>providerForm(p)),button('删除',()=>confirmAction('删除提供商','删除后，依赖此提供商的默认模型需要重新选择。',()=>wb('providers/delete',{data:{name:p.name,confirm:true}})),'danger')));if(!p.models.length)c.querySelectorAll('button').forEach(b=>{if(b.textContent.startsWith('用于'))b.disabled=true;});grid.append(c);}page.append(data.items.length?grid:empty('连接第一个模型','填写兼容接口地址和密钥后，就可以开始对话。密钥仅写入服务器，不会回传明文。',button('添加提供商',()=>providerForm(null),'primary')));return page;}
 function providerForm(provider) {
   const p=provider||{name:'',base_url:'',models:[],api_format:'openai'};
@@ -399,55 +401,6 @@ function localFilters(values){
   Object.assign(state.filters[state.route]??={},values);state.pageKey=pageKey();
   if(entry){pageCache.set(state.pageKey,entry.route,entry.content,entry.revision,root.scrollTop);Object.assign(pageCache.get(state.pageKey),entry);}
 }
-async function skillsPage(page,data){
-  page.classList.add('wb-skills-page');
-  const search=el('input',{type:'search',placeholder:'搜索技能名称或路径','aria-label':'搜索技能名称或路径'});search.value=filter('q')||'';
-  const states=el('select',{'aria-label':'技能状态筛选'},[{value:'',label:'全部状态'},...['enabled','disabled','hidden'].map(value=>({value,label:tag(value).textContent}))].map(o=>el('option',{value:o.value},o.label)));states.value=filter('skillState')||'';
-  const sources=el('select',{'aria-label':'技能来源筛选'},el('option',{value:''},'全部来源'),el('option',{value:'public'},'公共技能'),el('option',{value:'private'},'私有技能'));sources.value=filter('source')||'';
-  const counts=el('span',{class:'wb-note',role:'status'}),feedback=el('div',{'aria-live':'polite'}),grid=el('div',{class:'wb-grid wb-skill-grid'});
-  const noMatch=empty('没有匹配的技能','换一个关键词、状态或来源试试。',button('清除筛选',()=>{search.value='';states.value='';sources.value='';applyFilters();}));
-  const cards=[];
-  function applyFilters(remember=true){
-    if(remember)localFilters({q:search.value,skillState:states.value,source:sources.value});
-    const q=search.value.trim().toLowerCase();let visible=0;
-    for(const [skill,card] of cards){card.hidden=!((skill.name+' '+skill.path).toLowerCase().includes(q)&&(!states.value||skill.state===states.value)&&(!sources.value||skill.source===sources.value));if(!card.hidden)visible++;}
-    noMatch.hidden=visible>0;grid.hidden=visible===0;
-    counts.textContent=`${visible} / ${data.items.length} 个技能 · 已启用 ${data.items.filter(s=>s.state==='enabled').length}`;
-  }
-  search.oninput=()=>applyFilters();states.onchange=()=>applyFilters();sources.onchange=()=>applyFilters();
-  page.append(toolbar(search,states,sources,button('刷新',()=>render())),counts,
-    el('p',{class:'wb-note'},'直接切换即保存：启用 = 可见可用，关闭 = 可见但不可用，隐藏 = 不向 Agent 展示。'),feedback,grid,noMatch);
-  for(const skill of data.items){
-    const card=el('section',{class:'wb-card wb-skill-card','data-skill-path':skill.path}),badge=el('span'),result=el('div',{'aria-live':'polite'});
-    const choices=el('div',{class:'wb-skill-switch',role:'group','aria-label':skill.name+' 状态'}),controls=[];
-    const paint=()=>{badge.replaceChildren(tag(skill.state));for(const [value,btn] of controls){btn.classList.toggle('active',value===skill.state);btn.setAttribute('aria-pressed',String(value===skill.state));}};
-    for(const [value,label] of [['enabled','启用'],['disabled','关闭'],['hidden','隐藏']]){
-      const btn=button(label,async()=>{
-        if(value===skill.state)return;
-        const hadFocus=card.contains(document.activeElement);
-        choices.setAttribute('aria-busy','true');controls.forEach(([,b])=>b.disabled=true);result.replaceChildren(message('正在保存…','loading'));
-        try{
-          await wb('skills/state',{data:{path:skill.path,state:value}});skill.state=value;paint();
-          result.replaceChildren(message('已保存，后续上下文按新状态读取','success'));
-          feedback.replaceChildren(message(`${skill.name}：${tag(value).textContent}`,'success'));
-          applyFilters(false);if(card.hidden&&card.contains(document.activeElement))search.focus({preventScroll:true});
-        }catch(e){result.replaceChildren(message('未能确认保存结果：'+e.message+'。可刷新查看服务器状态。'));}
-        finally{choices.removeAttribute('aria-busy');controls.forEach(([,b])=>b.disabled=false);if(hadFocus&&page.isConnected&&(document.activeElement===document.body||document.activeElement===btn))(card.hidden?search:btn).focus({preventScroll:true});}
-      });controls.push([value,btn]);choices.append(btn);
-    }
-    card.append(el('div',{class:'wb-skill-heading'},el('h3',{},skill.name),badge),el('p',{class:'wb-skill-path',title:skill.path},skill.path),choices,result,
-      el('div',{class:'wb-card-footer'},el('span',{class:'wb-note'},skill.source==='private'?'私有技能':'公共技能'),button('查看说明',()=>skillDetail(skill))));
-    paint();cards.push([skill,card]);grid.append(card);
-  }
-  applyFilters(false);
-}
-async function skillDetail(skill){
-  const box=el('div',{},message('读取技能说明…','loading'));detail(skill.name,box);const signal=state.detailRequest.signal;
-  try{const d=await wb('skills'+query({path:skill.path}),{signal});box.replaceChildren(actions(tag(d.state),button('复制说明',errorOr(box,async()=>{await copyText(d.content);inlineState(box,'技能说明已复制');}))),el('p',{class:'wb-note'},skill.path),el('pre',{class:'wb-pre'},d.content||'此技能文件暂时没有内容。'));}
-  catch(e){if(e.name!=='AbortError')box.replaceChildren(message(e.message),button('重试读取',()=>skillDetail(skill)));}
-}
-
-
 async function managementModule(name){
   try{return await import('./'+name+'.js');}
   catch{throw new Error('管理页面脚本加载失败。若刚更新代码，请重启 XGent 服务并刷新网页；聊天、菜单和退出登录仍可使用。');}
@@ -474,7 +427,7 @@ window.addEventListener('xgent-authenticated',start);
 window.addEventListener('xgent-auth-expired',()=>{
   state.authEpoch++;started=false;state.authenticated=false;state.request?.abort();state.renderSequence++;
   state.boot=null;state.pendingKey=null;state.pageKey=null;state.dirty=false;state.retryAfter=0;
-  pageCache.clear();root.replaceChildren();closeDetail();
+  pageCache.clear();root.replaceChildren();closeDetail(true);
   if($('wb-dialog').open)$('wb-dialog').close();$('wb-dialog-body').replaceChildren();
   $('login').showModal();
 });
@@ -494,11 +447,12 @@ window.XGentWorkbench={
   prepareChat:async()=>{if(state.route!=='chat'){location.hash='/chat';await route();}return state.route==='chat';},
   commands:()=>state.boot?.commands,
   confirmCommand:cmd=>confirmAction('执行 '+cmd,'此命令可能改变共享数据或重启服务，是否继续？',async()=>window.XGentChat.command(cmd)),
-  beforeLogout:()=>{if(state.submitting)return false;if(state.dirty&&!confirm('尚有未保存修改，确定退出登录？'))return false;state.dirty=false;return true;}
+  beforeLogout:()=>{if(state.submitting||state.detailSaving)return false;if((state.dirty||state.detailDirty)&&!confirm('尚有未保存修改，确定退出登录？'))return false;state.dirty=false;state.detailDirty=false;return true;}
 };
 window.dispatchEvent(new Event('xgent-workbench-ready'));
 
 window.addEventListener('xgent-conversation-changed',()=>{
+  if(['models','settings'].includes(state.route))return; // Shared document/configuration drafts are not chat-bound.
   state.request?.abort();state.detailRequest?.abort();state.renderSequence++;
   pageCache.clear();state.pageKey=null;state.pendingKey=null;state.retryAfter=0;
   closeDetail();if(state.route!=='chat'&&state.authenticated)render();
@@ -508,4 +462,24 @@ window.addEventListener('xgent-fonts-applied',()=>{
   if(state.dirty||state.submitting)return;
   const values=window.XGentAppearance?.state.values||{};
   for(const input of document.querySelectorAll('.font-settings input[name]'))if(input.name in values)input.value=values[input.name];
+  for(const slider of document.querySelectorAll('.font-settings [data-font-key]'))if(slider.dataset.fontKey in values)slider.value=values[slider.dataset.fontKey];
 });
+
+function taskSourceSearch(){
+  const input=el('input',{type:'search',placeholder:'搜索对话名称或历史内容…','aria-label':'搜索来源对话'}),results=el('div',{class:'wb-source-results'});
+  const box=el('div',{class:'wb-source-dialog'},el('label',{class:'wb-field'},el('span',{},'对话名称或历史内容'),input),el('p',{class:'wb-note'},'选择结果只筛选任务来源，不切换当前聊天。'),results);
+  let controller,timer,sequence=0;
+  async function search(){
+    controller?.abort();controller=new AbortController();const current=++sequence;results.replaceChildren(message('正在搜索…','loading'));
+    try{
+      const data=await wb('conversations/search'+query({q:input.value}),{signal:controller.signal});
+      if(current!==sequence||!box.isConnected)return;
+      results.replaceChildren();
+      for(const item of data.items){const choose=button('',()=>{filter('source',item.id);filter('offset',0);state.dirty=false;closeDialog();render();});choose.classList.add('wb-source-result');choose.append(el('strong',{},item.name||'新对话'),el('span',{class:'wb-note'},item.id.slice(0,6)+(item.archived?' · 已归档':'')));if(item.snippet)choose.append(el('p',{},item.snippet));results.append(choose);}
+      if(!data.items.length)results.append(empty('没有找到对话','试试会话名称或消息中的关键词。'));
+    }catch(error){if(error.name!=='AbortError'&&current===sequence)results.replaceChildren(message(error.message),button('重新搜索',search));}
+  }
+  input.oninput=()=>{clearTimeout(timer);controller?.abort();sequence++;results.replaceChildren(message('正在搜索…','loading'));timer=setTimeout(search,250);};
+  dialog('搜索任务来源对话',box);search();
+  $('wb-dialog').addEventListener('close',()=>{clearTimeout(timer);controller?.abort();},{once:true});
+}

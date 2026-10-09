@@ -10,6 +10,7 @@
 <link rel="stylesheet" href="/assets/workbench.css">
 <link rel="stylesheet" href="/assets/conversations.css">
 <link rel="stylesheet" href="/assets/reading.css">
+<link rel="stylesheet" href="/assets/knowledge.css">
 </head>
 <body data-page="chat">
 
@@ -64,12 +65,12 @@
 <div id="conversation-backdrop" aria-hidden="true" hidden></div>
 <div id="wb-shell">
 <div id="header">
+  <button id="conversation-drawer-toggle" class="conv-drawer-toggle icon-btn" type="button" aria-label="对话记录" title="展开或收起对话记录" aria-controls="wb-nav" aria-expanded="false"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-menu"/></svg></button>
   <div class="header-info"><div class="header-text">
     <h1 id="wb-conversation-title" title="新对话">新对话</h1>
     <div class="bot-status" id="status-text"><span class="conn-dot" id="conn-dot"></span> 在线</div>
     <span class="bot-name" hidden>XGent</span><span id="bot-avatar" hidden>X</span>
   </div><span id="conversation-current-status" class="conv-title-status" hidden>正在生成</span></div>
-  <button id="conversation-drawer-toggle" class="conv-drawer-toggle" type="button" aria-label="查看对话列表" aria-controls="wb-nav" aria-expanded="false"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v12H9l-5 4zM8 8h8M8 12h5"/></svg><span>对话记录</span></button>
   <button id="chat-options-toggle" class="icon-btn" type="button" aria-label="聊天选项" aria-controls="chat-options" aria-expanded="false"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg></button>
   <div id="chat-options" hidden>
     <div id="wb-chat-controls"></div>

@@ -1,0 +1,36 @@
+/* Shared document management, using the existing responsive workbench. */
+.knowledge-card .wb-skill-heading{gap:8px;align-items:center;flex-wrap:nowrap}.knowledge-card .wb-skill-heading h3{min-width:0;flex:1;overflow-wrap:anywhere}
+.knowledge-rename-trigger{flex-shrink:0;min-width:36px;padding:5px 8px!important;font-size:1.1em!important}
+.knowledge-card-preview{font-size:var(--web-ui-font-size);line-height:1.6;color:var(--wb-muted);display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere;min-height:3em}
+.knowledge-card .wb-card-footer{flex-wrap:wrap;gap:8px}.knowledge-card .wb-card-footer .wb-actions{gap:6px}
+.knowledge-rename-area{margin:8px 0}.knowledge-rename .wb-field{margin:0 0 8px}.knowledge-rename input{width:100%;min-width:0}
+.knowledge-editor-toolbar{position:sticky;top:-18px;z-index:5;display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:var(--wb-panel);padding:10px 0;margin-bottom:12px;border-bottom:1px solid var(--wb-border)}
+.knowledge-editor-toolbar>.wb-note{flex-basis:100%}
+.knowledge-section{margin:14px 0;border:1px solid var(--wb-border);border-radius:10px;padding:14px;background:var(--wb-panel);min-width:0}
+.knowledge-section>header{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}.knowledge-section h3{margin:0;flex:1;font-size:calc(var(--web-ui-font-size) * 1.1)}
+.knowledge-section textarea,.knowledge-source{display:block;width:100%;min-width:0;padding:12px;border:1px solid var(--wb-border);border-radius:7px;resize:vertical;background:var(--wb-bg);color:var(--wb-text);font-family:var(--mono);font-size:var(--web-message-font-size);line-height:1.6}
+.knowledge-section textarea[hidden],.knowledge-source[hidden],.knowledge-editor-content[hidden]{display:none}
+.knowledge-source{min-height:52vh;white-space:pre;overflow:auto;tab-size:4}
+.knowledge-memory-text{min-height:40vh;white-space:pre-wrap}
+.knowledge-markdown.bubble{display:block;max-width:none;width:100%;min-width:0;padding:0;border:0;box-shadow:none;background:none;color:var(--wb-text);overflow-wrap:anywhere}
+.knowledge-markdown p:last-child{margin-bottom:0}.knowledge-markdown pre{max-width:100%;overflow:auto}.knowledge-markdown table{display:block;max-width:100%;overflow:auto}
+.wb-source-picker{display:flex;gap:5px;align-items:center;min-width:0}.wb-source-picker select{min-width:0;max-width:250px;flex:1}
+.wb-source-search{flex-shrink:0;width:38px;min-width:38px;min-height:38px;padding:7px!important}.wb-source-search .icon{width:17px;height:17px}
+.wb-source-results{display:grid;gap:8px;max-height:50dvh;overflow:auto}.wb-source-result{display:flex;align-items:flex-start;flex-direction:column;gap:4px;text-align:left;white-space:normal;min-width:0;width:100%}.wb-source-result p{margin:0;font-size:.92em;font-weight:400;line-height:1.5;overflow-wrap:anywhere}
+.font-control{display:grid;grid-template-columns:minmax(90px,130px) minmax(60px,1fr);gap:12px;align-items:center}.font-control input[type=range]{width:100%;max-width:none;accent-color:var(--wb-accent)}.font-control .wb-field{margin-top:8px}
+/* Conversation navigation is distinct from the composer command menu. */
+#header{display:grid;grid-template-columns:44px minmax(0,1fr) 44px;gap:8px}
+#header .conv-drawer-toggle{display:inline-flex;width:44px;height:44px;min-height:44px;min-width:44px;padding:10px;border:0;background:transparent;justify-content:center;align-items:center}
+#header .conv-drawer-toggle .icon{width:21px;height:21px}
+#header .header-info{display:block;position:relative;min-width:0;width:100%;margin:0}
+#header .header-text{text-align:center;width:100%;min-width:0}
+#header #wb-conversation-title{text-align:center;max-width:100%}
+#header .bot-status{justify-content:center;text-align:center}
+#header .conv-title-status{position:absolute;right:4px;top:5px}
+#btn-composer-menu{color:#fff!important;background:#1686d9!important;border:1px solid #1686d9!important;border-radius:9px;box-shadow:0 2px 5px #1686d922}
+#btn-composer-menu:hover{background:#0876c7!important}#btn-composer-menu:focus-visible{outline:2px solid var(--wb-accent);outline-offset:3px}#btn-composer-menu[aria-expanded=true]{background:#086bb3!important}
+@media(min-width:768px){body.conv-sidebar-collapsed{--sidebar:0px}body.conv-sidebar-collapsed #wb-nav{display:none}#header .header-text{padding:0 68px}}
+@media(max-width:767px){.knowledge-section textarea,.knowledge-source{font-size:max(16px,var(--web-message-font-size))}.knowledge-section{padding:12px}.knowledge-section>header .wb-btn,.knowledge-rename-trigger{min-height:44px;min-width:44px}.wb-source-picker{flex:1;max-width:100%}.wb-source-picker select{max-width:none}.wb-source-search{width:44px;min-height:44px}.font-control{grid-template-columns:135px minmax(80px,1fr);gap:12px}.knowledge-editor-toolbar{top:-18px}#header .conv-title-status{display:none}}
+
+/* Keep all three font controls and Save within easy reach on phones. */
+.font-settings .font-control{margin:0 0 12px}.font-settings .font-control .wb-field{margin:0;gap:4px}.font-control input[type=range]{min-height:44px}
