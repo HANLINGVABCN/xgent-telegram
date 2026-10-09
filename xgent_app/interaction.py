@@ -26,10 +26,14 @@ def identity():
 
 def selection_key(selector=None):
     if selector is None:
-        selector = 'telegram' if identity()[0] == 'telegram' else 'shared'
-    if selector not in {'telegram', 'shared'}:
+        origin = identity()[0]
+        from xgent_app import conversations
+        terminal = origin == 'cli' and getattr(conversations._manager, 'terminal_enabled', False)
+        selector = 'terminal' if terminal else 'telegram' if origin == 'telegram' else 'shared'
+    if selector not in {'telegram', 'shared', 'terminal'}:
         raise ValueError('未知会话选择端')
-    return 'telegram_conversation_id' if selector == 'telegram' else 'current_chat_id'
+    return {'telegram': 'telegram_conversation_id', 'terminal': 'terminal_conversation_id',
+            'shared': 'current_chat_id'}[selector]
 
 
 def is_temporary_key(key):

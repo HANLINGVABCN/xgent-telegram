@@ -310,7 +310,7 @@ class ConversationStore:
                 'revision': int(config.get('conversation_revision', 0)),
                 'running': config.get('conversation_running')}
 
-    async def manage_conversation(self, action, conversation_id=None, name=None, *, selector='shared'):
+    async def manage_conversation(self, action, conversation_id=None, name=None, *, selector='shared', select=True):
         from xgent_app.interaction import selection_key
         selected_key = selection_key(selector)
         if action not in {'create', 'switch', 'rename', 'archive', 'restore'}:
@@ -347,7 +347,8 @@ class ConversationStore:
                     active = await _config(conn, selected_key)
             if action in {'create', 'switch'}:
                 await conn.execute('UPDATE chat_sessions SET last_active=? WHERE id=?', (time.time(), active))
-            await _set_config(conn, selected_key, active)
+            if select:
+                await _set_config(conn, selected_key, active)
             await _set_config(conn, 'conversation_revision', int(await _config(conn, 'conversation_revision', 0)) + 1)
         self._config_cache.pop('current_chat_id', None)
         self._config_cache.pop('telegram_conversation_id', None)

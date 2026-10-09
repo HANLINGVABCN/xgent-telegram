@@ -35,6 +35,7 @@ import asyncio
 import atexit
 import contextlib
 import io
+import json
 import logging
 import os
 import queue
@@ -118,47 +119,119 @@ process_conversation = _ns["process_conversation"]
 handle_button_click = _ns["handle_button_click"]
 handle_text_message = _ns["handle_text_message"]
 logger = _ns["logger"]
-from xgent_app.conversations import conversation_operation, ConversationError, get_conversations
+from xgent_app.conversations import conversation_operation, ConversationError, ConversationChanged, get_conversations, current_scope, bind_conversation
 from xgent_app.cli_bridge import set_visible_conversation
 from xgent_app.interaction import interaction
+from xgent_app.terminal_workspace import TerminalWorkspace, current_submission, submitted
 
 _submitted_conversation_id = None
 _conversation_name = ''
+_terminal_workspace = None
+_terminal_frame = {}
+_submitted_generation = None
 _interactive_conversations = False
 _pending_conversation_read = None
 _exit_after_turn = False
 
 
 def _cli_conversation_notifier(frame):
-    global _conversation_name
-    cid = frame['current_chat_id']
+    global _conversation_name, _terminal_frame
+    _terminal_frame = frame
+    cid = frame.get('terminal_conversation_id', frame.get('current_chat_id'))
     selected = next((item for item in frame.get('items', []) if item['id'] == cid), {})
-    name = selected.get('name') or '新对话'
+    name = selected.get('name') or '选择对话'
     changed = bool(_conversation_name and _conversation_name != name)
     _conversation_name = name
     set_visible_conversation(cid)
-    if changed:
-        SCREEN.notice('当前会话：' + name + '（已同步；旧输入不会改投新会话）', 'info')
+    if _terminal_workspace is not None:
+        _terminal_workspace.on_state(frame)
+    elif changed:
+        SCREEN.notice('当前终端对话：' + name, 'info')
     box = attached_input_box()
     if box is not None:
         box.set_prompt(_prompt_plain(), _input_box_ansi())
 
 
+def _terminal_snapshot():
+    if _terminal_workspace is not None:
+        return _terminal_workspace.snapshot()
+    cid = _terminal_frame.get('terminal_conversation_id')
+    selected = next((c for c in _terminal_frame.get('items', []) if c['id'] == cid), {})
+    return {'conversation_id': cid, 'generation': selected.get('generation'),
+            'name': selected.get('name') or '选择对话'}
+
+
 _ns['_cli_conversation_notifier'] = _cli_conversation_notifier
+
+
+async def _refresh_terminal_model_config():
+    """Read shared model choices at admission, never half-way through a local run."""
+    db = await BotMemoryDB.get_instance()
+    conn = await db._get_conn()
+    keys = {'active_provider':'active_provider_key', 'default_model':'default_model',
+            'default_media_provider':'default_media_provider_key', 'default_media_model':'default_media_model',
+            'agent_mode':'agent_mode', 'stream_mode':'stream_mode', 'stream_style':'stream_style',
+            'thinking_level':'thinking_level', 'global_depth':'global_depth',
+            'disabled_skills':'disabled_skills', 'hidden_skills':'hidden_skills'}
+    cursor = await conn.execute('SELECT key,value FROM config WHERE key IN (' + ','.join('?' for _ in keys) + ')', tuple(keys))
+    rows = await cursor.fetchall()
+    await cursor.close()
+    for row in rows:
+        UserDataManager.set(keys[row['key']], json.loads(row['value']))
+    db._providers_cache = None
+    await UserDataManager.reload_providers()
 
 
 def _cli_operation(*, execution=False):
     def decorate(function):
         async def wrapped(*args, **kwargs):
             text = str(args[0]) if args else ''
-            navigation = function.__name__ == '_run_command' and text.split(' ', 1)[0] in {'/chats','/new','/getchat'}
-            cid = None if navigation else _submitted_conversation_id
+            receipt = current_submission()
+            snapshot = receipt.snapshot if receipt is not None else {'conversation_id': _submitted_conversation_id, 'generation': _submitted_generation}
+            navigation = function.__name__ == '_run_command' and text.split(' ', 1)[0] in {'/chats', '/new', '/getchat'}
+            cid = None if navigation else snapshot.get('conversation_id')
+            owner = None
             try:
+                await get_conversations().enable_terminal()
                 with interaction('cli', 'management'):
-                    async with conversation_operation(cid, expected=cid is not None, fresh=True, selector='shared') as scope:
+                    # Creation and choosing must remain reachable with no active chat.
+                    name = text.strip().split(' ', 1)[0].lower()
+                    if function.__name__ == '_run_command' and name == '/new':
+                        parts = text.split(maxsplit=1)
+                        await get_conversations().manage('create', name=parts[1] if len(parts) > 1 else None, selector='terminal')
+                        if receipt is not None:
+                            receipt.admit()
+                        if _terminal_workspace is not None:
+                            await _terminal_workspace.refresh_state()
+                            await _terminal_workspace.refresh_history(force=True)
+                            SCREEN.flash('已新建空白对话')
+                        else:
+                            update, context, _ = build_cli_command_objects(BotConfig.AUTHORIZED_USER_ID, text)
+                            with bind_conversation(await get_conversations().resolve(selector='terminal')):
+                                await _ns['show_conversation_menu'](update, context)
+                        return
+                    if function.__name__ == '_run_command' and name == '/chats' and not (await get_conversations().state()).get('terminal_conversation_id'):
+                        update, context, _ = build_cli_command_objects(BotConfig.AUTHORIZED_USER_ID, text)
+                        with bind_conversation(None):
+                            await _ns['show_conversation_menu'](update, context)
+                        if receipt is not None:
+                            receipt.admit()
+                        return
+                    if function.__name__ == '_run_callback' and not (await get_conversations().state()).get('terminal_conversation_id'):
+                        action = _ns['CallbackDataStore']._store.get(text, text)
+                        if action.startswith(('conv_switch:', 'conv_restore:', 'conv_delete:', 'conv_confirm_delete:')) or action in {'conv_list', 'conv_archived', 'conv_create', 'conv_home'} or action.startswith('conv_page:'):
+                            update, context, _ = build_cli_callback_objects(BotConfig.AUTHORIZED_USER_ID, text, 0)
+                            with bind_conversation(None):
+                                await _ns['handle_conversation_action'](update, context, action)
+                            if receipt is not None:
+                                receipt.admit()
+                            return
+                    async with conversation_operation(cid, expected=cid is not None, fresh=True, selector='terminal') as scope:
+                        if not navigation and snapshot.get('generation') is not None and snapshot['generation'] != scope.generation:
+                            raise ConversationChanged('上下文已重置或压缩，草稿仍保留；确认后再次发送。')
                         expired = UserDataManager.bind_ui_state()
                         if expired and function.__name__ == '_run_conversation':
-                            raise ConversationError('之前的录入已因上下文变化取消；本次内容未提交，请重新操作。')
+                            raise ConversationChanged('之前的录入已因上下文变化取消；本次内容未提交，请重新操作。')
                         execute = execution() if callable(execution) else execution
                         command_name = ''
                         if function.__name__ == '_run_command':
@@ -168,11 +241,28 @@ def _cli_operation(*, execution=False):
                                    (function.__name__ != '_run_command' or _resolve_command(command_name) is None)
                                    else 'management')
                         with interaction('cli', purpose):
-                            admitted = await get_conversations().resolve(scope.conversation_id, expected=cid is not None, selector='shared')
-                            async with conversation_operation(admitted, execution=execute, expected=cid is not None):
+                            admitted = await get_conversations().resolve(scope.conversation_id, expected=cid is not None, selector='terminal')
+                            async with conversation_operation(admitted, execution=execute, expected=cid is not None) as running:
+                                if execute:
+                                    await _refresh_terminal_model_config()
+                                if receipt is not None and purpose != 'chat':
+                                    receipt.admit()
+                                if _terminal_workspace is not None and execute:
+                                    owner = running
+                                    _terminal_workspace.begin_run(running)
                                 return await function(*args, **kwargs)
             except ConversationError as exc:
-                SCREEN.notice(str(exc), 'warn')
+                if receipt is not None:
+                    receipt.error = str(exc)
+                    if isinstance(exc, ConversationChanged):
+                        receipt.snapshot['reconfirm'] = True
+                if hasattr(SCREEN, 'flash'):
+                    SCREEN.flash(str(exc), 6)
+                else:
+                    SCREEN.notice(str(exc), 'warn')
+            finally:
+                if owner is not None and _terminal_workspace is not None:
+                    await _terminal_workspace.end_run(owner)
         return wrapped
     return decorate
 
@@ -465,7 +555,7 @@ def _prompt_color_name() -> str:
 
 def _prompt_plain() -> str:
     """给命令面板用的提示符：带颜色，但不带 readline 的 \\001..\\002 标记。"""
-    label = f'[{_conversation_name[:24]}] ' if _conversation_name else ''
+    label = '' if isinstance(SCREEN, cli_tui.PtScreen) else (f'[{_conversation_name[:24]}] ' if _conversation_name else '')
     pal = PALETTE
     if not pal.enabled:
         return label + "❯ "
@@ -788,6 +878,35 @@ def _fold_ai_reply_for_cli(content: str) -> str:
     return content
 
 
+def _history_row_lines(row):
+    """Read-only display: no historical keyboard can mutate a new context."""
+    from xgent_app.web_history import build_history_message
+    item = build_history_message(row, _ns['ArtifactManager'].ROOT_DIR, _ns['PROJECT_ROOT'])
+    renderer = SCREEN.renderer()
+    kind, role = item.get('msg_type'), item.get('role')
+    content = item.get('content') or ''
+    mode = item.get('parse_mode')
+    if kind == 'ai_reply' and not mode:
+        content, mode = _fold_ai_reply_for_cli(content), 'HTML'
+    style = 'token' if kind == 'token_usage' else 'user' if role == 'user' else 'system' if role == 'system' else 'ai'
+    if kind == 'ui_message':
+        style = 'system'
+    result = renderer.render_message(content, (), mode, title='User' if role == 'user' else 'XGent',
+                                     marker='❯' if role == 'user' else '◆', style=style) if content else []
+    for medium in item.get('media', []):
+        result += renderer.render_text('📎 ' + str(medium.get('filename') or '附件'), None)
+    return result
+
+
+async def _dispatch_tui(text, snapshot, on_admitted):
+    with submitted(snapshot, on_admitted) as receipt, interaction('cli', 'management'):
+        should_exit = await _dispatch_submitted(text)
+        if not receipt.error:
+            receipt.admit()
+        return {'exit': should_exit, 'accepted': receipt.accepted, 'error': receipt.error,
+                'reconfirm': receipt.snapshot.get('reconfirm', False)}
+
+
 def _render_history_rows(rows: Sequence[dict]) -> None:
     """把 get_display_history 的行渲染到终端。独立成函数方便单测。"""
     renderer = SCREEN.renderer()
@@ -817,6 +936,11 @@ def _render_history_rows(rows: Sequence[dict]) -> None:
 
 
 async def _pull_cross_client_history(limit: int) -> None:
+    if _terminal_workspace is not None:
+        _terminal_workspace._limits[_terminal_workspace.selected] = limit
+        await _terminal_workspace.refresh_history(force=True)
+        SCREEN.flash('当前对话历史已同步；新消息会自动刷新，F5 加载更早记录')
+        return
     db = await BotMemoryDB.get_instance()
     rows = await db.get_display_history(limit)
     SCREEN.print_plain("")
@@ -852,7 +976,7 @@ def _echo_submitted(text: str, *, conversation: bool) -> None:
 
     input() 回退路径系统已回显（last_read_native_echo），不重复打印。
     """
-    if getattr(_READER, "last_read_native_echo", False):
+    if isinstance(SCREEN, cli_tui.PtScreen) or getattr(_READER, "last_read_native_echo", False):
         return
     _print_user_block(text)
 
@@ -866,6 +990,19 @@ async def _report_failure(what: str) -> None:
     failure = await GlobalRecorder.record_error(sys.exc_info()[1] or f'{what}失败',
                                                 BotConfig.AUTHORIZED_USER_ID, source='cli')
     SCREEN.notice(failure, "err")
+
+
+async def _record_terminal_user(text):
+    row_id = await GlobalRecorder.record_user_message(
+        text, MessageType.USER_TEXT, BotConfig.AUTHORIZED_USER_ID, metadata={'origin': 'cli-chat'})
+    if row_id is None:
+        raise ConversationError('消息未能保存，草稿仍保留；请重试。')
+    receipt = current_submission()
+    if receipt is not None:
+        receipt.admit()
+    if isinstance(SCREEN, cli_tui.PtScreen):
+        _print_user_block(text)
+    return row_id
 
 
 @_cli_operation(execution=lambda: UserDataManager.get('state') == BotState.IDLE)
@@ -895,16 +1032,15 @@ async def _run_conversation(text: str) -> None:
     try:
         # 对话文本带 origin=cli-chat 标记：标记这是 CLI 的对话文本（区别于
         # 状态机输入），跨端历史据此识别来源。
-        await GlobalRecorder.record_user_message(
-            text, MessageType.USER_TEXT, BotConfig.AUTHORIZED_USER_ID,
-            metadata={'origin': 'cli-chat'},
-        )
+        await _record_terminal_user(text)
         # 把用户自己的这句话送到另外两端。**这是全流程里唯一带来源标识的
         # 地方**（Telegram/网页显示成 "🖥 [CLI]" 加原话）——接下来
         # process_conversation 产生的每一条消息都由 CliBot 逐个中继过去，
         # 与在 Telegram 里直接对话逐条一致，不加任何标记、不加任何额外文案。
         relay_user_message(text)
         await process_conversation(update, context, text)
+    except ConversationError:
+        raise
     except Exception:
         await _report_failure("对话")
 
@@ -920,10 +1056,7 @@ async def _run_command(command: str) -> None:
             # 未知命令降级成普通对话：接下来的输出是 AI 正文，不是命令返回。
             set_turn_kind("chat")
             SCREEN.notice(f"未知命令 /{name}，当作普通对话发给 AI（/help 看命令列表）。", "warn")
-            await GlobalRecorder.record_user_message(
-                command, MessageType.USER_TEXT, BotConfig.AUTHORIZED_USER_ID,
-                metadata={'origin': 'cli-chat'},
-            )
+            await _record_terminal_user(command)
             relay_user_message(command)
             await process_conversation(update, context, command)
         else:
@@ -931,6 +1064,8 @@ async def _run_command(command: str) -> None:
             set_turn_kind("cmd")
             async with _ns['ui_operation'](capture_text=True):
                 await handler(update, context)
+    except ConversationError:
+        raise
     except Exception:
         await _report_failure(f"命令 /{name}")
 
@@ -1266,6 +1401,13 @@ def _request_stop() -> bool:
     None（messages.py:1627/1640），凭空造一个只会设到一个没人等的事件上。
     这与 callbacks.py:11-24 处理 act_stop_generation 的写法保持一致。
     """
+    running = _terminal_frame.get('running') or {}
+    if running.get('run_id'):
+        try:
+            asyncio.get_running_loop().create_task(get_conversations().request_stop(running['run_id']))
+            return True
+        except RuntimeError:
+            pass
     event = _ns.get("_stop_generation_event")
     if event is None or event.is_set():
         return False
@@ -1315,15 +1457,16 @@ def _install_sigint_handler() -> None:
 
 
 async def _read_conversation_line():
-    global _pending_conversation_read, _submitted_conversation_id
+    global _pending_conversation_read, _submitted_conversation_id, _submitted_generation
     if _pending_conversation_read is None:
         await get_conversations().poll_once()
-        cid = (await get_conversations().state())['current_chat_id']
-        _pending_conversation_read = (asyncio.create_task(_READER.read(_prompt_text())), cid)
-    task, cid = _pending_conversation_read
+        snapshot = _terminal_snapshot()
+        _pending_conversation_read = (asyncio.create_task(_READER.read(_prompt_text())), snapshot)
+    task, snapshot = _pending_conversation_read
     line = await task
     _pending_conversation_read = None
-    _submitted_conversation_id = cid
+    _submitted_conversation_id = snapshot.get('conversation_id')
+    _submitted_generation = snapshot.get('generation')
     return line
 
 
@@ -1354,12 +1497,13 @@ def _management_input(line):
 
 
 async def _run_turn(coro) -> None:
-    global _turn_active, _pending_conversation_read, _submitted_conversation_id, _exit_after_turn
+    global _turn_active, _pending_conversation_read, _submitted_conversation_id, _submitted_generation, _exit_after_turn
     if _turn_active:
         await coro  # Read-only conversation management while the owner turn runs.
         return
     _turn_active = True
     task = asyncio.ensure_future(coro)
+    get_conversations().track_background(task)
     try:
         while not task.done():
             try:
@@ -1367,14 +1511,15 @@ async def _run_turn(coro) -> None:
                     await asyncio.shield(task)
                     break
                 if _pending_conversation_read is None:
-                    cid = (await get_conversations().state())['current_chat_id']
-                    _pending_conversation_read = (asyncio.create_task(_READER.read(_prompt_text())), cid)
-                reader, cid = _pending_conversation_read
+                    snapshot = _terminal_snapshot()
+                    _pending_conversation_read = (asyncio.create_task(_READER.read(_prompt_text())), snapshot)
+                reader, snapshot = _pending_conversation_read
                 ready, _ = await asyncio.wait({task, reader}, return_when=asyncio.FIRST_COMPLETED)
                 if reader in ready:
                     line = reader.result()
                     _pending_conversation_read = None
-                    _submitted_conversation_id = cid
+                    _submitted_conversation_id = snapshot.get('conversation_id')
+                    _submitted_generation = snapshot.get('generation')
                     if line in (_EXIT, _EOF):
                         _exit_after_turn = True
                         _request_stop()
@@ -1400,8 +1545,13 @@ async def _run_turn(coro) -> None:
 async def _init_runtime() -> None:
     await UserDataManager.init()
     await BotMemoryDB.get_instance()
+    global _terminal_workspace
+    await get_conversations().enable_terminal()
     await get_conversations().poll_once()
     get_conversations().start()
+    if isinstance(SCREEN, cli_tui.PtScreen):
+        _terminal_workspace = TerminalWorkspace(get_conversations(), SCREEN, _history_row_lines, _ns)
+        await _terminal_workspace.start()
     # 启动跨端中继：从这里起，对话核心在 CLI 里对 bot 的每一次调用都会被
     # 服务端原样回放到 Telegram 和网页。必须在 BotMemoryDB 之后——中继线程
     # 自己开一条 sqlite 连接，建表要等主库初始化完，免得两边同时建。
@@ -1414,6 +1564,10 @@ async def _init_runtime() -> None:
 
 
 async def _shutdown_runtime() -> None:
+    global _terminal_workspace
+    if _terminal_workspace is not None:
+        await _terminal_workspace.close()
+        _terminal_workspace = None
     await get_conversations().close()
     # 先排空中继再关库：本轮最后几条操作还在队列里，直接退出就是"最后几条
     # 消息没同步"（历史上 create_task 发完即忘留下的老毛病）。
@@ -1447,6 +1601,9 @@ async def _dispatch_submitted(line: Any) -> bool:
         await _run_turn(_run_conversation(text))
         return False
     low = text.lower()
+    if low == '/chats' and isinstance(SCREEN, cli_tui.PtScreen):
+        SCREEN.on_conversations()
+        return False
     if low in ("exit", "quit"):
         return True
     if low in ("/help", "help", "?", "/?"):
@@ -1578,6 +1735,31 @@ def _route_command_prefix(text: str) -> Optional[str]:
     return None
 
 
+def _build_tui_hooks():
+    from xgent_app.cli_bridge import active_menu_message_id
+    return cli_tui.TuiHooks(
+        dispatch=_dispatch_submitted,
+        banner=lambda: None,
+        status_text=lambda: _terminal_workspace.model_name if _terminal_workspace is not None else str(UserDataManager.get('default_model') or ''),
+        conversation=_terminal_snapshot,
+        conversation_items=lambda: _terminal_workspace.items if _terminal_workspace is not None else [],
+        running=lambda: _terminal_frame.get('running') or {},
+        completed=lambda: _terminal_workspace.finished if _terminal_workspace is not None else {},
+        dispatch_scoped=_dispatch_tui,
+        allow_busy_input=_management_input,
+        manage_conversation=lambda action, cid=None, name=None: _terminal_workspace.manage(action, cid, name),
+        load_older=lambda: _terminal_workspace.refresh_history(older=True),
+        prompt_text=_prompt_plain,
+        command_names=_command_names,
+        describe_command=_describe_command,
+        turn_active=lambda: _turn_active or bool(_terminal_frame.get('running')),
+        request_stop=_request_stop,
+        remember_history=_remember_history,
+        history_file=str(HISTORY_FILE),
+        menu_message_id=active_menu_message_id,
+    )
+
+
 def _run_tui_main() -> None:
     """全屏 prompt_toolkit 前端。
 
@@ -1589,33 +1771,13 @@ def _run_tui_main() -> None:
     """
     global SCREEN, PALETTE
     from xgent_app.cli_bridge import set_screen
-    from xgent_app.cli_bridge import active_menu_message_id as _active_menu_message_id
 
     pt_screen = cli_tui.PtScreen(palette=PALETTE)
     set_screen(pt_screen)
     SCREEN = pt_screen
     PALETTE = pt_screen.palette
 
-    def _tui_banner():
-        pt_screen.print_block([
-            PALETTE.paint("开始对话", PALETTE.bold),
-            "  直接输入消息，或输入 / 选择命令。",
-            PALETTE.paint("  F1 查看操作帮助 · /getchat 同步跨端历史", PALETTE.muted),
-        ])
-
-    hooks = cli_tui.TuiHooks(
-        dispatch=_dispatch_submitted,
-        banner=_tui_banner,
-        status_text=lambda: str(UserDataManager.get('default_model') or ''),
-        prompt_text=_prompt_plain,
-        command_names=_command_names,
-        describe_command=_describe_command,
-        turn_active=lambda: _turn_active,
-        request_stop=_request_stop,
-        remember_history=_remember_history,
-        history_file=str(HISTORY_FILE),
-        menu_message_id=_active_menu_message_id,
-    )
+    hooks = _build_tui_hooks()
 
     async def _run():
         await _init_runtime()
@@ -1639,7 +1801,22 @@ def _run_tui_main() -> None:
     print("再见。")
 
 
+def _configure_frontend_args(args=None):
+    import argparse
+    parser = argparse.ArgumentParser(description='XGent 终端：独立会话、共享历史与模型引擎')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--tui', action='store_true', help='使用全屏 TUI（需要交互终端）')
+    mode.add_argument('--no-tui', action='store_true', help='使用行式 CLI')
+    selected = parser.parse_args(args)
+    if selected.tui:
+        os.environ['XGENT_CLI_TUI'] = '1'
+        os.environ.pop('XGENT_CLI_NO_TUI', None)
+    elif selected.no_tui:
+        os.environ['XGENT_CLI_NO_TUI'] = '1'
+
+
 def main() -> None:
+    _configure_frontend_args()
     _quiet_console_logging()
 
     # 全屏 TUI 严格 opt-in（XGENT_CLI_TUI + pt 可用 + 双向 TTY）。不满足一律

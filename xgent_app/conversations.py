@@ -196,6 +196,32 @@ class ConversationManager:
         self._run_id = None
         self._admission_lock = asyncio.Lock()
         self.maintenance = None
+        self.terminal_enabled = False
+        self._terminal_id = None
+        self._terminal_revision = 0
+
+    async def enable_terminal(self):
+        """One selection per CLI process; never persisted as a shared global pointer."""
+        if not self.terminal_enabled:
+            db = await self.factory()
+            state = await db.get_conversation_state()
+            if not self.terminal_enabled:
+                self._terminal_id = state['current_chat_id']
+                self.terminal_enabled = True
+        return await self.state()
+
+    async def _terminal_state(self, state):
+        if self.terminal_enabled:
+            if self._terminal_id is not None:
+                db = await self.factory()
+                checked_id = self._terminal_id
+                session = await db.get_session(checked_id)
+                if checked_id == self._terminal_id and (session is None or session.get('archived') or session.get('deleting')):
+                    self._terminal_id = None
+                    self._terminal_revision += 1
+            state = {**state, 'terminal_conversation_id': self._terminal_id,
+                     'terminal_revision': self._terminal_revision}
+        return state
 
     async def state(self):
         db = await self.factory()
@@ -204,15 +230,21 @@ class ConversationManager:
         if state.get('running') and not self.lock.busy():
             await db.finish_conversation_run(state['running']['run_id'])
             state['running'] = None
-        return state
+        return await self._terminal_state(state)
 
     async def resolve(self, conversation_id=None, *, expected=False, allow_archived=False, selector=None):
         db = await self.factory()
         state = await db.get_conversation_state()
         from xgent_app.interaction import identity, selection_key
-        active = state.get(selection_key(selector))
+        key = selection_key(selector)
+        if key == 'terminal_conversation_id':
+            if not self.terminal_enabled:
+                await self.enable_terminal()
+            state = await self._terminal_state(state)
+        active = state.get(key)
         if conversation_id is None and active is None:
-            raise ConversationChanged('请先选择或新建 Bot 对话；本次内容尚未提交。')
+            subject = '终端' if key == 'terminal_conversation_id' else 'Bot'
+            raise ConversationChanged(f'请先选择或新建{subject}对话；本次内容尚未提交。')
         cid = str(conversation_id or active)
         if expected and cid != active:
             raise ConversationChanged('当前会话已在另一端切换，请确认后重新发送；内容尚未提交。')
@@ -319,8 +351,23 @@ class ConversationManager:
         db = await self.factory()
         from xgent_app.interaction import selection_key
         key = selection_key(selector)
-        result = await db.manage_conversation(action, conversation_id, name,
-                                               selector='telegram' if key == 'telegram_conversation_id' else 'shared')
+        if key == 'terminal_conversation_id':
+            await self.enable_terminal()
+            cid = conversation_id or self._terminal_id
+            if action == 'switch':
+                await self.resolve(cid, selector='terminal')
+                self._terminal_id = cid
+                self._terminal_revision += 1
+                result = {'ok': True, 'conversation_id': cid}
+            else:
+                result = await db.manage_conversation(action, cid, name, select=False)
+                if action == 'create':
+                    self._terminal_id = result['conversation_id']
+                    self._terminal_revision += 1
+            result = {**result, **await self.state()}
+        else:
+            result = await db.manage_conversation(action, conversation_id, name,
+                selector='telegram' if key == 'telegram_conversation_id' else 'shared')
         await self.poll_once()
         return result
 

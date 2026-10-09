@@ -2174,7 +2174,9 @@ def short_hash(s: str) -> str:
 
 
 async def _conversation_state_changed(state):
-    for key, side in (('current_chat_id', 'shared'), ('telegram_conversation_id', 'telegram')):
+    terminal = get_conversations().terminal_enabled
+    choices = (('terminal_conversation_id', 'terminal'),) if terminal else (('current_chat_id', 'shared'), ('telegram_conversation_id', 'telegram'))
+    for key, side in choices:
         previous = UserDataManager.get(key)
         selected = state.get(key)
         UserDataManager.set(key, selected)

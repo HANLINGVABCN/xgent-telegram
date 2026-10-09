@@ -2118,7 +2118,7 @@ class UserDataManager:
     def bind_ui_state(cls):
         """Validate workflow identity once at user admission, never on background reads."""
         from xgent_app.interaction import selection_key
-        side = 'telegram' if selection_key() == 'telegram_conversation_id' else 'shared'
+        side = {'telegram_conversation_id': 'telegram', 'terminal_conversation_id': 'terminal'}.get(selection_key(), 'shared')
         data = cls.ui_data(side)
         scope = current_scope()
         identity = (scope.conversation_id, scope.generation)

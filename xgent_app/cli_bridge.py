@@ -617,7 +617,7 @@ class CliBot:
         编辑那一刻从"◇ 命令 + 灰底"翻成"◆ XGent 双横线块"，中途换皮。
         """
         kind = _render_kind_for(text)
-        if not conversation_visible():
+        if not conversation_visible() and not getattr(self.screen, 'conversation_routing', False):
             return [], kind
         renderer = self._renderer()
         if kind == "token":
@@ -649,6 +649,8 @@ class CliBot:
                                     leading_blank=False)
         else:
             self.screen.print_block(lines, message_id=message_id)
+        if hasattr(self.screen, 'tag_menu'):
+            self.screen.tag_menu(message_id, bool(split_control_buttons(buttons)[0]), split_control_buttons(buttons)[0])
         _register_menu(message_id, split_control_buttons(buttons)[0], is_edit=False)
         _RELAY.emit(
             "send_message", message_id=message_id, text=str(text),
@@ -680,6 +682,8 @@ class CliBot:
         lines, _kind = self._render_by_kind(str(text), buttons, parse_mode)
         if lines and not self.screen.update_block(lines, target_id):
             self.screen.print_block(lines, message_id=target_id)
+        if hasattr(self.screen, 'tag_menu'):
+            self.screen.tag_menu(target_id, bool(split_control_buttons(buttons)[0]), split_control_buttons(buttons)[0])
         _register_menu(target_id, split_control_buttons(buttons)[0], is_edit=True)
         _RELAY.emit(
             "edit_message_text", message_id=target_id, text=str(text),
@@ -696,10 +700,12 @@ class CliBot:
         reply_markup = bind_callback_markup(reply_markup)
         buttons = buttons_from_markup(reply_markup)
         menu_buttons, hints = split_control_buttons(buttons)
+        if hasattr(self.screen, 'tag_menu'):
+            self.screen.tag_menu(target_id, bool(menu_buttons), menu_buttons)
         _register_menu(target_id, menu_buttons, is_edit=True)
         _RELAY.emit("edit_message_reply_markup", message_id=target_id,
                     reply_markup=_markup_to_frame(reply_markup))
-        if not buttons or not conversation_visible():
+        if not buttons or (not conversation_visible() and not getattr(self.screen, 'conversation_routing', False)):
             return True
         renderer = self._renderer()
         lines = renderer.render_buttons(menu_buttons) + renderer.render_hints(hints)
@@ -715,6 +721,10 @@ class CliBot:
         # CLI 没有对应物就降级为空操作"的取舍。但中继照发：Telegram/网页
         # 删得掉，"带停止按钮的占位消息跑完就消失"靠的正是这一条。
         _register_menu(int(message_id or 0), (), is_edit=True)
+        if hasattr(self.screen, 'tag_menu'):
+            self.screen.tag_menu(int(message_id or 0), False)
+        if hasattr(self.screen, 'delete_block'):
+            self.screen.delete_block(int(message_id or 0))
         _RELAY.emit("delete_message", message_id=int(message_id or 0))
         return True
 

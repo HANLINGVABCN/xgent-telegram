@@ -290,6 +290,17 @@ class MessageModel:
         self._touch()
         return True
 
+    def retain(self, ordered_keys):
+        """Reconcile a history window while preserving blocks, expansion and caches."""
+        items = [self._keyed[key] for key in ordered_keys if key in self._keyed]
+        if [m.key for m in items] == [m.key for m in self.messages]:
+            return
+        self.messages = items
+        self._keyed = {m.key: m for m in items}
+        self._index = {m.message_id: m for m in items if m.message_id is not None}
+        self._counts_cache = tuple(sum(m.fold_counts[i] for m in items) for i in range(2))
+        self._touch()
+
     def _block(self, target: ToggleTarget) -> Optional[Block]:
         if target is None:
             return None
@@ -503,8 +514,120 @@ class PtScreen:
             self.palette.user = self.palette.code = ""
         self._forced_width = width
         self.model = MessageModel(self.palette, preview_lines=0)
+        self.conversation_routing = False
+        self.conversation_id = None
+        self.generation = None
+        self._models = {None: self.model}
+        self._live_runs = {}
+        self._history = {}
+        self._menus = {}
+        self._forms = {}
+        self.flash_text = ''
+        self.flash_until = 0.0
+        self.on_conversations = lambda: None
         # 挂上 App 后指向重画回调；未挂时空操作，便于单测。
         self.on_change: Callable[[], None] = lambda: None
+
+    def _target(self):
+        if self.conversation_routing:
+            from xgent_app.conversations import current_scope
+            scope = current_scope(required=False)
+            cid = scope.conversation_id if scope is not None else self.conversation_id
+        else:
+            cid = self.conversation_id
+        return cid, self._models.setdefault(cid, MessageModel(self.palette, preview_lines=0))
+
+    def select_conversation(self, cid, generation=None):
+        changed = self.conversation_id != cid or self.generation != generation
+        if changed:
+            from .cli_bridge import dismiss_menu
+            dismiss_menu()
+        if self.conversation_id != cid:
+            old = self._models.get(self.conversation_id)
+            if old is not None:
+                old.retain([m.key for m in old.messages if m.key not in self._menus.get(self.conversation_id, set())
+                            or m.key in self._forms.get(self.conversation_id, {})])
+            self.conversation_id = cid
+            self.model = self._models.setdefault(cid, MessageModel(self.palette, preview_lines=0))
+        self.generation = generation
+        if changed and cid is not None:
+            from .cli_bridge import _register_menu
+            from .conversations import ConversationScope, bind_conversation
+            for mid, (form_generation, buttons) in list(self._forms.get(cid, {}).items()):
+                if form_generation != generation:
+                    self.model.remove(mid)
+                    self._forms[cid].pop(mid, None)
+                else:
+                    with bind_conversation(ConversationScope(cid, generation)):
+                        _register_menu(mid, buttons)
+        self.on_change()
+
+    def drop_conversations(self, existing):
+        for cid in list(self._models):
+            if cid is not None and cid not in existing:
+                self._models.pop(cid, None)
+                self._history.pop(cid, None)
+                self._live_runs.pop(cid, None)
+                self._menus.pop(cid, None)
+                self._forms.pop(cid, None)
+
+    def replace_history(self, cid, records):
+        model = self._models.setdefault(cid, MessageModel(self.palette, preview_lines=0))
+        known = self._history.setdefault(cid, {})
+        keys = []
+        for key, lines, fingerprint in records:
+            if not lines:
+                continue
+            keys.append(key)
+            if known.get(key) != fingerprint or not model.has(key):
+                model.upsert(key, lines)
+            known[key] = fingerprint
+        local = [m.key for m in model.messages if m.key not in known]
+        model.retain(keys + local)
+        self._history[cid] = {key: known[key] for key in keys}
+        self.on_change()
+
+    def finish_run(self, cid, run_id):
+        model = self._models.get(cid)
+        if model is None:
+            return
+        runs = self._live_runs.setdefault(cid, {})
+        removed = {key for key, value in runs.items() if value == run_id}
+        model.retain([m.key for m in model.messages if m.key not in removed or m.key in self._menus.get(cid, set())])
+        for key in removed:
+            runs.pop(key, None)
+        self.on_change()
+
+    def tag_menu(self, message_id, present, buttons=()):
+        cid, _ = self._target()
+        values = self._menus.setdefault(cid, set())
+        (values.add if present else values.discard)(message_id)
+        forms = self._forms.setdefault(cid, {})
+        if not present:
+            forms.pop(message_id, None)
+        else:
+            from .ui_history import resolve_callback
+            from .conversations import current_scope
+            for _, action in buttons:
+                try:
+                    action = resolve_callback(action)
+                except Exception:
+                    continue
+                if str(action).split(':', 1)[0] in {'asks','askm','asko','askk','askd','askx'}:
+                    scope = current_scope(required=False)
+                    forms[message_id] = (scope.generation if scope else self.generation, tuple(buttons))
+                    break
+
+    def delete_block(self, message_id):
+        _, model = self._target()
+        removed = model.remove(message_id)
+        if removed:
+            self.on_change()
+        return removed
+
+    def flash(self, text, seconds=4):
+        self.flash_text, self.flash_until = str(text), time.monotonic() + seconds
+        self.on_change()
 
     @property
     def width(self) -> int:
@@ -522,19 +645,24 @@ class PtScreen:
 
     def print_block(self, lines: Sequence[str], message_id: Optional[int] = None,
                     leading_blank: bool = True) -> None:
-        self.model.upsert(message_id, list(lines), leading_blank)
+        cid, model = self._target()
+        model.upsert(message_id, list(lines), leading_blank)
+        if self.conversation_routing:
+            from xgent_app.conversations import current_scope
+            scope = current_scope(required=False)
+            if scope is not None and scope.run_id:
+                self._live_runs.setdefault(cid, {})[model.messages[-1].key if message_id is None else message_id] = scope.run_id
         self.on_change()
 
     def update_block(self, lines: Sequence[str], message_id: int) -> bool:
-        if not self.model.has(message_id):
+        _, model = self._target()
+        if not model.has(message_id):
             return False
-        self.model.upsert(message_id, list(lines))
-        self.on_change()
+        self.print_block(lines, message_id)
         return True
 
     def print_plain(self, text: str = "") -> None:
-        self.model.upsert(None, [text], leading_blank=False)
-        self.on_change()
+        self.print_block([text], leading_blank=False)
 
     def notice(self, text: str, level: str = "info") -> None:
         pal = self.palette
@@ -569,6 +697,48 @@ class TuiHooks:
     history_file: Optional[str] = None
     status_text: Callable[[], str] = lambda: ""
     menu_message_id: Callable[[], Optional[int]] = lambda: None   # 当前菜单留在实时区原地更新
+    conversation: Callable[[], dict] = lambda: {}
+    conversation_items: Callable[[], Sequence[dict]] = lambda: ()
+    manage_conversation: Optional[Callable[..., Any]] = None
+    dispatch_scoped: Optional[Callable[..., Any]] = None
+    allow_busy_input: Callable[[str], bool] = lambda _text: False
+    load_older: Optional[Callable[[], Any]] = None
+    running: Callable[[], dict] = lambda: {}
+    completed: Callable[[], dict] = lambda: {}
+
+
+def fit_title(text, width):
+    """One safe terminal line, measured in cells rather than Python characters."""
+    from wcwidth import wcwidth
+    clean = ''.join(ch for ch in _strip_ansi(str(text)) if ch.isprintable())
+    if width <= 0:
+        return ''
+    used, result = 0, []
+    for ch in clean:
+        size = max(0, wcwidth(ch))
+        if used + size > width:
+            while result and used > width - 1:
+                used -= max(0, wcwidth(result.pop()))
+            return ''.join(result) + '…'
+        used += size
+        result.append(ch)
+    return clean
+
+
+def title_fragments(conversation, model, columns, busy=False):
+    from wcwidth import wcswidth
+    columns = max(1, int(columns))
+    icon = '⠧' if busy else '☰'
+    overhead = max(0, wcswidth(' ' + icon + ' ')) + 2
+    if columns <= overhead + 2:
+        return [('class:title.name', fit_title(conversation or 'xgent', columns))]
+    left_budget = max(1, (columns - overhead) // 2)
+    right_budget = max(0, columns - left_budget - overhead)
+    left = fit_title(conversation or '选择对话', left_budget)
+    right = fit_title(model or '未设置模型', right_budget)
+    prefix = ' ' + icon + ' ' + left
+    gap = max(1, columns - max(0, wcswidth(prefix)) - max(0, wcswidth(right)) - 1)
+    return [('class:title.name', prefix), ('class:title', ' ' * gap), ('class:title.model', right + ' ')]
 
 
 def _env_truthy(value: Optional[str]) -> bool:
@@ -709,7 +879,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
     app_ref: List[Any] = []
     state: Dict[str, Any] = {
         "sel": None,          # 浏览态选中的折叠块；None = 不在浏览态
-        "busy": False,        # 本地提交的一轮进行中
+        "busy": 0,            # In-flight local submissions; management can run beside one model turn.
         "exit_armed": 0.0,    # 空闲 Ctrl+C 第一次按下的时间
         "mouse": True,        # 接管鼠标：点击展开、滚轮滚动、自制拖选复制；F2 让给终端原生选择
         "flash": "",          # 底栏临时提示
@@ -943,7 +1113,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
         return out
 
     def _rows():
-        key = (model.revision, state["sel"])
+        key = (id(model), model.revision, state["sel"])
         if frag_cache["key"] != key:
             frag_cache.update(key=key, rows=model.render_rows(state["sel"]))
         return frag_cache
@@ -1076,6 +1246,49 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
         height=D(min=1, max=6), get_line_prefix=_prefix, wrap_lines=True,
         dont_extend_height=True)
 
+    # Drafts and scroll belong to the selected view, not to the shared config.
+    view = {'id': hooks.conversation().get('conversation_id'), 'binding': dict(hooks.conversation()), 'changing': False}
+    drafts = {}
+    scroll_positions = {}
+
+    def _remember_draft(_=None):
+        if view['changing']:
+            return
+        if not input_buffer.text:
+            view['binding'] = dict(hooks.conversation())
+        drafts[view['id']] = (input_buffer.text, input_buffer.cursor_position, dict(view['binding']))
+
+    input_buffer.on_text_changed += _remember_draft
+    input_buffer.on_cursor_position_changed += _remember_draft
+
+    def _sync_view():
+        nonlocal model
+        snapshot = hooks.conversation()
+        cid = snapshot.get('conversation_id')
+        if cid == view['id'] and model is screen.model:
+            if not input_buffer.text:
+                view['binding'] = dict(snapshot)
+            return
+        _remember_draft()
+        scroll_positions[view['id']] = (output_window.vertical_scroll, output_window.follow)
+        view['changing'] = True
+        try:
+            view['id'] = cid
+            text, cursor, binding = drafts.get(cid, ('', 0, dict(snapshot)))
+            view['binding'] = dict(binding)
+            input_buffer.set_document(Document(text, min(cursor, len(text))))
+            model = screen.model
+            state['sel'] = None
+            state['archive'] = False
+            archive_state['generation'] += 1
+            drag.update(anchor=None, end=None, active=False, moved=False, edge=0)
+            top, follow = scroll_positions.get(cid, (0, True))
+            output_window.vertical_scroll = top
+            output_window.follow = follow
+            frag_cache['key'] = None
+        finally:
+            view['changing'] = False
+
     # -- 顶栏 / 分隔 / 底栏 ---------------------------------------------------
     def _columns() -> int:
         try:
@@ -1084,29 +1297,13 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
             return 80
 
     def _status_bar():
-        columns = _columns()
-        left = [("class:title.name", " xgent ")]
-        if columns >= 60:
-            try:
-                context = str(hooks.status_text() or "").replace("\n", " ")[:40]
-            except Exception:
-                context = ""
-            if context:
-                left.append(("class:title", " · " + context + " "))
-        if _busy():
-            frame = _SPINNER[int(time.monotonic() * 10) % len(_SPINNER)]
-            right = [("class:title.busy", f"{frame} 生成中 ")]
-        else:
-            right = [("class:title.ok", "● 就绪 ")]
-        if not output_window.follow and columns >= 50:
-            right.insert(0, ("class:title", "Ctrl+End 回到最新  "))
-        if not state["mouse"] and columns >= 70:
-            right.insert(0, ("class:title", "原生选择  "))
-        # 状态不能挤掉右侧的运行/停止反馈。
-        while len(left) > 1 and fragment_list_width(left + right) >= columns:
-            left.pop()
-        pad = max(1, columns - fragment_list_width(left + right))
-        return left + [("class:title", " " * pad)] + right
+        try:
+            snapshot = hooks.conversation()
+            name = snapshot.get('name') or 'xgent'
+            model_name = hooks.status_text()
+        except Exception:
+            name, model_name = 'xgent', ''
+        return title_fragments(name, model_name, _columns(), _busy())
 
     def _mode() -> str:
         if state["archive"]:
@@ -1124,9 +1321,16 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
         return "input"
 
     def _hint_bar():
+        if screen.flash_text and time.monotonic() < screen.flash_until:
+            return [('class:hint.flash', ' ' + fit_title(screen.flash_text, _columns() - 1))]
         if state["flash"] and time.monotonic() < state["flash_until"]:
             return [("class:hint.flash", " " + state["flash"])]
-        return [("class:hint", " " + compact_hint_text(_mode()))]
+        running = hooks.running() or {}
+        current = hooks.conversation().get('conversation_id')
+        if running and running.get('conversation_id') != current:
+            return [('class:hint', ' ' + fit_title('后台：' + str(running.get('name') or '其他对话') + ' · 运行中 · F4 对话', _columns() - 1))]
+        extra = 'F4 对话 · F5 更早 · ' if hooks.manage_conversation is not None else ''
+        return [("class:hint", " " + fit_title(extra + compact_hint_text(_mode()), _columns() - 1))]
 
     def _input_rule():
         typing = bool(app_ref) and app_ref[0].layout.has_focus(input_window)
@@ -1137,7 +1341,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
 
     up_edge, down_edge = _edge_handler(-1), _edge_handler(1)
     status_window = Window(FormattedTextControl(
-        lambda: [(st, t, up_edge) for st, t, *_ in _status_bar()]), height=1, style="class:title")
+        lambda: [(st, t, (lambda ev: screen.on_conversations() if ev.event_type == MouseEventType.MOUSE_UP and not drag['active'] else up_edge(ev))) for st, t, *_ in _status_bar()]), height=1, style="class:title")
     rule_window = Window(FormattedTextControl(
         lambda: [(st, t, down_edge) for st, t, *_ in _input_rule()]), height=1)
     hint_window = Window(FormattedTextControl(_hint_bar), height=1, style="class:hint")
@@ -1150,6 +1354,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
             " 浏览：Enter 折叠 · y/Y 复制\n"
             " PgUp/PgDn 翻页 · Ctrl+Home/End 首尾\n"
             " Ctrl+O 最近工具 · F2 原生选择\n"
+            " F4 对话管理 · F5 更早历史\n"
             " F3 输出存档 · F5/F6 存档翻页\n"
             " 鼠标：滚轮翻页 · 拖选复制"),
             height=D(min=1, max=10), dont_extend_height=True,
@@ -1230,6 +1435,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
 
     @kb.add("enter", filter=in_input)
     def _submit(event):
+        _sync_view()
         buf = input_buffer
         if buf.complete_state and buf.complete_state.current_completion:
             buf.apply_completion(buf.complete_state.current_completion)
@@ -1238,34 +1444,75 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
         if not text.strip():
             buf.reset()
             return
-        if _busy():
-            _flash("还在生成中：草稿已保留，Ctrl+C 可中断当前回答")
+        if _busy() and not hooks.allow_busy_input(text):
+            _flash("还在生成中：草稿已保留，F4 可切换对话，Ctrl+C 可停止")
             return
-        buf.append_to_history()
-        try:
-            hooks.remember_history(text)
-        except Exception:
-            pass
-        buf.reset()
-        state["busy"] = True
-        output_window.follow = True  # 发出新消息 → 回到底部跟随
+        snapshot = dict(view['binding'])
+        submitted_cid = view['id']
+        accepted = False
+        def admitted():
+            nonlocal accepted
+            if accepted:
+                return
+            accepted = True
+            try:
+                hooks.remember_history(text)
+            except Exception:
+                pass
+            if view['id'] == submitted_cid and input_buffer.text == text:
+                buf.append_to_history()
+                buf.reset()
+                output_window.follow = True
+            else:
+                old = drafts.get(submitted_cid)
+                if old and old[0] == text:
+                    drafts[submitted_cid] = ('', 0, snapshot)
+        state['busy'] += 1
 
         async def _go():
             should_exit = False
             try:
-                should_exit = bool(await hooks.dispatch(text))
-            except Exception as exc:  # 一轮内部异常不能掀翻 TUI
-                try:
-                    screen.notice(f"处理出错：{exc}", "err")
-                except Exception:
-                    pass
+                if hooks.dispatch_scoped is not None:
+                    result = await hooks.dispatch_scoped(text, snapshot, admitted)
+                    should_exit = bool(result.get('exit'))
+                    if not result.get('accepted'):
+                        _flash(result.get('error') or '尚未提交，草稿保留', 6)
+                        if result.get('reconfirm') and view['id'] == submitted_cid:
+                            view['binding'] = dict(hooks.conversation())
+                            _remember_draft()
+                else:
+                    admitted()
+                    should_exit = bool(await hooks.dispatch(text))
+            except Exception as exc:
+                _flash(f'处理出错：{exc}', 6)
             finally:
-                state["busy"] = False
+                state['busy'] = max(0, state['busy'] - 1)
                 _invalidate()
             if should_exit:
                 event.app.exit()
 
         event.app.create_background_task(_go())
+
+    @kb.add('f4')
+    def _conversations(event):
+        screen.on_conversations()
+
+    @kb.add('f5', filter=~viewing_archive)
+    def _older(event):
+        if hooks.load_older is None:
+            return
+        async def load():
+            output_window.follow = False
+            before = len(model.render_rows(None))
+            top = output_window.vertical_scroll
+            cid = view['id']
+            try:
+                await hooks.load_older()
+                if view['id'] == cid:
+                    output_window.vertical_scroll = top + max(0, len(model.render_rows(None)) - before)
+            except Exception as exc:
+                _flash(str(exc), 5)
+        event.app.create_background_task(load())
 
     @kb.add("escape", "enter", filter=in_input)
     @kb.add("c-j", filter=in_input)
@@ -1572,6 +1819,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
     style = Style.from_dict({
         "title": "#808080",
         "title.name": "#5fafff bold",
+        "title.model": "#808080",
         "title.ok": "#5faf87",
         "title.busy": "#d7af5f",
         "title.warn": "#d7af5f",
@@ -1598,8 +1846,12 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
         raise TuiUnavailable(str(exc)) from exc
     app_ref.append(app)
 
+    from .tui_conversations import ConversationPanel
+    panel = ConversationPanel(lambda: app, lambda: body, hooks, lambda: app.layout.focus(input_window))
+    screen.on_conversations = lambda: panel.close() if panel.active else panel.open()
+
     def _on_change() -> None:
-        # 新内容只在 follow 时贴底（_ScrollWindow._scroll 处理）；上滚回看时不打扰。
+        _sync_view()
         app.invalidate()
 
     async def _ticker():
@@ -1615,7 +1867,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
                 drag["end"] = (row, 0 if drag["edge"] < 0 else 10 ** 6)
                 app.invalidate()
             frame = int(time.monotonic() * 10)
-            if (_busy() or state["flash"] or state["exit_armed"]) and frame != last_frame:
+            if (_busy() or state["flash"] or state["exit_armed"] or screen.flash_until > time.monotonic()) and frame != last_frame:
                 last_frame = frame
                 if state["flash"] and time.monotonic() >= state["flash_until"]:
                     state["flash"] = ""
@@ -1647,3 +1899,4 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
     finally:
         _alt_scroll(False)
         screen.on_change = lambda: None
+        screen.on_conversations = lambda: None

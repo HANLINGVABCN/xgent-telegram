@@ -913,7 +913,8 @@ async def show_conversation_menu(update, context, *, archived=False, page=1, mes
     with bind_conversation(scope):
         if scope is not None:
             await advance_ui_generation()
-        title = f'🗂 {safe_text(scope.name)} · {scope.conversation_id[:6]}' if scope else '🗂 选择 Bot 对话'
+        title = (f'🗂 {safe_text(scope.name)} · {scope.conversation_id[:6]}' if scope else
+                 '🗂 选择 Bot 对话' if selection_key() == 'telegram_conversation_id' else '🗂 选择终端对话')
         text = f'{title}\n{"已归档" if archived else "对话列表"} · 第 {page}/{pages} 页{safe_text(note)}'
         if notice:
             text += '\n' + safe_text(notice)
