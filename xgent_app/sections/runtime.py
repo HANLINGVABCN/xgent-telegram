@@ -247,6 +247,7 @@ def build_application() -> Any:
         ("chat_model", cmd_chat_model_menu),
         ("media_model", cmd_media_model_menu),
         ("prompts", cmd_prompts_menu),
+        ("clear", cmd_delete_chat),
         ("clear_memory", cmd_delete_chat),
         ("compress", cmd_compress),
         ("depth", cmd_depth_menu),

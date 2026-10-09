@@ -451,7 +451,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     # --- 处理器 ---
 
     def _serve_workbench_asset(self, path: str) -> None:
-        allowed = {"chat.js", "chat.css", "conversations.js", "conversations.css", "workbench.js", "workbench.css", "components.js", "page-cache.js", "settings.js", "usage.js", "terminal.js", "terminal.css"}
+        allowed = {"appearance.js", "reading.css", "chat.js", "chat.css", "conversations.js", "conversations.css", "workbench.js", "workbench.css", "components.js", "page-cache.js", "settings.js", "usage.js", "terminal.js", "terminal.css"}
         name = path.removeprefix("/assets/")
         if name not in allowed:
             self._send_json({"error": "not found"}, status=404)
@@ -824,6 +824,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         options = self._conversation_arguments(data, background=str(data.get('callback_data') or '').startswith('act_stop_generation'))
         if options is None:
             return
+        request_id = data.get('request_id')
+        if request_id is not None:
+            if not isinstance(request_id,str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,80}',request_id):
+                self._send_json({'error':'无效的操作标识'},status=400)
+                return
+            options['request_id'] = request_id
         outbox = self.server.outbox  # type: ignore[attr-defined]
         if any(key in data for key in ('ui_message_id', 'revision', 'button_id')):
             ui_message_id = data.get('ui_message_id')

@@ -17,7 +17,7 @@ TELEGRAM_COMMAND_DESCRIPTIONS = (
     ("chat_model", "选择默认对话模型"),
     ("media_model", "选择默认媒体模型"),
     ("prompts", "管理提示词"),
-    ("clear_memory", "清空上下文"),
+    ("clear", "重置上下文，保留聊天历史"),
     ("compress", "压缩上下文并归档"),
     ("depth", "设置记忆深度"),
     ("params", "参数设置"),
@@ -45,8 +45,17 @@ EXTRA_COMMAND_DESCRIPTIONS = (
 )
 
 
+# 兼容命令仍可输入执行，但不重复占用菜单、补全和帮助列表。
+COMMAND_ALIASES = {"clear_memory": "clear"}
+
+
+def visible_command_names(names):
+    return [name for name in names if name not in COMMAND_ALIASES]
+
+
 def command_description(name: str) -> str:
     """命令的一句话说明；没有登记过就返回空串。"""
+    name = COMMAND_ALIASES.get(name, name)
     for command_name, description in TELEGRAM_COMMAND_DESCRIPTIONS + EXTRA_COMMAND_DESCRIPTIONS:
         if command_name == name:
             return description

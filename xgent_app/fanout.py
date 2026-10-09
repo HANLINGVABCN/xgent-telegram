@@ -177,7 +177,7 @@ class Op:
     """
 
     __slots__ = ("kind", "logical_id", "chat_id", "payload", "transient",
-                 "durable", "seq", "created_at", "row_id", "attempts", "superseded", "conversation_context")
+                 "durable", "seq", "created_at", "row_id", "attempts", "superseded", "conversation_context", "presentation_context")
 
     def __init__(self, kind: str, *, logical_id: Optional[int] = None,
                  chat_id: Optional[int] = None,
@@ -191,6 +191,8 @@ class Op:
         self.chat_id = chat_id
         self.payload = dict(payload or {})
         self.conversation_context = self.payload.pop('_conversation_context', conversation_snapshot())
+        from xgent_app.telegram_presentation import presentation_snapshot
+        self.presentation_context = self.payload.pop('_telegram_presentation', presentation_snapshot())
         self.transient = transient or {}
         self.durable = bool(durable)
         self.seq = seq
@@ -215,7 +217,7 @@ class Op:
             "kind": self.kind,
             "logical_id": self.logical_id,
             "chat_id": self.chat_id,
-            "payload": json.dumps({**self.payload, '_conversation_context': self.conversation_context}, ensure_ascii=False),
+            "payload": json.dumps({**self.payload, '_conversation_context': self.conversation_context, '_telegram_presentation': self.presentation_context}, ensure_ascii=False),
             "created_at": self.created_at,
             "seq": self.seq,
             "attempts": int(self.attempts or 0),
@@ -638,7 +640,11 @@ class ChannelWorker:
         self._deferred_rows += 1
 
     async def _deliver_one(self, op: Op, native: Optional[int]) -> Any:
-        with replay_conversation(op.conversation_context):
+        from xgent_app.conversations import conversation_still_exists
+        if not await conversation_still_exists(op.conversation_context):
+            return None
+        from xgent_app.telegram_presentation import replay_presentation
+        with replay_conversation(op.conversation_context), replay_presentation(op.presentation_context):
             if op.kind in UPLOAD_KINDS:
                 return await self._deliver(op, native)
             return await asyncio.wait_for(self._deliver(op, native), timeout=self._timeout)

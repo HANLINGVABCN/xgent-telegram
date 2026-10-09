@@ -1,9 +1,12 @@
+import './appearance.js';
 
 var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
 if (tg) { try { tg.ready(); tg.expand(); } catch (e) {} }
 
 var term = null, fit = null, sessionId = null, currentPid = null, es = null;
-var currentFontSize = window.innerWidth < 520 ? 12 : 13.5;
+var currentFontSize = 13;
+window.addEventListener('xgent-fonts-applied',e=>{currentFontSize=e.detail.web_terminal_font_size;if(term){term.options.fontSize=currentFontSize;try{fit.fit();}catch{}}});
+function saveTerminalFont(){window.XGentAppearance.save({web_terminal_font_size:currentFontSize}).catch(()=>{currentFontSize=window.XGentAppearance.state.values.web_terminal_font_size;if(term)term.options.fontSize=currentFontSize;});}
 
 function $(id) { return document.getElementById(id); }
 
@@ -286,14 +289,16 @@ Array.prototype.forEach.call(vkeys, function (k) {
 
 $('fontPlusBtn').onclick = function () {
   if (!term || currentFontSize >= 24) return;
-  currentFontSize += 1.5;
+  currentFontSize += 1;
+  saveTerminalFont();
   term.options.fontSize = currentFontSize;
   try { fit.fit(); } catch (e) {}
   updateStatus();
 };
 $('fontMinusBtn').onclick = function () {
   if (!term || currentFontSize <= 10) return;
-  currentFontSize -= 1.5;
+  currentFontSize -= 1;
+  saveTerminalFont();
   term.options.fontSize = currentFontSize;
   try { fit.fit(); } catch (e) {}
   updateStatus();
@@ -407,3 +412,5 @@ if(theme==='light'||(!theme&&!matchMedia('(prefers-color-scheme:dark)').matches)
 
 new ResizeObserver(()=>{if(fit&&term){try{fit.fit();}catch{}}}).observe($('term-wrap'));
 window.visualViewport?.addEventListener('resize',()=>{if(fit&&term){try{fit.fit();}catch{}}});
+
+window.addEventListener('message',e=>{if(e.origin!==location.origin||e.data?.type!=='xgent-fonts')return;const size=e.data.values?.web_terminal_font_size;if(Number.isInteger(size)&&size>=10&&size<=24){currentFontSize=size;if(term){term.options.fontSize=size;try{fit.fit();}catch{}}}});

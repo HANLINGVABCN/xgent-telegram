@@ -232,6 +232,8 @@ class _CliRelay:
         from xgent_app.conversations import conversation_snapshot
         snapshot = conversation_snapshot()
         payload['conversation_context'] = snapshot
+        from xgent_app.telegram_presentation import presentation_snapshot
+        payload['telegram_presentation'] = presentation_snapshot()
         from xgent_app.ui_history import relay_ui_context
         ui_context = relay_ui_context()
         if ui_context is not None:

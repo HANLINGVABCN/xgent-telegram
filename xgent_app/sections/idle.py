@@ -160,7 +160,10 @@ _web_managed_here: bool = False
 _web_config_watch_task: Optional[asyncio.Task] = None
 
 # 网页可改的参数白名单。刻意不含提供商增删改和 API Key——那些留在 Telegram 里。
+from xgent_app.web_appearance import FONT_SETTINGS, read_appearance, write_appearance
+
 WEB_EDITABLE_SETTINGS = {
+    *FONT_SETTINGS,
     'thinking_level', 'stream_mode', 'agent_mode', 'text_stitch_mode',
     'global_depth', 'agent_max_iterations', 'stream_timeout', 'chat_model',
     'disabled_skills', 'hidden_skills', 'skill_state', 'agent_command_timeout', 'idle_message_interval',
@@ -328,9 +331,11 @@ def mirror_user_line_to_telegram(text: str) -> None:
         return
     channel = telegram_channel()
     channel.ensure_started()
-    for chunk in split_text_for_telegram(text):
-        channel.offer(Op(OP_SEND, chat_id=BotConfig.AUTHORIZED_USER_ID,
-                         payload={"text": chunk}))
+    from xgent_app.telegram_presentation import telegram_label, label_enabled
+    for index, chunk in enumerate(split_text_for_telegram(text)):
+        with telegram_label(label_enabled() and index == 0):
+            channel.offer(Op(OP_SEND, chat_id=BotConfig.AUTHORIZED_USER_ID,
+                             payload={"text": chunk}))
 
 
 # 每个 CLI 会话一个 MirrorBot。它持有 CLI 的 message_id -> 真实 Telegram
@@ -380,9 +385,15 @@ async def _replay_relay_op(mirror: Any, op: str, payload: Dict[str, Any]) -> Non
     if 'conversation_context' not in payload:
         db = await BotMemoryDB.get_instance()
         session = await db.get_session('global_memory')
+        if session is None or session.get('deleting'):
+            return
         payload = {**payload, 'conversation_context': {'conversation_id': 'global_memory',
                    'generation': session['generation'], 'run_id': None, 'name': session['name']}}
-    with replay_conversation(payload.get('conversation_context')), media_presentation_scope(payload.get('media_presentation')), replay_ui_context(payload.get('ui_context')):
+    from xgent_app.conversations import conversation_still_exists
+    from xgent_app.telegram_presentation import replay_presentation
+    if not await conversation_still_exists(payload.get('conversation_context')):
+        return
+    with replay_presentation(payload.get('telegram_presentation')), replay_conversation(payload.get('conversation_context')), media_presentation_scope(payload.get('media_presentation')), replay_ui_context(payload.get('ui_context')):
         await _replay_relay_op_with_presentation(mirror, op, payload)
 
 
@@ -688,8 +699,11 @@ async def _web_read_settings() -> Dict[str, Any]:
         else str(stats_auto_merge_val).lower() in {'1', 'true', 'yes', 'on'}
     stats_metric = UserDataManager.get('stats_metric', 'token') or 'token'
 
+    appearance = await read_appearance(await BotMemoryDB.get_instance())
     return {
+        'revision': appearance['revision'],
         'values': {
+            **appearance['values'],
             'thinking_level': normalize_thinking_level(UserDataManager.get('thinking_level')),
             'stream_mode': normalize_bool(UserDataManager.get('stream_mode', True), True),
             'hide_protocol_blocks': normalize_bool(UserDataManager.get('hide_protocol_blocks', True), True),
@@ -738,6 +752,12 @@ async def _web_read_settings() -> Dict[str, Any]:
 @conversation_entry()
 async def _web_write_setting(key: str, value: Any) -> Dict[str, Any]:
     """写入前一律过 normalize_*，与 Telegram 菜单走同一套校验。"""
+    if key in FONT_SETTINGS:
+        db = await BotMemoryDB.get_instance()
+        appearance = await write_appearance(db, key, value)
+        UserDataManager.set(key, appearance['values'][key])
+        await _sync_web_appearance(db, force=True)
+        return await _web_read_settings()
     if key not in WEB_EDITABLE_SETTINGS:
         raise ValueError(f"不可修改的配置项: {key}")
 
@@ -933,7 +953,7 @@ async def _web_handle_ui_callback(ui_message_id: str, revision: int, button_id: 
             async with ui_operation(capture_text=True, binding=row, message_id=message_id):
                 await handle_button_click(update, context)
     except UiHistoryError as exc:
-        failure = await GlobalRecorder.record_error(exc, BotConfig.AUTHORIZED_USER_ID, source='web_menu')
+        failure = str(exc)  # Stale clicks are UI feedback, not conversation records.
         outbox.put({'type': 'callback_answer', 'text': failure, 'show_alert': True})
     except Exception as exc:
         logger.exception('Web saved-menu callback failed')
@@ -996,6 +1016,7 @@ def _ensure_web_command_map() -> None:
         ("chat_model", "cmd_chat_model_menu"),
         ("media_model", "cmd_media_model_menu"),
         ("prompts", "cmd_prompts_menu"),
+        ("clear", "cmd_delete_chat"),
         ("clear_memory", "cmd_delete_chat"),
         ("compress", "cmd_compress"),
         ("depth", "cmd_depth_menu"),
@@ -1262,8 +1283,11 @@ def _web_submit_upload(filename: str, content: bytes, caption: str, outbox: Any,
     )
 
 
-def _web_submit_callback(callback_data: str, message_id: int, outbox: Any, *, conversation_id=None) -> None:
+def _web_submit_callback(callback_data: str, message_id: int, outbox: Any, *, conversation_id=None, request_id=None) -> None:
     """HTTP 线程调用：把网页按钮点击丢进事件循环。"""
+    if request_id:
+        from xgent_app.web_bridge import InteractionOutbox
+        outbox = InteractionOutbox(outbox, request_id)
     loop = _web_chat_server.config.loop if _web_chat_server else None
     if loop is None:
         outbox.put({"type": "turn_error", "text": "服务未就绪"})
@@ -1273,7 +1297,10 @@ def _web_submit_callback(callback_data: str, message_id: int, outbox: Any, *, co
     )
 
 
-def _web_submit_ui_callback(ui_message_id: str, revision: int, button_id: str, outbox: Any, *, conversation_id=None) -> None:
+def _web_submit_ui_callback(ui_message_id: str, revision: int, button_id: str, outbox: Any, *, conversation_id=None, request_id=None) -> None:
+    if request_id:
+        from xgent_app.web_bridge import InteractionOutbox
+        outbox = InteractionOutbox(outbox, request_id)
     loop = _web_chat_server.config.loop if _web_chat_server else None
     if loop is None:
         outbox.put({'type': 'callback_answer', 'text': '服务未就绪', 'show_alert': True})
@@ -1641,3 +1668,16 @@ async def _web_scoped_call(coro, conversation_id, outbox, *, execution=False, re
     finally:
         if not started:
             coro.close()
+
+
+_web_appearance_revision = -1
+
+async def _sync_web_appearance(db, force=False):
+    global _web_appearance_revision
+    appearance = await read_appearance(db)
+    if force or appearance['revision'] != _web_appearance_revision:
+        _web_appearance_revision = appearance['revision']
+        frame = {'type': 'settings_state', **appearance}
+        for outbox in dict.fromkeys((get_web_outbox(), globals().get('_web_external_outbox'))):
+            if outbox is not None:
+                outbox.put(frame)

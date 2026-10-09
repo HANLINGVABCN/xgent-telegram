@@ -613,7 +613,25 @@ def _extract_rich_message_text(msg):
     logger.warning(f"_extract_rich_message_text: total len={len(result)}, paragraphs={len(paragraphs)}")
     return result
 
+def management_input_output(function):
+    @wraps(function)
+    async def wrapped(update, context):
+        if UserDataManager.get('state', BotState.IDLE) == BotState.IDLE:
+            return await function(update, context)
+        restore = None
+        if not getattr(context.bot, '_is_xgent_web_bot', False) and not getattr(context.bot, '_is_xgent_cli_bot', False):
+            restore = install_tg_to_web_mirror(context.bot, get_web_outbox() or globals().get('_web_external_outbox'))
+        try:
+            async with ui_operation(capture_text=True):
+                return await function(update, context)
+        finally:
+            if restore is not None:
+                restore()
+    return wrapped
+
+
 @conversation_entry(execution=lambda: UserDataManager.get('state', BotState.IDLE) == BotState.IDLE, guard=authorize_before_conversation)
+@management_input_output
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
         return
@@ -717,25 +735,44 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _handle_ask_text_input(update, context, state, text)
         return
 
-    # 普通聊天按拼接模式决定：直接发送，或累计到“完成”按钮后再写入记忆。
+    # Consume management values before ordinary recording/title/model admission.
+    # Only structured audit is retained; raw names, secrets and cancel are not prompts.
     if state != BotState.IDLE:
-        recorded_text = (
-            "[已填入 UPDATE_GITHUB_TOKEN，内容已隐藏]"
-            if state == BotState.SET_UPDATE_TOKEN
-            else "[已填入搜索 API Key，内容已隐藏]"
-            if state == BotState.SET_SEARCH_KEY
-            else "[已设置 Web 访问密码，内容已隐藏]"
-            if state == BotState.SET_WEB_PASSWORD
-            else "[已提交提供商配置 JSON，内容已隐藏]"
-            if state == BotState.IMPORT_PROVIDER_CONFIG
-            else "[已填入 API Key，内容已隐藏]"
-            if state in (BotState.EDIT_PROV_KEY, BotState.ADD_PROV_KEY)
-            else "[已录入表单密钥，内容已隐藏]"
-            if state == BotState.ASK_SECRET_INPUT
-            else text
-        )
-        await GlobalRecorder.record_user_message(recorded_text, MessageType.USER_TEXT, update.effective_chat.id)
-    
+        await GlobalRecorder.record_system_op('提交管理输入', {'workflow': str(state), 'ui_only': True}, update.effective_chat.id)
+
+    if state == BotState.RENAME_CHAT:
+        pending = UserDataManager.get('temp_conversation_rename') or {}
+        scope = current_scope()
+        if pending.get('conversation_id') != scope.conversation_id or pending.get('generation') != scope.generation:
+            UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('temp_conversation_rename', None)
+            await update.message.reply_text('重命名操作已过期，请重新打开 /chats；本条输入未提交给模型。')
+            return
+        from xgent_app.ui_history import saved_ui_binding, restore_ui_binding
+        with restore_ui_binding(pending.get('ui_binding')):
+            try:
+                if text.lower() == 'cancel':
+                    UserDataManager.set('state', BotState.IDLE)
+                    UserDataManager.set('temp_conversation_rename', None)
+                    await show_conversation_menu(update, context, message=pending.get('message'), notice='已取消重命名。')
+                    return
+                try:
+                    await get_conversations().manage('rename', pending['conversation_id'], text.strip())
+                except ConversationError as exc:
+                    await edit_conversation_card(update, context,
+                        f'🗂 {safe_text(scope.name)} · {scope.conversation_id[:6]}\n{safe_text(str(exc))}\n请重新输入，或 cancel 取消。',
+                        InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回', callback_data='conv_cancel_rename')]]),
+                        message=pending.get('message'))
+                    return
+                UserDataManager.set('state', BotState.IDLE)
+                UserDataManager.set('temp_conversation_rename', None)
+                await GlobalRecorder.record_system_op('会话已重命名', {'conversation_id': pending['conversation_id'], 'ui_only': True})
+                await show_conversation_menu(update, context, message=pending.get('message'), notice='🏷️ 会话已重命名。')
+                return
+
+            finally:
+                pending['ui_binding'] = saved_ui_binding()
+
     # 取消操作
     if text.lower() == 'cancel' and state != BotState.IDLE:
         UserDataManager.set('state', BotState.IDLE)
@@ -1427,15 +1464,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         models = UserDataManager.get('fetched_cache', [])
         title, kb = build_fetched_models_view(pname)
         await update.message.reply_text(title, reply_markup=kb)
-        return
-    
-    if state == BotState.RENAME_CHAT:
-        await get_conversations().manage('rename', current_scope().conversation_id, text.strip())
-        UserDataManager.set('state', BotState.IDLE)
-        await update.message.reply_text(
-            "🏷️ 会话已重命名。",
-            reply_markup=get_main_menu()
-        )
         return
     
     # --- 正常对话处理 ---

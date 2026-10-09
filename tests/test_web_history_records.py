@@ -73,8 +73,8 @@ async def main():
     print(json.dumps({
         "deliveries": deliveries, "links": len(media_before),
         "restart_equal": media_before == media_after,
-        "cleared": await ns["_web_read_history"](0) == [],
-        "revoked": await ns["_web_read_history_message"](saved_id) is None,
+        "history_retained": bool(await ns["_web_read_history"](0)),
+        "link_retained": await ns["_web_read_history_message"](saved_id) is not None,
         "originals_kept": all(Path(path).is_file() for path in paths),
         "no_fake_delivery_success": not any("\u5df2\u6210\u529f\u5bfc\u51fa" in m["content"] for m in before),
     }))
@@ -94,7 +94,7 @@ asyncio.run(run())
             for key in ("linked_before_send", "open_original", "zip_valid", "json_valid", "html_valid"):
                 self.assertTrue(delivery[key], (key, delivery["name"]))
         self.assertEqual(6, result["links"])
-        for key in ("restart_equal", "cleared", "revoked", "originals_kept", "no_fake_delivery_success"):
+        for key in ("restart_equal", "history_retained", "link_retained", "originals_kept", "no_fake_delivery_success"):
             self.assertTrue(result[key], key)
 
     def test_generated_mixed_media_has_display_order_without_new_audio_context(self):
@@ -159,12 +159,12 @@ async def main():
         while (frame := stream.get(timeout=0)) is not None:
             frames.append(frame)
     print(json.dumps({
-        "reset_first": frames[0]["type"] == "history_reset",
-        "single_reset": sum(frame["type"] == "history_reset" for frame in frames) == 1,
-        "history_cleared_with_fresh_menu": all(
-            row['msg_type'] == 'ui_message' for row in await ns['_web_read_history'](0)),
+        "reset_first": frames[0]["type"] == "context_reset",
+        "single_reset": sum(frame["type"] == "context_reset" for frame in frames) == 1,
+        "history_retained_with_fresh_menu": any(
+            row.get('id') == row_id for row in await ns['_web_read_history'](0)),
         "model_history_empty": not (await db.get_compression_snapshot())['records'],
-        "revoked": await ns["_web_read_history_message"](row_id) is None,
+        "link_retained": await ns["_web_read_history_message"](row_id) is not None,
         "original_kept": Path(saved["abs_path"]).read_bytes() == b"original",
     }))
     await db.close()
@@ -205,7 +205,7 @@ async def main():
         rejected = True
     print(json.dumps({
         "rejected": rejected, "no_model_attachment": "attachments" not in metadata,
-        "history_empty": await ns["_web_read_history"](0) == [],
+        "no_stale_result": not any(m["content"]=="old result" for m in await ns["_web_read_history"](0)),
         "original_kept": Path(saved["abs_path"]).is_file(),
     }))
     await db.close()

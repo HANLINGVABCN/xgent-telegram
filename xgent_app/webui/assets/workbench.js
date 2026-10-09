@@ -1,3 +1,4 @@
+import './appearance.js';
 import {PageCache} from './page-cache.js';
 import {$,el,button,fmt,stamp,bytes,message,empty,field,select,check,table,formData,api,wb,download,query,tag,copyText,requestId,safeLocalUrl,inlineState} from './components.js';
 const pages=[['chat','对话','M4 4h16v12H8l-4 4V4'],['tasks','任务','M8 5h12M8 12h12M8 19h12M3 5h1M3 12h1M3 19h1'],['files','文件与输出','M3 5h7l2 3h9v12H3V5'],['models','模型与技能','M12 3l9 5v8l-9 5-9-5V8l9-5M3 8l9 5 9-5M12 13v8'],['usage','用量','M4 20V10M10 20V4M16 20v-8M22 20H2'],['settings','设置','M4 6h16M4 12h16M4 18h16M9 3v6M16 9v6M8 15v6']];
@@ -74,7 +75,7 @@ function closeDetail(){state.detailRequest?.abort();$('wb-detail').hidden=true;$
 $('wb-detail-close').onclick=closeDetail;
 function errorOr(node,fn){return async()=>{try{await fn();}catch(e){showError(node,e);}};}
 async function outputViewer(path,title='输出存档',onBack){let current=0,previous=[];const area=el('div');detail(title,area);const signal=state.detailRequest.signal;async function load(offset,back){area.replaceChildren(message('正在读取存档…','loading'));try{const page=await api('/api/output/page',{data:{path,offset},signal});current=offset;previous=back;area.replaceChildren(el('p',{class:'wb-note'},`${page.filename} · ${bytes(page.offset)} — ${bytes(page.next_offset)} / ${bytes(page.size)}`),actions(button('上一页',()=>load(previous.at(-1),previous.slice(0,-1))),button('下一页',()=>load(page.next_offset,[...previous,current])),button('复制本页',()=>copyText(page.text).catch(e=>showError(area,e)))),el('pre',{class:'wb-pre'},page.text));area.querySelectorAll('button')[0].disabled=!previous.length;area.querySelectorAll('button')[1].disabled=page.eof;if(onBack)area.prepend(button('返回任务详情',onBack));}catch(e){area.replaceChildren(message(e.message),button('重试读取',()=>load(offset,back)),onBack?button('返回任务详情',onBack):null);}}await load(0,[]);}
-async function refreshBootstrap(){const epoch=state.authEpoch;const boot=await wb('bootstrap');if(epoch!==state.authEpoch)throw new DOMException('登录状态已改变','AbortError');state.boot=boot;window.XGentChat?.commands(state.boot.commands||[]);chatControls();return state.boot;}
+async function refreshBootstrap(){const epoch=state.authEpoch;const boot=await wb('bootstrap');if(epoch!==state.authEpoch)throw new DOMException('登录状态已改变','AbortError');state.boot=boot;window.XGentAppearance?.accept(boot.settings);window.XGentChat?.commands(state.boot.commands||[]);chatControls();return state.boot;}
 function chatControls(){if(!state.boot)return;window.XGentConversations?.accept(state.boot.conversations);const data=state.boot.settings;const options=data.options?.chat_model||[];const sel=el('select',{'aria-label':'对话模型'},el('option',{value:''},'选择模型'),options.map(o=>el('option',{value:o.value,selected:o.value===data.values.chat_model},o.label)));sel.onchange=()=>changeQuick('chat_model',sel.value);const agent=button(data.values.agent_mode?'Agent 开启':'Agent 关闭',()=>changeQuick('agent_mode',!data.values.agent_mode),data.values.agent_mode?'primary':'');const levels=data.options?.thinking_level||['auto','low','medium','high'];const thinking=el('select',{'aria-label':'思考深度'},levels.map(v=>el('option',{value:v.value??v,selected:(v.value??v)===data.values.thinking_level},v.label??v)));thinking.onchange=()=>changeQuick('thinking_level',thinking.value);$('wb-chat-controls').replaceChildren(sel,thinking,agent);}
 async function changeQuick(key,value){try{await wb('settings',{data:{key,value}});await refreshBootstrap();}catch(e){$('wb-history-state').textContent=e.message;}}
 function logout(){return window.XGentChat?.logout();}
@@ -109,7 +110,9 @@ async function route(){
   }
   rememberPage();
   state.request?.abort();state.renderSequence++;state.pendingKey=null;
-  state.dirty=false;state.route=next;state.retryAfter=0;
+  state.dirty=false;
+  if(state.route==='settings'&&next!=='settings')window.XGentAppearance?.cancelPreview();
+  state.route=next;state.retryAfter=0;
   state.routed=true;document.body.dataset.page=next;
   document.querySelectorAll('[data-route]').forEach(n=>{n.classList.toggle('active',n.dataset.route===next);n.setAttribute('aria-current',n.dataset.route===next?'page':'false');});
   root.hidden=next==='chat';closeDetail();
@@ -212,8 +215,8 @@ function cancelTasks(ids,after){
     ()=>wb('tasks/cancel',{data:{ids,confirm:true}}),null,after);
 }
 async function taskPage(read){
-  const status=filter('status')||'',q=filter('q')||'',kind=filter('trigger')||'';
-  const data=await read('tasks'+query({status,q,kind,offset:filter('offset')||0}));
+  const status=filter('status')||'',q=filter('q')||'',kind=filter('trigger')||'',source=filter('source')||'';
+  const data=await read('tasks'+query({status,q,kind,source_conversation_id:source,offset:filter('offset')||0}));
   const page=el('div',{class:'wb-task-page'},heading('任务中心','管理 Trigger 的计划、条件与执行结果；所有通道共享同一份任务。',
     [button('创建任务',()=>taskForm(data.timezone),'primary')]));
   const counts=data.counts||{},stats=el('div',{class:'wb-task-stats'});
@@ -229,18 +232,20 @@ async function taskPage(read){
   const change=()=>{filter('offset',0);render();};
   const statusSelect=selectFilter('status',[{value:'',label:'全部状态'},...['scheduled','pending','running','waiting_delivery','completed','failed','cancelled'].map(v=>({value:v,label:tag(v).textContent}))],'',change);
   const kindSelect=selectFilter('trigger',[{value:'',label:'全部触发方式'},{value:'once',label:'单次执行'},{value:'cron',label:'Cron 定时'},{value:'condition',label:'条件触发'},{value:'immediate',label:'立即执行'}],'',change);
-  page.append(toolbar(searchFilter('搜索任务名称、命令或 ID',change),statusSelect,kindSelect,button('刷新',()=>render())));
+  const sourceSelect=selectFilter('source',[{value:'',label:'全部来源对话'},...(data.sources||[]).map(c=>({value:c.id,label:(c.name||'新对话')+' · '+c.id.slice(0,6)+(c.archived?'（已归档）':'')}))],'',change);
+   sourceSelect.setAttribute('aria-label','任务来源对话');
+   page.append(toolbar(searchFilter('搜索任务名称、命令或 ID',change),sourceSelect,statusSelect,kindSelect,button('刷新',()=>render())));
   page.append(el('div',{class:'wb-selection-bar'},el('label',{class:'wb-check'},all,'全选本页'),selection,cancel));
   all.disabled=!data.items.some(activeTask);
   if(!data.items.length){
-    page.append(status||q||kind?empty('没有匹配的任务','试试其他状态、触发方式或关键词。',button('清除筛选',()=>{for(const k of ['status','q','trigger'])filter(k,'');filter('offset',0);render();})):
+    page.append(status||q||kind||source?empty('没有匹配的任务','试试其他状态、触发方式或关键词。',button('清除筛选',()=>{for(const k of ['status','q','trigger','source'])filter(k,'');filter('offset',0);render();})):
       empty('暂时没有任务','支持延时、指定时间、Cron 和输出条件触发。查看本页不会执行命令。',button('创建第一个任务',()=>taskForm(data.timezone),'primary')));
   }else{
     const labels=['选择','任务 / 命令','触发规则','状态','下次执行','执行次数','操作'];
     const list=table(labels,data.items.map(t=>{
       const box=el('input',{type:'checkbox',disabled:!activeTask(t),'aria-label':'选择 '+(t.summary||t.id),onchange:e=>{e.target.checked?selected.add(t.id):selected.delete(t.id);updateSelection();}});
       if(activeTask(t))boxes.push([box,t.id]);
-      const title=el('div',{class:'wb-task-title'},el('button',{class:'link',type:'button',onclick:()=>taskDetail(t.id)},t.summary||t.id),el('code',{class:'wb-task-command',title:t.command},t.command));
+      const title=el('div',{class:'wb-task-title'},el('button',{class:'link',type:'button',onclick:()=>taskDetail(t.id)},t.summary||t.id),el('small',{class:'wb-task-source'},(t.conversation_name||t.conversation_id)+' · '+t.conversation_id.slice(0,6)+(t.conversation_archived?'（已归档）':'')),el('code',{class:'wb-task-command',title:t.command},t.command));
       const rule=el('div',{},el('strong',{},triggerLabel(t)),el('small',{class:'wb-task-rule',title:t.schedule_expr||''},t.schedule_expr||(t.condition_expr?'命令启动后监控输出':'立即执行，无时间计划')),t.condition_expr?el('small',{class:'wb-task-rule',title:t.condition_expr},'条件：'+t.condition_expr):null,t.repeat?el('small',{},'命中后重复监控'):null);
       return [el('label',{class:'wb-task-select'},box),title,rule,tag(t.status),el('div',{},taskNext(t),activeTask(t)?el('small',{},t.timezone):null),
         el('div',{},fmt(t.fire_count),t.failure_count?el('small',{class:'wb-danger-text'},`失败 ${fmt(t.failure_count)} 次`):null),
@@ -258,7 +263,9 @@ async function taskPage(read){
 }
 function taskForm(timezone) {
   const zone=timezone||'Asia/Shanghai',drafts={};let currentMode;
-  const form=el('form',{},field('任务名称','task','','text','描述任务目的，便于查看执行记录'),
+  const target=window.XGentConversations?.current;
+  const targetName=document.getElementById('wb-conversation-title')?.textContent||target;
+  const form=el('form',{},el('p',{class:'wb-note'},'任务来源：'+targetName+' · '+String(target||'').slice(0,6)),field('任务名称','task','','text','描述任务目的，便于查看执行记录'),
     field('执行命令','command','','textarea','使用服务运行账号执行；不会提供沙箱隔离。'),
     select('触发方式','mode',[{value:'after',label:'延时执行'},{value:'at',label:'指定时间'},{value:'cron',label:'Cron 定时'},{value:'when',label:'输出条件触发'}],'after'));
   const schedule=el('div'),summary=el('div',{class:'wb-callout','aria-live':'polite'});
@@ -290,9 +297,9 @@ function taskForm(timezone) {
     if(!d.task.trim()||!d.command.trim())throw new Error('请填写任务名称和执行命令');
     if(!d.expression)throw new Error('请填写触发时间或条件');
     const expression=d.mode==='at'?d.expression.replace('T',' '):d.expression;
-    await wb('tasks/create',{data:{request_id:id,task:d.task,command:d.command,timezone:d.timezone,
+    await wb('tasks/create',{data:{conversation_id:target,request_id:id,task:d.task,command:d.command,timezone:d.timezone,
       [d.mode]:expression,...(d.mode==='when'?{repeat:!!d.repeat}:{})}});
-    state.dirty=false;closeDialog();for(const key of ['status','q','trigger'])filter(key,'');filter('offset',0);await render();
+    state.dirty=false;closeDialog();for(const key of ['status','q','trigger','source'])filter(key,'');filter('offset',0);await render();
   });};dialog('创建后台任务',form);
 }
 
@@ -304,7 +311,7 @@ async function taskDetail(id){
     const showRun=r=>card(taskStamp(r.started_at||r.created_at,t.timezone),tag(r.status),el('p',{class:'wb-note'},'退出码 '+(r.exit_code??'—')),
       r.error?message(r.error):null,r.output_path?button('查看完整输出',()=>outputViewer(r.output_path,'任务输出',()=>taskDetail(id))):el('pre',{class:'wb-pre'},r.output||'暂无输出'));
     box.replaceChildren(el('h2',{class:'wb-detail-filename'},t.summary||id),actions(tag(t.status),button('刷新状态',()=>taskDetail(id))),
-      el('dl',{},[['任务 ID',t.id],['触发方式',triggerLabel(t)],['计划',t.schedule_expr],['输出条件',t.condition_expr],['重复监控',t.repeat?'是':'否'],['时区',t.timezone],
+      el('dl',{},[['任务 ID',t.id],['来源对话',(t.conversation_name||t.conversation_id)+' · '+t.conversation_id.slice(0,6)+(t.conversation_archived?'（已归档）':'')],['触发方式',triggerLabel(t)],['计划',t.schedule_expr],['输出条件',t.condition_expr],['重复监控',t.repeat?'是':'否'],['时区',t.timezone],
         ['下次执行',taskNext(t)],['创建时间',taskStamp(t.created_at,t.timezone)],['执行 / 失败',`${fmt(t.fire_count)} / ${fmt(t.failure_count||0)}`]]
         .filter(([k,v])=>v!=null&&v!=='').map(([k,v])=>el('div',{class:'wb-detail-row'},el('dt',{},k),el('dd',{},v)))),
       el('h3',{class:'wb-section-title'},'执行命令'),el('pre',{class:'wb-pre'},t.command),button('复制命令',errorOr(box,async()=>{await copyText(t.command);inlineState(box,'命令已复制');})));
@@ -495,4 +502,10 @@ window.addEventListener('xgent-conversation-changed',()=>{
   state.request?.abort();state.detailRequest?.abort();state.renderSequence++;
   pageCache.clear();state.pageKey=null;state.pendingKey=null;state.retryAfter=0;
   closeDetail();if(state.route!=='chat'&&state.authenticated)render();
+});
+
+window.addEventListener('xgent-fonts-applied',()=>{
+  if(state.dirty||state.submitting)return;
+  const values=window.XGentAppearance?.state.values||{};
+  for(const input of document.querySelectorAll('.font-settings input[name]'))if(input.name in values)input.value=values[input.name];
 });

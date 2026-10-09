@@ -92,7 +92,9 @@ async def advance_ui_generation() -> None:
     if isinstance(scope, UiScope) and _factory is not None:
         db = await _factory()
         # Child tasks keep the old scope and must not inherit this explicit clear.
-        _scope.set(UiScope(await db.get_attachment_generation(), scope.capture_text))
+        generation = await db.get_attachment_generation()
+        if generation != scope.generation:
+            _scope.set(UiScope(generation, scope.capture_text))
 
 
 def active_ui_generation() -> int | None:
@@ -174,13 +176,18 @@ def durable_markup(rows: list) -> bool:
     ) for row in rows for button in row)
 
 
-def ui_record(row: dict) -> dict:
+def ui_record(row: dict, *, active_generation=None) -> dict:
     payload = json.loads(row['payload']) if isinstance(row.get('payload'), str) else row['payload']
+    readonly = active_generation is not None and row['generation'] != active_generation
+    markup = payload.get('reply_markup', [])
+    if readonly:
+        markup = [[{**b, 'callback_data': None, 'unavailable': True} if b.get('callback_data') else b for b in buttons] for buttons in markup]
     return {
+        'conversation_id': row.get('conversation_id'), 'readonly': readonly,
         'id': None, 'ui_message_id': row['ui_message_id'], 'revision': row['revision'],
         'ui_generation': row['generation'], 'timestamp': row['timestamp'],
         'msg_type': 'ui_message', 'role': 'assistant', 'content': payload.get('content', ''),
-        'parse_mode': payload.get('parse_mode'), 'reply_markup': payload.get('reply_markup', []),
+        'parse_mode': payload.get('parse_mode'), 'reply_markup': markup,
         'deleted': bool(payload.get('deleted')), 'media': [],
     }
 
@@ -273,3 +280,23 @@ def hide_audit_record(record: dict) -> bool:
         return True
     return (any(key in metadata for key in ('skill_state', 'disabled_skills', 'hidden_skills'))
             and text.startswith(('Skill \u8bbe\u7f6e\u5df2\u66f4\u65b0:', 'Skill \u72b6\u6001\u5df2\u66f4\u65b0:')))
+
+
+def saved_ui_binding():
+    """In-process workflow continuation; unlike relay context, retains card identity."""
+    scope = _scope.get()
+    if not isinstance(scope, UiScope):
+        return None
+    return {key: getattr(scope,key) for key in ('generation','capture_text','ui_message_id','message_id','revision','guard')}
+
+
+@contextlib.contextmanager
+def restore_ui_binding(binding):
+    if not binding:
+        yield
+        return
+    token = _scope.set(UiScope(**binding))
+    try:
+        yield
+    finally:
+        _scope.reset(token)

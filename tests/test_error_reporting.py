@@ -48,7 +48,7 @@ async def main():
                 h.drain_frames()
                 await h.turn('first question')
                 frames=html.unescape(json.dumps(h.drain_frames(),ensure_ascii=False))
-                rows=await h.db.get_global_messages(100)
+                rows=await h.db.get_global_messages(100, active_context=True)
                 errors=[r for r in rows if r['msg_type']=='runtime_error']
                 context=await h.db.get_conversation_messages(100)
                 assert len(errors)==1,rows
@@ -95,7 +95,7 @@ async def main():
                 h.drain_frames()
                 with patch.object(bot.ModelClient,'think_and_reply',AsyncMock(side_effect=AttachmentContextError(message))), patch.object(bot.ModelClient,'think_and_reply_stream',broken_stream):
                     await h.turn('cause failure')
-                rows=await h.db.get_global_messages(100)
+                rows=await h.db.get_global_messages(100, active_context=True)
                 errors=[r for r in rows if r['msg_type']=='runtime_error']
                 assert len(errors)==1,rows
                 row=errors[0];text=row['content'];frames=html.unescape(json.dumps(h.drain_frames(),ensure_ascii=False))
@@ -136,7 +136,7 @@ async def main():
                     AsyncMock(side_effect=slow) if case=='timeout' else AsyncMock(return_value=(None,'TUPLE ERROR') if case=='tuple' else ('',None)))
                 with patch.object(bot.ModelClient,'think_and_reply',call), patch.object(bot,'_nonstream_hard_timeout_seconds',return_value=.05):
                     await h.turn('request')
-                rows=await h.db.get_global_messages(100)
+                rows=await h.db.get_global_messages(100, active_context=True)
                 assert len([r for r in rows if r['msg_type']=='runtime_error'])==1,(case,rows)
                 assert not any(r['msg_type']=='ai_reply' for r in rows),(case,rows)
                 result[case]=True
@@ -161,7 +161,7 @@ async def main():
                 except RuntimeError:pass
             once=await bot.GlobalRecorder.record_error(error,1,source='outer')
             twice=await bot.GlobalRecorder.record_error(error,1,source='outer again')
-            rows=await h.db.get_global_messages(100)
+            rows=await h.db.get_global_messages(100, active_context=True)
             assert len([r for r in rows if r['msg_type']=='runtime_error'])==1
             await h.db.close()
             await h.db._get_conn()
@@ -173,7 +173,7 @@ async def main():
             with runtime_error_scope(1,old_generation):
                 await bot.GlobalRecorder.record_error(old_error,1)
             await bot.GlobalRecorder.record_error(old_error,1,source='outer')
-            assert not await h.db.get_global_messages(100)
+            assert not await h.db.get_conversation_messages(100)
             print(json.dumps({'deduplicated':once==twice,'restart':True,'clear_guard':True}))
 asyncio.run(main())
 ''')

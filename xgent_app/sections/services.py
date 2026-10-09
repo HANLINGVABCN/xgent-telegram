@@ -197,6 +197,8 @@ class GlobalRecorder:
             text = '⚠️ ' + text
         metadata = {**(display_metadata or {}), 'error_source': source, 'error_type': type(error).__name__ if isinstance(error, BaseException) else 'reported_error',
                     'display': {'content': '<pre>' + html.escape(text) + '</pre>', 'parse_mode': 'HTML'}}
+        if source in {'web_menu', 'workbench'}:
+            metadata['ui_only'] = True
         if context and context[0] == chat_id:
             metadata['ui_generation'] = context[1]
         try:
@@ -2192,7 +2194,10 @@ async def _conversation_state_changed(state):
 @without_ui_history
 async def _announce_conversation_switch(bot, name):
     with contextlib.suppress(Exception):
-        mirror_user_line_to_telegram(f'🗂 当前会话：{name}（三端已同步；未提交的设置输入已取消）')
+        from xgent_app.telegram_presentation import telegram_label
+        with telegram_label(False):
+            scope = current_scope()
+            mirror_user_line_to_telegram(f'🗂 {name} · {scope.conversation_id[:6]}\n已切换会话，三端同步；未提交的设置输入已取消。')
 
 
 configure_conversations(lambda: BotMemoryDB.get_instance(), BotConfig.DB_FILE, _conversation_state_changed)
@@ -2243,3 +2248,85 @@ async def _clear_current_conversation_inner():
                 _pending_text_conversations.pop(key, None)
     await advance_ui_generation()
     return counts
+
+
+from xgent_app.conversations import conversation_operation, stamp_frame
+
+_conversation_delete_tasks = {}
+
+async def _finish_conversation_deletion(cid):
+    manager = get_conversations()
+    db = await BotMemoryDB.get_instance()
+    # Only the scheduler owner can confirm that remote command processes stopped.
+    from xgent_app.conversations import ExecutionFileLock
+    if SelfTriggerManager._scheduler is None and ExecutionFileLock(str(db.db_path) + '.scheduler').busy():
+        return
+    for task in await db.list_trigger_tasks(active_only=False):
+        if task['conversation_id'] == cid:
+            await SelfTriggerManager.cancel(task['id'])
+    while True:
+        running = (await manager.state()).get('running')
+        if not running or running['conversation_id'] != cid:
+            break
+        await manager.request_stop(running['run_id'], cid)
+        await asyncio.sleep(.1)
+    SECRET_STORE.purge(cid)
+    PENDING_ASKS.purge_conversation(cid)
+    with _pending_text_conversations_lock:
+        for key, pending in list(_pending_text_conversations.items()):
+            if (pending.conversation_context or {}).get('conversation_id') == cid:
+                _pending_text_conversations.pop(key, None)
+    with _pending_album_conversations_lock:
+        for key, pending in list(_pending_album_conversations.items()):
+            if (pending.conversation_context or {}).get('conversation_id') == cid:
+                pending.closed = True
+                if pending.flush_task is not None:
+                    pending.flush_task.cancel()
+                _pending_album_conversations.pop(key, None)
+    await db.finish_conversation_delete(cid)
+    from xgent_app.web_bridge import MEDIA_TOKEN_REGISTRY
+    MEDIA_TOKEN_REGISTRY.purge_conversation(cid)
+    frame = {'type': 'conversation_deleted', 'conversation_id': cid}
+    for outbox in dict.fromkeys((get_web_outbox(), globals().get('_web_external_outbox'))):
+        if outbox is not None:
+            outbox.put(frame)
+    await manager.poll_once()
+
+async def _conversation_maintenance():
+    db = await BotMemoryDB.get_instance()
+    if '_sync_web_appearance' in globals():
+        await _sync_web_appearance(db)
+    for cid in await db.pending_conversation_deletions():
+        previous = _conversation_delete_tasks.get(cid)
+        if previous is not None and not previous.done():
+            continue
+        task = asyncio.create_task(_finish_conversation_deletion(cid), name='delete-conversation:' + cid)
+        _conversation_delete_tasks[cid] = task
+        get_conversations().track_background(task)
+        def report(done, target=cid):
+            if _conversation_delete_tasks.get(target) is done:
+                _conversation_delete_tasks.pop(target, None)
+            if not done.cancelled() and done.exception():
+                logger.error('会话删除待重试: %s', done.exception())
+        task.add_done_callback(report)
+
+async def delete_conversation(cid):
+    db = await BotMemoryDB.get_instance()
+    await db.begin_conversation_delete(cid)
+    await _conversation_maintenance()
+    await get_conversations().poll_once()
+    task = _conversation_delete_tasks.get(cid)
+    if task is not None:
+        await asyncio.wait({task}, timeout=1)
+    return {'ok': True, 'deleting': await db.get_session(cid) is not None}
+
+async def reset_conversation_context(cid):
+    async with conversation_operation(cid, fresh=True, allow_archived=True):
+        result = await clear_current_conversation()
+        for outbox in dict.fromkeys((get_web_outbox(), globals().get('_web_external_outbox'))):
+            if outbox is not None:
+                outbox.put(stamp_frame({'type': 'context_reset'}))
+    await get_conversations().poll_once()
+    return result
+
+get_conversations().maintenance = _conversation_maintenance

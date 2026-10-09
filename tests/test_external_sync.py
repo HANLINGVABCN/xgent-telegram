@@ -594,7 +594,7 @@ async def main():
         "ai_context_raw": "正文回复 **加粗**" in all_ctx,
         "display_ids": all(r.get("id") and r.get("timestamp") for r in web),
         "status_not_in_ctx": "Agent 第 1 轮" not in all_ctx,
-        "cmd_prefixed_in_ctx": "[命令] /restart" in all_ctx or "[命令]" in all_ctx,
+        "cmd_hidden_from_ctx": "[命令] /restart" not in all_ctx and "/restart" not in all_ctx,
     }))
     await db.close()
 
@@ -603,7 +603,7 @@ asyncio.run(main())
         self.assertTrue(result["cmd_hidden"], "AGENT_CMD 协议原文在显示历史里应整体隐藏")
         self.assertTrue(result["status_shown"], "落库的轮次状态行要原样显示（与 bot 界面逐字一致）")
         self.assertTrue(result["status_not_in_ctx"], "轮次状态是 UI 信息，不进 AI 上下文")
-        self.assertTrue(result["cmd_prefixed_in_ctx"], "命令记录在 AI 上下文里要带 [命令] 前缀")
+        self.assertTrue(result["cmd_hidden_from_ctx"], "菜单管理命令不能混进模型上下文")
         self.assertTrue(result["no_raw_fence"], "刷新后的显示里不允许出现协议围栏原文")
         self.assertTrue(result["no_media_prompt"], "媒体生成的完整提示词不该出现在显示里")
         self.assertTrue(result["token_gray"], "token 统计行要降级成 system 灰条")

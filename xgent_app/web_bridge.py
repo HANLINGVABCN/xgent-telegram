@@ -123,16 +123,29 @@ class MediaTokenRegistry:
         self._max_entries = max(1, int(max_entries))
         self._lock = threading.Lock()
         self._entries = collections.OrderedDict()
+        self._owners = {}
 
     def register(self, abs_path: str, filename: str) -> str:
         mime_type, _ = mimetypes.guess_type(filename or abs_path)
         token = secrets.token_urlsafe(24)
         with self._lock:
             self._entries[token] = (abs_path, filename, mime_type or "application/octet-stream")
+            from xgent_app.conversations import current_scope
+            scope = current_scope(required=False)
+            if scope is not None:
+                self._owners[token] = scope.conversation_id
             self._entries.move_to_end(token)
             while len(self._entries) > self._max_entries:
-                self._entries.popitem(last=False)
+                old, _ = self._entries.popitem(last=False)
+                self._owners.pop(old, None)
         return token
+
+    def purge_conversation(self, cid):
+        with self._lock:
+            for token, owner in list(self._owners.items()):
+                if owner == cid:
+                    self._owners.pop(token, None)
+                    self._entries.pop(token, None)
 
     def resolve(self, token: str):
         with self._lock:
@@ -223,6 +236,7 @@ class WebOutbox:
         self._lock = threading.Lock()
         self._changed = threading.Condition(self._lock)
         self._inflight = collections.OrderedDict()
+        self._deleted_conversations = set()
         self._inflight_bytes = 0
         self._queues: Dict["queue.Queue[Optional[Dict[str, Any]]]", bool] = {}
         self._closed = threading.Event()
@@ -254,6 +268,13 @@ class WebOutbox:
             return
         size = len(json.dumps(saved, ensure_ascii=False).encode('utf-8'))
         with self._lock:
+            cid = saved.get('conversation_id')
+            if saved.get('type') == 'conversation_deleted':
+                self._deleted_conversations.add(cid)
+                self._events = collections.deque((event, n) for event, n in self._events if event['frame'].get('conversation_id') != cid)
+                self._event_bytes = sum(n for _, n in self._events)
+            elif cid in self._deleted_conversations:
+                return
             if saved.get('type') == 'history_reset' and not saved.get('conversation_id'):
                 self._events.clear()
                 self._inflight.clear()
@@ -285,11 +306,11 @@ class WebOutbox:
         view; their durable counterpart is served by display history.
         """
         kind = frame.get('type')
-        if kind in {'turn_end', 'turn_error', 'generation_end', 'history_reset'}:
+        if kind in {'turn_end', 'turn_error', 'generation_end', 'history_reset', 'context_reset', 'conversation_deleted'}:
             cid, run_id = frame.get('conversation_id'), frame.get('run_id')
             for key, (saved, size) in list(self._inflight.items()):
                 if (not cid or saved.get('conversation_id') == cid) and (
-                    kind == 'history_reset' or saved.get('run_id') == run_id
+                    kind in {'history_reset', 'context_reset', 'conversation_deleted'} or saved.get('run_id') == run_id
                 ):
                     self._inflight.pop(key, None)
                     self._inflight_bytes -= size
@@ -528,6 +549,27 @@ async def emit_ui_frame(outbox: WebOutbox, chat_id: int, frame_type: str,
         outbox.put({'type': 'callback_answer', 'text': str(exc), 'show_alert': True})
         raise
     outbox.put(_present_media_frame(frame))
+
+
+class InteractionOutbox:
+    """Correlate one browser action with its UI effects without a second event stream."""
+    def __init__(self, outbox, request_id):
+        self.outbox, self.request_id = outbox, request_id
+        self.appended = False
+        self.edited_message_id = None
+
+    def __getattr__(self, key):
+        return getattr(self.outbox, key)
+
+    def put(self, frame):
+        kind = frame.get('type')
+        if kind in {'message','photo','document','user_message'}:
+            self.appended = True
+        if kind in {'edit','edit_markup'}:
+            self.edited_message_id = ('ui:' + frame['ui_message_id']) if frame.get('ui_message_id') else frame.get('message_id')
+        if kind == 'callback_done':
+            frame = {**frame, 'appended': self.appended, 'edited_message_id': self.edited_message_id}
+        self.outbox.put({**frame, 'interaction_id': self.request_id})
 
 
 class WebBot:

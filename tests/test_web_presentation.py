@@ -109,7 +109,7 @@ def test_live_refresh_and_pagination_have_identical_dom(full_output_server,reply
                         'next_cursor':None if older else 'older-page','busy':False,'ui_generation':None,
                         **({} if older else {'live':server.outbox.snapshot()})})
                 page.route('**/api/workbench/history?*',paged)
-                page.reload();page.wait_for_function('!document.getElementById("btn-send").disabled');page.locator('#wb-earlier').click()
+                page.reload();page.wait_for_function('!document.getElementById("btn-send").disabled');page.locator('#log').evaluate('(e)=>e.scrollTop=0');page.locator('#wb-earlier').click()
                 page.locator(selector).wait_for()
                 assert page.locator(selector+' .body').inner_html()==before,case['name']
                 assert page.locator(selector).get_attribute('class')==role

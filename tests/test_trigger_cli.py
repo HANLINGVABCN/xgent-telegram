@@ -19,7 +19,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 
 
-def _run_cli(args, *, workdir, chat_id="42", conversation_id="testconv", extra_env=None):
+def _run_cli(args, *, workdir, chat_id="42", conversation_id="global_memory", extra_env=None):
     env = {
         **os.environ,
         "AUTHORIZED_USER_ID": "1",
@@ -43,6 +43,7 @@ def _run_cli(args, *, workdir, chat_id="42", conversation_id="testconv", extra_e
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=120,
     )
     return proc

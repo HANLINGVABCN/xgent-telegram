@@ -122,7 +122,7 @@ async def main():
 asyncio.run(main())
 """ % USAGE)
         self.assertEqual(len(result["stats_after_clear"]), 1)
-        self.assertEqual(result["display_rows_after_clear"], 0)  # 老表显示行随对话清掉
+        self.assertEqual(result["display_rows_after_clear"], 1)  # 重置上下文保留历史提示；统计仍不重复
         records = result["records_after_clear"]
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["model"], "test-model")

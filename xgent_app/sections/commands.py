@@ -816,21 +816,42 @@ async def cmd_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_conversation_menu(update, context)
 
 
-async def show_conversation_menu(update, context, *, archived=False, page=1):
+async def edit_conversation_card(update, context, text, markup, *, message=None):
+    from xgent_app.telegram_presentation import telegram_label
+    message = message or getattr(getattr(update, 'callback_query', None), 'message', None)
+    with telegram_label(False):
+        if message is not None:
+            try:
+                await message.edit_text(text, reply_markup=markup, parse_mode=constants.ParseMode.HTML)
+                return message
+            except BadRequest as exc:
+                reason = str(exc).lower()
+                if 'message is not modified' in reason:
+                    return message
+                if not any(part in reason for part in ("message can't be edited", 'message to edit not found', 'message_id_invalid')):
+                    raise
+        return await context.bot.send_message(chat_id=update.effective_chat.id, text=text,
+                                              reply_markup=markup, parse_mode=constants.ParseMode.HTML)
+
+
+async def show_conversation_menu(update, context, *, archived=False, page=1, message=None, notice=''):
     manager = get_conversations()
     state = await manager.state()
     scope = await manager.resolve()
     db = await BotMemoryDB.get_instance()
     sessions = [item for item in await db.get_all_sessions() if bool(item['archived']) == archived]
-    pages = max(1, (len(sessions) + 7) // 8)
+    page_size = 4 if archived else 5
+    pages = max(1, (len(sessions) + page_size - 1) // page_size)
     page = max(1, min(pages, int(page)))
     rows = []
-    for session in sessions[(page - 1) * 8:page * 8]:
+    for session in sessions[(page - 1) * page_size:page * page_size]:
         cid = session['id']
         marker = '✓ ' if cid == state['current_chat_id'] else ''
         action = 'restore' if archived else 'switch'
-        rows.append([InlineKeyboardButton(marker + str(session['name'] or '新对话')[:40],
-                                          callback_data=f'conv_{action}:{cid}')])
+        entry = [InlineKeyboardButton(marker + str(session['name'] or '新对话')[:40], callback_data=f'conv_{action}:{cid}')]
+        if archived:
+            entry.append(InlineKeyboardButton('删除', callback_data=f'conv_delete:{cid}'))
+        rows.append(entry)
     navigation = []
     if page > 1:
         navigation.append(InlineKeyboardButton('◀ 上一页', callback_data=f'conv_page:{int(archived)}:{page-1}'))
@@ -838,17 +859,23 @@ async def show_conversation_menu(update, context, *, archived=False, page=1):
         navigation.append(InlineKeyboardButton('下一页 ▶', callback_data=f'conv_page:{int(archived)}:{page+1}'))
     if navigation:
         rows.append(navigation)
-    rows.extend([
-        [InlineKeyboardButton('➕ 新建会话', callback_data='conv_create'),
-         InlineKeyboardButton('🏷 重命名当前会话', callback_data='conv_rename')],
-        [InlineKeyboardButton('📦 归档当前会话', callback_data='conv_archive'),
-         InlineKeyboardButton('🗃 已归档' if not archived else '🗂 未归档',
-                              callback_data='conv_archived' if not archived else 'conv_list')],
-    ])
+    if not archived:
+        rows.extend([
+            [InlineKeyboardButton('➕ 新建会话', callback_data='conv_create'),
+             InlineKeyboardButton('🏷 重命名当前会话', callback_data='conv_rename')],
+            [InlineKeyboardButton('📦 归档当前会话', callback_data='conv_archive'),
+             InlineKeyboardButton('🗃 已归档' if not archived else '🗂 未归档',
+                                  callback_data='conv_archived' if not archived else 'conv_list')],
+        ])
+        rows.append([InlineKeyboardButton('🧹 重置上下文', callback_data=f'conv_reset:{scope.conversation_id}'),
+                     InlineKeyboardButton('🗑 删除当前会话', callback_data=f'conv_delete:{scope.conversation_id}')])
+    rows.append([InlineKeyboardButton('🔙 返回', callback_data='conv_list' if archived else 'act_main_menu')])
     running = state.get('running')
     note = f"\n⏳ {running.get('name') or running['conversation_id']} 正在执行；切换不会中断。" if running else ''
     with bind_conversation(scope):
         await advance_ui_generation()
-        await context.bot.send_message(chat_id=update.effective_chat.id,
-                                       text=f'🗂 当前会话：{scope.name} · 第 {page}/{pages} 页{note}',
-                                       reply_markup=InlineKeyboardMarkup(rows))
+        title = f'🗂 {safe_text(scope.name)} · {scope.conversation_id[:6]}'
+        text = f'{title}\n{"已归档" if archived else "对话列表"} · 第 {page}/{pages} 页{safe_text(note)}'
+        if notice:
+            text += '\n' + safe_text(notice)
+        return await edit_conversation_card(update, context, text, InlineKeyboardMarkup(rows), message=message)

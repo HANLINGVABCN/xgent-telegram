@@ -289,6 +289,11 @@ class PendingAskStore:
         """原子取出：提交/取消用它，天然防重复处理。"""
         return self._store.pop(ask_id, None)
 
+    def purge_conversation(self, conversation_id):
+        for aid, pending in list(self._store.items()):
+            if pending.conversation_id == conversation_id:
+                self._store.pop(aid, None)
+
     def purge_generation(self, generation: int) -> int:
         """清掉某个 generation 的所有挂起表单（清空上下文时调用）。"""
         victims = [aid for aid, p in self._store.items() if p.generation == generation]

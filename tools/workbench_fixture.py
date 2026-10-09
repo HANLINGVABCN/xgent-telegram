@@ -85,14 +85,17 @@ async def serve(port, count, conversation_count=0):
     service=Workbench(ns)
     async def history(limit):return (await service.handle('GET','history',{'limit':limit}))['messages']
     config=WebChatConfig(host='127.0.0.1',port=port,password_hash=hash_password('preview-only'),bot_token='',authorized_user_id=1,
-        loop=asyncio.get_running_loop(),submit_message=lambda *args:None,read_history=history,
+        loop=asyncio.get_running_loop(),submit_message=lambda *args,**kwargs:None,read_history=history,
+        submit_callback=ns['_web_submit_callback'],submit_ui_callback=ns['_web_submit_ui_callback'],submit_command=ns['_web_submit_command'],
         read_settings=ns['_web_read_settings'],write_setting=ns['_web_write_setting'],request_stop=lambda:None,is_busy=lambda:False,
         read_health=lambda:{'components':{'web':{'state':'up'},'telegram':{'state':'degraded','error':'演示：连接重试中'},'triggers':{'state':'up'}}},
         media_allowed_roots=[ns['ArtifactManager'].ROOT_DIR],is_terminal_enabled=lambda:True,workbench=service.handle)
     server=WebChatServer(config);server.start()
+    ns['_web_chat_server']=server
+    ns['get_conversations']().start()
     print(json.dumps({'url':f'http://127.0.0.1:{server._httpd.server_address[1]}','password':'preview-only'}),flush=True)
     try:await asyncio.Event().wait()
-    finally:server.stop();await db.close()
+    finally:server.stop();await ns['get_conversations']().close();await db.close()
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--port',type=int,default=0);parser.add_argument('--messages',type=int,default=4)

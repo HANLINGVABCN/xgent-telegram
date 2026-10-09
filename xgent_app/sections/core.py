@@ -801,6 +801,9 @@ def build_token_usage_message(usage: Optional[Dict[str, int]], elapsed_seconds: 
     return f"<i>{html.escape(body)}</i>"
 
 
+from xgent_app.telegram_presentation import without_conversation_label
+
+@without_conversation_label
 async def send_token_usage_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
                                    usage: Optional[Dict[str, int]], elapsed_seconds: float,
                                    token_text_sink: Optional[List[str]] = None) -> None:

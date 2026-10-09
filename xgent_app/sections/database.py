@@ -440,8 +440,9 @@ class BotMemoryDB(ConversationStore):
 
         await self.migrate_conversations()
         default_session = await self.get_session('global_memory')
-        with bind_conversation(ConversationScope('global_memory', default_session['generation'])):
-            await self._migrate_compression_seed()
+        if default_session and not default_session.get('deleting'):
+            with bind_conversation(ConversationScope('global_memory', default_session['generation'])):
+                await self._migrate_compression_seed()
         self._initialized = True
         logger.info("📚 系统记忆数据库初始化完成")
     
@@ -451,6 +452,7 @@ class BotMemoryDB(ConversationStore):
                                      metadata: Optional[Dict[str, Any]] = None,
                                      stop_event: Optional[asyncio.Event] = None) -> Optional[int]:
         """记录一条全局消息，返回新行 rowid（供 token 统计双写关联去重）。"""
+        title_changed = False
         compression = (metadata or {}).get('compression_job_id')
         ui_scoped = metadata is not None and 'ui_generation' in metadata
         auto_title = msg_type == 'user_text' and role == 'user' and not str(content).startswith(('[后台任务结果]', '[用户已取消表单]', '/'))
@@ -486,8 +488,11 @@ class BotMemoryDB(ConversationStore):
                 title = ' '.join(str(content or '').split()).strip()
                 if title:
                     title = title[:32] + ('…' if len(title) > 32 else '')
-                    await conn.execute("UPDATE chat_sessions SET name=? WHERE id=? AND (name IS NULL OR name='新对话')",
-                                       (title, session_id))
+                    changed = await conn.execute("UPDATE chat_sessions SET name=?,title_auto_pending=0 WHERE id=? AND title_auto_pending=1",
+                                                 (title, session_id))
+                    title_changed = changed.rowcount > 0
+                    if title_changed:
+                        await self._bump_conversation_revision(conn)
             if compression:
                 await conn.execute('''
                     INSERT INTO chat_messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)
@@ -499,7 +504,11 @@ class BotMemoryDB(ConversationStore):
                     await self._update_compression_notice(conn, entry)
                     if stop_event is not None and stop_event.is_set():
                         raise CompressionError('用户已停止恢复，未登记为完整压缩结果。')
-            return row_id
+        if title_changed:
+            from xgent_app.conversations import refresh_scope_name, notify_conversation_metadata
+            refresh_scope_name(title)
+            await notify_conversation_metadata(self)
+        return row_id
 
     @staticmethod
     async def _insert_global_record(conn, chat_id, user_id, msg_type, role, content, timestamp, session_id, metadata):
@@ -554,25 +563,26 @@ class BotMemoryDB(ConversationStore):
         return [dict(row) for row in rows]
     
     async def get_global_messages(self, limit: int = 50,
-                                   include_types: Optional[List[str]] = None) -> List[Dict]:
-        """获取全局消息"""
+                                   include_types: Optional[List[str]] = None, *, active_context: bool = False) -> List[Dict]:
+        """读取完整会话记录；active_context 只读当前有效范围（含 UI 类型记录）。"""
         conn = await self._get_conn()
+        start = await self._context_start(conn) if active_context else 0
         
         if include_types:
             placeholders = ','.join('?' * len(include_types))
             query = f'''
                 SELECT msg_type, role, content, timestamp, session_id, metadata 
                 FROM global_messages
-                WHERE session_id = ? AND msg_type IN ({placeholders})
+                WHERE session_id = ? AND id>=? AND msg_type IN ({placeholders})
                 ORDER BY timestamp DESC LIMIT ?
             '''
-            cursor = await conn.execute(query, (self._conversation_id(), *include_types, limit))
+            cursor = await conn.execute(query, (self._conversation_id(), start, *include_types, limit))
         else:
             cursor = await conn.execute('''
                 SELECT msg_type, role, content, timestamp, session_id, metadata 
-                FROM global_messages WHERE session_id = ?
+                FROM global_messages WHERE session_id = ? AND id>=?
                 ORDER BY timestamp DESC LIMIT ?
-            ''', (self._conversation_id(), limit,))
+            ''', (self._conversation_id(), start, limit,))
         
         rows = await cursor.fetchall()
         messages = [dict(row) for row in reversed(rows)]
@@ -586,7 +596,9 @@ class BotMemoryDB(ConversationStore):
         # Filter before applying the model-message limit: UI rows do not consume it.
         conn = await self._get_conn()
         cursor = await conn.execute("SELECT id, role, content, timestamp, msg_type, metadata "
-                                    "FROM global_messages WHERE session_id = ? ORDER BY timestamp DESC, id DESC",
+                                    "FROM global_messages WHERE session_id = ? AND id >= "
+                                    "(SELECT context_start_record_id FROM chat_sessions WHERE id=global_messages.session_id) "
+                                    "ORDER BY timestamp DESC, id DESC",
                                     (self._conversation_id(),))
         result = []
         while True:
@@ -610,6 +622,8 @@ class BotMemoryDB(ConversationStore):
         for row in rows:
             msg = dict(row)
             metadata = metadata_of(msg)
+            if not include_all and (metadata.get('ui_audit') or metadata.get('ui_only') or msg.get('msg_type') in {'button_click', 'command', 'management_input'}):
+                continue
             if not include_all and metadata.get('model_context_superseded'):
                 continue
             if not include_all and metadata.get('model_context') is not None:
@@ -683,7 +697,7 @@ class BotMemoryDB(ConversationStore):
         conn = await self._get_conn()
         cursor = await conn.execute('''
             SELECT id, chat_id, msg_type, role, content, timestamp, metadata FROM global_messages
-            WHERE session_id = ? AND ((role = 'user' AND msg_type IN (?, ?))
+            WHERE session_id = ? AND id >= (SELECT context_start_record_id FROM chat_sessions WHERE id=global_messages.session_id) AND ((role = 'user' AND msg_type IN (?, ?))
                OR (role = 'assistant' AND msg_type = ?)
                OR (role = 'media_module' AND msg_type = ?))
             ORDER BY id
@@ -694,7 +708,8 @@ class BotMemoryDB(ConversationStore):
 
     async def get_tool_context_records(self) -> List[Dict]:
         conn = await self._get_conn()
-        cursor = await conn.execute("SELECT * FROM global_messages WHERE session_id = ? AND metadata LIKE '%model_context%' "
+        cursor = await conn.execute("SELECT * FROM global_messages WHERE session_id = ? AND id >= "
+                                    "(SELECT context_start_record_id FROM chat_sessions WHERE id=global_messages.session_id) AND metadata LIKE '%model_context%' "
                                     "ORDER BY timestamp, id", (self._conversation_id(),))
         return [dict(row) for row in await cursor.fetchall()]
 
@@ -731,17 +746,29 @@ class BotMemoryDB(ConversationStore):
     async def get_attachment_generation(self) -> int:
         return await self._conversation_generation(await self._get_conn())
 
-    async def _compression_snapshot(self, conn) -> Dict[str, Any]:
-        cursor = await conn.execute('SELECT * FROM global_messages WHERE session_id = ? ORDER BY timestamp, id', (self._conversation_id(),))
+    async def _compression_snapshot(self, conn, *, full_history=False) -> Dict[str, Any]:
+        from xgent_app.compression import metadata_of
+        start = 0 if full_history else await self._context_start(conn)
+        cursor = await conn.execute('SELECT * FROM global_messages WHERE session_id = ? AND id>=? ORDER BY timestamp, id', (self._conversation_id(),start))
         records = [dict(row) for row in await cursor.fetchall()]
+        if not full_history:
+            records = [r for r in records if not (metadata_of(r).get('ui_audit') or metadata_of(r).get('ui_only')
+                       or r['msg_type'] in {'button_click','command','management_input','token_usage','agent_status'})]
         cursor = await conn.execute('SELECT * FROM chat_messages WHERE session_id = ? ORDER BY id', (self._conversation_id(),))
         mirror = [dict(row) for row in await cursor.fetchall()]
         cursor = await conn.execute('SELECT * FROM chat_sessions WHERE id = ?', (self._conversation_id(),))
         sessions = [dict(row) for row in await cursor.fetchall()]
-        cursor = await conn.execute('SELECT payload FROM context_compressions WHERE session_id = ? ORDER BY sequence', (self._conversation_id(),))
+        epoch = int(sessions[0]['context_epoch'])
+        cursor = await conn.execute('SELECT payload FROM context_compressions WHERE session_id = ?' +
+                                    ('' if full_history else ' AND context_epoch=?') + ' ORDER BY sequence',
+                                    (self._conversation_id(),) if full_history else (self._conversation_id(),epoch))
         rounds = [json.loads(row['payload']) for row in await cursor.fetchall()]
+        cursor = await conn.execute('SELECT COALESCE(MAX(sequence),0)+1 n FROM context_compressions WHERE session_id=?', (self._conversation_id(),))
+        next_sequence = int((await cursor.fetchone())['n'])
         return {
-            'conversation_id': self._conversation_id(),
+            'conversation_id': self._conversation_id(), 'context_epoch': epoch,
+            'context_start_record_id': int(sessions[0]['context_start_record_id']),
+            'next_sequence': next_sequence, 'full_history': full_history,
             'generation': await self._conversation_generation(conn),
             'records': records, 'mirror_records': mirror, 'sessions': sessions,
             'compressions': rounds,
@@ -751,10 +778,14 @@ class BotMemoryDB(ConversationStore):
         async with self._transaction() as conn:
             return await self._compression_snapshot(conn)
 
+    async def get_export_snapshot(self):
+        async with self._transaction() as conn:
+            return await self._compression_snapshot(conn, full_history=True)
+
     async def get_latest_compression(self) -> Optional[Dict[str, Any]]:
         conn = await self._get_conn()
         cursor = await conn.execute(
-            'SELECT payload FROM context_compressions WHERE session_id = ? ORDER BY sequence DESC LIMIT 1',
+            'SELECT payload FROM context_compressions WHERE session_id = ? AND context_epoch=(SELECT context_epoch FROM chat_sessions WHERE id=context_compressions.session_id) ORDER BY sequence DESC LIMIT 1',
             (self._conversation_id(),)
         )
         row = await cursor.fetchone()
@@ -779,15 +810,16 @@ class BotMemoryDB(ConversationStore):
             if self._compression_identity(await self._compression_snapshot(conn)) != self._compression_identity(snapshot):
                 raise CompressionError('导出期间对话已变化或清空，原上下文未替换，请重试。')
             entry = {
-                **bundle, 'conversation_id': self._conversation_id(), 'version': 3, 'sequence': len(snapshot['compressions']) + 1,
+                **bundle, 'conversation_id': self._conversation_id(), 'version': 3, 'sequence': snapshot.get('next_sequence', len(snapshot['compressions']) + 1),
+                'context_epoch': snapshot.get('context_epoch', 0),
                 'job_id': uuid.uuid4().hex, 'created_at': time.time(), 'status': 'pending',
                 'generation': snapshot['generation'], 'summary': '', 'error': '',
                 'source_records': snapshot['records'], 'mirror_records': snapshot['mirror_records'],
                 'sessions': snapshot['sessions'], 'chat_id': chat_id, 'src': source,
                 'provider': provider, 'model': model,
             }
-            await conn.execute('INSERT INTO context_compression_jobs (job_id, payload, session_id) VALUES (?, ?, ?)',
-                               (entry['job_id'], json.dumps(entry, ensure_ascii=False), self._conversation_id()))
+            await conn.execute('INSERT INTO context_compression_jobs (job_id, payload, session_id, context_epoch) VALUES (?, ?, ?, ?)',
+                               (entry['job_id'], json.dumps(entry, ensure_ascii=False), self._conversation_id(), entry['context_epoch']))
         return entry
 
     async def commit_compression(self, entry, summary, stop_event):
@@ -819,8 +851,8 @@ class BotMemoryDB(ConversationStore):
             current['notice_row_id'] = await self._insert_global_record(
                 conn, current['chat_id'], 0, MessageType.SYSTEM_OP, 'system', notice,
                 now, self._conversation_id(), metadata)
-            await conn.execute('INSERT INTO context_compressions (session_id, sequence, payload) VALUES (?, ?, ?)',
-                               (self._conversation_id(), current['sequence'], json.dumps(current, ensure_ascii=False)))
+            await conn.execute('INSERT INTO context_compressions (session_id, sequence, payload, context_epoch) VALUES (?, ?, ?, ?)',
+                               (self._conversation_id(), current['sequence'], json.dumps(current, ensure_ascii=False), current.get('context_epoch', 0)))
             await self._save_compression_job(conn, current)
             if stop_event.is_set():
                 raise CompressionError('用户已停止压缩，原上下文已保留。')
@@ -933,8 +965,8 @@ class BotMemoryDB(ConversationStore):
             await self._validate_conversation_write(conn)
             cursor = await conn.execute('''
                 UPDATE global_messages SET metadata = ?
-                WHERE id = ? AND metadata IS ? AND session_id = ?
-            ''', (json.dumps(metadata, ensure_ascii=False), row_id, previous, self._conversation_id()))
+                WHERE id = ? AND metadata IS ? AND session_id = ? AND id>=?
+            ''', (json.dumps(metadata, ensure_ascii=False), row_id, previous, self._conversation_id(), await self._context_start(conn)))
             return cursor.rowcount == 1
 
     async def get_display_history(self, limit: int = 50) -> List[Dict]:
@@ -952,7 +984,7 @@ class BotMemoryDB(ConversationStore):
                 WHERE session_id = ? ORDER BY timestamp ASC, id ASC
             ''', (self._conversation_id(),))
             rows = await cursor.fetchall()
-            cursor = await conn.execute('SELECT * FROM ui_messages ORDER BY timestamp, ui_message_id')
+            cursor = await conn.execute('SELECT * FROM ui_messages WHERE conversation_id=? ORDER BY timestamp, ui_message_id', (self._conversation_id(),))
             ui_rows = [dict(row) for row in await cursor.fetchall()]
             generation = await self._conversation_generation(conn)
 
@@ -975,9 +1007,7 @@ class BotMemoryDB(ConversationStore):
             result.append(msg)
         tombstones = []
         for row in ui_rows:
-            if row['generation'] != generation:
-                continue
-            item = ui_record(row)
+            item = ui_record(row, active_generation=generation)
             if item.pop('deleted'):
                 tombstones.append({key: item[key] for key in ('ui_message_id', 'revision', 'ui_generation')})
             else:
@@ -1027,6 +1057,7 @@ class BotMemoryDB(ConversationStore):
                     'revision': 0, 'timestamp': float(frame.get('ts') or time.time()),
                 }
                 payload = {}
+            row['conversation_id'] = self._conversation_id()
             if frame['type'] in {'message', 'edit'}:
                 payload.update(content=str(frame.get('text') or ''), parse_mode=frame.get('parse_mode'))
             if frame['type'] in {'message', 'edit', 'edit_markup'}:
@@ -1037,11 +1068,11 @@ class BotMemoryDB(ConversationStore):
             row['payload'] = json.dumps(payload, ensure_ascii=False)
             await conn.execute('''
                 INSERT INTO ui_messages
-                    (ui_message_id, source, chat_id, message_id, generation, revision, timestamp, payload)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (ui_message_id, source, chat_id, message_id, generation, revision, timestamp, payload, conversation_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(ui_message_id) DO UPDATE SET revision = excluded.revision, payload = excluded.payload
             ''', tuple(row[key] for key in (
-                'ui_message_id', 'source', 'chat_id', 'message_id', 'generation', 'revision', 'timestamp', 'payload',
+                'ui_message_id', 'source', 'chat_id', 'message_id', 'generation', 'revision', 'timestamp', 'payload', 'conversation_id',
             )))
             return row
 
@@ -1306,6 +1337,7 @@ class BotMemoryDB(ConversationStore):
                 now = time.time()
                 await conn.execute('INSERT INTO chat_sessions (id,name,created_at,last_active,generation) VALUES(?,?,?,?,?)',
                                    (session_id, '新对话', now, now, generation))
+                await conn.execute('UPDATE chat_sessions SET title_auto_pending=1 WHERE id=?', (session_id,))
         return session_id
 
     async def get_session(self, session_id: str) -> Optional[Dict]:
@@ -1325,6 +1357,8 @@ class BotMemoryDB(ConversationStore):
                     logger.warning(f"尝试更新非法列名: {key}，已拒绝")
                     continue
                 await conn.execute(f'UPDATE chat_sessions SET {key} = ? WHERE id = ?', (value, session_id))
+                if key == 'name':
+                    await conn.execute('UPDATE chat_sessions SET title_auto_pending=0 WHERE id=?', (session_id,))
     
     async def get_all_sessions(self) -> List[Dict]:
         """List titles are presentation-only; selecting a chat must not reorder it."""
@@ -1342,7 +1376,7 @@ class BotMemoryDB(ConversationStore):
                             ('user_text','user_file','user_photo','ai_reply','media_reply')
                           ORDER BY m.timestamp DESC, m.id DESC LIMIT 1),
                          s.created_at, s.last_active, 0) AS activity_at
-            FROM chat_sessions s ORDER BY activity_at DESC, s.id
+            FROM chat_sessions s WHERE s.deleting=0 ORDER BY activity_at DESC, s.id
         ''')
         rows = await cursor.fetchall()
         await cursor.close()
@@ -1351,7 +1385,7 @@ class BotMemoryDB(ConversationStore):
             item = dict(row)
             first = ' '.join(str(item.pop('first_user_text') or '').split()).strip()
             name = item.get('name') or '新对话'
-            item['display_title'] = (first[:32] + ('…' if len(first) > 32 else '')) if name == '新对话' and first else name
+            item['display_title'] = (first[:32] + ('…' if len(first) > 32 else '')) if item.get('title_auto_pending') and first else name
             result.append(item)
         return result
     
@@ -1380,20 +1414,24 @@ class BotMemoryDB(ConversationStore):
         return counts
 
     async def _clear_conversation_memory(self, conn, *, preserve_compressions: bool) -> Dict[str, int]:
-        cid = self._conversation_id()
-        old_generation = await self._conversation_generation(conn)
-        counts = {'chat_sessions': 0}
-        for table in ('global_messages', 'chat_messages'):
-            cursor = await conn.execute(f'SELECT COUNT(*) AS count FROM {table} WHERE session_id=?', (cid,))
-            counts[table] = int((await cursor.fetchone())['count'])
-            await conn.execute(f'DELETE FROM {table} WHERE session_id=?', (cid,))
-        await conn.execute('DELETE FROM ui_messages WHERE generation=?', (old_generation,))
-        if not preserve_compressions:
-            await conn.execute('DELETE FROM context_compressions WHERE session_id=?', (cid,))
-            await conn.execute('DELETE FROM context_compression_jobs WHERE session_id=?', (cid,))
+        cid = await self._validate_conversation_write(conn)
+        start = await self._context_start(conn)
+        cursor = await conn.execute('SELECT COUNT(*) n FROM global_messages WHERE session_id=? AND id>=?', (cid,start))
+        counts = {'global_messages': int((await cursor.fetchone())['n']), 'chat_sessions': 0}
+        cursor = await conn.execute('SELECT COUNT(*) n FROM chat_messages WHERE session_id=?', (cid,))
+        counts['chat_messages'] = int((await cursor.fetchone())['n'])
+        await conn.execute('DELETE FROM chat_messages WHERE session_id=?', (cid,))
+        cursor = await conn.execute('SELECT COALESCE(MAX(id),0)+1 n FROM global_messages')
+        boundary = int((await cursor.fetchone())['n'])
         generation = await self._allocate_conversation_generation(conn)
-        await conn.execute('UPDATE chat_sessions SET generation=?,agent_iteration=0 WHERE id=?', (generation, cid))
-        return counts
+        await conn.execute('UPDATE chat_sessions SET generation=?,agent_iteration=0,context_start_record_id=?,context_epoch=context_epoch+? WHERE id=?',
+                           (generation,boundary,0 if preserve_compressions else 1,cid))
+        await self._bump_conversation_revision(conn)
+        await self._insert_global_record(conn, 0, 0, MessageType.SYSTEM_OP, 'system',
+            '── 上下文已压缩，历史保留 ──' if preserve_compressions else '── 上下文已重置，此前消息不再提供给模型 ──',
+            time.time(), cid, {'ui_only': True, 'context_boundary': 'compression' if preserve_compressions else 'reset',
+                              'generation': generation})
+        return {**counts, 'history_preserved': True, 'generation': generation}
 
     async def add_chat_message(self, session_id: str, role: str, content: str,
                                *, attachment_generation: Optional[int] = None):
@@ -1644,7 +1682,10 @@ class BotMemoryDB(ConversationStore):
 
     # --- 持久化后台触发任务 ---
     async def create_trigger_task(self, task: Dict[str, Any]):
-        async with self._write() as conn:
+        async with self._transaction() as conn:
+            owner = await conn.execute('SELECT id FROM chat_sessions WHERE id=? AND deleting=0', (task['conversation_id'],))
+            if await owner.fetchone() is None:
+                raise ConversationError('任务来源会话已不存在，未创建任务。')
             await conn.execute('''
                 INSERT INTO trigger_tasks (
                     id, chat_id, conversation_id, command, summary, schedule_type, schedule_expr,
@@ -1699,7 +1740,7 @@ class BotMemoryDB(ConversationStore):
         assignments = ', '.join(f'{key} = ?' for key in updates)
         async with self._write() as conn:
             await conn.execute(
-                f'UPDATE trigger_tasks SET {assignments} WHERE id = ?',
+                f"UPDATE trigger_tasks SET {assignments} WHERE id = ? AND status<>'cancelled'",
                 (*updates.values(), task_id),
             )
 
@@ -1755,6 +1796,9 @@ class BotMemoryDB(ConversationStore):
                                  trigger_reason: str) -> Tuple[Dict[str, Any], bool]:
         # INSERT 之后要按 (task_id, scheduled_at) 把同一行读回来，必须同事务。
         async with self._transaction() as conn:
+            owner = await conn.execute("SELECT t.id FROM trigger_tasks t JOIN chat_sessions s ON s.id=t.conversation_id WHERE t.id=? AND t.status<>'cancelled' AND s.deleting=0", (task_id,))
+            if await owner.fetchone() is None:
+                raise ConversationError('任务已取消或来源会话已删除。')
             run_id = f"trun_{uuid.uuid4().hex[:10]}"
             now = time.time()
             cursor = await conn.execute('''

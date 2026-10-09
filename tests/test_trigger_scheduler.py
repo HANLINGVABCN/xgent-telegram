@@ -23,7 +23,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 PROBE_PREAMBLE = """
-import json, sys
+import json, sys, os
+def fail_fast(kind, value, tb):
+    sys.__excepthook__(kind, value, tb)
+    sys.stderr.flush()
+    os._exit(1)
+sys.excepthook = fail_fast
 sys.path.insert(0, %r)
 """ % str(ROOT)
 
@@ -115,7 +120,7 @@ async def main():
     # CLI 进程从不 startup：_scheduler 保持 None
     assert mgr._scheduler is None
     text = await mgr.register(
-        %r, SimpleNamespace(), 1, "conv",
+        %r, SimpleNamespace(), 1, "global_memory",
         "origin user text", "origin assistant text")
     rows = await db.list_trigger_tasks(active_only=True)
     await db.close()
@@ -149,7 +154,7 @@ async def main():
     task = {
         'id': 'trg_probe_pickup',
         'chat_id': 1,
-        'conversation_id': 'conv',
+        'conversation_id': 'global_memory',
         'command': 'echo hello',
         'summary': 'probe task',
         'schedule_type': 'once',

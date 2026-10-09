@@ -72,9 +72,9 @@ class Workbench:
         return task
 
     async def handle(self, method, resource, data):
-        navigation = resource == 'conversations' or resource.startswith('conversations/')
+        navigation = resource == 'conversations' or resource.startswith('conversations/') or resource in {'tasks','tasks/cancel'}
         cid = None if navigation else data.get('conversation_id')
-        if method != 'GET' and resource in {'memory/clear','tasks/create','tasks/cancel'} and not cid:
+        if method != 'GET' and resource in {'memory/clear','tasks/create'} and not cid:
             raise WorkbenchError('缺少目标会话，请刷新后重试。', 409)
         try:
             async with conversation_operation(cid, expected=method != 'GET' and not navigation, fresh=True):
@@ -85,12 +85,12 @@ class Workbench:
     async def _handle_scoped(self, method, resource, data):
         await self.db()
         if method == 'GET':
-            operations = {'conversations': self.conversations, 'bootstrap': self.bootstrap, 'history': self.history, 'search': self.search,
+            operations = {'conversations': self.conversations, 'conversations/delete_info': self.conversation_delete_info, 'bootstrap': self.bootstrap, 'history': self.history, 'search': self.search,
                           'tasks': self.tasks, 'artifacts': self.artifacts, 'providers': self.providers,
                           'skills': self.skills, 'usage': self.usage, 'usage/records': self.usage_records,
                           'artifacts/preview': self.artifact_preview, 'settings': self.read_settings}
         else:
-            operations = {**{f'conversations/{action}': self.conversation_action for action in ('create','switch','rename','archive','restore')},
+            operations = {**{f'conversations/{action}': self.conversation_action for action in ('create','switch','rename','archive','restore','reset_context','delete')},
                           'tasks/create': self.create_task, 'tasks/cancel': self.cancel_tasks,
                           'providers/save': self.save_provider, 'providers/delete': self.delete_provider,
                           'providers/fetch': self.fetch_models, 'providers/select': self.select_model,
@@ -128,8 +128,9 @@ class Workbench:
             if value is not missing and value is not None:
                 self.ns['UserDataManager'].set(key, value)
         settings = await self.ns['_web_read_settings']()
+        visible_names = self.ns.get('visible_command_names', lambda names: names)(self.ns['_WEB_COMMAND_MAP'])
         commands = [{'cmd': '/' + name, 'desc': self.ns['command_description'](name)}
-                    for name in sorted(self.ns['_WEB_COMMAND_MAP'], key=lambda n: (n != 'start', n))]
+                    for name in sorted(visible_names, key=lambda n: (n != 'start', n))]
         return {'settings': settings, 'commands': commands,
                 'conversations': await self.conversations({}),
                 'capabilities': {'tasks': True, 'providers': True, 'skills': True, 'usage': True, 'artifacts': True, 'shared_memory': True},
@@ -155,9 +156,9 @@ class Workbench:
         anchor = str(data.get('anchor') or '')
         if anchor:
             kind, _, key = anchor.partition(':')
-            sql = ('SELECT timestamp FROM ui_messages WHERE ui_message_id=? AND generation=?'
+            sql = ('SELECT timestamp FROM ui_messages WHERE ui_message_id=? AND conversation_id=?'
                    if kind == 'ui' else 'SELECT timestamp FROM global_messages WHERE id=? AND session_id=?')
-            cur = await conn.execute(sql, (key, generation) if kind == 'ui' else (key, current_scope().conversation_id))
+            cur = await conn.execute(sql, (key, current_scope().conversation_id))
             row = await cur.fetchone()
             await cur.close()
             if row is None: raise WorkbenchError('消息已不存在', 404)
@@ -175,7 +176,7 @@ class Workbench:
                 table = 'ui_messages' if source else 'global_messages'
                 key_column = 'ui_message_id' if source else 'id'
                 text_column = 'payload' if source else 'content'
-                where, params = (['generation=?'], [generation]) if source else (["session_id=?", "msg_type<>?"], [current_scope().conversation_id, str(self.ns['MessageType'].AGENT_CMD)])
+                where, params = (['conversation_id=?'], [current_scope().conversation_id]) if source else (["session_id=?", "msg_type<>?"], [current_scope().conversation_id, str(self.ns['MessageType'].AGENT_CMD)])
                 if boundary:
                     ts, boundary_source, key, _ = boundary
                     if source == boundary_source:
@@ -207,7 +208,7 @@ class Workbench:
                 scanned += 1
                 boundary = [row['timestamp'], row['_source'], row['_key'], generation]
                 if row['_source']:
-                    message = ui_record(row)
+                    message = ui_record(row, active_generation=generation)
                     if message.pop('deleted', False):
                         tombstones.append({k: message[k] for k in ('ui_message_id','revision','ui_generation')})
                         continue
@@ -240,7 +241,11 @@ class Workbench:
         db = await self.db(); conn = await db._get_conn(); task_id = str(data.get('id') or '')
         if task_id:
             task = await db.get_trigger_task(task_id)
-            if task is None or task['conversation_id'] != current_scope().conversation_id: raise WorkbenchError('任务不存在', 404)
+            if task is None: raise WorkbenchError('任务不存在', 404)
+            owner = await db.get_session(task['conversation_id'])
+            if owner is None or owner.get('deleting'): raise WorkbenchError('任务不存在', 404)
+            task['conversation_name'] = owner['name']
+            task['conversation_archived'] = bool(owner['archived'])
             before = data.get('before')
             boundary = json.loads(before) if before else [time.time()+1, '\uffff']
             if not isinstance(boundary,list) or len(boundary)!=2: raise WorkbenchError('运行记录游标无效')
@@ -254,9 +259,10 @@ class Workbench:
             offset = max(0, int(data.get('offset') or 0))
         except (ValueError, TypeError, OverflowError):
             raise WorkbenchError('任务分页位置无效') from None
-        clauses, params = ['conversation_id=?'], [current_scope().conversation_id]
-        if status:
-            clauses.append('status=?'); params.append(status)
+        source = str(data.get('source_conversation_id') or '')
+        clauses, params = ["conversation_id IN (SELECT id FROM chat_sessions WHERE deleting=0)"], []
+        if source and source != 'all':
+            clauses.append('conversation_id=?'); params.append(source)
         if kind == 'condition':
             clauses.append("COALESCE(condition_expr, '') != ''")
         elif kind in ('cron', 'once', 'immediate'):
@@ -268,6 +274,9 @@ class Workbench:
             pattern = '%' + search.replace('!', '!!').replace('%', '!%').replace('_', '!_') + '%'
             clauses.append("(summary LIKE ? ESCAPE '!' OR command LIKE ? ESCAPE '!' OR id LIKE ? ESCAPE '!')")
             params.extend([pattern] * 3)
+        count_clauses, count_params = list(clauses), list(params)
+        if status:
+            clauses.append('status=?'); params.append(status)
         condition = 'WHERE ' + ' AND '.join(clauses) if clauses else ''
         cur = await conn.execute(f'SELECT COUNT(*) FROM trigger_tasks {condition}', params)
         total = (await cur.fetchone())[0]; await cur.close()
@@ -275,9 +284,15 @@ class Workbench:
         offset = min(offset, max(0, (total - 1) // 50 * 50))
         cur = await conn.execute(f'SELECT * FROM trigger_tasks {condition} ORDER BY created_at DESC, id DESC LIMIT 51 OFFSET ?', (*params, offset))
         rows = [dict(r) for r in await cur.fetchall()]; await cur.close()
-        cur = await conn.execute('SELECT status, COUNT(*) AS count FROM trigger_tasks WHERE conversation_id=? GROUP BY status', (current_scope().conversation_id,))
+        cur = await conn.execute('SELECT status, COUNT(*) AS count FROM trigger_tasks WHERE ' + ' AND '.join(count_clauses) + ' GROUP BY status', count_params)
         counts = {r['status']: r['count'] for r in await cur.fetchall()}; await cur.close()
-        return {'items': rows[:50], 'offset': offset, 'total': total, 'counts': counts,
+        sources = await db.get_all_sessions()
+        owners = {item['id']: item for item in sources}
+        for task in rows:
+            owner = owners.get(task['conversation_id'], {})
+            task['conversation_name'] = owner.get('name', task['conversation_id'])
+            task['conversation_archived'] = bool(owner.get('archived'))
+        return {'sources': sources, 'source_conversation_id': source, 'items': rows[:50], 'offset': offset, 'total': total, 'counts': counts,
                 'next_offset': offset+50 if len(rows)>50 else None,
                 'timezone': self.ns['SelfTriggerManager'].DEFAULT_TIMEZONE}
 
@@ -318,8 +333,11 @@ class Workbench:
         db = await self.db()
         for task_id in ids:
             task = await db.get_trigger_task(str(task_id))
-            if task is None or task['conversation_id'] != current_scope().conversation_id:
-                raise WorkbenchError('任务不属于当前会话', 404)
+            if task is None:
+                raise WorkbenchError('任务不存在', 404)
+            owner = await db.get_session(task['conversation_id'])
+            if owner is None or owner.get('deleting'):
+                raise WorkbenchError('任务来源已不存在', 404)
         results = [await self.ns['SelfTriggerManager'].cancel(str(task_id)) for task_id in ids]
         return {'ok': True, 'messages': results}
 
@@ -647,12 +665,12 @@ class Workbench:
         self.background(apply()); return {'ok':True,'requires_login':True}
 
     async def clear_memory(self, data):
-        if data.get('confirm') != '清空当前会话':
-            raise WorkbenchError('请输入“清空当前会话”确认；其他会话不会受影响。')
+        if data.get('confirm') not in {'清空当前会话', '重置上下文'}:
+            raise WorkbenchError('请输入“重置上下文”确认；历史保留，其他会话不受影响。')
         result = await self.ns['clear_current_conversation']()
         outbox = self.ns['get_web_outbox']()
         if outbox is not None:
-            outbox.put(stamp_frame({'type': 'history_reset'}))
+            outbox.put(stamp_frame({'type': 'context_reset'}))
         return {'ok': True, 'result': result}
 
     async def artifacts(self,data):
@@ -697,5 +715,19 @@ class Workbench:
     async def conversation_action(self, data):
         if data['action'] != 'create' and not data.get('id'):
             raise WorkbenchError('缺少目标会话。', 409)
-        await get_conversations().manage(data['action'], data.get('id'), data.get('name'))
-        return await self.conversations({})
+        action = data['action']
+        result = {}
+        if action in {'reset_context','delete'}:
+            if data.get('confirm') is not True:
+                raise WorkbenchError('请确认目标会话后再操作。')
+            if action == 'delete':
+                result = await self.ns['delete_conversation'](str(data['id']))
+            else:
+                await self.ns['reset_conversation_context'](str(data['id']))
+        else:
+            await get_conversations().manage(action, data.get('id'), data.get('name'))
+        return {**await self.conversations({}), **result}
+
+    async def conversation_delete_info(self, data):
+        db = await self.db()
+        return await db.conversation_delete_info(str(data.get('id') or ''))

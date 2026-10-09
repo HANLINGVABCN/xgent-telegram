@@ -2,15 +2,23 @@ import {el,button,field,select,check,wb,message,tag} from './components.js';
 
 export async function settingsView({logout,boot,health,state,render,dialog,closeDialog,submit,dirtyForm,confirmAction,refreshBootstrap,setTheme,filter,heading,card,actions}) {
   const settings=boot.settings;
-  const page=el('div',{},heading('设置','业务设置与 Telegram、CLI 共享。外观偏好仅影响当前浏览器。',[button('退出登录',logout,'danger')]));
+  const page=el('div',{},heading('设置','业务设置与 Telegram、CLI 共享。字号保存到服务端并跨网页设备同步；主题与动效仅影响当前浏览器。',[button('退出登录',logout,'danger')]));
   const sections=[['appearance','外观'],['conversation','对话与记忆'],['agent','Agent'],['web','Web 与安全'],['health','系统状态']];
   const active=filter('section')||'appearance';
-  page.append(el('div',{class:'wb-tabs',role:'tablist'},sections.map(([id,title])=>el('button',{role:'tab','aria-selected':id===active,class:id===active?'active':'',onclick:()=>{if(state.dirty&&!confirm('尚有未保存设置，放弃修改？'))return;state.dirty=false;filter('section',id);render();}},title))));
+  page.append(el('div',{class:'wb-tabs',role:'tablist'},sections.map(([id,title])=>el('button',{role:'tab','aria-selected':id===active,class:id===active?'active':'',onclick:()=>{if(state.dirty&&!confirm('尚有未保存设置，放弃修改？'))return;state.dirty=false;if(active==='appearance'&&id!==active)window.XGentAppearance?.cancelPreview();filter('section',id);render();}},title))));
   const grid=el('div',{class:'wb-settings-grid'});
   if(active==='appearance'){
     const appearance=card('让工作台适合你的习惯',el('p',{},'桌面、手机与 Telegram 内嵌页使用同一套可访问的视觉系统。'));
     const theme=select('主题','theme',[{value:'system',label:'跟随系统'},{value:'light',label:'浅色'},{value:'dark',label:'深色'}],localStorage.getItem('xgent-theme')||'system');theme.querySelector('select').onchange=e=>setTheme(e.target.value);
     const reduce=check('减少界面动效','reduce',localStorage.getItem('xgent-reduce-motion')==='1');reduce.onchange=e=>{localStorage.setItem('xgent-reduce-motion',e.target.checked?'1':'0');document.body.classList.toggle('wb-reduce-motion',e.target.checked);};
+    const fonts=window.XGentAppearance, fontForm=el('form',{class:'font-settings'});
+    const fontKeys=[['web_message_font_size','消息字号'],['web_ui_font_size','界面字号'],['web_terminal_font_size','网页终端字号']];
+    for(const [key,label] of fontKeys){const control=field(label+'（px）',key,fonts.state.values[key],'number');const input=control.querySelector('input');[input.min,input.max]=fonts.limits[key];input.step='1';fontForm.append(control);}
+    const preview=el('div',{class:'font-preview'},'消息预览：中文、English、12345。',el('br'),el('code',{},'代码与表格跟随消息字号。'));
+    const feedback=el('div');fontForm.append(preview,feedback,actions(button('恢复默认',()=>{for(const [key] of fontKeys)fontForm.elements[key].value=fonts.defaults[key];state.dirty=true;fonts.preview(fonts.defaults);}),button('取消预览',()=>{fonts.cancelPreview();for(const [key] of fontKeys)fontForm.elements[key].value=fonts.state.values[key];state.dirty=false;}),el('button',{class:'wb-btn primary',type:'submit'},'保存字号')));
+    dirtyForm(fontForm);fontForm.addEventListener('input',()=>{const values={};for(const [key] of fontKeys){const n=Number(fontForm.elements[key].value),[min,max]=fonts.limits[key];if(Number.isInteger(n)&&n>=min&&n<=max)values[key]=n;}fonts.preview(values);});
+    fontForm.onsubmit=e=>{e.preventDefault();submit(fontForm,async d=>{await fonts.save(Object.fromEntries(fontKeys.map(([key])=>[key,Number(d[key])])));feedback.replaceChildren(message('字号已保存，其他网页设备同步生效。','success'));});};
+    appearance.append(fontForm);
     appearance.append(theme,reduce,button('重置布局宽度',()=>{localStorage.removeItem('xgent-detail-width');document.documentElement.style.setProperty('--detail-width','440px');}));
     grid.append(appearance,card('快捷操作',el('dl',{},...[['Ctrl / ⌘ K','搜索命令'],['Ctrl / ⌘ F','搜索全部历史'],['Enter','桌面发送消息'],['Shift / Alt + Enter','换行'],['Esc','关闭详情或弹窗']].map(([k,v])=>el('div',{class:'wb-detail-row'},el('dt',{},k),el('dd',{},v)))),el('p',{class:'wb-note'},'触屏 Enter 始终换行。正在生成时仍可编辑草稿。')));
   }
@@ -23,8 +31,8 @@ export async function settingsView({logout,boot,health,state,render,dialog,close
     form.onsubmit=e=>{e.preventDefault();submit(form,async d=>{for(const [key,,type] of fields)await wb('settings',{data:{key,value:type==='number'?Number(d[key]):d[key]}});feedback.replaceChildren(message('设置已保存','success'));await refreshBootstrap();});};
     grid.append(card(active==='agent'?'执行行为':'对话行为',form));
     if(active==='conversation'){
-      const danger=card('当前会话上下文',el('p',{},'只清空当前会话在网页、Telegram 和 CLI 共用的上下文与显示记录；其他会话、手工用户记忆、模型配置和用量统计不受影响。'),
-        button('清空当前会话',()=>confirmAction('清空当前会话','清空后无法恢复，先确认不再需要当前上下文。',async()=>{await wb('memory/clear',{data:{confirm:'清空当前会话'}});await window.XGentChat?.reload();},'清空当前会话'),'danger'));danger.classList.add('wb-danger-zone');grid.append(danger);
+      const danger=card('当前会话上下文',el('p',{},'只重置当前会话的模型上下文；历史消息、附件和定时任务保留。其他会话、手工记忆、模型配置和用量统计不受影响。'),
+        button('重置上下文',()=>{const target=window.XGentConversations?.current;confirmAction('重置上下文','历史保留，但此前内容不再提供给模型。确认重置目标会话？',async()=>{await wb('memory/clear',{data:{conversation_id:target,confirm:'重置上下文'}});await window.XGentChat?.reload();},'重置上下文');},'danger'));danger.classList.add('wb-danger-zone');grid.append(danger);
     }else grid.append(card('执行权限说明',el('div',{class:'wb-callout'},el('strong',{},'这不是沙箱'),el('p',{},'Agent 与网页终端拥有运行账号的实际权限。命令黑名单不是安全隔离。请只执行你信任的任务。')),button('管理命令黑名单',()=>{location.hash='/chat';window.XGentChat?.command('/blacklist');})));
   }
   if(active==='web'){

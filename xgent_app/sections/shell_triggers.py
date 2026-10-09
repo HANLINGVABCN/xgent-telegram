@@ -1711,6 +1711,7 @@ class SelfTriggerManager:
             'updated_at': now,
         }
         db = await BotMemoryDB.get_instance()
+        await get_conversations().resolve(conversation_id, allow_archived=True)
         await db.create_trigger_task(task)
 
         # 归属判断：只有持有自持调度器的进程（服务端：PTB / 纯 Web）才激活
@@ -1797,6 +1798,7 @@ class SelfTriggerManager:
             'updated_at': now,
         }
         db = await BotMemoryDB.get_instance()
+        await get_conversations().resolve(conversation_id, allow_archived=True)
         await db.create_trigger_task(task_row)
 
         schedule_text = cls._format_schedule(task_row)
@@ -1822,7 +1824,7 @@ class SelfTriggerManager:
         """取消一个触发任务。"""
         db = await BotMemoryDB.get_instance()
         task = await db.get_trigger_task(task_id)
-        if task is None or task['status'] in {'completed', 'cancelled', 'failed'}:
+        if task is None:
             return f"❌ 未找到活跃的触发任务: {task_id}"
         await db.cancel_trigger_tasks(task_id)
         cls._remove_scheduler_job(task_id)
@@ -1879,6 +1881,9 @@ class SelfTriggerManager:
         cls._processes.clear()
         cls._delivery_run_ids.clear()
         cls._delivery_tasks_by_task.clear()
+        owner = getattr(cls, '_owner_lock', None)
+        if owner is not None:
+            owner.release()
 
     @classmethod
     async def format_active_tasks(cls) -> str:
@@ -1964,6 +1969,11 @@ class SelfTriggerManager:
         if cls._started and not cls._stopping:
             if application is not None:
                 cls._application = application
+            return
+        from xgent_app.conversations import ExecutionFileLock
+        db = await BotMemoryDB.get_instance()
+        cls._owner_lock = ExecutionFileLock(str(db.db_path) + '.scheduler')
+        if not cls._owner_lock.acquire():
             return
         cls._application = application
         cls._stopping = False
@@ -2565,9 +2575,14 @@ class SelfTriggerManager:
         task = await db.get_trigger_task(run['task_id'])
         if task is None:
             return
-        async with conversation_operation(task['conversation_id'], execution=True, wait=True,
-                                          allow_archived=True, fresh=True):
-            await cls._deliver_run_inner(run_id)
+        if task['status'] == 'cancelled':
+            return
+        try:
+            async with conversation_operation(task['conversation_id'], execution=True, wait=True,
+                                              allow_archived=True, fresh=True):
+                await cls._deliver_run_inner(run_id)
+        except ConversationError:
+            return  # Deleted conversations must never wake or retarget a task.
 
     @classmethod
     async def _deliver_run_inner(cls, run_id: str):

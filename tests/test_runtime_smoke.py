@@ -152,7 +152,7 @@ async def main():
         await db.create_trigger_task({
             "id": "trg_claim",
             "chat_id": 1,
-            "conversation_id": "conv",
+            "conversation_id": "global_memory",
             "command": "echo ok",
             "summary": "claim test",
             "schedule_type": "delay",

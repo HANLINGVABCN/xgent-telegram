@@ -40,10 +40,10 @@ class ConversationStore:
         version = await _config(conn, 'conversation_schema_version', 0) if 'config' in tables else 0
         if version > SCHEMA_VERSION:
             raise ConversationError('数据库版本较新，请升级程序，不能降级混跑。')
-        if 'global_messages' not in tables or self.db_path == ':memory:' or version:
+        if 'global_messages' not in tables or self.db_path == ':memory:' or version >= SCHEMA_VERSION:
             return
         database = Path(self.db_path).resolve()
-        backup = database.with_name(database.name + '.pre-conversations-v1.sqlite3')
+        backup = database.with_name(database.name + f'.pre-conversations-v{1 if not version else SCHEMA_VERSION}.sqlite3')
         guard = ExecutionFileLock(str(database) + '.migration')
         while not guard.acquire():
             await asyncio.sleep(0.05)
@@ -63,12 +63,12 @@ class ConversationStore:
         finally:
             guard.release()
 
-    async def migrate_conversations(self):
+    async def _migrate_conversations_v1(self):
         async with self._transaction() as conn:
             version = await _config(conn, 'conversation_schema_version', 0)
             if version > SCHEMA_VERSION:
                 raise ConversationError('数据库版本较新，请升级程序，不能降级混跑。')
-            if version == SCHEMA_VERSION:
+            if version >= 1:
                 return
             cursor = await conn.execute('PRAGMA table_info(chat_sessions)')
             columns = {row['name'] for row in await cursor.fetchall()}
@@ -140,15 +140,129 @@ class ConversationStore:
             await _set_config(conn, 'current_chat_id', cid)
             await _set_config(conn, 'conversation_revision', 1)
             await _set_config(conn, 'conversation_running', None)
+            await _set_config(conn, 'conversation_schema_version', 1)
+        self._config_cache.clear()
+
+    async def migrate_conversations(self):
+        await self._migrate_conversations_v1()
+        async with self._transaction() as conn:
+            version = int(await _config(conn, 'conversation_schema_version', 0))
+            if version > SCHEMA_VERSION:
+                raise ConversationError('数据库版本较新，请升级程序。')
+            if version == SCHEMA_VERSION:
+                return
+            for column, definition in (
+                ('context_start_record_id', 'INTEGER NOT NULL DEFAULT 0'),
+                ('context_epoch', 'INTEGER NOT NULL DEFAULT 0'),
+                ('deleting', 'INTEGER NOT NULL DEFAULT 0'),
+                ('title_auto_pending', 'INTEGER NOT NULL DEFAULT 0'),
+            ):
+                await conn.execute(f'ALTER TABLE chat_sessions ADD COLUMN {column} {definition}')
+            await conn.execute("UPDATE chat_sessions SET title_auto_pending=1 WHERE name IS NULL OR name='新对话'")
+            await conn.execute('ALTER TABLE ui_messages ADD COLUMN conversation_id TEXT')
+            await conn.execute('UPDATE ui_messages SET conversation_id=(SELECT id FROM chat_sessions '
+                               'WHERE chat_sessions.generation=ui_messages.generation)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_ui_conversation_history ON ui_messages(conversation_id,timestamp,ui_message_id)')
+            for table in ('context_compressions', 'context_compression_jobs'):
+                await conn.execute(f'ALTER TABLE {table} ADD COLUMN context_epoch INTEGER NOT NULL DEFAULT 0')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_active_context ON global_messages(session_id,id)')
             await _set_config(conn, 'conversation_schema_version', SCHEMA_VERSION)
         self._config_cache.clear()
+
+    async def _context_start(self, conn):
+        cursor = await conn.execute('SELECT context_start_record_id FROM chat_sessions WHERE id=?', (self._conversation_id(),))
+        row = await cursor.fetchone()
+        if row is None:
+            raise ConversationError('会话不存在。')
+        return int(row['context_start_record_id'])
+
+    async def _bump_conversation_revision(self, conn):
+        await _set_config(conn, 'conversation_revision', int(await _config(conn, 'conversation_revision', 0)) + 1)
+
+    async def _select_fallback(self, conn):
+        cursor = await conn.execute('SELECT s.id FROM chat_sessions s WHERE s.archived=0 AND s.deleting=0 '
+                                   'ORDER BY COALESCE((SELECT MAX(timestamp) FROM global_messages m '
+                                   'WHERE m.session_id=s.id AND m.msg_type IN '
+                                   "('user_text','user_file','user_photo','ai_reply','media_reply')),s.created_at) DESC,s.id LIMIT 1")
+        row = await cursor.fetchone()
+        active = row['id'] if row else await self._new_conversation(conn)
+        await _set_config(conn, 'current_chat_id', active)
+        self._config_cache.pop('current_chat_id', None)
+        return active
+
+    async def conversation_delete_info(self, cid):
+        session = await self.get_session(cid)
+        if session is None:
+            raise ConversationError('该会话已不存在。')
+        conn = await self._get_conn()
+        cursor = await conn.execute("SELECT COUNT(*) n FROM trigger_tasks WHERE conversation_id=? "
+                                    "AND status NOT IN ('completed','cancelled','failed')", (cid,))
+        return {**session, 'active_tasks': int((await cursor.fetchone())['n'])}
+
+    async def begin_conversation_delete(self, cid):
+        async with self._transaction() as conn:
+            cursor = await conn.execute('SELECT * FROM chat_sessions WHERE id=?', (cid,))
+            row = await cursor.fetchone()
+            if row is None:
+                return False
+            if not row['deleting']:
+                generation = await self._allocate_conversation_generation(conn)
+                await conn.execute('UPDATE chat_sessions SET deleting=1,generation=? WHERE id=?', (generation,cid))
+            now = time.time()
+            await conn.execute("UPDATE trigger_tasks SET status='cancelled',next_run_at=NULL,updated_at=? WHERE conversation_id=?", (now,cid))
+            await conn.execute('UPDATE trigger_runs SET delivered_at=COALESCE(delivered_at,?) '
+                               'WHERE task_id IN (SELECT id FROM trigger_tasks WHERE conversation_id=?)', (now,cid))
+            running = await _config(conn, 'conversation_running')
+            if running and running['conversation_id'] == cid:
+                running['stop_requested'] = True
+                await _set_config(conn, 'conversation_running', running)
+            if await _config(conn, 'current_chat_id') == cid:
+                await self._select_fallback(conn)
+            await self._bump_conversation_revision(conn)
+        return True
+
+    async def pending_conversation_deletions(self):
+        conn = await self._get_conn()
+        cursor = await conn.execute('SELECT id FROM chat_sessions WHERE deleting=1')
+        return [row['id'] for row in await cursor.fetchall()]
+
+    async def finish_conversation_delete(self, cid):
+        async with self._transaction() as conn:
+            cursor = await conn.execute('SELECT deleting FROM chat_sessions WHERE id=?', (cid,))
+            row = await cursor.fetchone()
+            if row is None:
+                return
+            if not row['deleting']:
+                raise ConversationError('删除操作尚未确认。')
+            running = await _config(conn, 'conversation_running')
+            if running and running['conversation_id'] == cid:
+                raise ConversationError('正在停止该会话的回合，请稍候。')
+            await conn.execute('DELETE FROM trigger_runs WHERE task_id IN (SELECT id FROM trigger_tasks WHERE conversation_id=?)', (cid,))
+            await conn.execute('DELETE FROM trigger_tasks WHERE conversation_id=?', (cid,))
+            for table in ('global_messages','chat_messages','context_compressions','context_compression_jobs'):
+                await conn.execute(f'DELETE FROM {table} WHERE session_id=?', (cid,))
+            await conn.execute('DELETE FROM ui_messages WHERE conversation_id=?', (cid,))
+            for table, key in (('cli_relay_ops','conversation_context'),('channel_outbox','_conversation_context'),('channel_deadletter','_conversation_context')):
+                cursor = await conn.execute(f'SELECT id,payload FROM {table}')
+                ids = []
+                for record in await cursor.fetchall():
+                    try:
+                        context = json.loads(record['payload']).get(key) or {}
+                        if context.get('conversation_id') == cid:
+                            ids.append((record['id'],))
+                    except (ValueError,TypeError,AttributeError):
+                        pass
+                if ids:
+                    await conn.executemany(f'DELETE FROM {table} WHERE id=?', ids)
+            await conn.execute('DELETE FROM chat_sessions WHERE id=?', (cid,))
+            await self._bump_conversation_revision(conn)
 
     def _conversation_id(self, explicit=None):
         return require_conversation_id(explicit)
 
     async def _conversation_generation(self, conn, conversation_id=None):
         cid = conversation_id or self._conversation_id()
-        cursor = await conn.execute('SELECT generation FROM chat_sessions WHERE id=?', (cid,))
+        cursor = await conn.execute('SELECT generation FROM chat_sessions WHERE id=? AND deleting=0', (cid,))
         row = await cursor.fetchone()
         await cursor.close()
         if row is None:
@@ -171,9 +285,9 @@ class ConversationStore:
         generation = await self._allocate_conversation_generation(conn)
         now = time.time()
         await conn.execute('INSERT INTO chat_sessions '
-                           '(id,name,model,created_at,last_active,archived,generation,agent_iteration) '
-                           'VALUES(?,?,NULL,?,?,0,?,0)',
-                           (cid, name or '新对话', now, now, generation))
+                           '(id,name,model,created_at,last_active,archived,generation,agent_iteration,title_auto_pending) '
+                           'VALUES(?,?,NULL,?,?,0,?,0,?)',
+                           (cid, name or '新对话', now, now, generation,int(name is None)))
         return cid
 
     async def get_conversation_state(self):
@@ -203,20 +317,20 @@ class ConversationStore:
             else:
                 cursor = await conn.execute('SELECT * FROM chat_sessions WHERE id=?', (cid,))
                 session = await cursor.fetchone()
-                if session is None:
+                if session is None or session['deleting']:
                     raise ConversationError('会话不存在，请刷新列表。')
                 if action == 'switch':
                     if session['archived']:
                         raise ConversationError('请先恢复已归档会话。')
                     active = cid
                 elif action == 'rename':
-                    await conn.execute('UPDATE chat_sessions SET name=? WHERE id=?', (name, cid))
+                    await conn.execute('UPDATE chat_sessions SET name=?,title_auto_pending=0 WHERE id=?', (name, cid))
                 elif action == 'restore':
                     await conn.execute('UPDATE chat_sessions SET archived=0 WHERE id=?', (cid,))
                 elif action == 'archive':
                     await conn.execute('UPDATE chat_sessions SET archived=1 WHERE id=?', (cid,))
                     if cid == active:
-                        cursor = await conn.execute('SELECT id FROM chat_sessions WHERE archived=0 '
+                        cursor = await conn.execute('SELECT id FROM chat_sessions WHERE archived=0 AND deleting=0 '
                                                     'ORDER BY last_active DESC,id LIMIT 1')
                         other = await cursor.fetchone()
                         active = other['id'] if other else await self._new_conversation(conn)
@@ -234,6 +348,8 @@ class ConversationStore:
                 return False
             if conversation_id and running.get('conversation_id') != conversation_id:
                 return False
+            if running.get('stop_requested'):
+                return True
             running['stop_requested'] = True
             await _set_config(conn, 'conversation_running', running)
             await _set_config(conn, 'conversation_revision', int(await _config(conn, 'conversation_revision', 0)) + 1)

@@ -114,7 +114,7 @@ async def run():
     await ns['UserDataManager'].init();w=Workbench(ns);db=await w.db();conn=await db._get_conn()
     await conn.executemany("INSERT INTO global_messages(chat_id,user_id,msg_type,role,content,timestamp,session_id) VALUES(1,1,'user_text','user',?,100,'global_memory')",[(str(i),) for i in range(260)])
     for i in range(160):
-        await conn.execute("INSERT INTO ui_messages(ui_message_id,source,chat_id,message_id,generation,revision,timestamp,payload) VALUES(?, 'test',1,?,0,1,100,?)",(f'{i:032x}',i,json.dumps({'content':'menu '+str(i)})))
+        await conn.execute("INSERT INTO ui_messages(ui_message_id,source,chat_id,message_id,generation,revision,timestamp,payload,conversation_id) VALUES(?, 'test',1,?,0,1,100,?,'global_memory')",(f'{i:032x}',i,json.dumps({'content':'menu '+str(i)})))
     cursor=None;ids=[]
     while True:
         page=await w.history({'before':cursor} if cursor else {})

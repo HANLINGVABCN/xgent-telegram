@@ -238,6 +238,22 @@ print(json.dumps({"first": first, "second": second}))
 
 
 class CompletionTests(CliProbeMixin, unittest.TestCase):
+    def test_legacy_clear_alias_is_executable_but_not_listed(self):
+        result = self.run_probe("""
+names = xgent_cli._command_names()
+telegram = [name for name, _ in xgent_cli._ns['TELEGRAM_COMMAND_DESCRIPTIONS']]
+print(json.dumps({
+    'cli': [name for name in names if name in ('clear', 'clear_memory')],
+    'telegram': [name for name in telegram if name in ('clear', 'clear_memory')],
+    'alias_works': xgent_cli._resolve_command('clear_memory') is xgent_cli._resolve_command('clear') is not None,
+    'same_description': xgent_cli._describe_command('clear_memory') == xgent_cli._describe_command('clear'),
+}))
+""")
+        self.assertEqual(['clear'], result['cli'])
+        self.assertEqual(['clear'], result['telegram'])
+        self.assertTrue(result['alias_works'])
+        self.assertTrue(result['same_description'])
+
     def test_s_prefix_prioritizes_start_in_all_cli_completion_paths(self):
         result = self.run_probe("""
 names = xgent_cli._command_names()

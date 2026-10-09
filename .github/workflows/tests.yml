@@ -8,6 +8,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      # 每个版本和分片独立跑完，单个失败不取消其他兼容性验证。
+      fail-fast: false
       matrix:
         # 代码使用 zoneinfo 和 str.removesuffix（3.9+），install.sh 的门槛是 3.10。
         python-version: ["3.10", "3.11", "3.12"]

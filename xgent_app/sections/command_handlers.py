@@ -10,7 +10,7 @@ async def cmd_delete_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     db = await BotMemoryDB.get_instance()
     counts = await clear_current_conversation()
-    publish_conversation_event(context, {'type': 'history_reset'})
+    publish_conversation_event(context, {'type': 'context_reset'})
 
     message = update.message or update.callback_query.message
     deleted_total = counts['global_messages']
@@ -18,26 +18,26 @@ async def cmd_delete_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if update.callback_query:
         await message.edit_text(
-            "🧹 当前会话已经清空了；其他会话不受影响。\n"
-            f"🌐 删除了 {deleted_total} 条会话记录\n"
-            f"🪞 删除了 {deleted_mirror} 条内部镜像消息\n"
-            f"📦 保留了会话名称与归档状态\n\n"
+            "🧹 当前会话的模型上下文已重置；历史消息仍保留。\n"
+            f"🧠 此前 {deleted_total} 条记录已退出模型上下文\n"
+            f"🪞 已重置 {deleted_mirror} 条内部上下文缓存\n"
+            f"📦 会话名称、历史、附件与定时任务均保留\n\n"
             "Provider 配置、提示词、.env 都还在，token 用量统计（/stats）也保留了。",
             reply_markup=get_main_menu()
         )
     else:
         await message.reply_text(
-            "🧹 当前会话已经清空了；其他会话不受影响。\n"
-            f"🌐 删除了 {deleted_total} 条会话记录\n"
-            f"🪞 删除了 {deleted_mirror} 条内部镜像消息\n"
-            f"📦 保留了会话名称与归档状态\n\n"
+            "🧹 当前会话的模型上下文已重置；历史消息仍保留。\n"
+            f"🧠 此前 {deleted_total} 条记录已退出模型上下文\n"
+            f"🪞 已重置 {deleted_mirror} 条内部上下文缓存\n"
+            f"📦 会话名称、历史、附件与定时任务均保留\n\n"
             "Provider 配置、提示词、.env 都还在，token 用量统计（/stats）也保留了。",
             reply_markup=get_main_menu()
         )
 
 async def create_conversation_export(snapshot: Optional[Dict] = None) -> Tuple[Dict, Dict]:
     db = await BotMemoryDB.get_instance()
-    snapshot = snapshot if snapshot is not None else await db.get_compression_snapshot()
+    snapshot = snapshot if snapshot is not None else await db.get_export_snapshot()
     instruction = PromptFileManager.get_required('compression_prompt')
     system_prompt = build_conversation_system_prompt(bool(UserDataManager.get('agent_mode', False)))
     logs = await db.get_unauthorized_access_logs(1000)
@@ -229,7 +229,7 @@ async def run_context_compression(update: Update, context: ContextTypes.DEFAULT_
             changed = True
             cancel_pending_album_conversations()
             await get_or_create_chat_session()
-            publish_conversation_event(context, {'type': 'history_reset'})
+            publish_conversation_event(context, {'type': 'context_reset'})
             # Delivery is after commit; a Telegram outage cannot undo the summary.
             with contextlib.suppress(Exception):
                 await safe_send_message(context, update.effective_chat.id, summary)

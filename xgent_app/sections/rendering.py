@@ -1,3 +1,4 @@
+from xgent_app.telegram_presentation import telegram_label, label_enabled, stream_part
 # This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
@@ -752,59 +753,60 @@ async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
     sent: List[Any] = []
 
     for index, chunk in enumerate(chunks):
-        send_kwargs = dict(kwargs)
-        if index > 0:
-            send_kwargs.pop('reply_markup', None)
-        try:
-            sent.append(await context.bot.send_message(chat_id=chat_id, text=chunk, **send_kwargs))
-        except RetryAfter as e:
-            await asyncio.sleep(_retry_after_seconds(e) + 0.1)
-            sent.append(await context.bot.send_message(chat_id=chat_id, text=chunk, **send_kwargs))
-        except BadRequest as e:
-            message = str(e).lower()
-            if parse_mode and "can't parse entities" in message:
-                # 先尝试清理 HTML 保留格式，而非直接降级到纯文本
-                logger.warning(f"HTML 解析失败，尝试清理后重发: {e}")
-                sanitized = _sanitize_telegram_html(chunk)
-                try:
-                    sent.append(await context.bot.send_message(
-                        chat_id=chat_id, text=sanitized, **send_kwargs
-                    ))
+        with telegram_label(label_enabled() and index == 0):
+            send_kwargs = dict(kwargs)
+            if index > 0:
+                send_kwargs.pop('reply_markup', None)
+            try:
+                sent.append(await context.bot.send_message(chat_id=chat_id, text=chunk, **send_kwargs))
+            except RetryAfter as e:
+                await asyncio.sleep(_retry_after_seconds(e) + 0.1)
+                sent.append(await context.bot.send_message(chat_id=chat_id, text=chunk, **send_kwargs))
+            except BadRequest as e:
+                message = str(e).lower()
+                if parse_mode and "can't parse entities" in message:
+                    # 先尝试清理 HTML 保留格式，而非直接降级到纯文本
+                    logger.warning(f"HTML 解析失败，尝试清理后重发: {e}")
+                    sanitized = _sanitize_telegram_html(chunk)
+                    try:
+                        sent.append(await context.bot.send_message(
+                            chat_id=chat_id, text=sanitized, **send_kwargs
+                        ))
+                        continue
+                    except BadRequest:
+                        pass  # 清理后仍失败，降级到纯文本
+                    fallback_kwargs = dict(send_kwargs)
+                    fallback_kwargs.pop('parse_mode', None)
+                    fallback_text = plain_text_from_html(chunk)
+                    for fallback_chunk in split_text_for_telegram(fallback_text, limit):
+                        sent.append(await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=fallback_chunk,
+                            **fallback_kwargs
+                        ))
                     continue
-                except BadRequest:
-                    pass  # 清理后仍失败，降级到纯文本
-                fallback_kwargs = dict(send_kwargs)
-                fallback_kwargs.pop('parse_mode', None)
-                fallback_text = plain_text_from_html(chunk)
-                for fallback_chunk in split_text_for_telegram(fallback_text, limit):
-                    sent.append(await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=fallback_chunk,
-                        **fallback_kwargs
-                    ))
-                continue
-            if parse_mode and "message is too long" in message:
-                fallback_kwargs = dict(send_kwargs)
-                fallback_kwargs.pop('parse_mode', None)
-                fallback_text = plain_text_from_html(chunk)
-                for fallback_chunk in split_text_for_telegram(fallback_text, limit):
-                    sent.append(await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=fallback_chunk,
-                        **fallback_kwargs
-                    ))
-                continue
-            if "message is too long" in message:
-                fallback_kwargs = dict(send_kwargs)
-                fallback_kwargs.pop('parse_mode', None)
-                for fallback_chunk in split_text_for_telegram(plain_text_from_html(chunk), 3000):
-                    sent.append(await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=fallback_chunk,
-                        **fallback_kwargs
-                    ))
-                continue
-            raise
+                if parse_mode and "message is too long" in message:
+                    fallback_kwargs = dict(send_kwargs)
+                    fallback_kwargs.pop('parse_mode', None)
+                    fallback_text = plain_text_from_html(chunk)
+                    for fallback_chunk in split_text_for_telegram(fallback_text, limit):
+                        sent.append(await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=fallback_chunk,
+                            **fallback_kwargs
+                        ))
+                    continue
+                if "message is too long" in message:
+                    fallback_kwargs = dict(send_kwargs)
+                    fallback_kwargs.pop('parse_mode', None)
+                    for fallback_chunk in split_text_for_telegram(plain_text_from_html(chunk), 3000):
+                        sent.append(await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=fallback_chunk,
+                            **fallback_kwargs
+                        ))
+                    continue
+                raise
 
     return sent
 
@@ -821,9 +823,10 @@ async def finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         f"text_len={len(response)}, html_len={len(html_response)}, chunks={len(chunks)}"
     )
     await safe_edit_text(msg, chunks[0], reply_markup=None, parse_mode=constants.ParseMode.HTML)
-    for extra_chunk in chunks[1:]:
-        sent = await safe_send_message(context, chat_id, extra_chunk, limit=limit, parse_mode=constants.ParseMode.HTML)
-        remember_reply_messages(sent)
+    with telegram_label(False):
+        for extra_chunk in chunks[1:]:
+            sent = await safe_send_message(context, chat_id, extra_chunk, limit=limit, parse_mode=constants.ParseMode.HTML)
+            remember_reply_messages(sent)
 
 
 def _folded_display_html(response: str, hide_unclosed: bool = False, monospace: bool = True,
@@ -927,9 +930,10 @@ async def finalize_html_response(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         f"Sending final folded HTML: chat_id={chat_id}, html_len={len(safe_html)}, chunks={len(chunks)}"
     )
     await safe_edit_text(msg, chunks[0], reply_markup=None, parse_mode=constants.ParseMode.HTML)
-    for extra_chunk in chunks[1:]:
-        sent = await safe_send_message(context, chat_id, extra_chunk, limit=limit, parse_mode=constants.ParseMode.HTML)
-        remember_reply_messages(sent)
+    with telegram_label(False):
+        for extra_chunk in chunks[1:]:
+            sent = await safe_send_message(context, chat_id, extra_chunk, limit=limit, parse_mode=constants.ParseMode.HTML)
+            remember_reply_messages(sent)
 
 
 def _retry_after_seconds(exc: RetryAfter) -> float:
@@ -1125,6 +1129,7 @@ class TelegramStreamRenderer:
             except asyncio.CancelledError:
                 pass
 
+    @stream_part
     async def stop_and_keep_partial(self) -> str:
         """Stop live rendering, flush pending text, and keep already generated content visible."""
         if self.pending_text:
@@ -1177,6 +1182,7 @@ class TelegramStreamRenderer:
                 logger.debug(f"停止时保留流式内容失败: {e}")
         return partial
 
+    @stream_part
     async def remove_controls(self):
         """流式完成后：用 Rich Message 发送最终内容，删除旧占位消息。"""
         if not self.current_text.strip():
@@ -1236,6 +1242,7 @@ class TelegramStreamRenderer:
             if len(self.pending_text) >= self.MIN_CHARS_PER_FLUSH or '\n' in chunk:
                 await self._flush_pending()
 
+    @stream_part
     async def _flush_pending(self):
         if not self.pending_text:
             return
@@ -1259,12 +1266,13 @@ class TelegramStreamRenderer:
                 try:
                     new_text = text if text.strip() else "…"
                     html_text = self._display_html(new_text, hide_unclosed=True)
-                    self.current_msg = await self.context.bot.send_message(
-                        chat_id=self.chat_id,
-                        text=html_text,
-                        reply_markup=self.reply_markup,
-                        parse_mode=constants.ParseMode.HTML
-                    )
+                    with telegram_label(False):
+                        self.current_msg = await self.context.bot.send_message(
+                            chat_id=self.chat_id,
+                            text=html_text,
+                            reply_markup=self.reply_markup,
+                            parse_mode=constants.ParseMode.HTML
+                        )
                     self.message_ids.append(getattr(self.current_msg, 'message_id', None))
                 except Exception as e:
                     self.live_edit_enabled = False
@@ -1459,11 +1467,12 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
     try:
         generated_reply = await _ensure_generated_reply(generated_reply, chat_id, prov_name, model)
         stop_kb = build_stop_keyboard()
-        msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text="流式输出中...",
-            reply_markup=stop_kb
-        )
+        with telegram_label(False):
+            msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text="流式输出中...",
+                reply_markup=stop_kb
+            )
         renderer = TelegramStreamRenderer(context, chat_id, msg, stop_kb, TELEGRAM_MSG_LIMIT, stop_event)
         _remember_live_reply(generated_reply, context, renderer.message_ids)
         renderer.start()
@@ -1828,11 +1837,12 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
     try:
         generated_reply = await _ensure_generated_reply(generated_reply, chat_id, prov_name, model)
         stop_kb = build_stop_keyboard()
-        msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text="后台流式输出中...",
-            reply_markup=stop_kb
-        )
+        with telegram_label(False):
+            msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text="后台流式输出中...",
+                reply_markup=stop_kb
+            )
         _remember_live_reply(generated_reply, context, [getattr(msg, 'message_id', None)])
         typing_stop = asyncio.Event()
         typing_task = asyncio.create_task(
@@ -2155,11 +2165,12 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
     try:
         generated_reply = await _ensure_generated_reply(generated_reply, chat_id, prov_name, model)
         stop_kb = build_stop_keyboard()
-        msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text="非流式输出中...",
-            reply_markup=stop_kb
-        )
+        with telegram_label(False):
+            msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text="非流式输出中...",
+                reply_markup=stop_kb
+            )
         _remember_live_reply(generated_reply, context, [getattr(msg, 'message_id', None)])
         typing_stop = asyncio.Event()
         typing_task = asyncio.create_task(

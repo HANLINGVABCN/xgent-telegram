@@ -282,11 +282,12 @@ function renderRunning() {
   banner.hidden = !running || running.conversation_id === state.current_chat_id;
   if (banner.hidden) { banner.replaceChildren(); return; }
   const item = itemById(running.conversation_id);
-  const text = node('span', {}, '「' + (item ? title(item) : running.name || '另一段对话') + '」正在生成');
+  const text = node('span', {}, '「' + (item ? title(item) : running.name || '另一段对话') + '」' + (running.stop_requested ? '正在停止…' : '正在生成'));
   const visit = button('查看', () => {
     if (item && isArchived(item)) { view = 'archived'; render(); setDrawer(true); }
     else selectConversation(running.conversation_id);
   });
+  visit.disabled = !item;
   const stop = button('停止', async event => {
     const trigger = event.currentTarget;
     trigger.disabled = true;
@@ -337,9 +338,36 @@ function openMenu(id, trigger) {
   const other = isArchived(item)
     ? button([icon('restore'), node('span', {}, '恢复对话')], () => restoreConversation(id), {role: 'menuitem'})
     : button([icon('archive'), node('span', {}, '归档对话')], () => archiveConversation(id), {role: 'menuitem'});
-  menu.replaceChildren(rename, other); menu.hidden = false; positionMenu();
+  const reset=button('🧹 重置上下文',()=>confirmConversationAction('reset_context',id),{role:'menuitem'});
+  const remove=button('🗑 删除对话',()=>confirmConversationAction('delete',id),{role:'menuitem',class:'danger'});
+  menu.replaceChildren(rename, other, reset, remove); menu.hidden = false; positionMenu();
   rename.focus({preventScroll: true});
 }
+async function confirmConversationAction(action,id) {
+  closeMenu(false);
+  const item=itemById(id);if(!item)return;
+  let info;
+  try{info=await api('/api/workbench/conversations/delete_info?id='+encodeURIComponent(id));}
+  catch(error){notify(error.message);return;}
+  const deleting=action==='delete', dialog=node('dialog',{class:'conv-dialog conv-action-dialog','aria-label':deleting?'删除对话':'重置上下文'});
+  const feedback=node('p',{role:'alert'});
+  const cancel=button('取消',()=>dialog.close());
+  const confirm=button(deleting?'永久删除':'确认重置',async()=>{
+    cancel.disabled=confirm.disabled=true;feedback.textContent='';
+    try{
+      const result=await mutate(action,{id,confirm:true});if(!result)return;
+      dialog.close();notify(deleting?(result.deleting?'删除已提交，正在停止所属任务…':'已删除「'+title(item)+'」'):'已重置「'+title(item)+'」的上下文，历史保留。');
+      if(deleting)window.dispatchEvent(new CustomEvent('xgent-conversation-deleted',{detail:{conversation_id:id}}));
+    }catch(error){feedback.textContent=error.message;}
+    finally{cancel.disabled=confirm.disabled=false;}
+  },{class:deleting?'danger':''});
+  dialog.append(node('h2',{},deleting?'永久删除对话？':'重置模型上下文？'),node('p',{},title(item)+' · '+id.slice(0,6)),
+    node('p',{},deleting?'会话历史与任务记录将永久删除，并终止 '+info.active_tasks+' 个未完成任务。共享工作目录文件和用量统计保留。':'历史消息、附件与定时任务保留；此前内容不再提供给模型，其他会话不受影响。'),
+    feedback,node('div',{class:'conv-dialog-actions'},cancel,confirm));
+  dialog.addEventListener('cancel',event=>{if(confirm.disabled)event.preventDefault();});
+  dialog.addEventListener('close',()=>dialog.remove(),{once:true});document.body.append(dialog);dialog.showModal();cancel.focus();
+}
+
 function openRename(id) {
   const item = itemById(id);
   if (!item || mutation) return;

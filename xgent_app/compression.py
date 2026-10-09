@@ -284,7 +284,7 @@ def with_legacy_seed(records: list[dict], previous: dict | None) -> list[dict]:
 
 
 def archive_files(rounds: list[dict], current_records: list[dict], *, system_prompt: str,
-                  compression_prompt: str, access_logs: list[dict], storage_root: str | Path) -> dict[str, bytes]:
+                  compression_prompt: str, access_logs: list[dict], storage_root: str | Path, next_sequence=None) -> dict[str, bytes]:
     logs = '\n\n'.join(
         '\n'.join(f'{key}: {_text(value)}' for key, value in row.items()) for row in access_logs
     ) or '\u6682\u65e0\u62e6\u622a\u8bb0\u5f55\u3002'
@@ -307,7 +307,8 @@ def archive_files(rounds: list[dict], current_records: list[dict], *, system_pro
         if completed(entry):
             files[f'{number}c{SUMMARY_NAME}.txt'] = _text(entry['summary']).encode('utf-8')
         previous = entry
-    source(len(rounds) + 1, with_legacy_seed(current_records, previous))
+    number = next_sequence or max((int(r['sequence']) for r in rounds), default=0) + 1
+    source(number, with_legacy_seed(current_records, previous))
     return files
 
 
@@ -335,7 +336,11 @@ def save_conversation_export(root: str | Path, snapshot: dict, *, system_prompt:
     archive_path = directory / EXPORT_NAME
     files = archive_files(snapshot['compressions'], snapshot['records'], system_prompt=system_prompt,
                           compression_prompt=compression_prompt, access_logs=access_logs,
-                          storage_root=storage_root)
+                          storage_root=storage_root, next_sequence=snapshot.get('next_sequence'))
+    if snapshot.get('full_history'):
+        files['上下文范围.txt'] = (f"会话：{snapshot.get('conversation_id', '')}\n"
+            f"存档保留全部历史；当前模型上下文从记录 ID {snapshot.get('context_start_record_id', 0)} 开始。\n"
+            f"上下文周期：{snapshot.get('context_epoch', 0)}。管理审计、Token 提示不提供给模型。\n").encode('utf-8')
     for name, data in files.items():
         with (directory / name).open('xb') as handle:
             os.chmod(handle.name, 0o600)
@@ -351,7 +356,7 @@ def save_conversation_export(root: str | Path, snapshot: dict, *, system_prompt:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, archive_path)
-    number = len(snapshot['compressions']) + 1
+    number = snapshot.get('next_sequence') or max((int(r['sequence']) for r in snapshot['compressions']), default=0) + 1
     bundle = {
         'version': 2, 'archive_path': str(archive_path), 'text_dir': str(directory),
         'memory_path': str(directory / f'{number}a{MEMORY_NAME}.txt'),

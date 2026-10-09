@@ -53,7 +53,8 @@ async def navigation(bot, root):
         assert not any(row['msg_type'] == 'button_click' for row in visible)
         assert not any('Skill ' in row['content'] and row['msg_type'] == 'system_op' for row in visible)
         snapshot = await h.db.get_compression_snapshot()
-        assert sum(row['msg_type'] == 'button_click' for row in snapshot['records']) == 3
+        assert not any(row['msg_type'] == 'button_click' for row in snapshot['records'])
+        assert sum(row['msg_type'] == 'button_click' for row in (await h.db.get_export_snapshot())['records']) == 3
         assert not any(row['msg_type'] == 'ui_message' for row in snapshot['records'])
         await bot._web_handle_command('/start', h.outbox)
         assert len(await menus(bot)) == 2
@@ -128,7 +129,8 @@ async def validation(bot, root):
         with patch.object(bot, 'handle_button_click', AsyncMock()) as execute:
             await click(bot, h, before_clear, 'set_skill_state:')
             execute.assert_not_called()
-        assert not await menus(bot)
+        assert await menus(bot)
+        assert all(not b.get('callback_data') for m in await menus(bot) for row in m['reply_markup'] for b in row)
         return {'serialized_clicks': True, 'forgery': True, 'missing_skill': True,
                 'expired_confirmation': True, 'clear_revokes': True, 'missing_provider': True,
                 'other_window_workflow': True}
@@ -234,7 +236,8 @@ async def bridges(bot, root):
             raise AssertionError('old CLI task revived')
         except UiHistoryError:
             pass
-        assert not await menus(bot)
+        assert await menus(bot)
+        assert all(not b.get('callback_data') for m in await menus(bot) for row in m['reply_markup'] for b in row)
 
         class TelegramStub:
             async def send_message(self, *args, **kwargs):
@@ -255,10 +258,11 @@ async def bridges(bot, root):
                 await stub.send_message(17, 'TG-MENU', reply_markup=keyboard)
                 await stub.edit_message_text('TG-UPDATED', 17, 42, reply_markup=keyboard)
                 await stub.edit_message_reply_markup(17, 42, reply_markup=keyboard)
-                saved = (await menus(bot))[0]
+                saved = (await menus(bot))[-1]
                 assert saved['revision'] == 3 and saved['content'] == 'TG-UPDATED'
                 await stub.delete_message(17, 42)
-                assert not await menus(bot)
+                assert await menus(bot)
+                assert all(not b.get('callback_data') for m in await menus(bot) for row in m['reply_markup'] for b in row)
         finally:
             restore()
         return {'canonical_cli_actions': True, 'cli_clear_race': True, 'telegram_positional_calls': True}

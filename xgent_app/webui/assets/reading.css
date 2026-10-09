@@ -1,0 +1,59 @@
+/* Typography is server-configured. Layout/hit targets are not scaled with text. */
+body{font-size:var(--web-ui-font-size,13px)}
+:root{--web-message-font-size:14px;--web-ui-font-size:13px;--web-terminal-font-size:13px;--chat-header-height:56px}
+#header{height:var(--chat-header-height);padding:0 18px;gap:8px;z-index:35}
+#header .header-info{margin:0;min-width:0;gap:8px}
+#header .header-text{min-width:0}
+#wb-conversation-title{margin:0;font-size:var(--web-ui-font-size);line-height:1.35;font-weight:600;letter-spacing:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#header .bot-status{font-size:.8em;line-height:1.2}
+#chat-options-toggle{flex-shrink:0;width:44px;height:44px}
+#chat-options{position:absolute;top:calc(var(--chat-header-height) + 5px);right:12px;width:min(355px,calc(100vw - 24px));padding:12px;border:1px solid var(--wb-border);border-radius:12px;background:var(--wb-panel);box-shadow:0 8px 30px #0002;font-size:var(--web-ui-font-size);z-index:60}
+#chat-options[hidden]{display:none}
+#chat-options #wb-chat-controls{display:flex;flex-wrap:wrap;max-width:none;gap:8px;width:100%;grid-column:auto}
+#chat-options #wb-chat-controls select{font-size:1em;max-width:100%;min-width:0;min-height:40px;flex:1}
+#chat-options #wb-chat-controls select:first-child{flex-basis:100%;max-width:100%}
+#chat-options #wb-chat-controls button{font-size:1em;min-height:40px}
+.chat-option-tools{display:flex;flex-wrap:wrap;gap:8px;border-top:1px solid var(--wb-border);margin-top:10px;padding-top:8px;align-items:center}
+#chat-options .icon-btn{min-width:40px;min-height:44px;display:inline-flex}
+#wb-chat{top:var(--chat-header-height)}
+#wb-page{top:var(--chat-header-height)}
+#search-bar{top:var(--chat-header-height)}
+#wb-history-controls{position:absolute;top:0;left:0;right:0;display:none;align-items:center;justify-content:center;flex-wrap:wrap;gap:4px;padding:4px 8px;margin:0;background:var(--wb-panel);box-shadow:0 3px 8px #0001;z-index:4;font-size:.8em}
+#wb-chat.history-top #wb-history-controls,#wb-chat.history-past #wb-history-controls{display:flex}
+#wb-history-controls button{font-size:1em;min-height:32px;padding:4px 7px}
+#wb-history-state:empty{display:none}
+#wb-chat #log{padding-top:12px;padding-bottom:20px;scroll-padding-top:42px}
+#conversation-running{margin:4px 14px 0;padding:5px 10px;font-size:.9em}
+#conversation-running[hidden]{display:none}
+#empty-state{inset:0 16px 0;top:0}
+.msg-row{margin-bottom:16px}
+.bubble{font-size:var(--web-message-font-size);line-height:1.55}
+.bubble h1{font-size:1.45em}.bubble h2{font-size:1.3em}.bubble h3{font-size:1.15em}.bubble h4,.bubble h5,.bubble h6{font-size:1em}
+.bubble table,.bubble pre,.bubble pre code,.bubble :not(pre)>code{font-size:.93em}
+.bubble .pb-title,.bubble .pb-title b,.bubble .pb-head{font-size:.93em}
+.bubble .media-cap,.bubble .file-card,.bubble .fc-name{font-size:1em}
+.inline-keyboard{font-size:var(--web-ui-font-size)}.inline-keyboard .ik-btn{font-size:1em}
+#input{font-size:max(16px,var(--web-message-font-size));line-height:1.4}
+.font-preview{padding:12px;border:1px solid var(--wb-border);border-radius:8px;font-size:var(--web-message-font-size);line-height:1.55}
+.font-preview code{font-size:.93em}.font-settings .wb-field{margin-top:12px}.font-settings input{max-width:160px}
+.conv-item-menu .danger{color:var(--wb-danger)}
+.conv-action-dialog p{font-size:var(--web-ui-font-size);line-height:1.7;text-align:left;overflow-wrap:anywhere}
+.conv-action-dialog h2{text-align:left}
+@media(max-width:767px){
+ #header{height:56px;padding:0 12px}
+ #header .conv-drawer-toggle{height:44px;min-height:44px;padding:6px;border:0;background:transparent;font-size:var(--web-ui-font-size)}
+ #header .conv-drawer-toggle .icon{width:18px;height:18px}
+ #wb-chat{top:56px}#wb-page{top:56px}
+ #wb-chat #log{padding:10px 14px 16px}
+ .bubble{font-size:var(--web-message-font-size);line-height:1.55}
+ .msg-row{margin-bottom:15px}.bubble.user{padding:8px 12px}.bubble.ai{padding:3px 0}
+ #wb-shell>footer{padding:6px 12px 8px}#input{padding-top:8px;padding-bottom:8px}
+ #wb-history-state{flex-basis:auto;order:0}
+ #conversation-running{margin:3px 10px 0}
+}
+
+.conv-dialog-actions button.danger{color:var(--wb-danger);border-color:var(--wb-danger)}
+@media(max-width:767px){#chat-options #wb-chat-controls select,#chat-options #wb-chat-controls button{min-height:44px}}
+
+/* History navigation is contextual, never covers the first visible message. */
+#wb-history-controls{position:relative;left:auto;right:auto;top:auto;flex-shrink:0}

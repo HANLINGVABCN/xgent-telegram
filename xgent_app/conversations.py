@@ -19,7 +19,7 @@ from typing import Any
 
 DEFAULT_CONVERSATION_ID = 'global_memory'
 DEFAULT_CONVERSATION_NAME = '默认会话'
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class ConversationError(ValueError):
@@ -67,6 +67,17 @@ def advance_generation(generation: int) -> None:
     _scope.set(dataclasses.replace(current_scope(), generation=int(generation)))
 
 
+def refresh_scope_name(name):
+    scope = current_scope(required=False)
+    if scope is not None:
+        _scope.set(dataclasses.replace(scope, name=str(name)))
+
+
+async def notify_conversation_metadata(database):
+    if _manager is not None and str(Path(_manager.lock.path).resolve()) == str(Path(str(database.db_path) + '.turn.lock').resolve()):
+        await _manager.poll_once()
+
+
 def conversation_snapshot() -> dict | None:
     scope = current_scope(required=False)
     return dataclasses.asdict(scope) if scope is not None else None
@@ -89,7 +100,7 @@ def replay_conversation(snapshot):
 
 def stamp_frame(frame: dict) -> dict:
     scope = current_scope(required=False)
-    if scope is None or frame.get('type') == 'conversation_state':
+    if scope is None or frame.get('type') in {'conversation_state', 'settings_state'}:
         return dict(frame)
     return {'conversation_id': scope.conversation_id, 'generation': scope.generation,
             'run_id': scope.run_id, 'conversation_name': scope.name, **frame}
@@ -166,6 +177,7 @@ class ConversationManager:
         self._stop_event = None
         self._run_id = None
         self._admission_lock = asyncio.Lock()
+        self.maintenance = None
 
     async def state(self):
         db = await self.factory()
@@ -184,7 +196,7 @@ class ConversationManager:
         if expected and cid != active:
             raise ConversationChanged('当前会话已在另一端切换，请确认后重新发送；内容尚未提交。')
         session = await db.get_session(cid)
-        if session is None:
+        if session is None or session.get('deleting'):
             raise ConversationChanged('该会话不存在，请刷新会话列表。')
         if session.get('archived') and not allow_archived:
             raise ConversationChanged('该会话已归档，请先恢复。')
@@ -286,6 +298,8 @@ class ConversationManager:
         return result
 
     async def poll_once(self):
+        if self.maintenance is not None:
+            await self.maintenance()
         state = await self.state()
         running = state.get('running') or {}
         if running.get('run_id') == self._run_id and running.get('stop_requested') and self._stop_event:
@@ -433,13 +447,14 @@ def conversation_labelled_text(text, parse_mode=None, *, limit=4096):
     Callers retain unmodified history/Web text; unscoped system notices stay plain.
     """
     scope = current_scope(required=False)
-    if scope is None or not text:
+    from xgent_app.telegram_presentation import label_enabled
+    if scope is None or not text or not label_enabled():
         return text
     label = f'🗂 {scope.name or scope.conversation_id[:8]} · {scope.conversation_id[:6]}'
     mode = str(parse_mode or '').lower()
     if mode == 'html':
         import html
-        label = '<b>' + html.escape(label) + '</b>'
+        label = html.escape(label)
     elif mode.startswith('markdown'):
         from telegram.helpers import escape_markdown
         label = escape_markdown(label, version=2 if 'v2' in mode else 1)
@@ -458,3 +473,11 @@ def defer_completion(frame, callback):
         _manager._completions.append(callback)
         return True
     return False
+
+
+async def conversation_still_exists(snapshot):
+    if _manager is None or not snapshot or not snapshot.get('conversation_id'):
+        return True
+    db = await _manager.factory()
+    session = await db.get_session(snapshot['conversation_id'])
+    return session is not None and not session.get('deleting')

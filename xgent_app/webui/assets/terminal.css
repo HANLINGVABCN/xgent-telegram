@@ -29,7 +29,7 @@
   html, body {
     height: 100%; overflow: hidden; width: 100%;
     background: var(--bg); color: var(--text);
-    font-family: var(--font); font-size: 14px;
+    font-family: var(--font); font-size:calc(var(--web-ui-font-size,13px) * 1.07692);
     -webkit-font-smoothing: antialiased;
   }
   ::selection { background: var(--accent-ring); }
@@ -59,7 +59,7 @@
   }
   #bar .dot-mark .icon { width: 15px; height: 15px; }
   #bar .title {
-    font-size: 14px; font-weight: 650; letter-spacing: -0.01em;
+    font-size:calc(var(--web-ui-font-size,13px) * 1.07692); font-weight: 650; letter-spacing: -0.01em;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .icon-btn {
@@ -117,7 +117,7 @@
     padding: 4px 10px; border-radius: var(--r-full);
     background: rgba(16, 18, 24, .85); border: 1px solid var(--line);
     backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
-    font-size: 11px; font-weight: 500; color: var(--text-3);
+    font-size:calc(var(--web-ui-font-size,13px) * 0.84615); font-weight: 500; color: var(--text-3);
     font-variant-numeric: tabular-nums; pointer-events: none;
   }
   #status.flash { color: var(--ok); }
@@ -149,48 +149,48 @@
     box-shadow: 0 8px 26px var(--accent-ring);
   }
   .card .mark .icon { width: 25px; height: 25px; }
-  .card h2 { margin: 0 0 6px; font-size: 18px; font-weight: 700; text-align: center; }
-  .card .sub { margin: 0 0 18px; font-size: 13.5px; line-height: 1.55; color: var(--text-3); text-align: center; }
+  .card h2 { margin: 0 0 6px; font-size:calc(var(--web-ui-font-size,13px) * 1.38462); font-weight: 700; text-align: center; }
+  .card .sub { margin: 0 0 18px; font-size:calc(var(--web-ui-font-size,13px) * 1.03846); line-height: 1.55; color: var(--text-3); text-align: center; }
   .card input, .card textarea {
     width: 100%; padding: 12px 14px; margin-bottom: 12px;
     background: var(--surface-2); color: var(--text);
     border: 1px solid var(--line); border-radius: var(--r-sm);
-    font-family: var(--font); font-size: 14.5px; resize: none;
+    font-family: var(--font); font-size:calc(var(--web-ui-font-size,13px) * 1.11538); resize: none;
   }
-  .card textarea { font-family: var(--mono); font-size: 13px; min-height: 100px; }
+  .card textarea { font-family: var(--mono); font-size:calc(var(--web-ui-font-size,13px) * 1.00000); min-height: 100px; }
   .card input:focus, .card textarea:focus {
     outline: none; background: var(--bg); border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-ring);
   }
   .btn-primary {
     width: 100%; padding: 12px 14px; border: none; border-radius: var(--r-sm);
     background: var(--grad); color: #fff;
-    font-family: var(--font); font-size: 14.5px; font-weight: 600; cursor: pointer;
+    font-family: var(--font); font-size:calc(var(--web-ui-font-size,13px) * 1.11538); font-weight: 600; cursor: pointer;
     box-shadow: 0 4px 16px var(--accent-ring);
   }
   .btn-ghost {
     width: 100%; margin-top: 8px; padding: 10px 14px;
     background: transparent; color: var(--text-2);
     border: 1px solid var(--line); border-radius: var(--r-sm);
-    font-family: var(--font); font-size: 13.5px; font-weight: 550; cursor: pointer;
+    font-family: var(--font); font-size:calc(var(--web-ui-font-size,13px) * 1.03846); font-weight: 550; cursor: pointer;
   }
   .btn-ghost:hover { background: var(--surface-2); color: var(--text); }
-  .muted { color: var(--text-3); font-size: 12.5px; margin-top: 14px; text-align: center; }
-  #err { color: var(--danger); font-size: 13px; min-height: 18px; margin-bottom: 6px; }
+  .muted { color: var(--text-3); font-size:calc(var(--web-ui-font-size,13px) * 0.96154); margin-top: 14px; text-align: center; }
+  #err { color: var(--danger); font-size:calc(var(--web-ui-font-size,13px) * 1.00000); min-height: 18px; margin-bottom: 6px; }
 
   #toast {
     position: absolute; left: 50%; bottom: 50px; z-index: 20;
     transform: translate(-50%, 10px); max-width: 88vw;
     background: rgba(236, 238, 243, .95); color: #0B0D12;
     padding: 8px 16px; border-radius: var(--r-full);
-    font-size: 13px; font-weight: 550; box-shadow: 0 8px 28px rgba(0, 0, 0, .4);
+    font-size:calc(var(--web-ui-font-size,13px) * 1.00000); font-weight: 550; box-shadow: 0 8px 28px rgba(0, 0, 0, .4);
     opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s;
   }
   #toast.show { opacity: 1; transform: translate(-50%, 0); }
 
 #sessionBar{position:absolute;top:52px;left:0;right:0;z-index:4;height:46px;display:flex;gap:8px;align-items:center;padding:5px 12px;background:var(--surface);border-bottom:1px solid var(--line)}
-#sessionBar select,#sessionBar button{background:var(--surface-2);border:1px solid var(--line);border-radius:6px;color:var(--text);font:12px var(--font);padding:8px;min-height:34px}#sessionBar select{max-width:230px;flex:1}#sessionNote{font-size:11px;color:var(--text-2);margin-left:auto}#term{top:98px!important}.dot-mark{background:#147f9e!important;box-shadow:none!important}
+#sessionBar select,#sessionBar button{background:var(--surface-2);border:1px solid var(--line);border-radius:6px;color:var(--text);font:12px var(--font);padding:8px;min-height:34px}#sessionBar select{max-width:230px;flex:1}#sessionNote{font-size:calc(var(--web-ui-font-size,13px) * 0.84615);color:var(--text-2);margin-left:auto}#term{top:98px!important}.dot-mark{background:#147f9e!important;box-shadow:none!important}
 :root{--accent:#62bcd6;--grad:#147f9e}body.light{--bg:#f7f9fb;--surface:#fff;--surface-2:#eef2f5;--surface-3:#e4e9ed;--line:#dbe2e8;--text:#22313d;--text-2:#61717e;--text-3:#7c8a96}
-@media(max-width:600px){#sessionNote{display:none}#sessionBar{gap:5px;padding:5px 8px}#sessionBar button{min-height:38px;font-size:11px}#sessionBar select{min-width:0} .vkey,.icon-btn{min-height:40px} }
+@media(max-width:600px){#sessionNote{display:none}#sessionBar{gap:5px;padding:5px 8px}#sessionBar button{min-height:38px;font-size:calc(var(--web-ui-font-size,13px) * 0.84615)}#sessionBar select{min-width:0} .vkey,.icon-btn{min-height:40px} }
 
 #keybar{top:calc(var(--header-h) + 46px + env(safe-area-inset-top))}#term-wrap{top:calc(var(--header-h) + var(--keybar-h) + 46px + env(safe-area-inset-top))}#sessionBar{top:calc(var(--header-h) + env(safe-area-inset-top))}
 

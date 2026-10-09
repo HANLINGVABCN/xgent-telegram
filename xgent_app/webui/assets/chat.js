@@ -97,7 +97,7 @@
         {cmd:"/skills", desc:"查看与管理 Agent 技能"},
         {cmd:"/status", desc:"查看当前状态与运行环境"},
         {cmd:"/show_chat_info", desc:"状态与记忆统计"},
-        {cmd:"/clear_memory", desc:"清空上下文会话记忆"},
+        {cmd:"/clear", desc:"重置上下文，保留聊天历史"},
         {cmd:"/compress", desc:"压缩上下文并归档"}
       ]
     },
@@ -416,6 +416,23 @@
     toastEl._t = setTimeout(function () { toastEl.classList.remove("show"); }, alert ? 2600 : 1800);
   }
 
+  var cardRequests = new Map(), cardScrollIntent = null;
+  function finishCardRequest(id) {const pending=cardRequests.get(id);if(pending){clearTimeout(pending.timer);pending.button.disabled=false;pending.button.classList.remove('loading');cardRequests.delete(id);}}
+  function cancelCardFollow(){cardScrollIntent=null;}
+  for(const kind of ['wheel','touchstart','pointerdown'])log.addEventListener(kind,cancelCardFollow,{passive:true});
+  log.addEventListener('keydown',event=>{if(['PageUp','PageDown','Home','End','ArrowUp','ArrowDown'].includes(event.key))cancelCardFollow();});
+  async function finishCardScroll(frame){
+    const intent=cardScrollIntent;finishCardRequest(frame.interaction_id);
+    if(!intent||intent.id!==frame.interaction_id||intent.cid!==selectedConversationId)return;
+    if(frame.appended){
+      if(viewingPast){historyAnchor=null;viewingPast=false;newFrames=0;await resync();}
+      if(cardScrollIntent===intent&&intent.cid===selectedConversationId)scrollDown();
+    }else{
+      const entry=byMessageId[frame.edited_message_id]||byMessageId[intent.messageId];
+      if(entry&&cardScrollIntent===intent)entry.row.scrollIntoView({block:'nearest'});
+    }
+    if(cardScrollIntent===intent)cardScrollIntent=null;
+  }
   function scrollDown() { log.scrollTop = log.scrollHeight; hideScrollBtn(); }
   function isNearBottom() { return log.scrollHeight - log.scrollTop - log.clientHeight < 90; }
   function hideScrollBtn() { scrollBtn.classList.remove("show"); }
@@ -1003,9 +1020,12 @@
           triggerHaptic();
           var payload = ui ? {ui_message_id: ui.id, revision: ui.revision, button_id: btn.button_id} :
             {callback_data: btn.callback_data, message_id: messageId};
+          var requestId=crypto.randomUUID?crypto.randomUUID():Date.now().toString(36)+Math.random().toString(36).slice(2);
+          payload.request_id=requestId;
+          cardScrollIntent={id:requestId,cid:selectedConversationId,messageId:ui?'ui:'+ui.id:messageId};
+          cardRequests.set(requestId,{button:b,timer:setTimeout(()=>{finishCardRequest(requestId);if(cardScrollIntent?.id===requestId)cardScrollIntent=null;},180000)});
           api("/api/callback", { method: "POST", body: JSON.stringify(payload) })
-            .catch(function (err) { toast(err.message); })
-            .finally(function () { setTimeout(function () { b.disabled = false; b.classList.remove("loading"); }, 350); });
+            .catch(function (err) { finishCardRequest(requestId);if(cardScrollIntent?.id===requestId)cardScrollIntent=null;toast(err.message); });
         });
         rowEl.appendChild(b);
       });
@@ -1153,6 +1173,9 @@
   }
 
   function handleFrame(frame) {
+    if(frame.type==='settings_state'){window.XGentAppearance?.accept(frame);return;}
+    if(frame.type==='conversation_deleted'){window.dispatchEvent(new CustomEvent('xgent-conversation-deleted',{detail:frame}));window.XGentConversations?.refresh();return;}
+    if(frame.interaction_id&&['callback_done','turn_error'].includes(frame.type))finishCardRequest(frame.interaction_id);
     if(frame.type === 'conversation_state') {
       window.XGentConversations?.accept(frame);
       setBusy(!!frame.running);
@@ -1236,7 +1259,8 @@
     } else if (frame.type === "callback_answer") {
       toast(frame.text, frame.show_alert);
     } else if (frame.type === "callback_done") {
-      if (frame.resync) refreshMenus();
+      const refreshed=frame.resync?refreshMenus():Promise.resolve();
+      Promise.resolve(refreshed).then(()=>finishCardScroll(frame)).catch(()=>finishCardRequest(frame.interaction_id));
     } else if (frame.type === "generation_end") {
       setBusy(false);hideTyping();
     } else if (frame.type === "turn_end" || frame.type === "turn_error") {
@@ -1265,7 +1289,7 @@
         // Restore failures and retry controls are durable after the archive switch.
         if (frame.committed) resync();
       }
-    } else if (frame.type === "history_reset") {
+    } else if (frame.type === "history_reset" || frame.type === "context_reset") {
       cancelUploads("记忆已清空");
       pendingFrames = [];
       resync();
@@ -1495,6 +1519,8 @@
     return (last?rows.at(-1):rows[0])?.dataset.historyCursor;
   }
   function updateHistoryState() {
+    document.getElementById('wb-chat').classList.toggle('history-past',viewingPast);
+    document.getElementById('wb-chat').classList.toggle('history-top',log.scrollTop<8&&!!historyCursor);
     document.getElementById('wb-earlier').disabled=historyLoading||!historyCursor;
     document.getElementById('wb-newer').disabled=historyLoading||!newerAvailable;
     document.getElementById('wb-history-state').textContent=viewingPast?
@@ -1546,10 +1572,7 @@
       if(!selectedConversationId && data.conversation_id)selectedConversationId=data.conversation_id;
       historyControls(data);
       const sameGeneration=uiGeneration===null || data.ui_generation==null || uiGeneration===data.ui_generation;
-      if(!sameGeneration){
-        Array.from(new Set(Object.values(byMessageId))).forEach(removeEntry);
-        log.replaceChildren();byMessageId={};uiRevisions={};uiDeleted={};
-      }
+      if(!sameGeneration){uiRevisions={};uiDeleted={};}
       uiGeneration=Number.isSafeInteger(data.ui_generation)?data.ui_generation:null;
       (data.ui_tombstones||[]).forEach(function(item){uiRevisions[item.ui_message_id]=item.revision;uiDeleted[item.ui_message_id]=true;});
       const retained=new Set();
@@ -1579,6 +1602,7 @@
       if(data.busy && !(live?.frames||[]).length && (!data.running || data.running.conversation_id===selectedConversationId))showTyping();else hideTyping();
       updateEmptyState();boundMessages(false);
       if(wasNearBottom||historyAnchor)scrollDown();else log.scrollTop=top;
+      updateHistoryState();
       if(historyAnchor){const entry=byMessageId[historyAnchor];if(entry){entry.row.classList.add('wb-focus');setTimeout(()=>entry.row.classList.remove('wb-focus'),2000);}}
     });
   }
@@ -2409,6 +2433,7 @@
   });
 
   log.addEventListener("scroll", function () {
+    document.getElementById('wb-chat').classList.toggle('history-top',log.scrollTop<8&&!!historyCursor);
     if (isNearBottom()) hideScrollBtn(); else showScrollBtn();
   });
   scrollBtn.addEventListener("click", function () { scrollDown(); triggerHaptic(); });
@@ -2486,7 +2511,7 @@
     function execute(cmd){
       var error=window.XGentChat.commandError();if(error){feedback.replaceChildren(actionMessage(error,true));return;}
       closeCommands(false);
-      if(['/clear_memory','/restart','/update'].includes(cmd)){
+      if(['/clear','/clear_memory','/restart','/update'].includes(cmd)){
         if(window.XGentWorkbench){window.XGentWorkbench.confirmCommand(cmd);return;}
         if(!confirm('此命令可能改变共享数据或重启服务，是否执行 '+cmd+'？'))return;
       }
@@ -2582,6 +2607,7 @@
     }
   });
   window.addEventListener('xgent-conversation-changed',function(event){
+    cancelCardFollow();
     var next=event.detail.conversation_id;
     if(next===selectedConversationId)return;
     if(selectedConversationId){
@@ -2602,6 +2628,16 @@
     if(!loggedOut)resync(true).catch(function(){});
   });
   window.addEventListener('xgent-conversation-state',function(event){setBusy(!!event.detail.running);});
+  window.addEventListener('xgent-conversation-deleted',function(event){
+    const cid=event.detail.conversation_id;delete conversationDrafts[cid];try{sessionStorage.removeItem(draftKey(cid));}catch{}
+    if(cardScrollIntent?.cid===cid)cancelCardFollow();
+  });
+  const optionsPanel=document.getElementById('chat-options'), optionsToggle=document.getElementById('chat-options-toggle');
+  function closeChatOptions(){optionsPanel.hidden=true;optionsToggle.setAttribute('aria-expanded','false');}
+  optionsToggle.addEventListener('click',()=>{optionsPanel.hidden=!optionsPanel.hidden;optionsToggle.setAttribute('aria-expanded',String(!optionsPanel.hidden));});
+  document.addEventListener('click',event=>{if(!optionsPanel.contains(event.target)&&!optionsToggle.contains(event.target))closeChatOptions();});
+  optionsPanel.addEventListener('click',event=>{if(event.target.closest('.chat-option-tools button'))closeChatOptions();});
+  document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!optionsPanel.hidden){closeChatOptions();optionsToggle.focus();}});
   window.XGentChat = {
     openCommands:openCommands,logout:logoutAction,
     commandError: function(){

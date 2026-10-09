@@ -99,7 +99,7 @@ def test_logout_is_visible_clears_draft_and_does_not_reload_auto_login(browser_c
     expect=pytest.importorskip('playwright.sync_api').expect
     page=browser_context.new_page();ready(page,workspace_url['url'])
     page.locator('#input').fill('应当清理的草稿')
-    page.locator('#wb-logout').click()
+    page.locator('#chat-options-toggle').click();page.locator('#wb-logout').click()
     expect(page.locator('#login')).to_be_visible()
     assert not browser_context.request.get(workspace_url['url']+'/api/session').json()['authenticated']
     assert page.locator('#input').input_value()==''
@@ -138,7 +138,7 @@ def test_logout_failure_keeps_session_and_shows_retry(browser_context,workspace_
     page=browser_context.new_page();ready(page,workspace_url['url'])
     page.locator('#input').fill('退出失败时保留')
     page.route('**/api/logout',lambda r:r.fulfill(status=503,json={'error':'fixture logout unavailable'}))
-    page.locator('#wb-logout').click()
+    page.locator('#chat-options-toggle').click();page.locator('#wb-logout').click()
     expect(page.locator('#wb-dialog')).to_contain_text('退出失败')
     assert browser_context.request.get(workspace_url['url']+'/api/session').json()['authenticated']
     assert page.locator('#input').input_value()=='退出失败时保留'

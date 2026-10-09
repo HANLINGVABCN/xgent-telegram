@@ -280,7 +280,9 @@ def _command_map() -> dict:
 
 
 def _command_names() -> List[str]:
-    return sorted(_command_map())
+    names = _command_map()
+    visible = _ns.get("visible_command_names")
+    return sorted(visible(names) if callable(visible) else names)
 
 
 def _resolve_command(name: str):
@@ -1317,7 +1319,7 @@ def _management_input(line):
     if line in (_EXIT, _EOF, _CANCEL, _MENU_DISMISS):
         return True
     text = str(line).strip()
-    if text.split(' ', 1)[0] in {'/chats', '/new', '/getchat', '/menu', '/help'}:
+    if text.split(' ', 1)[0] in {'/chats', '/new', '/getchat', '/menu', '/help', '/clear', '/clear_memory'}:
         return True
     if UserDataManager.get('state') == BotState.RENAME_CHAT:
         return True

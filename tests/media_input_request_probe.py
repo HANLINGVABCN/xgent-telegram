@@ -234,7 +234,7 @@ async def check_agent_flow(bot, root):
                 assert_images(h.requests[before], [originals()[4]])
                 assert unpack(h.requests[before + 1])[1] == [originals()[0], originals()[1], originals()[0]]
                 assert_images(h.requests[before + 2], [originals()[4], *generated_images])
-                rows = await h.db.get_global_messages(1000)
+                rows = await h.db.get_global_messages(1000, active_context=True)
                 media = [row for row in rows if row["msg_type"] == "media_reply"]
                 assert len(media) == 1, (fmt, media)
                 metadata = json.loads(media[0]["metadata"])
@@ -257,7 +257,7 @@ async def check_agent_flow(bot, root):
         await h.turn("report missing input")
         assert len(h.requests) == before + 2
         assert all(body.get("model") != MEDIA_MODEL for body in h.requests[before:])
-        rows = await h.db.get_global_messages(1000)
+        rows = await h.db.get_global_messages(1000, active_context=True)
         failures = [row for row in rows if row["msg_type"] == "media_reply"]
         assert len(failures) == 1 and "File #2" in failures[0]["content"]
         assert missing in failures[0]["content"]
@@ -331,7 +331,7 @@ async def check_file_loading_races(bot, root):
                 if mode == "complete_stop":
                     sender.assert_not_awaited()
             assert len(await refs(h)) == 2
-            rows = await h.db.get_global_messages(1000)
+            rows = await h.db.get_global_messages(1000, active_context=True)
             assert len([row for row in rows if row["msg_type"] == "media_reply"]) == 1
             h.replies.clear()
             h.configure(agent=False)
@@ -343,35 +343,50 @@ async def check_file_loading_races(bot, root):
 
 
 async def check_request_boundary_races(bot, root):
+    from xgent_app.conversations import bind_conversation, current_scope
+
     async with GeneratedHarness(bot, root) as h:
         path = save(h, "reference.png", originals()[0])
+        conversation_id = current_scope().conversation_id
         result = {}
         for fmt in FORMATS:
             for phase in ("stop", "clear"):
-                configure_media(h, fmt)
-                bot.ModelClient._thinking_unsupported.clear()
-                bot.UserDataManager.set("thinking_level", "low")
-                h.error = (400, "unsupported thinking configuration")
-                before = len(h.requests)
-                respond = h.http._transport.handler
+                # Each matrix case is a new inbound operation. A clear in a child
+                # task advances SQLite, not the parent's immutable ContextVar.
+                # Python <=3.11 wait_for always creates that child; 3.12+ can run
+                # the coroutine inline. Do not rely on either implementation.
+                scope = await bot.get_conversations().resolve(conversation_id)
+                with bind_conversation(scope):
+                    configure_media(h, fmt)
+                    bot.ModelClient._thinking_unsupported.clear()
+                    bot.UserDataManager.set("thinking_level", "low")
+                    h.error = (400, "unsupported thinking configuration")
+                    before = len(h.requests)
+                    respond = h.http._transport.handler
 
-                async def interrupt_response(request, respond=respond, phase=phase):
-                    response = respond(request)
-                    if phase == "stop":
-                        bot.get_or_create_stop_event().set()
-                    else:
-                        await h.db.clear_all_conversation_memory()
-                    return response
+                    async def interrupt_response(request, respond=respond, phase=phase):
+                        response = respond(request)
+                        if phase == "stop":
+                            bot.get_or_create_stop_event().set()
+                        else:
+                            # A separate /clear operation must invalidate the
+                            # admitted request without rebinding its scope.
+                            await asyncio.create_task(h.db.clear_all_conversation_memory())
+                        return response
 
-                with patch.object(h.http._transport, "handler", interrupt_response):
-                    try:
-                        await bot.run_media_protocol(request_body([path]))
-                    except asyncio.CancelledError:
-                        pass
-                    else:
-                        raise AssertionError("interrupted media request was retried")
-                assert len(h.requests) == before + 1
-                result[f"{fmt}/{phase}"] = True
+                    with patch.object(h.http._transport, "handler", interrupt_response):
+                        task = asyncio.create_task(bot.run_media_protocol(request_body([path])))
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                        else:
+                            raise AssertionError(f"{fmt}/{phase}: interrupted media request returned without cancellation")
+                    assert len(h.requests) == before + 1, f"{fmt}/{phase}: provider request was retried"
+                    assert current_scope() == scope, "child task rebound the parent operation"
+                    if phase == "clear":
+                        assert await h.db.get_attachment_generation() != scope.generation
+                    result[f"{fmt}/{phase}"] = True
         return result
 
 

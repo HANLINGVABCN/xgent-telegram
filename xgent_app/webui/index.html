@@ -9,6 +9,7 @@
 <link rel="stylesheet" href="/assets/chat.css">
 <link rel="stylesheet" href="/assets/workbench.css">
 <link rel="stylesheet" href="/assets/conversations.css">
+<link rel="stylesheet" href="/assets/reading.css">
 </head>
 <body data-page="chat">
 
@@ -63,21 +64,22 @@
 <div id="conversation-backdrop" aria-hidden="true" hidden></div>
 <div id="wb-shell">
 <div id="header">
-  <div class="header-info">
-    <div class="bot-avatar" id="bot-avatar">X</div>
-    <div class="header-text">
-      <div class="bot-name-row">
-        <span class="bot-name">XGent</span>
-        <span class="model-pill" id="model-pill">AI</span>
-      </div>
-      <div class="bot-status" id="status-text"><span class="conn-dot" id="conn-dot"></span> 在线</div>
-    </div>
-  </div>
-  <button id="btn-search" class="icon-btn" title="查找消息 (Ctrl+F)" aria-label="查找消息"><svg class="icon" viewBox="0 0 24 24"><use href="#i-search"/></svg></button>
+  <div class="header-info"><div class="header-text">
+    <h1 id="wb-conversation-title" title="新对话">新对话</h1>
+    <div class="bot-status" id="status-text"><span class="conn-dot" id="conn-dot"></span> 在线</div>
+    <span class="bot-name" hidden>XGent</span><span id="bot-avatar" hidden>X</span>
+  </div><span id="conversation-current-status" class="conv-title-status" hidden>正在生成</span></div>
+  <button id="conversation-drawer-toggle" class="conv-drawer-toggle" type="button" aria-label="查看对话列表" aria-controls="wb-nav" aria-expanded="false"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v12H9l-5 4zM8 8h8M8 12h5"/></svg><span>对话记录</span></button>
+  <button id="chat-options-toggle" class="icon-btn" type="button" aria-label="聊天选项" aria-controls="chat-options" aria-expanded="false"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg></button>
+  <div id="chat-options" hidden>
+    <div id="wb-chat-controls"></div>
+    <div class="chat-option-tools">  <button id="btn-search" class="icon-btn" title="查找消息 (Ctrl+F)" aria-label="查找消息"><svg class="icon" viewBox="0 0 24 24"><use href="#i-search"/></svg></button>
   <button id="btn-theme" class="icon-btn" title="切换主题" aria-label="切换主题"><svg class="icon" viewBox="0 0 24 24"><use href="#i-moon"/></svg></button>
   <button id="btn-terminal" class="icon-btn" title="终端" aria-label="终端"><svg class="icon" viewBox="0 0 24 24"><use href="#i-terminal"/></svg></button>
   <button id="wb-logout" class="icon-btn" type="button" title="退出当前登录" aria-label="退出登录"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 4H4v16h6M14 8l4 4-4 4M8 12h10"/></svg></button>
   <button id="btn-settings" class="icon-btn" title="设置" aria-label="设置"><svg class="icon" viewBox="0 0 24 24"><use href="#i-settings"/></svg></button>
+<span class="model-pill" id="model-pill">AI</span></div>
+  </div>
 </div>
 
 <!-- 查找栏 -->
@@ -95,11 +97,6 @@
 </div>
 
 <section id="wb-chat" aria-label="对话">
-<div id="wb-chat-intro">
-  <div class="conv-chat-heading"><h1 id="wb-conversation-title" title="新对话">新对话</h1><span id="conversation-current-status" class="conv-title-status" hidden>正在生成</span></div>
-  <button id="conversation-drawer-toggle" class="conv-drawer-toggle" type="button" aria-label="查看对话列表" aria-controls="wb-nav" aria-expanded="false"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v12H9l-5 4zM8 8h8M8 12h5"/></svg><span>对话记录</span></button>
-  <div id="wb-chat-controls"></div>
-</div>
 <div id="conversation-running" class="conv-running" role="status" hidden></div>
 <div id="wb-history-controls"><button id="wb-earlier">↑ 加载更早记录</button><button id="wb-newer" disabled>加载较新记录 ↓</button><span id="wb-history-state" role="status"></span><button id="wb-latest">回到最新 ↓</button></div>
 <main id="log" aria-label="消息记录"></main>

@@ -129,7 +129,7 @@ class TelegramConversationControlTests(unittest.TestCase):
                 result = self.probe('named_menu_probe', surface)
                 menus = [item for item in result['sent'] if 'XGent for Telegram 已就绪' in item['text']]
                 self.assertEqual(1, len(menus))
-                prefix = '<b>🗂 洛溪，在不在 &lt;&amp;&gt; · ' + result['id'][:6] + '</b>\n'
+                prefix = '🗂 洛溪，在不在 &lt;&amp;&gt; · ' + result['id'][:6] + '\n'
                 self.assertTrue(menus[0]['text'].startswith(prefix), menus[0]['text'])
                 self.assertEqual(1, menus[0]['text'].count(prefix))
                 self.assertEqual('HTML', menus[0]['parse_mode'])
@@ -142,7 +142,7 @@ class TelegramConversationControlTests(unittest.TestCase):
     def test_label_does_not_require_a_model_run_and_keeps_legacy_short_id(self):
         scope = ConversationScope('8e5bca' + '0' * 26, 2, name='洛溪，在不在')
         with bind_conversation(scope):
-            expected = '<b>🗂 洛溪，在不在 · 8e5bca</b>\n菜单正文'
+            expected = '🗂 洛溪，在不在 · 8e5bca\n菜单正文'
             self.assertEqual(expected, conversation_labelled_text('菜单正文', 'HTML'))
             self.assertEqual(expected, conversation_labelled_text(expected, 'HTML'))
             self.assertEqual('x' * 4096, conversation_labelled_text('x' * 4096, 'HTML'))

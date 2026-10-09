@@ -167,10 +167,10 @@ async def provider_matrix(bot, root):
                 with zipfile.ZipFile(latest['archive_path']) as archive:
                     assert archive.testzip() is None
                 frames = h.drain_frames()
-                events = [f for f in frames if f['type'] in {'history_reset', 'compression_state'}]
+                events = [f for f in frames if f['type'] in {'context_reset', 'compression_state'}]
                 assert all(f.get('conversation_id') == 'global_memory' for f in events)
                 events = [{k:v for k,v in f.items() if k not in {'conversation_id','generation','run_id','conversation_name'}} for f in events]
-                assert events == [{'type': 'compression_state', 'busy': True}, {'type': 'history_reset'},
+                assert events == [{'type': 'compression_state', 'busy': True}, {'type': 'context_reset'},
                                   {'type': 'compression_state', 'busy': False, 'committed': True}]
                 await h.call(fmt)
                 assert contents(h.requests[-1]).count('SUMMARY-ONE') == 1

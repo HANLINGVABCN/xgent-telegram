@@ -167,9 +167,35 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif data == 'conv_archive':
             await manager.manage('archive', current_scope().conversation_id)
         elif data in {'conv_rename', 'cmd_rename_chat'}:
+            scope = current_scope()
             UserDataManager.set('state', BotState.RENAME_CHAT)
-            await context.bot.send_message(chat_id=update.effective_chat.id, text='请输入当前会话的新名称（1–80 字），或 cancel 取消。')
+            UserDataManager.set('temp_conversation_rename', {'conversation_id': scope.conversation_id,
+                                'generation': scope.generation, 'message': query.message})
+            await edit_conversation_card(update, context,
+                f'🗂 {safe_text(scope.name)} · {scope.conversation_id[:6]}\n请输入新名称（1–80 字），或 cancel 取消。',
+                InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回', callback_data='conv_cancel_rename')]]))
+            from xgent_app.ui_history import saved_ui_binding
+            UserDataManager.get('temp_conversation_rename')['ui_binding'] = saved_ui_binding()
             return
+        elif data == 'conv_cancel_rename':
+            UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('temp_conversation_rename', None)
+        elif data.startswith(('conv_delete:', 'conv_reset:')):
+            action, cid = data.split(':', 1)
+            db = await BotMemoryDB.get_instance()
+            info = await db.conversation_delete_info(cid)
+            deleting = action == 'conv_delete'
+            text = (f"🗂 {safe_text(info['name'])} · {cid[:6]}\n" +
+                    (f"永久删除该会话、历史和任务记录，并终止 {info['active_tasks']} 个未完成任务？此操作不可恢复。"
+                     if deleting else '重置该会话的模型上下文？历史、附件和定时任务仍保留。'))
+            await edit_conversation_card(update, context, text, InlineKeyboardMarkup([
+                [InlineKeyboardButton('🗑 确认永久删除' if deleting else '🧹 确认重置', callback_data=f"conv_confirm_{'delete' if deleting else 'reset'}:{cid}")],
+                [InlineKeyboardButton('🔙 返回', callback_data='conv_list')]]))
+            return
+        elif data.startswith('conv_confirm_delete:'):
+            await delete_conversation(data.split(':', 1)[1])
+        elif data.startswith('conv_confirm_reset:'):
+            await reset_conversation_context(data.split(':', 1)[1])
         archived, page = data == 'conv_archived', 1
         if data.startswith('conv_page:'):
             _, archived_flag, page_number = data.split(':', 2)
@@ -2173,14 +2199,14 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             global_count = len(await db.get_global_messages(10000))
             mirror_count = len(await db.get_chat_messages(current_scope().conversation_id))
             await query.message.edit_text(
-                "⚠️ <b>确认清空当前会话吗？</b>\n\n"
-                f"这只删除当前会话的上下文，其他会话不受影响。\n"
-                f"🌐 全局记忆记录: <b>{global_count}</b> 条\n"
+                "⚠️ <b>确认重置当前会话的模型上下文吗？</b>\n\n"
+                f"历史消息和附件会保留，旧内容不再提供给模型；其他会话不受影响。\n"
+                f"📜 保留的会话历史: <b>{global_count}</b> 条\n"
                 f"🪞 内部镜像消息: <b>{mirror_count}</b> 条\n\n"
                 "不会删除 Provider 配置、.env、提示词文件，token 用量统计（/stats）也会保留。",
                 parse_mode=constants.ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🧹 确认清空", callback_data="confirm_clear_memory")],
+                    [InlineKeyboardButton("🧹 确认重置", callback_data="confirm_clear_memory")],
                     [InlineKeyboardButton("🔙 返回主菜单", callback_data="act_main_menu")]
                 ])
             )
@@ -2195,7 +2221,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif data == "confirm_clear_memory":
             await cmd_delete_chat(update, context)
         elif data in {"cmd_new_chat", "cmd_save", "cmd_list_chats", "cmd_rename_chat"} or data.startswith("load_chat_"):
-            await query.answer("现在只有一份全局记忆，不再支持分段管理。", show_alert=True)
+            await query.answer("请使用 /chats 管理会话。", show_alert=True)
         else:
             # 没有任何分支命中。最常见的原因是重启后旧按钮里的短 ID 已经从
             # 内存映射表里消失（CallbackDataStore 是纯内存的）。以前这里
