@@ -1977,6 +1977,10 @@ class BotMemoryDB(ConversationStore):
 class UserDataManager:
     """管理用户数据，内存缓存优先"""
     _ui_state_revision = 0
+    _telegram_ui_revision = 0
+    _telegram_ui_data = {}
+    _ui_data_owner = None
+    _ui_bindings = {}
     
     _data: Dict[str, Any] = {}
     _db: Optional[BotMemoryDB] = None
@@ -2098,15 +2102,63 @@ class UserDataManager:
         }
     
     @classmethod
+    def ui_data(cls, selector=None):
+        from xgent_app.interaction import selection_key, is_temporary_key
+        if cls._ui_data_owner is not cls._data:
+            cls._ui_data_owner = cls._data
+            cls._telegram_ui_data = {'state': BotState.IDLE, 'temp_page': 1, 'fetched_cache': [],
+                                     'prompt_buffer': '', 'memory_buffer': '', 'editing_prompt_key': ''}
+            cls._ui_bindings = {}
+            cls._telegram_ui_revision = 0
+        telegram = selection_key(selector) == 'telegram_conversation_id'
+        data = cls._telegram_ui_data if telegram else cls._data
+        return data
+
+    @classmethod
+    def bind_ui_state(cls):
+        """Validate workflow identity once at user admission, never on background reads."""
+        from xgent_app.interaction import selection_key
+        side = 'telegram' if selection_key() == 'telegram_conversation_id' else 'shared'
+        data = cls.ui_data(side)
+        scope = current_scope()
+        identity = (scope.conversation_id, scope.generation)
+        previous = cls._ui_bindings.get(side)
+        expired = previous is not None and previous != identity and data.get('state', BotState.IDLE) != BotState.IDLE
+        if previous is not None and previous != identity:
+            cls.clear_ui_state(side)
+        cls._ui_bindings[side] = identity
+        return expired
+
+    @classmethod
+    def clear_ui_state(cls, selector):
+        from xgent_app.interaction import is_temporary_key
+        data = cls.ui_data(selector)
+        for key in list(data):
+            if is_temporary_key(key):
+                data.pop(key, None)
+        data.update(state=BotState.IDLE, temp_page=1, fetched_cache=[], prompt_buffer='')
+        cls._ui_bindings.pop(selector, None)
+        if selector == 'telegram':
+            cls._telegram_ui_revision += 1
+        else:
+            cls._ui_state_revision += 1
+
+    @classmethod
     def get(cls, key: str, default: Any = None) -> Any:
-        return cls._data.get(key, default)
-    
+        from xgent_app.interaction import is_temporary_key
+        return (cls.ui_data() if is_temporary_key(key) else cls._data).get(key, default)
+
     @classmethod
     def set(cls, key: str, value: Any):
+        from xgent_app.interaction import is_temporary_key, selection_key
+        data = cls.ui_data() if is_temporary_key(key) else cls._data
         if key == 'state':
-            cls._ui_state_revision += 1
-        cls._data[key] = value
-    
+            if selection_key() == 'telegram_conversation_id':
+                cls._telegram_ui_revision += 1
+            else:
+                cls._ui_state_revision += 1
+        data[key] = value
+
     @classmethod
     async def save_config(cls, key: str, value: Any):
         """保存配置到数据库"""

@@ -144,7 +144,7 @@ class ContextHistoryTests(unittest.IsolatedAsyncioTestCase):
             await conn.execute(f'ALTER TABLE {table} DROP COLUMN {column}')
         await self.db.set_config('conversation_schema_version',1)
         await self.db.close();await self.db._init_db()
-        self.assertTrue(Path(self.path+'.pre-conversations-v2.sqlite3').exists())
+        self.assertTrue(Path(self.path+'.pre-conversations-v3.sqlite3').exists())
         self.assertEqual(b,(await self.manager.state())['current_chat_id'])
         for cid,text in [(a.conversation_id,'A'),(b,'B')]:
             with bind_conversation(await self.manager.resolve(cid)):

@@ -78,9 +78,11 @@ class Workbench:
         cid = None if navigation else data.get('conversation_id')
         if method != 'GET' and resource in {'memory/clear','tasks/create'} and not cid:
             raise WorkbenchError('缺少目标会话，请刷新后重试。', 409)
+        from xgent_app.interaction import interaction
         try:
-            async with conversation_operation(cid, expected=method != 'GET' and not navigation, fresh=True):
-                return await self._handle_scoped(method, resource, data)
+            with interaction('web', 'management'):
+                async with conversation_operation(cid, expected=method != 'GET' and not navigation, fresh=True, selector='shared'):
+                    return await self._handle_scoped(method, resource, data)
         except ConversationError as exc:
             raise WorkbenchError(str(exc), exc.status) from exc
 

@@ -93,7 +93,7 @@ async def serve(port, count, conversation_count=0):
     server=WebChatServer(config);server.start()
     ns['_web_chat_server']=server
     ns['get_conversations']().start()
-    print(json.dumps({'url':f'http://127.0.0.1:{server._httpd.server_address[1]}','password':'preview-only'}),flush=True)
+    print(json.dumps({'url':f'http://127.0.0.1:{server._httpd.server_address[1]}','password':'preview-only','database_path':str(Path(db.db_path).resolve())}),flush=True)
     try:await asyncio.Event().wait()
     finally:server.stop();await ns['get_conversations']().close();await db.close()
 

@@ -77,9 +77,19 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
             else:
                 await context.bot.send_message(chat_id=BotConfig.AUTHORIZED_USER_ID, text=str(error))
         return
-    with replay_conversation(getattr(error, 'conversation_context', None)):
-        async with conversation_operation():
-            await _scoped_global_error_handler(update, context)
+    from xgent_app.interaction import interaction
+    from xgent_app.telegram_presentation import telegram_label
+    from xgent_app.web_bridge import install_tg_to_web_mirror
+    restore = install_tg_to_web_mirror(context.bot, get_web_outbox() or globals().get('_web_external_outbox'))
+    try:
+        with interaction('telegram', 'chat'), replay_conversation(getattr(error, 'conversation_context', None)), telegram_label('auto'):
+            if current_scope(required=False) is None and not (await get_conversations().state()).get('telegram_conversation_id'):
+                await context.bot.send_message(chat_id=BotConfig.AUTHORIZED_USER_ID, text='操作未完成，请先用 /chats 选择对话。')
+                return
+            async with conversation_operation(selector='telegram'):
+                await _scoped_global_error_handler(update, context)
+    finally:
+        restore()
 
 
 async def _scoped_global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -110,13 +120,30 @@ async def boot_core() -> None:
     get_conversations().start()
 
 
-@conversation_entry()
 async def telegram_ready(app) -> None:
+    from xgent_app.interaction import interaction
+    from xgent_app.web_bridge import install_tg_to_web_mirror
+    from xgent_app.telegram_presentation import telegram_label
+    with interaction('telegram', 'management'):
+        manager = get_conversations()
+        selected = (await manager.state()).get('telegram_conversation_id')
+        scope = await manager.resolve(selected, selector='telegram') if selected else None
+        with bind_conversation(scope), telegram_label('menu'):
+            restore = install_tg_to_web_mirror(app.bot, get_web_outbox() or globals().get('_web_external_outbox'))
+            try:
+                await _telegram_ready(app)
+            finally:
+                restore()
+
+
+async def _telegram_ready(app) -> None:
     """Telegram 通道真的就绪之后才做的事：同步 /命令 菜单 + 发启动主菜单。
 
     由 telegram_supervisor 在长轮询起来之后调用。两段各自 try 住：菜单同步失败
     不影响启动菜单，启动菜单失败也不影响任何别的组件。
     """
+    from xgent_app.telegram_presentation import render_telegram_text
+    from xgent_app.conversations import bind_callback_markup
     global _startup_commands_synced, _startup_menu_sent
 
     if not _startup_commands_synced:
@@ -197,6 +224,10 @@ async def telegram_ready(app) -> None:
                 await db.set_config('restart_expected_pid', None)
                 await db.set_config('restart_expected_ts', None)
 
+            if current_scope(required=False) is None:
+                _startup_menu_sent = True
+                return  # No automatic rebind or unsolicited selection menu.
+
             # 跨进程去重：检查上次发送时间戳
             last_sent_ts = await db.get_config('last_startup_menu_sent_ts', 0)
             elapsed = time.time() - float(last_sent_ts or 0)
@@ -207,12 +238,15 @@ async def telegram_ready(app) -> None:
             # 标记置位（不再回滚）：宁可启动菜单漏发，也绝不能重复发送。
             # 漏发时用户随时可手动 /start；重复发送才是真正困扰用户的问题。
             _startup_menu_sent = True
-            await app.bot.send_message(
-                chat_id=notify_chat_id or BotConfig.AUTHORIZED_USER_ID,
-                text=build_start_menu_text(),
-                reply_markup=get_main_menu(),
-                parse_mode=constants.ParseMode.HTML
-            )
+            from xgent_app.telegram_presentation import telegram_label
+            with telegram_label('footer'):
+                await app.bot.send_message(
+                    chat_id=notify_chat_id or BotConfig.AUTHORIZED_USER_ID,
+                    text=(build_start_menu_text() if getattr(app.bot.send_message, '_xgent_native_labelled', False)
+                          else await render_telegram_text(build_start_menu_text(), 'HTML')),
+                    reply_markup=bind_callback_markup(get_main_menu()),
+                    parse_mode=constants.ParseMode.HTML
+                )
             # 记录发送时间戳到数据库（跨进程有效）
             await db.set_config('last_startup_menu_sent_ts', time.time())
             await GlobalRecorder.record_system_op("启动后发送完整主菜单", {"chat_id": notify_chat_id, "restart_notice_sent": restart_notice_sent})

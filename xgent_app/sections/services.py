@@ -69,10 +69,13 @@ _RECORDER_SOURCE_ID = f"pid{os.getpid()}-{uuid.uuid4().hex[:6]}"
 
 
 def current_ui_workflow_guard() -> str:
-    state = {key: value for key, value in UserDataManager._data.items()
+    from xgent_app.interaction import selection_key
+    state = {key: value for key, value in UserDataManager.ui_data().items()
              if key == 'state' or key.startswith(('temp_', 'editing_')) or key.endswith('_buffer')}
     digest = hashlib.sha256(json.dumps(state, sort_keys=True, default=str).encode('utf-8')).hexdigest()
-    return f'{UI_PROCESS_ID}:{UserDataManager._ui_state_revision}:{digest}'
+    revision = (UserDataManager._telegram_ui_revision if selection_key() == 'telegram_conversation_id'
+                else UserDataManager._ui_state_revision)
+    return f'{UI_PROCESS_ID}:{revision}:{digest}'
 
 
 def validate_saved_menu_action(action: str) -> None:
@@ -2171,13 +2174,12 @@ def short_hash(s: str) -> str:
 
 
 async def _conversation_state_changed(state):
-    previous = UserDataManager.get('current_chat_id')
-    UserDataManager.set('current_chat_id', state['current_chat_id'])
-    if previous and previous != state['current_chat_id']:
-        UserDataManager.set('state', BotState.IDLE)
-        for key in list(UserDataManager._data):
-            if key.startswith(('temp_', 'editing_')) or key.endswith('_buffer') or key == 'ask_input_target':
-                UserDataManager._data.pop(key, None)
+    for key, side in (('current_chat_id', 'shared'), ('telegram_conversation_id', 'telegram')):
+        previous = UserDataManager.get(key)
+        selected = state.get(key)
+        UserDataManager.set(key, selected)
+        if previous != selected:
+            UserDataManager.clear_ui_state(side)
     db = await BotMemoryDB.get_instance()
     frame = {'type': 'conversation_state', **state, 'items': await db.get_all_sessions()}
     outbox = get_web_outbox() if 'get_web_outbox' in globals() else None
@@ -2187,21 +2189,6 @@ async def _conversation_state_changed(state):
     notifier = globals().get('_cli_conversation_notifier')
     if notifier is not None:
         notifier(frame)
-    if previous and previous != state['current_chat_id']:
-        bot = globals().get('_web_real_bot')
-        if bot is not None:
-            scope = await get_conversations().resolve()
-            with bind_conversation(scope):
-                await _announce_conversation_switch(bot, scope.name)
-
-
-@without_ui_history
-async def _announce_conversation_switch(bot, name):
-    with contextlib.suppress(Exception):
-        from xgent_app.telegram_presentation import telegram_label
-        with telegram_label(False):
-            scope = current_scope()
-            mirror_user_line_to_telegram(f'🗂 {name} · {scope.conversation_id[:6]}\n已切换会话，三端同步；未提交的设置输入已取消。')
 
 
 configure_conversations(lambda: BotMemoryDB.get_instance(), BotConfig.DB_FILE, _conversation_state_changed)

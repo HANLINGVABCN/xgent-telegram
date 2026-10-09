@@ -193,7 +193,10 @@ def ui_record(row: dict, *, active_generation=None) -> dict:
 
 
 async def capture_ui_frame(frame: dict, chat_id: int, *, source=None) -> dict:
+    from xgent_app.conversations import current_scope
     scope = _scope.get()
+    if current_scope(required=False) is None:
+        return frame  # The unselected Bot chooser is not part of any conversation history.
     if _factory is None or scope is False or frame.get('type') not in {'message', 'edit', 'edit_markup', 'delete'}:
         return frame
     markup = normalize_markup(frame.get('reply_markup'))

@@ -195,12 +195,11 @@ async def main():
     sends = [c for c in calls if c[0] == "send"]
     edits = [c for c in calls if c[0] == "edit"]
     deletes = [c for c in calls if c[0] == "delete"]
-    from xgent_app.conversations import conversation_labelled_text
-    # Native Telegram gets the conversation label; the relayed body stays exact.
-    placeholder = [c for c in sends if c[1] == conversation_labelled_text("流式输出中...")]
+    # Same-conversation Telegram output is plain; relayed bodies stay exact.
+    placeholder = [c for c in sends if c[1] == "流式输出中..."]
     print(json.dumps({
         "user_echo_once": sum(1 for c in sends if "帮我看下这个 bug" in c[1]) == 1,
-        "user_echo_marked": any(c[1] == conversation_labelled_text("🖥 [CLI]" + chr(10) + "帮我看下这个 bug") for c in sends),
+        "user_echo_marked": any(c[1] == "🖥 [CLI]" + chr(10) + "帮我看下这个 bug" for c in sends),
         "only_user_marked": sum(1 for c in sends if "[CLI]" in c[1]) == 1,
         "placeholder_verbatim": len(placeholder) == 1,
         "placeholder_has_stop_button": bool(placeholder) and placeholder[0][2] != [],

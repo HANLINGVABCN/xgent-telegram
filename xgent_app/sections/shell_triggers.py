@@ -2578,9 +2578,11 @@ class SelfTriggerManager:
         if task['status'] == 'cancelled':
             return
         try:
-            async with conversation_operation(task['conversation_id'], execution=True, wait=True,
-                                              allow_archived=True, fresh=True):
-                await cls._deliver_run_inner(run_id)
+            from xgent_app.interaction import interaction
+            with interaction('task', 'notification'):
+                async with conversation_operation(task['conversation_id'], execution=True, wait=True,
+                                                  allow_archived=True, fresh=True):
+                    await cls._deliver_run_inner(run_id)
         except ConversationError:
             return  # Deleted conversations must never wake or retarget a task.
 

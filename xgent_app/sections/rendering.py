@@ -1,4 +1,4 @@
-from xgent_app.telegram_presentation import telegram_label, label_enabled, stream_part
+from xgent_app.telegram_presentation import telegram_label, label_enabled, stream_part, presentation_mode, conversation_reply
 # This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
@@ -78,8 +78,8 @@ class TelegramRichAPI:
         由 Telegram 服务端自行解析 Markdown 为原生 RichBlock（表格/标题/列表等），
         无需客户端自行构建 block_tree。
         """
-        from xgent_app.conversations import conversation_labelled_text
-        text = conversation_labelled_text(text, 'MarkdownV2', limit=RICH_MESSAGE_CHAR_LIMIT)
+        from xgent_app.telegram_presentation import render_telegram_text
+        text = await render_telegram_text(text, 'MarkdownV2', limit=RICH_MESSAGE_CHAR_LIMIT + 512)
         payload: Dict[str, Any] = {
             "chat_id": chat_id,
             "rich_message": {"markdown": text or " "},
@@ -105,8 +105,8 @@ class TelegramRichAPI:
         完成后必须调用 send_rich_message 发送最终消息以持久化。
         API 返回 True（非 Message 对象），draft_id 由调用方生成。
         """
-        from xgent_app.conversations import conversation_labelled_text
-        text = conversation_labelled_text(text, 'MarkdownV2', limit=RICH_MESSAGE_CHAR_LIMIT)
+        from xgent_app.telegram_presentation import render_telegram_text
+        text = await render_telegram_text(text, 'MarkdownV2', limit=RICH_MESSAGE_CHAR_LIMIT + 512)
         payload: Dict[str, Any] = {
             "chat_id": chat_id,
             "draft_id": draft_id,
@@ -735,6 +735,7 @@ def _sanitize_telegram_html(text: str) -> str:
 async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: Any,
                             limit: int = 3900, **kwargs: Any) -> List[Any]:
     """Send text without letting Telegram's per-message limit break the handler."""
+    limit = min(limit, 3900)  # Reserve UTF-16 room for an 80-character source name.
     raw_text = str(text if text is not None else "")
     if not raw_text:
         raw_text = " "
@@ -753,7 +754,7 @@ async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
     sent: List[Any] = []
 
     for index, chunk in enumerate(chunks):
-        with telegram_label(label_enabled() and index == 0):
+        with telegram_label(presentation_mode()):
             send_kwargs = dict(kwargs)
             if index > 0:
                 send_kwargs.pop('reply_markup', None)
@@ -813,6 +814,7 @@ async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
 @without_ui_history
 async def finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: Any,
                                  response: str, limit: int = 4000):
+    limit = min(limit, 3900)
     html_response = markdown_to_telegram_html(response)
     # 按标签边界切（split_html_for_telegram），不用 split_text_for_telegram：后者会在
     # 恰好 limit 处硬切，可能落在 <pre>/<code>/<a href="…"> 标签中间 → 400。此处 html_response
@@ -823,7 +825,7 @@ async def finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         f"text_len={len(response)}, html_len={len(html_response)}, chunks={len(chunks)}"
     )
     await safe_edit_text(msg, chunks[0], reply_markup=None, parse_mode=constants.ParseMode.HTML)
-    with telegram_label(False):
+    with telegram_label('auto'):
         for extra_chunk in chunks[1:]:
             sent = await safe_send_message(context, chat_id, extra_chunk, limit=limit, parse_mode=constants.ParseMode.HTML)
             remember_reply_messages(sent)
@@ -924,13 +926,14 @@ async def finalize_html_response(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     折叠消息（含 <blockquote expandable>）走这条路：在块边界分段，parse_mode=HTML
     直发，原生 expandable / <pre> 属性原样到达 Telegram 与网页。
     """
+    limit = min(limit, 3900)
     safe_html = html_text if (html_text and str(html_text).strip()) else " "
     chunks = split_html_for_telegram(safe_html, limit)
     logger.info(
         f"Sending final folded HTML: chat_id={chat_id}, html_len={len(safe_html)}, chunks={len(chunks)}"
     )
     await safe_edit_text(msg, chunks[0], reply_markup=None, parse_mode=constants.ParseMode.HTML)
-    with telegram_label(False):
+    with telegram_label('auto'):
         for extra_chunk in chunks[1:]:
             sent = await safe_send_message(context, chat_id, extra_chunk, limit=limit, parse_mode=constants.ParseMode.HTML)
             remember_reply_messages(sent)
@@ -1266,7 +1269,7 @@ class TelegramStreamRenderer:
                 try:
                     new_text = text if text.strip() else "…"
                     html_text = self._display_html(new_text, hide_unclosed=True)
-                    with telegram_label(False):
+                    with telegram_label('auto'):
                         self.current_msg = await self.context.bot.send_message(
                             chat_id=self.chat_id,
                             text=html_text,

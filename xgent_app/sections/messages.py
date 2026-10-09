@@ -1664,6 +1664,7 @@ async def _record_user_stopped_reply(db, cid, chat_id, partial_text: str) -> str
 
 
 @without_ui_history
+@conversation_reply
 @conversation_entry(execution=True)
 async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
                                content_override: Optional[Any] = None,
@@ -1684,10 +1685,10 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
         # 否则补丁会残留，下次 install 把残留 wrapper 当“原方法”再次包裹，
         # real_bot 被注入成 chat_id → “got multiple values for argument 'chat_id'”。
         # 详见 web_bridge._ACTIVE_MIRRORS 的重入引用计数保护。
-        if is_web_chat_running() and not getattr(context.bot, "_is_xgent_web_bot", False):
-            _web_outbox = get_web_outbox()
+        if not getattr(context.bot, "_is_xgent_web_bot", False) and not getattr(context.bot, "_is_xgent_cli_bot", False):
+            _web_outbox = get_web_outbox() or globals().get('_web_external_outbox')
+            restore_mirror = install_tg_to_web_mirror(context.bot, _web_outbox)
             if _web_outbox is not None:
-                restore_mirror = install_tg_to_web_mirror(get_web_real_bot(), _web_outbox)
                 _web_outbox.put({"type": "user_message", "text": str(text or ""), "ts": time.time()})
         async with _conversation_processing_lock:
             if lock_acquired_event is not None:
@@ -2652,6 +2653,8 @@ async def resume_from_ask(ask_id: str) -> str:
         # 期间被 /清空上下文：快照历史已作废，别拿旧上下文继续。
         return "上下文已清空，这个表单已失效——如需继续，请让 AI 重新发起提问。"
 
+    from xgent_app.conversations import restore_reply_route
+    restore_reply_route(pending.conversation_context)
     answer_text = pending.form.assemble_answer(pending.draft)
 
     # 记录一条用户消息（表单回答，不含明文密钥）到全局记忆，供三端展示与后续历史。
@@ -2691,6 +2694,8 @@ async def cancel_ask(ask_id: str) -> str:
     if pending.generation != await db.get_attachment_generation():
         return "上下文已清空，这个表单已失效。"
 
+    from xgent_app.conversations import restore_reply_route
+    restore_reply_route(pending.conversation_context)
     notice = "[用户已取消表单] 用户没有作答，请不要再等待表单结果，自行决定如何收尾或改用其它方式。"
     answer_message = await persist_ask_answer(notice, pending.chat_id, pending.generation)
     bot = build_trigger_delivery_bot(int(pending.chat_id))

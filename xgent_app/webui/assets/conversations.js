@@ -16,7 +16,7 @@ const paths = {
   restore: 'M4 8h16v12H4zM3 4h18v4H3zM12 17v-6m-3 3 3-3 3 3',
   close: 'm6 6 12 12M6 18 18 6',
 };
-let state = {current_chat_id: null, revision: -1, items: [], running: null};
+let state = {current_chat_id: null, telegram_conversation_id: null, revision: -1, items: [], running: null};
 let authenticated = false, authEpoch = 0, request = null, mutation = null;
 let view = 'recent', listSignature = '', menuTarget = null, menuTrigger = null;
 let drawerOpen = false, drawerReturn = null, previousInert = null;
@@ -210,8 +210,9 @@ function notify(text, options = {}) {
 function createRow(item) {
   const row = node('div', {class: 'conv-row', 'data-conversation-id': item.id});
   const name = node('span', {class: 'conv-row-title'});
+  const bot = node('span', {class: 'conv-bot-badge', hidden: '', title: 'Telegram 当前使用此对话，不代表正在执行任务'}, 'Bot 当前');
   const dot = node('span', {class: 'conv-running-dot', 'aria-label': '正在生成', hidden: ''});
-  const open = button([name, dot], () => {
+  const open = button([name, bot, dot], () => {
     const current = itemById(item.id);
     if (current && isArchived(current)) restoreConversation(item.id, true);
     else selectConversation(item.id);
@@ -224,13 +225,13 @@ function createRow(item) {
   });
   const restore = button(icon('restore'), () => restoreConversation(item.id), {class: 'conv-restore conv-icon-button', hidden: ''});
   row.append(open, restore, more);
-  return {row, open, name, more, dot, restore};
+  return {row, open, name, more, dot, restore, bot};
 }
 function renderList() {
   const query = search.value.trim().toLocaleLowerCase();
   const visible = state.items.filter(item => isArchived(item) === (view === 'archived') && title(item).toLocaleLowerCase().includes(query))
     .sort((a, b) => timestamp(b) - timestamp(a) || a.id.localeCompare(b.id));
-  const signature = JSON.stringify([view, query, state.current_chat_id, state.running?.conversation_id, mutation,
+  const signature = JSON.stringify([view, query, state.current_chat_id, state.telegram_conversation_id, state.running?.conversation_id, mutation,
     visible.map(item => [item.id, title(item), groupFor(item)])]);
   if (signature === listSignature) return;
   listSignature = signature;
@@ -247,6 +248,7 @@ function renderList() {
     entry.row.classList.toggle('is-current', current);
     entry.row.classList.toggle('is-archived', isArchived(item));
     entry.row.classList.toggle('is-pending', mutation?.name === 'switch' && mutation.id === item.id);
+    entry.bot.hidden = item.id !== state.telegram_conversation_id;
     entry.name.textContent = title(item);
     entry.open.title = title(item);
     entry.open.setAttribute('aria-label', (isArchived(item) ? '已归档：' : '打开对话：') + title(item));

@@ -334,13 +334,15 @@ def save_conversation_export(root: str | Path, snapshot: dict, *, system_prompt:
                  / f'{now:%H%M%S}_{uuid.uuid4().hex}')
     directory.mkdir(parents=True, mode=0o700)
     archive_path = directory / EXPORT_NAME
-    files = archive_files(snapshot['compressions'], snapshot['records'], system_prompt=system_prompt,
-                          compression_prompt=compression_prompt, access_logs=access_logs,
-                          storage_root=storage_root, next_sequence=snapshot.get('next_sequence'))
+    current_files = None
     if snapshot.get('full_history'):
-        files['上下文范围.txt'] = (f"会话：{snapshot.get('conversation_id', '')}\n"
-            f"存档保留全部历史；当前模型上下文从记录 ID {snapshot.get('context_start_record_id', 0)} 开始。\n"
-            f"上下文周期：{snapshot.get('context_epoch', 0)}。管理审计、Token 提示不提供给模型。\n").encode('utf-8')
+        from xgent_app.history_export import history_archive_files
+        files, current_files = history_archive_files(snapshot, system_prompt=system_prompt,
+            compression_prompt=compression_prompt, access_logs=access_logs, storage_root=storage_root)
+    else:
+        files = archive_files(snapshot['compressions'], snapshot['records'], system_prompt=system_prompt,
+                              compression_prompt=compression_prompt, access_logs=access_logs,
+                              storage_root=storage_root, next_sequence=snapshot.get('next_sequence'))
     for name, data in files.items():
         with (directory / name).open('xb') as handle:
             os.chmod(handle.name, 0o600)
@@ -359,8 +361,8 @@ def save_conversation_export(root: str | Path, snapshot: dict, *, system_prompt:
     number = snapshot.get('next_sequence') or max((int(r['sequence']) for r in snapshot['compressions']), default=0) + 1
     bundle = {
         'version': 2, 'archive_path': str(archive_path), 'text_dir': str(directory),
-        'memory_path': str(directory / f'{number}a{MEMORY_NAME}.txt'),
-        'attachments_path': str(directory / f'{number}b{ATTACHMENTS_NAME}.txt'),
+        'memory_path': str(directory / (current_files[0] if current_files else f'{number}a{MEMORY_NAME}.txt')),
+        'attachments_path': str(directory / (current_files[1] if current_files else f'{number}b{ATTACHMENTS_NAME}.txt')),
         'instruction_path': str(directory / INSTRUCTION_NAME),
         'instruction': compression_prompt, 'system_prompt': system_prompt,
         'file_hashes': {name: hashlib.sha256(data).hexdigest() for name, data in files.items()},

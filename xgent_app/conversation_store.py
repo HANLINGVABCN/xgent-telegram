@@ -151,22 +151,27 @@ class ConversationStore:
                 raise ConversationError('数据库版本较新，请升级程序。')
             if version == SCHEMA_VERSION:
                 return
-            for column, definition in (
-                ('context_start_record_id', 'INTEGER NOT NULL DEFAULT 0'),
-                ('context_epoch', 'INTEGER NOT NULL DEFAULT 0'),
-                ('deleting', 'INTEGER NOT NULL DEFAULT 0'),
-                ('title_auto_pending', 'INTEGER NOT NULL DEFAULT 0'),
-            ):
-                await conn.execute(f'ALTER TABLE chat_sessions ADD COLUMN {column} {definition}')
-            await conn.execute("UPDATE chat_sessions SET title_auto_pending=1 WHERE name IS NULL OR name='新对话'")
-            await conn.execute('ALTER TABLE ui_messages ADD COLUMN conversation_id TEXT')
-            await conn.execute('UPDATE ui_messages SET conversation_id=(SELECT id FROM chat_sessions '
-                               'WHERE chat_sessions.generation=ui_messages.generation)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_ui_conversation_history ON ui_messages(conversation_id,timestamp,ui_message_id)')
-            for table in ('context_compressions', 'context_compression_jobs'):
-                await conn.execute(f'ALTER TABLE {table} ADD COLUMN context_epoch INTEGER NOT NULL DEFAULT 0')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_active_context ON global_messages(session_id,id)')
-            await _set_config(conn, 'conversation_schema_version', SCHEMA_VERSION)
+            if version < 2:
+                for column, definition in (
+                    ('context_start_record_id', 'INTEGER NOT NULL DEFAULT 0'),
+                    ('context_epoch', 'INTEGER NOT NULL DEFAULT 0'),
+                    ('deleting', 'INTEGER NOT NULL DEFAULT 0'),
+                    ('title_auto_pending', 'INTEGER NOT NULL DEFAULT 0'),
+                ):
+                    await conn.execute(f'ALTER TABLE chat_sessions ADD COLUMN {column} {definition}')
+                await conn.execute("UPDATE chat_sessions SET title_auto_pending=1 WHERE name IS NULL OR name='新对话'")
+                await conn.execute('ALTER TABLE ui_messages ADD COLUMN conversation_id TEXT')
+                await conn.execute('UPDATE ui_messages SET conversation_id=(SELECT id FROM chat_sessions '
+                                   'WHERE chat_sessions.generation=ui_messages.generation)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_ui_conversation_history ON ui_messages(conversation_id,timestamp,ui_message_id)')
+                for table in ('context_compressions', 'context_compression_jobs'):
+                    await conn.execute(f'ALTER TABLE {table} ADD COLUMN context_epoch INTEGER NOT NULL DEFAULT 0')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_active_context ON global_messages(session_id,id)')
+                await _set_config(conn, 'conversation_schema_version', 2)
+            if version < 3:
+                active = await _config(conn, 'current_chat_id')
+                await _set_config(conn, 'telegram_conversation_id', active)
+                await _set_config(conn, 'conversation_schema_version', 3)
         self._config_cache.clear()
 
     async def _context_start(self, conn):
@@ -218,6 +223,9 @@ class ConversationStore:
                 await _set_config(conn, 'conversation_running', running)
             if await _config(conn, 'current_chat_id') == cid:
                 await self._select_fallback(conn)
+            if await _config(conn, 'telegram_conversation_id') == cid:
+                await _set_config(conn, 'telegram_conversation_id', None)
+                self._config_cache.pop('telegram_conversation_id', None)
             await self._bump_conversation_revision(conn)
         return True
 
@@ -294,14 +302,17 @@ class ConversationStore:
         # One statement gives an atomic selection/revision/run snapshot.
         conn = await self._get_conn()
         cursor = await conn.execute("SELECT key,value FROM config WHERE key IN "
-                                    "('current_chat_id','conversation_revision','conversation_running')")
+                                    "('current_chat_id','telegram_conversation_id','conversation_revision','conversation_running')")
         config = {row['key']: json.loads(row['value']) for row in await cursor.fetchall()}
         await cursor.close()
         return {'current_chat_id': config.get('current_chat_id', DEFAULT_CONVERSATION_ID),
+                'telegram_conversation_id': config.get('telegram_conversation_id'),
                 'revision': int(config.get('conversation_revision', 0)),
                 'running': config.get('conversation_running')}
 
-    async def manage_conversation(self, action, conversation_id=None, name=None):
+    async def manage_conversation(self, action, conversation_id=None, name=None, *, selector='shared'):
+        from xgent_app.interaction import selection_key
+        selected_key = selection_key(selector)
         if action not in {'create', 'switch', 'rename', 'archive', 'restore'}:
             raise ConversationError('未知会话操作。')
         if action == 'rename' or name is not None:
@@ -309,8 +320,8 @@ class ConversationStore:
             if not name or len(name) > 80:
                 raise ConversationError('会话名称需要 1–80 个字符。')
         async with self._transaction() as conn:
-            active = await _config(conn, 'current_chat_id', DEFAULT_CONVERSATION_ID)
-            cid = str(conversation_id or active)
+            active = await _config(conn, selected_key)
+            cid = str(conversation_id or active or '')
             if action == 'create':
                 cid = await self._new_conversation(conn, name)
                 active = cid
@@ -329,16 +340,17 @@ class ConversationStore:
                     await conn.execute('UPDATE chat_sessions SET archived=0 WHERE id=?', (cid,))
                 elif action == 'archive':
                     await conn.execute('UPDATE chat_sessions SET archived=1 WHERE id=?', (cid,))
-                    if cid == active:
-                        cursor = await conn.execute('SELECT id FROM chat_sessions WHERE archived=0 AND deleting=0 '
-                                                    'ORDER BY last_active DESC,id LIMIT 1')
-                        other = await cursor.fetchone()
-                        active = other['id'] if other else await self._new_conversation(conn)
+                    if await _config(conn, 'telegram_conversation_id') == cid:
+                        await _set_config(conn, 'telegram_conversation_id', None)
+                    if await _config(conn, 'current_chat_id') == cid:
+                        await self._select_fallback(conn)
+                    active = await _config(conn, selected_key)
             if action in {'create', 'switch'}:
                 await conn.execute('UPDATE chat_sessions SET last_active=? WHERE id=?', (time.time(), active))
-            await _set_config(conn, 'current_chat_id', active)
+            await _set_config(conn, selected_key, active)
             await _set_config(conn, 'conversation_revision', int(await _config(conn, 'conversation_revision', 0)) + 1)
         self._config_cache.pop('current_chat_id', None)
+        self._config_cache.pop('telegram_conversation_id', None)
         return {'ok': True, 'conversation_id': cid, **await self.get_conversation_state()}
 
     async def request_conversation_stop(self, run_id, conversation_id=None):

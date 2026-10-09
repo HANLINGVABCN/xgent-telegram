@@ -19,7 +19,7 @@ from typing import Any
 
 DEFAULT_CONVERSATION_ID = 'global_memory'
 DEFAULT_CONVERSATION_NAME = '默认会话'
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class ConversationError(ValueError):
@@ -40,6 +40,9 @@ class ConversationScope:
     generation: int
     run_id: str | None = None
     name: str = ''
+    origin: str = 'legacy'
+    purpose: str = 'chat'
+    telegram_delivery: bool | None = None
 
 
 _scope = contextvars.ContextVar('xgent_conversation', default=None)
@@ -54,7 +57,7 @@ def current_scope(*, required=True) -> ConversationScope | None:
 
 
 @contextlib.contextmanager
-def bind_conversation(scope: ConversationScope):
+def bind_conversation(scope: ConversationScope | None):
     token = _scope.set(scope)
     try:
         yield scope
@@ -92,10 +95,25 @@ def replay_conversation(snapshot):
         finally:
             _scope.reset(token)
         return
+    from xgent_app.interaction import interaction
     scope = ConversationScope(str(snapshot['conversation_id']), int(snapshot['generation']),
-                              snapshot.get('run_id'), str(snapshot.get('name') or ''))
-    with bind_conversation(scope):
+                              snapshot.get('run_id'), str(snapshot.get('name') or ''),
+                              str(snapshot.get('origin') or 'legacy'), str(snapshot.get('purpose') or 'chat'),
+                              snapshot.get('telegram_delivery'))
+    with interaction(scope.origin, scope.purpose), bind_conversation(scope):
         yield scope
+
+
+def restore_reply_route(snapshot):
+    """Continue a form's original delivery contract, retaining the new run identity."""
+    if not snapshot:
+        return
+    scope = current_scope()
+    if snapshot.get('conversation_id') != scope.conversation_id or snapshot.get('generation') != scope.generation:
+        raise ConversationChanged('表单已不属于当前会话或上下文。')
+    _scope.set(dataclasses.replace(scope, origin=snapshot.get('origin', 'legacy'),
+                                  purpose=snapshot.get('purpose', 'chat'),
+                                  telegram_delivery=snapshot.get('telegram_delivery')))
 
 
 def stamp_frame(frame: dict) -> dict:
@@ -188,10 +206,13 @@ class ConversationManager:
             state['running'] = None
         return state
 
-    async def resolve(self, conversation_id=None, *, expected=False, allow_archived=False):
+    async def resolve(self, conversation_id=None, *, expected=False, allow_archived=False, selector=None):
         db = await self.factory()
         state = await db.get_conversation_state()
-        active = state['current_chat_id']
+        from xgent_app.interaction import identity, selection_key
+        active = state.get(selection_key(selector))
+        if conversation_id is None and active is None:
+            raise ConversationChanged('请先选择或新建 Bot 对话；本次内容尚未提交。')
         cid = str(conversation_id or active)
         if expected and cid != active:
             raise ConversationChanged('当前会话已在另一端切换，请确认后重新发送；内容尚未提交。')
@@ -200,11 +221,14 @@ class ConversationManager:
             raise ConversationChanged('该会话不存在，请刷新会话列表。')
         if session.get('archived') and not allow_archived:
             raise ConversationChanged('该会话已归档，请先恢复。')
-        return ConversationScope(cid, int(session['generation']), name=session.get('name') or '新对话')
+        origin, purpose = identity()
+        deliver = (purpose == 'chat' and cid == state.get('telegram_conversation_id')) if origin in {'web','cli'} else True
+        return ConversationScope(cid, int(session['generation']), name=session.get('name') or '新对话',
+                                 origin=origin, purpose=purpose, telegram_delivery=deliver if origin != 'legacy' else None)
 
     @contextlib.asynccontextmanager
     async def operation(self, conversation_id=None, *, execution=False, wait=False,
-                        expected=False, allow_archived=False, fresh=False):
+                        expected=False, allow_archived=False, fresh=False, selector=None):
         inherited = current_scope(required=False)
         if isinstance(conversation_id, ConversationScope):
             scope = conversation_id
@@ -213,7 +237,7 @@ class ConversationManager:
                 require_conversation_id(conversation_id)
             scope = inherited
         else:
-            scope = await self.resolve(conversation_id, expected=expected, allow_archived=allow_archived)
+            scope = await self.resolve(conversation_id, expected=expected, allow_archived=allow_archived, selector=selector)
         acquired = False
         if execution and not (scope.run_id and scope.run_id == self._run_id):
             while True:
@@ -227,7 +251,7 @@ class ConversationManager:
             try:
                 # Check again after acquisition, before any message is persisted.
                 fresh_scope = await self.resolve(scope.conversation_id, expected=expected,
-                                                 allow_archived=allow_archived)
+                                                 allow_archived=allow_archived, selector=selector)
                 if fresh_scope.generation != scope.generation:
                     raise ConversationChanged('对话已清空或压缩，旧操作未提交。')
                 scope = dataclasses.replace(scope, run_id=uuid.uuid4().hex)
@@ -291,9 +315,12 @@ class ConversationManager:
             self._stop_event.set()
         return accepted
 
-    async def manage(self, action, conversation_id=None, name=None):
+    async def manage(self, action, conversation_id=None, name=None, *, selector=None):
         db = await self.factory()
-        result = await db.manage_conversation(action, conversation_id, name)
+        from xgent_app.interaction import selection_key
+        key = selection_key(selector)
+        result = await db.manage_conversation(action, conversation_id, name,
+                                               selector='telegram' if key == 'telegram_conversation_id' else 'shared')
         await self.poll_once()
         return result
 
@@ -447,8 +474,8 @@ def conversation_labelled_text(text, parse_mode=None, *, limit=4096):
     Callers retain unmodified history/Web text; unscoped system notices stay plain.
     """
     scope = current_scope(required=False)
-    from xgent_app.telegram_presentation import label_enabled
-    if scope is None or not text or not label_enabled():
+    from xgent_app.telegram_presentation import should_label, presentation_mode
+    if scope is None or not should_label(scope):
         return text
     label = f'🗂 {scope.name or scope.conversation_id[:8]} · {scope.conversation_id[:6]}'
     mode = str(parse_mode or '').lower()
@@ -458,10 +485,20 @@ def conversation_labelled_text(text, parse_mode=None, *, limit=4096):
     elif mode.startswith('markdown'):
         from telegram.helpers import escape_markdown
         label = escape_markdown(label, version=2 if 'v2' in mode else 1)
-    prefix = label + '\n'
-    if str(text).startswith(prefix) or len(prefix) + len(str(text)) > limit:
+    body = str(text or '')
+    if body == label or body.startswith((label + '\n', label + ' · ')) or body.endswith('\n' + label):
         return text
-    return prefix + str(text)
+    prefix = label + (' · ' if presentation_mode() == 'inline' else '\n')
+    result = (body.rstrip() + '\n' + label if presentation_mode() == 'footer'
+              else prefix + body if body else label)
+    measured = result
+    if mode == 'html':
+        from xgent_app.protocols import ProtocolParser
+        import re
+        measured = html.unescape(re.sub(r'<[^>]*>', '', ProtocolParser.to_telegram_html(measured)))
+    if len(measured.encode('utf-16-le', errors='surrogatepass')) // 2 > limit:
+        return text
+    return result
 
 
 def defer_completion(frame, callback):

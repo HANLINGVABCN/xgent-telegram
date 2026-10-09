@@ -120,6 +120,7 @@ handle_text_message = _ns["handle_text_message"]
 logger = _ns["logger"]
 from xgent_app.conversations import conversation_operation, ConversationError, get_conversations
 from xgent_app.cli_bridge import set_visible_conversation
+from xgent_app.interaction import interaction
 
 _submitted_conversation_id = None
 _conversation_name = ''
@@ -152,13 +153,24 @@ def _cli_operation(*, execution=False):
             text = str(args[0]) if args else ''
             navigation = function.__name__ == '_run_command' and text.split(' ', 1)[0] in {'/chats','/new','/getchat'}
             cid = None if navigation else _submitted_conversation_id
-            execute = execution() if callable(execution) else execution
-            if function.__name__ == '_run_command':
-                command_name = text.strip().split(' ', 1)[0].lstrip('/').split('@', 1)[0].lower()
-                execute = command_name == 'compress' or _resolve_command(command_name) is None
             try:
-                async with conversation_operation(cid, execution=execute, expected=cid is not None, fresh=True):
-                    return await function(*args, **kwargs)
+                with interaction('cli', 'management'):
+                    async with conversation_operation(cid, expected=cid is not None, fresh=True, selector='shared') as scope:
+                        expired = UserDataManager.bind_ui_state()
+                        if expired and function.__name__ == '_run_conversation':
+                            raise ConversationError('之前的录入已因上下文变化取消；本次内容未提交，请重新操作。')
+                        execute = execution() if callable(execution) else execution
+                        command_name = ''
+                        if function.__name__ == '_run_command':
+                            command_name = text.strip().split(' ', 1)[0].lstrip('/').split('@', 1)[0].lower()
+                            execute = command_name == 'compress' or _resolve_command(command_name) is None
+                        purpose = ('chat' if execute and UserDataManager.get('state') == BotState.IDLE and
+                                   (function.__name__ != '_run_command' or _resolve_command(command_name) is None)
+                                   else 'management')
+                        with interaction('cli', purpose):
+                            admitted = await get_conversations().resolve(scope.conversation_id, expected=cid is not None, selector='shared')
+                            async with conversation_operation(admitted, execution=execute, expected=cid is not None):
+                                return await function(*args, **kwargs)
             except ConversationError as exc:
                 SCREEN.notice(str(exc), 'warn')
         return wrapped

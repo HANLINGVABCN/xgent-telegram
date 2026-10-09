@@ -13,25 +13,15 @@ async def cmd_delete_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     publish_conversation_event(context, {'type': 'context_reset'})
 
     message = update.message or update.callback_query.message
-    deleted_total = counts['global_messages']
-    deleted_mirror = counts['chat_messages']
 
     if update.callback_query:
         await message.edit_text(
-            "🧹 当前会话的模型上下文已重置；历史消息仍保留。\n"
-            f"🧠 此前 {deleted_total} 条记录已退出模型上下文\n"
-            f"🪞 已重置 {deleted_mirror} 条内部上下文缓存\n"
-            f"📦 会话名称、历史、附件与定时任务均保留\n\n"
-            "Provider 配置、提示词、.env 都还在，token 用量统计（/stats）也保留了。",
+            "🧹 上下文已重置，历史和附件仍保留。",
             reply_markup=get_main_menu()
         )
     else:
         await message.reply_text(
-            "🧹 当前会话的模型上下文已重置；历史消息仍保留。\n"
-            f"🧠 此前 {deleted_total} 条记录已退出模型上下文\n"
-            f"🪞 已重置 {deleted_mirror} 条内部上下文缓存\n"
-            f"📦 会话名称、历史、附件与定时任务均保留\n\n"
-            "Provider 配置、提示词、.env 都还在，token 用量统计（/stats）也保留了。",
+            "🧹 上下文已重置，历史和附件仍保留。",
             reply_markup=get_main_menu()
         )
 
@@ -159,6 +149,7 @@ async def generate_compression_summary(provider, data, model, history, stop_even
 
 
 @without_ui_history
+@conversation_reply
 @conversation_entry(execution=True)
 async def run_context_compression(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                    retry_job_id: Optional[str] = None):
@@ -184,10 +175,9 @@ async def run_context_compression(update: Update, context: ContextTypes.DEFAULT_
         typing_stop = asyncio.Event()
         typing_task = None
         try:
-            if is_web_chat_running() and not getattr(context.bot, '_is_xgent_web_bot', False):
-                outbox = get_web_outbox()
-                if outbox is not None:
-                    restore_mirror = install_tg_to_web_mirror(get_web_real_bot(), outbox)
+            if not getattr(context.bot, '_is_xgent_web_bot', False) and not getattr(context.bot, '_is_xgent_cli_bot', False):
+                outbox = get_web_outbox() or globals().get('_web_external_outbox')
+                restore_mirror = install_tg_to_web_mirror(context.bot, outbox)
             publish_conversation_event(context, {'type': 'compression_state', 'busy': True})
             typing_task = asyncio.create_task(keep_typing_while_waiting(
                 context, update.effective_chat.id, typing_stop, max_duration=TYPING_MAX_DURATION_SECONDS))
@@ -217,7 +207,7 @@ async def run_context_compression(update: Update, context: ContextTypes.DEFAULT_
                     await message.reply_text(warning)
             # Create this message only after archive delivery: editing an earlier
             # placeholder would leave the compression status above the ZIP in chat.
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(Exception), telegram_label('inline'):
                 status = await message.reply_text('正在压缩，成功前保留原上下文...', reply_markup=build_stop_keyboard())
             entry = await db.start_compression_attempt(entry['job_id'], provider, model)
             await asyncio.to_thread(verify_export, entry)

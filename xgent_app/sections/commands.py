@@ -18,16 +18,21 @@ def build_start_menu_text() -> str:
         f"📡 当前对话提供商: <b>{safe_text(active_prov)}</b>\n"
         f"💬 对话模型: <b>{safe_text(curr_model)}</b>\n"
         f"🖼️ 媒体模型: <b>{safe_text(media_model)}</b>\n"
-        f"🌐 全局模式: <b>常驻开启</b>\n"
         f"🤖 Agent模式: <b>{agent_mode}</b>\n"
         f"🧠 思考深度: <b>{safe_text(thinking_level)}</b>\n"
         f"🧩 文字拼接: <b>{safe_text(stitch_mode)}</b>\n"
         f"📊 全局记忆深度: <b>{global_depth}条</b>\n"
-        f"💾 记忆系统: <b>异步SQLite + 内存缓存</b>\n"
         f"━━━━━━━━━━━━━━\n"
         f"用户，服务正在运行"
     )
     return welcome_msg
+
+async def show_start_card(message, *, edit=False):
+    from xgent_app.telegram_presentation import telegram_label
+    with telegram_label('footer'):
+        send = message.edit_text if edit else message.reply_text
+        return await send(build_start_menu_text(), reply_markup=get_main_menu(), parse_mode=constants.ParseMode.HTML)
+
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
@@ -39,17 +44,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and update.message.text:
         await GlobalRecorder.record_user_message(update.message.text, MessageType.COMMAND, update.effective_chat.id)
     
-    welcome_msg = build_start_menu_text()
-    
     # 记录系统操作
     await GlobalRecorder.record_system_op("启动机器人", {"command": "/start"})
     
     message = update.message or update.callback_query.message
-    await message.reply_text(
-        welcome_msg, 
-        reply_markup=get_main_menu(), 
-        parse_mode=constants.ParseMode.HTML
-    )
+    await show_start_card(message)
 
 async def cmd_restart_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
@@ -816,10 +815,44 @@ async def cmd_new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_conversation_menu(update, context)
 
 
+_telegram_unselected_nonce = None
+
+
+def bind_unselected_telegram_markup(markup):
+    """A scope-less chooser must not leave reusable, unguarded selection buttons."""
+    global _telegram_unselected_nonce
+    _telegram_unselected_nonce = uuid.uuid4().hex[:12]
+    rows = []
+    for row in markup.inline_keyboard:
+        buttons = []
+        for button in row:
+            fields = button.to_dict()
+            if button.callback_data:
+                fields['callback_data'] = CallbackDataStore.store(
+                    f'tn:{_telegram_unselected_nonce}:{button.callback_data}')
+            buttons.append(InlineKeyboardButton.de_json(fields, None))
+        rows.append(buttons)
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_unselected_telegram_home(update, context):
+    await edit_conversation_card(update, context,
+        '🗂 尚未选择 Bot 对话\n请选择或新建对话后继续。',
+        InlineKeyboardMarkup([[InlineKeyboardButton('🗂 对话列表', callback_data='conv_list'),
+                               InlineKeyboardButton('➕ 新建对话', callback_data='conv_create')]]))
+
+
 async def edit_conversation_card(update, context, text, markup, *, message=None):
+    global _telegram_unselected_nonce
     from xgent_app.telegram_presentation import telegram_label
+    from xgent_app.interaction import selection_key
+    if selection_key() == 'telegram_conversation_id':
+        if current_scope(required=False) is None:
+            markup = bind_unselected_telegram_markup(markup)
+        else:
+            _telegram_unselected_nonce = None
     message = message or getattr(getattr(update, 'callback_query', None), 'message', None)
-    with telegram_label(False):
+    with telegram_label('self'):
         if message is not None:
             try:
                 await message.edit_text(text, reply_markup=markup, parse_mode=constants.ParseMode.HTML)
@@ -837,7 +870,9 @@ async def edit_conversation_card(update, context, text, markup, *, message=None)
 async def show_conversation_menu(update, context, *, archived=False, page=1, message=None, notice=''):
     manager = get_conversations()
     state = await manager.state()
-    scope = await manager.resolve()
+    from xgent_app.interaction import selection_key
+    selected = state.get(selection_key())
+    scope = await manager.resolve(selected) if selected else None
     db = await BotMemoryDB.get_instance()
     sessions = [item for item in await db.get_all_sessions() if bool(item['archived']) == archived]
     page_size = 4 if archived else 5
@@ -846,7 +881,7 @@ async def show_conversation_menu(update, context, *, archived=False, page=1, mes
     rows = []
     for session in sessions[(page - 1) * page_size:page * page_size]:
         cid = session['id']
-        marker = '✓ ' if cid == state['current_chat_id'] else ''
+        marker = '✓ ' if cid == selected else ''
         action = 'restore' if archived else 'switch'
         entry = [InlineKeyboardButton(marker + str(session['name'] or '新对话')[:40], callback_data=f'conv_{action}:{cid}')]
         if archived:
@@ -859,7 +894,7 @@ async def show_conversation_menu(update, context, *, archived=False, page=1, mes
         navigation.append(InlineKeyboardButton('下一页 ▶', callback_data=f'conv_page:{int(archived)}:{page+1}'))
     if navigation:
         rows.append(navigation)
-    if not archived:
+    if not archived and scope is not None:
         rows.extend([
             [InlineKeyboardButton('➕ 新建会话', callback_data='conv_create'),
              InlineKeyboardButton('🏷 重命名当前会话', callback_data='conv_rename')],
@@ -869,12 +904,16 @@ async def show_conversation_menu(update, context, *, archived=False, page=1, mes
         ])
         rows.append([InlineKeyboardButton('🧹 重置上下文', callback_data=f'conv_reset:{scope.conversation_id}'),
                      InlineKeyboardButton('🗑 删除当前会话', callback_data=f'conv_delete:{scope.conversation_id}')])
-    rows.append([InlineKeyboardButton('🔙 返回', callback_data='conv_list' if archived else 'act_main_menu')])
+    if not archived and scope is None:
+        rows.append([InlineKeyboardButton('➕ 新建会话', callback_data='conv_create'),
+                     InlineKeyboardButton('🗃 已归档', callback_data='conv_archived')])
+    rows.append([InlineKeyboardButton('🔙 返回', callback_data='conv_list' if archived else ('act_main_menu' if scope else 'conv_home'))])
     running = state.get('running')
     note = f"\n⏳ {running.get('name') or running['conversation_id']} 正在执行；切换不会中断。" if running else ''
     with bind_conversation(scope):
-        await advance_ui_generation()
-        title = f'🗂 {safe_text(scope.name)} · {scope.conversation_id[:6]}'
+        if scope is not None:
+            await advance_ui_generation()
+        title = f'🗂 {safe_text(scope.name)} · {scope.conversation_id[:6]}' if scope else '🗂 选择 Bot 对话'
         text = f'{title}\n{"已归档" if archived else "对话列表"} · 第 {page}/{pages} 页{safe_text(note)}'
         if notice:
             text += '\n' + safe_text(notice)

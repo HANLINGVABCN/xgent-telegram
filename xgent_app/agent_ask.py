@@ -261,6 +261,7 @@ class PendingAsk:
     chat_id: int
     origin: Any = None                     # AgentTurnOrigin，用于恢复时标记来源
     conversation_id: str = 'global_memory'
+    conversation_context: Optional[Dict[str, Any]] = None
     draft: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     form_message_id: Optional[int] = None  # 表单消息 id，供录入自定义/密钥后原地重画键盘
 
@@ -280,6 +281,9 @@ class PendingAskStore:
         return _secrets.token_hex(3)
 
     def put(self, pending: PendingAsk) -> None:
+        from xgent_app.conversations import conversation_snapshot
+        if pending.conversation_context is None:
+            pending.conversation_context = conversation_snapshot()
         self._store[pending.ask_id] = pending
 
     def get(self, ask_id: str) -> Optional[PendingAsk]:

@@ -129,14 +129,16 @@ class TelegramConversationControlTests(unittest.TestCase):
                 result = self.probe('named_menu_probe', surface)
                 menus = [item for item in result['sent'] if 'XGent for Telegram 已就绪' in item['text']]
                 self.assertEqual(1, len(menus))
-                prefix = '🗂 洛溪，在不在 &lt;&amp;&gt; · ' + result['id'][:6] + '\n'
-                self.assertTrue(menus[0]['text'].startswith(prefix), menus[0]['text'])
+                prefix = '\n🗂 洛溪，在不在 &lt;&amp;&gt; · ' + result['id'][:6]
+                self.assertTrue(menus[0]['text'].endswith(prefix), menus[0]['text'])
+                self.assertNotIn('🌐 全局模式', menus[0]['text'])
+                self.assertNotIn('💾 记忆系统', menus[0]['text'])
                 self.assertEqual(1, menus[0]['text'].count(prefix))
                 self.assertEqual('HTML', menus[0]['parse_mode'])
                 web = [frame for frame in result['frames'] if 'XGent for Telegram 已就绪' in str(frame.get('text', ''))]
                 self.assertEqual(1, len(web))
                 self.assertEqual(result['id'], web[0]['conversation_id'])
-                self.assertFalse(web[0]['text'].startswith(prefix))
+                self.assertNotIn(prefix, web[0]['text'])
                 self.assertFalse(result['model_called'])
 
     def test_label_does_not_require_a_model_run_and_keeps_legacy_short_id(self):

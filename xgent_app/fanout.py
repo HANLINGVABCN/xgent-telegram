@@ -212,6 +212,18 @@ class Op:
             return None
         return f"{self.kind}:{self.logical_id}"
 
+    @property
+    def muted(self) -> bool:
+        context = self.conversation_context or {}
+        if context.get('telegram_delivery') is False:
+            return True
+        # Exact legacy control signature, not a heuristic over user/model text.
+        text = self.payload.get('text', '')
+        return (self.kind == OP_SEND and not context.get('run_id') and
+                self.presentation_context == {'label': False} and isinstance(text, str) and
+                text.startswith('🗂 ') and
+                text.endswith('\n已切换会话，三端同步；未提交的设置输入已取消。'))
+
     def to_row(self) -> Dict[str, Any]:
         return {
             "kind": self.kind,
@@ -395,6 +407,8 @@ class ChannelWorker:
         永远不抛异常：调用方是对话核心，它正握着全局对话锁，任何异常或阻塞都会
         变成"整轮对话卡住"。
         """
+        if op.muted:
+            return False
         try:
             with self._lock:
                 self._seq += 1
@@ -641,6 +655,8 @@ class ChannelWorker:
 
     async def _deliver_one(self, op: Op, native: Optional[int]) -> Any:
         from xgent_app.conversations import conversation_still_exists
+        if op.muted:
+            return None
         if not await conversation_still_exists(op.conversation_context):
             return None
         from xgent_app.telegram_presentation import replay_presentation
@@ -688,6 +704,9 @@ class ChannelWorker:
             replayed = 0
             bad_streak = 0
             for op in keep:
+                if op.muted:
+                    await self._forget(op)
+                    continue
                 if self._closing or not self._breaker.allow():
                     break
                 if int(op.attempts or 0) >= MAX_OP_ATTEMPTS:

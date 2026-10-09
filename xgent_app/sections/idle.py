@@ -5,9 +5,14 @@ async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
     if get_conversations().lock.busy():
         return
     try:
-        async with conversation_operation(execution=True, fresh=True):
-            await _check_and_send_idle_message(context)
-    except ConversationBusy:
+        from xgent_app.interaction import interaction
+        selector = 'telegram' if globals().get('_web_real_bot') is not None else 'shared'
+        if selector == 'telegram' and (await get_conversations().state()).get('telegram_conversation_id') is None:
+            return
+        with interaction('idle', 'notification'):
+            async with conversation_operation(execution=True, fresh=True, selector=selector):
+                await _check_and_send_idle_message(context)
+    except ConversationError:
         return
 
 
@@ -327,13 +332,14 @@ def mirror_user_line_to_telegram(text: str) -> None:
 
     只发 Telegram，不推网页帧：用户自己那条气泡网页早就画出来了。
     """
-    if _web_real_bot is None:
+    from xgent_app.interaction import telegram_delivery_allowed
+    if _web_real_bot is None or not telegram_delivery_allowed():
         return
     channel = telegram_channel()
     channel.ensure_started()
-    from xgent_app.telegram_presentation import telegram_label, label_enabled
+    from xgent_app.telegram_presentation import telegram_label, presentation_mode
     for index, chunk in enumerate(split_text_for_telegram(text)):
-        with telegram_label(label_enabled() and index == 0):
+        with telegram_label(presentation_mode()):
             channel.offer(Op(OP_SEND, chat_id=BotConfig.AUTHORIZED_USER_ID,
                              payload={"text": chunk}))
 
@@ -1048,7 +1054,7 @@ def _web_submit_message(text: str, outbox: Any, *, conversation_id=None) -> None
     if loop is None:
         outbox.put({"type": "turn_error", "text": "服务未就绪"})
         return
-    asyncio.run_coroutine_threadsafe(_web_scoped_call(_web_run_conversation(text, outbox), conversation_id, outbox, execution=UserDataManager.get('state') == BotState.IDLE, rejected_text=text), loop)
+    asyncio.run_coroutine_threadsafe(_web_scoped_call(_web_run_conversation(text, outbox), conversation_id, outbox, execution=lambda: UserDataManager.get('state') == BotState.IDLE, rejected_text=text), loop)
 
 
 async def _web_deliver_file_to_tg(abs_path: str, filename: str, caption: str) -> None:
@@ -1060,8 +1066,9 @@ async def _web_deliver_file_to_tg(abs_path: str, filename: str, caption: str) ->
 
     本函数刻意不抛异常：TG 同步失败用 outbox 推一条 sys 提示，网页对话不被拖崩。
     """
-    if _web_real_bot is None:
-        return  # 纯网页模式，无 TG 可同步
+    from xgent_app.interaction import telegram_delivery_allowed
+    if _web_real_bot is None or not telegram_delivery_allowed():
+        return  # Filter before touching Telegram or creating a deferred upload.
 
     # 这条路径刻意绕过出站通道（要处理 file:// 容器路径与硬链清理），所以必须
     # 自己看一眼熔断状态：这里的上传超时最高开到 1800s，通道明摆着不通时还硬试
@@ -1080,8 +1087,11 @@ async def _web_deliver_file_to_tg(abs_path: str, filename: str, caption: str) ->
     chat_id = BotConfig.AUTHORIZED_USER_ID
     # 发到 TG 的 caption 带 [网页] 标记，与网页文本消息的镜像标记一致，
     # 让 TG 端知道这文件来自网页。仅用于 TG 发送，不影响喂给模型的附言。
-    tg_caption = f"💬 [网页]\n{caption}" if caption else "💬 [网页]"
+    from xgent_app.telegram_presentation import render_telegram_caption, render_telegram_text
+    tg_caption, overflow_caption = await render_telegram_caption(caption or None)
     try:
+        if overflow_caption is not None:
+            await _web_real_bot.send_message(chat_id=chat_id, text=await render_telegram_text(overflow_caption))
         file_size = os.path.getsize(abs_path)
         # AgentExecutor.MAX_FILE_SIZE 与发送侧同源（50MB），通过共享命名空间可见。
         max_file_size = AgentExecutor.MAX_FILE_SIZE
@@ -1154,7 +1164,7 @@ async def _web_deliver_file_to_tg(abs_path: str, filename: str, caption: str) ->
                 chat_id=chat_id,
                 document=f,
                 filename=filename,
-                caption=caption or None,
+                caption=tg_caption,
                 read_timeout=120,
                 write_timeout=120,
             )
@@ -1252,34 +1262,22 @@ async def _web_run_photo_conversation(filename: str, content: bytes,
 _WEB_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
 
+async def _web_run_upload(filename, content, caption, outbox):
+    # Choose only after the Web workflow has been bound, not in the HTTP thread.
+    ext = os.path.splitext(filename.lower())[1]
+    handler = (_web_run_photo_conversation if ext in _WEB_IMAGE_EXTENSIONS and
+               UserDataManager.get('state') == BotState.IDLE else _web_run_file_conversation)
+    await handler(filename, content, caption, outbox)
+
+
 def _web_submit_upload(filename: str, content: bytes, caption: str, outbox: Any, *, conversation_id=None) -> None:
-    """HTTP 线程调用：把网页上传文件的对话丢进事件循环，不等它跑完。
-
-    按文件名后缀分流：图片走 _web_run_photo_conversation（AI 能看懂图片
-    内容），其余走 _web_run_file_conversation（process_incoming_document
-    的状态机分流，覆盖提供商配置导入等场景）。仅当当前不处于任何配置类
-    状态时才按图片处理——如果用户正在"覆盖导入提供商配置"流程中发了张
-    图片（几乎不会发生，但保持行为可预期），仍应交给状态机处理并提示
-    格式错误，而不是被当成图片直接喂给 AI。
-    """
-    _, ext = os.path.splitext(filename.lower())
-    state = UserDataManager.get('state')
-    if ext in _WEB_IMAGE_EXTENSIONS and state == BotState.IDLE:
-        loop = _web_chat_server.config.loop if _web_chat_server else None
-        if loop is None:
-            outbox.put({"type": "turn_error", "text": "服务未就绪"})
-            return
-        asyncio.run_coroutine_threadsafe(
-            _web_scoped_call(_web_run_photo_conversation(filename, content, caption, outbox), conversation_id, outbox, execution=True), loop,
-        )
-        return
-
     loop = _web_chat_server.config.loop if _web_chat_server else None
     if loop is None:
         outbox.put({"type": "turn_error", "text": "服务未就绪"})
         return
     asyncio.run_coroutine_threadsafe(
-        _web_scoped_call(_web_run_file_conversation(filename, content, caption, outbox), conversation_id, outbox, execution=True), loop,
+        _web_scoped_call(_web_run_upload(filename, content, caption, outbox), conversation_id, outbox,
+                         execution=lambda: UserDataManager.get('state') == BotState.IDLE), loop,
     )
 
 
@@ -1318,7 +1316,7 @@ def _web_submit_command(command: str, outbox: Any, *, conversation_id=None) -> N
         outbox.put({"type": "turn_error", "text": "服务未就绪"})
         return
     name = command.strip().split(' ', 1)[0].lstrip('/').split('@', 1)[0].lower()
-    asyncio.run_coroutine_threadsafe(_web_scoped_call(_web_handle_command(command, outbox), conversation_id, outbox, execution=name == 'compress' or name not in _WEB_COMMAND_MAP, rejected_text=command), loop)
+    asyncio.run_coroutine_threadsafe(_web_scoped_call(_web_handle_command(command, outbox), conversation_id, outbox, execution=name == 'compress' or name not in _WEB_COMMAND_MAP, rejected_text=command, purpose='management' if name in _WEB_COMMAND_MAP else 'chat'), loop)
 
 
 def get_web_outbox() -> Optional[Any]:
@@ -1334,6 +1332,75 @@ def get_web_outbox() -> Optional[Any]:
 def get_web_real_bot() -> Optional[Any]:
     """返回真实 PTB bot 引用，供 TG 侧构建 MirrorBot 镜像到网页。"""
     return _web_real_bot
+
+
+def telegram_entry(handler):
+    """Bind native input before persistence; presentation works even without Web."""
+    @wraps(handler)
+    async def wrapped(update, context):
+        if not await authorize_before_conversation(update, context):
+            return
+        from xgent_app.interaction import interaction
+        from xgent_app.web_bridge import install_tg_to_web_mirror
+        restore = install_tg_to_web_mirror(context.bot, get_web_outbox() or globals().get('_web_external_outbox'))
+        try:
+            with interaction('telegram', 'management'), bind_conversation(None):
+                await UserDataManager.init()
+                manager = get_conversations()
+                state = await manager.state()
+                query = getattr(update, 'callback_query', None)
+                text = str(getattr(getattr(update, 'message', None), 'text', '') or '')
+                action = str(getattr(query, 'data', '') or '')
+                for _ in range(8):
+                    resolved = CallbackDataStore._store.get(action, action)
+                    if resolved == action:
+                        break
+                    action = resolved
+                if action.startswith('act_stop_generation'):
+                    run_id = action.partition(':')[2]
+                    accepted = await manager.request_stop(run_id) if run_id else False
+                    await query.answer('已收到停止请求' if accepted else '该回合已结束，停止按钮已失效。')
+                    return
+                chooser = action.startswith('tn:')
+                if chooser:
+                    _, nonce, action = action.split(':', 2)
+                    if state.get('telegram_conversation_id') is not None or nonce != globals().get('_telegram_unselected_nonce'):
+                        await query.answer('这个菜单已失效，请重新打开 /chats。', show_alert=True, cache_time=0)
+                        return
+                if state.get('telegram_conversation_id') is None:
+                    command = text.split(maxsplit=1)[0].split('@')[0].lower() if text else ''
+                    if query is not None:
+                        if not chooser:
+                            await query.answer('这个按钮属于旧会话，请重新打开 /chats 选择对话。', show_alert=True, cache_time=0)
+                            return
+                        await query.answer()
+                        if action == 'conv_home':
+                            await show_unselected_telegram_home(update, context)
+                        else:
+                            await handle_conversation_action(update, context, action)
+                        return
+                    if command == '/new':
+                        parts = text.split(maxsplit=1)
+                        await manager.manage('create', name=parts[1].strip() if len(parts) > 1 else None)
+                    await show_conversation_menu(update, context,
+                        notice='' if (await manager.state()).get('telegram_conversation_id') else
+                               '请先选择或新建 Bot 对话；未提交的内容不会自动重发。')
+                    return
+                async with conversation_operation(selector='telegram', fresh=True):
+                    expired = UserDataManager.bind_ui_state()
+                    if expired and query is None and not text.startswith('/'):
+                        await context.bot.send_message(chat_id=update.effective_chat.id,
+                            text='之前的录入已因上下文变化取消；本次内容未提交，请重新操作。')
+                        return
+                    purpose = ('management' if query is not None or text.startswith('/') or
+                               UserDataManager.get('state') != BotState.IDLE else 'chat')
+                    scope = current_scope()
+                    from dataclasses import replace
+                    with interaction('telegram', purpose), bind_conversation(replace(scope, purpose=purpose)):
+                        return await handler(update, context)
+        finally:
+            restore()
+    return wrapped
 
 
 def mirror_to_web(handler):
@@ -1356,8 +1423,10 @@ def mirror_to_web(handler):
             if str(getattr(getattr(update, 'callback_query', None), 'data', '') or '').startswith('act_stop_generation'):
                 return await handler(update, context)
             authorized = getattr(getattr(update, 'effective_user', None), 'id', None) == BotConfig.AUTHORIZED_USER_ID
-            async with ui_operation(capture_text=authorized):
-                return await handler(update, context)
+            from xgent_app.telegram_presentation import telegram_label
+            with telegram_label('menu'):
+                async with ui_operation(capture_text=authorized):
+                    return await handler(update, context)
         finally:
             restore()
     wrapped.__name__ = getattr(handler, "__name__", "wrapped")
@@ -1654,13 +1723,27 @@ async def stop_web_config_reconciler() -> None:
 # --- ☆ 其他类型消息处理 ☆ ---
 
 
-async def _web_scoped_call(coro, conversation_id, outbox, *, execution=False, rejected_text=None):
+async def _web_scoped_call(coro, conversation_id, outbox, *, execution=False, rejected_text=None, purpose=None):
+    from xgent_app.interaction import interaction
     started = False
     try:
-        async with conversation_operation(conversation_id, execution=execution,
-                                          expected=conversation_id is not None, fresh=True):
-            started = True
-            await coro
+        with interaction('web', 'management'):
+            async with conversation_operation(conversation_id, expected=conversation_id is not None,
+                                               fresh=True, selector='shared') as scope:
+                await UserDataManager.init()
+                expired = UserDataManager.bind_ui_state()
+                name = getattr(getattr(coro, 'cr_code', None), 'co_name', '')
+                user_input = name in {'_web_run_conversation', '_web_run_upload',
+                                     '_web_run_photo_conversation', '_web_run_file_conversation'}
+                if expired and user_input:
+                    raise ConversationChanged('之前的录入已因上下文变化取消；本次内容未提交，请重新操作。')
+                purpose = purpose or ('chat' if user_input and UserDataManager.get('state') == BotState.IDLE else 'management')
+                execute = execution() if callable(execution) else execution
+                with interaction('web', purpose):
+                    admitted = await get_conversations().resolve(scope.conversation_id, expected=conversation_id is not None, selector='shared')
+                    async with conversation_operation(admitted, execution=execute, expected=conversation_id is not None):
+                        started = True
+                        await coro
     except ConversationError as exc:
         outbox.put({'type': 'turn_rejected', 'conversation_id': conversation_id,
                     'generation': None, 'run_id': None, 'conversation_name': None,

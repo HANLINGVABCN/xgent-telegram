@@ -69,7 +69,7 @@ async def telegram_parts(bot,root):
         await bot.safe_send_message(context,1,'正文。'*3000,parse_mode='HTML')
         await mirror.flush_telegram()
         assert len(sent)>=3
-        assert sum(item['text'].count('🗂') for item in sent)==1,sent
+        assert sum(item['text'].count('🗂') for item in sent)==0,sent
         assert not sent[0]['text'].startswith('<b>')
         sent.clear()
         await bot.send_token_usage_message(context,1,{'input_tokens':120,'output_tokens':45,'total_tokens':165},1.2)
@@ -79,8 +79,14 @@ async def telegram_parts(bot,root):
             await mirror.send_message(1,'流式输出中...')
         await mirror.flush_telegram()
         assert sent[-1]['text']=='流式输出中...'
+        sent.clear()
+        await bot.get_conversations().manage('create', name='Bot B', selector='telegram')
+        await bot.safe_send_message(context,1,'异会话正文。'*1500,parse_mode='HTML')
+        await mirror.flush_telegram()
+        assert len(sent) >= 2 and all(item['text'].startswith('🗂 ') for item in sent)
+        assert not any('🗂 ' in str(frame.get('text','')) for frame in h.drain_frames())
         await mirror._tg_channel().aclose()
-        return {'one_header':True,'usage_plain':True,'placeholder_plain':True}
+        return {'current_plain':True,'foreign_parts_labelled':True,'usage_plain':True,'placeholder_plain':True}
 
 
 async def delete_running_and_recover(bot,root):

@@ -198,9 +198,13 @@ async def export_equivalence(bot, root):
             await h.compress()
         assert len(bundles) == 2
         with zipfile.ZipFile(bundles[0]['archive_path']) as left, zipfile.ZipFile(bundles[1]['archive_path']) as right:
-            assert set(left.namelist()) - set(right.namelist()) == {'上下文范围.txt'}
-            assert all(left.read(name) == right.read(name) for name in right.namelist())
-        return {'one_exporter_identical_files': True}
+            # Ordinary exports have sortable stages; model snapshots keep their
+            # old a/b/c paths. With no reset, corresponding payloads are identical.
+            assert '上下文范围.txt' in left.namelist()
+            for name in right.namelist():
+                normal = ('001-当前-00' + name) if name.startswith(('1a','1b')) else name
+                assert left.read(normal) == right.read(name), name
+        return {'ordinary_payloads_match_frozen_snapshot': True}
 
 
 async def legacy_saved(bot, root):

@@ -132,6 +132,58 @@ async def _dispatch_ask_callback(update: Any, context: Any, data: str) -> None:
         )
 
 
+async def handle_conversation_action(update, context, data):
+    """Shared single-card navigation, also usable from an unselected Bot chooser."""
+    query = update.callback_query
+    manager = get_conversations()
+    if data in {'conv_create', 'cmd_new_chat'}:
+        await manager.manage('create')
+    elif data.startswith('conv_switch:'):
+        await manager.manage('switch', data.split(':', 1)[1])
+    elif data.startswith('conv_restore:'):
+        cid = data.split(':', 1)[1]
+        await manager.manage('restore', cid)
+        await manager.manage('switch', cid)
+    elif data == 'conv_archive':
+        await manager.manage('archive', current_scope().conversation_id)
+    elif data in {'conv_rename', 'cmd_rename_chat'}:
+        scope = current_scope()
+        UserDataManager.set('state', BotState.RENAME_CHAT)
+        UserDataManager.set('temp_conversation_rename', {'conversation_id': scope.conversation_id,
+                            'generation': scope.generation, 'message': query.message})
+        await edit_conversation_card(update, context,
+            f'🗂 {safe_text(scope.name)} · {scope.conversation_id[:6]}\n请输入新名称（1–80 字），或 cancel 取消。',
+            InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回', callback_data='conv_cancel_rename')]]))
+        from xgent_app.ui_history import saved_ui_binding
+        UserDataManager.get('temp_conversation_rename')['ui_binding'] = saved_ui_binding()
+        return
+    elif data == 'conv_cancel_rename':
+        UserDataManager.set('state', BotState.IDLE)
+        UserDataManager.set('temp_conversation_rename', None)
+    elif data.startswith(('conv_delete:', 'conv_reset:')):
+        action, cid = data.split(':', 1)
+        db = await BotMemoryDB.get_instance()
+        info = await db.conversation_delete_info(cid)
+        deleting = action == 'conv_delete'
+        text = (f"🗂 {safe_text(info['name'])} · {cid[:6]}\n" +
+                (f"永久删除该会话、历史和任务记录，并终止 {info['active_tasks']} 个未完成任务？此操作不可恢复。"
+                 if deleting else '重置该会话的模型上下文？历史、附件和定时任务仍保留。'))
+        await edit_conversation_card(update, context, text, InlineKeyboardMarkup([
+            [InlineKeyboardButton('🗑 确认永久删除' if deleting else '🧹 确认重置', callback_data=f"conv_confirm_{'delete' if deleting else 'reset'}:{cid}")],
+            [InlineKeyboardButton('🔙 返回', callback_data='conv_list')]]))
+        return
+    elif data.startswith('conv_confirm_delete:'):
+        await delete_conversation(data.split(':', 1)[1])
+    elif data.startswith('conv_confirm_reset:'):
+        await reset_conversation_context(data.split(':', 1)[1])
+    archived, page = data == 'conv_archived', 1
+    if data.startswith('conv_page:'):
+        _, archived_flag, page_number = data.split(':', 2)
+        archived, page = archived_flag == '1', int(page_number)
+    await show_conversation_menu(update, context, archived=archived, page=page)
+    return
+
+
 @conversation_entry()
 async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -155,52 +207,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if data.startswith('conv_') or data in {'cmd_new_chat', 'cmd_list_chats', 'cmd_rename_chat'}:
         await query.answer()
-        manager = get_conversations()
-        if data in {'conv_create', 'cmd_new_chat'}:
-            await manager.manage('create')
-        elif data.startswith('conv_switch:'):
-            await manager.manage('switch', data.split(':', 1)[1])
-        elif data.startswith('conv_restore:'):
-            cid = data.split(':', 1)[1]
-            await manager.manage('restore', cid)
-            await manager.manage('switch', cid)
-        elif data == 'conv_archive':
-            await manager.manage('archive', current_scope().conversation_id)
-        elif data in {'conv_rename', 'cmd_rename_chat'}:
-            scope = current_scope()
-            UserDataManager.set('state', BotState.RENAME_CHAT)
-            UserDataManager.set('temp_conversation_rename', {'conversation_id': scope.conversation_id,
-                                'generation': scope.generation, 'message': query.message})
-            await edit_conversation_card(update, context,
-                f'🗂 {safe_text(scope.name)} · {scope.conversation_id[:6]}\n请输入新名称（1–80 字），或 cancel 取消。',
-                InlineKeyboardMarkup([[InlineKeyboardButton('🔙 返回', callback_data='conv_cancel_rename')]]))
-            from xgent_app.ui_history import saved_ui_binding
-            UserDataManager.get('temp_conversation_rename')['ui_binding'] = saved_ui_binding()
-            return
-        elif data == 'conv_cancel_rename':
-            UserDataManager.set('state', BotState.IDLE)
-            UserDataManager.set('temp_conversation_rename', None)
-        elif data.startswith(('conv_delete:', 'conv_reset:')):
-            action, cid = data.split(':', 1)
-            db = await BotMemoryDB.get_instance()
-            info = await db.conversation_delete_info(cid)
-            deleting = action == 'conv_delete'
-            text = (f"🗂 {safe_text(info['name'])} · {cid[:6]}\n" +
-                    (f"永久删除该会话、历史和任务记录，并终止 {info['active_tasks']} 个未完成任务？此操作不可恢复。"
-                     if deleting else '重置该会话的模型上下文？历史、附件和定时任务仍保留。'))
-            await edit_conversation_card(update, context, text, InlineKeyboardMarkup([
-                [InlineKeyboardButton('🗑 确认永久删除' if deleting else '🧹 确认重置', callback_data=f"conv_confirm_{'delete' if deleting else 'reset'}:{cid}")],
-                [InlineKeyboardButton('🔙 返回', callback_data='conv_list')]]))
-            return
-        elif data.startswith('conv_confirm_delete:'):
-            await delete_conversation(data.split(':', 1)[1])
-        elif data.startswith('conv_confirm_reset:'):
-            await reset_conversation_context(data.split(':', 1)[1])
-        archived, page = data == 'conv_archived', 1
-        if data.startswith('conv_page:'):
-            _, archived_flag, page_number = data.split(':', 2)
-            archived, page = archived_flag == '1', int(page_number)
-        await show_conversation_menu(update, context, archived=archived, page=page)
+        await handle_conversation_action(update, context, data)
         return
 
     if data == 'cmd_compress':
@@ -239,11 +246,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         # --- 主菜单 ---
         if data == "act_main_menu":
-            await query.message.edit_text(
-                build_start_menu_text(),
-                reply_markup=get_main_menu(),
-                parse_mode=constants.ParseMode.HTML
-            )
+            await show_start_card(query.message, edit=True)
 
         elif data in {"menu_price_table", "add_price_model", "menu_merge_map"} or data.startswith("edit_price_"):
             await handle_price_table_callbacks(update, context)
@@ -805,11 +808,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 {"agent_mode": new_mode}
             )
             
-            await query.message.edit_text(
-                build_start_menu_text(),
-                reply_markup=get_main_menu(),
-                parse_mode=constants.ParseMode.HTML
-            )
+            await show_start_card(query.message, edit=True)
         
         # --- 请求模式切换 ---
         elif data == "toggle_stream_mode":
@@ -823,11 +822,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 {"stream_mode": new_mode}
             )
 
-            await query.message.edit_text(
-                build_start_menu_text(),
-                reply_markup=get_main_menu(),
-                parse_mode=constants.ParseMode.HTML
-            )
+            await show_start_card(query.message, edit=True)
 
         # --- 流式风格切换（前台流式 / 后台流式）---
         elif data == "toggle_stream_style":

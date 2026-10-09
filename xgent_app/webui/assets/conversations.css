@@ -149,3 +149,6 @@ body.dark { --conv-hover: #262f39; --conv-selected: #303b47; }
   .conv-workspace { padding-top: 8px; padding-bottom: 4px; }
   #wb-nav .wb-nav-bottom { display: none; }
 }
+
+/* Selection badge, deliberately distinct from the generation/busy dot. */
+.conv-bot-badge { flex: 0 0 auto; white-space: nowrap; font-size: calc(var(--web-ui-font-size,13px) * .76923); line-height: 1.5; font-weight: 400; color: var(--wb-accent); border: 1px solid var(--wb-border); border-radius: 4px; padding: 0 4px; }

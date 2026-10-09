@@ -234,7 +234,7 @@ def build_application() -> Any:
 
     # 注册命令。CommandHandler 必须放在兜底 MessageHandler 前面，否则命令会被普通消息处理器吃掉。
     # mirror_to_web 让 TG 端命令/按钮的输出（菜单切换、按钮变化）同步到 web 端。
-    app.add_handler(CommandHandler("start", mirror_to_web(cmd_start)))
+    app.add_handler(CommandHandler("start", telegram_entry(mirror_to_web(cmd_start))))
     for cmd, handler in (
         ("chats", cmd_chats),
         ("new", cmd_new_chat),
@@ -263,32 +263,32 @@ def build_application() -> Any:
         ("stats", cmd_token_stats),
         ("show_chat_info", cmd_show_info),
     ):
-        app.add_handler(CommandHandler(cmd, mirror_to_web(handler)))
+        app.add_handler(CommandHandler(cmd, telegram_entry(mirror_to_web(handler))))
 
-    app.add_handler(CallbackQueryHandler(mirror_to_web(handle_button_click)))
+    app.add_handler(CallbackQueryHandler(telegram_entry(mirror_to_web(handle_button_click))))
     app.add_handler(MessageHandler(
         filters.Regex(r"^/(?:黑名单|blacklist)(?:@\w+)?(?:\s|$)"),
-        mirror_to_web(cmd_blacklist_menu)
+        telegram_entry(mirror_to_web(cmd_blacklist_menu))
     ))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document_message))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
-    app.add_handler(MessageHandler(filters.Sticker.ALL, handle_sticker_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, telegram_entry(handle_document_message)))
+    app.add_handler(MessageHandler(filters.PHOTO, telegram_entry(handle_photo_message)))
+    app.add_handler(MessageHandler(filters.Sticker.ALL, telegram_entry(handle_sticker_message)))
     # 原生音视频（语音/音频/视频/视频消息/GIF）直发：下载落盘、保留路径、送模型。
     # 必须放在兜底器之前，否则会被 handle_other_message 记成「[其他类型消息]」而丢失。
     _native_media_filter = (
         filters.VOICE | filters.AUDIO | filters.VIDEO
         | filters.VIDEO_NOTE | filters.ANIMATION
     )
-    app.add_handler(MessageHandler(_native_media_filter, handle_media_message))
+    app.add_handler(MessageHandler(_native_media_filter, telegram_entry(handle_media_message)))
     # 文本处理器（含转发消息——转发消息和普通消息完全一样处理）
     app.add_handler(MessageHandler(
-        (filters.TEXT | filters.FORWARDED) & ~filters.COMMAND, handle_text_message))
+        (filters.TEXT | filters.FORWARDED) & ~filters.COMMAND, telegram_entry(handle_text_message)))
     # 其他类型消息（排除转发、文本、文件/图片/贴纸/原生音视频）
     app.add_handler(MessageHandler(
         filters.ALL & ~filters.COMMAND & ~filters.TEXT & ~filters.FORWARDED
         & ~filters.Document.ALL & ~filters.PHOTO & ~filters.Sticker.ALL
         & ~_native_media_filter,
-        handle_other_message
+        telegram_entry(handle_other_message)
     ))
     app.add_error_handler(global_error_handler)
     return app

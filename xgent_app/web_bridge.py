@@ -201,7 +201,8 @@ def _offer(q: "queue.Queue[Optional[Dict[str, Any]]]", item: Optional[Dict[str, 
             pass
 
 
-from xgent_app.conversations import stamp_frame, bind_callback_markup, conversation_labelled_text, defer_completion
+from xgent_app.conversations import stamp_frame, bind_callback_markup, defer_completion
+from xgent_app.telegram_presentation import render_telegram_text, render_telegram_caption
 
 
 class WebOutbox:
@@ -541,14 +542,20 @@ def _present_media_frame(frame: Dict[str, Any]) -> Dict[str, Any]:
 
 async def emit_ui_frame(outbox: WebOutbox, chat_id: int, frame_type: str,
                         *, source: Optional[str] = None, **fields: Any) -> None:
+    from xgent_app.interaction import identity
+    from xgent_app.conversations import current_scope
+    if source == 'telegram' and identity()[0] == 'telegram' and current_scope(required=False) is None:
+        return
     frame = {'type': frame_type, 'ts': time.time(), **fields}
     try:
         frame = await capture_ui_frame(frame, chat_id, source=source)
     except UiHistoryError as exc:
         logging.getLogger(__name__).warning('UI state was not saved: %s', exc)
-        outbox.put({'type': 'callback_answer', 'text': str(exc), 'show_alert': True})
+        if outbox is not None:
+            outbox.put({'type': 'callback_answer', 'text': str(exc), 'show_alert': True})
         raise
-    outbox.put(_present_media_frame(frame))
+    if outbox is not None:
+        outbox.put(_present_media_frame(frame))
 
 
 class InteractionOutbox:
@@ -594,6 +601,10 @@ class WebBot:
         return _allocate_web_message_id()
 
     def _emit(self, frame_type: str, **fields: Any) -> None:
+        from xgent_app.interaction import identity
+        from xgent_app.conversations import current_scope
+        if identity()[0] == 'telegram' and current_scope(required=False) is None:
+            return
         frame: Dict[str, Any] = {"type": frame_type, "ts": time.time()}
         frame.update(fields)
         self.outbox.put(_present_media_frame(frame))
@@ -758,9 +769,11 @@ async def deliver_op_to_bot(bot: Any, op: Op, native_id: Optional[int], *,
             return fn
         async def native_call(*args, **kwargs):
             if 'text' in kwargs:
-                kwargs['text'] = conversation_labelled_text(kwargs['text'], kwargs.get('parse_mode'))
-            if 'caption' in kwargs:
-                kwargs['caption'] = conversation_labelled_text(kwargs['caption'], kwargs.get('parse_mode'), limit=1024)
+                kwargs['text'] = await render_telegram_text(kwargs['text'], kwargs.get('parse_mode'))
+            if 'caption' in kwargs or name in {'send_document', 'send_photo'}:
+                kwargs['caption'], overflow = await render_telegram_caption(kwargs.get('caption'), kwargs.get('parse_mode'))
+                if overflow is not None:
+                    await method('send_message')(chat_id=kwargs.get('chat_id'), text=overflow, parse_mode=kwargs.get('parse_mode'))
             return await fn(*args, **kwargs)
         return native_call
 
@@ -947,7 +960,8 @@ class MirrorBot:
                transient: Optional[Dict[str, Any]] = None,
                durable: bool = True) -> None:
         """把一次 Telegram 调用交给通道。同步、非阻塞、永不抛。"""
-        if self.real_bot is None:
+        from xgent_app.interaction import telegram_delivery_allowed
+        if self.real_bot is None or not telegram_delivery_allowed():
             return
         try:
             channel = self._tg_channel()
@@ -1336,7 +1350,7 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
     与 MirrorBot（Web->TG）的区别：这里用的是真实 message_id，因为 Telegram 侧
     全程直接用真实 id；网页前端按帧里的 message_id 跟踪气泡，两套 id 互不冲突。
     """
-    if real_bot is None or outbox is None:
+    if real_bot is None:
         return lambda: None
 
     cls = type(real_bot)
@@ -1355,13 +1369,16 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
         # 存类上的原 function（未绑定），用 staticmethod 覆盖类属性。
         # staticmethod 不绑 self，wrapper 的 args 不含 self，与原实例覆盖
         # 方案一致；转发时显式传 real_bot 给原 function。
+        if not hasattr(cls, name):
+            return
         saved[name] = getattr(cls, name)
         setattr(cls, name, staticmethod(wrapper))
 
     def emit(frame_type: str, **fields: Any) -> None:
         frame: Dict[str, Any] = {"type": frame_type, "ts": time.time()}
         frame.update(fields)
-        outbox.put(_present_media_frame(frame))
+        if outbox is not None:
+            outbox.put(_present_media_frame(frame))
 
     def _kw_text(kwargs: Dict[str, Any], args: tuple, send: bool = False) -> str:
         text = kwargs.get("text")
@@ -1373,22 +1390,22 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
             return str(args[0])
         return ""
 
-    def native_arguments(args, kwargs, *, send=False):
+    async def native_arguments(args, kwargs, *, send=False):
         native = dict(kwargs)
         positional = list(args)
         if 'text' in native:
-            native['text'] = conversation_labelled_text(native['text'], native.get('parse_mode'))
+            native['text'] = await render_telegram_text(native['text'], native.get('parse_mode'))
         else:
             index = 1 if send else 0
             if len(positional) > index:
-                positional[index] = conversation_labelled_text(positional[index], native.get('parse_mode'))
+                positional[index] = await render_telegram_text(positional[index], native.get('parse_mode'))
         return positional, native
 
     # send_message
     async def send_message(*args: Any, **kwargs: Any) -> Any:
         if 'reply_markup' in kwargs:
             kwargs['reply_markup'] = bind_callback_markup(kwargs['reply_markup'])
-        native_args, native_kwargs = native_arguments(args, kwargs, send=True)
+        native_args, native_kwargs = await native_arguments(args, kwargs, send=True)
         result = await saved["send_message"](real_bot, *native_args, **native_kwargs)
         try:
             await emit_ui_frame(outbox, int(getattr(result, 'chat_id', None) or kwargs.get('chat_id')
@@ -1407,7 +1424,7 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
     async def edit_message_text(*args: Any, **kwargs: Any) -> Any:
         if 'reply_markup' in kwargs:
             kwargs['reply_markup'] = bind_callback_markup(kwargs['reply_markup'])
-        native_args, native_kwargs = native_arguments(args, kwargs)
+        native_args, native_kwargs = await native_arguments(args, kwargs)
         result = await saved["edit_message_text"](real_bot, *native_args, **native_kwargs)
         try:
             mid = kwargs.get("message_id")
@@ -1465,9 +1482,24 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
         return result
     _patch("send_chat_action", send_chat_action)
 
+    async def media_arguments(args, kwargs):
+        positional, native = list(args), dict(kwargs)
+        caption = kwargs.get('caption', args[2] if len(args) > 2 else None)
+        rendered, overflow = await render_telegram_caption(caption, kwargs.get('parse_mode'))
+        if 'caption' not in kwargs and len(positional) > 2:
+            positional[2] = rendered
+        else:
+            native['caption'] = rendered
+        if overflow is not None:
+            await saved["send_message"](real_bot, chat_id=kwargs.get('chat_id', args[0] if args else None),
+                                       text=await render_telegram_text(overflow, kwargs.get('parse_mode')),
+                                       parse_mode=kwargs.get('parse_mode'))
+        return positional, native, caption
+
     # send_document
     async def send_document(*args: Any, **kwargs: Any) -> Any:
-        result = await saved["send_document"](real_bot, *args, **kwargs)
+        native_args, native, caption = await media_arguments(args, kwargs)
+        result = await saved["send_document"](real_bot, *native_args, **native)
         try:
             doc = kwargs.get("document", args[1] if len(args) > 1 else None)
             name = _media_filename(doc, kwargs.get("filename"))
@@ -1478,16 +1510,18 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
                 download_url = f"/api/media/{token}"
             emit("document", message_id=getattr(result, "message_id", 0),
                  filename=str(name),
-                 caption=str(kwargs.get("caption")) if kwargs.get("caption") else None,
+                 caption=str(caption) if caption else None,
                  download_url=download_url)
         except Exception:  # noqa: BLE001
             pass
         return result
+    send_document._xgent_native_labelled = True
     _patch("send_document", send_document)
 
     # send_photo
     async def send_photo(*args: Any, **kwargs: Any) -> Any:
-        result = await saved["send_photo"](real_bot, *args, **kwargs)
+        native_args, native, caption = await media_arguments(args, kwargs)
+        result = await saved["send_photo"](real_bot, *native_args, **native)
         try:
             photo = kwargs.get("photo", args[1] if len(args) > 1 else None)
             local_path = _local_path_from_send_arg(photo)
@@ -1498,11 +1532,12 @@ def install_tg_to_web_mirror(real_bot: Any, outbox: WebOutbox):
                 download_url = f"/api/media/{token}"
             emit("photo", message_id=getattr(result, "message_id", 0),
                  filename=name,
-                 caption=str(kwargs.get("caption")) if kwargs.get("caption") else None,
+                 caption=str(caption) if caption else None,
                  download_url=download_url)
         except Exception:  # noqa: BLE001
             pass
         return result
+    send_photo._xgent_native_labelled = True
     _patch("send_photo", send_photo)
 
     def restore() -> None:
