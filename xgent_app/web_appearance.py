@@ -2,8 +2,8 @@
 import json
 
 FONT_SETTINGS = {
-    'web_message_font_size': (14, 12, 24),
-    'web_ui_font_size': (13, 12, 20),
+    'web_message_font_size': (16, 12, 24),
+    'web_ui_font_size': (14, 12, 20),
     'web_terminal_font_size': (13, 10, 24),
 }
 

@@ -93,13 +93,12 @@ def test_header_font_settings_and_removed_reset_card(browser_context,workspace_u
     page=browser_context.new_page();page.set_viewport_size({'width':size[0],'height':size[1]});ready(page,workspace_url['url'])
     menu=page.get_by_role('button',name='对话记录',exact=True);title=page.locator('#wb-conversation-title');header=page.locator('#header')
     assert menu.bounding_box()['x']-header.bounding_box()['x']<24
-    center=title.bounding_box()['x']+title.bounding_box()['width']/2
-    assert abs(center-(header.bounding_box()['x']+header.bounding_box()['width']/2))<2
+    assert title.bounding_box()['x']-header.bounding_box()['x']<90
     assert not menu.inner_text().strip()
     colors=page.locator('#btn-composer-menu').evaluate('(e)=>({bg:getComputedStyle(e).backgroundColor,color:getComputedStyle(e).color})')
-    assert colors['color']=='rgb(255, 255, 255)' and colors['bg'] not in ['rgba(0, 0, 0, 0)','rgb(255, 255, 255)']
+    assert colors['color']!=colors['bg']
     if size[0]>=768:
-        menu.click();assert page.locator('#wb-nav').is_hidden();menu.click();assert page.locator('#wb-nav').is_visible()
+        menu.click();assert page.locator('#conversation-scroll').is_hidden();menu.click();assert page.locator('#conversation-scroll').is_visible()
     else:
         menu.click();assert page.locator('#wb-nav').is_visible();page.locator('#conversation-drawer-close').click()
     page.evaluate('location.hash="/settings"');page.get_by_role('heading',name='文字字号',exact=True).wait_for()

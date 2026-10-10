@@ -42,15 +42,17 @@ export async function knowledgePage(page,data,kind,ctx){
   states.value=ctx.filter('skillState')||'';
   const sources=el('select',{'aria-label':'技能来源筛选'},el('option',{value:''},'全部来源'),el('option',{value:'public'},'公共技能'),el('option',{value:'private'},'私有技能'));
   sources.value=ctx.filter('source')||'';
+  const sort=el('select',{'aria-label':noun+'排序'},el('option',{value:'name'},'按名称排序'),el('option',{value:'source'},skillMode?'按来源排序':'按路径排序'));sort.value=ctx.filter(skillMode?'skillSort':'memorySort')||'name';
   const counts=el('span',{class:'wb-note',role:'status'}),feedback=el('div',{'aria-live':'polite'}),grid=el('div',{class:'wb-grid wb-skill-grid'}),cards=[];
   const noMatch=empty('没有匹配的'+noun,'换一个关键词或筛选条件试试。',button('清除筛选',()=>{search.value='';states.value='';sources.value='';applyFilters();}));
   function applyFilters(save=true){
     if(save)ctx.localFilters(skillMode?{q:search.value,skillState:states.value,source:sources.value}:{memoryQuery:search.value});
     const q=search.value.trim().toLocaleLowerCase();let visible=0;
     for(const [item,card] of cards){card.hidden=!((!q||[item.name,item.path,item.summary,item.preview].join(' ').toLocaleLowerCase().includes(q))&&(!skillMode||(!states.value||states.value===item.state)&&(!sources.value||sources.value===item.source)));if(!card.hidden)visible++;}
+    const ordered=cards.slice().sort(([a],[b])=>String(sort.value==='source'?(a.source||a.path):a.name).localeCompare(String(sort.value==='source'?(b.source||b.path):b.name),'zh-CN'));for(const [,card] of ordered)grid.append(card);
     noMatch.hidden=visible>0;counts.textContent=visible+' / '+items.length+' 个'+noun+(skillMode?' · 已启用 '+items.filter(item=>item.state==='enabled').length:' · 所有对话共享');
   }
-  search.oninput=()=>applyFilters();states.onchange=()=>applyFilters();sources.onchange=()=>applyFilters();
+  search.oninput=()=>applyFilters();states.onchange=()=>applyFilters();sources.onchange=()=>applyFilters();sort.onchange=()=>{ctx.localFilters({[skillMode?'skillSort':'memorySort']:sort.value});applyFilters();};
   const create=button('新建'+noun,async()=>{
     if(create.disabled)return;
     create.disabled=true;
@@ -61,7 +63,7 @@ export async function knowledgePage(page,data,kind,ctx){
     }catch(error){feedback.replaceChildren(message('新建失败：'+error.message));}
     finally{create.disabled=false;}
   },'primary');
-  page.append(ctx.toolbar(search,...(skillMode?[states,sources]:[]),create),counts,
+  page.append(ctx.toolbar(search,...(skillMode?[states,sources]:[]),sort,button('清除筛选',()=>{search.value='';states.value='';sources.value='';applyFilters();}),create),counts,
     el('p',{class:'wb-note'},skillMode?'新建技能立即保存为空白私有 .md 文件，默认关闭。简介用于技能索引，正文可留空；文件名可在卡片上直接修改。':'手工记忆与所有对话共享，保存后在后续对话中读取；它不是聊天历史或压缩摘要。'),feedback,grid,noMatch);
   for(const item of items){
     const card=el('section',{class:'wb-card wb-skill-card knowledge-card',[skillMode?'data-skill-path':'data-memory-path']:item.path});

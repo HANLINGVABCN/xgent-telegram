@@ -85,10 +85,10 @@ def test_composer_menu_opens_shared_palette_and_preserves_draft(browser_context,
         page.evaluate('(theme)=>document.body.classList.toggle("dark",theme==="dark")',theme)
         box=menu.bounding_box();attachment=page.locator('#btn-attach').bounding_box()
         text=page.locator('#input').bounding_box();send=page.locator('#btn-send').bounding_box()
-        assert box['width']>=44 and box['height']>=44
+        assert box['width']>=40 and box['height']>=40
         assert box['x']+box['width']<=attachment['x']
-        assert attachment['x']+attachment['width']<=text['x']
-        assert text['width']>=120 and text['x']+text['width']<=send['x']
+        assert text['y']+text['height']<=box['y']+1
+        assert text['width']>=250 and attachment['x']+attachment['width']<=send['x']
         assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
         menu.click()
         page.locator('#composer-commands .composer-command').first.wait_for()

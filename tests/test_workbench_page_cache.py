@@ -169,17 +169,17 @@ def test_auth_expiry_clears_authenticated_page_cache(browser_context,workspace_u
 
 def test_filter_change_does_not_restore_mismatched_form_state(browser_context,workspace_url):
     page=open_page(browser_context,workspace_url,'files')
-    page.locator('[data-filter=kind]').select_option('outputs')
-    page.get_by_role('button',name='查看日志',exact=True).first.wait_for()
+    page.get_by_role('tab',name='命令输出',exact=True).click()
+    page.get_by_role('button',name='查看完整输出',exact=True).first.wait_for()
     reads=count(page,'/api/workbench/artifacts')
     go(page,'tasks','任务中心');go(page,'files','文件与输出')
-    assert page.locator('[data-filter=kind]').input_value()=='outputs'
-    assert page.get_by_role('button',name='查看日志',exact=True).first.is_visible()
+    assert page.get_by_role('tab',name='命令输出',exact=True).get_attribute('aria-selected')=='true'
+    assert page.get_by_role('button',name='查看完整输出',exact=True).first.is_visible()
     assert count(page,'/api/workbench/artifacts')==reads
-    page.locator('[data-filter=kind]').select_option('files')
+    page.get_by_role('tab',name='附件与生成文件',exact=True).click()
     page.get_by_role('button',name='部署报告.md',exact=True).wait_for()
     go(page,'tasks','任务中心');go(page,'files','文件与输出')
-    assert page.locator('[data-filter=kind]').input_value()=='files'
+    assert page.get_by_role('tab',name='附件与生成文件',exact=True).get_attribute('aria-selected')=='true'
     assert page.get_by_role('button',name='部署报告.md',exact=True).is_visible()
 
 
@@ -215,9 +215,9 @@ def test_mobile_back_navigation_reuses_page_without_flash(browser_context,worksp
     page.set_viewport_size({'width':390,'height':844})
     page.evaluate("window.__cached=document.querySelector('#wb-page').firstElementChild")
     reads=count(page,'/api/workbench/artifacts')
-    page.locator('#wb-mobile-nav [data-route=tasks]').click()
+    page.locator('#conversation-drawer-toggle').click();page.locator('#workspace-settings').click();page.locator('#wb-nav-links [data-route=tasks]').click()
     page.get_by_role('heading',name='任务中心',exact=True).wait_for()
-    page.locator('#wb-mobile-nav [data-route=files]').click()
+    page.locator('#conversation-drawer-toggle').click();page.locator('#workspace-settings').click();page.locator('#wb-nav-links [data-route=files]').click()
     page.wait_for_function('document.querySelector("#wb-page").firstElementChild===window.__cached')
     assert page.locator('#wb-page > .wb-loading').count()==0
     assert count(page,'/api/workbench/artifacts')==reads

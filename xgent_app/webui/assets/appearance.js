@@ -1,4 +1,4 @@
-const defaults = {web_message_font_size:14, web_ui_font_size:13, web_terminal_font_size:13};
+const defaults = {web_message_font_size:16, web_ui_font_size:14, web_terminal_font_size:13};
 const limits = {web_message_font_size:[12,24], web_ui_font_size:[12,20], web_terminal_font_size:[10,24]};
 let state = {revision:-1, values:{...defaults}}, preview = null;
 function apply(values) {

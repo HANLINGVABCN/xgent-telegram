@@ -40,7 +40,7 @@ def test_touch_menu_and_logout_do_not_depend_on_workbench(touch_context,workspac
         expect(page.locator('#composer-commands')).not_to_be_visible()
     page.locator('#btn-composer-menu').tap();page.locator('#composer-commands .composer-command').first.tap()
     assert sent==[{'conversation_id':'global_memory','command':'/start'}]
-    page.locator('#chat-options-toggle').tap();page.locator('#wb-logout').tap()
+    page.locator('#conversation-drawer-toggle').tap();page.locator('#workspace-settings').tap();page.locator('#wb-logout').tap()
     expect(page.locator('#login')).to_be_visible()
     assert not touch_context.request.get(workspace_url['url']+'/api/session').json()['authenticated']
     assert page.locator('#log .msg-row').count()==0
@@ -53,13 +53,13 @@ def test_optional_page_import_failure_is_local_to_that_page(touch_context,worksp
     page=touch_context.new_page();reads=[]
     page.on('request',lambda r:reads.append(r.url))
     page.route('**/assets/'+module+'.js',lambda r:r.fulfill(status=404,body='not found'))
-    page.goto(workspace_url['url']);page.locator('#wb-chat-controls select').first.wait_for(state='attached')
+    page.goto(workspace_url['url']);page.wait_for_function('document.getElementById("composer-model")?.disabled===false')
     assert not any('/assets/'+module+'.js' in url for url in reads)
     page.locator('#btn-composer-menu').tap();expect(page.locator('#composer-commands')).to_be_visible();page.keyboard.press('Escape')
     page.evaluate('(name)=>location.hash="/"+name',module)
     expect(page.locator('#wb-page')).to_contain_text('管理页面脚本加载失败')
     page.keyboard.press('Control+k');expect(page.locator('#composer-commands .composer-command strong').first).to_have_text('/start')
-    page.locator('#chat-options-toggle').tap();page.locator('#wb-logout').tap()
+    page.locator('#conversation-drawer-toggle').tap();page.locator('#workspace-settings').tap();page.locator('#wb-logout').tap()
     expect(page.locator('#login')).to_be_visible()
 
 
@@ -77,7 +77,7 @@ def test_failure_fallback_retry_and_no_duplicate_logout(touch_context,workspace_
     page.keyboard.press('Escape')
     def fail(r):requests.append(r.request);r.fulfill(status=503,json={'error':'logout offline'})
     page.route('**/api/logout',fail)
-    page.locator('#chat-options-toggle').tap();page.locator('#wb-logout').tap()
+    page.locator('#conversation-drawer-toggle').tap();page.locator('#workspace-settings').tap();page.locator('#wb-logout').tap()
     expect(page.locator('#wb-dialog')).to_contain_text('退出失败：logout offline')
     assert len(requests)==1
     page.unroute('**/api/logout');page.get_by_role('button',name='重试退出',exact=True).tap()
@@ -100,18 +100,18 @@ def test_fallback_request_timeout_is_visible(touch_context,workspace_url):
 def test_normal_touch_controls_and_screenshot(touch_context,workspace_url):
     expect=pytest.importorskip('playwright.sync_api').expect
     page=touch_context.new_page();errors=[];page.on('pageerror',lambda e:errors.append(str(e)))
-    page.goto(workspace_url['url']);page.locator('#wb-chat-controls select').first.wait_for(state='attached')
+    page.goto(workspace_url['url']);page.wait_for_function('document.getElementById("composer-model")?.disabled===false')
     page.locator('#btn-composer-menu').tap();expect(page.locator('#composer-commands .composer-command strong').first).to_have_text('/start')
     output=Path(__file__).resolve().parents[1]/'workspace'/'web-basic-actions-qa';output.mkdir(parents=True,exist_ok=True)
     page.screenshot(path=str(output/'390-menu.png'))
-    page.keyboard.press('Escape');page.locator('#chat-options-toggle').tap();page.locator('#wb-logout').tap();expect(page.locator('#login')).to_be_visible()
+    page.keyboard.press('Escape');page.locator('#conversation-drawer-toggle').tap();page.locator('#workspace-settings').tap();page.locator('#wb-logout').tap();expect(page.locator('#login')).to_be_visible()
     page.screenshot(path=str(output/'390-logged-out.png'))
     assert not errors
 
 
 def test_composer_menu_is_anchored_nonmodal_toggle_and_outside_dismiss(touch_context,workspace_url):
     expect=pytest.importorskip('playwright.sync_api').expect
-    page=touch_context.new_page();page.goto(workspace_url['url']);page.locator('#wb-chat-controls select').first.wait_for(state='attached')
+    page=touch_context.new_page();page.goto(workspace_url['url']);page.wait_for_function('document.getElementById("composer-model")?.disabled===false')
     page.locator('#input').fill('草稿不被菜单覆盖')
     panel=page.locator('#composer-commands');trigger=page.locator('#btn-composer-menu')
     for height in [844,560]:

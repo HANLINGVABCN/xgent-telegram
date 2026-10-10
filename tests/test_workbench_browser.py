@@ -50,7 +50,7 @@ def browser_context(workspace_url):
 
 def ready(page,url,route='chat'):
     page.goto(url+'/#/'+route)
-    if route=='chat':page.locator('#wb-chat-controls select').first.wait_for(state='attached')
+    if route=='chat':page.wait_for_function('document.getElementById("composer-model")?.disabled===false')
     else:page.locator('#wb-page .wb-page-head').wait_for()
 
 
@@ -86,7 +86,8 @@ def test_responsive_routes_themes_and_no_layout_overflow(browser_context,workspa
                 page.wait_for_timeout(80)
                 assert page.evaluate('document.documentElement.scrollWidth <= innerWidth+1')
                 if size[0]==390:
-                    assert page.locator('#wb-mobile-nav').bounding_box()['height']>=60
+                    assert page.locator('#wb-mobile-nav').count()==0
+                    assert page.get_by_role('button',name='对话记录',exact=True).is_visible()
                 page.screenshot(path=str(tmp_path/f'{size[0]}-{theme}-{route}.png'))
     assert not errors
 
@@ -113,7 +114,7 @@ def test_history_is_paged_search_locates_unloaded_messages_and_draft_survives(br
         page.locator('#wb-newer').click()
     page.wait_for_timeout(100)
     assert page.locator('#log').inner_text()!=before
-    page.locator('#chat-options-toggle').click();page.locator('#btn-search').click()
+    page.locator('#workspace-settings').click();page.locator('#btn-search').click()
     page.get_by_placeholder('搜索当前会话历史…').fill('历史记录 1234：')
     page.locator('#wb-dialog .wb-command-result').first.wait_for()
     page.locator('#wb-dialog .wb-command-result').first.click()
@@ -157,8 +158,8 @@ def test_command_palette_and_output_detail(browser_context,workspace_url):
     assert page.locator('#composer-commands .composer-command strong').first.text_content()=='/start'
     page.keyboard.press('Escape')
     page.evaluate('location.hash="/files"');page.locator('#wb-page h1').wait_for()
-    page.locator('#wb-page select[data-filter="kind"]').select_option('outputs')
-    page.get_by_role('button',name='查看日志',exact=True).first.wait_for();page.get_by_role('button',name='查看日志',exact=True).first.click()
+    page.get_by_role('tab',name='命令输出',exact=True).click()
+    page.get_by_role('button',name='查看完整输出',exact=True).first.wait_for();page.get_by_role('button',name='查看完整输出',exact=True).first.click()
     page.locator('#wb-detail .wb-pre').wait_for()
     assert 'Review completed' in page.locator('#wb-detail .wb-pre').text_content()
     assert len(page.locator('#wb-detail .wb-pre').text_content().encode())<=65536
@@ -211,7 +212,7 @@ def test_task_modes_alt_enter_and_current_model(browser_context,workspace_url):
     card=page.locator('.wb-card').filter(has=page.get_by_role('heading',name='OpenAI',exact=True))
     card.locator('select').select_option('gpt-4.1-mini')
     card.get_by_role('button',name='用于对话',exact=True).click()
-    page.wait_for_function('document.querySelector("#wb-chat-controls select")?.value==="OpenAI|gpt-4.1-mini"')
+    page.wait_for_function('document.querySelector("#composer-model")?.dataset.value==="OpenAI|gpt-4.1-mini"')
     page.reload();page.locator('#wb-page .wb-card').first.wait_for()
     card=page.locator('.wb-card').filter(has=page.get_by_role('heading',name='OpenAI',exact=True))
     assert card.locator('select').input_value()=='gpt-4.1-mini'

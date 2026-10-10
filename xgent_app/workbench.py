@@ -16,6 +16,7 @@ from urllib.parse import urlsplit, parse_qsl
 from zoneinfo import ZoneInfo
 from .web_history import build_history_message
 from .ui_history import ui_record, hide_audit_record
+from .workbench_sources import owners as resource_owners, source_info, reference_anchor, output_sources
 
 class WorkbenchError(ValueError):
     def __init__(self, message, status=400):
@@ -81,7 +82,7 @@ class Workbench:
         from xgent_app.interaction import interaction
         try:
             with interaction('web', 'management'):
-                async with conversation_operation(cid, expected=method != 'GET' and not navigation, fresh=True, selector='shared'):
+                async with conversation_operation(cid, expected=method != 'GET' and not navigation, allow_archived=method=='GET' and resource in {'history','search','artifacts/preview'}, fresh=True, selector='shared'):
                     return await self._handle_scoped(method, resource, data)
         except ConversationError as exc:
             raise WorkbenchError(str(exc), exc.status) from exc
@@ -92,7 +93,7 @@ class Workbench:
             operations = {'conversations': self.conversations, 'conversations/delete_info': self.conversation_delete_info, 'conversations/search': self.search_conversations, 'bootstrap': self.bootstrap, 'history': self.history, 'search': self.search,
                           'tasks': self.tasks, 'artifacts': self.artifacts, 'providers': self.providers,
                           'skills': self.skills, 'memories': self.memories, 'usage': self.usage, 'usage/records': self.usage_records,
-                          'artifacts/preview': self.artifact_preview, 'settings': self.read_settings}
+                          'artifacts/preview': self.artifact_preview, 'settings/blacklist': self.blacklist, 'settings': self.read_settings}
         else:
             operations = {**{f'{kind}/{action}': self.document_action for kind in ('skills','memories') for action in ('create','update','rename','delete')}, **{f'conversations/{action}': self.conversation_action for action in ('create','switch','rename','archive','restore','reset_context','delete')},
                           'tasks/create': self.create_task, 'tasks/cancel': self.cancel_tasks,
@@ -100,7 +101,7 @@ class Workbench:
                           'providers/fetch': self.fetch_models, 'providers/select': self.select_model,
                           'providers/import': self.import_providers, 'providers/export': self.export_providers,
                           'skills/state': self.skill_state, 'settings': self.settings,
-                          'password': self.password, 'memory/clear': self.clear_memory, 'settings/web': self.web_settings}
+                          'settings/blacklist': self.save_blacklist, 'password': self.password, 'memory/clear': self.clear_memory, 'settings/web': self.web_settings}
         operation = operations.get(resource)
         if operation is None: raise WorkbenchError('工作台接口不存在', 404)
         try:
@@ -253,11 +254,14 @@ class Workbench:
             if owner is None or owner.get('deleting'): raise WorkbenchError('任务不存在', 404)
             task['conversation_name'] = owner['name']
             task['conversation_archived'] = bool(owner['archived'])
+            task['source'] = source_info(owner, await reference_anchor(conn, task['conversation_id'], task_id))
             before = data.get('before')
             boundary = json.loads(before) if before else [time.time()+1, '\uffff']
             if not isinstance(boundary,list) or len(boundary)!=2: raise WorkbenchError('运行记录游标无效')
             cur = await conn.execute('SELECT * FROM trigger_runs WHERE task_id=? AND (created_at,run_id)<(?,?) ORDER BY created_at DESC,run_id DESC LIMIT 51', (task_id, *boundary))
             runs = [dict(row) for row in await cur.fetchall()]; await cur.close()
+            for run in runs:
+                run['source'] = source_info(owner, await reference_anchor(conn, task['conversation_id'], run['run_id']))
             return {'task': task, 'runs': runs[:50], 'next_cursor': json.dumps([runs[49]['created_at'],runs[49]['run_id']]) if len(runs)>50 else None}
         status = str(data.get('status') or '')
         kind = str(data.get('kind') or '')
@@ -299,6 +303,7 @@ class Workbench:
             owner = owners.get(task['conversation_id'], {})
             task['conversation_name'] = owner.get('name', task['conversation_id'])
             task['conversation_archived'] = bool(owner.get('archived'))
+            task['source'] = source_info(owner, await reference_anchor(conn, task['conversation_id'], task['id']))
         return {'sources': sources, 'source_conversation_id': source, 'items': rows[:50], 'offset': offset, 'total': total, 'counts': counts,
                 'next_offset': offset+50 if len(rows)>50 else None,
                 'timezone': self.ns['SelfTriggerManager'].DEFAULT_TIMEZONE}
@@ -645,6 +650,24 @@ class Workbench:
                 raise WorkbenchError('请输入非负整数')
         return await self.ns['_web_write_setting'](key, value)
 
+    async def blacklist(self, data):
+        manager=self.ns['AgentCommandBlacklist']
+        patterns=manager.get_patterns()
+        revision=hashlib.sha256(json.dumps(patterns,ensure_ascii=False).encode()).hexdigest()
+        return {'patterns':patterns,'recommended':list(manager.RECOMMENDED_PATTERNS),'revision':revision}
+
+    async def save_blacklist(self, data):
+        patterns=data.get('patterns')
+        if not isinstance(patterns,list) or len(patterns)>1000 or any(not isinstance(p,str) or len(p)>1000 or '\n' in p or '\r' in p for p in patterns):
+            raise WorkbenchError('每行填写一条规则，最多 1000 条，每条不超过 1000 字符')
+        async with self._settings_lock:
+            current=await self.blacklist({})
+            if data.get('revision')!=current['revision']:raise WorkbenchError('黑名单已在其他位置修改，请重新读取后保存',409)
+            cleaned=self.ns['AgentCommandBlacklist'].parse('\n'.join(patterns))
+            if not cleaned and current['patterns'] and data.get('confirm_clear') is not True:raise WorkbenchError('清空黑名单需要确认')
+            await asyncio.to_thread(self.ns['AgentCommandBlacklist'].save,cleaned)
+            return {'ok':True,**await self.blacklist({})}
+
     async def read_settings(self, data):
         db = await self.db()
         return {key: await db.get_config_fresh(key, default) for key, default in
@@ -774,39 +797,82 @@ class Workbench:
             outbox.put(stamp_frame({'type': 'context_reset'}))
         return {'ok': True, 'result': result}
 
-    async def artifacts(self,data):
-        kind=data.get('kind','files'); q=str(data.get('q') or '').lower()[:200]
+    async def artifacts(self, data):
+        kind = str(data.get('kind') or 'files')
+        if kind not in {'files','outputs'}: raise WorkbenchError('文件来源无效')
+        query = str(data.get('q') or '').strip().lower()[:200]
+        source = str(data.get('source_conversation_id') or current_scope().conversation_id)
+        sort = str(data.get('sort') or 'newest')
+        if sort not in {'newest','oldest','name','size'}: raise WorkbenchError('排序方式无效')
+        try: offset = max(0,int(data.get('offset') or 0))
+        except (TypeError,ValueError,OverflowError): raise WorkbenchError('分页位置无效') from None
+        zone = ZoneInfo(self.ns['SelfTriggerManager'].DEFAULT_TIMEZONE)
+        try:
+            start = datetime.fromisoformat(str(data['start_date'])).replace(tzinfo=zone).timestamp() if data.get('start_date') else None
+            end = (datetime.fromisoformat(str(data['end_date'])).replace(tzinfo=zone)+timedelta(days=1)).timestamp() if data.get('end_date') else None
+            if start is not None and end is not None and start>=end: raise ValueError()
+        except (ValueError,TypeError): raise WorkbenchError('时间范围无效') from None
+        db=await self.db();conn=await db._get_conn();owner_map=await resource_owners(conn)
+        if source=='current':source=current_scope().conversation_id
+        if source!='all' and source not in owner_map:raise WorkbenchError('来源对话不存在',404)
+        items=[]
         if kind=='outputs':
-            root=Path(self.ns['COMMAND_OUTPUT_DIR']).resolve(); after=str(data.get('after') or '')
+            root=Path(self.ns['COMMAND_OUTPUT_DIR']).resolve()
+            references=await output_sources(conn,root,owner_map)
+            after=str(data.get('after') or '')
             def scan():
-                import heapq
-                def candidates():
-                    if not root.exists(): return
-                    for directory in root.iterdir():
-                        if directory.is_symlink() or not directory.is_dir(): continue
-                        for path in directory.iterdir():
-                            key=path.relative_to(root).as_posix()
-                            if path.suffix=='.txt' and path.is_file() and not path.is_symlink() and (not after or key<after) and q in key.lower(): yield key,path
-                chosen=heapq.nlargest(51,candidates(),key=lambda item:item[0]); rows=[]
-                for key,path in chosen[:50]:
-                    try:
-                        info=path.stat(); rows.append({'id':key,'filename':path.name,'path':str(path),'kind':'output','size':info.st_size,'timestamp':info.st_mtime})
-                    except OSError: continue
-                return {'items':rows,'next_cursor':chosen[49][0] if len(chosen)>50 else None}
-            return await asyncio.to_thread(scan)
-        db=await self.db(); conn=await db._get_conn(); before=int(data.get('before') or 2**63-1)
-        search_sql = " AND (instr(lower(content),?)>0 OR instr(lower(COALESCE(metadata,'')),?)>0 OR instr(lower(COALESCE(metadata,'')),?)>0)" if q else ''
-        params = (current_scope().conversation_id,before,q,q,json.dumps(q,ensure_ascii=True)[1:-1]) if q else (current_scope().conversation_id,before,)
-        cur=await conn.execute("SELECT * FROM global_messages WHERE session_id=? AND id<? AND (metadata LIKE '%attachments%' OR metadata LIKE '%display_media%' OR msg_type IN ('user_file','user_photo','media_reply'))" + search_sql + " ORDER BY id DESC LIMIT 51",params)
-        rows=[dict(r) for r in await cur.fetchall()]; await cur.close(); items=[]
-        for row in rows[:50]:
-            message=await asyncio.to_thread(build_history_message,row,self.ns['ArtifactManager'].ROOT_DIR,str(Path(self.ns['AgentExecutor'].WORK_DIR)/'workspace'))
-            for index,item in enumerate(message.get('media',[])):
-                if q and q not in str(item.get('filename','')).lower(): continue
-                if data.get('media_type') and item.get('kind') != data['media_type']: continue
-                items.append({**item,'id':f"{row['id']}:{index}",'source_id':row['id'],'timestamp':row['timestamp']})
-            if message.get('media_error'): items.append({'id':str(row['id']),'filename':'附件记录','error':message['media_error'],'source_id':row['id']})
-        return {'items':items,'next_cursor':rows[49]['id'] if len(rows)>50 else None}
+                found=[]
+                if not root.exists():return found
+                for directory in root.iterdir():
+                    if directory.is_symlink() or not directory.is_dir():continue
+                    for file in directory.iterdir():
+                        key=file.relative_to(root).as_posix()
+                        if file.suffix!='.txt' or file.is_symlink() or not file.is_file() or after and key>=after:continue
+                        try:
+                            stat=file.stat()
+                            found.append({'id':key,'filename':file.name,'path':str(file),'kind':'output','size':stat.st_size,'timestamp':stat.st_mtime,**references.get(key,{})})
+                        except OSError:continue
+                return found
+            items=await asyncio.to_thread(scan)
+            # Legacy output listing without an explicit source was global; keep that API contract.
+            if not data.get('source_conversation_id'):source='all'
+        else:
+            try:before=int(data.get('before') or 2**63-1)
+            except (TypeError,ValueError,OverflowError):raise WorkbenchError('文件分页位置无效') from None
+            clauses=["m.id<?","s.deleting=0","(m.metadata LIKE '%attachments%' OR m.metadata LIKE '%display_media%' OR m.msg_type IN ('user_file','user_photo','media_reply'))"]
+            params=[before]
+            if source!='all':clauses.append('m.session_id=?');params.append(source)
+            if start is not None:clauses.append('m.timestamp>=?');params.append(start)
+            if end is not None:clauses.append('m.timestamp<?');params.append(end)
+            cursor=await conn.execute('SELECT m.* FROM global_messages m JOIN chat_sessions s ON s.id=m.session_id WHERE '+' AND '.join(clauses)+' ORDER BY m.id DESC',params)
+            try:
+                async for record in cursor:
+                    row=dict(record)
+                    message=await asyncio.to_thread(build_history_message,row,self.ns['ArtifactManager'].ROOT_DIR,str(Path(self.ns['AgentExecutor'].WORK_DIR)/'workspace'))
+                    provenance=source_info(owner_map[row['session_id']],'history:'+str(row['id']))
+                    for index,item in enumerate(message.get('media',[])):
+                        items.append({**item,'id':f"{row['id']}:{index}",'source_id':row['id'],'timestamp':row['timestamp'],'source':provenance})
+                    if message.get('media_error') and not message.get('media'):
+                        items.append({'id':str(row['id']),'filename':'附件记录','kind':'file','error':message['media_error'],'source_id':row['id'],'timestamp':row['timestamp'],'source':provenance})
+            finally:await cursor.close()
+        filtered=[]
+        for item in items:
+            if source!='all' and (item.get('source') or {}).get('conversation_id')!=source:continue
+            if query and query not in ' '.join(str(item.get(key) or '') for key in ('filename','command','task_name')).lower():continue
+            if data.get('media_type') and item.get('kind')!=data['media_type']:continue
+            available='missing' if item.get('error') else 'available'
+            if data.get('availability') and data['availability']!=available:continue
+            if data.get('execution_status') and item.get('status')!=data['execution_status']:continue
+            at=item.get('timestamp') or 0
+            if start is not None and at<start or end is not None and at>=end:continue
+            item['availability']=available
+            filtered.append(item)
+        keys={'newest':lambda x:(-(x.get('timestamp') or 0),str(x['id'])),'oldest':lambda x:(x.get('timestamp') or 0,str(x['id'])),'name':lambda x:(str(x.get('filename') or '').casefold(),str(x['id'])),'size':lambda x:(-(x.get('size') or 0),str(x['id']))}
+        filtered.sort(key=keys[sort]);total=len(filtered);offset=min(offset,max(0,(total-1)//50*50))
+        selected=filtered[offset:offset+50]
+        legacy_cursor=(selected[-1]['id'] if kind=='outputs' else selected[-1].get('source_id')) if selected and offset+50<total else None
+        return {'items':selected,'sources':list(owner_map.values()),'source_conversation_id':source,'total':total,'offset':offset,
+                'next_offset':offset+50 if offset+50<total else None,'next_cursor':legacy_cursor}
 
 
     async def conversations(self, data):

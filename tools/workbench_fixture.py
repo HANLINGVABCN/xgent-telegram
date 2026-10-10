@@ -13,7 +13,11 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-async def serve(port, count, conversation_count=0):
+async def serve(port, count, conversation_count=0, workbench_demo=False):
+    os.environ["PYTHON_DOTENV_DISABLED"]="1"
+    os.environ["HOME"]=str(Path.cwd())
+    os.environ["SHELL"]="/bin/sh" if os.name!="nt" else ""
+    os.environ["ENV"]=os.environ["BASH_ENV"]=""
     from xgent_app.bootstrap import load_sections
     from xgent_app.web_auth import hash_password
     from xgent_app.web_server import WebChatConfig, WebChatServer
@@ -82,6 +86,21 @@ async def serve(port, count, conversation_count=0):
             if index >= conversation_count - 2:
                 await db.manage_conversation('archive', cid)
         await db.manage_conversation('switch', 'global_memory')
+    demo={}
+    if workbench_demo:
+        async def add_record(cid,kind,role,text,metadata=None):
+            cursor=await conn.execute("INSERT INTO global_messages(chat_id,user_id,msg_type,role,content,timestamp,metadata,session_id) VALUES(1,1,?,?,?,?,?,?)",(kind,role,text,now+len(demo),json.dumps(metadata) if metadata else None,cid))
+            return cursor.lastrowid
+        demo['task_message']=await add_record('global_memory','agent_result','assistant','已登记触发任务 trg_fixture0 · 每日服务健康检查')
+        from xgent_app.agent_status import build_agent_round_status
+        demo['round_message']=await add_record('global_memory','agent_status','assistant',build_agent_round_status(2,'completed',operation_count=3))
+        usage={'input_tokens':2400,'output_tokens':800,'total_tokens':3200,'cached_tokens':400,'reasoning_tokens':200}
+        demo['token_message']=await add_record('global_memory','token_usage','assistant',ns['build_token_usage_message'](usage,2.0),{'usage':usage,'model':'gpt-4.1'})
+        source=(await db.manage_conversation('create',name='来源验证对话'))['conversation_id'];demo['source_conversation']=source
+        attachment=uploads/'来源验证.txt';attachment.write_text('来自来源验证对话的文件。',encoding='utf-8')
+        demo['file_message']=await add_record(source,'user_file','user','来源文件',{'attachments':[{'version':1,'path':attachment.name,'filename':attachment.name,'mime_type':'text/plain','storage':'uploads'}]})
+        for index in range(80):await add_record(source,'user_text','user','来源验证后续消息 '+str(index))
+        await db.manage_conversation('switch','global_memory')
     service=Workbench(ns)
     async def history(limit):return (await service.handle('GET','history',{'limit':limit}))['messages']
     config=WebChatConfig(host='127.0.0.1',port=port,password_hash=hash_password('preview-only'),bot_token='',authorized_user_id=1,
@@ -93,15 +112,15 @@ async def serve(port, count, conversation_count=0):
     server=WebChatServer(config);server.start()
     ns['_web_chat_server']=server
     ns['get_conversations']().start()
-    print(json.dumps({'url':f'http://127.0.0.1:{server._httpd.server_address[1]}','password':'preview-only','database_path':str(Path(db.db_path).resolve())}),flush=True)
+    print(json.dumps({'url':f'http://127.0.0.1:{server._httpd.server_address[1]}','password':'preview-only','database_path':str(Path(db.db_path).resolve()),'demo':demo}),flush=True)
     try:await asyncio.Event().wait()
     finally:server.stop();await ns['get_conversations']().close();await db.close()
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--port',type=int,default=0);parser.add_argument('--messages',type=int,default=4)
-    parser.add_argument('--conversations',type=int,default=0)
+    parser.add_argument('--conversations',type=int,default=0);parser.add_argument('--workbench-demo',action='store_true')
     args=parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='xgent-workbench-') as temporary:
         os.chdir(temporary)
-        try:asyncio.run(serve(args.port,args.messages,args.conversations))
+        try:asyncio.run(serve(args.port,args.messages,args.conversations,args.workbench_demo))
         except KeyboardInterrupt:pass

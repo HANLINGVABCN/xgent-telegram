@@ -452,6 +452,7 @@
     var pre = bq.querySelector("pre");
     if (!pre || bq._pbText === undefined) return;
     var expanded = bq.classList.contains("expanded") || bq.classList.contains("pb-short");
+    bq.querySelector(".pb-toggle")?.setAttribute("aria-expanded",String(expanded));
     var text = bq._pbText;
     if (!expanded) {
       // 收起时只构建三行 DOM；这不是内容删除，复制和展开都使用完整 _pbText。
@@ -464,35 +465,32 @@
     else pre.innerHTML = '<code>' + highlightCode(text, bq._pbLang || "shell") + '</code>';
   }
 
+  function closeOutputPage(bq) {
+    bq._outputVersion=(bq._outputVersion||0)+1;
+    bq._outputRequest?.abort();bq._outputRequest=null;bq._outputLoading=false;
+    bq.querySelector('.output-pages')?.remove();bq.classList.remove('output-open');
+    var trigger=bq.querySelector('.btn-output');if(trigger){trigger.textContent='查看完整输出';trigger.setAttribute('aria-expanded','false');}
+  }
   function showOutputPage(bq, offset, previous) {
-    if (bq._outputLoading) return;
-    bq._outputLoading = true;
-    var area = bq.querySelector('.output-pages');
-    if (!area) {
-      area = document.createElement('div'); area.className = 'output-pages'; bq.appendChild(area);
-    }
-    var oldLabel = area.querySelector('.output-page-label');
-    if (oldLabel) oldLabel.textContent = '读取存档中…';
-    api('/api/output/page', {method: 'POST', body: JSON.stringify({
-      path: bq.getAttribute('data-output-path'), offset: offset
-    })}).then(function (page) {
-      bq._outputPage = page; bq._outputPrevious = previous;
-      while (area.firstChild) area.removeChild(area.firstChild);
-      var controls = document.createElement('div'); controls.className = 'pb-head';
-      var label = document.createElement('span'); label.className = 'output-page-label';
-      label.textContent = page.filename + ' · ' + page.offset + '–' + page.next_offset + ' / ' + page.size + ' bytes';
-      controls.appendChild(label);
-      [['prev', '上一页', !previous.length], ['next', '下一页', page.eof], ['copy', '复制本页', false], ['close', '关闭', false]].forEach(function (item) {
-        var button = document.createElement('button'); button.type = 'button';
-        button.className = 'code-btn btn-output-' + item[0]; button.textContent = item[1];
-        button.disabled = item[2]; controls.appendChild(button);
-      });
-      var pre = document.createElement('pre'); pre.className = 'output-page-text'; pre.dataset.enhanced = '1';
-      // 存档是不可信文本，不走 innerHTML、不执行其中的协议/脚本。
-      pre.textContent = page.text;
-      area.appendChild(controls); area.appendChild(pre);
-    }).catch(function (err) { toast('读取输出失败：' + err.message, true); })
-      .finally(function () { bq._outputLoading = false; });
+    if(bq._outputLoading)return;
+    bq._outputLoading=true;
+    var version=bq._outputVersion=(bq._outputVersion||0)+1;
+    var controller=bq._outputRequest=new AbortController();
+    var area=bq.querySelector('.output-pages');
+    if(!area){area=document.createElement('div');area.className='output-pages';bq.appendChild(area);}
+    bq.classList.add('output-open');
+    var trigger=bq.querySelector('.btn-output');if(trigger){trigger.textContent='收起完整输出';trigger.setAttribute('aria-expanded','true');}
+    var loading=document.createElement('p');loading.className='output-page-label';loading.textContent='正在读取完整日志…';area.appendChild(loading);
+    api('/api/output/page',{method:'POST',signal:controller.signal,body:JSON.stringify({path:bq.getAttribute('data-output-path'),offset:offset})}).then(function(page){
+      if(version!==bq._outputVersion||!area.isConnected)return;
+      bq._outputPage=page;bq._outputPrevious=previous;area.replaceChildren();
+      var controls=document.createElement('div');controls.className='pb-head';
+      var label=document.createElement('span');label.className='output-page-label';
+      label.textContent=page.filename+' · '+page.offset+'–'+page.next_offset+' / '+page.size+' bytes';controls.appendChild(label);
+      [['prev','上一页',!previous.length],['next','下一页',page.eof],['copy','复制本页',false],['close','收起完整输出',false]].forEach(function(item){var button=document.createElement('button');button.type='button';button.className='code-btn btn-output-'+item[0];button.textContent=item[1];button.disabled=item[2];controls.appendChild(button);});
+      var pre=document.createElement('pre');pre.className='output-page-text';pre.dataset.enhanced='1';pre.textContent=page.text;
+      area.appendChild(controls);area.appendChild(pre);
+    }).catch(function(err){if(err.name!=='AbortError'&&version===bq._outputVersion){closeOutputPage(bq);toast('读取输出失败：'+err.message,true);}}).finally(function(){if(version===bq._outputVersion){bq._outputLoading=false;bq._outputRequest=null;}});
   }
 
   function enhanceProtocolBlocks(container) {
@@ -532,9 +530,10 @@
         (bq.getAttribute("data-raw") ? '<button class="code-btn btn-copy-all" type="button" title="复制整个协议块（BEGIN 到 END 原文）">' + svgIcon("copy") + '<span>复制全部</span></button>' : '');
 
       head.title = title;
+      if(!short){var toggle=document.createElement("button");toggle.type="button";toggle.className="pb-toggle";toggle.setAttribute("aria-label","展开或收起 "+title);toggle.setAttribute("aria-expanded",String(bq.classList.contains("expanded")));var caret=head.querySelector(".pb-caret"),caption=head.querySelector(".pb-title");if(caret)toggle.appendChild(caret);toggle.appendChild(caption);head.prepend(toggle);}
       if (bq.getAttribute('data-output-path')) {
         var archive = document.createElement('button'); archive.type = 'button';
-        archive.className = 'code-btn btn-output'; archive.textContent = '查看存档';
+        archive.className = 'code-btn btn-output'; archive.textContent = '查看完整输出';archive.setAttribute('aria-expanded','false');
         head.appendChild(archive);
       }
       bq._pbText = text; bq._pbLang = pbLang;
@@ -603,7 +602,7 @@
         var pre = wrap && wrap.querySelector("pre");
         e.stopPropagation();
         if (btn.classList.contains('btn-output')) {
-          showOutputPage(wrap, 0, []); return;
+          if(wrap.classList.contains('output-open'))closeOutputPage(wrap);else showOutputPage(wrap,0,[]);return;
         }
         if (btn.classList.contains('btn-output-copy')) {
           if (wrap._outputPage) copyText(wrap._outputPage.text)
@@ -611,7 +610,7 @@
           return;
         }
         if (btn.classList.contains('btn-output-close')) {
-          var pages = wrap.querySelector('.output-pages'); if (pages) pages.remove();
+          closeOutputPage(wrap);
           wrap._outputPage = null; wrap._outputPrevious = []; return;
         }
         if (btn.classList.contains('btn-output-next')) {
@@ -651,7 +650,7 @@
         if (e.detail > 1) return;
         foldBq._ft = setTimeout(function () {
           if (String(window.getSelection() || "").length) return;
-          foldBq.classList.toggle("expanded");
+          if(foldBq.classList.contains("output-open")){closeOutputPage(foldBq);foldBq.classList.remove("expanded");}else foldBq.classList.toggle("expanded");
           paintProtocolBody(foldBq);
         }, 250);
         return;
@@ -747,12 +746,12 @@
     bubble.className = "bubble " + role;
 
     var head = null;
-    if (role === "ai" || role === "cmd" || role === "sys") {
+    if (role === "ai" || role === "cmd" || role === "sys" || role === "user") {
       head = document.createElement("div");
       head.className = "bubble-header";
       var iconCls = role === "ai" ? "" : (" " + role);
       var iconText = role === "ai" ? "X" : "◇";
-      var authorName = role === "ai" ? "XGent" : (role === "cmd" ? "命令" : "系统");
+      var authorName = role === "ai" ? "XGent" : role === "user" ? "你" : (role === "cmd" ? "工具结果" : "系统");
       head.innerHTML = '<div class="bubble-author"><span class="bubble-author-icon' + iconCls + '">' + iconText + '</span> ' + authorName + '</div>';
       bubble.appendChild(head);
     }
@@ -1561,7 +1560,7 @@
   }
   document.getElementById('wb-earlier').onclick=function(){historyPage(false);};
   document.getElementById('wb-newer').onclick=function(){historyPage(true);};
-  document.getElementById('wb-latest').onclick=function(){historyAnchor=null;viewingPast=false;newFrames=0;resync().catch(function(){});};
+  document.getElementById('wb-latest').onclick=function(){if(location.hash.includes('?conversation=')){history.replaceState(null,'','#/chat');document.getElementById('source-navigation').hidden=true;}historyAnchor=null;viewingPast=false;newFrames=0;resync().catch(function(){});};
   function loadHistory() {
     historyGen++;
     var gen=historyGen, requestedCid=selectedConversationId;
@@ -2633,12 +2632,24 @@
     const cid=event.detail.conversation_id;delete conversationDrafts[cid];try{sessionStorage.removeItem(draftKey(cid));}catch{}
     if(cardScrollIntent?.cid===cid)cancelCardFollow();
   });
-  const optionsPanel=document.getElementById('chat-options'), optionsToggle=document.getElementById('chat-options-toggle');
-  function closeChatOptions(){optionsPanel.hidden=true;optionsToggle.setAttribute('aria-expanded','false');}
-  optionsToggle.addEventListener('click',()=>{optionsPanel.hidden=!optionsPanel.hidden;optionsToggle.setAttribute('aria-expanded',String(!optionsPanel.hidden));});
-  document.addEventListener('click',event=>{if(!optionsPanel.contains(event.target)&&!optionsToggle.contains(event.target))closeChatOptions();});
-  optionsPanel.addEventListener('click',event=>{if(event.target.closest('.chat-option-tools button'))closeChatOptions();});
-  document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!optionsPanel.hidden){closeChatOptions();optionsToggle.focus();}});
+  // The compact launcher is anchored at the bottom-left, not another navigation rail.
+  const workspaceMenu=document.getElementById('workspace-menu'),workspaceTrigger=document.getElementById('workspace-settings');
+  function positionWorkspaceMenu(){
+    const box=workspaceTrigger.getBoundingClientRect(),viewport=window.visualViewport;
+    const top=viewport?.offsetTop||0,height=viewport?.height||innerHeight;
+    workspaceMenu.style.left=Math.max(8,Math.min(box.left,innerWidth-268))+'px';
+    workspaceMenu.style.bottom=Math.max(8,innerHeight-box.top+6)+'px';
+    workspaceMenu.style.maxHeight=Math.max(100,box.top-top-16)+'px';
+  }
+  function closeWorkspaceMenu(restore){workspaceMenu.hidden=true;workspaceTrigger.setAttribute('aria-expanded','false');if(restore)workspaceTrigger.focus();}
+  workspaceTrigger.addEventListener('click',()=>{if(!workspaceMenu.hidden){closeWorkspaceMenu(true);return;}workspaceMenu.hidden=false;workspaceTrigger.setAttribute('aria-expanded','true');positionWorkspaceMenu();workspaceMenu.querySelector('a,button')?.focus();});
+  document.addEventListener('click',event=>{if(!workspaceMenu.hidden&&!workspaceMenu.contains(event.target)&&!workspaceTrigger.contains(event.target))closeWorkspaceMenu(false);});
+  workspaceMenu.addEventListener('click',event=>{if(event.target.closest('a,button'))closeWorkspaceMenu(false);});
+  workspaceMenu.addEventListener('keydown',event=>{const items=Array.from(workspaceMenu.querySelectorAll('a,button')).filter(node=>!node.hidden&&!node.disabled);let at=items.indexOf(document.activeElement);if(event.key==='Escape'){event.preventDefault();event.stopPropagation();closeWorkspaceMenu(true);}else if(['ArrowDown','ArrowUp','Home','End'].includes(event.key)){event.preventDefault();at=event.key==='Home'?0:event.key==='End'?items.length-1:(at+(event.key==='ArrowUp'?-1:1)+items.length)%items.length;items[at]?.focus();}});
+  window.addEventListener('resize',()=>{if(!workspaceMenu.hidden)positionWorkspaceMenu();});
+  window.addEventListener('hashchange',()=>closeWorkspaceMenu(false));
+  window.addEventListener('xgent-auth-expired',()=>closeWorkspaceMenu(false));
+  window.XGentWorkspaceMenu={close:restore=>closeWorkspaceMenu(!!restore)};
   window.XGentChat = {
     openCommands:openCommands,logout:logoutAction,
     commandError: function(){
@@ -2652,7 +2663,7 @@
       input.value=command;syncSendState();send();return true;
     },
     reload: function(){historyAnchor=null;viewingPast=false;newFrames=0;return resync();},
-    locate: function(key){location.hash="/chat";historyAnchor=key;return loadHistory();},
+    locate: async function(key){if(document.body.dataset.page!=='chat')location.hash='/chat';if(historyRequest)await historyRequest;historyAnchor=key;await loadHistory();const entry=key&&byMessageId[key];if(entry){entry.row.classList.add('source-target');entry.row.scrollIntoView({block:'center'});setTimeout(()=>entry.row.classList.remove('source-target'),3500);}},
     settings: function(){return loadSettings();},
     commands: function(commands){
       if (!commands.length) return;

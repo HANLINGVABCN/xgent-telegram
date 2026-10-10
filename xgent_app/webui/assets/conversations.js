@@ -414,16 +414,16 @@ function setDrawer(open, restoreFocus = true) {
   document.body.classList.toggle('conv-drawer-open', open);
   $('conversation-backdrop').hidden = !open;
   syncConversationToggle();
-  const shell = $('wb-shell'), bottom = $('wb-mobile-nav');
+  const shell = $('wb-shell');
   if (open) {
     drawerReturn = document.activeElement;
-    previousInert = [shell.inert, bottom.inert]; shell.inert = bottom.inert = true;
+    previousInert = shell.inert; shell.inert = true;
     sidebar.setAttribute('role', 'dialog'); sidebar.setAttribute('aria-modal', 'true');
     requestAnimationFrame(() => $('conversation-drawer-close').focus({preventScroll: true}));
   } else {
-    closeMenu(false);
+    closeMenu(false);window.XGentWorkspaceMenu?.close();
     sidebar.removeAttribute('role'); sidebar.removeAttribute('aria-modal');
-    if (previousInert) { [shell.inert, bottom.inert] = previousInert; previousInert = null; }
+    if (previousInert !== null) { shell.inert = previousInert; previousInert = null; }
     if (restoreFocus && drawerReturn?.isConnected) drawerReturn.focus({preventScroll: true});
   }
 }
@@ -434,6 +434,7 @@ $('conversation-drawer-toggle').addEventListener('click', () => {
 });
 $('conversation-drawer-close').addEventListener('click', () => setDrawer(false));
 $('conversation-backdrop').addEventListener('click', () => setDrawer(false));
+$('workspace-menu').addEventListener('click',event=>{if(event.target.closest('a, #btn-settings, #btn-search, #wb-logout'))setDrawer(false,false);});
 $('conversation-archive-view').addEventListener('click', () => setView(view === 'archived' ? 'recent' : 'archived'));
 $('conversation-view-back').addEventListener('click', () => setView('recent'));
 search.addEventListener('input', () => { closeMenu(false); render(); scroll.scrollTop = 0; });
@@ -462,6 +463,7 @@ document.addEventListener('pointerdown', event => {
   if (!menu.hidden && !menu.contains(event.target) && !event.target.closest('.conv-more')) closeMenu(false);
 }, true);
 document.addEventListener('keydown', event => {
+  if (!$('workspace-menu').hidden) { if(event.key==='Escape'){event.preventDefault();event.stopImmediatePropagation();window.XGentWorkspaceMenu?.close(true);}return; }
   if (event.isComposing || renameDialog.open) return;
   if (!menu.hidden) {
     const choices = Array.from(menu.querySelectorAll('button'));
@@ -485,7 +487,9 @@ document.addEventListener('keydown', event => {
 }, true);
 
 window.XGentConversations = {
-  accept, refresh, get current() { return state.current_chat_id; }, get running() { return state.running; },
+  accept, refresh, get items(){return state.items;},
+  async select(id){if(mutation)throw new Error('正在切换对话，请稍后重试');if(id!==state.current_chat_id)await mutate('switch',{id});closeMenu(false);setDrawer(false);return state.current_chat_id===id;},
+  get current() { return state.current_chat_id; }, get running() { return state.running; },
 };
 function start() { authenticated = true; refresh(); }
 window.addEventListener('xgent-authenticated', start);

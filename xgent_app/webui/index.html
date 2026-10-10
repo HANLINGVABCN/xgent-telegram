@@ -58,29 +58,31 @@
   <div id="conversation-scroll" class="conv-scroll">
     <div id="conversation-list" aria-labelledby="conversation-list-title" aria-busy="true"><p class="conv-list-hint">正在加载对话…</p></div>
   </div>
+  <div class="workspace-dock">
+    <button id="workspace-settings" type="button" aria-label="设置与工作台" aria-haspopup="menu" aria-controls="workspace-menu" aria-expanded="false"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-settings"/></svg><span>设置</span></button>
+    <div id="workspace-menu" role="menu" aria-label="设置与工作台" hidden>
+      <div class="workspace-menu-label">工作台</div>
+      <nav id="wb-nav-links" aria-label="工作台导航"></nav>
+      <div class="workspace-menu-label">对话与账户</div>
   <button id="conversation-archive-view" class="conv-archive-link" type="button"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h16v12H4zM3 4h18v4H3zM10 12h4"/></svg><span>已归档</span><span id="conversation-archive-count" class="conv-count" hidden></span></button>
-  <div class="conv-workspace"><span class="wb-nav-caption">工作台</span><nav id="wb-nav-links" aria-label="工作台导航"></nav></div>
-  <div class="wb-nav-bottom"><span class="wb-server-dot"></span><span>私有工作台<small>三端同步 · 独立对话</small></span></div>
+      <button id="btn-search" type="button" role="menuitem" title="查找消息 (Ctrl+F)" aria-label="查找消息"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-search"/></svg><span>查找当前对话</span></button>
+      <button id="btn-settings" type="button" role="menuitem" aria-label="偏好与安全"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-settings"/></svg><span>偏好与安全</span></button>
+      <button id="wb-logout" type="button" role="menuitem" aria-label="退出登录"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 4H4v16h6M14 8l4 4-4 4M8 12h10"/></svg><span>退出登录</span></button>
+    </div>
+  </div>
 </aside>
 <div id="conversation-backdrop" aria-hidden="true" hidden></div>
 <div id="wb-shell">
 <div id="header">
   <button id="conversation-drawer-toggle" class="conv-drawer-toggle icon-btn" type="button" aria-label="对话记录" title="展开或收起对话记录" aria-controls="wb-nav" aria-expanded="false"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-menu"/></svg></button>
   <div class="header-info"><div class="header-text">
-    <h1 id="wb-conversation-title" title="新对话">新对话</h1>
+    <h1 id="wb-conversation-title" title="新对话">新对话</h1><span id="wb-page-title" hidden></span>
     <div class="bot-status" id="status-text"><span class="conn-dot" id="conn-dot"></span> 在线</div>
     <span class="bot-name" hidden>XGent</span><span id="bot-avatar" hidden>X</span>
   </div><span id="conversation-current-status" class="conv-title-status" hidden>正在生成</span></div>
-  <button id="chat-options-toggle" class="icon-btn" type="button" aria-label="聊天选项" aria-controls="chat-options" aria-expanded="false"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg></button>
-  <div id="chat-options" hidden>
-    <div id="wb-chat-controls"></div>
-    <div class="chat-option-tools">  <button id="btn-search" class="icon-btn" title="查找消息 (Ctrl+F)" aria-label="查找消息"><svg class="icon" viewBox="0 0 24 24"><use href="#i-search"/></svg></button>
-  <button id="btn-theme" class="icon-btn" title="切换主题" aria-label="切换主题"><svg class="icon" viewBox="0 0 24 24"><use href="#i-moon"/></svg></button>
-  <button id="btn-terminal" class="icon-btn" title="终端" aria-label="终端"><svg class="icon" viewBox="0 0 24 24"><use href="#i-terminal"/></svg></button>
-  <button id="wb-logout" class="icon-btn" type="button" title="退出当前登录" aria-label="退出登录"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 4H4v16h6M14 8l4 4-4 4M8 12h10"/></svg></button>
-  <button id="btn-settings" class="icon-btn" title="设置" aria-label="设置"><svg class="icon" viewBox="0 0 24 24"><use href="#i-settings"/></svg></button>
-<span class="model-pill" id="model-pill">AI</span></div>
-  </div>
+  <button id="btn-theme" class="icon-btn" type="button" title="切换主题" aria-label="切换主题"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-moon"/></svg></button>
+  <button id="btn-terminal" class="icon-btn" type="button" title="终端" aria-label="终端"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-terminal"/></svg></button>
+  <span class="model-pill" id="model-pill" hidden>AI</span>
 </div>
 
 <!-- 查找栏 -->
@@ -115,6 +117,7 @@
   </div>
 </div>
 
+<div id="source-navigation" role="status" hidden></div>
 <div id="typing" class="hidden"><span></span><span></span><span></span></div>
 
 <button id="scroll-bottom" title="滚动到底部" aria-label="滚动到底部"><svg class="icon" viewBox="0 0 24 24"><use href="#i-down"/></svg></button>
@@ -150,17 +153,20 @@
   <div id="composer">
     <div class="composer-card">
       <div id="pending-files" class="pending-files hidden"></div>
+      <div class="input-wrap">
+        <textarea id="input" rows="1" placeholder="发送消息…" aria-label="消息"></textarea>
+      </div>
       <div class="composer-row">
         <input type="file" id="file-input" class="hidden" multiple>
         <button id="btn-composer-menu" class="icon-btn" type="button" title="命令菜单 (Ctrl / ⌘ K)" aria-label="命令菜单" aria-expanded="false" aria-controls="composer-commands"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-menu"/></svg></button>
         <button id="btn-attach" class="icon-btn" title="添加附件或拖入文件" aria-label="附件"><svg class="icon" viewBox="0 0 24 24"><use href="#i-attach"/></svg></button>
-        <div class="input-wrap">
-          <textarea id="input" rows="1" placeholder="发送消息…"></textarea>
-        </div>
-        <button id="btn-send" class="send-btn" title="发送消息 (Enter)" aria-label="发送"><svg class="icon" viewBox="0 0 24 24"><use href="#i-send"/></svg></button>
+        <div id="wb-chat-controls" aria-label="模型与生成设置"></div>
+        <button id="btn-send" class="send-btn" disabled title="发送消息 (Enter)" aria-label="发送"><svg class="icon" viewBox="0 0 24 24"><use href="#i-send"/></svg></button>
         <button id="btn-stop" class="stop-btn hidden" title="停止生成" aria-label="停止"><svg class="icon" viewBox="0 0 24 24"><use href="#i-stop"/></svg></button>
       </div>
     </div>
+    <div id="composer-options-popover" aria-label="输入选项" hidden></div>
+    <p id="composer-option-error" role="status" hidden></p>
     <section id="composer-commands" aria-label="命令列表" hidden></section>
     <div id="cmd-suggest" class="cmd-suggest hidden"></div>
   </div>
@@ -191,7 +197,7 @@
 
 </div>
 <aside id="wb-detail" aria-label="详情" hidden><div id="wb-resizer" role="separator" aria-label="调整详情宽度" tabindex="0"></div><header><span id="wb-detail-title">详情</span><button id="wb-detail-close" aria-label="关闭详情">×</button></header><div id="wb-detail-body"></div></aside>
-<nav id="wb-mobile-nav" aria-label="底部导航"></nav>
+
 <dialog id="wb-dialog" aria-labelledby="wb-dialog-title"><header><h2 id="wb-dialog-title"></h2><button id="wb-dialog-close" aria-label="关闭">×</button></header><div id="wb-dialog-body"></div></dialog>
 <div id="conversation-item-menu" class="conv-item-menu" role="menu" aria-label="对话操作" hidden></div>
 <dialog id="conversation-rename-dialog" class="conv-dialog" aria-labelledby="conversation-rename-title">

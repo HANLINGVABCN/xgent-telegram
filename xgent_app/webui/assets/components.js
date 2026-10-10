@@ -33,7 +33,7 @@ export async function api(path,{data,signal,...options}={}) {
   const cid=window.XGentConversations?.current;
   let requestPath=path;
   if(cid&&path.startsWith('/api/workbench/')&&!path.includes('/conversations')){
-    if(data===undefined){if(['history','search','tasks','artifacts'].some(name=>path.startsWith('/api/workbench/'+name)))requestPath+= (path.includes('?')?'&':'?')+'conversation_id='+encodeURIComponent(cid);}
+    if(data===undefined){if(!new URL(path,location.origin).searchParams.has('conversation_id')&&['history','search','tasks','artifacts'].some(name=>path.startsWith('/api/workbench/'+name)))requestPath+= (path.includes('?')?'&':'?')+'conversation_id='+encodeURIComponent(cid);}
     else data={conversation_id:cid,...data};
   }
   const affected=data===undefined?[]:affectedPages(path,data?.key);
