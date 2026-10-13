@@ -1710,6 +1710,7 @@ body {
     <div class="toolbar glass">
         <div class="breadcrumb" id="breadcrumb"></div>
         <div class="toolbar-actions">
+            <button class="btn desktop-only" onclick="openFileTrashPage()" title="文件回收站"><span class="btn-icon">🗑️</span>文件回收站</button>
             <button class="btn desktop-only" onclick="openCreateModal()">➕ 新建</button>
             <button class="btn transfer-btn" onclick="openDownloadPage()" title="传输中心">传输<span class="task-badge" id="transferBadge">0</span></button>
             <button class="btn desktop-only" onclick="openLinksPage()">🔗 链接</button>
@@ -1880,6 +1881,22 @@ body {
             <button class="btn btn-danger link-trash-action" id="clearShareTrashBtn" onclick="clearShareTrash()" style="display:none;">清空回收站</button>
         </div>
         <div class="link-list" id="linkList"></div>
+    </section>
+
+    <!-- File trash page -->
+    <section class="page-panel glass" id="trashPage">
+        <div class="page-head">
+            <div>
+                <div class="page-title">文件回收站</div>
+                <div class="page-subtitle">查看已删除的文件与文件夹，支持还原与彻底删除</div>
+            </div>
+            <div class="page-actions">
+                <button class="btn" onclick="showBrowserPage()">返回</button>
+                <button class="btn" onclick="loadFileTrash()">刷新</button>
+                <button class="btn btn-danger" id="clearFileTrashBtn" onclick="clearFileTrash()" style="display:none;">清空回收站</button>
+            </div>
+        </div>
+        <div class="link-list" id="fileTrashList"></div>
     </section>
 </div>
 
@@ -2257,6 +2274,7 @@ body {
 
 <!-- Mobile bottom bar -->
 <div class="mobile-bar app-hidden" id="mobileBar">
+    <button class="mob-btn" onclick="openFileTrashPage()"><span class="mob-btn-icon">🗑️</span>文件回收站</button>
     <button class="mob-btn" onclick="openCreateModal()"><span class="mob-btn-icon">➕</span>新建</button>
     <button class="mob-btn transfer-btn" onclick="openDownloadPage()"><span class="mob-btn-icon">⇅</span>传输<span class="task-badge" id="mobileTransferBadge">0</span></button>
     <button class="mob-btn" onclick="openLinksPage()"><span class="mob-btn-icon">🔗</span>链接</button>
@@ -2975,7 +2993,7 @@ function showCtx(x, y) {
     setDisabled('ctxShare', !singleFile || !f || f.isDir);
     setDisabled('ctxCopy', !hasSel);
     setDisabled('ctxCut', !hasSel);
-    setDisabled('ctxPaste', !clipboard);
+    setDisabled('ctxPaste', false);
     setDisabled('ctxRename', !singleFile);
     setDisabled('ctxDelete', !hasSel);
     setDisabled('ctxProps', !singleFile);
@@ -3080,15 +3098,45 @@ function ctxCut() {
     renderFiles();
 }
 
-async function ctxPaste() {
-    hideCtx();
+async function ctxPasteInternal() {
     if (!clipboard) return toast('剪贴板为空', 'warning');
     const endpoint = clipboard.action === 'copy' ? '/api/copy' : '/api/move';
+    const actionText = clipboard.action === 'copy' ? '复制' : '移动';
+
+    const renames = {};
+    const sourcesToProcess = [];
+
+    for (const s of clipboard.paths) {
+        const baseName = s.split('/').filter(Boolean).pop();
+        if (!baseName) continue;
+        const exists = files.some(f => f.name === baseName);
+        if (exists) {
+            const suggested = defaultConflictName(baseName, val => files.some(f => f.name === val) || Object.values(renames).includes(val));
+            const renamed = await promptUploadRename({
+                title: '检测到同名项目',
+                text: `目标目录已存在同名项目「${baseName}」。是否重命名后继续${actionText}，或取消操作？`,
+                currentName: baseName,
+                suggestedName: suggested,
+                exists: val => files.some(f => f.name === val) || Object.values(renames).includes(val),
+            });
+            if (!renamed) {
+                toast(`已取消${actionText}操作`, 'info');
+                return;
+            }
+            renames[s] = renamed;
+            sourcesToProcess.push(s);
+        } else {
+            sourcesToProcess.push(s);
+        }
+    }
+
+    if (sourcesToProcess.length === 0) return;
+
     try {
         const data = await apiFetch(endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sources: clipboard.paths, dest: curPath }),
+            body: JSON.stringify({ sources: sourcesToProcess, dest: curPath, renames }),
         });
         if (data.success) {
             toast(clipboard.action === 'copy' ? '复制成功' : '移动成功', 'success');
@@ -3099,6 +3147,39 @@ async function ctxPaste() {
     } catch (e) { toast(e.message, 'error'); }
     await loadFiles(curPath);
     loadDiskInfo(true);
+}
+
+async function ctxPaste() {
+    hideCtx();
+    if (clipboard && clipboard.paths && clipboard.paths.length > 0) {
+        return await ctxPasteInternal();
+    }
+    if (navigator.clipboard && navigator.clipboard.read) {
+        try {
+            const items = await navigator.clipboard.read();
+            const files = [];
+            for (const item of items) {
+                for (const type of item.types) {
+                    if (type.startsWith('image/') || type === 'application/octet-stream') {
+                        const blob = await item.getType(type);
+                        const ext = type.split('/')[1] || 'png';
+                        const now = new Date();
+                        const pad = n => String(n).padStart(2, '0');
+                        const ts = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+                        files.push(new File([blob], `screenshot_${ts}.${ext}`, { type }));
+                    }
+                }
+            }
+            if (files.length > 0) {
+                toast(`已读取剪贴板 ${files.length} 个文件，开始上传...`, 'info');
+                await uploadFiles(files);
+                return;
+            }
+        } catch (e) {
+            // Permission or format not readable
+        }
+    }
+    toast('提示：从本地复制的文件/截图，请直接在页面按快捷键 Ctrl+V (或 Cmd+V) 粘贴上传', 'info');
 }
 
 function ctxRename() {
@@ -3138,14 +3219,14 @@ function ctxDelete() {
         return f ? f.name : p;
     });
     const display = names.length <= 3 ? names.join('、') : names.slice(0, 3).join('、') + ` 等 ${count} 项`;
-    showConfirm('🗑️ 确认删除', `确定要删除「${display}」吗？\n此操作不可恢复。`, async () => {
+    showConfirm('🗑️ 移入回收站', `确定要将「${display}」移入文件回收站吗？\n您可以在回收站中随时还原或彻底删除。`, async () => {
         try {
             const data = await apiFetch('/api/delete', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ paths: [...selected] }),
             });
-            if (data.success) toast(`已删除 ${count} 个项目`, 'success');
+            if (data.success) toast(`已移入回收站 ${count} 个项目`, 'success');
             else toast((data.errors || []).join('\n'), 'error');
         } catch (e) { toast(e.message, 'error'); }
         await loadFiles(curPath);
@@ -3397,10 +3478,16 @@ document.addEventListener('DOMContentLoaded', () => {
     const uz = document.getElementById('uploadZone');
     uz.addEventListener('dragover', (e) => { e.preventDefault(); uz.classList.add('drag-over'); });
     uz.addEventListener('dragleave', () => uz.classList.remove('drag-over'));
-    uz.addEventListener('drop', (e) => {
+    uz.addEventListener('drop', async (e) => {
         e.preventDefault();
         uz.classList.remove('drag-over');
-        if (e.dataTransfer.files.length > 0) uploadFiles(e.dataTransfer.files);
+        let files = [];
+        try {
+            files = await extractFilesFromDataTransfer(e.dataTransfer);
+        } catch (err) {
+            if (e.dataTransfer && e.dataTransfer.files) files = Array.from(e.dataTransfer.files);
+        }
+        if (files.length > 0) uploadFiles(files);
     });
 });
 
@@ -3688,6 +3775,160 @@ function fmtDuration(sec) {
 }
 
 /* ============================================================
+   DataTransfer & Clipboard File Extraction (Files & Folders)
+   ============================================================ */
+async function extractFilesFromDataTransfer(dataTransfer) {
+    if (!dataTransfer) return [];
+    const items = dataTransfer.items ? Array.from(dataTransfer.items) : [];
+    const hasEntrySupport = items.some(it => typeof it.webkitGetAsEntry === 'function');
+    if (hasEntrySupport && items.length > 0) {
+        const fileList = [];
+        for (const item of items) {
+            if (item.kind !== 'file') continue;
+            const entry = typeof item.webkitGetAsEntry === 'function' ? item.webkitGetAsEntry() : null;
+            if (entry) {
+                const scanned = await scanEntryRecursive(entry, '');
+                fileList.push(...scanned);
+            } else {
+                const f = item.getAsFile();
+                if (f) fileList.push(f);
+            }
+        }
+        if (fileList.length > 0) return fileList;
+    }
+    if (dataTransfer.files && dataTransfer.files.length > 0) {
+        return Array.from(dataTransfer.files);
+    }
+    return [];
+}
+
+async function scanEntryRecursive(entry, currentPath = '') {
+    const results = [];
+    if (!entry) return results;
+    if (entry.isFile) {
+        try {
+            const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+            const relPath = currentPath ? `${currentPath}/${file.name}` : file.name;
+            try {
+                Object.defineProperty(file, 'webkitRelativePath', {
+                    value: relPath,
+                    writable: true,
+                    configurable: true
+                });
+            } catch (e) {
+                file.relativePath = relPath;
+            }
+            results.push(file);
+        } catch (e) {
+            console.warn('Error reading file entry:', e);
+        }
+    } else if (entry.isDirectory) {
+        const dirReader = entry.createReader();
+        const nextPath = currentPath ? `${currentPath}/${entry.name}` : entry.name;
+        const readBatch = () => new Promise((resolve, reject) => {
+            dirReader.readEntries(resolve, reject);
+        });
+        try {
+            let entries = await readBatch();
+            while (entries && entries.length > 0) {
+                for (const child of entries) {
+                    const subFiles = await scanEntryRecursive(child, nextPath);
+                    results.push(...subFiles);
+                }
+                entries = await readBatch();
+            }
+        } catch (e) {
+            console.warn('Error reading directory entry:', e);
+        }
+    }
+    return results;
+}
+
+function normalizePastedFiles(files) {
+    const now = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    const ts = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+    return files.map((file, idx) => {
+        const isGenericImage = (!file.name || file.name === 'image.png' || file.name === 'blob' || file.name === 'image.jpeg') && file.type && file.type.startsWith('image/');
+        if (isGenericImage) {
+            const ext = file.type === 'image/jpeg' ? 'jpg' : 'png';
+            const suffix = files.length > 1 ? `_${idx + 1}` : '';
+            const newName = `screenshot_${ts}${suffix}.${ext}`;
+            try {
+                return new File([file], newName, { type: file.type });
+            } catch (e) {
+                return file;
+            }
+        }
+        return file;
+    });
+}
+
+function promptPasteTextAsFile(text) {
+    const now = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    const ts = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+    const defaultName = `paste_${ts}.txt`;
+    showConfirm('📋 粘贴文本为文件', `检测到剪贴板中含有文本内容（共 ${text.length} 字符）。\n是否将其作为文本文件「${defaultName}」上传到当前目录？`, async () => {
+        const file = new File([text], defaultName, { type: 'text/plain;charset=utf-8' });
+        await uploadFiles([file]);
+    });
+}
+
+/* ============================================================
+   Paste Handling (Local files, screenshots & fallback)
+   ============================================================ */
+function setupPaste() {
+    document.addEventListener('paste', async (e) => {
+        const tag = (e.target && e.target.tagName) || '';
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target && e.target.isContentEditable)) {
+            return;
+        }
+        if (typeof currentView !== 'undefined' && currentView !== 'browser') {
+            return;
+        }
+
+        const cd = e.clipboardData;
+        if (!cd) return;
+
+        let filesToUpload = [];
+        try {
+            filesToUpload = await extractFilesFromDataTransfer(cd);
+        } catch (err) {
+            console.warn('Failed to extract files from clipboard:', err);
+            if (cd.files && cd.files.length > 0) {
+                filesToUpload = Array.from(cd.files);
+            }
+        }
+
+        // 1. If files or images found in system clipboard
+        if (filesToUpload && filesToUpload.length > 0) {
+            e.preventDefault();
+            filesToUpload = normalizePastedFiles(filesToUpload);
+            toast(`检测到本地剪贴板 ${filesToUpload.length} 个文件，开始上传...`, 'info');
+            await uploadFiles(filesToUpload);
+            return;
+        }
+
+        // 2. Fallback to webpage internal clipboard (copy/move)
+        if (clipboard && clipboard.paths && clipboard.paths.length > 0) {
+            e.preventDefault();
+            await ctxPasteInternal();
+            return;
+        }
+
+        // 3. Fallback: prompt if user copied plain text
+        const text = cd.getData('text/plain');
+        if (text && text.trim()) {
+            e.preventDefault();
+            promptPasteTextAsFile(text);
+        } else {
+            toast('剪贴板为空', 'warning');
+        }
+    });
+}
+
+/* ============================================================
    Drag & Drop (page-level)
    ============================================================ */
 function setupDragDrop() {
@@ -3704,12 +3945,18 @@ function setupDragDrop() {
         if (dragCount <= 0) { dragCount = 0; overlay.classList.remove('show'); }
     });
     document.addEventListener('dragover', (e) => e.preventDefault());
-    document.addEventListener('drop', (e) => {
+    document.addEventListener('drop', async (e) => {
         e.preventDefault();
         dragCount = 0;
         overlay.classList.remove('show');
-        if (e.dataTransfer.files.length > 0) {
-            uploadFiles(e.dataTransfer.files);
+        let files = [];
+        try {
+            files = await extractFilesFromDataTransfer(e.dataTransfer);
+        } catch (err) {
+            if (e.dataTransfer && e.dataTransfer.files) files = Array.from(e.dataTransfer.files);
+        }
+        if (files.length > 0) {
+            uploadFiles(files);
         }
     });
 }
@@ -3725,7 +3972,6 @@ function setupKeyboard() {
             switch (e.key.toLowerCase()) {
                 case 'c': e.preventDefault(); if (selected.size > 0) ctxCopy(); break;
                 case 'x': e.preventDefault(); if (selected.size > 0) ctxCut(); break;
-                case 'v': e.preventDefault(); ctxPaste(); break;
                 case 'a': e.preventDefault(); files.forEach(f => selected.add(f.path)); renderFiles(); break;
             }
         } else {
@@ -3775,6 +4021,7 @@ function setupEvents() {
     setupDragDrop();
     setupKeyboard();
     setupTouch();
+    setupPaste();
 
     const fileList = document.getElementById('fileList');
     fileList.addEventListener('mousedown', onFileListMouseDown);
@@ -3920,7 +4167,7 @@ function showView(view) {
     currentView = view;
     const browser = document.getElementById('browserPage');
     if (browser) browser.style.display = view === 'browser' ? '' : 'none';
-    ['downloadPage', 'editorPage', 'linksPage'].forEach(id => {
+    ['downloadPage', 'editorPage', 'linksPage', 'trashPage'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.classList.toggle('active', id === view + 'Page');
     });
@@ -3982,7 +4229,7 @@ function showCtx(x, y) {
     setDisabled('ctxExtract', !singleFile || !isExtractableArchive(f));
     setDisabled('ctxCopy', !hasSel);
     setDisabled('ctxCut', !hasSel);
-    setDisabled('ctxPaste', !clipboard);
+    setDisabled('ctxPaste', false);
     setDisabled('ctxRename', !singleFile);
     setDisabled('ctxDelete', !hasSel);
     setDisabled('ctxProps', !singleFile);
@@ -4741,7 +4988,6 @@ function setupKeyboard() {
             switch (e.key.toLowerCase()) {
                 case 'c': e.preventDefault(); if (selected.size > 0) ctxCopy(); break;
                 case 'x': e.preventDefault(); if (selected.size > 0) ctxCut(); break;
-                case 'v': e.preventDefault(); ctxPaste(); break;
                 case 'a': e.preventDefault(); files.forEach(f => selected.add(f.path)); renderFiles(); break;
             }
         } else {
@@ -5367,7 +5613,7 @@ function showView(view, opts = {}) {
     currentView = view;
     const browser = document.getElementById('browserPage');
     if (browser) browser.style.display = view === 'browser' ? '' : 'none';
-    ['downloadPage', 'editorPage', 'linksPage'].forEach(id => {
+    ['downloadPage', 'editorPage', 'linksPage', 'trashPage'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.classList.toggle('active', id === view + 'Page');
     });
@@ -6115,23 +6361,29 @@ function uploadNameExistsInCurrentDir(name) {
     return files.some(f => f.name === name);
 }
 
-function defaultConflictName(name) {
+function defaultConflictName(name, existsFn = null) {
     const dot = name.lastIndexOf('.');
-    if (dot > 0) return name.slice(0, dot) + '_1' + name.slice(dot);
-    return name + '_1';
+    const stem = dot > 0 ? name.slice(0, dot) : name;
+    const ext = dot > 0 ? name.slice(dot) : '';
+    let idx = 1;
+    while (true) {
+        const candidate = `${stem} (${idx})${ext}`;
+        if (!existsFn || !existsFn(candidate)) return candidate;
+        idx++;
+    }
 }
 
 function validUploadRenameName(name) {
     return !!name && !name.startsWith('.') && !name.includes('/') && !name.includes('\\') && !name.includes('..');
 }
 
-function promptUploadRename({ title, text, currentName, exists = null }) {
+function promptUploadRename({ title, text, currentName, suggestedName = null, exists = null }) {
     return new Promise(resolve => {
         const modal = document.getElementById('uploadConflictModal');
         const input = document.getElementById('uploadConflictInput');
         document.getElementById('uploadConflictText').textContent = text;
         document.querySelector('#uploadConflictModal .modal-title').textContent = title;
-        input.value = defaultConflictName(currentName);
+        input.value = suggestedName || defaultConflictName(currentName, exists);
         const cleanup = () => {
             document.getElementById('uploadConflictRename').onclick = null;
             document.getElementById('uploadConflictCancel').onclick = null;
@@ -7070,6 +7322,114 @@ async function clearShareTrash() {
             toast('回收站已清空', 'success');
             await loadShares();
         } catch (e) { toast(e.message, 'error'); }
+    });
+}
+
+/* ============================================================
+   File Trash Management
+   ============================================================ */
+let fileTrashItems = [];
+
+async function openFileTrashPage() {
+    showView('trash');
+    await loadFileTrash();
+}
+
+async function loadFileTrash() {
+    const list = document.getElementById('fileTrashList');
+    const clearBtn = document.getElementById('clearFileTrashBtn');
+    if (!list) return;
+    list.innerHTML = '<div class="empty-state"><div class="empty-text">加载中...</div></div>';
+    try {
+        const data = await apiFetch('/api/file-trash-list');
+        fileTrashItems = data.items || [];
+        renderFileTrashList();
+    } catch (e) {
+        list.innerHTML = `<div class="empty-state"><div class="empty-text">加载失败: ${esc(e.message)}</div></div>`;
+    }
+}
+
+function renderFileTrashList() {
+    const list = document.getElementById('fileTrashList');
+    const clearBtn = document.getElementById('clearFileTrashBtn');
+    if (!list) return;
+    if (clearBtn) clearBtn.style.display = fileTrashItems.length > 0 ? '' : 'none';
+
+    if (fileTrashItems.length === 0) {
+        list.innerHTML = '<div class="empty-state"><div class="empty-icon">🗑️</div><div class="empty-text">文件回收站为空</div></div>';
+        return;
+    }
+
+    list.innerHTML = fileTrashItems.map(item => {
+        const icon = fileIcon(item);
+        return `
+            <div class="link-item" id="trash_item_${item.id}">
+                <div class="link-main">
+                    <div class="link-name"><span style="margin-right:6px;">${icon}</span>${esc(item.name)}</div>
+                    <div class="link-url">原位置: ${esc(item.originalPath)}</div>
+                    <div class="link-meta">
+                        <span>大小: ${item.isDir ? '文件夹' : fmtSize(item.size)}</span>
+                        <span>删除时间: ${esc(item.deletedAtStr || '')}</span>
+                    </div>
+                </div>
+                <div class="link-actions" style="display:flex;align-items:center;gap:6px;">
+                    <button class="btn btn-primary" onclick="restoreFileTrash('${item.id}')">↩️ 还原</button>
+                    <button class="btn btn-danger" onclick="purgeFileTrash('${item.id}')">彻底删除</button>
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+async function restoreFileTrash(id) {
+    const item = fileTrashItems.find(it => it.id === id);
+    const name = item ? item.name : '该文件';
+    try {
+        const res = await apiFetch('/api/file-trash-restore', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids: [id] })
+        });
+        toast(res.message || `已还原「${name}」`, 'success');
+        await loadFileTrash();
+        loadDiskInfo(true);
+    } catch (e) {
+        toast(e.message, 'error');
+    }
+}
+
+async function purgeFileTrash(id) {
+    const item = fileTrashItems.find(it => it.id === id);
+    const name = item ? item.name : '该项目';
+    showConfirm('彻底删除', `确定要彻底删除「${name}」吗？\n此操作不可恢复。`, async () => {
+        try {
+            const res = await apiFetch('/api/file-trash-delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ids: [id] })
+            });
+            toast(res.message || '已彻底删除', 'success');
+            await loadFileTrash();
+            loadDiskInfo(true);
+        } catch (e) {
+            toast(e.message, 'error');
+        }
+    });
+}
+
+async function clearFileTrash() {
+    showConfirm('清空回收站', '确定要清空文件回收站中的所有项目吗？\n此操作不可恢复。', async () => {
+        try {
+            const res = await apiFetch('/api/file-trash-clear', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+            });
+            toast(res.message || '回收站已清空', 'success');
+            await loadFileTrash();
+            loadDiskInfo(true);
+        } catch (e) {
+            toast(e.message, 'error');
+        }
     });
 }
 

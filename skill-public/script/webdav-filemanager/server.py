@@ -169,7 +169,7 @@ def get_file_info(root, rel_path, full_path):
 
 
 def _empty_state():
-    return {'shares': {}, 'shareTrash': {}, 'tempFiles': {}, 'tasks': {}, 'pinned': [], 'taskTrash': {}, 'taskDeleted': {}, 'taskRevision': 0}
+    return {'shares': {}, 'shareTrash': {}, 'tempFiles': {}, 'tasks': {}, 'pinned': [], 'taskTrash': {}, 'taskDeleted': {}, 'taskRevision': 0, 'fileTrash': {}}
 
 
 def load_state():
@@ -187,6 +187,7 @@ def load_state():
         data.setdefault('taskTrash', {})
         data.setdefault('taskDeleted', {})
         data.setdefault('taskRevision', 0)
+        data.setdefault('fileTrash', {})
         return data
 
 
@@ -1663,6 +1664,7 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             '/api/tasks': self._api_tasks,
             '/api/tasks-trash': self._api_tasks_trash,
             '/api/pinned': self._api_pinned,
+            '/api/file-trash-list': self._api_file_trash_list,
         }
         handler = routes.get(path)
         if handler:
@@ -1752,6 +1754,8 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         items = []
         try:
             for name in os.listdir(full):
+                if name == '.trash':
+                    continue
                 fp = os.path.join(full, name)
                 rp = (req_path.rstrip('/') + '/' + name) if req_path != '/' else '/' + name
                 info = get_file_info(ROOT_DIR, rp, fp)
@@ -2076,6 +2080,9 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             '/api/extract': self._api_extract,
             '/api/tasks-restore': self._api_tasks_restore,
             '/api/pinned': self._api_pinned,
+            '/api/file-trash-restore': self._api_file_trash_restore,
+            '/api/file-trash-delete': self._api_file_trash_delete,
+            '/api/file-trash-clear': self._api_file_trash_clear,
         }
         handler = routes.get(path)
         if handler:
@@ -3009,6 +3016,13 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         paths = data.get('paths', [])
         if not paths:
             return self.send_err(400, '请选择要删除的文件')
+        permanent = bool(data.get('permanent', False))
+        trash_dir = os.path.join(ROOT_DIR, '.trash')
+        os.makedirs(trash_dir, exist_ok=True)
+        state = load_state()
+        trash_map = state.setdefault('fileTrash', {})
+        root_real = os.path.realpath(ROOT_DIR)
+        trash_real = os.path.realpath(trash_dir)
         errs = []
         for p in paths:
             fp = safe_join(ROOT_DIR, p)
@@ -3018,17 +3032,167 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             if not os.path.exists(fp):
                 errs.append(f'{p}: 文件不存在')
                 continue
-            try:
-                if os.path.isdir(fp):
-                    shutil.rmtree(fp)
-                else:
-                    os.remove(fp)
-            except OSError as e:
-                errs.append(f'{p}: {e}')
+            fp_real = os.path.realpath(fp)
+            if fp_real == root_real or fp_real == trash_real or fp_real.startswith(trash_real + os.sep):
+                errs.append(f'{p}: 不能删除根目录或回收站内部文件')
+                continue
+            if permanent:
+                try:
+                    if os.path.isdir(fp):
+                        shutil.rmtree(fp)
+                    else:
+                        os.remove(fp)
+                except OSError as e:
+                    errs.append(f'{p}: {e}')
+            else:
+                is_dir = os.path.isdir(fp)
+                size = 0
+                try:
+                    if is_dir:
+                        for r, d, fnames in os.walk(fp):
+                            for fn in fnames:
+                                size += os.path.getsize(os.path.join(r, fn))
+                    else:
+                        size = os.path.getsize(fp)
+                except OSError:
+                    pass
+
+                trash_id = f"ftr_{int(time.time())}_{secrets.token_hex(4)}"
+                base_name = os.path.basename(fp)
+                trash_name = f"{trash_id}_{base_name}"
+                trash_target = os.path.join(trash_dir, trash_name)
+                try:
+                    shutil.move(fp, trash_target)
+                    trash_map[trash_id] = {
+                        'id': trash_id,
+                        'name': base_name,
+                        'originalPath': p if p.startswith('/') else '/' + p,
+                        'trashName': trash_name,
+                        'size': size,
+                        'isDir': is_dir,
+                        'deletedAt': time.time(),
+                        'deletedAtStr': datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S'),
+                    }
+                except OSError as e:
+                    errs.append(f'{p}: {self._sanitize_error(e)}')
+
+        if not permanent:
+            save_state(state)
+
         if errs:
             self.send_json({'success': False, 'errors': errs}, 207)
         else:
-            self.send_ok('删除成功')
+            self.send_ok('已彻底删除' if permanent else '已移入回收站')
+
+    def _api_file_trash_list(self, qs=None):
+        state = load_state()
+        trash_map = state.get('fileTrash', {})
+        items = []
+        for tid, meta in trash_map.items():
+            tpath = os.path.join(ROOT_DIR, '.trash', meta.get('trashName', ''))
+            if os.path.exists(tpath):
+                items.append(meta)
+        items.sort(key=lambda x: x.get('deletedAt', 0), reverse=True)
+        self.send_json({'success': True, 'items': items})
+
+    def _api_file_trash_restore(self):
+        data = self.read_json()
+        ids = data.get('ids', [])
+        if not ids:
+            return self.send_err(400, '缺少参数')
+        state = load_state()
+        trash_map = state.setdefault('fileTrash', {})
+        trash_dir = os.path.join(ROOT_DIR, '.trash')
+        errs = []
+        for tid in ids:
+            meta = trash_map.get(tid)
+            if not meta:
+                errs.append(f'{tid}: 记录不存在')
+                continue
+            trash_path = os.path.join(trash_dir, meta.get('trashName', ''))
+            if not os.path.exists(trash_path):
+                trash_map.pop(tid, None)
+                errs.append(f"{meta.get('name')}: 回收站中未找到实际文件")
+                continue
+            orig_path = meta.get('originalPath', '/')
+            target = safe_join(ROOT_DIR, orig_path)
+            if not target:
+                errs.append(f"{meta.get('name')}: 原路径非法")
+                continue
+            target_dir = os.path.dirname(target)
+            os.makedirs(target_dir, exist_ok=True)
+            if os.path.exists(target):
+                base = meta.get('name', os.path.basename(target))
+                stem, ext = os.path.splitext(base)
+                idx = 1
+                while True:
+                    cand = os.path.join(target_dir, f"{stem} ({idx}){ext}")
+                    if not os.path.exists(cand):
+                        target = cand
+                        break
+                    idx += 1
+            try:
+                shutil.move(trash_path, target)
+                trash_map.pop(tid, None)
+            except OSError as e:
+                errs.append(f"{meta.get('name')}: {self._sanitize_error(e)}")
+
+        save_state(state)
+        if errs:
+            self.send_json({'success': False, 'errors': errs}, 207)
+        else:
+            self.send_ok('还原成功')
+
+    def _api_file_trash_delete(self):
+        data = self.read_json()
+        ids = data.get('ids', [])
+        if not ids:
+            return self.send_err(400, '缺少参数')
+        state = load_state()
+        trash_map = state.setdefault('fileTrash', {})
+        trash_dir = os.path.join(ROOT_DIR, '.trash')
+        errs = []
+        for tid in ids:
+            meta = trash_map.pop(tid, None)
+            if not meta:
+                continue
+            trash_path = os.path.join(trash_dir, meta.get('trashName', ''))
+            if os.path.exists(trash_path):
+                try:
+                    if os.path.isdir(trash_path):
+                        shutil.rmtree(trash_path)
+                    else:
+                        os.remove(trash_path)
+                except OSError as e:
+                    errs.append(f"{meta.get('name')}: {self._sanitize_error(e)}")
+
+        save_state(state)
+        if errs:
+            self.send_json({'success': False, 'errors': errs}, 207)
+        else:
+            self.send_ok('已彻底删除')
+
+    def _api_file_trash_clear(self):
+        state = load_state()
+        trash_dir = os.path.join(ROOT_DIR, '.trash')
+        errs = []
+        if os.path.exists(trash_dir):
+            for name in os.listdir(trash_dir):
+                fp = os.path.join(trash_dir, name)
+                try:
+                    if os.path.isdir(fp):
+                        shutil.rmtree(fp)
+                    else:
+                        os.remove(fp)
+                except OSError as e:
+                    errs.append(f'{name}: {self._sanitize_error(e)}')
+
+        state['fileTrash'] = {}
+        save_state(state)
+        if errs:
+            self.send_json({'success': False, 'errors': errs}, 207)
+        else:
+            self.send_ok('回收站已清空')
 
     def _api_rename(self):
         data = self.read_json()
@@ -3102,6 +3266,7 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         data = self.read_json()
         sources = data.get('sources', [])
         dest = data.get('dest', '')
+        renames = data.get('renames', {})
         if not sources or not dest:
             return self.send_err(400, '缺少参数')
         dp = safe_join(ROOT_DIR, dest)
@@ -3113,7 +3278,9 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             if not sp or not os.path.exists(sp):
                 errs.append(f'{s}: 文件不存在')
                 continue
-            target = os.path.join(dp, os.path.basename(sp))
+            new_name = renames.get(s)
+            target_name = new_name if (new_name and isinstance(new_name, str) and not ('/' in new_name or '\\' in new_name or '..' in new_name)) else os.path.basename(sp)
+            target = os.path.join(dp, target_name)
             if os.path.exists(target):
                 errs.append(f'{s}: 目标目录已存在同名文件或文件夹')
                 continue
@@ -3133,6 +3300,7 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         data = self.read_json()
         sources = data.get('sources', [])
         dest = data.get('dest', '')
+        renames = data.get('renames', {})
         if not sources or not dest:
             return self.send_err(400, '缺少参数')
         dp = safe_join(ROOT_DIR, dest)
@@ -3145,7 +3313,9 @@ class FileManagerHandler(BaseHTTPRequestHandler):
             if not sp or not os.path.exists(sp):
                 errs.append(f'{s}: 文件不存在')
                 continue
-            target = os.path.join(dp, os.path.basename(sp))
+            new_name = renames.get(s)
+            target_name = new_name if (new_name and isinstance(new_name, str) and not ('/' in new_name or '\\' in new_name or '..' in new_name)) else os.path.basename(sp)
+            target = os.path.join(dp, target_name)
             # Security: verify target stays within ROOT_DIR (handles symlinks)
             target_real = os.path.realpath(target)
             if not (target_real == root_real or target_real.startswith(root_real + os.sep)):
@@ -3291,6 +3461,8 @@ class FileManagerHandler(BaseHTTPRequestHandler):
         if is_dir and depth != '0':
             try:
                 for name in sorted(os.listdir(full)):
+                    if name == '.trash':
+                        continue
                     child_full = os.path.join(full, name)
                     child_rel = rel.rstrip('/') + '/' + name
                     child_is_dir = os.path.isdir(child_full)
