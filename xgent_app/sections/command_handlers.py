@@ -69,7 +69,6 @@ async def build_compression_history(snapshot, instruction):
     """Freeze exactly this conversation, including native payloads, without addons."""
     from xgent_app.attachments import is_attachment_record
     from xgent_app.tool_context import restore_tool_context, deduplicate_attachment_parts
-    from xgent_app.compression import metadata_of
     history = BotMemoryDB.conversation_records_to_messages(snapshot['records'])
     history = await asyncio.to_thread(restore_tool_context, history, snapshot['records'],
                                      ArtifactManager.UPLOAD_DIR)
@@ -77,11 +76,8 @@ async def build_compression_history(snapshot, instruction):
     parts, updates, errors = await asyncio.to_thread(
         prepare_attachment_context, records, ArtifactManager.UPLOAD_DIR,
         ArtifactManager.GENERATED_MEDIA_DIR,
+        strict=True,
     )
-    for metadata in [metadata_of(r) for r in records] + [item[2] for item in updates]:
-        for reference in metadata.get('attachments', []):
-            if reference.get('kind') == 'invalid':
-                errors.append(f"无法完整读取附件：{reference.get('name')}")
     if errors:
         raise CompressionError('压缩无法完整提供附件：\n' + '\n'.join(errors))
     parts = deduplicate_attachment_parts(history, parts)

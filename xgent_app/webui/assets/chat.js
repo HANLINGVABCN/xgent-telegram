@@ -54,6 +54,12 @@
   var pendingFiles = [];
   var fileStatuses = new WeakMap();
   var uploadQueue = null;
+  var queueEnabled=false,queueState=null,queueController=null,queueVersion=0,queueExpanded=false,queueRefreshPending=false;
+  var queueActions=new Map(),recoveredEdits=new Set(),textSubmitting=false,textSubmission=null;
+  try{
+    JSON.parse(sessionStorage.getItem('xgent_queue_edits')||'[]').forEach(saved=>queueActions.set(saved.item.id,{...saved,busy:false,error:'取回结果待确认'}));
+    recoveredEdits=new Set(JSON.parse(sessionStorage.getItem('xgent_queue_recovered')||'[]'));
+  }catch(e){}
 
   function svgIcon(name, cls) {
     return '<svg class="icon' + (cls ? " " + cls : "") + '" viewBox="0 0 24 24"><use href="#i-' + name + '"/></svg>';
@@ -171,7 +177,7 @@
     notifyWorkbench();
     return fetch(requestPath, options).then(function (r) {
       return r.json().catch(function () { return {}; }).then(function (body) {
-        if (!r.ok) { throw new Error(body.error || ("HTTP " + r.status)); }
+        if (!r.ok) { var error=new Error(body.error || ("HTTP " + r.status));error.status=r.status;throw error; }
         return body;
       });
     }).finally(notifyWorkbench);
@@ -294,7 +300,9 @@
   }
 
   function sanitizeHtml(htmlStr) {
-    var tmp = document.createElement("div");
+    // Parse inertly: a detached DIV can still fetch IMG URLs and fire onerror
+    // before its forbidden attributes/nodes are removed. Template contents cannot.
+    var tmp = document.createElement("template");
     tmp.innerHTML = String(htmlStr);
     (function clean(node) {
       Array.prototype.slice.call(node.childNodes).forEach(function (c) {
@@ -333,7 +341,7 @@
         if (c.tagName === "A") { c.target = "_blank"; c.rel = "noopener noreferrer"; }
         clean(c);
       });
-    })(tmp);
+    })(tmp.content);
     return tmp.innerHTML;
   }
 
@@ -346,8 +354,11 @@
         if (c.nodeType === 1) { visit(c); return; }
         if (c.nodeType !== 3 || c.nodeValue.indexOf("\n") < 0) return;
         if (/^(TABLE|THEAD|TBODY|TR|UL|OL)$/.test(node.tagName)) return;
-        if (/^\s*$/.test(c.nodeValue) && c.previousSibling &&
-            /^(PRE|BLOCKQUOTE|DIV|TABLE|UL|OL|P)$/.test(c.previousSibling.tagName)) return;
+        // Formatting whitespace next to a block is not another visible blank
+        // paragraph. Leave the original text node intact instead of adding BRs.
+        if (/^\s*$/.test(c.nodeValue) && [c.previousSibling,c.nextSibling].some(function(s){
+          return s && /^(PRE|BLOCKQUOTE|DIV|TABLE|UL|OL|P|H[1-6]|HR)$/.test(s.tagName);
+        })) return;
         var frag = document.createDocumentFragment();
         c.nodeValue.split("\n").forEach(function (line, i) {
           if (i) frag.appendChild(document.createElement("br"));
@@ -390,7 +401,7 @@
   // *、`、#、| 之类被当 markdown 语法篡改显示（Telegram/CLI 两端都原样回显用户
   // 输入，Web 对齐）。其余角色照常走 renderText。初始渲染(makeBubble)与流式/编辑
   // 更新(putTextFrame)两处共用，避免规则失步。
-  function renderBubbleBody(role, text, parseMode) {
+  function renderBubbleBody(role, text, parseMode, webDisplay) {
     if (role === "user") {
       return escapeHtml(text == null ? "" : String(text)).replace(/\n/g, "<br>");
     }
@@ -399,7 +410,35 @@
     if(role==='sys'&&!parseMode&&/^⚠️(?:\s|$)/.test(String(text||''))){
       return '<pre>'+escapeHtml(String(text||''))+'</pre>';
     }
+    if(webDisplay?.version===1 && Array.isArray(webDisplay.segments) &&
+       webDisplay.segments.every(s=>s && ['markdown','html'].includes(s.kind) && typeof s.text==='string')){
+      // Every segment uses the same allowlist. Never trust even stored/tool HTML.
+      return webDisplay.segments.map(s=>renderText(s.text,s.kind==='html'?'HTML':null)).join('\n');
+    }
     return renderText(text, parseMode);
+  }
+
+  function repaintBubble(entry, html) {
+    var next=document.createElement('div');next.innerHTML=html;
+    var oldBlocks=Array.from(entry.body.querySelectorAll('blockquote[expandable]'));
+    next.querySelectorAll('blockquote[expandable]').forEach(function(block){
+      var key=block.getAttribute('data-raw'),path=block.getAttribute('data-output-path');
+      var text=block.querySelector('pre')?.textContent||'';
+      var index=oldBlocks.findIndex(old=>key ? old.getAttribute('data-raw')===key :
+        old.getAttribute('data-output-path')===path && old._pbText===text);
+      if(index>=0)block.replaceWith(oldBlocks.splice(index,1)[0]);
+    });
+    oldBlocks.forEach(block=>{clearTimeout(block._ft);block._outputRequest?.abort();});
+    var oldCode=Array.from(entry.body.querySelectorAll('.code-block-wrap'));
+    next.querySelectorAll('pre').forEach(function(pre){
+      if(pre.closest('blockquote[expandable],.code-block-wrap'))return;
+      var code=pre.querySelector('code'),text=(code||pre).textContent;
+      var lang=/language-([a-zA-Z0-9_+#.-]+)/.exec(code?.className||'')?.[1]||'CODE';
+      var index=oldCode.findIndex(wrap=>wrap._codeText===text && wrap._codeLang===lang);
+      if(index>=0)pre.replaceWith(oldCode.splice(index,1)[0]);
+    });
+    enhanceBubbleContent(next);
+    entry.body.replaceChildren(...next.childNodes);
   }
 
   function nowTime(timestamp) {
@@ -433,7 +472,8 @@
     }
     if(cardScrollIntent===intent)cardScrollIntent=null;
   }
-  function scrollDown() { log.scrollTop = log.scrollHeight; hideScrollBtn(); }
+  var renderingHistory=0;
+  function scrollDown() { if(renderingHistory)return;log.scrollTop = log.scrollHeight; hideScrollBtn(); }
   function isNearBottom() { return log.scrollHeight - log.scrollTop - log.clientHeight < 90; }
   function hideScrollBtn() { scrollBtn.classList.remove("show"); }
   function showScrollBtn() { scrollBtn.classList.add("show"); }
@@ -571,6 +611,7 @@
           var lm = /language-([a-zA-Z0-9_+#.-]+)/.exec(codeTag.className);
           if (lm) lang = lm[1];
         }
+        wrap._codeText=rawCode;wrap._codeLang=lang;
 
         var header = document.createElement("div");
         header.className = "code-header";
@@ -719,7 +760,7 @@
   }
 
   var lastStreamEntry = null;
-  function makeBubble(role, text, messageId, parseMode, markup, messageType, timestamp) {
+  function makeBubble(role, text, messageId, parseMode, markup, messageType, timestamp, webDisplay) {
     var stick = isNearBottom();
     msgCount++;
     updateEmptyState();
@@ -758,7 +799,7 @@
 
     var body = document.createElement("div");
     body.className = "body";
-    body.innerHTML = renderBubbleBody(role, text, parseMode);
+    body.innerHTML = renderBubbleBody(role, text, parseMode, webDisplay);
     enhanceBubbleContent(body);
 
     var ts = document.createElement("span");
@@ -1045,8 +1086,7 @@
   var conversationBusy = false;
   function setBusy(busy) {
     conversationBusy = !!busy;
-    btnSend.disabled = busy || !!uploadQueue || !historyReady || !!currentConnState;
-    btnSend.classList.toggle("hidden", busy);
+    updateSendAvailability();
     btnStop.classList.toggle("hidden", !busy);
     botAvatar.classList.toggle("pulsing", busy);
     setConnState(currentConnState);
@@ -1073,7 +1113,8 @@
 
   function putTextFrame(role, frame) {
     var id = frame.ui_message_id ? "ui:" + frame.ui_message_id :
-      (frame.media_group_id || (frame.record_id != null ? "history:" + frame.record_id : frame.message_id));
+      (frame.media_group_id || (frame.record_id != null ? "history:" + frame.record_id :
+        (frame.web_display?.reply_message_id ?? frame.message_id)));
     var entry = id != null ? byMessageId[id] : null;
     // An already saved reply must not regress to a delayed transport fragment.
     if(entry?.durable && frame.record_id==null && !frame.ui_message_id)return entry;
@@ -1082,18 +1123,19 @@
     });
     if (!entry && frame.type === "edit" && id == null) entry = lastStreamEntry;
     var newRole = classifyMessageText(role, frame.text, frame.msg_type);
+    var displayKey=JSON.stringify(frame.web_display?.segments||null);
     if (entry && entry.rawText !== undefined && entry.role === newRole) {
-      if(entry.rawText!==frame.text || entry.parseMode!==frame.parse_mode){
-        entry.rawText = frame.text;entry.parseMode=frame.parse_mode;
-        entry.body.innerHTML = renderBubbleBody(newRole, frame.text, frame.parse_mode);
-        enhanceBubbleContent(entry.body);
+      if(entry.displayKey!==displayKey || (!frame.web_display &&
+          (entry.rawText!==frame.text || entry.parseMode!==frame.parse_mode))){
+        repaintBubble(entry,renderBubbleBody(newRole, frame.text, frame.parse_mode, frame.web_display));
       }
     } else {
       var next = entry && entry.row.nextSibling;
       removeEntry(entry);
-      entry = makeBubble(role, frame.text, id, frame.parse_mode, null, frame.msg_type, frame.timestamp || frame.ts);
+      entry = makeBubble(role, frame.text, id, frame.parse_mode, null, frame.msg_type, frame.timestamp || frame.ts, frame.web_display);
       if (next && next.parentNode === log) log.insertBefore(entry.row, next);
     }
+    entry.rawText=frame.text;entry.parseMode=frame.parse_mode;entry.displayKey=displayKey;
     if(frame.timestamp!=null){
       var ts=entry.row.querySelector('.ts');
       if(ts){ts.textContent=nowTime(frame.timestamp);ts.title=new Date(Number(frame.timestamp)*1000).toLocaleString();}
@@ -1142,8 +1184,9 @@
     if (!Number.isSafeInteger(frame.ui_generation) || !Number.isSafeInteger(frame.revision)) return false;
     if (uiGeneration !== null && frame.ui_generation < uiGeneration) return false;
     if (uiGeneration !== null && frame.ui_generation > uiGeneration) {
-      pendingFrames.push(frame);
-      resync();
+      // UI frames are persisted before delivery. Fetch their new generation;
+      // never put an unsequenced raw frame into the transport replay queue.
+      resync(true).catch(function(){});
       return false;
     }
     uiGeneration = frame.ui_generation;
@@ -1172,6 +1215,20 @@
   }
 
   function handleFrame(frame) {
+    if(!['message','edit','edit_markup','delete','user_message','document','photo','notice','record_snapshot'].includes(frame.type)){
+      handleFrameContent(frame);return;
+    }
+    var anchor=scrollAnchor(),follow=isNearBottom()&&!viewingPast;
+    renderingHistory++;
+    try{handleFrameContent(frame);}finally{
+      renderingHistory--;
+      if(follow)scrollDown();else restoreScrollAnchor(anchor);
+    }
+  }
+
+  function handleFrameContent(frame) {
+    if(frame.type==='queue_state'){refreshQueue();return;}
+    if(frame.queue_id)refreshQueue();
     if(frame.type==='settings_state'){window.XGentAppearance?.accept(frame);return;}
     if(frame.type==='knowledge_state'){window.dispatchEvent(new CustomEvent('xgent-workbench-change',{detail:{pages:['models','settings']}}));return;}
     if(frame.type==='conversation_deleted'){window.dispatchEvent(new CustomEvent('xgent-conversation-deleted',{detail:frame}));window.XGentConversations?.refresh();return;}
@@ -1207,15 +1264,17 @@
       return;
     }
     if(frame.type==='turn_end'||frame.type==='turn_error')window.dispatchEvent(new Event('xgent-turn-finished'));
-    if(viewingPast && ['message','edit','user_message','document','photo','record_snapshot'].includes(frame.type) &&
-       (!frame.ui_generation || frame.ui_generation===uiGeneration)) {
-      newFrames++;newerAvailable=true;updateHistoryState();return;
+    if(viewingPast && ['message','edit','edit_markup','user_message','document','photo','notice','record_snapshot'].includes(frame.type) &&
+       (!frame.ui_generation || frame.ui_generation===uiGeneration) && !displayedFrameEntry(frame)) {
+      var newId=frame.web_display?.reply_message_id??frame.ui_message_id??frame.record_id??frame.message_id;
+      if(newId==null||!unseenHistoryFrames.has(newId)){newFrames++;unseenHistoryFrames.add(newId);}
+      newerAvailable=true;updateHistoryState();return;
     }
     if (isNearBottom()) requestAnimationFrame(function(){boundMessages(false);});
     if (!acceptUiFrame(frame)) return;
     if(frame.type==='record_snapshot'){
       if(Number.isSafeInteger(frame.ui_generation)&&uiGeneration!==null&&frame.ui_generation!==uiGeneration){
-        if(frame.ui_generation>uiGeneration)resync();
+        if(frame.ui_generation>uiGeneration)resync(true).catch(function(){});
         return;
       }
       var anchor=Array.from(log.children).find(row=>row.getBoundingClientRect().bottom>log.getBoundingClientRect().top);
@@ -1236,6 +1295,9 @@
         if (em) setButtons(em, frame.reply_markup, frame.message_id);
       }
     } else if (frame.type === "delete") {
+      if(frame.web_display?.reply_message_id!=null&&frame.message_id!==frame.web_display.reply_message_id){
+        delete byMessageId[frame.message_id];return;
+      }
       var deletedId = frame.ui_message_id ? "ui:" + frame.ui_message_id : frame.message_id;
       var d = byMessageId[deletedId];
       if(d?.durable&&!frame.ui_message_id)return;
@@ -1287,12 +1349,14 @@
       if (!frame.busy) {
         reconcileAfterTurn = false;
         // Restore failures and retry controls are durable after the archive switch.
-        if (frame.committed) resync();
+        if (frame.committed) resync(true).catch(function(){});
       }
     } else if (frame.type === "history_reset" || frame.type === "context_reset") {
       cancelUploads("记忆已清空");
       pendingFrames = [];
-      resync();
+      // An earlier baseline may be resolving and flushing this very event.
+      // Invalidation must replace it, not coalesce into that stale request.
+      resync(true).catch(function(){});
     }
   }
 
@@ -1314,7 +1378,9 @@
       try { receiveEvent(event.epoch,event.id,event.frame); }
       catch(e){console.error('消息渲染失败',e);}
     });
-    btnSend.disabled=conversationBusy||!!uploadQueue||!!currentConnState;
+    updateSendAvailability();
+    scheduleHistoryPrefetch();
+    refreshQueue();
   }
 
   function resync(force) {
@@ -1340,7 +1406,7 @@
     else if (conversationBusy) statusText.innerHTML = '<span class="conn-dot"></span> 思考与生成中…';
     else statusText.innerHTML = '<span class="' + cls + '"></span> 在线';
     statusText.classList.toggle("busy", conversationBusy && !state);
-    btnSend.disabled = conversationBusy || !!uploadQueue || !historyReady || !!state;
+    updateSendAvailability();
   }
 
   function stopLiveTransport() {
@@ -1493,6 +1559,9 @@
 
   var historyCursor = null;
   var historyLoading = false;
+  var historyPageRequest=null, historyLoadController=null, historyPageVersion=0;
+  var historyError=null, historyPrefetchScheduled=false;
+  var unseenHistoryFrames=new Set();
   var historyAnchor = null;
   var viewingPast = false;
   var newerAvailable = false;
@@ -1502,17 +1571,47 @@
   }
   function boundMessages(prepend) {
     var rows = Array.from(log.children);
+    var removedFront=false;
     while (rows.length > 200) {
       var row = prepend ? rows.pop() : rows.shift();
       var selection=window.getSelection();
-      if(row.contains(document.activeElement) || row.querySelector("blockquote.expanded") ||
+      var box=row.getBoundingClientRect(),viewport=log.getBoundingClientRect();
+      if((box.bottom>viewport.top&&box.top<viewport.bottom) || row.contains(document.activeElement) || row.querySelector("blockquote.expanded") ||
          Array.from(row.querySelectorAll("video,audio")).some(function(media){return !media.paused;}) ||
          (selection&&!selection.isCollapsed&&(row.contains(selection.anchorNode)||row.contains(selection.focusNode)))) continue;
       var entry=null;
       Object.keys(byMessageId).forEach(function(key){if(byMessageId[key].row===row){entry=byMessageId[key];delete byMessageId[key];}});
       if(entry)removeEntry(entry);else row.remove();
-      if(prepend)newerAvailable=true;
+      if(prepend){newerAvailable=true;viewingPast=true;}else removedFront=true;
     }
+    if(removedFront)historyCursor=edgeCursor(false)||historyCursor;
+  }
+  function displayedFrameEntry(frame){
+    var keys=[frame.ui_message_id?'ui:'+frame.ui_message_id:null,frame.media_group_id,
+      frame.record_id!=null?'history:'+frame.record_id:null,frame.web_display?.reply_message_id,frame.message_id,
+      ...(frame.replace_message_ids||[]),...(frame.web_live?.epoch===streamEpoch?frame.web_live.message_ids||[]:[])];
+    return keys.map(key=>key!=null?byMessageId[key]:null).find(Boolean);
+  }
+  function scrollAnchor(){
+    var row=Array.from(log.children).find(row=>row.getBoundingClientRect().bottom>log.getBoundingClientRect().top);
+    return row?{row:row,top:row.getBoundingClientRect().top}:null;
+  }
+  function restoreScrollAnchor(anchor){
+    if(anchor?.row.isConnected)log.scrollTop+=anchor.row.getBoundingClientRect().top-anchor.top;
+  }
+  function cancelHistoryPage(){
+    historyPageVersion++;
+    historyPageRequest?.controller.abort();historyPageRequest=null;
+    historyLoading=false;historyError=null;
+  }
+  function scheduleHistoryPrefetch(){
+    if(historyPrefetchScheduled)return;
+    historyPrefetchScheduled=true;
+    requestAnimationFrame(function(){
+      historyPrefetchScheduled=false;
+      if(historyReady&&!loggedOut&&!historyLoading&&!historyError&&historyCursor&&
+         log.clientHeight>0&&log.scrollTop<=Math.max(800,1.5*log.clientHeight))historyPage(false);
+    });
   }
   function edgeCursor(last) {
     var rows=Array.from(log.querySelectorAll('[data-history-cursor]'));
@@ -1521,56 +1620,84 @@
   function updateHistoryState() {
     document.getElementById('wb-chat').classList.toggle('history-past',viewingPast);
     document.getElementById('wb-chat').classList.toggle('history-top',log.scrollTop<8&&!!historyCursor);
+    document.getElementById('wb-chat').classList.toggle('history-error',!!historyError);
     document.getElementById('wb-earlier').disabled=historyLoading||!historyCursor;
     document.getElementById('wb-newer').disabled=historyLoading||!newerAvailable;
-    document.getElementById('wb-history-state').textContent=viewingPast?
+    document.getElementById('wb-earlier').textContent=historyError&&!historyError.forward?'重试加载历史':'加载更早消息';
+    document.getElementById('wb-newer').textContent=historyError?.forward?'重试较新消息':'加载较新消息';
+    document.getElementById('wb-history-state').textContent=historyError?'加载失败：'+historyError.message:
+      historyLoading?'正在加载…':viewingPast?
       ('浏览历史'+(newFrames?' · 有 '+newFrames+' 条新动态':'')+' · 可向前/后翻页'):'';
   }
   function historyControls(data) {
     historyCursor=data.next_cursor||null;
     newerAvailable=!!historyAnchor;
     viewingPast=!!historyAnchor;
+    newFrames=0;unseenHistoryFrames.clear();
     updateHistoryState();
   }
   async function historyPage(forward) {
-    var cursor=forward?edgeCursor(true):edgeCursor(false)||historyCursor;
+    var cursor=forward?edgeCursor(true):historyCursor;
     if(!cursor||historyLoading||(forward&&!newerAvailable))return;
-    historyLoading=true;updateHistoryState();
-    var generation=historyGen;
-    var visible=Array.from(log.children).find(function(row){return row.getBoundingClientRect().bottom>log.getBoundingClientRect().top;});
-    var visibleTop=visible?.getBoundingClientRect().top;
+    var request={controller:new AbortController(),version:++historyPageVersion,generation:historyGen,cid:selectedConversationId};
+    historyPageRequest=request;historyLoading=true;historyError=null;updateHistoryState();
+    var current=()=>historyPageRequest===request&&request.version===historyPageVersion&&
+      request.generation===historyGen&&request.cid===selectedConversationId;
     try{
-      var data=await api('/api/workbench/history?limit=50&'+(forward?'after=':'before=')+encodeURIComponent(cursor));
-      if(generation!==historyGen)return;
-      if(data.reset){historyAnchor=null;viewingPast=false;await loadHistory();return;}
-      var first=log.firstChild;
-      (data.messages||[]).forEach(function(m){
-        var id=m.history_key||(m.ui_message_id?'ui:'+m.ui_message_id:'history:'+m.id);
-        if(byMessageId[id])return;
-        var entry=putHistoryFrame(m,streamEpoch);
-        if(!forward){log.insertBefore(entry.row,first);(entry.mediaEntries||[]).forEach(function(media){log.insertBefore(media.row,first);});}
-      });
-      boundMessages(!forward);
-      if(visible?.isConnected)log.scrollTop+=visible.getBoundingClientRect().top-visibleTop;
-      if(forward){newerAvailable=!!data.next_cursor;historyCursor=edgeCursor(false);}
-      else {historyCursor=data.next_cursor;newerAvailable=true;}
-      viewingPast=true;
-    }catch(err){document.getElementById('wb-history-state').textContent=err.message;}
-    finally{historyLoading=false;updateHistoryState();}
+      var data=await api('/api/workbench/history?limit=50&'+(forward?'after=':'before=')+encodeURIComponent(cursor),{signal:request.controller.signal});
+      if(!current())return;
+      if(data.conversation_id&&request.cid&&data.conversation_id!==request.cid){
+        throw new Error('会话已变化，请重试加载历史');
+      }
+      if(data.reset||(Number.isSafeInteger(data.ui_generation)&&uiGeneration!==null&&data.ui_generation!==uiGeneration)){
+        historyAnchor=null;viewingPast=false;await resync(true);return;
+      }
+      // Capture NOW, not before the network request: the reader may have moved
+      // several screens while a slow page was in flight.
+      var anchor=scrollAnchor(),first=log.firstChild;
+      renderingHistory++;
+      try{
+        (data.messages||[]).forEach(function(m){
+          var id=m.history_key||(m.ui_message_id?'ui:'+m.ui_message_id:'history:'+m.id);
+          if(byMessageId[id])return;
+          if(m.ui_message_id&&(uiDeleted[m.ui_message_id]||m.revision<(uiRevisions[m.ui_message_id]||0)))return;
+          var entry=putHistoryFrame(m,streamEpoch);
+          if(m.ui_message_id)uiRevisions[m.ui_message_id]=m.revision;
+          if(!forward){log.insertBefore(entry.row,first);(entry.mediaEntries||[]).forEach(media=>log.insertBefore(media.row,first));}
+        });
+        // Restore before pruning so the visible rows are protected by the window.
+        restoreScrollAnchor(anchor);boundMessages(!forward);
+        if(forward){newerAvailable=!!data.next_cursor;historyCursor=edgeCursor(false)||historyCursor;}
+        else historyCursor=(data.messages?.length&&data.next_cursor!==cursor)?data.next_cursor||null:null;
+        updateHistoryState();restoreScrollAnchor(anchor);
+      }finally{renderingHistory--;}
+    }catch(err){if(current()&&err.name!=='AbortError')historyError={forward:forward,message:err.message};}
+    finally{
+      if(current()){historyPageRequest=null;historyLoading=false;updateHistoryState();scheduleHistoryPrefetch();}
+    }
   }
   document.getElementById('wb-earlier').onclick=function(){historyPage(false);};
   document.getElementById('wb-newer').onclick=function(){historyPage(true);};
-  document.getElementById('wb-latest').onclick=function(){if(location.hash.includes('?conversation=')){history.replaceState(null,'','#/chat');document.getElementById('source-navigation').hidden=true;}historyAnchor=null;viewingPast=false;newFrames=0;resync().catch(function(){});};
+  document.getElementById('wb-latest').onclick=function(){if(location.hash.includes('?conversation=')){history.replaceState(null,'','#/chat');document.getElementById('source-navigation').hidden=true;}historyAnchor=null;viewingPast=false;newFrames=0;resync(true).then(scrollDown).catch(function(){});};
   function loadHistory() {
+    cancelHistoryPage();historyLoadController?.abort();
+    var controller=historyLoadController=new AbortController();
     historyGen++;
     var gen=historyGen, requestedCid=selectedConversationId;
     var wasNearBottom=isNearBottom();
     var top=log.scrollTop;
-    return api(historyUrl()).then(function(data){
+    return api(historyUrl(),{signal:controller.signal}).then(function(data){
       if(gen!==historyGen || requestedCid!==selectedConversationId)return;
-      if(data.conversation_id && requestedCid && data.conversation_id!==requestedCid)return;
-      if(!selectedConversationId && data.conversation_id)selectedConversationId=data.conversation_id;
+      if(data.conversation_id && requestedCid && data.conversation_id!==requestedCid){
+        throw new Error('会话已变化，请重新加载');
+      }
+      if(!selectedConversationId && data.conversation_id){
+        selectedConversationId=data.conversation_id;
+        if(!input.value){try{input.value=sessionStorage.getItem(draftKey())||'';}catch(e){}}
+        syncSendState();
+      }
       historyControls(data);
+      if(typeof data.queue_enabled==='boolean')queueEnabled=data.queue_enabled;
       const sameGeneration=uiGeneration===null || data.ui_generation==null || uiGeneration===data.ui_generation;
       if(!sameGeneration){uiRevisions={};uiDeleted={};}
       uiGeneration=Number.isSafeInteger(data.ui_generation)?data.ui_generation:null;
@@ -1604,7 +1731,7 @@
       if(wasNearBottom||historyAnchor)scrollDown();else log.scrollTop=top;
       updateHistoryState();
       if(historyAnchor){const entry=byMessageId[historyAnchor];if(entry){entry.row.classList.add('wb-focus');setTimeout(()=>entry.row.classList.remove('wb-focus'),2000);}}
-    });
+    }).finally(function(){if(historyLoadController===controller)historyLoadController=null;});
   }
 
   function appendHistoryMedia(entry, message, role) {
@@ -1635,9 +1762,112 @@
 
   function syncSendState() {
     btnSend.classList.toggle("ready", input.value.trim().length > 0 || pendingFiles.length > 0);
+    updateSendAvailability();
+  }
+
+  function updateSendAvailability(){
+    var queueable=queueEnabled&&!pendingFiles.length&&!input.value.trim().startsWith('/');
+    btnSend.disabled=!!textSubmitting||!!uploadQueue||!historyReady||!!currentConnState||(conversationBusy&&!queueable);
+    btnSend.classList.toggle('hidden',conversationBusy&&!queueEnabled);
+    btnSend.title=conversationBusy&&queueable?'加入待发队列 (Enter)':'发送消息 (Enter)';
+  }
+
+  function queueRequestId(){return globalThis.crypto?.randomUUID?.()||('q'+Date.now().toString(36)+Math.random().toString(36).slice(2));}
+  function queueReason(reason){return {waiting:'等待安全接入点',stopped:'已停止 · 手动继续',failed:'执行未完成 · 手动继续',restart:'来源进程已退出 · 手动继续',ask:'等待表单提交',ask_cancelled:'表单已取消 · 手动继续',generation:'上下文已改变 · 请取回重发',archived:'对话已归档'}[reason]||'排队中';}
+  function drawQueue(error){
+    var panel=document.getElementById('message-queue');if(!panel)return;
+    var items=queueState?.conversation_id===selectedConversationId?queueState.items:[];
+    var recovering=Array.from(queueActions.values()).filter(p=>p.action==='edit'&&p.item?.conversation_id===selectedConversationId&&!items?.some(i=>i.id===p.item.id));
+    var anchor=scrollAnchor();
+    panel.replaceChildren();panel.hidden=!items?.length&&!error&&!queueState?.paused&&!recovering.length;
+    if(panel.hidden)return;
+    var head=document.createElement('div');head.className='queue-head';
+    var title=document.createElement('strong');title.textContent='待发消息 · '+(items?.length||0)+' 条';head.appendChild(title);
+    function button(label,fn){var b=document.createElement('button');b.type='button';b.textContent=label;b.onclick=fn;return b;}
+    if(queueState?.paused&&queueState.reason!=='ask')head.appendChild(button('继续发送',()=>changeQueue(null,'resume')));
+    if(items?.length>3)head.appendChild(button(queueExpanded?'收起':'展开全部',()=>{queueExpanded=!queueExpanded;drawQueue();}));
+    panel.appendChild(head);
+    var list=document.createElement('div');list.className='queue-list';
+    (queueExpanded?items:items?.slice(0,3)||[]).forEach(item=>{
+      var row=document.createElement('div');row.className='queue-item';row.dataset.queueId=item.id;
+      var preview=document.createElement('div');preview.className='queue-preview';
+      var p=document.createElement('p');p.textContent=item.text;p.title=item.text;
+      var reason=document.createElement('small');reason.textContent=queueReason(item.reason)+' · '+item.origin;
+      preview.append(p,reason);row.appendChild(preview);
+      var actions=document.createElement('div');actions.className='queue-actions';
+      ['cancel','edit'].forEach(action=>{var b=button(action==='cancel'?'❌ 取消':'编辑',()=>changeQueue(item,action));b.disabled=!!queueActions.get(item.id)?.busy;actions.appendChild(b);});
+      row.appendChild(actions);list.appendChild(row);
+    });panel.appendChild(list);
+    recovering.forEach(p=>{
+      var row=document.createElement('div');row.className='queue-actions';
+      var text=document.createElement('span');text.textContent=p.busy?'正在取回消息…':'取回结果待确认，原文仍安全保留。';row.appendChild(text);
+      var retry=button('重试取回',()=>changeQueue(p.item,'edit'));retry.disabled=p.busy;row.appendChild(retry);panel.appendChild(row);
+    });
+    if(error){var note=document.createElement('p');note.className='queue-error';note.textContent=error;panel.append(note,button('刷新队列',()=>refreshQueue(true)));}
+    restoreScrollAnchor(anchor);
+  }
+
+  async function refreshQueue(force){
+    if(loggedOut||!selectedConversationId||!historyReady)return;
+    if(queueController&&!force){queueRefreshPending=true;return;}
+    queueRefreshPending=false;
+    queueController?.abort();var controller=queueController=new AbortController(),version=++queueVersion,cid=selectedConversationId;
+    try{
+      var response=await fetch('/api/queue?conversation_id='+encodeURIComponent(cid),{credentials:'same-origin',signal:controller.signal});
+      if(response.status===404){queueEnabled=false;return;}
+      var data=await response.json();if(!response.ok)throw new Error(data.error||'读取队列失败');
+      if(version!==queueVersion||cid!==selectedConversationId||data.conversation_id!==cid)return;
+      queueEnabled=true;
+      if(!queueState||JSON.stringify(queueState)!==JSON.stringify(data)){queueState=data;drawQueue();}
+    }catch(e){if(e.name!=='AbortError'&&version===queueVersion)drawQueue(e.message);}
+    finally{if(queueController===controller){queueController=null;if(queueRefreshPending)refreshQueue();}updateSendAvailability();}
+  }
+
+  function restoreQueuedDraft(cid,text,key){
+    if(recoveredEdits.has(key))return;
+    recoveredEdits.add(key);
+    var draft=cid===selectedConversationId?input.value:conversationDrafts[cid]||'';
+    var merged=text+(draft?'\n\n'+draft:'');conversationDrafts[cid]=merged;
+    try{sessionStorage.setItem(draftKey(cid),merged);}catch(e){}
+    try{sessionStorage.setItem('xgent_queue_recovered',JSON.stringify(Array.from(recoveredEdits).slice(-200)));}catch(e){}
+    if(cid===selectedConversationId){input.value=merged;syncSendState();input.dispatchEvent(new Event('input'));input.focus();}
+  }
+
+  async function changeQueue(item,action){
+    var cid=item?.conversation_id||selectedConversationId,key=item?.id||('resume:'+cid),previous=queueActions.get(key);
+    if(previous?.busy)return;
+    var pending=previous?.action===action?previous:{action,request_id:queueRequestId(),item};pending.busy=true;queueActions.set(key,pending);persistQueueEdits();drawQueue();
+    try{
+      var data=await api('/api/queue/'+action,{method:'POST',body:JSON.stringify({conversation_id:cid,id:item?.id,
+        generation:item?.generation??queueState.generation,revision:item?.revision??queueState.revision,request_id:pending.request_id})});
+      if(action==='edit')restoreQueuedDraft(cid,data.text,pending.request_id);
+      queueActions.delete(key);persistQueueEdits();await refreshQueue(true);drawQueue();
+    }catch(e){pending.busy=false;pending.error=e.message;if(e.status===409&&action==='resume'){queueActions.delete(key);refreshQueue(true);}if(cid===selectedConversationId)drawQueue(e.message);else toast(e.message,true);}
+  }
+
+  function persistQueueEdits(){
+    try{sessionStorage.setItem('xgent_queue_edits',JSON.stringify(Array.from(queueActions.values()).filter(p=>p.action==='edit').map(p=>({action:p.action,request_id:p.request_id,item:{id:p.item.id,conversation_id:p.item.conversation_id,generation:p.item.generation,revision:p.item.revision}}))));}catch(e){}
+  }
+
+  async function sendQueuedText(text){
+    var cid=selectedConversationId,draft=input.value;
+    if(!textSubmission||textSubmission.cid!==cid||textSubmission.text!==text){textSubmission={cid,text,generation:uiGeneration,request_id:queueRequestId()};}
+    var submission=textSubmission;textSubmitting=true;updateSendAvailability();
+    try{
+      var result=await api('/api/chat',{method:'POST',body:JSON.stringify({text,conversation_id:cid,generation:submission.generation,request_id:submission.request_id})});
+      if(cid===selectedConversationId&&input.value===draft){input.value='';input.style.height='auto';conversationDrafts[cid]='';try{sessionStorage.removeItem(draftKey(cid));}catch(e){}}
+      else if(cid!==selectedConversationId&&conversationDrafts[cid]===draft){conversationDrafts[cid]='';try{sessionStorage.removeItem(draftKey(cid));}catch(e){}}
+      if(!result.queued&&!result.management&&cid===selectedConversationId)makeBubble('user',text);
+      textSubmission=null;await refreshQueue(true);triggerHaptic();
+    }catch(e){if(e.status>=400&&e.status<500)textSubmission=null;toast(e.message+'；内容已保留，可重试发送。',true);}
+    finally{textSubmitting=false;syncSendState();}
   }
 
   function send() {
+    if(queueEnabled&&!pendingFiles.length&&!input.value.trim().startsWith('/')){
+      var queuedText=input.value.trim();if(!queuedText||btnSend.disabled)return;
+      sendQueuedText(queuedText);return;
+    }
     if(viewingPast){historyAnchor=null;viewingPast=false;newFrames=0;newerAvailable=false;updateHistoryState();}
     var text = input.value.trim();
     var hasFiles = pendingFiles.length > 0;
@@ -2435,7 +2665,9 @@
   log.addEventListener("scroll", function () {
     document.getElementById('wb-chat').classList.toggle('history-top',log.scrollTop<8&&!!historyCursor);
     if (isNearBottom()) hideScrollBtn(); else showScrollBtn();
+    scheduleHistoryPrefetch();
   });
+  new ResizeObserver(scheduleHistoryPrefetch).observe(log);
   scrollBtn.addEventListener("click", function () { scrollDown(); triggerHaptic(); });
 
   // These essentials belong to the standalone chat entry, not to the optional
@@ -2617,6 +2849,7 @@
     }
     if(uploadQueue)uploadQueue.cancelled=true;
     selectedConversationId=next;
+    queueController?.abort();queueController=null;queueVersion++;queueState=null;queueExpanded=false;drawQueue();
     input.value=conversationDrafts[next]||'';
     try{input.value=input.value||sessionStorage.getItem(draftKey(next))||'';}catch(e){}
     pendingFiles=(conversationFiles[next]||[]).slice();renderPendingFiles();
@@ -2663,14 +2896,14 @@
       input.value=command;syncSendState();send();return true;
     },
     reload: function(){historyAnchor=null;viewingPast=false;newFrames=0;return resync();},
-    locate: async function(key){if(document.body.dataset.page!=='chat')location.hash='/chat';if(historyRequest)await historyRequest;historyAnchor=key;await loadHistory();const entry=key&&byMessageId[key];if(entry){entry.row.classList.add('source-target');entry.row.scrollIntoView({block:'center'});setTimeout(()=>entry.row.classList.remove('source-target'),3500);}},
+    locate: async function(key){if(document.body.dataset.page!=='chat')location.hash='/chat';historyAnchor=key;const cid=selectedConversationId;await resync(true);const entry=cid===selectedConversationId&&key&&byMessageId[key];if(entry){entry.row.classList.add('source-target');entry.row.scrollIntoView({block:'center'});setTimeout(()=>entry.row.classList.remove('source-target'),3500);}},
     settings: function(){return loadSettings();},
     commands: function(commands){
       if (!commands.length) return;
       COMMAND_GROUPS=[{group:"全部命令",items:commands}]; FLAT_COMMANDS=commands.slice();
     },
     terminal: function(){document.getElementById("btn-terminal").click();},
-    render: function(text,mode){return renderText(text,mode);},
+    render: function(text,mode,webDisplay){return renderBubbleBody('ai',text,mode,webDisplay);},
     enhance: enhanceBubbleContent
   };
   try { input.value=sessionStorage.getItem(draftKey())||""; syncSendState(); } catch(e) {}
@@ -2679,7 +2912,9 @@
     closeCommands(false);
     if(actionRequest){actionRequest.abort();actionRequest=null;}
     if(actionDialog.open)closeAction();
-    loggedOut=true;stopLiveTransport();historyGen++;historyReady=false;pendingFrames=[];
+    loggedOut=true;stopLiveTransport();cancelHistoryPage();historyLoadController?.abort();historyGen++;historyReady=false;pendingFrames=[];
+    queueController?.abort();queueController=null;queueVersion++;queueState=null;queueEnabled=false;queueActions.clear();recoveredEdits.clear();textSubmission=null;drawQueue();
+    try{sessionStorage.removeItem('xgent_queue_edits');sessionStorage.removeItem('xgent_queue_recovered');}catch(e){}
     cancelUploads('已退出登录');clearPendingFiles();input.value='';try { sessionStorage.removeItem(draftKey()); } catch(e) {}
     Array.from(new Set(Object.values(byMessageId))).forEach(removeEntry);
     log.replaceChildren();byMessageId={};uiRevisions={};uiDeleted={};uiGeneration=null;streamEpoch=null;streamCursor=null;

@@ -106,7 +106,7 @@ def test_history_is_paged_search_locates_unloaded_messages_and_draft_survives(br
     assert page.locator('#input').input_value()=='跨页保留的输入草稿'
     for _ in range(5):
         with page.expect_response('**/api/workbench/history?limit=50&before=*'):
-            page.locator('#log').evaluate('(e)=>e.scrollTop=0');page.locator('#wb-earlier').click()
+            page.locator('#log').evaluate('(e)=>e.scrollTop=400')
         page.wait_for_timeout(80)
     assert page.locator('#log>.msg-row').count()<=200
     before=page.locator('#log').inner_text()

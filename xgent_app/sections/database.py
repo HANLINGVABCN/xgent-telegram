@@ -591,15 +591,16 @@ class BotMemoryDB(ConversationStore):
             if not is_redundant_agent_command_record(msg.get('msg_type'), msg.get('content'))
         ]
     
-    async def get_conversation_messages(self, limit: int = 50) -> List[Dict]:
+    async def get_conversation_messages(self, limit: int = 50, *, before_record_id=None) -> List[Dict]:
         """获取所有消息（用于AI上下文）- 包含对话和系统操作"""
         # Filter before applying the model-message limit: UI rows do not consume it.
         conn = await self._get_conn()
         cursor = await conn.execute("SELECT id, role, content, timestamp, msg_type, metadata "
                                     "FROM global_messages WHERE session_id = ? AND id >= "
                                     "(SELECT context_start_record_id FROM chat_sessions WHERE id=global_messages.session_id) "
+                                    "AND (? IS NULL OR id<?) "
                                     "ORDER BY timestamp DESC, id DESC",
-                                    (self._conversation_id(),))
+                                    (self._conversation_id(), before_record_id, before_record_id))
         result = []
         while True:
             rows = await cursor.fetchmany(max(128, min(limit, 1024)))

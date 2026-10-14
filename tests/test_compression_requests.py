@@ -73,6 +73,9 @@ class CompressionRequestTests(unittest.TestCase):
     def test_archive_is_sent_before_compression_status_including_retry(self):
         self.check('export_before_compression_status', 'lossless_context_probe', 5)
 
+    def test_mutable_uploads_are_frozen_per_compression_and_missing_only_blocks_compression(self):
+        self.check('mutable_upload_compression', count=4)
+
 
 if __name__ == '__main__':
     unittest.main()

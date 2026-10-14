@@ -44,6 +44,28 @@ def make(buffer: str = "", history=None) -> SlashPalette:
     return palette
 
 
+class QueueAcknowledgementTests(unittest.TestCase):
+    def test_deferred_submit_clears_only_after_persistence_ack(self):
+        palette = make('pending exact text')
+        palette._render = lambda: None
+        palette.defer_submit_clear = True
+        self.assertEqual('pending exact text', palette._submit())
+        self.assertEqual('pending exact text', palette.buffer)
+        palette.acknowledge_submission('pending exact text')
+        self.assertEqual('', palette.buffer)
+
+    def test_ack_keeps_new_edits_and_recovery_keeps_pasted_draft(self):
+        palette = make('first')
+        palette._render = lambda: None
+        palette.defer_submit_clear = True
+        palette._submit()
+        palette._insert(' continued')
+        palette.acknowledge_submission('first')
+        self.assertEqual('first continued', palette.buffer)
+        palette.prepend_draft('returned\n  exact')
+        self.assertEqual('returned\n  exact\n\nfirst continued', palette._expand_pastes(palette.buffer))
+
+
 class MenuVisibilityTests(unittest.TestCase):
     def test_slash_at_line_start_opens_the_menu(self):
         self.assertTrue(make("/")._menu_open())

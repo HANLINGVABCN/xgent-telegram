@@ -109,7 +109,11 @@ class WebChatConfig:
         read_conversations: Optional[Callable[[], Any]] = None,
         submit_ui_callback: Optional[Callable[[str, int, str, WebOutbox], Any]] = None,
         workbench: Optional[Callable[..., Any]] = None,
+        accept_text: Optional[Callable[..., Any]] = None,
+        queue_api: Optional[Callable[..., Any]] = None,
     ):
+        self.accept_text = accept_text
+        self.queue_api = queue_api
         self.workbench = workbench
         self.host = host
         self.port = port
@@ -178,16 +182,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("X-Content-Type-Options", "nosniff")
+        if status >= 400 and getattr(self, 'command', '') == 'POST':
+            # The JSON body may already be consumed (validation/CAS failure),
+            # or not read yet (auth/origin rejection). Do not read it twice and
+            # accidentally consume the next keep-alive request.
+            self.close_connection = True
+            self.send_header('Connection', 'close')
         for key, value in (extra_headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
         with contextlib.suppress(ConnectionError):
             self.wfile.write(raw)
-        if status != 200 and getattr(self, "command", "") == "POST":
-            with contextlib.suppress(Exception):
-                length = int(self.headers.get("Content-Length") or 0)
-                if 0 < length <= MAX_REQUEST_BODY:
-                    self.rfile.read(length)
 
     def _send_html(self, body: bytes, status: int = 200) -> None:
         self.send_response(status)
@@ -375,6 +380,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._handle_media_download(path[len("/api/media/"):])
             elif path == "/api/session":
                 self._send_json({"authenticated": self._is_authenticated()})
+            elif path == '/api/queue':
+                self._handle_queue('list')
             elif path == "/healthz":
                 self._handle_liveness()
             elif path == "/api/health":
@@ -415,6 +422,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._handle_logout()
             elif path == "/api/chat":
                 self._handle_chat()
+            elif path in {'/api/queue/cancel', '/api/queue/edit', '/api/queue/resume'}:
+                self._handle_queue(path.rsplit('/', 1)[-1])
             elif path == "/api/upload":
                 self._handle_upload()
             elif path == "/api/callback":
@@ -512,6 +521,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                                   and (not result.get('conversation_id') or frame.get('conversation_id') == result['conversation_id'])]
                 result['live'] = live
                 result['busy'] = bool(result.get('busy') or live['frames'])
+            if method == 'GET' and resource == 'history':
+                result['queue_enabled'] = self.config.accept_text is not None
             if resource == 'bootstrap':
                 result['capabilities'].update(terminal=self.config.is_terminal_enabled(),
                                                terminal_supported=web_terminal.is_terminal_supported())
@@ -755,6 +766,22 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._send_json({"error": "消息不能为空"}, status=400)
             return
 
+        if self.config.accept_text is not None:
+            request_id = data.get('request_id')
+            if request_id is not None and (not isinstance(request_id, str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,80}', request_id)):
+                self._send_json({'error': '无效的请求标识'}, status=400)
+                return
+            try:
+                generation = data.get('generation')
+                if generation is not None and type(generation) is not int:
+                    raise ValueError('无效的上下文版本')
+                result = self._run_coro(self.config.accept_text(text, request_id=request_id, generation=generation, **options))
+            except ValueError as exc:
+                self._send_json({'error': str(exc)}, status=409)
+                return
+            self._send_json(result)
+            return
+
         # 全局对话锁被占用时直接拒绝，语义与 Telegram 侧的"仍在处理"一致。
         if self.config.is_busy():
             self._send_json({"error": "系统仍在处理上一个请求，请稍后再发送"}, status=409)
@@ -765,6 +792,34 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # 对话可能跑好几分钟，HTTP 请求不能挂在那里。
         self.config.submit_message(text, outbox, **options)
         self._send_json({"ok": True})
+
+    def _handle_queue(self, action):
+        if not self._require_auth() or not self._require_web_enabled():
+            return
+        if self.config.queue_api is None:
+            self._send_json({'error': '消息队列未启用'}, status=404)
+            return
+        if action == 'list':
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            data = {key: values[0] for key, values in query.items()}
+        else:
+            data = self._read_json()
+            if data is None:
+                return
+        cid = data.get('conversation_id')
+        if not isinstance(cid, str) or not cid:
+            self._send_json({'error': '缺少会话'}, status=400)
+            return
+        request_id = data.get('request_id')
+        if request_id is not None and (not isinstance(request_id, str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,80}', request_id)):
+            self._send_json({'error': '无效的请求标识'}, status=400)
+            return
+        try:
+            result = self._run_coro(self.config.queue_api(action, cid, data))
+        except ValueError as exc:
+            self._send_json({'error': str(exc)}, status=409)
+            return
+        self._send_json(result)
 
     def _handle_upload(self) -> None:
         """网页文件上传。校验与 /api/chat 一致，只是改读 multipart。

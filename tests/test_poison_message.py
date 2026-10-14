@@ -82,11 +82,7 @@ class TestTargetIdsZeroGuard(unittest.TestCase):
     def _make_mirror_bot(self):
         """构造一个最小 MirrorBot 以调用 _target_ids。"""
         outbox = MagicMock()
-        bot = MirrorBot.__new__(MirrorBot)
-        bot.chat_id = 12345
-        bot.real_bot = MagicMock()
-        bot._outbox = outbox
-        bot._offer_fn = lambda *a, **kw: None
+        bot = MirrorBot(outbox, 12345, MagicMock())
         # 模拟 _tg_channel 方法
         fake_channel = MagicMock()
         fake_channel.knows_logical = MagicMock(return_value=False)
@@ -112,6 +108,11 @@ class TestTargetIdsZeroGuard(unittest.TestCase):
         logical, native = bot._target_ids(42)
         self.assertEqual(native, 42,
                          "正数未知 ID 仍应走情况 3 返回 native=42")
+
+    def test_allocated_but_not_yet_delivered_id_remains_logical(self):
+        bot = self._make_mirror_bot()
+        mid = bot._resolve_send_id()
+        self.assertEqual((mid, None), bot._target_ids(mid))
 
     def test_none_passthrough(self):
         bot = self._make_mirror_bot()

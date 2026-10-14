@@ -115,6 +115,14 @@ class PromptConsistencyTests(unittest.TestCase):
         for clause in ("file-x", "BEGIN/END", "Agent 关闭时不得", "压缩请求不额外注入"):
             self.assertIn(clause, memory)
 
+    def test_ask_secrets_require_validation_and_safe_child_process_parameters(self):
+        source = text('prompts/agent_addon.txt')
+        for clause in ('${DB_ROOT_PASS:-}', '缺失或为空立即停止', 'os.environ.get("VAR")',
+                       'value is None or value == ""', 'subprocess.run([...], shell=False)',
+                       '禁止在命令行或脚本源码中直接拼入变量值', '旧 shell', '记录密钥'):
+            self.assertIn(clause, source)
+        self.assertNotIn('存入服务器进程环境变量', source)
+
 
 if __name__ == "__main__":
     unittest.main()

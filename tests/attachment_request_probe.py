@@ -239,6 +239,49 @@ def upload_update(h, kind, message_id, data, group=None, caption=CAPTION, name=N
     return update, context
 
 
+async def mutate_upload_and_leave_new_version(bot, root):
+    import hashlib
+    import os
+    async with Harness(bot, root) as h:
+        original = await h.add_upload(b'VERSION-ORIGINAL', 'editable.txt', 'keep this caption')
+        before = (await h.db.get_attachment_records())[0]
+        await h.call()
+        assert 'VERSION-ORIGINAL' in '\n'.join(unpack_request(h.requests[-1])[0])
+        path = Path(bot.ArtifactManager.UPLOAD_DIR) / original['path']
+        stamp = path.stat()
+        current = b'VERSION-MODIFIED'
+        assert len(current) == original['size']
+        path.write_bytes(current)
+        os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        await h.call()
+        text = '\n'.join(unpack_request(h.requests[-1])[0])
+        assert 'VERSION-MODIFIED' in text and 'VERSION-ORIGINAL' not in text
+        after = (await h.db.get_attachment_records())[0]
+        ref = json.loads(after['metadata'])['attachments'][0]
+        assert ref['sha256'] == hashlib.sha256(current).hexdigest()
+        assert ref['id'] == original['id'] and ref['caption'] == original['caption']
+        assert (after['id'], after['content']) == (before['id'], before['content'])
+        # No further request refreshes metadata before the next Python process.
+        path.write_bytes('重启后最新文件\r\n  保留空格\n'.encode('utf-16'))
+        return {'same_length_and_mtime_read': True, 'conditional_metadata_refresh': True}
+
+
+async def mutated_upload_after_restart(bot, root):
+    import hashlib
+    async with Harness(bot, root) as h:
+        before = (await h.db.get_attachment_records())[0]
+        previous = json.loads(before['metadata'])['attachments'][0]
+        await h.call()
+        text = '\n'.join(unpack_request(h.requests[-1])[0])
+        assert '重启后最新文件\r\n  保留空格\n' in text and 'VERSION-MODIFIED' not in text
+        current = json.loads((await h.db.get_attachment_records())[0]['metadata'])['attachments'][0]
+        assert current['encoding'] == 'utf-16'
+        assert current['id'] == previous['id'] and current['path'] == previous['path']
+        path = Path(bot.ArtifactManager.UPLOAD_DIR) / current['path']
+        assert current['sha256'] == hashlib.sha256(path.read_bytes()).hexdigest()
+        return {'restart_reads_latest': True, 'encoding_reinspected': True}
+
+
 async def seed_and_check(bot, root):
     result = {"providers": {}}
     async with Harness(bot, root) as h:
@@ -396,15 +439,13 @@ async def check_failures(bot, root):
             else:
                 path.write_bytes(changed)
             before = len(h.requests)
-            try:
-                await h.call()
-            except AttachmentContextError as exc:
-                assert "long.txt" in str(exc)
-            else:
-                raise AssertionError("missing/changed original was silently omitted")
-            assert len(h.requests) == before
+            await h.call()
+            assert len(h.requests) == before + 1
+            texts, images, _ = unpack_request(h.requests[-1])
+            assert 'long.txt' in '\n'.join(texts)
+            assert ('temporarily unavailable' if changed is None else 'changed original') in '\n'.join(texts)
             path.write_bytes(original)
-        result["missing_and_changed_originals_block"] = True
+        result["missing_and_changed_uploads_do_not_block"] = True
 
         with patch.object(h.db, "record_global_message", AsyncMock(side_effect=OSError("disk full"))):
             try:

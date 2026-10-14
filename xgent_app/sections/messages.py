@@ -2,6 +2,7 @@
 # Keep cross-section names available through the loader until the next decoupling phase.
 
 from xgent_app.agent_coordinator import plan_agent_round_transition
+from xgent_app.message_queue import mark_outcome, batch_messages
 from xgent_app.agent_status import AgentTurnOrigin, build_agent_round_status
 from xgent_app.agent_ask import PENDING_ASKS, SECRET_STORE, PendingAsk, parse_ask_form
 from xgent_app.agent_context import (
@@ -630,21 +631,17 @@ def management_input_output(function):
     return wrapped
 
 
-@conversation_entry(execution=lambda: UserDataManager.get('state', BotState.IDLE) == BotState.IDLE, guard=authorize_before_conversation)
+@conversation_entry(guard=authorize_before_conversation)
 @management_input_output
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
         return
     
-    # Configuration/menu input is not a new model turn.
-    if _conversation_processing_lock.locked() and UserDataManager.get('state') == BotState.IDLE:
-        await update.message.reply_text(
-            "⏳ 系统仍在处理上一个请求... 请稍后再发送新请求。"
-        )
-        return
-    
     await UserDataManager.init()
     state = UserDataManager.get('state')
+    expected_state = getattr(update, 'xgent_expected_state', None)
+    if expected_state is not None and state != expected_state:
+        raise ConversationChanged('录入状态已改变，本次内容未提交，请重新操作。')
     # 普通聊天使用 text_markdown 保留粗体/斜体/代码块等格式。
     # 但 Key、URL、模型 ID、提供商名称等配置值必须使用 Telegram 原始文本：
     # Markdown 序列化会给特殊字符插入转义符（例如 \, -, _, `），导致凭据或模型 ID 被改写。
@@ -731,6 +728,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # ask 协议表单的「自定义文本 / 密钥」录入：完全自包含（自己处理 cancel、录入、
     # 密钥落 SecretStore、重画表单），处理完直接 return，不落入下面的通用配置状态机。
+    if expected_state is not None and UserDataManager.get('state') != expected_state:
+        raise ConversationChanged('录入状态已改变，本次内容未提交，请重新操作。')
     if state in (BotState.ASK_FIELD_INPUT, BotState.ASK_SECRET_INPUT):
         await _handle_ask_text_input(update, context, state, text)
         return
@@ -772,6 +771,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             finally:
                 pending['ui_binding'] = saved_ui_binding()
+
+    if state == BotState.SET_UPDATE_TOKEN:
+        await handle_update_token_input(update, context, text)
+        return
 
     # 取消操作
     if text.lower() == 'cancel' and state != BotState.IDLE:
@@ -848,53 +851,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"❌ 导入失败：{safe_text(await GlobalRecorder.record_error(e, update.effective_chat.id, source='message_handler'))}",
                 parse_mode=constants.ParseMode.HTML
             )
-        return
-
-    if state == BotState.SET_UPDATE_TOKEN:
-        token = text.strip()
-        if not token:
-            await update.message.reply_text("⚠️ GitHub Token 不能为空。请重新发送，或发送 cancel 取消。")
-            return
-        pending_update_url = UserDataManager.get('pending_update_zip_url', "") or BotConfig.TEST_UPDATE_ZIP_URL
-        try:
-            await asyncio.to_thread(persist_update_github_token, token, pending_update_url)
-        except Exception as e:
-            logger.exception("保存更新 token 失败")
-            await update.message.reply_text(
-                f"❌ 保存 GitHub Token 失败：<code>{safe_text(await GlobalRecorder.record_error(e, update.effective_chat.id, source='message_handler'))}</code>",
-                parse_mode=constants.ParseMode.HTML
-            )
-            return
-
-        UserDataManager.set('state', BotState.IDLE)
-        UserDataManager.set('pending_update_zip_url', "")
-        await GlobalRecorder.record_system_op(
-            "保存 UPDATE_GITHUB_TOKEN",
-            {"update_source": BotConfig.UPDATE_ZIP_URL},
-            update.effective_chat.id
-        )
-        status_msg = await update.message.reply_text(
-            f"✅ 已保存 <code>{safe_text(mask_update_github_token(token))}</code>，正在验证...",
-            parse_mode=constants.ParseMode.HTML
-        )
-        # 立即验证，避免坏 Token 一路存进去、直到点更新才 401。
-        verification = await asyncio.to_thread(
-            verify_update_github_token, token, BotConfig.UPDATE_ZIP_URL
-        )
-        if not verification['ok']:
-            await status_msg.edit_text(
-                f"❌ <b>Token 验证未通过</b>\n\n{verification['message']}\n\n"
-                "<i>修正后重新发送，或点下方按钮管理。</i>",
-                reply_markup=get_github_token_menu(),
-                parse_mode=constants.ParseMode.HTML
-            )
-            return
-
-        await status_msg.edit_text(
-            f"✅ Token 已保存并验证通过。\n{verification['message']}",
-            parse_mode=constants.ParseMode.HTML
-        )
-        await send_update_confirmation_message(status_msg)
         return
 
     if state == BotState.SET_SEARCH_KEY:
@@ -1473,15 +1429,16 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     await handle_normal_text_conversation(update, context, text)
 
 
-@conversation_entry(execution=True)
+@conversation_entry()
 async def handle_normal_text_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     if has_pending_text_conversation(update):
         await queue_text_conversation(update, context, text)
         return
 
     if not should_stitch_text_message(text):
-        await GlobalRecorder.record_user_message(text, MessageType.USER_TEXT, update.effective_chat.id)
-        await process_conversation(update, context, text)
+        mid = getattr(update.message, 'message_id', None)
+        await submit_ordinary_text(text, chat_id=update.effective_chat.id,
+            request_key=f'telegram:{update.effective_chat.id}:{mid}' if current_scope().origin == 'telegram' and mid is not None else None)
         return
 
     await queue_text_conversation(update, context, text)
@@ -1542,18 +1499,28 @@ async def finish_text_conversation(update: Update, context: ContextTypes.DEFAULT
             await update.callback_query.answer("拼接内容为空", show_alert=True)
         return
 
+    try:
+        from xgent_app.conversations import replay_conversation
+        with replay_conversation(pending.conversation_context):
+            await submit_ordinary_text(text, chat_id=pending.update.effective_chat.id)
+    except BaseException:
+        with _pending_text_conversations_lock:
+            newer = _pending_text_conversations.get(key)
+            if newer is None:
+                _pending_text_conversations[key] = pending
+            else:
+                newer.parts[:0] = pending.parts
+        raise
     if pending.prompt_message is not None:
         with contextlib.suppress(Exception):
             await pending.prompt_message.edit_text(
-                f"✅ 已完成拼接，正在发送给 AI。\n累计 {len(pending.parts)} 段，{len(text)} 字。"
+                f"✅ 已完成拼接并接收，将在安全接入点发送给 AI。\n累计 {len(pending.parts)} 段，{len(text)} 字。",
+                reply_markup=None,
             )
-
-    await GlobalRecorder.record_user_message(text, MessageType.USER_TEXT, pending.update.effective_chat.id)
     logger.info(
         f"Finished stitched text conversation: parts={len(pending.parts)}, "
         f"chars={len(text)}, chat_id={key[0]}"
     )
-    await process_conversation(pending.update, pending.context, text)
 
 
 async def cancel_text_conversation(update: Update):
@@ -1672,7 +1639,8 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
                                force_agent_mode: bool = False,
                                reset_agent_iterations: bool = True,
                                agent_origin: Optional[AgentTurnOrigin] = None,
-                               resume_state: Optional[Dict[str, Any]] = None):
+                               resume_state: Optional[Dict[str, Any]] = None,
+                               queued_messages=None):
     """处理对话（全局模式 + Agent 协议执行：命令 / 读文件 / 发文件 / 写文件 / 媒体）"""
     global _is_processing, _stop_generation_event
 
@@ -1688,7 +1656,7 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
         if not getattr(context.bot, "_is_xgent_web_bot", False) and not getattr(context.bot, "_is_xgent_cli_bot", False):
             _web_outbox = get_web_outbox() or globals().get('_web_external_outbox')
             restore_mirror = install_tg_to_web_mirror(context.bot, _web_outbox)
-            if _web_outbox is not None:
+            if _web_outbox is not None and not queued_messages:
                 _web_outbox.put({"type": "user_message", "text": str(text or ""), "ts": time.time()})
         async with _conversation_processing_lock:
             if lock_acquired_event is not None:
@@ -1705,9 +1673,10 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
                     try:
                         await _process_conversation_inner(
                             update, context, text, content_override, force_agent_mode,
-                            reset_agent_iterations, agent_origin, resume_state,
+                            reset_agent_iterations, agent_origin, resume_state, queued_messages,
                         )
                     except Exception as exc:
+                        mark_outcome('failed')
                         await GlobalRecorder.record_error(exc, update.effective_chat.id, source='conversation')
                         raise
             finally:
@@ -1723,7 +1692,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                        force_agent_mode: bool = False,
                                        reset_agent_iterations: bool = True,
                                        agent_origin: Optional[AgentTurnOrigin] = None,
-                                       resume_state: Optional[Dict[str, Any]] = None):
+                                       resume_state: Optional[Dict[str, Any]] = None,
+                                       queued_messages=None):
     """process_conversation 内部实现"""
     agent_mode = force_agent_mode or UserDataManager.get('agent_mode', False)
     agent_origin = agent_origin or AgentTurnOrigin.user()
@@ -1754,6 +1724,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
         )
         trigger_status_iteration = agent_iteration
         if agent_iteration > max_agent_iterations:
+            mark_outcome('failed')
             return
     prov_name, prov_data = get_current_provider()
     # 防御性回退：模型取值优先读会话绑定（chat_sessions.model），若某条
@@ -1768,6 +1739,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     )
 
     if not prov_data or not model:
+        mark_outcome('failed')
         if trigger_status_msg is not None and trigger_status_iteration is not None:
             with contextlib.suppress(Exception):
                 await safe_edit_text(
@@ -1788,7 +1760,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     if prov_name is None:
         raise RuntimeError("provider 校验通过但名称为空，状态不一致")
 
-    if reset_agent_iterations:
+    if reset_agent_iterations and not queued_messages:
         await db.add_chat_message(cid, 'user', text)
 
     global_depth = max(1, int(UserDataManager.get('global_depth', 30)))
@@ -1799,6 +1771,17 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
         # 退化成纯文本 notice，破坏 readx 已加载进上下文的完整内容。只追加，不重建。
         history = list(resume_state['turn_history_snapshot'])
         history.append(resume_state['answer_message'])
+        if resume_state.get('queue_submit'):
+            batch = await get_text_queue().claim_continuation()
+            history.extend(batch_messages(batch))
+            await publish_queued_users(context, batch)
+    elif queued_messages:
+        # Current user input counts toward the configured message depth, as on
+        # the old single-message path. Only the current batch may exceed it.
+        prior_depth = max(0, global_depth - len(queued_messages))
+        history = (await db.get_conversation_messages(prior_depth, before_record_id=queued_messages[0]['record_id'])
+                   if prior_depth else [])
+        history.extend(batch_messages(queued_messages))
     else:
         history = with_current_question(
             await db.get_conversation_messages(global_depth), text, content_override,
@@ -1847,6 +1830,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
         )
     
     if not response:
+        mark_outcome('stopped' if is_stop_requested() else 'failed')
         if is_stop_requested():
             # 用户在接收 AI 回复期间手动停止：保留用户消息与已生成的部分，
             # 记录“当前回复已被用户手动停止”，并跳过后续 Agent 协议执行。
@@ -1910,6 +1894,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     if agent_mode:
         while True:
             if is_stop_requested():
+                mark_outcome('stopped')
                 if pending_round_status_msg is not None and pending_round_iteration is not None:
                     with contextlib.suppress(Exception):
                         await safe_edit_text(
@@ -2232,7 +2217,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             conversation_id=cid,
                             form=ask_form,
                             generation=attachment_generation,
-                            turn_history_snapshot=list(agent_turn_history),
+                            turn_history_snapshot=list(agent_turn_history) + list(round_state.continuation_messages),
                             agent_iteration=agent_iteration,
                             chat_id=update.effective_chat.id,
                             origin=AgentTurnOrigin.ask(),
@@ -2249,6 +2234,10 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         with contextlib.suppress(Exception):
                             pending.form_message_id = form_msg.message_id
                         PENDING_ASKS.put(pending)
+                        queue = get_text_queue()
+                        await queue.start()
+                        await db.queue_wait_ask(current_scope(), queue.instance)
+                        mark_outcome('ask')
                         await persist_agent_result(
                             recorder=GlobalRecorder,
                             message_type=MessageType.AGENT_RESULT,
@@ -2388,6 +2377,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                 finalize_result=finalize_media_result,
                             )
                         except AttachmentContextError as exc:
+                            mark_outcome('failed')
                             failure = await GlobalRecorder.record_error(exc, update.effective_chat.id, source='media_save')
                             await safe_edit_text(agent_stop_msg, failure, reply_markup=None)
                             return
@@ -2442,7 +2432,16 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             # over 协议的拦截点，全局就这一处：模型说了不必回灌，且这一轮每个操作都成功，
             # 就把回灌载荷丢掉，让下面的协调器落到"没有新上下文"那条既有分支——正常收尾、
             # 不再叫一次模型。该发的结果已经发了，该落库的也已经落库了。
-            round_state.apply_over()
+            batch = []
+            if (round_state.should_continue and round_state.has_context and not is_stop_requested()
+                    and agent_iteration + 1 <= max_agent_iterations and get_conversations().text_queue is not None):
+                batch = await get_text_queue().claim_continuation()
+                if batch:
+                    await publish_queued_users(context, batch)
+                    for message in batch_messages(batch):
+                        round_state.add_context(message)
+            if not batch:
+                round_state.apply_over()
 
             round_decision = plan_agent_round_transition(
                 round_state,
@@ -2512,6 +2511,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             # duplicate just-recorded Agent results and make prompt caching worse.
             agent_iteration = await _reserve_agent_turn_iteration(db)
             if agent_iteration > max_agent_iterations:
+                mark_outcome('failed')
                 await safe_send_message(
                     context,
                     update.effective_chat.id,
@@ -2566,6 +2566,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 )
             
             if not response:
+                mark_outcome('stopped' if is_stop_requested() else 'failed')
                 if is_stop_requested():
                     # Agent 后续回复期间被用户手动停止：记录“当前回复已被用户手动停止”后结束本轮。
                     if pending_round_status_msg is not None and pending_round_iteration is not None:
@@ -2659,6 +2660,9 @@ async def resume_from_ask(ask_id: str) -> str:
 
     # 记录一条用户消息（表单回答，不含明文密钥）到全局记忆，供三端展示与后续历史。
     answer_message = await persist_ask_answer(answer_text, pending.chat_id, pending.generation)
+    queue = get_text_queue()
+    await queue.start()
+    await db.queue_resume(current_scope(), queue.instance, ask=True)
 
     # 走 trigger 同款投递：MirrorBot（TG + 网页双通道），与哪个端点了提交无关。
     bot = build_trigger_delivery_bot(int(pending.chat_id))
@@ -2667,6 +2671,7 @@ async def resume_from_ask(ask_id: str) -> str:
     resume_state = {
         'turn_history_snapshot': pending.turn_history_snapshot,
         'answer_message': answer_message,
+        'queue_submit': True,
     }
     await process_conversation(
         update,
@@ -2697,6 +2702,9 @@ async def cancel_ask(ask_id: str) -> str:
     from xgent_app.conversations import restore_reply_route
     restore_reply_route(pending.conversation_context)
     notice = "[用户已取消表单] 用户没有作答，请不要再等待表单结果，自行决定如何收尾或改用其它方式。"
+    queue = get_text_queue()
+    await queue.start()
+    await db.queue_resume(current_scope(), queue.instance, ask=True, cancel_ask=True)
     answer_message = await persist_ask_answer(notice, pending.chat_id, pending.generation)
     bot = build_trigger_delivery_bot(int(pending.chat_id))
     update = _SelfTriggerUpdate(bot, int(pending.chat_id))

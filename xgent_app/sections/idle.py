@@ -161,6 +161,176 @@ _web_application: Optional[Any] = None
 # 拿一个 [Errno 98] Address already in use，被 logger.error 吞掉。用户那边表现为
 # "密码怎么改都不生效"，日志里一行提示都不给他。
 _web_managed_here: bool = False
+
+
+def get_text_queue():
+    from xgent_app.message_queue import MessageQueue
+    manager = get_conversations()
+    if manager.text_queue is None:
+        manager.text_queue = MessageQueue(manager, globals().get('_cli_queue_dispatch', _dispatch_queued_batch),
+                                           _queue_notify_changed, _queue_sync_receipts)
+    return manager.text_queue
+
+
+async def _queue_notify_changed(revision):
+    outbox = get_web_outbox() or globals().get('_web_external_outbox')
+    if outbox is not None:
+        outbox.put({'type': 'queue_state', 'revision': revision})
+    notifier = globals().get('_cli_queue_notifier')
+    if notifier is not None:
+        await notifier()
+
+
+async def publish_queued_users(context, batch):
+    """Durable user snapshots replace pending UI, never masquerade as tool results."""
+    db = await BotMemoryDB.get_instance()
+    outbox = getattr(context.bot, 'outbox', None) or get_web_outbox() or _web_external_outbox
+    cli = bool(getattr(context.bot, '_is_xgent_cli_bot', False))
+    for item in batch:
+        row = await db.get_display_message(item['record_id'])
+        if row is None:
+            continue
+        message = build_history_message(row, ArtifactManager.ROOT_DIR, AgentExecutor.WORK_DIR)
+        frame = {**message, 'type': 'record_snapshot', 'record_id': row['id'], 'text': message['content'],
+                 'queue_id': item['id'], 'ui_generation': current_scope().generation}
+        frame.pop('content', None)
+        if outbox is not None:
+            outbox.put(frame)
+        if cli:
+            from xgent_app.cli_bridge import relay_conversation_event, relay_user_message
+            relay_conversation_event(frame)
+            relay_user_message(item['text'], queue_origin=item['origin'], queue_id=item['id'])
+        elif item['origin'] != 'telegram':
+            mirror_user_line_to_telegram(('🖥 [CLI]' if item['origin'] == 'cli' else '💬 [网页]') + '\n' + item['text'])
+
+
+async def _dispatch_queued_batch(batch):
+    outbox = get_web_outbox() or globals().get('_web_external_outbox')
+    if current_scope().origin == 'telegram' and _web_real_bot is not None:
+        update, context = _SelfTriggerUpdate(_web_real_bot, BotConfig.AUTHORIZED_USER_ID), _SelfTriggerContext(_web_real_bot)
+    else:
+        update, context, _ = build_web_mirror_objects(BotConfig.AUTHORIZED_USER_ID, outbox,
+                                                     _web_real_bot, channel=telegram_channel())
+    try:
+        await publish_queued_users(context, batch)
+        await process_conversation(update, context, batch[-1]['text'], queued_messages=batch)
+        outbox.put({'type': 'turn_end'})
+    except Exception as exc:
+        from xgent_app.message_queue import mark_outcome
+        mark_outcome('failed')
+        failure = await GlobalRecorder.record_error(exc, BotConfig.AUTHORIZED_USER_ID, source='queue')
+        outbox.put({'type': 'turn_error', 'text': failure})
+        raise
+
+
+_queue_receipt_offered = {}
+
+
+async def _queue_sync_receipts(db):
+    if _web_real_bot is None:
+        return
+    from xgent_app.conversations import ConversationScope
+    from xgent_app.interaction import interaction
+    for item in await db.queue_receipts():
+        if _queue_receipt_offered.get(item['id']) == item['revision']:
+            continue
+        # The outbox re-reads authoritative text/revision on delivery. Native ID
+        # is stored with the queue item so restart edits, rather than re-sends.
+        with interaction('telegram', 'management'), bind_conversation(ConversationScope(
+                item['conversation_id'], item['generation'], origin='telegram', purpose='management', telegram_delivery=True)):
+            channel = telegram_channel()
+            channel.ensure_started()
+            channel.offer(Op(OP_SEND, logical_id=-(10**12 + item['seq']), chat_id=item['chat_id'],
+                             payload={'queue_receipt': item['id']}))
+        _queue_receipt_offered[item['id']] = item['revision']
+
+
+async def submit_ordinary_text(text, *, chat_id, request_key=None):
+    queue = get_text_queue()
+    item = await queue.submit(text, chat_id=chat_id, request_key=request_key)
+    get_conversations().start()
+    # Schedule only after persistence. The HTTP response is not held for a model.
+    try:
+        await queue.poll()
+    except Exception:
+        logger.exception('待发消息已保存，唤醒暂失败；后台轮询将重试')
+    return item
+
+
+async def _web_accept_text(text, *, conversation_id=None, request_id=None, generation=None):
+    from xgent_app.interaction import interaction
+    from xgent_app.message_queue import public_item
+    with interaction('web', 'management'):
+        async with conversation_operation(conversation_id, fresh=True, expected=conversation_id is not None, selector='shared'):
+            await UserDataManager.init()
+            db = await BotMemoryDB.get_instance()
+            request_key = 'web:' + request_id if request_id else None
+            previous = await db.queue_request(request_key) if request_key else None
+            if previous:
+                if previous['conversation_id'] != current_scope().conversation_id:
+                    raise ConversationChanged('请求标识已属于另一会话。')
+                if previous['kind'] == 'chat':
+                    if previous['item']['text'] != text:
+                        raise ConversationChanged('请求标识已用于另一条消息。')
+                    return {'ok': True, 'queued': True, **public_item(previous['item'])}
+                return {'ok': True, 'management': True}
+            if UserDataManager.bind_ui_state():
+                raise ConversationChanged('之前的录入已取消；请重新提交。')
+            if generation is not None and generation != current_scope().generation:
+                raise ConversationChanged('上下文已改变，输入已保留，请确认后重新发送。')
+            if UserDataManager.get('state') != BotState.IDLE:
+                # State/secret input is deliberately not persisted in the queue.
+                expected_state = UserDataManager.get('state')
+                if request_key:
+                    receipt = await db.queue_accept_management(current_scope(), request_key)
+                    if not receipt['new']:
+                        return ({'ok': True, 'queued': True, **public_item(receipt['item'])} if receipt['kind'] == 'chat'
+                                else {'ok': True, 'management': True})
+                task = asyncio.create_task(_web_scoped_call(_web_run_conversation(text, get_web_outbox() or _web_external_outbox,
+                    expected_state=expected_state),
+                    conversation_id, get_web_outbox() or _web_external_outbox, purpose='management'))
+                get_conversations().track_background(task)
+                return {'ok': True, 'management': True}
+            with interaction('web', 'chat'):
+                scope = await get_conversations().resolve(conversation_id, selector='shared')
+                with bind_conversation(scope):
+                    item = await submit_ordinary_text(text, chat_id=BotConfig.AUTHORIZED_USER_ID,
+                        request_key=request_key)
+                    return {'ok': True, 'queued': True, **public_item(item)}
+
+
+async def queue_api(action, conversation_id, data=None):
+    from xgent_app.interaction import interaction
+    from xgent_app.message_queue import public_item
+    data = data or {}
+    queue = get_text_queue()
+    with interaction('web', 'management'):
+        scope = await get_conversations().resolve(conversation_id, allow_archived=action != 'resume')
+        with bind_conversation(scope):
+            if action == 'list':
+                return await queue.snapshot(scope.conversation_id)
+            db = await BotMemoryDB.get_instance()
+            if action == 'resume':
+                if data.get('generation') != scope.generation or type(data.get('revision')) is not int or not data.get('request_id'):
+                    raise ConversationChanged('上下文已改变，请刷新队列。')
+                await queue.start()
+                await db.queue_resume(scope, queue.instance, revision=data['revision'], request_key='resume:' + data['request_id'])
+                result = {'ok': True}
+            elif action in {'cancel', 'edit'}:
+                if type(data.get('generation')) is not int or type(data.get('revision')) is not int:
+                    raise ConversationError('队列版本参数无效。')
+                if action == 'edit' and not data.get('request_id'):
+                    raise ConversationError('取回编辑需要请求标识。')
+                item = await db.queue_change(scope.conversation_id, data['generation'], data.get('id'),
+                                             data['revision'], action, data.get('request_id'))
+                result = {'ok': True, **public_item(item)}
+            else:
+                raise ConversationError('未知队列操作。')
+            try:
+                await queue.poll()
+            except Exception:
+                logger.exception('队列操作已保存，状态通知暂失败')
+            return result
 # 配置对账任务。见 _web_config_reconciler。
 _web_config_watch_task: Optional[asyncio.Task] = None
 
@@ -397,9 +567,10 @@ async def _replay_relay_op(mirror: Any, op: str, payload: Dict[str, Any]) -> Non
                    'generation': session['generation'], 'run_id': None, 'name': session['name']}}
     from xgent_app.conversations import conversation_still_exists
     from xgent_app.telegram_presentation import replay_presentation
+    from xgent_app.web_display import web_display_scope
     if not await conversation_still_exists(payload.get('conversation_context')):
         return
-    with replay_presentation(payload.get('telegram_presentation')), replay_conversation(payload.get('conversation_context')), media_presentation_scope(payload.get('media_presentation')), replay_ui_context(payload.get('ui_context')):
+    with replay_presentation(payload.get('telegram_presentation')), replay_conversation(payload.get('conversation_context')), media_presentation_scope(payload.get('media_presentation')), replay_ui_context(payload.get('ui_context')), web_display_scope(payload.get('web_display')):
         await _replay_relay_op_with_presentation(mirror, op, payload)
 
 
@@ -420,10 +591,11 @@ async def _replay_relay_op_with_presentation(mirror: Any, op: str, payload: Dict
             return
         # 唯一加来源标识的地方。走出站通道（非阻塞 + 断连可补投），而不是直接
         # await 真实 bot——那样 TG 不通时每条都要等满一个超时，把整条回放流拖住。
-        if mirror.real_bot is not None:
-            mirror_user_line_to_telegram(f"🖥 [CLI]\n{text}")
+        if mirror.real_bot is not None and payload.get('queue_origin') != 'telegram':
+            prefix = '💬 [网页]' if payload.get('queue_origin') == 'web' else '🖥 [CLI]'
+            mirror_user_line_to_telegram(f"{prefix}\n{text}")
         outbox = _web_external_outbox
-        if outbox is not None:
+        if outbox is not None and not payload.get('queue_id'):
             # user_message 帧让网页渲染成用户气泡（右侧），而不是 AI 气泡。
             outbox.put({"type": "user_message", "text": text,
                         "ts": time.time(), "external": True})
@@ -881,7 +1053,7 @@ async def _web_write_setting(key: str, value: Any) -> Dict[str, Any]:
     return await _web_read_settings()
 
 
-async def _web_run_conversation(text: str, outbox: Any) -> None:
+async def _web_run_conversation(text: str, outbox: Any, *, expected_state=None) -> None:
     """跑一轮完整对话，结束后给网页发一帧收尾信号。
 
     用 MirrorBot 而不是纯 WebBot：网页发的对话会同时投递到 Telegram，让两端
@@ -895,6 +1067,11 @@ async def _web_run_conversation(text: str, outbox: Any) -> None:
     # 配置状态（设置密码/端口/地址/提示词/Key 等）：走 Telegram 同款状态机，
     # 不要当 AI 对话。否则网页输入 cancel 或配置值会被发给 AI（既有 bug）。
     state = UserDataManager.get('state')
+    if expected_state is not None:
+        if state != expected_state:
+            outbox.put({'type': 'turn_error', 'text': '录入状态已变化，本次内容未发给 AI，请重新操作。'})
+            return
+        update.xgent_expected_state = expected_state
     if state != BotState.IDLE:
         try:
             update.message.text = text
@@ -1012,6 +1189,7 @@ def _ensure_web_command_map() -> None:
     pairs = [
         ("start", "cmd_start"),
         ("chats", "cmd_chats"),
+        ("queue", "cmd_queue"),
         ("new", "cmd_new_chat"),
         ("config", "cmd_settings_menu"),
         ("update", "cmd_update_system"),
@@ -1351,6 +1529,8 @@ def telegram_entry(handler):
                 query = getattr(update, 'callback_query', None)
                 text = str(getattr(getattr(update, 'message', None), 'text', '') or '')
                 action = str(getattr(query, 'data', '') or '')
+                if action.startswith('q:'):
+                    return await handle_queue_callback(update, context, action)
                 for _ in range(8):
                     resolved = CallbackDataStore._store.get(action, action)
                     if resolved == action:
@@ -1489,6 +1669,8 @@ async def start_web_chat_if_enabled(app: Optional[Any] = None, *,
         authorized_user_id=BotConfig.AUTHORIZED_USER_ID,
         loop=asyncio.get_running_loop(),
         submit_message=_web_submit_message,
+        accept_text=_web_accept_text,
+        queue_api=queue_api,
         submit_callback=_web_submit_callback,
         submit_ui_callback=_web_submit_ui_callback,
         submit_command=_web_submit_command,

@@ -7,6 +7,7 @@ import io
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from PIL import Image
@@ -14,6 +15,7 @@ from PIL import Image
 from xgent_app.attachments import (
     ATTACHMENT_CONTEXT_MARKER,
     AttachmentContextError,
+    AttachmentUnavailable,
     create_attachment_reference,
     create_generated_image_references,
     decode_full_text,
@@ -168,18 +170,64 @@ class AttachmentTests(unittest.TestCase):
                 self.assertTrue(binary_parts)
                 self.assertEqual(data, base64.b64decode(binary_parts[0]["data"]))
 
-    def test_missing_original_blocks_instead_of_omitting(self):
+    def test_missing_upload_is_explicit_and_recovers_without_reupload(self):
         ref = self.reference(b"original")
-        (self.root / ref["path"]).unlink()
+        path = self.root / ref['path']
+        path.unlink()
         parts, _, errors = self.restore(ref)
-        self.assertFalse(parts)
-        self.assertIn("missing or unreadable", errors[0])
+        self.assertFalse(errors)
+        self.assertIn('temporarily unavailable', parts[0]['text'])
+        self.assertIn('missing or unreadable', parts[0]['text'])
+        self.assertTrue(prepare_attachment_context([self.record(ref)], self.root, strict=True)[2])
+        path.write_bytes(b'restored')
+        parts, updates, errors = self.restore(ref)
+        self.assertFalse(errors)
+        self.assertIn('restored', parts[-1]['text'])
+        self.assertEqual(1, len(updates))
 
-    def test_changed_original_blocks_even_when_size_is_unchanged(self):
+    def test_changed_upload_refreshes_hash_even_when_size_is_unchanged(self):
         ref = self.reference(b"original")
         (self.root / ref["path"]).write_bytes(b"replaced")
-        _, _, errors = self.restore(ref)
-        self.assertIn("has changed", errors[0])
+        parts, updates, errors = self.restore(ref)
+        self.assertFalse(errors)
+        self.assertIn('replaced', parts[-1]['text'])
+        refreshed = updates[0][2]['attachments'][0]
+        self.assertEqual(ref['id'], refreshed['id'])
+        self.assertEqual(hashlib.sha256(b'replaced').hexdigest(), refreshed['sha256'])
+        self.assertEqual(hashlib.sha256(b'original').hexdigest(), ref['sha256'])
+
+    def test_mutable_upload_reinspects_image_and_text_encoding(self):
+        ref = self.reference(image_bytes(), 'picture.png')
+        changed = image_bytes('JPEG', size=(27, 31))
+        (self.root / ref['path']).write_bytes(changed)
+        parts, updates, errors = self.restore(ref)
+        self.assertFalse(errors)
+        self.assertEqual(changed, base64.b64decode(parts[-1]['data']))
+        self.assertEqual(('image/jpeg', 27, 31), tuple(parts[-1][k] for k in ('mime_type','width','height')))
+        self.assertEqual(27, updates[0][2]['attachments'][0]['width'])
+        ref = self.reference(b'old text')
+        (self.root / ref['path']).write_bytes('中文新版'.encode('utf-16'))
+        parts, updates, errors = self.restore(ref)
+        self.assertFalse(errors)
+        self.assertIn('中文新版', parts[-1]['text'])
+        self.assertEqual('utf-16', updates[0][2]['attachments'][0]['encoding'])
+
+    def test_damaged_upload_does_not_poison_other_attachments(self):
+        ref = self.reference(image_bytes(), 'picture.png')
+        path = self.root / ref['path']
+        path.write_bytes(b'broken image')
+        parts, updates, errors = self.restore(ref, self.reference(b'available'))
+        self.assertFalse(errors)
+        self.assertIn('temporarily unavailable', parts[0]['text'])
+        self.assertIn('available', parts[-1]['text'])
+        self.assertEqual([], updates)
+        path.write_bytes(image_bytes('PNG', color='blue'))
+        self.assertEqual('image', self.restore(ref)[0][-1]['type'])
+
+    def test_invalid_upload_path_is_not_a_soft_failure(self):
+        ref = self.reference(b'bad image', 'picture.png')
+        ref['path'] = '../outside.png'
+        self.assertIn('outside', self.restore(ref)[2][0])
 
     def test_reference_cannot_escape_upload_root(self):
         ref = self.reference(b"original")
@@ -275,6 +323,38 @@ class AttachmentTests(unittest.TestCase):
         migrated = updates[0][2]["attachments"][0]
         self.assertTrue(migrated["legacy"])
         self.assertEqual(ref["path"], migrated["path"])
+
+    def test_missing_legacy_upload_is_kept_and_can_recover(self):
+        ref = self.reference(b'old')
+        record = self.legacy(ref)
+        path = self.root / ref['path']
+        path.unlink()
+        parts, updates, errors = prepare_attachment_context([record], self.root)
+        self.assertFalse(errors)
+        self.assertIn('附件暂不可用', str(parts))
+        record['metadata'] = updates[0][2]
+        path.write_bytes(b'restored current legacy bytes')
+        parts, updates, errors = prepare_attachment_context([record], self.root)
+        self.assertFalse(errors)
+        self.assertIn('restored current legacy bytes', str(parts))
+        self.assertEqual(ref['id'], updates[0][2]['attachments'][0]['id'])
+
+    def test_unstable_read_is_unavailable_but_strict_compression_rejects_it(self):
+        ref = self.reference(b'current')
+        with patch('xgent_app.attachments._read_stable_upload', side_effect=AttachmentUnavailable('write in progress')):
+            parts, updates, errors = self.restore(ref)
+            self.assertFalse(errors)
+            self.assertFalse(updates)
+            self.assertIn('write in progress', str(parts))
+            parts, _, errors = prepare_attachment_context([self.record(ref)], self.root, strict=True)
+            self.assertFalse(parts)
+            self.assertIn('write in progress', str(errors))
+
+    def test_unexpected_read_errors_are_not_disguised_as_missing_files(self):
+        ref = self.reference(b'current')
+        with patch('xgent_app.attachments._read_stable_upload', side_effect=RuntimeError('programming failure')):
+            with self.assertRaisesRegex(RuntimeError, 'programming failure'):
+                self.restore(ref)
 
     def test_arbitrary_text_cannot_create_legacy_attachment_associations(self):
         record = self.legacy(self.reference(b"secret"))

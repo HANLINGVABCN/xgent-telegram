@@ -202,6 +202,67 @@ async def restart_current_process(chat_id: int, bot: Any = None):
     logger.info("进程即将退出以完成重启")
     sys.exit(0)
 
+async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_authorized_user_middleware(update, context):
+        return
+    from xgent_app.queue_store import REASONS
+    queue = get_text_queue()
+    state = await queue.snapshot(current_scope().conversation_id)
+    args = list(getattr(context, 'args', []) or [])
+    page = int(args[0]) if args and args[0].isdigit() else 1
+    page = max(1, min(page, max(1, (len(state['items']) + 7) // 8)))
+    items = state['items'][(page - 1) * 8:page * 8]
+    lines = [f"📥 待发消息 · {len(state['items'])} 条", '尚未接入 AI，可取消；暂停项需要手动继续。']
+    keyboard = []
+    for item in items:
+        lines += ['', f"{item['id'][:8]} · {REASONS.get(item['reason'], '排队中')}",
+                  item['text'][:160] + ('…' if len(item['text']) > 160 else '')]
+        keyboard.append([InlineKeyboardButton(f"❌ 取消 {item['id'][:8]}", callback_data=f"q:c:{item['id']}:{item['revision']}")])
+    if state['paused'] and state['reason'] != 'ask':
+        keyboard.append([InlineKeyboardButton('▶ 继续发送本对话', callback_data=f"q:r:{state['conversation_id']}:{state['generation']}:{state['revision']}")])
+    if len(state['items']) > 8:
+        lines.append(f'\n第 {page} 页；/queue {page + 1} 查看下一页。')
+    message = update.message or update.callback_query.message
+    sender = message.edit_text if update.callback_query else message.reply_text
+    await sender('\n'.join(lines), reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
+
+
+async def handle_queue_callback(update, context, data):
+    from xgent_app.interaction import interaction
+    from xgent_app.conversations import bind_conversation
+    query = update.callback_query
+    try:
+        _, action, identifier, version, *extra = data.split(':')
+        revision = int(version)
+        queue = get_text_queue()
+        await queue.start()
+        db = await BotMemoryDB.get_instance()
+        if action == 'c':
+            item = await db.queue_item(identifier)
+            if not item:
+                raise ConversationChanged('排队消息已不存在。')
+            await db.queue_change(item['conversation_id'], item['generation'], identifier, revision, 'cancel')
+        elif action == 'r':
+            with interaction(click_origin(update), 'management'):
+                scope = await get_conversations().resolve(identifier)
+                if scope.generation != revision:
+                    raise ConversationChanged('上下文已变化，请重新打开 /queue。')
+                with bind_conversation(scope):
+                    if len(extra) != 1:
+                        raise ConversationChanged('请重新打开 /queue。')
+                    await db.queue_resume(scope, queue.instance, revision=int(extra[0]), request_key='resume:' + data)
+        else:
+            raise ConversationError('未知队列操作。')
+        await query.answer('已取消' if action == 'c' else '已恢复本对话队列')
+        await queue.poll()
+        if action == 'r' or getattr(query.message, 'message_id', None) != item.get('receipt_id'):
+            target = identifier if action == 'r' else item['conversation_id']
+            with bind_conversation(await get_conversations().resolve(target, allow_archived=True)):
+                await cmd_queue(update, context)
+    except (ValueError, ConversationError) as exc:
+        await query.answer(str(exc), show_alert=True)
+
+
 async def cmd_update_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):
         return
@@ -211,10 +272,53 @@ async def cmd_update_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await UserDataManager.init()
     message = update.message or update.callback_query.message
-    await send_update_source_menu(message)
+    UserDataManager.set('state', BotState.IDLE)
+    UserDataManager.set('pending_update_zip_url', '')
+    await send_update_source_menu(message, new=bool(update.message))
 
-async def send_update_source_menu(message: Any):
-    await message.reply_text(
+def remember_update_card(message, phase):
+    from xgent_app.ui_history import saved_ui_binding
+    scope = current_scope(required=False)
+    UserDataManager.set('temp_update_card', {
+        'message_id': message.message_id, 'chat_id': message.chat_id,
+        'conversation_id': scope.conversation_id if scope else None,
+        'generation': scope.generation if scope else None,
+        'phase': phase, 'ui_binding': saved_ui_binding(),
+    })
+
+
+async def validate_update_card(message=None, *, phase=None, claim=None):
+    """The same surface/card/revision must own a continuation, including native TG."""
+    from xgent_app.ui_history import saved_ui_binding
+    pending = UserDataManager.get('temp_update_card') or {}
+    scope = current_scope(required=False)
+    if (not pending or pending.get('conversation_id') != (scope.conversation_id if scope else None)
+            or pending.get('generation') != (scope.generation if scope else None)
+            or phase is not None and pending.get('phase') != phase):
+        raise UiHistoryError('更新卡片已失效，请重新打开 /update。')
+    binding = pending.get('ui_binding') or {}
+    current = saved_ui_binding() or {}
+    if message is not None and message.message_id != pending['message_id'] and not (
+            binding.get('ui_message_id') and binding.get('ui_message_id') == current.get('ui_message_id')):
+        raise UiHistoryError('更新卡片已失效，请重新打开 /update。')
+    if binding.get('ui_message_id'):
+        db = await BotMemoryDB.get_instance()
+        row = await db.get_ui_message(binding['ui_message_id'])
+        if (not row or row['generation'] != binding['generation'] or row['revision'] != binding['revision']
+                or json.loads(row['payload']).get('deleted')):
+            raise UiHistoryError('更新卡片已失效，请重新打开 /update。')
+    # Database validation yielded. Another native click or a newly opened card
+    # may have taken ownership in the meantime; claim before any further await.
+    if (UserDataManager.get('temp_update_card') is not pending
+            or phase is not None and pending.get('phase') != phase):
+        raise UiHistoryError('更新卡片已变化，请在当前卡片操作。')
+    if claim is not None:
+        pending['phase'] = claim
+    return pending
+
+
+async def send_update_source_menu(message: Any, *, new=False):
+    card = await (message.reply_text if new else message.edit_text)(
         "⬆️ <b>选择更新来源</b>\n\n"
         "请选择这次要从哪里拉取最新代码：\n"
         "1. 正常更新：从 <code>xgent-telegram</code> 项目拉取。\n"
@@ -226,20 +330,22 @@ async def send_update_source_menu(message: Any):
             [InlineKeyboardButton("取消", callback_data="menu_more_settings")]
         ])
     )
+    remember_update_card(card if new else message, 'source')
 
 async def request_update_github_token(message: Any, update_url: str):
     set_update_source(update_url)
     UserDataManager.set('state', BotState.SET_UPDATE_TOKEN)
     UserDataManager.set('pending_update_zip_url', BotConfig.UPDATE_ZIP_URL)
-    await message.reply_text(
+    await message.edit_text(
         "🔐 <b>需要 GitHub Token</b>\n\n"
         "你选择的是 test 私有目录：\n"
         f"<code>{safe_text(BotConfig.UPDATE_ZIP_URL)}</code>\n\n"
         "请发送一个 Fine-grained GitHub Token，权限只需要该仓库 <b>Contents: Read-only</b>。\n"
         "收到后会写入项目根目录的 <code>.env</code>，然后继续更新确认。\n\n"
         "<i>发送 cancel 可取消。</i>",
-        parse_mode=constants.ParseMode.HTML
+        parse_mode=constants.ParseMode.HTML, reply_markup=None,
     )
+    remember_update_card(message, 'token')
 
 async def show_update_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message or update.callback_query.message
@@ -252,7 +358,7 @@ async def send_update_confirmation_message(message: Any):
         if is_test_update_source(BotConfig.UPDATE_ZIP_URL)
         else "正常更新源不需要 GitHub Token。\n\n"
     )
-    await message.reply_text(
+    await message.edit_text(
         "⬆️ <b>更新确认</b>\n\n"
         f"更新会从 <b>{safe_text(source_label)}</b> 下载最新代码并覆盖当前项目文件，然后自动重启。\n"
         f"更新源：<code>{safe_text(BotConfig.UPDATE_ZIP_URL)}</code>\n"
@@ -270,17 +376,21 @@ async def send_update_confirmation_message(message: Any):
             [InlineKeyboardButton("取消", callback_data="menu_more_settings")]
         ])
     )
+    remember_update_card(message, 'confirm')
 
 async def perform_update_system(update: Update, context: ContextTypes.DEFAULT_TYPE, overwrite_local_custom_files: bool):
     if not await check_authorized_user_middleware(update, context):
         return
 
     message = update.message or update.callback_query.message
+    await validate_update_card(message, phase='confirm', claim='running')
     custom_files_mode = "覆盖并自动备份 prompts/" if overwrite_local_custom_files else "保留当前 prompts/"
-    status_msg = await message.reply_text(
+    status_msg = message
+    await status_msg.edit_text(
         "⬇️ 正在从更新源下载最新代码并覆盖当前目录...\n"
         f"本地文件策略：{custom_files_mode}\n"
-        "运行数据、数据库、日志、存储目录、虚拟环境和 Git 目录会保留。"
+        "运行数据、数据库、日志、存储目录、虚拟环境和 Git 目录会保留。",
+        reply_markup=None,
     )
 
     try:
@@ -289,8 +399,9 @@ async def perform_update_system(update: Update, context: ContextTypes.DEFAULT_TY
         logger.exception("项目更新失败")
         await status_msg.edit_text(
             f"❌ 更新失败：<code>{safe_text(format_provider_exception(e))}</code>",
-            parse_mode=constants.ParseMode.HTML
+            parse_mode=constants.ParseMode.HTML, reply_markup=None,
         )
+        remember_update_card(status_msg, 'failed')
         return
 
     reload_result = None
@@ -304,6 +415,7 @@ async def perform_update_system(update: Update, context: ContextTypes.DEFAULT_TY
                 f"❌ 更新文件已覆盖，但提示词重载失败：<code>{safe_text(format_provider_exception(e))}</code>",
                 parse_mode=constants.ParseMode.HTML
             )
+            remember_update_card(status_msg, 'failed')
             return
 
     await GlobalRecorder.record_system_op(
@@ -341,11 +453,75 @@ async def perform_update_system(update: Update, context: ContextTypes.DEFAULT_TY
 
     await status_msg.edit_text(
         f"{success_title}"
-        f"{skipped_line}{reload_line}{backup_line}"
+        f"{skipped_line}{reload_line}{backup_line}", reply_markup=None,
     )
+    remember_update_card(status_msg, 'complete')
     # 给 Telegram 一点时间把“更新成功”消息发出去，避免 sys.exit 截断
     await asyncio.sleep(0.4)
     await restart_current_process(update.effective_chat.id, context.bot)
+
+
+async def handle_update_token_input(update, context, text):
+    """Resume the original surface's card, never edit the user's secret message."""
+    from xgent_app.ui_history import restore_ui_binding
+    from xgent_app.web_bridge import WebMessage
+    pending = UserDataManager.get('temp_update_card') or {}
+    binding = pending.get('ui_binding') or {}
+    lock_id = binding.get('ui_message_id') or f"update:{pending.get('chat_id')}:{pending.get('message_id')}"
+    async with callback_lock(lock_id):
+        try:
+            pending = await validate_update_card(phase='token')
+        except UiHistoryError as exc:
+            UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('pending_update_zip_url', '')
+            await update.message.reply_text(str(exc))
+            return
+        card = WebMessage(context.bot, pending['message_id'], pending['chat_id'])
+        with restore_ui_binding(pending.get('ui_binding')):
+            if text.lower() == 'cancel':
+                UserDataManager.set('state', BotState.IDLE)
+                UserDataManager.set('pending_update_zip_url', '')
+                await card.edit_text('🚫 更新操作已取消。', reply_markup=get_main_menu())
+                remember_update_card(card, 'cancelled')
+                return
+            token = text.strip()
+            if not token:
+                await card.edit_text('⚠️ GitHub Token 不能为空。请重新发送，或发送 cancel 取消。', reply_markup=None)
+                remember_update_card(card, 'token')
+                return
+            pending_update_url = UserDataManager.get('pending_update_zip_url', '') or BotConfig.TEST_UPDATE_ZIP_URL
+            try:
+                await asyncio.to_thread(persist_update_github_token, token, pending_update_url)
+            except Exception as exc:
+                logger.exception('保存更新 token 失败')
+                await card.edit_text(
+                    f'❌ 保存 GitHub Token 失败：<code>{safe_text(format_provider_exception(exc))}</code>\n请重新发送，或 cancel 取消。',
+                    parse_mode=constants.ParseMode.HTML, reply_markup=None,
+                )
+                remember_update_card(card, 'token')
+                return
+            await GlobalRecorder.record_system_op('保存 UPDATE_GITHUB_TOKEN',
+                {'update_source': BotConfig.UPDATE_ZIP_URL}, update.effective_chat.id)
+            await card.edit_text(
+                f'✅ 已保存 <code>{safe_text(mask_update_github_token(token))}</code>，正在验证...',
+                parse_mode=constants.ParseMode.HTML, reply_markup=None,
+            )
+            try:
+                verification = await asyncio.to_thread(verify_update_github_token, token, BotConfig.UPDATE_ZIP_URL)
+            except Exception as exc:
+                verification = {'ok': False, 'message': safe_text(format_provider_exception(exc))}
+            if not verification['ok']:
+                await card.edit_text(
+                    f"❌ <b>Token 验证未通过</b>\n\n{verification['message']}\n\n"
+                    '<i>请重新发送 Token，或发送 cancel 取消。</i>',
+                    reply_markup=get_github_token_menu(), parse_mode=constants.ParseMode.HTML,
+                )
+                remember_update_card(card, 'token')
+                return
+            UserDataManager.set('state', BotState.IDLE)
+            UserDataManager.set('pending_update_zip_url', '')
+            await send_update_confirmation_message(card)
+
 
 def build_provider_config_export() -> Dict[str, Any]:
     """构建可移植的 Provider 配置；API Key 会原样包含在导出文件中。

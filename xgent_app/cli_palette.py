@@ -316,6 +316,8 @@ class SlashPalette:
         self._history_stash = ""
         # 占位符 -> 真正的粘贴正文。大段粘贴不进输入行本体（见 _apply_paste）。
         self._pastes: "OrderedDict[str, str]" = OrderedDict()
+        self.defer_submit_clear = False
+        self._submitted_text = None
         self._paste_seq = 0
         # 已经从 fd 读出来、但还没当成按键消化掉的字节。粘贴是整块读的
         # （os.read 一次拿一大片），结束标记后面可能还粘着用户随后敲的键；
@@ -818,6 +820,14 @@ class SlashPalette:
             self._box_palette = Palette(bool(box_ansi))
             self._render()
 
+    def prepend_draft(self, text: str) -> None:
+        """Recover a queue item without overwriting the live/pasted draft."""
+        with self._io_lock:
+            previous = self._expand_pastes(self.buffer)
+            self._discard_draft()
+            self._apply_paste(text + ('\n\n' + previous if previous else ''))
+            self._render()
+
     def withdraw(self) -> None:
         """把框从屏幕上撤掉，光标落回框顶行行首（= 输出流的当前位置）。
 
@@ -860,9 +870,20 @@ class SlashPalette:
     def _submit(self) -> str:
         """回车提交：展开粘贴占位符，框原地清空保留，返回这一行。"""
         line = self._expand_pastes(self.buffer)
-        self._reset_line()
+        if self.defer_submit_clear:
+            self._submitted_text = line
+        else:
+            self._reset_line()
         self._render()
         return line
+
+    def acknowledge_submission(self, text: str) -> None:
+        with self._io_lock:
+            if self._submitted_text == text:
+                if self._expand_pastes(self.buffer) == text:
+                    self._reset_line()
+                self._submitted_text = None
+                self._render()
 
     def _discard_draft(self) -> None:
         """作废草稿（Ctrl+C 取消 / EOF）：清缓冲，框保留。"""
@@ -951,9 +972,9 @@ class SlashPalette:
                 if self.matches and self.buffer[1:] != self.matches[self.selected]:
                     self._accept_selection()
                     self._refresh_matches()
-                # 忙闸门：上一轮还在跑（或主循环还没回到等输入的位置）时，
-                # 回车不提交——草稿留在输入行，提示用户稍候，对齐 Telegram
-                # 端的忙语义；不做排队，等空闲后再按一次回车即发送。
+                # Input-reader handshake, not a model lock: the owner may accept
+                # ordinary text into its queue while the model is still running.
+                # Never hand a line to a future that has no waiting consumer.
                 if self.busy_check is not None and self.busy_check():
                     if self.buffer and self.on_busy_submit is not None:
                         try:

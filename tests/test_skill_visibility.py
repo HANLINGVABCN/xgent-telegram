@@ -4,6 +4,24 @@ from tests.test_external_sync import SectionsProbeMixin
 
 
 class SkillVisibilityTests(SectionsProbeMixin, unittest.TestCase):
+    def test_only_root_documents_enter_skill_index_and_prompt(self):
+        result = self.run_probe(self.SECTIONS_PREAMBLE + r'''
+from pathlib import Path
+for key in ('SKILL_PUBLIC_DIR', 'SKILL_PRIVATE_DIR', 'SKILL_LEGACY_DIR'):
+    root = Path(ns[key]);root.mkdir(exist_ok=True)
+    (root / 'root.MD').write_text('```!\nROOT SUMMARY\n```', encoding='utf-8')
+    (root / '.hidden.md').write_text('hidden', encoding='utf-8')
+    (root / 'fake.md').mkdir()
+    folder = root / 'script' / 'helper';folder.mkdir(parents=True)
+    (folder / '01-guide.md').write_text('AUXILIARY CONTENT', encoding='utf-8')
+files = ns['list_skill_files']()
+prompt = ns['build_skill_prompt_section']()
+print(json.dumps({'files': files, 'clean': '01-guide' not in prompt and '无简介' not in prompt,
+                  'aux_readable': ns['read_skill_text'](str(folder / '01-guide.md')) == 'AUXILIARY CONTENT'}))
+''')
+        self.assertEqual(['private/root.MD', 'root.MD', 'root.MD'], result['files'])
+        self.assertTrue(result['clean'] and result['aux_readable'])
+
     def test_state_change_is_atomic_and_preserves_other_skills(self):
         result = self.run_probe(self.SECTIONS_PREAMBLE + r'''
 import asyncio

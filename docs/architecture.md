@@ -31,6 +31,9 @@ components. The first extracted components are:
 | `xgent_app/agent_media_delivery.py` | Deliver generated media or the existing failure warning without persistence/context concerns |
 | `xgent_app/web_auth.py` | Web Chat password hashing, signed session cookies, login rate limiting, and Telegram `initData` verification; no HTTP or Telegram concerns |
 | `xgent_app/web_bridge.py` | Duck-typed `Update`/`Context`/`Bot` shims that let the Web UI drive `process_conversation` unchanged, plus the thread-safe outbound frame queue |
+| `xgent_app/web_display.py` | Optional semantic Markdown/tool-HTML display segments and scoped live reply grouping; original model/Telegram/CLI content is unchanged |
+| `xgent_app/reply_delivery.py` | Run-local Web→Telegram subscription; materialize only the unfinished reply and enqueue creation before edits without unmuting old queued operations |
+| `xgent_app/message_queue.py`, `xgent_app/queue_store.py` | Cross-process text queue ownership, transactional claim/cancel/edit, manual resume and generation-safe recovery; pending text is not model history |
 | `xgent_app/web_server.py` | Zero-dependency threaded HTTP/SSE server for the Web Chat UI; receives all application behavior through injected callbacks |
 | `xgent_app/fanout.py` | Per-channel outbound isolation: bounded queue + single worker + circuit breaker + durable pending store, so one unreachable surface cannot slow another; stdlib only, no `telegram` import |
 

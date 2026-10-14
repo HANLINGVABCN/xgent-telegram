@@ -42,7 +42,8 @@ class TelegramSelectionTests(unittest.IsolatedAsyncioTestCase):
         await conn.commit()
         await self.db.close()
         await self.db._init_db()
-        self.assertTrue(Path(self.path + '.pre-conversations-v3.sqlite3').exists())
+        from xgent_app.conversations import SCHEMA_VERSION
+        self.assertTrue(Path(self.path + f'.pre-conversations-v{SCHEMA_VERSION}.sqlite3').exists())
         self.assertEqual(b, (await self.manager.state())['telegram_conversation_id'])
         with bind_conversation(a):
             self.assertIn('kept A', str(await self.db.get_conversation_messages()))

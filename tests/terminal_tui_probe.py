@@ -44,7 +44,7 @@ async def actual_tui(cli, scenario='routing'):
         entered = asyncio.Event()
         finish = asyncio.Event()
         calls = []
-        async def engine(update, context, text):
+        async def engine(update, context, text, **kwargs):
             calls.append((current_scope().conversation_id, text))
             await context.bot.send_message(1, '本机流式开始')
             entered.set()
@@ -90,7 +90,9 @@ async def actual_tui(cli, scenario='routing'):
                         await work.manage('switch', b)
                         assert buf.text == 'B 草稿'
                         await keys('\r')
-                        assert len(calls) == 1 and buf.text == 'B 草稿'
+                        assert len(calls) == 1 and buf.text == ''
+                        pending = await cli._ns['get_text_queue']().snapshot(b)
+                        assert len(pending['items']) == 1 and pending['items'][0]['text'] == 'B 草稿'
                         assert '本机流式开始' not in str(screen.model.render_rows())
                         # F4 and Enter are real modal navigation, allowed while generating.
                         await keys('\x1bOS', .4)  # F4
@@ -102,7 +104,7 @@ async def actual_tui(cli, scenario='routing'):
                         assert buf.text == '' and len(calls) == 1
                         assert (await db.get_conversation_state())['current_chat_id'] == b
                         finish.set()
-                        await wait_for(lambda: not cli._turn_active)
+                        await wait_for(lambda: len(calls) == 2 and not manager.lock.busy())
                         await work.refresh_history(force=True)
                         assert '本机完整回复' not in str(screen.model.render_rows())
                         await work.manage('switch', a)
@@ -112,6 +114,56 @@ async def actual_tui(cli, scenario='routing'):
                         assert '本机流式开始' not in content
                         assert b == (await db.get_conversation_state())['current_chat_id']
                         assert b == (await db.get_conversation_state())['telegram_conversation_id']
+                    elif scenario == 'queue_double_submit':
+                        original_enqueue = db.queue_enqueue
+                        writes, release_write = [], asyncio.Event()
+                        async def slow_write(**kwargs):
+                            writes.append(kwargs)
+                            await release_write.wait()
+                            return await original_enqueue(**kwargs)
+                        finish.set()
+                        with patch.object(db, 'queue_enqueue', slow_write):
+                            await keys('one submitted text\r\r', .3)
+                            assert len(writes) == 1 and buf.text == 'one submitted text'
+                            release_write.set()
+                            await wait_for(lambda: len(calls) == 1 and not manager.lock.busy())
+                        assert buf.text == ''
+                    elif scenario == 'queue':
+                        from prompt_toolkit.formatted_text import to_formatted_text
+                        from prompt_toolkit.mouse_events import MouseEventType
+                        from types import SimpleNamespace
+                        async def queue_click(label):
+                            for control in app.layout.find_all_controls():
+                                try:
+                                    parts = to_formatted_text(getattr(control, 'text', ''))
+                                except Exception:
+                                    continue
+                                for part in parts:
+                                    if len(part) == 3 and part[1].strip() == label:
+                                        part[2](SimpleNamespace(event_type=MouseEventType.MOUSE_UP))
+                                        await keys('', .25)
+                                        return
+                            raise AssertionError('Queue action not found: '+label)
+                        await keys('current task\r')
+                        await asyncio.wait_for(entered.wait(),5)
+                        await keys('queued cancel\r')
+                        await keys('queued edit\r')
+                        assert buf.text == '' and len(calls) == 1
+                        assert len((await cli._ns['get_text_queue']().snapshot(a))['items']) == 2
+                        await queue_click('[❌]')
+                        await keys('existing draft')
+                        await queue_click('[编辑]')
+                        assert buf.text == 'queued edit\n\nexisting draft', repr(buf.text)
+                        assert not (await cli._ns['get_text_queue']().snapshot(a))['items']
+                        buf.reset()
+                        await keys('paused input\r')
+                        await manager.request_stop(manager._run_id)
+                        finish.set()
+                        await wait_for(lambda: not manager.lock.busy())
+                        assert (await cli._ns['get_text_queue']().snapshot(a))['paused']
+                        await work.refresh_state()
+                        await queue_click('[继续发送]')
+                        await wait_for(lambda: len(calls)==2 and not manager.lock.busy())
                     elif scenario == 'stale':
                         await keys('旧上下文草稿')
                         with bind_conversation(await manager.resolve(a, selector='terminal')):
@@ -136,7 +188,7 @@ async def actual_tui(cli, scenario='routing'):
                     elif scenario == 'write_failure':
                         from unittest.mock import AsyncMock
                         await keys('失败时保留的草稿')
-                        with patch.object(cli.GlobalRecorder, 'record_user_message', AsyncMock(return_value=None)):
+                        with patch.object(db, 'queue_enqueue', AsyncMock(side_effect=OSError('fixture disk full'))):
                             await keys('\r', .5)
                         assert not calls and buf.text == '失败时保留的草稿'
                         assert '失败时保留的草稿' not in str(screen.model.render_rows())

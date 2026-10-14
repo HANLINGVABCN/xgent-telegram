@@ -37,3 +37,9 @@ print(json.dumps({'tui':a,'line':b}))
 
     def test_failed_persistence_does_not_lose_draft_or_call_model(self):
         self.probe('write_failure')
+
+    def test_queue_cancel_edit_and_resume_with_real_controls(self):
+        self.probe('queue')
+
+    def test_repeated_enter_during_queue_write_is_one_submission(self):
+        self.probe('queue_double_submit')

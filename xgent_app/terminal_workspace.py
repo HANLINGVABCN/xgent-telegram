@@ -118,6 +118,8 @@ class TerminalWorkspace:
     async def refresh_state(self):
         db = await self.manager.factory()
         self.on_state({**await self.manager.state(), 'items': await db.get_all_sessions()})
+        if self.config is not None and self.config.get('_cli_queue_notifier'):
+            await self.config['_cli_queue_notifier']()
         if self.config is not None:
             model = str(await db.get_config_fresh('default_model', '') or '')
             if model != self.model_name:

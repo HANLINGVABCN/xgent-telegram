@@ -228,6 +228,21 @@ def _history_display_html(content: str) -> str | None:
         return None
 
 
+def history_web_display(content: str, display=None):
+    """Reconstruct semantic prose for old records without changing frozen folding.
+
+    Old display snapshots already encode whether protocol blocks were folded.
+    Only records without a snapshot consult the current preference, as before.
+    """
+    from .web_display import build_web_display
+    if isinstance(display, dict) and isinstance(display.get('content'), str):
+        folded = '<blockquote expandable' in display['content']
+    else:
+        ns = _section_ns()
+        folded = bool(ns and ns['_should_hide_protocol_blocks']())
+    return build_web_display(content, fold=folded)
+
+
 def build_history_message(
     record: dict[str, Any], storage_root: str | Path, workspace_root: str | Path,
 ) -> dict[str, Any]:
@@ -254,10 +269,16 @@ def build_history_message(
         metadata = {}
         message["media_error"] = "\u5386\u53f2\u9644\u4ef6\u5143\u6570\u636e\u635f\u574f"
     live = metadata.get('web_live')
+    if isinstance(metadata.get('queue_id'), str):
+        message['queue_id'] = metadata['queue_id']
     if (isinstance(live, dict) and isinstance(live.get('epoch'), str)
             and isinstance(live.get('message_ids'), list)):
         message['web_live'] = {'epoch': live['epoch'], 'message_ids': [mid for mid in live['message_ids'] if type(mid) is int]}
     display = metadata.get("display")
+    if kind in {'ai_reply', 'media_reply'}:
+        web_display = metadata.get('web_display')
+        message['web_display'] = (web_display if isinstance(web_display, dict) else
+                                  history_web_display(content, display))
     if isinstance(display, dict) and isinstance(display.get("content"), str):
         from .protocols import ProtocolParser
         from .output_archive import attach_archive_path

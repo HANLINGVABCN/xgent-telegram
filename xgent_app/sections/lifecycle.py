@@ -8,6 +8,7 @@
 TELEGRAM_COMMAND_DESCRIPTIONS = (
     ("start", "打开主菜单"),
     ("chats", "管理与切换会话"),
+    ("queue", "查看与管理待发消息"),
     ("new", "新建会话"),
     ("config", "打开设置面板"),
     ("update", "更新代码并重启"),
@@ -117,6 +118,7 @@ async def boot_core() -> None:
     """
     await UserDataManager.init()
     await BotMemoryDB.get_instance()
+    await get_text_queue().start()
     get_conversations().start()
 
 

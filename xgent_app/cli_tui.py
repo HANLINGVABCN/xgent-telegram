@@ -705,6 +705,9 @@ class TuiHooks:
     load_older: Optional[Callable[[], Any]] = None
     running: Callable[[], dict] = lambda: {}
     completed: Callable[[], dict] = lambda: {}
+    queue_snapshot: Callable[[], dict] = lambda: {'items': []}
+    queue_action: Optional[Callable[..., Any]] = None
+    take_queue_edits: Callable[[], list] = lambda: []
 
 
 def fit_title(text, width):
@@ -1289,6 +1292,74 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
         finally:
             view['changing'] = False
 
+    recovered_queue_edits = set()
+    queue_requests = {}
+    queue_expanded = [False]
+
+    def _recover_queue_edit(cid, text, key):
+        if key in recovered_queue_edits:
+            return
+        recovered_queue_edits.add(key)
+        snapshot = dict(hooks.conversation())
+        old = input_buffer.text if view['id'] == cid else drafts.get(cid, ('', 0, snapshot))[0]
+        merged = text + ('\n\n' + old if old else '')
+        drafts[cid] = (merged, len(text), snapshot)
+        if view['id'] == cid:
+            input_buffer.set_document(Document(merged, len(text)))
+            if app_ref:
+                app_ref[0].layout.focus(input_window)
+
+    def _queue_click(action, item=None):
+        def clicked(event):
+            if event.event_type != MouseEventType.MOUSE_UP or not hooks.queue_action:
+                return
+            import uuid
+            cid = item['conversation_id'] if item else hooks.conversation().get('conversation_id')
+            key = (item.get('id', cid) if item else cid, action)
+            pending = queue_requests.setdefault(key, {'busy': False, 'id': uuid.uuid4().hex})
+            if pending['busy']:
+                return
+            pending['busy'] = True
+            async def run():
+                try:
+                    result = await hooks.queue_action(action, item, pending['id'])
+                    if action == 'edit':
+                        _recover_queue_edit(cid, result['text'], pending['id'])
+                    queue_requests.pop(key, None)
+                except Exception as exc:
+                    pending['busy'] = False
+                    _flash(str(exc), 6)
+                _invalidate()
+            app_ref[0].create_background_task(run())
+        return clicked
+
+    def _queue_fragments():
+        from .queue_store import REASONS
+        data = hooks.queue_snapshot()
+        items = data.get('items') or []
+        result = [('class:hint', f' 待发 {len(items)} 条 · /queue 管理 ')]
+        if data.get('paused') and data.get('reason') != 'ask':
+            result.append(('class:title.name', '[继续发送] ', _queue_click('resume', data)))
+        def expand(event):
+            if event.event_type == MouseEventType.MOUSE_UP:
+                queue_expanded[0] = not queue_expanded[0]
+                _invalidate()
+        if len(items) > 3:
+            result.append(('class:title.name', '[收起]\n' if queue_expanded[0] else '[展开]\n', expand))
+        else:
+            result.append(('', '\n'))
+        for item in items[:12 if queue_expanded[0] else 3]:
+            preview = fit_title(item['text'], max(12, _columns() - 30))
+            result += [('class:hint', f" {item['id'][:8]} {preview} "),
+                       ('class:title.warn', '[❌]', _queue_click('cancel', item)),
+                       ('class:title.name', ' [编辑]', _queue_click('edit', item)),
+                       ('class:hint', '\n ' + REASONS.get(item['reason'], '排队中') + '\n')]
+        return result[:-1] + [('class:hint', result[-1][1].rstrip('\n'))] if result else []
+
+    queue_window = ConditionalContainer(Window(FormattedTextControl(_queue_fragments),
+        height=D(min=1, max=9), wrap_lines=False), filter=Condition(lambda: bool(
+            hooks.queue_snapshot().get('items') or hooks.queue_snapshot().get('paused'))))
+
     # -- 顶栏 / 分隔 / 底栏 ---------------------------------------------------
     def _columns() -> int:
         try:
@@ -1433,6 +1504,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
         event.app.layout.focus(output_window)
         _invalidate()
 
+    pending_submissions = {}
     @kb.add("enter", filter=in_input)
     def _submit(event):
         _sync_view()
@@ -1449,6 +1521,14 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
             return
         snapshot = dict(view['binding'])
         submitted_cid = view['id']
+        import uuid
+        submission_key = (submitted_cid, snapshot.get('generation'), text)
+        pending = pending_submissions.setdefault(submission_key, {'id': uuid.uuid4().hex, 'busy': False})
+        if pending['busy']:
+            _flash('正在接收这条消息，请勿重复提交')
+            return
+        pending['busy'] = True
+        snapshot['queue_request_id'] = pending['id']
         accepted = False
         def admitted():
             nonlocal accepted
@@ -1462,7 +1542,8 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
             if view['id'] == submitted_cid and input_buffer.text == text:
                 buf.append_to_history()
                 buf.reset()
-                output_window.follow = True
+                if hooks.queue_action is None or not hooks.turn_active():
+                    output_window.follow = True
             else:
                 old = drafts.get(submitted_cid)
                 if old and old[0] == text:
@@ -1486,6 +1567,9 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
             except Exception as exc:
                 _flash(f'处理出错：{exc}', 6)
             finally:
+                pending['busy'] = False
+                if accepted:
+                    pending_submissions.pop(submission_key, None)
                 state['busy'] = max(0, state['busy'] - 1)
                 _invalidate()
             if should_exit:
@@ -1810,6 +1894,7 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
             archive_window,
             help_window,
             rule_window,
+            queue_window,
             input_window,
             hint_window,
         ]),
@@ -1852,6 +1937,8 @@ async def run_tui(screen: "PtScreen", hooks: TuiHooks) -> None:
 
     def _on_change() -> None:
         _sync_view()
+        for edit in hooks.take_queue_edits():
+            _recover_queue_edit(edit['conversation_id'], edit['text'], edit['id'])
         app.invalidate()
 
     async def _ticker():

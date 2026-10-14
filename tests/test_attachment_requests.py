@@ -110,6 +110,11 @@ class AttachmentRequestTests(unittest.TestCase):
         self.assertEqual(3, len(result))
         self.assertTrue(all(result.values()), result)
 
+    def test_same_length_upload_edits_and_restart_refresh_current_metadata(self):
+        root = self.root / 'mutable-upload'
+        self.assertTrue(all(probe('mutate_upload_and_leave_new_version', root).values()))
+        self.assertTrue(all(probe('mutated_upload_after_restart', root).values()))
+
 
 if __name__ == "__main__":
     unittest.main()

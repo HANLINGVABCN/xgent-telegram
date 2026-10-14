@@ -17,6 +17,7 @@ from xgent_app.conversations import (
     DEFAULT_CONVERSATION_ID, DEFAULT_CONVERSATION_NAME, SCHEMA_VERSION,
     ConversationError, ExecutionFileLock, current_scope, require_conversation_id,
 )
+from xgent_app.queue_store import QueueStore, migrate_queue
 
 
 async def _config(conn, key, default=None):
@@ -32,7 +33,7 @@ async def _set_config(conn, key, value):
                        (key, json.dumps(value, ensure_ascii=False)))
 
 
-class ConversationStore:
+class ConversationStore(QueueStore):
     async def backup_legacy_conversations(self):
         conn = await self._get_conn()
         cursor = await conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -172,6 +173,9 @@ class ConversationStore:
                 active = await _config(conn, 'current_chat_id')
                 await _set_config(conn, 'telegram_conversation_id', active)
                 await _set_config(conn, 'conversation_schema_version', 3)
+            if version < 4:
+                await migrate_queue(conn)
+                await _set_config(conn, 'conversation_schema_version', 4)
         self._config_cache.clear()
 
     async def _context_start(self, conn):
@@ -250,6 +254,9 @@ class ConversationStore:
             for table in ('global_messages','chat_messages','context_compressions','context_compression_jobs'):
                 await conn.execute(f'DELETE FROM {table} WHERE session_id=?', (cid,))
             await conn.execute('DELETE FROM ui_messages WHERE conversation_id=?', (cid,))
+            await conn.execute('DELETE FROM message_queue WHERE conversation_id=?', (cid,))
+            await conn.execute('DELETE FROM message_queue_controls WHERE conversation_id=?', (cid,))
+            await conn.execute('DELETE FROM message_queue_requests WHERE conversation_id=?', (cid,))
             for table, key in (('cli_relay_ops','conversation_context'),('channel_outbox','_conversation_context'),('channel_deadletter','_conversation_context')):
                 cursor = await conn.execute(f'SELECT id,payload FROM {table}')
                 ids = []
@@ -364,6 +371,7 @@ class ConversationStore:
             if running.get('stop_requested'):
                 return True
             running['stop_requested'] = True
+            await self._queue_pause_all(conn, 'stopped')
             await _set_config(conn, 'conversation_running', running)
             await _set_config(conn, 'conversation_revision', int(await _config(conn, 'conversation_revision', 0)) + 1)
             return True

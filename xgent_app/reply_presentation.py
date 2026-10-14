@@ -10,10 +10,12 @@ _current = contextvars.ContextVar('reply_presentation', default=None)
 def track_reply_presentation(function):
     @functools.wraps(function)
     async def wrapped(*args, **kwargs):
+        from .reply_delivery import live_reply_delivery
         state = {'active': True, 'ids': None}
         token = _current.set(state)
         try:
-            return await function(*args, **kwargs)
+            with live_reply_delivery():
+                return await function(*args, **kwargs)
         finally:
             state['active'] = False
             _current.reset(token)
@@ -24,6 +26,11 @@ def bind_reply_message_ids(ids):
     state = _current.get()
     if state and state['active']:
         state['ids'] = ids
+
+
+def reply_message_ids():
+    state = _current.get()
+    return state['ids'] if state and state['active'] else None
 
 
 def remember_reply_messages(messages):

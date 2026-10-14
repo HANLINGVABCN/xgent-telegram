@@ -47,6 +47,7 @@ class UiScope:
     message_id: int | None = None
     revision: int | None = None
     guard: str | None = None
+    last_binding: dict | None = None
 
 
 def configure_ui_history(factory, resolve, guard) -> None:
@@ -224,6 +225,12 @@ async def capture_ui_frame(frame: dict, chat_id: int, *, source=None) -> dict:
         return frame
     if bind:
         bind.revision = row['revision']
+    if isinstance(scope, UiScope):
+        scope.last_binding = {
+            'generation': row['generation'], 'capture_text': scope.capture_text,
+            'ui_message_id': row['ui_message_id'], 'message_id': frame.get('message_id'),
+            'revision': row['revision'], 'guard': scope.guard,
+        }
     display = ui_record(row)
     return {
         **frame, 'ui_message_id': display['ui_message_id'], 'revision': display['revision'],
@@ -290,6 +297,8 @@ def saved_ui_binding():
     scope = _scope.get()
     if not isinstance(scope, UiScope):
         return None
+    if scope.last_binding is not None:
+        return dict(scope.last_binding)
     return {key: getattr(scope,key) for key in ('generation','capture_text','ui_message_id','message_id','revision','guard')}
 
 

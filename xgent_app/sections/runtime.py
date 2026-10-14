@@ -237,6 +237,7 @@ def build_application() -> Any:
     app.add_handler(CommandHandler("start", telegram_entry(mirror_to_web(cmd_start))))
     for cmd, handler in (
         ("chats", cmd_chats),
+        ("queue", cmd_queue),
         ("new", cmd_new_chat),
         ("config", cmd_settings_menu),
         ("update", cmd_update_system),

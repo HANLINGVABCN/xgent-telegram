@@ -4,6 +4,7 @@ from xgent_app.telegram_presentation import telegram_label, label_enabled, strea
 
 from xgent_app.protocols import ProtocolParser
 from xgent_app.reply_presentation import track_reply_presentation, bind_reply_message_ids, remember_reply_messages
+from xgent_app.web_display import web_text_response, web_stream_display
 
 
 def _should_hide_protocol_blocks() -> bool:
@@ -126,6 +127,7 @@ class TelegramRichAPI:
         return result
 
 @without_ui_history
+@web_text_response
 async def rich_finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
                                        msg: Any, response: str, limit: int = RICH_MESSAGE_CHAR_LIMIT):
     """使用 Rich Message 发送最终回复。失败时 fallback 到旧 HTML 编辑模式。"""
@@ -812,6 +814,7 @@ async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
     return sent
 
 @without_ui_history
+@web_text_response
 async def finalize_text_response(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg: Any,
                                  response: str, limit: int = 4000):
     limit = min(limit, 3900)
@@ -1047,6 +1050,8 @@ class TelegramStreamRenderer:
         self.chat_id = chat_id
         self.current_msg = msg
         self.message_ids = [getattr(msg, 'message_id', None)]
+        self._web_messages = [msg]
+        self._web_chunks = []
         self.reply_markup = reply_markup
         self.limit = limit
         self.stop_event = stop_event
@@ -1060,6 +1065,7 @@ class TelegramStreamRenderer:
         self._last_display: Optional[str] = None
         self.pending_text = ""
         self._task: Optional[asyncio.Task] = None
+        self._closing = False
         self.live_edit_enabled = True
         # Rich Message Draft 模式
         # draft_id 由 bot 自行生成（API 要求非零整数），相同 draft_id 的调用会动画过渡更新
@@ -1111,6 +1117,38 @@ class TelegramStreamRenderer:
     def start(self):
         self._task = asyncio.create_task(self._render_loop())
 
+    async def _render_web_reply(self, *, final=False, stopped=False):
+        """One semantic Web bubble, stable and size-safe Telegram transport parts.
+
+        The model accumulator is untouched. Re-rendering the whole display keeps
+        Markdown fences and folded protocols intact at transport split boundaries.
+        """
+        raw = ''.join(self.response_parts)
+        display = self._display_html(raw, hide_unclosed=not final)
+        if stopped:
+            display += ('\n\n⏹️ 已停止，保留以上已生成内容。' if raw.strip() else
+                        '⏹️ 已停止，还没有生成可保留的内容。')
+        chunks = split_html_for_telegram(display or ' ', 3900)
+        for index, chunk in enumerate(chunks):
+            active = not final and index == len(chunks) - 1
+            markup = self.reply_markup if active else None
+            if index == len(self._web_messages):
+                with telegram_label('auto'):
+                    message = await self.context.bot.send_message(
+                        chat_id=self.chat_id, text=chunk, reply_markup=markup,
+                        parse_mode=constants.ParseMode.HTML,
+                    )
+                self._web_messages.append(message)
+                self.message_ids.append(message.message_id)
+            elif index >= len(self._web_chunks) or self._web_chunks[index] != (chunk, active):
+                await safe_edit_text(self._web_messages[index], chunk, reply_markup=markup,
+                                     parse_mode=constants.ParseMode.HTML)
+        for message in self._web_messages[len(chunks):]:
+            await message.delete()
+        del self._web_messages[len(chunks):]
+        self._web_chunks = [(chunk, not final and i == len(chunks) - 1) for i, chunk in enumerate(chunks)]
+        self.current_msg = self._web_messages[-1]
+
     async def append(self, text: str):
         if not text:
             return
@@ -1125,6 +1163,8 @@ class TelegramStreamRenderer:
         return ''.join(self.response_parts).strip()
 
     async def cancel(self):
+        self._closing = True
+        self.queue.put_nowait(None)
         if self._task and not self._task.done():
             self._task.cancel()
             try:
@@ -1133,15 +1173,26 @@ class TelegramStreamRenderer:
                 pass
 
     @stream_part
+    @web_stream_display(final=True, stopped=True)
     async def stop_and_keep_partial(self) -> str:
         """Stop live rendering, flush pending text, and keep already generated content visible."""
-        if self.pending_text:
-            await self._flush_pending()
+        self._closing = True
+        self.queue.put_nowait(None)
         if self._task and not self._task.done():
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
+        while not self.queue.empty():
+            chunk = self.queue.get_nowait()
+            if chunk is not None:
+                self.pending_text += chunk
+        if self.pending_text:
+            await self._flush_pending()
         partial = ''.join(self.response_parts).strip()
+        if self._is_web_bot:
+            if self.live_edit_enabled:
+                await self._render_web_reply(final=True, stopped=True)
+            return partial
         # 折叠开：定稿显示走 <blockquote expandable> HTML + 块边界分段（HTML 通道）。
         # 返回值 partial 恒为原始文本，落库不受影响。
         if self._hide_blocks:
@@ -1186,9 +1237,14 @@ class TelegramStreamRenderer:
         return partial
 
     @stream_part
+    @web_stream_display(final=True)
     async def remove_controls(self):
         """流式完成后：用 Rich Message 发送最终内容，删除旧占位消息。"""
         if not self.current_text.strip():
+            return
+        if self._is_web_bot:
+            if self.live_edit_enabled:
+                await self._render_web_reply(final=True)
             return
         # 折叠开：定稿产出最终 <blockquote expandable> HTML，走 HTML 通道并在块边界
         # 分段（单条 safe_edit_text 无法分段，故用 finalize_html_response）。current_text
@@ -1226,7 +1282,10 @@ class TelegramStreamRenderer:
                 logger.debug(f"移除流式停止按钮失败: {e}")
 
     async def _render_loop(self):
-        while True:
+        # Python 3.10/3.11 wait_for can swallow cancellation when queue.get()
+        # completes concurrently. A persistent closing flag + sentinel prevents
+        # entering a new wait forever after stop/cancel (CI regression).
+        while not self._closing:
             if self.stop_event and self.stop_event.is_set():
                 break
             try:
@@ -1246,11 +1305,21 @@ class TelegramStreamRenderer:
                 await self._flush_pending()
 
     @stream_part
+    @web_stream_display()
     async def _flush_pending(self):
         if not self.pending_text:
             return
         text = self.pending_text
         self.pending_text = ""
+        if self._is_web_bot:
+            self.current_text += text
+            if self.live_edit_enabled:
+                try:
+                    await self._render_web_reply()
+                except Exception as exc:
+                    self.live_edit_enabled = False
+                    logger.warning('Web 流式显示失败，结束后重发定稿: %s', exc)
+            return
 
         # 溢出判定按「显示长度」：隐藏时折叠后的正文更短，分段更晚触发（合理）；
         # 不隐藏时 _display_text 原样返回，len 与原来完全一致，行为不变。
@@ -1599,6 +1668,8 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             return None
 
         if stream_timed_out:
+            from xgent_app.message_queue import mark_outcome
+            mark_outcome('failed')
             waited = int(_stream_chunk_idle_timeout_seconds())
             timeout_notice = (
                 f"\n\n⏱️ 已超过 {waited} 秒没有收到新内容，本次流式回复被中断。"
@@ -1954,6 +2025,8 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
             return None
 
         if stream_timed_out:
+            from xgent_app.message_queue import mark_outcome
+            mark_outcome('failed')
             waited = int(_stream_chunk_idle_timeout_seconds())
             timeout_notice = (
                 f"\n\n⏱️ 已超过 {waited} 秒没有收到新内容，本次流式回复被中断。"

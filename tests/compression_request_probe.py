@@ -89,6 +89,43 @@ class CompressionHarness(Harness):
         await self.bot.handle_button_click(update, context)
 
 
+async def mutable_upload_compression(bot, root):
+    from tests.lossless_context_probe import latest_job
+    async with CompressionHarness(bot, root) as h:
+        ref = await h.add_upload(b'ORIGINAL-UPLOAD', 'editable.txt')
+        path = Path(bot.ArtifactManager.UPLOAD_DIR) / ref['path']
+        current = b'CURRENT-FULL-UPLOAD\n' + b'complete contents\n' * 1000
+        path.write_bytes(current)
+        snapshot = await h.db.get_compression_snapshot()
+        frozen = await bot.build_compression_history(snapshot, 'compress current version')
+        assert current.decode() in contents({'messages': frozen})
+        # A subsequent edit must not alter the already assembled compression request.
+        path.write_bytes(b'AFTER-REQUEST-SNAPSHOT')
+        assert current.decode() in contents({'messages': frozen})
+        assert 'AFTER-REQUEST-SNAPSHOT' not in contents({'messages': frozen})
+        await h.compress()
+        assert (await latest_job(h.db))['status'] == 'completed'
+        assert 'AFTER-REQUEST-SNAPSHOT' in contents(h.requests[-1])
+        archive = Path((await h.db.get_latest_compression())['archive_path'])
+        archive_bytes = archive.read_bytes()
+        # Missing uploads fail compression only. Ordinary chat retains the reference
+        # and explicitly describes unavailability, then recovers after file restore.
+        missing = await h.add_upload(b'WILL-RETURN', 'missing.txt')
+        missing_path = Path(bot.ArtifactManager.UPLOAD_DIR) / missing['path']
+        missing_path.unlink()
+        before = len(h.requests)
+        await h.compress()
+        assert (await latest_job(h.db))['status'] == 'failed' and len(h.requests) == before
+        await h.call(question='continue without the missing file')
+        assert '附件暂不可用' in contents(h.requests[-1])
+        missing_path.write_bytes(b'RESTORED-CURRENT-CONTENT')
+        await h.call(question='read the restored file')
+        assert 'RESTORED-CURRENT-CONTENT' in contents(h.requests[-1])
+        assert archive.read_bytes() == archive_bytes
+        return {'compression_current_and_frozen': True, 'ordinary_chat_survives': True,
+                'restore_reread': True, 'archive_unchanged': True}
+
+
 async def sse_compression(bot, root):
     def frame(value):
         return 'data: ' + json.dumps(value) + '\n\n'

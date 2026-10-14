@@ -19,7 +19,7 @@ from typing import Any
 
 DEFAULT_CONVERSATION_ID = 'global_memory'
 DEFAULT_CONVERSATION_NAME = '默认会话'
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class ConversationError(ValueError):
@@ -118,7 +118,7 @@ def restore_reply_route(snapshot):
 
 def stamp_frame(frame: dict) -> dict:
     scope = current_scope(required=False)
-    if scope is None or frame.get('type') in {'conversation_state', 'settings_state', 'knowledge_state'}:
+    if scope is None or frame.get('type') in {'conversation_state', 'settings_state', 'knowledge_state', 'queue_state'}:
         return dict(frame)
     return {'conversation_id': scope.conversation_id, 'generation': scope.generation,
             'run_id': scope.run_id, 'conversation_name': scope.name, **frame}
@@ -194,6 +194,9 @@ class ConversationManager:
         self._last_state = None
         self._stop_event = None
         self._run_id = None
+        self._reply_delivery = None
+        self.text_queue = None
+        self._run_outcome = 'completed'
         self._admission_lock = asyncio.Lock()
         self.maintenance = None
         self.terminal_enabled = False
@@ -227,9 +230,19 @@ class ConversationManager:
         db = await self.factory()
         state = await db.get_conversation_state()
         # A dead owner leaves metadata, not a live lock. Never resurrect that run.
-        if state.get('running') and not self.lock.busy():
-            await db.finish_conversation_run(state['running']['run_id'])
-            state['running'] = None
+        if state.get('running') and self._run_id is None:
+            probe = ExecutionFileLock(self.lock.path.removesuffix('.turn.lock'))
+            if probe.acquire():
+                try:
+                    # Hold the OS slot across the database awaits. Another process
+                    # cannot start a new run between "not busy" and recovery.
+                    state = await db.get_conversation_state()
+                    if state.get('running'):
+                        await db.queue_finish_run(state['running']['run_id'], 'interrupted')
+                        await db.finish_conversation_run(state['running']['run_id'])
+                        state['running'] = None
+                finally:
+                    probe.release()
         return await self._terminal_state(state)
 
     async def resolve(self, conversation_id=None, *, expected=False, allow_archived=False, selector=None):
@@ -288,6 +301,10 @@ class ConversationManager:
                     raise ConversationChanged('对话已清空或压缩，旧操作未提交。')
                 scope = dataclasses.replace(scope, run_id=uuid.uuid4().hex)
                 self._run_id = scope.run_id
+                self._run_outcome = 'completed'
+                if scope.origin == 'web' and scope.purpose == 'chat':
+                    from .reply_delivery import WebRunDelivery
+                    self._reply_delivery = WebRunDelivery(scope)
                 self._completions = []
                 self._stop_event = asyncio.Event()
                 db = await self.factory()
@@ -295,9 +312,13 @@ class ConversationManager:
                     'run_id': scope.run_id, 'conversation_id': scope.conversation_id,
                     'name': scope.name, 'pid': os.getpid(), 'started_at': time.time(),
                     'stop_requested': False,
+                    'queue_instance': self.text_queue.instance if self.text_queue else None,
                 })
                 await self.poll_once()
             except BaseException:
+                if self._reply_delivery is not None:
+                    self._reply_delivery.close()
+                    self._reply_delivery = None
                 self._run_id = None
                 self._stop_event = None
                 self.lock.release()
@@ -308,6 +329,8 @@ class ConversationManager:
                 try:
                     yield scope
                 except BaseException as exc:
+                    if acquired:
+                        self._run_outcome = 'stopped' if isinstance(exc, asyncio.CancelledError) else 'failed'
                     if not hasattr(exc, 'conversation_context'):
                         exc.conversation_context = dataclasses.asdict(current_scope())
                     raise
@@ -317,8 +340,13 @@ class ConversationManager:
             if inherited and not inherited.run_id and final_scope and inherited.conversation_id == final_scope.conversation_id and inherited.generation != final_scope.generation:
                 _scope.set(dataclasses.replace(inherited, generation=final_scope.generation))
             if acquired:
+                if self._reply_delivery is not None:
+                    self._reply_delivery.close()
+                    self._reply_delivery = None
                 try:
                     db = await self.factory()
+                    outcome = 'stopped' if self._stop_event and self._stop_event.is_set() else self._run_outcome
+                    await db.queue_finish_run(scope.run_id, outcome)
                     await db.finish_conversation_run(scope.run_id)
                 finally:
                     self._run_id = None
@@ -376,6 +404,16 @@ class ConversationManager:
             await self.maintenance()
         state = await self.state()
         running = state.get('running') or {}
+        delivery = self._reply_delivery
+        if delivery is not None and delivery.active and not delivery.subscribed and (
+                running.get('run_id') == delivery.scope.run_id and
+                state.get('telegram_conversation_id') == delivery.scope.conversation_id):
+            db = await self.factory()
+            session = await db.get_session(delivery.scope.conversation_id)
+            if session and not session.get('deleting') and session['generation'] == delivery.scope.generation:
+                delivery.subscribe()
+            else:
+                delivery.close()
         if running.get('run_id') == self._run_id and running.get('stop_requested') and self._stop_event:
             self._stop_event.set()
         encoded = json.dumps(state, sort_keys=True, ensure_ascii=False)
@@ -385,6 +423,8 @@ class ConversationManager:
                 result = self.notify(state)
                 if hasattr(result, '__await__'):
                     await result
+        if self.text_queue is not None:
+            await self.text_queue.poll()
         return state
 
     def start(self):
@@ -409,6 +449,8 @@ class ConversationManager:
         task.add_done_callback(self._background.discard)
 
     async def close(self):
+        if self.text_queue is not None:
+            self.text_queue._closed = True
         tasks = list(self._background)
         for task in tasks:
             task.cancel()
@@ -419,6 +461,8 @@ class ConversationManager:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._poll_task
             self._poll_task = None
+        if self.text_queue is not None:
+            await self.text_queue.close()
 
 
 def configure_conversations(factory, database_path, notify=None):
@@ -495,7 +539,7 @@ def bind_callback_markup(markup):
         bound = []
         for button in row:
             data = getattr(button, 'callback_data', None)
-            if data and not str(data).startswith(('cv:', 'act_stop_generation')):
+            if data and not str(data).startswith(('cv:', 'act_stop_generation', 'q:')):
                 fields = button.to_dict()
                 action = _callback_resolver(str(data))
                 fields['callback_data'] = _callback_encoder(f'cv:{scope.generation}:{action}')

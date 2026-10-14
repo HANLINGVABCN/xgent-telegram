@@ -234,6 +234,9 @@ class _CliRelay:
         payload['conversation_context'] = snapshot
         from xgent_app.telegram_presentation import presentation_snapshot
         payload['telegram_presentation'] = presentation_snapshot()
+        from xgent_app.web_display import current_web_display
+        if op in {'send_message', 'edit_message_text'} and current_web_display() is not None:
+            payload['web_display'] = current_web_display()
         from xgent_app.ui_history import relay_ui_context
         ui_context = relay_ui_context()
         if ui_context is not None:
@@ -367,7 +370,7 @@ def relay_enabled() -> bool:
     return _RELAY.enabled
 
 
-def relay_user_message(text: str) -> None:
+def relay_user_message(text: str, *, queue_origin=None, queue_id=None) -> None:
     """用户自己在 CLI 里说的那句话。
 
     **这是全流程里唯一带来源标识的地方**：Telegram/网页那边显示成
@@ -375,7 +378,7 @@ def relay_user_message(text: str) -> None:
     最终回复）都与原生 Telegram 会话逐字一致，不加任何标记、不加任何额外
     文案。加标识的动作放在服务端回放时做，这里只负责把原话送过去。
     """
-    _RELAY.emit("user_echo", text=str(text))
+    _RELAY.emit("user_echo", text=str(text), **({'queue_origin': queue_origin, 'queue_id': queue_id} if queue_id else {}))
 
 
 def relay_conversation_event(frame: dict) -> None:

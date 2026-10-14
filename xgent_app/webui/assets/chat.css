@@ -126,10 +126,8 @@
     font-family: var(--font);
     font-size:calc(var(--web-ui-font-size,13px) * 1.15385);
     line-height: 1.6;
-    letter-spacing: -0.008em;
+    letter-spacing: normal;
     display: flex; flex-direction: column;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
     transition: background 0.26s var(--ease), color 0.26s var(--ease);
   }

@@ -233,11 +233,14 @@ def _cli_operation(*, execution=False):
                         if expired and function.__name__ == '_run_conversation':
                             raise ConversationChanged('之前的录入已因上下文变化取消；本次内容未提交，请重新操作。')
                         execute = execution() if callable(execution) else execution
+                        ordinary_text = function.__name__ == '_run_conversation' and UserDataManager.get('state') == BotState.IDLE
+                        if ordinary_text:
+                            execute = False  # Durable queue admission never takes the model slot.
                         command_name = ''
                         if function.__name__ == '_run_command':
                             command_name = text.strip().split(' ', 1)[0].lstrip('/').split('@', 1)[0].lower()
                             execute = command_name == 'compress' or _resolve_command(command_name) is None
-                        purpose = ('chat' if execute and UserDataManager.get('state') == BotState.IDLE and
+                        purpose = ('chat' if ordinary_text or execute and UserDataManager.get('state') == BotState.IDLE and
                                    (function.__name__ != '_run_command' or _resolve_command(command_name) is None)
                                    else 'management')
                         with interaction('cli', purpose):
@@ -1030,15 +1033,17 @@ async def _run_conversation(text: str) -> None:
 
     set_turn_kind("chat")
     try:
-        # 对话文本带 origin=cli-chat 标记：标记这是 CLI 的对话文本（区别于
-        # 状态机输入），跨端历史据此识别来源。
-        await _record_terminal_user(text)
-        # 把用户自己的这句话送到另外两端。**这是全流程里唯一带来源标识的
-        # 地方**（Telegram/网页显示成 "🖥 [CLI]" 加原话）——接下来
-        # process_conversation 产生的每一条消息都由 CliBot 逐个中继过去，
-        # 与在 Telegram 里直接对话逐条一致，不加任何标记、不加任何额外文案。
-        relay_user_message(text)
-        await process_conversation(update, context, text)
+        receipt = current_submission()
+        if receipt is not None:
+            request_id = receipt.snapshot.setdefault('queue_request_id', uuid.uuid4().hex)
+        else:
+            request_id = uuid.uuid4().hex
+        item = await _ns['submit_ordinary_text'](text, chat_id=BotConfig.AUTHORIZED_USER_ID,
+                                               request_key='cli:' + request_id)
+        if receipt is not None:
+            receipt.admit()
+        if not isinstance(SCREEN, cli_tui.PtScreen):
+            SCREEN.notice(f"⏳ 已接收 {item['id'][:8]}；/queue 查看、取消或取回编辑。", 'warn')
     except ConversationError:
         raise
     except Exception:
@@ -1052,7 +1057,9 @@ async def _run_command(command: str) -> None:
     handler = _resolve_command(name)
     update, context, _bot = build_cli_command_objects(BotConfig.AUTHORIZED_USER_ID, command)
     try:
-        if handler is None:
+        if name == 'queue':
+            await _cli_queue_command(command)
+        elif handler is None:
             # 未知命令降级成普通对话：接下来的输出是 AI 正文，不是命令返回。
             set_turn_kind("chat")
             SCREEN.notice(f"未知命令 /{name}，当作普通对话发给 AI（/help 看命令列表）。", "warn")
@@ -1311,12 +1318,10 @@ def _input_box_ansi() -> str:
 def _submit_blocked() -> bool:
     """常驻面板的回车闸门：一轮进行中，或主循环还没回到等输入的位置。
 
-    对齐 Telegram 端忙闸门的语义——忙时回车不提交、草稿留在输入行，提示
-    用户稍候；主循环回到 read() 后再按一次回车即发送。不做排队：用户明确
-    不要"turn 结束后依次发送"。主循环还没回到 read() 的那几毫秒也算忙，
-    否则提交会落进没人等的 future 里被丢掉、草稿却被清空。
+    普通文字可以在模型忙时入队，但主循环尚未等待输入的几毫秒仍不能提交，
+    否则会落入无人等待的 future。是否属于文字/菜单由共同路由判断。
     """
-    return _turn_active or not _READER.waiting()
+    return not _READER.waiting()
 
 
 def _busy_notice(_text: str) -> None:
@@ -1351,6 +1356,7 @@ def _start_input_box() -> None:
         on_busy_submit=_busy_notice,
         box_ansi=_input_box_ansi(),
     )
+    box.defer_submit_clear = True
     attach_input_box(box)
 
 
@@ -1474,7 +1480,7 @@ def _management_input(line):
     if line in (_EXIT, _EOF, _CANCEL, _MENU_DISMISS):
         return True
     text = str(line).strip()
-    if text.split(' ', 1)[0] in {'/chats', '/new', '/getchat', '/menu', '/help', '/clear', '/clear_memory'}:
+    if text.split(' ', 1)[0] in {'/chats', '/new', '/getchat', '/menu', '/help', '/clear', '/clear_memory', '/queue'}:
         return True
     if UserDataManager.get('state') == BotState.RENAME_CHAT:
         return True
@@ -1492,8 +1498,21 @@ def _management_input(line):
             if resolved == action:
                 break
             action = resolved
-        return action.startswith('conv_')
+        return action.startswith(('conv_', 'q:'))
     return False
+
+
+def _allow_queued_input(line):
+    if _management_input(line):
+        return True
+    text = str(line).strip()
+    if UserDataManager.get('state') != BotState.IDLE:
+        return False
+    if text.startswith('/') and '\n' not in text:
+        return False
+    if '\n' not in text and (text.startswith(':') or text.isdigit()) and get_last_menu_options():
+        return False
+    return bool(text)
 
 
 async def _run_turn(coro) -> None:
@@ -1529,8 +1548,8 @@ async def _run_turn(coro) -> None:
                         _request_stop()
                     elif line is _MENU_DISMISS:
                         dismiss_menu()
-                    elif _management_input(line):
-                        await _dispatch_submitted(line)
+                    elif _allow_queued_input(line):
+                        await _dispatch_submitted(line, new_submission=True)
                     else:
                         SCREEN.notice('正在执行；此时可用 /chats 切换查看、/new 新建或 Ctrl+C 停止。新消息未提交。', 'warn')
             except KeyboardInterrupt:
@@ -1542,6 +1561,115 @@ async def _run_turn(coro) -> None:
         _turn_active = False
 
 
+_cli_queue_state = {'items': []}
+_cli_queue_edits = []
+
+
+async def _cli_queue_refresh():
+    global _cli_queue_state
+    cid = _terminal_snapshot().get('conversation_id')
+    if cid:
+        _cli_queue_state = await _ns['get_text_queue']().snapshot(cid)
+    else:
+        _cli_queue_state = {'items': []}
+    if hasattr(SCREEN, 'invalidate'):
+        SCREEN.invalidate()
+
+
+async def _cli_queue_dispatch(batch):
+    scope = current_scope()
+    await _refresh_terminal_model_config()
+    update, context, _ = build_cli_conversation_objects(BotConfig.AUTHORIZED_USER_ID)
+    if _terminal_workspace is not None:
+        _terminal_workspace.begin_run(scope)
+    try:
+        set_turn_kind('chat')
+        for item in batch:
+            _print_user_block(item['text'])
+        await _ns['publish_queued_users'](context, batch)
+        await process_conversation(update, context, batch[-1]['text'], queued_messages=batch)
+    except Exception:
+        from xgent_app.message_queue import mark_outcome
+        mark_outcome('failed')
+        await _report_failure('排队消息')
+        raise
+    finally:
+        if _terminal_workspace is not None:
+            await _terminal_workspace.end_run(scope)
+
+
+def _cli_take_queue_edits():
+    edits = _cli_queue_edits[:]
+    _cli_queue_edits.clear()
+    return edits
+
+
+async def _cli_queue_action(action, item=None, request_id=None):
+    queue = _ns['get_text_queue']()
+    await queue.start()
+    cid = item['conversation_id'] if item else _terminal_snapshot().get('conversation_id')
+    with interaction('cli', 'management'):
+        scope = await get_conversations().resolve(cid, allow_archived=action != 'resume', selector='terminal')
+        with bind_conversation(scope):
+            db = await BotMemoryDB.get_instance()
+            if action == 'resume':
+                snapshot = item or _cli_queue_state
+                if snapshot.get('generation') != scope.generation:
+                    raise ConversationChanged('上下文已改变，请刷新队列。')
+                await db.queue_resume(scope, queue.instance, revision=snapshot.get('revision'),
+                    request_key='resume:' + request_id if request_id else None)
+                result = {'ok': True}
+            else:
+                result = await db.queue_change(cid, item['generation'], item['id'], item['revision'], action, request_id)
+    try:
+        await queue.poll()
+        await _cli_queue_refresh()
+    except Exception:
+        logger.exception('队列操作已提交，显示刷新暂失败')
+    return result
+
+
+async def _cli_queue_command(command):
+    from xgent_app.queue_store import REASONS
+    await _cli_queue_refresh()
+    parts = command.split()
+    action = parts[1] if len(parts) > 1 else 'list'
+    if action == 'resume':
+        await _cli_queue_action('resume')
+        SCREEN.notice('已恢复本对话待发队列。', 'info')
+        return
+    if action in {'cancel', 'edit'} and len(parts) == 3:
+        matches = [item for item in _cli_queue_state['items'] if item['id'].startswith(parts[2])]
+        if len(matches) != 1:
+            raise ConversationChanged('队列 ID 不存在或不唯一，请重新 /queue 查看。')
+        item = matches[0]
+        result = await _cli_queue_action(action, item, uuid.uuid4().hex)
+        if action == 'edit':
+            if isinstance(SCREEN, cli_tui.PtScreen):
+                _cli_queue_edits.append({'conversation_id': item['conversation_id'], 'text': result['text'], 'id': item['id']})
+                SCREEN.invalidate()
+            elif attached_input_box() is not None:
+                attached_input_box().prepend_draft(result['text'])
+            elif sys.stdin.isatty() and _readline is not None:
+                def prefill():
+                    _readline.insert_text(result['text'])
+                    _readline.redisplay()
+                    _readline.set_pre_input_hook(None)
+                _readline.set_pre_input_hook(prefill)
+            else:
+                SCREEN.print_plain(result['text'])
+                SCREEN.notice('已取回文本；当前非交互式输入，不自动发送。', 'info')
+        else:
+            SCREEN.notice('已取消，未送入 AI。', 'info')
+        return
+    if action != 'list':
+        SCREEN.notice('用法：/queue | /queue cancel <id> | /queue edit <id> | /queue resume', 'warn')
+        return
+    SCREEN.notice(f"待发消息 · {len(_cli_queue_state['items'])} 条", 'info')
+    for item in _cli_queue_state['items']:
+        SCREEN.print_plain(f"{item['id'][:8]} · {REASONS.get(item['reason'], '排队中')}\n{item['text']}")
+
+
 async def _init_runtime() -> None:
     await UserDataManager.init()
     await BotMemoryDB.get_instance()
@@ -1549,6 +1677,9 @@ async def _init_runtime() -> None:
     await get_conversations().enable_terminal()
     await get_conversations().poll_once()
     get_conversations().start()
+    _ns['_cli_queue_dispatch'] = _cli_queue_dispatch
+    _ns['_cli_queue_notifier'] = _cli_queue_refresh
+    await _ns['get_text_queue']().start()
     if isinstance(SCREEN, cli_tui.PtScreen):
         _terminal_workspace = TerminalWorkspace(get_conversations(), SCREEN, _history_row_lines, _ns)
         await _terminal_workspace.start()
@@ -1582,7 +1713,24 @@ async def _shutdown_runtime() -> None:
         logger.exception("CLI 关闭数据库失败")
 
 
-async def _dispatch_submitted(line: Any) -> bool:
+async def _dispatch_submitted(line: Any, *, new_submission=False) -> bool:
+    """Clear the interactive line only after the common route acknowledges it."""
+    if current_submission() is not None and not new_submission:
+        return await _dispatch_submitted_inner(line)
+    text = str(line)
+    def acknowledged():
+        box = attached_input_box()
+        if box is not None:
+            box.acknowledge_submission(text)
+    snapshot = {'conversation_id': _submitted_conversation_id, 'generation': _submitted_generation}
+    with submitted(snapshot, acknowledged) as receipt:
+        result = await _dispatch_submitted_inner(line)
+        if not receipt.error:
+            receipt.admit()
+        return result
+
+
+async def _dispatch_submitted_inner(line: Any) -> bool:
     """处理一行**已提交**的输入，返回 True 表示"该退出 CLI 了"。
 
     这是 legacy 行式主循环与全屏 TUI 的**共用**路由：两条前端拿到用户敲下的
@@ -1683,6 +1831,20 @@ async def _main_loop() -> None:
             break
         line = await _read_conversation_line()
         if line is _EXIT or line is _EOF:
+            if line is _EOF and not sys.stdin.isatty():
+                # Piped input has no next interactive prompt. Finish only ready
+                # local queue work; paused work remains durable for manual resume.
+                pending = _ns['get_text_queue']()
+                while True:
+                    await pending.poll()
+                    task = pending._task
+                    if task is not None and not task.done():
+                        await asyncio.shield(task)
+                        continue
+                    head = await (await BotMemoryDB.get_instance()).queue_head()
+                    if not head or head['dispatch_instance'] != pending.instance:
+                        break
+                    await asyncio.sleep(.1)
             break
         if line is _MENU_DISMISS:
             # 菜单导航中按了 Ctrl+C：关闭当前菜单（编号不再生效），提示符
@@ -1746,7 +1908,10 @@ def _build_tui_hooks():
         running=lambda: _terminal_frame.get('running') or {},
         completed=lambda: _terminal_workspace.finished if _terminal_workspace is not None else {},
         dispatch_scoped=_dispatch_tui,
-        allow_busy_input=_management_input,
+        allow_busy_input=_allow_queued_input,
+        queue_snapshot=lambda: _cli_queue_state,
+        queue_action=_cli_queue_action,
+        take_queue_edits=_cli_take_queue_edits,
         manage_conversation=lambda action, cid=None, name=None: _terminal_workspace.manage(action, cid, name),
         load_older=lambda: _terminal_workspace.refresh_history(older=True),
         prompt_text=_prompt_plain,
