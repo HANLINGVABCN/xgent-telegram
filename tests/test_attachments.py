@@ -71,7 +71,7 @@ class AttachmentTests(unittest.TestCase):
         text = " \r\n" + "abcdefghijklmnop" * 12000 + "\nEND-OF-FILE-19417  \n"
         parts, updates, errors = self.restore(self.reference(text.encode()))
         self.assertFalse(errors)
-        self.assertFalse(updates)
+        self.assertEqual('baseline', updates[0][2]['attachments'][0]['versions']['seed_kind'])
         self.assertEqual(
             f"[File content begins]\n{text}\n[File content ends]", parts[-1]["text"],
         )
@@ -220,7 +220,8 @@ class AttachmentTests(unittest.TestCase):
         self.assertFalse(errors)
         self.assertIn('temporarily unavailable', parts[0]['text'])
         self.assertIn('available', parts[-1]['text'])
-        self.assertEqual([], updates)
+        self.assertEqual('image', updates[0][2]['attachments'][0]['kind'], 'damaged bytes must not replace the last valid file metadata')
+        self.assertTrue(updates[0][2]['attachments'][0]['versions'])
         path.write_bytes(image_bytes('PNG', color='blue'))
         self.assertEqual('image', self.restore(ref)[0][-1]['type'])
 

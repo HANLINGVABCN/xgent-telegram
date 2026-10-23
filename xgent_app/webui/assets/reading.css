@@ -70,6 +70,11 @@ body,body.dark { --code-bg:#182334; --code-header:#101827; --code-fg:#eef3f9; --
 #message-queue button { flex-shrink:0; padding:5px 7px; border:0; border-radius:6px; font:inherit; font-size:.85em; background:var(--wb-soft); color:var(--wb-text); cursor:pointer; }
 #message-queue button:disabled { opacity:.5; cursor:wait; }
 .queue-error { margin:5px 0; font-size:.9em; color:var(--wb-danger); }
+.media-versions { display:block; margin-top:8px; padding:5px 10px; border:1px solid var(--wb-border); border-radius:6px; background:var(--wb-panel); color:var(--wb-text); font:inherit; font-size:.85em; cursor:pointer; }
+.attachment-versions .version-list { display:flex; flex-direction:column; gap:10px; margin:12px 0; }
+.version-card { border:1px solid var(--wb-border); border-radius:8px; padding:12px; }
+.version-card>code { display:block; margin-top:4px; overflow-wrap:anywhere; }
+.attachment-versions .wb-actions { flex-wrap:wrap; }.version-preview img { max-width:100%;height:auto; }
 @media(max-width:767px){#message-queue button{min-height:36px;} .queue-item{gap:4px;} .queue-actions{gap:4px;}}
 .conv-item-menu .danger,.conv-dialog-actions button.danger { color:var(--wb-danger); }
 .conv-action-dialog p { font-size:var(--web-ui-font-size); line-height:1.7; text-align:left; overflow-wrap:anywhere; }.conv-action-dialog h2 { text-align:left; }

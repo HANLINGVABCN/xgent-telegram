@@ -70,7 +70,7 @@
 ## 实现与接口
 
 - `current_chat_id` 保留 Web 选择；可为空的 `telegram_conversation_id` 保存 Bot 选择。`GET /api/workbench/conversations` 和 `conversation_state` 事件返回两者，沿用修订号与现有轮询。Bot 标记变化只更新列表，不重载聊天或丢弃草稿。
-- 原有 `POST /api/workbench/conversations/{create,switch,rename,archive,restore,reset_context,delete}` 继续只管理 Web 的选择；非新建操作传 `id`，重置／删除需要确认。不会开放一个能悄悄替 Bot 切换的网页接口。
+- 原有 `POST /api/workbench/conversations/{create,switch,rename,archive,restore,reset_context,delete}` 保持原行为；新增 `conversations/set_bot` 只响应「⋯ → 设为 Bot 当前对话」的明确操作。参数 `id`、目标 `generation`、`expected_bot` 校验原 Bot 选择，事务中只更新 `telegram_conversation_id`；不切换 Web/CLI、不移动任务、不改变暂停队列。未配置 Bot、目标已归档或已失效时拒绝。
 - `ConversationManager` 的终端选择仅在该进程内保存，通过显式 `selector="terminal"` 管理；schema v4 新增的是共享待发消息表，不增加全局终端选择指针。
 - `ConversationScope` 在记录、附件处理之前绑定；除会话、版本、回合外，保存操作来源、用途与固定的初始 Telegram 投递决定。Web 的 `WebRunDelivery` 只物化当前未结束回复，订阅后将**新操作**的投递许可写进既有出站 Op 快照；先入队创建再入队编辑，断线继续走异步出站队列，旧禁止投递记录不重新解禁。回合结束即清理订阅，模型引擎与工具接口不重新实现。
 - 原有 WebOutbox、CLI 中继和出站队列保留。回放恢复原身份与投递策略；来源标签在实际发送／编辑时重新读取 Bot 选择。CLI `session_id` 仍指中继进程，不与逻辑会话 ID 混用。

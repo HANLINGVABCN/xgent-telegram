@@ -1442,21 +1442,39 @@ _WEB_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
 async def _web_run_upload(filename, content, caption, outbox):
     # Choose only after the Web workflow has been bound, not in the HTTP thread.
+    state = UserDataManager.get('state')
+    if is_prompt_edit_state(state) or state in {
+        BotState.IMPORT_PROVIDER_CONFIG, BotState.SET_COMMAND_BLACKLIST, BotState.SET_MEMORY,
+    }:
+        from xgent_app.attachment_versions import confirm_upload_received
+        confirm_upload_received()  # Only the actual configuration-import routes bypass ordinary backup.
     ext = os.path.splitext(filename.lower())[1]
     handler = (_web_run_photo_conversation if ext in _WEB_IMAGE_EXTENSIONS and
                UserDataManager.get('state') == BotState.IDLE else _web_run_file_conversation)
     await handler(filename, content, caption, outbox)
 
 
-def _web_submit_upload(filename: str, content: bytes, caption: str, outbox: Any, *, conversation_id=None) -> None:
+def _web_submit_upload(filename: str, content: bytes, caption: str, outbox: Any, *, conversation_id=None):
+    from concurrent.futures import Future
+    from xgent_app.attachment_versions import upload_receipt_scope
+    receipt = Future()
     loop = _web_chat_server.config.loop if _web_chat_server else None
     if loop is None:
         outbox.put({"type": "turn_error", "text": "服务未就绪"})
-        return
-    asyncio.run_coroutine_threadsafe(
-        _web_scoped_call(_web_run_upload(filename, content, caption, outbox), conversation_id, outbox,
-                         execution=lambda: UserDataManager.get('state') == BotState.IDLE), loop,
-    )
+        receipt.set_result({'ok': False, 'error': '服务未就绪，附件尚未确认接收。'})
+        return receipt
+    async def receive():
+        with upload_receipt_scope(receipt):
+            try:
+                await _web_scoped_call(_web_run_upload(filename, content, caption, outbox), conversation_id, outbox,
+                                      execution=lambda: UserDataManager.get('state') == BotState.IDLE)
+            finally:
+                if not receipt.done():
+                    receipt.set_result({'ok': False, 'error': '附件原件备份或关联保存未完成，请查看错误后重试；文件仍保留在输入区。'})
+    task = asyncio.run_coroutine_threadsafe(receive(), loop)
+    # Keep the scheduling future alive; input confirmation need not wait for AI.
+    task.add_done_callback(lambda finished: finished.exception() if not finished.cancelled() else None)
+    return receipt
 
 
 def _web_submit_callback(callback_data: str, message_id: int, outbox: Any, *, conversation_id=None, request_id=None) -> None:

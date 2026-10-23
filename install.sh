@@ -27,6 +27,8 @@ APT_UPDATED=0
 SKIP_CONFIRM=0
 # ensure_virtualenv 这一次有没有真的新建/重建 venv。
 VENV_CREATED=0
+# 完整更新（update）时置 1：忽略依赖快照，强制升级 pip 与全部依赖。
+FORCE_DEPS_UPGRADE=0
 # 更新代码用的 GitHub 仓库信息（强制写死正式公开仓库）
 UPDATE_REPO_URL="https://github.com/HANLINGVABCN/xgent-telegram"
 UPDATE_BRANCH="main"
@@ -480,7 +482,7 @@ fix_line_endings() {
 }
 
 python_version_ok() {
-    "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1
+    "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1
 }
 
 # 候选解释器文件名，按优先级从高到低。
@@ -491,7 +493,7 @@ python_version_ok() {
 # 于是我们挑中一个建不了 venv 的解释器，而自动补包又只会去装 python3-venv，
 # 修的是另一个版本。只有当系统默认那个太旧时，才轮到带版本号的候选。
 python_candidate_names() {
-    printf '%s\n' python3 python3.14 python3.13 python3.12 python3.11 python3.10 python
+    printf '%s\n' python3 python3.14 python3.13 python3.12 python3.11 python
 }
 
 # 要翻的目录：PATH 全部条目 + 几个常见安装位置，去重后保持顺序。
@@ -526,7 +528,7 @@ is_project_venv_python() {
 # 起本脚本——比如让 Bot 自己执行 install.sh），`python3` 解析到的就是那个
 # venv 的解释器。而 venv 解释器的版本被钉死在它**被创建的那一刻**，可能远比
 # 系统里现有的旧。于是同一台机器上，SSH 手敲能装、从 Bot 里调起就报"需要
-# Python 3.10"，看起来像"时好时坏"，实际只是 PATH 差异。
+# Python 3.11"，看起来像"时好时坏"，实际只是 PATH 差异。
 #
 # 光换成 `command -v` 也不够：它只返回第一个命中，venv 排在 PATH 首位时后面
 # 所有同名解释器全被挡住。所以这里按"文件名优先级 × 全部搜索目录"逐个试，
@@ -571,13 +573,13 @@ ensure_python() {
     PYTHON_BIN="$(discover_python || true)"
 
     if [ -z "$PYTHON_BIN" ] && [ -z "${XGENT_PYTHON:-}" ]; then
-        warn "   未找到 3.10 及以上的 Python，尝试自动安装..."
+        warn "   未找到 3.11 及以上的 Python，尝试自动安装..."
         ensure_apt_packages python3 python3-pip python3-venv
         PYTHON_BIN="$(discover_python || true)"
     fi
 
     if [ -z "$PYTHON_BIN" ]; then
-        error "[错误] 需要 Python 3.10 或更高版本，但当前系统里找不到可用的。"
+        error "[错误] 需要 Python 3.11 或更高版本，但当前系统里找不到可用的。"
         if [ -n "${XGENT_PYTHON:-}" ]; then
             error "       XGENT_PYTHON=${XGENT_PYTHON} 指向的解释器不可用或版本过低。"
         fi
@@ -601,7 +603,7 @@ ensure_python() {
 
     echo "   使用解释器: $PYTHON_BIN"
     echo "   Python 版本: $("$PYTHON_BIN" --version 2>&1)"
-    success "Python 版本满足要求 (>= 3.10)"
+    success "Python 版本满足要求 (>= 3.11)"
 }
 
 resolve_path() {
@@ -971,21 +973,28 @@ install_requirements() {
     # 重启，可"重启一个已经装好的服务"跟装依赖本来是两件事。所以：requirements.txt
     # 与上次装的那份一致、三个核心包又都 import 得动，就直接跳过。
     # 两个条件都要满足，venv 被人删过半截时才还能自愈。
-    if [ "$VENV_CREATED" -eq 0 ] && requirements_up_to_date && core_imports_ok; then
+    if [ "$FORCE_DEPS_UPGRADE" -eq 0 ] && [ "$VENV_CREATED" -eq 0 ] && requirements_up_to_date && core_imports_ok; then
         info "[pip] 依赖与上次安装一致，跳过（重启路径不联网）。"
         print_core_versions
         return
     fi
 
-    # pip 自身只在新建 venv 时升一次，失败也不致命：它是顺手做的好事，
+    # pip 自身只在新建 venv 或完整更新时升级，失败也不致命：它是顺手做的好事，
     # 不是装依赖的前提。
-    if [ "$VENV_CREATED" -eq 1 ]; then
+    if [ "$VENV_CREATED" -eq 1 ] || [ "$FORCE_DEPS_UPGRADE" -eq 1 ]; then
         info "[pip] 正在升级 pip..."
         python -m pip install --upgrade pip -q || warn "   pip 自身升级失败，继续用现有版本。"
     fi
 
-    info "[pip] 正在安装 Python 依赖..."
-    python -m pip install -r requirements.txt -q
+    if [ "$FORCE_DEPS_UPGRADE" -eq 1 ]; then
+        # 完整更新：把所有依赖升到 requirements.txt 允许范围内的最新版，
+        # 拿到安全补丁，而不是"已满足最低版本就不动"。
+        info "[pip] 正在升级全部 Python 依赖到最新兼容版本..."
+        python -m pip install --upgrade -r requirements.txt -q
+    else
+        info "[pip] 正在安装 Python 依赖..."
+        python -m pip install -r requirements.txt -q
+    fi
 
     ensure_state_dir
     cp -f requirements.txt "$REQUIREMENTS_SNAPSHOT" 2>/dev/null || true
@@ -2168,11 +2177,14 @@ update_via_download() {
 }
 
 update_code() {
-    info "[更新] 正在检查代码更新..."
+    info "[更新] 完整更新：代码 + Python 环境 + 全部依赖"
 
     local do_update=""
     echo ""
-    read -r -p "   即将从 GitHub 下载最新代码并覆盖本地（保留所有用户配置和数据），是否继续？[Y/n]: " do_update
+    echo "   将执行: 下载最新代码覆盖 → 检查/重建 Python 环境 → 升级 pip 与全部依赖"
+    echo "           → 刷新 xgent 命令 → 检查数据库 → 重启服务"
+    echo "   保留: .env、数据库、会话历史、workspace、日志、私有技能"
+    read -r -p "   是否继续？[Y/n]: " do_update
     case "$do_update" in
         n|N) return 0 ;;
         *)   ;;
@@ -2182,16 +2194,27 @@ update_code() {
 
     # 更新 .xgent-version
     printf 'updated-%s' "$(date +%Y%m%d)" > "$SCRIPT_DIR/.xgent-version"
+    chmod +x "$SCRIPT_DIR/install.sh" "$SCRIPT_DIR/bin/xgent" 2>/dev/null || true
 
-    # 重新安装依赖（复用 prepare_base_environment）
-    info "[更新] 正在重新检查环境和依赖..."
+    # install.sh 自身刚被覆盖。bash 是边读边执行脚本的，继续跑旧进程既可能
+    # 读到错位的新内容，也会用旧逻辑去准备新代码的环境（例如旧的 Python 门槛）。
+    # 所以交给新脚本完成剩下的环境更新。
+    info "[更新] 代码已覆盖，切换到新版安装脚本继续更新环境..."
+    exec bash "$SCRIPT_DIR/install.sh" update-finish
+}
+
+# 完整更新的后半段，由新下载的 install.sh 执行。
+update_finish() {
+    FORCE_DEPS_UPGRADE=1
+    info "[更新] 正在检查 Python 环境并升级全部依赖..."
     prepare_base_environment
+    install_xgent_command
+    success "环境与依赖已全部更新。"
 
-    # 询问重启
     if service_running; then
         echo ""
         local do_restart=""
-        read -r -p "代码已更新，是否立即重启服务？[Y/n]: " do_restart
+        read -r -p "已完成完整更新，是否立即重启服务以加载新代码和依赖？[Y/n]: " do_restart
         case "$do_restart" in
             n|N) warn "已跳过重启。请稍后执行: bash install.sh restart" ;;
             *)   restart_app ;;
@@ -2923,7 +2946,7 @@ component_state_cli() {
         return
     fi
     if ! python_version_ok "$VENV_PYTHON"; then
-        printf 'error|venv 里是 %s，低于 3.10，重新安装即可修复\n' "$("$VENV_PYTHON" --version 2>&1)"
+        printf 'error|venv 里是 %s，低于 3.11，重新安装即可修复\n' "$("$VENV_PYTHON" --version 2>&1)"
         return
     fi
 
@@ -3449,7 +3472,7 @@ show_menu() {
     echo "  8) 本地 API 容器 (Docker)  启动/关闭本地 Telegram Bot API server"
     echo "  9) 彻底重建 PM2 进程       重新加载 PM2 启动参数，进程 ID 会 +1"
     echo " 10) 卸载本脚本安装的运行内容"
-    echo " 11) 更新代码                 从 GitHub 下载最新代码覆盖本地（保留用户数据）"
+    echo " 11) 完整更新                 下载最新代码，并更新 Python 环境与全部依赖（保留用户数据）"
     echo "  0) 退出"
     echo ""
 }
@@ -3466,7 +3489,7 @@ show_usage() {
     echo "  ./install.sh switch-mode     配置 / 移除 Telegram Bot（等价于组件清单里的第 3 项）"
     echo "  ./install.sh uninstall       卸载本脚本安装的运行内容"
     echo "  ./install.sh uninstall -y    跳过确认直接卸载"
-    echo "  ./install.sh update          从 GitHub 下载最新代码覆盖本地"
+    echo "  ./install.sh update          完整更新：最新代码 + Python 环境 + 全部依赖"
     echo ""
     echo "安装后可用命令:"
     echo "  xgent                        打开本地终端客户端（与 Telegram/Web 共用同一套对话核心）"
@@ -3678,6 +3701,10 @@ case "${1:-}" in
     update|--update)
         print_banner
         update_code
+        ;;
+    update-finish)
+        # 内部入口：update_code 覆盖完代码后 exec 到新脚本执行这里。
+        update_finish
         ;;
     help|--help|-h)
         show_usage

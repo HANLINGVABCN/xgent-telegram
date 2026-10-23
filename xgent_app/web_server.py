@@ -499,6 +499,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             live = self.server.outbox.snapshot() if method == 'GET' and resource == 'history' else None
             if self.config.workbench is not None:
                 result = self._run_coro(self.config.workbench(method, resource, data), timeout=45)
+                from .attachment_version_api import VersionDownload
+                if isinstance(result, VersionDownload):
+                    self._send_version_download(result)
+                    return
             elif method == 'GET' and resource == 'bootstrap':
                 result = {'settings': self._run_coro(self.config.read_settings()), 'commands': [],
                           'capabilities': {}, 'timezone': 'Asia/Shanghai'}
@@ -821,6 +825,20 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         self._send_json(result)
 
+    def _send_version_download(self, result):
+        # Serve the bytes already checksum-verified under the version lock, not
+        # a path that may have changed after authorization. Active HTML/SVG is attachment-only.
+        inline = result.inline and result.mime_type.startswith('image/') and result.mime_type != 'image/svg+xml'
+        self.send_response(200)
+        self.send_header('Content-Type', result.mime_type)
+        self.send_header('Content-Length', str(len(result.content)))
+        self.send_header('Content-Disposition', ('inline' if inline else 'attachment') + "; filename*=UTF-8''" + urllib.parse.quote(result.filename, safe=''))
+        self.send_header('Cache-Control', 'private, no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Content-Security-Policy', "default-src 'none'; sandbox")
+        self.end_headers()
+        self.wfile.write(result.content)
+
     def _handle_upload(self) -> None:
         """网页文件上传。校验与 /api/chat 一致，只是改读 multipart。
 
@@ -848,8 +866,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         filename = str(data.get("filename") or "upload")
         content = data["file"]   # _read_multipart 已保证非 None
         caption = str(data.get("text") or "")
-        self.config.submit_upload(filename, content, caption, outbox, **options)
-        self._send_json({"ok": True})
+        receipt = self.config.submit_upload(filename, content, caption, outbox, **options)
+        from concurrent.futures import Future
+        if isinstance(receipt, Future):
+            try:
+                result = receipt.result(timeout=45)
+            except FutureTimeoutError:
+                self._send_json({'error': '附件接收仍未确认，请刷新核对后重试。'}, status=504)
+                return
+            self._send_json(result, status=200 if result.get('ok') else 409)
+        else:
+            self._send_json({"ok": True})
 
     def _handle_stop(self) -> None:
         if not self._require_auth():

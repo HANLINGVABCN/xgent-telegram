@@ -325,7 +325,15 @@ def build_history_message(
     if "attachments" not in metadata and "display_media" not in metadata:
         if not (kind in {"ai_reply", "media_reply"} and metadata.get("generated_media_processed") is True):
             legacy = _legacy_media(record, storage, workspace)
-            groups.extend((ref, False) for ref in legacy)
+            if kind in {'user_file', 'user_photo'} and role == 'user':
+                try:
+                    from .attachments import _legacy_references
+                    verified = _legacy_references(record, storage / 'uploads')
+                    groups.extend((ref, True) for ref in verified)
+                except ValueError:
+                    groups.extend((ref, False) for ref in legacy)
+            else:
+                groups.extend((ref, False) for ref in legacy)
             if not legacy and (kind in {"user_file", "user_photo"} or (
                     kind in {"ai_reply", "media_reply"} and _GENERATED_PREFIX in content)):
                 message["media_error"] = "\u65e7\u8bb0\u5f55\u672a\u4fdd\u7559\u53ef\u9a8c\u8bc1\u7684\u9644\u4ef6\u5173\u8054\uff0c\u65e0\u6cd5\u6062\u590d\u4e0b\u8f7d"
@@ -340,6 +348,13 @@ def build_history_message(
         if item.get("path"):
             seen.add(item["path"])
         index = len(message["media"])
+        if kind in {'user_file', 'user_photo'} and role == 'user' and attachment and isinstance(ref, dict) and ref.get('storage', 'uploads') == 'uploads':
+            try:
+                from .attachment_versions import attachment_identity
+                identity, _ = attachment_identity(ref, storage / 'uploads')
+                item['versions_id'] = f"{record['id']}:{identity}"
+            except (ValueError, KeyError, TypeError):
+                pass  # Unsafe/damaged associations never expose a version capability.
         if not item.get("error") and type(record.get("id")) is int:
             item["download_url"] = f"/api/history/media/{record['id']}/{index}"
         message["media"].append(item)

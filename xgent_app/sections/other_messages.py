@@ -19,6 +19,8 @@ def build_photo_multimodal_payload(photo_bytes: bytes, caption: str,
         saved_photo, filename, photo_bytes, caption, context_prefix,
         expected_image=True, source_message_id=source_message_id,
     )
+    from xgent_app.attachment_versions import save_original_version
+    save_original_version(reference, photo_bytes, ArtifactManager.UPLOAD_DIR)
     return {
         "image_b64": image_b64,
         "mime_type": reference["mime_type"],

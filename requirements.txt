@@ -13,7 +13,8 @@ apscheduler>=3.10,<4.0
 # pyyaml is imported in sections/shell_triggers.py for YAML parsing.
 pyyaml>=6.0,<7.0
 # Verify uploaded images and preserve their real media type without re-encoding.
-Pillow>=10.4,<13.0
+# Pillow 13.0 fixes 35 known CVEs in 12.x and requires Python 3.11+.
+Pillow>=13.0,<14.0
 # Identify native media/document types from file signatures, without conversion.
 filetype>=1.2,<2.0
 # Full-screen CLI TUI (xgent_cli --tui / XGENT_CLI_TUI): in-place expand of folded

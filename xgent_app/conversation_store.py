@@ -361,6 +361,29 @@ class ConversationStore(QueueStore):
         self._config_cache.pop('telegram_conversation_id', None)
         return {'ok': True, 'conversation_id': cid, **await self.get_conversation_state()}
 
+    async def set_bot_conversation(self, cid, generation, expected_bot):
+        """Explicit Web action: CAS only the Bot selector, never the Web/CLI view.
+
+        Returns the target session name when the selector actually changed,
+        or None for an idempotent repeat (so callers notify only once).
+        """
+        from .queue_store import one
+        from .conversations import ConversationChanged
+        changed = None
+        async with self._transaction() as conn:
+            session = await one(conn, 'SELECT generation,archived,deleting,name FROM chat_sessions WHERE id=?', (cid,))
+            if not session or session['deleting'] or session['archived'] or session['generation'] != generation:
+                raise ConversationChanged('目标会话已改变或已归档，请刷新后再设置 Bot。')
+            selected = await _config(conn, 'telegram_conversation_id')
+            if selected != expected_bot and selected != cid:
+                raise ConversationChanged('Bot 当前对话已被其他端切换，请刷新后确认。')
+            if selected != cid:
+                await _set_config(conn, 'telegram_conversation_id', cid)
+                await self._bump_conversation_revision(conn)
+                changed = str(session['name'] or cid)
+        self._config_cache.pop('telegram_conversation_id', None)
+        return changed
+
     async def request_conversation_stop(self, run_id, conversation_id=None):
         async with self._transaction() as conn:
             running = await _config(conn, 'conversation_running')

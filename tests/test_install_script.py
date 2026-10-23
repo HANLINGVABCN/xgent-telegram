@@ -262,7 +262,7 @@ class PythonDiscoveryTests(InstallScriptLibraryMixin, unittest.TestCase):
     用户报告的"时好时坏"就是这条：SSH 干净 shell 里 PATH 首位是
     /usr/local/bin，`python3` 是 3.11，装得上；从跑在 venv 里的 Bot 进程调起
     同一个脚本时 PATH 首位变成 venv/bin，`python3` 是创建 venv 那天的 3.9.2，
-    于是同一台机器同一份脚本报"需要 Python 3.10"。
+    于是同一台机器同一份脚本报"需要 Python 3.11"。
     """
 
     def test_venv_python_is_recognised_without_resolving_symlinks(self):
@@ -307,7 +307,7 @@ class PythonDiscoveryTests(InstallScriptLibraryMixin, unittest.TestCase):
             old = make_executable(venv_bin / "python3", (
                 '#!/bin/sh\n'
                 'case "$*" in\n'
-                '  *"version_info >= (3, 10)"*) exit 1 ;;\n'
+                '  *"version_info >= (3, 11)"*) exit 1 ;;\n'
                 '  --version) echo "Python 3.9.2" ;;\n'
                 '  *) exit 0 ;;\n'
                 'esac\n'
@@ -315,7 +315,7 @@ class PythonDiscoveryTests(InstallScriptLibraryMixin, unittest.TestCase):
             new = make_executable(sys_bin / "python3", (
                 '#!/bin/sh\n'
                 'case "$*" in\n'
-                '  *"version_info >= (3, 10)"*) exit 0 ;;\n'
+                '  *"version_info >= (3, 11)"*) exit 0 ;;\n'
                 '  --version) echo "Python 3.11.15" ;;\n'
                 '  *) exit 0 ;;\n'
                 'esac\n'
@@ -342,7 +342,7 @@ class PythonDiscoveryTests(InstallScriptLibraryMixin, unittest.TestCase):
             b = make_executable(good / "python3", (
                 '#!/bin/sh\n'
                 'case "$*" in\n'
-                '  *"version_info >= (3, 10)"*) exit 0 ;;\n'
+                '  *"version_info >= (3, 11)"*) exit 0 ;;\n'
                 '  *) exit 0 ;;\n'
                 'esac\n'
             ))
@@ -906,6 +906,28 @@ class DependencyInstallTests(InstallScriptLibraryMixin, unittest.TestCase):
             )
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertIn("PIP_RAN", result.stdout)
+
+    def test_force_deps_upgrade_forces_pip_and_requirements_upgrade(self):
+        # 完整更新（update）时 FORCE_DEPS_UPGRADE=1：
+        # 即使 requirements 快照与核心包都完好，也必须触发 pip 自身升级与 --upgrade 依赖升级。
+        stubs = (
+            'core_imports_ok() { return 0; }\n'
+            'print_core_versions() { :; }\n'
+            'python() { echo "PIP_RAN $*"; }\n'
+        )
+        with self.temp_dir() as temp_dir:
+            root = self.sandbox(temp_dir)
+            write_lf(root / "requirements.txt", "aiosqlite\n")
+            result = self.run_lib(
+                'ensure_state_dir\n'
+                'cp requirements.txt "$REQUIREMENTS_SNAPSHOT"\n'
+                'FORCE_DEPS_UPGRADE=1\n'
+                + stubs + 'install_requirements\n',
+                root,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("PIP_RAN -m pip install --upgrade pip -q", result.stdout)
+            self.assertIn("PIP_RAN -m pip install --upgrade -r requirements.txt -q", result.stdout)
 
 
 class UninstallSafetyTests(unittest.TestCase):

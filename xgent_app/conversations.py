@@ -361,6 +361,17 @@ class ConversationManager:
     def stop_event(self):
         return self._stop_event
 
+    @contextlib.asynccontextmanager
+    async def file_maintenance_slot(self):
+        """Brief file restore exclusion, not a model run or a queue transition."""
+        async with self._admission_lock:
+            if not self.lock.acquire():
+                raise ConversationBusy('正在执行任务，请等待完成后再恢复附件；未停止任务或修改文件。')
+        try:
+            yield
+        finally:
+            self.lock.release()
+
     def attach_stop_event(self, event):
         if self._stop_event is not None and self._stop_event.is_set():
             event.set()

@@ -13,7 +13,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-async def serve(port, count, conversation_count=0, workbench_demo=False):
+async def serve(port, count, conversation_count=0, workbench_demo=False, version_demo=False):
     os.environ["PYTHON_DOTENV_DISABLED"]="1"
     os.environ["HOME"]=str(Path.cwd())
     os.environ["SHELL"]="/bin/sh" if os.name!="nt" else ""
@@ -101,6 +101,24 @@ async def serve(port, count, conversation_count=0, workbench_demo=False):
         demo['file_message']=await add_record(source,'user_file','user','来源文件',{'attachments':[{'version':1,'path':attachment.name,'filename':attachment.name,'mime_type':'text/plain','storage':'uploads'}]})
         for index in range(80):await add_record(source,'user_text','user','来源验证后续消息 '+str(index))
         await db.manage_conversation('switch','global_memory')
+    if version_demo:
+        # Synthetic token only enables the selector capability; no Bot or model
+        # client is started by this isolated fixture.
+        ns['BotConfig'].TOKEN = '123456:version-fixture-not-real'
+        from xgent_app.conversations import bind_conversation
+        from xgent_app.attachment_versions import AttachmentVersions
+        with bind_conversation(await ns['get_conversations']().resolve('global_memory')):
+            for name, original, current in [
+                ('版本说明.txt', '上传原件\n<safe> $value'.encode('utf-8'), ('修改后的 UTF16 内容\n' * 6000).encode('utf-16')),
+            ]:
+                payload=ns['build_document_attachment_payload'](name,original,'附件版本验收')
+                row=await ns['GlobalRecorder'].record_attachment_message(payload['index_text'],'user_file',1,[payload['attachment']])
+                Path(payload['saved_file']['abs_path']).write_bytes(current)
+                saved=AttachmentVersions(ns['ArtifactManager'].UPLOAD_DIR,payload['attachment']).describe()
+                demo['versions_id']=f"{row}:{payload['attachment']['id']}"
+                demo['version_record']=row
+                demo['original_version']=saved['seed']
+                demo['current_version']=saved['current']
     service=Workbench(ns)
     async def history(limit):return (await service.handle('GET','history',{'limit':limit}))['messages']
     config=WebChatConfig(host='127.0.0.1',port=port,password_hash=hash_password('preview-only'),bot_token='',authorized_user_id=1,
@@ -119,8 +137,9 @@ async def serve(port, count, conversation_count=0, workbench_demo=False):
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--port',type=int,default=0);parser.add_argument('--messages',type=int,default=4)
     parser.add_argument('--conversations',type=int,default=0);parser.add_argument('--workbench-demo',action='store_true')
+    parser.add_argument('--version-demo',action='store_true')
     args=parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='xgent-workbench-') as temporary:
         os.chdir(temporary)
-        try:asyncio.run(serve(args.port,args.messages,args.conversations,args.workbench_demo))
+        try:asyncio.run(serve(args.port,args.messages,args.conversations,args.workbench_demo,args.version_demo))
         except KeyboardInterrupt:pass

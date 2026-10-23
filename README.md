@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/HANLINGVABCN/xgent-telegram/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/HANLINGVABCN/xgent-telegram/actions/workflows/tests.yml/badge.svg"></a>
   <a href="https://github.com/HANLINGVABCN/xgent-telegram/blob/main/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
-  <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white">
+  <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
   <img alt="Self-hosted" src="https://img.shields.io/badge/Self--hosted-private-24A1DE?logo=telegram&logoColor=white">
 </p>
 
@@ -128,8 +128,8 @@ XGent 由三个可以自由组合的组件构成，`install.sh` 装完环境后�
 
 所有模式共同的要求：
 
-- Linux 服务器与可用的 Python 3.10+
-  （install.sh 的自动补依赖只支持 Debian/Ubuntu；其它发行版需先手动装好 Python 3.10+、pip、git、curl）
+- Linux 服务器与可用的 Python 3.11+
+  （install.sh 的自动补依赖只支持 Debian/Ubuntu；其它发行版需先手动装好 Python 3.11+、pip、git、curl）
 - 至少一个可用的模型 API Key
 
 再按你要用的模式补齐：
@@ -218,6 +218,7 @@ CLI 端流程完全一样：敲 `xgent` 进入终端界面后，`/start` 打开�
 
 - Telegram / CLI 使用 `/chats` 管理会话，`/new [名称]` 新建；Web 桌面端左侧直接显示对话列表，手机端通过“对话记录”打开抽屉；支持搜索、时间分组及每条对话旁的 `⋯` 操作。
 - Bot、Web 和每个 CLI/TUI 终端各自保持当前会话；网页浏览不再让 Bot 或终端换上下文。网页列表用小型「Bot 当前」标记显示其归属。执行中允许查看其他会话，原任务不改投，也不会启动第二个用户任务。
+- 网页对话列表「⋯ → 设为 Bot 当前对话」是显式选择操作，只更新 Bot 选择；Web/CLI 的视图与草稿不变。未配置 Telegram 时禁用，归档会话须先恢复；切入运行中 Web 会话沿用当前回复同步，不补旧回合。
 - Web / CLI 只把 Bot 当前会话里的普通聊天同步到 Telegram，管理回执不广播；任务通知仍保留。同会话回复无抬头，异会话结果在实际发送时标明来源。
 - Bot 中途切入 Web 正在执行的会话，会立即接上**当前尚未结束回复**的已有片段，再同步后续编辑；不补发过去回合，重复切入不重复发消息。已接入的回合切走后仍完整结束，并按原规则标明来源。CLI 的回合接纳规则不变。
 - Bot 当前会话被归档或删除后等待重新选择；不自动改投、不补发未提交的输入。
@@ -242,6 +243,7 @@ Telegram 照片、以文件发送的图片及 Web 上传统一保存文件，并
 - 每轮输入成本和请求体积随累计附件增加。没有近期附件数量上限、按需读取或自动摘要替代。只有用户明确执行压缩或清空记忆，旧附件才退出自动上下文。平台是否提供缓存及如何收费，以该平台为准。
 - 容量已知时检查完整输入并预留输出空间；文本按 UTF-8 字节、图片按尺寸进行保守 token 估算，不是供应商的精确分词计数，可能提前拒绝请求。容量未知时发送完整请求，以接口反馈为准。
 - **上传附件允许原地修改**，不强制先复制到工作目录。下一次请求读取磁盘当前完整内容，重新识别编码、MIME、图片尺寸并条件更新大小/SHA-256 等元数据；同长度改写也能识别。附件身份、附言和聊天正文不变。
+- **原件与版本追溯**：新普通上传确认接收前保存独立原件，另保留最近 10 个不同内容版本；聊天附件与文件详情提供查看、下载及确认恢复。旧附件首次保存标为升级后基准，不伪称最初原件。模型仍只自动收到完整当前内容，旧版本不额外注入；普通请求无法留版时明确提示。详见 [附件版本管理](docs/attachment-versions.md)。
 - 上传文件缺失、不可读、损坏或读取期间仍在变化时，普通聊天收到明确的“附件暂不可用”说明，其余内容继续处理；不假称已读文件。引用保留，修复或恢复后自动重读。路径越界、关联损坏、会话版本冲突仍拒绝请求；已知容量超限和模型不支持原生输入的原有检查不变。
 - 压缩要求当次附件完整可读；缺少必要附件只使压缩失败，不阻止普通聊天。工具结果冻结副本、AI 生成图片的版本校验和既有压缩归档不因此放宽或改写。
 - 可核验路径的旧上传记录会自动补充关联，缺失文件同样可恢复；没有可信路径的旧记录仍明确报错。旧版本已截断的附言无法恢复，只能保留旧索引中的部分。
@@ -494,7 +496,7 @@ prompt: 把第一张图中人物手里的棒棒糖换成第二张图里的冰淇
 
 以上是接口表达范围，不是对模型能力的保证；模型或兼容网关不支持某种输入时会保留接口错误。仍使用现有对话端点，不切换图片编辑端点，也不新增文件上传服务。任一文件缺失、不可读、图片损坏、类型不支持或已知限制超出时，在调用前明确失败并报告文件序号、路径与原因，不会发送删减后的请求。输入文件不会新增普通聊天附件关联，原先已关联的附件不变；生成图片仍先保存再投递，继续进入后续上下文，Web 图文合并和下载行为不变。
 
-默认协议说明来自 `prompts/agent_addon.txt`；部署时保留了自定义提示词的，需要在提示词菜单更新或从该文件重载。自动测试验证原始字节、全文和顺序到达实际适配层，不保证真实模型能精确完成编辑；“棒棒糖换冰淇淋”的效果需用支持图片编辑的媒体模型实测。
+默认协议说明来自 `prompts/agent_addon.txt`；部署时保留了自定义提示词的，需要在提示词菜单更新或从该文件重载。 复杂操作必须在已授权写入的前提下先落脚本、等写入成功、检查后执行；首次转义错误简化实现，不反复叠转义。可验证示例和手动合并说明见 [可靠执行提示词](docs/reliable-execution.md)，不自动覆盖自定义 prompts，也不承诺仅靠提示词消除模型错误。自动测试验证原始字节、全文和顺序到达实际适配层，不保证真实模型能精确完成编辑；“棒棒糖换冰淇淋”的效果需用支持图片编辑的媒体模型实测。
 
 ### 命令输出
 
@@ -810,7 +812,7 @@ node tools/web_menu_smoke.mjs
 
 菜单回归另外使用真实菜单处理器和隔离 SQLite 数据库，覆盖刷新、双窗口、重启、长中文按钮、删除与清空后的旧事件重放；截图写入 `workspace/web-menu-qa/`。手动测试菜单可运行 `python tools/web_menu_fixture.py --serve`，不会调用实际模型或 Telegram。
 
-GitHub Actions 会在 Python 3.10、3.11 和 3.12 上执行完整性检查、编译检查、单元测试及 Shell 语法检查。
+GitHub Actions 会在 Python 3.11 和 3.12 上执行完整性检查、编译检查、单元测试及 Shell 语法检查，并用 pip-audit 扫描依赖漏洞。
 
 入口由 `xgent_app/bootstrap.py` 引导，并按清单加载 `xgent_app/sections/` 中的兼容模块。详细职责和后续迁移计划见 [`docs/architecture.md`](docs/architecture.md)。
 

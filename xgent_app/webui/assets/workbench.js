@@ -408,11 +408,77 @@ async function filePage(read){
   if(!data.items.length)page.append(empty('没有匹配的文件','可调整来源、类型或时间范围。',button('清除筛选',clear)));
   else {
     const labels=['来源对话',kind==='outputs'?'命令 / 日志':'文件','类型 / 大小','时间','操作'];
-    const tableNode=table(labels,data.items.map(file=>[sourceLink(file.source),el('div',{class:'wb-file-title'},el('button',{class:'link',type:'button',onclick:()=>fileDetail(file)},file.filename||'文件'),file.command?el('code',{class:'wb-file-command',title:file.command},file.command):null,file.task_name?el('small',{},file.task_name):null,file.error?el('small',{class:'wb-danger-text'},file.error):null),el('div',{},({photo:'图片',video:'视频',audio:'音频',output:'命令输出',file:'文档'})[file.kind]||'文件',el('small',{},bytes(file.size)),file.status?tag(file.status):null),stamp(file.timestamp),button(file.kind==='output'?'查看完整输出':'预览',()=>fileDetail(file))]));
+    const tableNode=table(labels,data.items.map(file=>[sourceLink(file.source),el('div',{class:'wb-file-title'},el('button',{class:'link',type:'button',onclick:()=>fileDetail(file)},file.filename||'文件'),file.command?el('code',{class:'wb-file-command',title:file.command},file.command):null,file.task_name?el('small',{},file.task_name):null,file.error?el('small',{class:'wb-danger-text'},file.error):null),el('div',{},({photo:'图片',video:'视频',audio:'音频',output:'命令输出',file:'文档'})[file.kind]||'文件',el('small',{},bytes(file.size)),file.status?tag(file.status):null),stamp(file.timestamp),actions(button(file.kind==='output'?'查看完整输出':'预览',()=>fileDetail(file)),file.versions_id?button('版本',()=>attachmentVersions(file)):null)]));
     tableNode.classList.add('wb-file-table');for(const row of tableNode.querySelectorAll('tbody tr'))[...row.children].forEach((cell,index)=>cell.dataset.label=labels[index]);page.append(tableNode);
   }
   page.append(filePagination(data));return page;
 }
+async function attachmentVersions(file){
+  const id=file.versions_id,cid=file.source?.conversation_id||file.conversation_id||window.XGentConversations?.current;
+  const box=el('div',{class:'attachment-versions'});
+  if(!detail('附件版本',box))return;
+  const signal=state.detailRequest.signal;
+  let snapshot=null,sequence=0;
+  const parameters={id,conversation_id:cid};
+  const versionUrl=(v,inline=false)=>'/api/workbench/artifacts/version_download'+query({...parameters,version_id:v,inline:inline?'1':undefined});
+  async function preview(item,area){
+    const seq=++sequence;
+    area.replaceChildren();
+    if(item.kind==='image'&&item.mime_type!=='image/svg+xml'){
+      area.append(el('img',{src:versionUrl(item.id,true),alt:'保存版本预览',onerror:()=>{if(seq===sequence)area.replaceChildren(message('版本图片不可读取，请刷新或下载核验'));}}));return;
+    }
+    if(item.kind!=='text'){area.append(message('此版本不支持在线预览，可下载查看。','note'));return;}
+    async function loadPage(offset,previous){
+      area.replaceChildren(message('读取保存版本…','loading'));
+      try{
+        const page=await wb('artifacts/version_preview'+query({...parameters,version_id:item.id,offset}),{signal});
+        if(seq!==sequence||signal.aborted)return;
+        if(page.version_id!==item.id)throw new Error('预览版本已改变，请重新打开');
+        const prev=button('上一页',()=>loadPage(previous.at(-1),previous.slice(0,-1))),next=button('下一页',()=>loadPage(page.next_offset,[...previous,offset]));
+        prev.disabled=!previous.length;next.disabled=page.eof;
+        area.replaceChildren(el('p',{class:'wb-note'},`${page.encoding} · 字符 ${offset}–${page.next_offset} / ${page.characters} · ${bytes(page.size)}`),actions(prev,next),el('pre',{class:'wb-pre wb-document-preview',tabindex:'0'},page.text));
+      }catch(error){if(!signal.aborted&&seq===sequence)area.replaceChildren(message(error.message),button('重试读取',()=>loadPage(offset,previous)));}
+    }
+    await loadPage(0,[]);
+  }
+  async function restore(item){
+    const expected=snapshot;
+    await confirmAction('恢复附件版本？',`将「${expected.filename}」的当前文件替换为 ${item.id.slice(0,12)}。当前可读取内容会先保存为版本；不会发送新消息或自动运行 AI。`,async()=>{
+      state.detailSaving=true;
+      try{
+        const result=await wb('artifacts/restore_version',{data:{...parameters,version_id:item.id,generation:expected.generation,fingerprint:expected.current_file.fingerprint,confirm:true}});
+        window.XGentChat?.attachmentChanged({conversation_id:cid,generation:expected.generation,record_id:result.message.id,message:result.message});
+        window.dispatchEvent(new CustomEvent('xgent-workbench-change',{detail:{pages:['files']}}));
+      }finally{state.detailSaving=false;}
+    },null,async()=>{await load();if(box.isConnected)inlineState(box,'已恢复指定版本；下一次模型请求读取当前文件。');});
+  }
+  async function load(){
+    const loadSequence=++sequence;box.replaceChildren(message('读取版本记录…','loading'));
+    try{
+      const loaded=await wb('artifacts/versions'+query(parameters),{signal});
+      if(signal.aborted||loadSequence!==sequence||!box.isConnected)return;
+      snapshot=loaded;
+      const current=snapshot.current_file,area=el('div',{class:'version-preview'});
+      box.replaceChildren(el('h2',{class:'wb-detail-filename'},snapshot.filename),el('p',{class:'wb-note'},'保留上传原件（旧附件为升级后基准）及最近 10 个不同内容版本；只记录已观察到的内容，未观察到的外部改写无法还原。'),
+        el('p',{class:'version-current'},'当前磁盘：'+({available:'可读取',missing:'文件缺失',damaged:'格式损坏或不支持',unreadable:'不可读取'})[current.state]+(current.id?' · '+current.id.slice(0,12):'')),
+        current.warning?message(current.warning):null,current.error?message(current.error):null,
+        snapshot.restore_reason?el('p',{class:'wb-note'},snapshot.restore_reason):null,button('刷新版本',load));
+      const list=el('div',{class:'version-list'});
+      for(const item of snapshot.versions){
+        const seed=item.id===snapshot.seed,label=seed?(snapshot.seed_kind==='original'?'上传原件':'升级后首次保存版本'):'已保存版本';
+        const disabled=!snapshot.can_restore||!current.fingerprint||item.id===current.id;
+        const restoreButton=button('恢复此版本',()=>restore(item));restoreButton.disabled=disabled;
+        restoreButton.title=item.id===current.id?'当前文件已是此版本':snapshot.restore_reason||(!current.fingerprint?'当前文件不可读，不能覆盖':'');
+        list.append(el('section',{class:'version-card','data-version-id':item.id},el('strong',{},label+(item.id===current.id?' · 当前':'')),el('code',{},item.id.slice(0,16)),el('p',{class:'wb-note'},`${stamp(item.saved_at)} · ${bytes(item.size)} · ${item.mime_type}`),actions(button('预览版本',()=>preview(item,area)),el('a',{href:versionUrl(item.id),download:snapshot.filename,class:'wb-btn'},'下载版本'),restoreButton)));
+      }
+      if(!snapshot.versions.length)list.append(message('尚无已保存版本；当前文件恢复可读后会自动留版。','note'));
+      box.append(list,area);
+    }catch(error){if(!signal.aborted&&loadSequence===sequence&&box.isConnected)box.replaceChildren(message(error.message),button('重试读取版本',load));}
+  }
+  await load();
+}
+window.addEventListener('xgent-attachment-changed',()=>{pageCache.invalidate(['files']);state.retryAfter=0;});
+
 async function fileDetail(file) {
   if(file.kind==='output'){await outputViewer(file.path,file.filename,null,file.source);return;}
   const box=el('div',{},el('h2',{class:'wb-detail-filename'},file.filename||'文件'));
@@ -420,6 +486,7 @@ async function fileDetail(file) {
   detail('文件详情',box);const signal=state.detailRequest.signal;
   const metadata=el('dl',{class:'wb-file-facts'},...Object.entries({'类型':file.mime_type||file.kind||'未知','大小':bytes(file.size),'时间':stamp(file.timestamp)}).map(([k,v])=>el('div',{class:'wb-detail-row'},el('dt',{},k),el('dd',{},v))));
   box.append(sourceLink(file.source),metadata);
+  if(file.versions_id)box.append(button('版本 · 查看或恢复',()=>attachmentVersions(file)));
   if(file.error){box.append(message(file.error));return;}
   if(!safeLocalUrl(url)){box.append(message('文件地址无效或已缺失，请重新加载记录。'));return;}
   const tools=actions(el('a',{href:url,download:file.filename,class:'wb-btn primary'},'下载原文件'));
@@ -528,6 +595,7 @@ new MutationObserver(()=>{$('terminal-iframe')?.contentWindow?.postMessage({type
 // Basic chat actions have their own handlers; enhance them only after this
 // entire optional workbench initialized successfully.
 window.XGentWorkbench={
+  attachmentVersions,
   dialog,closeDialog,
   prepareChat:async()=>{if(state.route!=='chat'||location.hash.includes('?')){location.hash='/chat';await route();}return state.route==='chat';},
   commands:()=>state.boot?.commands,

@@ -988,6 +988,11 @@
       container.textContent = (filename || (kind === "photo" ? "图片" : "文件")) +
         "\n" + (item.error || "文件暂不可下载");
     }
+    if(item.versions_id){
+      var versions=document.createElement('button');versions.type='button';versions.className='media-versions';versions.textContent='版本';
+      versions.addEventListener('click',function(e){e.stopPropagation();if(window.XGentWorkbench?.attachmentVersions)window.XGentWorkbench.attachmentVersions(item);else toast('附件详情模块未加载，请刷新后重试。',true);});
+      container.appendChild(versions);
+    }
     return container;
   }
 
@@ -1024,10 +1029,10 @@
     if (stick) scrollDown();
   }
 
-  function makeMediaBubble(kind, filename, caption, downloadUrl, messageId, side, timestamp, error) {
+  function makeMediaBubble(kind, filename, caption, downloadUrl, messageId, side, timestamp, error, descriptor) {
     var entry = makeBubble(side || "ai", caption || "", messageId, null, null, null, timestamp);
     entry.bubble.classList.add("media-bubble");
-    setInlineMedia(entry, [{ kind: kind, filename: filename, download_url: downloadUrl, error: error }]);
+    setInlineMedia(entry, [{...descriptor, kind: kind, filename: filename, download_url: downloadUrl, error: error }]);
     return entry;
   }
 
@@ -1215,7 +1220,7 @@
   }
 
   function handleFrame(frame) {
-    if(!['message','edit','edit_markup','delete','user_message','document','photo','notice','record_snapshot'].includes(frame.type)){
+    if(!['message','edit','edit_markup','delete','user_message','document','photo','notice','record_snapshot','attachment_changed'].includes(frame.type)){
       handleFrameContent(frame);return;
     }
     var anchor=scrollAnchor(),follow=isNearBottom()&&!viewingPast;
@@ -1227,6 +1232,14 @@
   }
 
   function handleFrameContent(frame) {
+    if(frame.type==='attachment_changed'){
+      window.dispatchEvent(new CustomEvent('xgent-attachment-changed',{detail:frame}));
+      if(frame.conversation_id===selectedConversationId&&frame.generation===uiGeneration){
+        var existing=byMessageId['history:'+frame.record_id];
+        if(existing&&frame.message)putHistoryFrame(frame.message,streamEpoch);
+      }
+      return;
+    }
     if(frame.type==='queue_state'){refreshQueue();return;}
     if(frame.queue_id)refreshQueue();
     if(frame.type==='settings_state'){window.XGentAppearance?.accept(frame);return;}
@@ -1735,19 +1748,24 @@
   }
 
   function appendHistoryMedia(entry, message, role) {
-    (entry.mediaEntries || []).forEach(removeEntry);
+    var previousMedia=entry.mediaEntries||[];
     entry.mediaEntries = [];
     if (message.media_group_id || message.msg_type === "ai_reply" || message.msg_type === "media_reply") {
+      previousMedia.forEach(removeEntry);
       setInlineMedia(entry, message.media || []);
     } else {
       var after = entry.row;
-      (message.media || []).forEach(function (item) {
-        var card = makeMediaBubble(item.kind, item.filename, item.path, item.download_url,
-          null, role === "user" ? "user" : "ai", message.timestamp, item.error);
+      (message.media || []).forEach(function (item,index) {
+        item={...item,conversation_id:message.conversation_id||selectedConversationId};
+        var card = previousMedia[index];
+        if(card)setInlineMedia(card,[item]);
+        else card=makeMediaBubble(item.kind, item.filename, item.path, item.download_url,
+          null, role === "user" ? "user" : "ai", message.timestamp, item.error,item);
         log.insertBefore(card.row, after.nextSibling);
         after = card.row;
         entry.mediaEntries.push(card);
       });
+      previousMedia.slice(entry.mediaEntries.length).forEach(removeEntry);
     }
     if (entry.mediaWarning) entry.mediaWarning.remove();
     entry.mediaWarning = null;
@@ -2884,6 +2902,7 @@
   window.addEventListener('xgent-auth-expired',()=>closeWorkspaceMenu(false));
   window.XGentWorkspaceMenu={close:restore=>closeWorkspaceMenu(!!restore)};
   window.XGentChat = {
+    attachmentChanged: frame=>handleFrame({...frame,type:'attachment_changed'}),
     openCommands:openCommands,logout:logoutAction,
     commandError: function(){
       if(conversationBusy||uploadQueue)return '当前正在生成或上传，请先停止或等待完成后再执行命令。';

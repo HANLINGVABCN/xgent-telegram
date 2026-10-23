@@ -75,20 +75,54 @@ class Workbench:
         return task
 
     async def handle(self, method, resource, data):
+        version_operation = resource in {'artifacts/versions', 'artifacts/version_preview', 'artifacts/version_download', 'artifacts/restore_version'}
         navigation = resource == 'conversations' or resource.startswith('conversations/') or resource in {'tasks','tasks/cancel','skills','memories'} or resource.startswith(('skills/','memories/'))
         cid = None if navigation else data.get('conversation_id')
+        if version_operation and not cid:
+            raise WorkbenchError('缺少附件所属会话', 409)
         if method != 'GET' and resource in {'memory/clear','tasks/create'} and not cid:
             raise WorkbenchError('缺少目标会话，请刷新后重试。', 409)
         from xgent_app.interaction import interaction
         try:
             with interaction('web', 'management'):
-                async with conversation_operation(cid, expected=method != 'GET' and not navigation, allow_archived=method=='GET' and resource in {'history','search','artifacts/preview'}, fresh=True, selector='shared'):
+                async with conversation_operation(cid, expected=method != 'GET' and not navigation and not version_operation, allow_archived=method=='GET' and (version_operation or resource in {'history','search','artifacts/preview'}), fresh=True, selector='shared'):
                     return await self._handle_scoped(method, resource, data)
         except ConversationError as exc:
             raise WorkbenchError(str(exc), exc.status) from exc
 
     async def _handle_scoped(self, method, resource, data):
         await self.db()
+        if resource == 'conversations/set_bot':
+            if method != 'POST':
+                raise WorkbenchError('请使用设置操作', 405)
+            if not self.ns['BotConfig'].TOKEN:
+                raise WorkbenchError('此部署未配置 Telegram Bot', 409)
+            if (not isinstance(data.get('id'), str) or not data['id'] or type(data.get('generation')) is not int
+                    or 'expected_bot' not in data or data['expected_bot'] is not None and not isinstance(data['expected_bot'], str)):
+                raise WorkbenchError('缺少有效的目标会话或 Bot 选择版本', 400)
+            db = await self.db()
+            changed = await db.set_bot_conversation(data['id'], data['generation'], data['expected_bot'])
+            await get_conversations().poll_once()
+            notify = self.ns.get('_notify_owner_soon')
+            if changed and callable(notify):
+                # System notice only: sent straight to Telegram, never recorded
+                # into conversation history or model context.
+                name = changed if len(changed) <= 60 else changed[:59] + '…'
+                notify(f'🔀 系统提示：Bot 当前对话已切换到「{name}」（来自网页）')
+            return {'ok': True, **await self.conversations({})}
+        if resource in {'artifacts/versions', 'artifacts/version_preview', 'artifacts/version_download', 'artifacts/restore_version'}:
+            from .attachment_version_api import AttachmentVersionAPI
+            from .attachment_versions import VersionError
+            from .attachments import AttachmentContextError
+            api = AttachmentVersionAPI(self)
+            action = resource.split('/')[1]
+            if (action == 'restore_version') != (method == 'POST'):
+                raise WorkbenchError('此版本操作不支持该请求方式', 405)
+            try:
+                return await api.restore(data) if action == 'restore_version' else await api.read(action, data)
+            except (VersionError, AttachmentContextError, OSError) as exc:
+                # Expected version conflicts are UI feedback, not new chat/error rows.
+                raise WorkbenchError(str(exc), getattr(exc, 'status', 409)) from exc
         if method == 'GET':
             operations = {'conversations': self.conversations, 'conversations/delete_info': self.conversation_delete_info, 'conversations/search': self.search_conversations, 'bootstrap': self.bootstrap, 'history': self.history, 'search': self.search,
                           'tasks': self.tasks, 'artifacts': self.artifacts, 'providers': self.providers,
@@ -877,7 +911,8 @@ class Workbench:
 
     async def conversations(self, data):
         db = await self.db()
-        return {**await get_conversations().state(), 'items': await db.get_all_sessions()}
+        return {**await get_conversations().state(), 'items': await db.get_all_sessions(),
+                'telegram_configured': bool(self.ns['BotConfig'].TOKEN)}
 
     async def conversation_action(self, data):
         if data['action'] != 'create' and not data.get('id'):

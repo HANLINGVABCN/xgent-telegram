@@ -342,8 +342,20 @@ function openMenu(id, trigger) {
     : button([icon('archive'), node('span', {}, '归档对话')], () => archiveConversation(id), {role: 'menuitem'});
   const reset=button('🧹 重置上下文',()=>confirmConversationAction('reset_context',id),{role:'menuitem'});
   const remove=button('🗑 删除对话',()=>confirmConversationAction('delete',id),{role:'menuitem',class:'danger'});
-  menu.replaceChildren(rename, other, reset, remove); menu.hidden = false; positionMenu();
+  const botCurrent=state.telegram_conversation_id===id;
+  const setBot=button(botCurrent?'🤖 Bot 当前对话':'🤖 设为 Bot 当前对话',()=>setBotConversation(item),{role:'menuitem'});
+  setBot.disabled=botCurrent||isArchived(item)||!state.telegram_configured;
+  setBot.title=!state.telegram_configured?'此部署未配置 Telegram Bot':isArchived(item)?'请先恢复已归档会话':botCurrent?'Bot 已使用此对话':'只改变 Bot 的选择，不切换网页或终端，不改投运行任务';
+  menu.replaceChildren(rename, setBot, other, reset, remove); menu.hidden = false; positionMenu();
   rename.focus({preventScroll: true});
+}
+async function setBotConversation(item){
+  if(mutation)return;
+  const expected=state.telegram_conversation_id;
+  closeMenu(false);
+  try{
+    if(await mutate('set_bot',{id:item.id,generation:item.generation,expected_bot:expected}))notify('Bot 当前对话已设为「'+title(item)+'」，网页选择不变。');
+  }catch(error){if(error.name!=='AbortError'){notify('设置失败：'+error.message,{error:true,retry:refresh});await refresh();}}
 }
 async function confirmConversationAction(action,id) {
   closeMenu(false);

@@ -40,6 +40,8 @@ def build_document_attachment_payload(doc_name: str, content_bytes: bytes, capti
         saved_file, doc_name, content_bytes, caption, context_prefix,
         mime_type=mime_type, source_message_id=source_message_id,
     )
+    from xgent_app.attachment_versions import save_original_version
+    save_original_version(reference, content_bytes, ArtifactManager.UPLOAD_DIR)
     kind = "图片" if reference['kind'] == 'image' else "文件"
     note = ArtifactManager.shorten_text(caption, 80) if caption else ""
     return {
