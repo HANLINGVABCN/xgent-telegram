@@ -299,14 +299,14 @@ def build_history_message(
         message['reply_markup'] = [[{
             'text': '\u91cd\u8bd5\u6062\u590d', 'callback_data': 'retry_compress:' + task['id'],
         }]]
-    if kind not in _FILE_TYPES:
+    if kind not in _FILE_TYPES and not metadata.get('server_uploads'):
         return message
     if (metadata.get("attachment_purpose") == "configuration"
             or kind in {"user_file", "user_photo"} and content.startswith(_CONFIG_PREFIXES)):
         return message
     storage, workspace = Path(storage_root), Path(workspace_root)
     groups = []
-    for key in ("display_media", "attachments"):
+    for key in ("display_media", "attachments", "server_uploads"):
         if key in metadata:
             refs = metadata[key]
             if not isinstance(refs, list):
@@ -321,8 +321,8 @@ def build_history_message(
                     else pair[0], pair[0],
                 ))
                 refs = [ref for _, ref in refs]
-            groups.extend((ref, key == "attachments") for ref in refs)
-    if "attachments" not in metadata and "display_media" not in metadata:
+            groups.extend((ref, key in {"attachments", "server_uploads"}) for ref in refs)
+    if "attachments" not in metadata and "display_media" not in metadata and "server_uploads" not in metadata:
         if not (kind in {"ai_reply", "media_reply"} and metadata.get("generated_media_processed") is True):
             legacy = _legacy_media(record, storage, workspace)
             if kind in {'user_file', 'user_photo'} and role == 'user':
@@ -348,7 +348,8 @@ def build_history_message(
         if item.get("path"):
             seen.add(item["path"])
         index = len(message["media"])
-        if kind in {'user_file', 'user_photo'} and role == 'user' and attachment and isinstance(ref, dict) and ref.get('storage', 'uploads') == 'uploads':
+        if (kind in {'user_file', 'user_photo'} and role == 'user' and attachment and isinstance(ref, dict)
+                and ref.get('storage', 'uploads') == 'uploads' and ref not in metadata.get('server_uploads', [])):
             try:
                 from .attachment_versions import attachment_identity
                 identity, _ = attachment_identity(ref, storage / 'uploads')

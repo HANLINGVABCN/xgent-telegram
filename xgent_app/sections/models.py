@@ -42,13 +42,13 @@ class ModelClient:
                                             system_prompt: str, history: list,
                                             max_tokens: Optional[int]) -> Tuple[list, Optional[int]]:
         frozen = isinstance(history, FrozenConversation)
+        limits = ModelClient.request_limits(prov_name, base_url, model)
         if frozen:
             db = await BotMemoryDB.get_instance()
             if history.generation != await db.get_attachment_generation():
                 raise AttachmentContextError('压缩快照已失效，本轮未调用模型。')
         else:
-            history = await build_model_conversation_history(history)
-        limits = ModelClient.request_limits(prov_name, base_url, model)
+            history = await build_model_conversation_history(history, file_limits=limits)
         request = ConversationRequest(history, limits, system_prompt)
         request.require_complete = frozen
         return request, reserved_output_tokens(limits, max_tokens)

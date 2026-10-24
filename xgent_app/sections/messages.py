@@ -318,20 +318,11 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     if not await check_authorized_user_middleware(update, context):
         return
 
-    # 处理中锁（仅对非提示词编辑状态生效）
     await UserDataManager.init()
     state = UserDataManager.get('state')
     configuration_upload = is_prompt_edit_state(state) or state in {
         BotState.SET_COMMAND_BLACKLIST, BotState.SET_MEMORY, BotState.IMPORT_PROVIDER_CONFIG,
     }
-    media_group_id = getattr(update.message, "media_group_id", None)
-    if not configuration_upload:
-        if _conversation_processing_lock.locked():
-            await update.message.reply_text(
-                "⏳ 系统仍在处理上一个请求... 请稍等。"
-            )
-            return
-
     doc = update.message.document
     doc_name = doc.file_name or f"document_{uuid.uuid4().hex[:8]}.bin"
     # caption 同样只取原文：格式属性丢弃，字符一字不差。
@@ -342,19 +333,8 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         if caption:
             logger.warning(f"handle_document_message: extracted caption via rich_message, len={len(caption)}: {caption[:200]}")
 
-    if media_group_id and not configuration_upload:
-        async def prepare_document():
-            data = bytes(await download_telegram_file(doc))
-            return await asyncio.to_thread(
-                build_document_attachment_payload, doc_name, data, caption,
-                build_incoming_context_prefix(update.message), doc.mime_type,
-                update.message.message_id,
-            )
-
-        await _handle_album_attachment(
-            update, context, media_group_id, prepare_document, MessageType.USER_FILE,
-            received_at_ns=received_at_ns,
-        )
+    if not configuration_upload:
+        await receive_stitched_file(update, context, doc, doc_name, caption)
         return
 
     db = await BotMemoryDB.get_instance()
@@ -1433,7 +1413,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 @conversation_entry()
 async def handle_normal_text_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    if has_pending_text_conversation(update):
+    if has_pending_text_conversation(update) or _stitch_receiving.get(get_text_conversation_buffer_key(update)):
         await queue_text_conversation(update, context, text)
         return
 
@@ -1455,9 +1435,87 @@ async def queue_text_conversation(update: Update, context: ContextTypes.DEFAULT_
             pending = PendingTextConversation(update, context, text)
             _pending_text_conversations[key] = pending
         else:
+            if pending.committing:
+                raise ConversationBusy('正在提交拼接，请稍后继续发送。')
             pending.append(update, context, text)
 
     await show_or_update_text_stitch_prompt(pending)
+
+
+async def receive_stitched_file(update, context, media, name, caption):
+    """Persist bytes now, join the existing manual Done/Clear text buffer."""
+    key = get_text_conversation_buffer_key(update)
+    mid = getattr(update.message, 'message_id', None)
+    pending = _pending_text_conversations.get(key)
+    if mid is not None and pending and any(p['attachment'].get('source_message_id') == mid for p in pending.attachments):
+        return
+    payload = None
+    retained = False
+    generation = current_scope().generation
+    cancel_epoch = _stitch_cancellations.get(key, 0)
+    _stitch_receiving[key] = _stitch_receiving.get(key, 0) + 1
+    try:
+        db = await BotMemoryDB.get_instance()
+        for record in await db.get_attachment_records():
+            metadata = record.get('metadata') or '{}'
+            metadata = json.loads(metadata) if isinstance(metadata, str) else metadata
+            if mid is not None and any(ref.get('source_message_id') == mid for ref in metadata.get('attachments', [])):
+                return
+        with tempfile.TemporaryDirectory(prefix='telegram-incoming-') as directory:
+            path = os.path.join(directory, 'file')
+            downloaded = await download_telegram_file(media, path)
+            if isinstance(downloaded, (bytes, bytearray)):
+                with open(path, 'wb') as handle:
+                    handle.write(downloaded)
+            payload = await asyncio.to_thread(ArtifactManager.adopt_upload, name, path, caption,
+                                             source_message_id=mid)
+            payload['attachment']['context_prefix'] = build_incoming_context_prefix(update.message)
+        if generation != await db.get_attachment_generation() or cancel_epoch != _stitch_cancellations.get(key, 0):
+            raise ValueError('拼接已清空或会话已改变，此文件未提交')
+        # Image documents preserve the image route instead of starting stitching.
+        if payload['attachment']['kind'] == 'image':
+            group = getattr(update.message, 'media_group_id', None)
+            if group:
+                async def prepared():
+                    return payload
+                scope = await admit_media_album(update, group)
+                with bind_conversation(scope):
+                    retained = bool(await _handle_album_attachment(update, context, group, prepared, MessageType.USER_PHOTO))
+                if not retained:
+                    from xgent_app.file_ingress import cleanup_payloads
+                    await asyncio.to_thread(cleanup_payloads, [payload], ArtifactManager.UPLOAD_DIR)
+            else:
+                async with conversation_operation(execution=True):
+                    await GlobalRecorder.record_attachment_message(payload['index_text'], MessageType.USER_PHOTO,
+                        update.effective_chat.id, [payload['attachment']], current_scope().generation)
+                    retained = True
+                    await process_conversation(update, context, payload['index_text'])
+            return
+        with _pending_text_conversations_lock:
+            pending = _pending_text_conversations.get(key)
+            if pending is None:
+                pending = PendingTextConversation(update, context, '')
+                pending.parts = []
+                _pending_text_conversations[key] = pending
+            if pending.committing:
+                raise ConversationBusy('正在提交拼接，请稍后重发此文件。')
+            if mid is not None and any(p['attachment'].get('source_message_id') == mid for p in pending.attachments):
+                from xgent_app.file_ingress import cleanup_payloads
+                cleanup_payloads([payload], ArtifactManager.UPLOAD_DIR)
+                return
+            pending.attachments.append(payload)
+            pending.attachments.sort(key=lambda p: p['attachment'].get('source_message_id') or 0)
+            retained = True
+        await show_or_update_text_stitch_prompt(pending)
+    except Exception as exc:
+        if payload is not None and not retained:
+            from xgent_app.file_ingress import cleanup_payloads
+            await asyncio.to_thread(cleanup_payloads, [payload], ArtifactManager.UPLOAD_DIR)
+        await update.message.reply_text(f'文件 {name} 未加入拼接：{exc}')
+    finally:
+        _stitch_receiving[key] -= 1
+        if not _stitch_receiving[key]:
+            _stitch_receiving.pop(key, None)
 
 
 async def show_or_update_text_stitch_prompt(pending: PendingTextConversation):
@@ -1487,6 +1545,34 @@ async def show_or_update_text_stitch_prompt(pending: PendingTextConversation):
 
 async def finish_text_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = get_text_conversation_buffer_key(update)
+    if _stitch_receiving.get(key):
+        if update.callback_query:
+            await update.callback_query.answer('附件仍在接收保存，请完成后再点发送。', show_alert=True)
+        return
+    pending = _pending_text_conversations.get(key)
+    if pending is not None and pending.attachments:
+        if pending.committing:
+            return
+        from xgent_app.conversations import replay_conversation
+        with replay_conversation(pending.conversation_context):
+            async with conversation_operation(execution=True):
+                if _pending_text_conversations.get(key) is not pending:
+                    return
+                pending.committing = True
+                try:
+                    text = merge_text_conversation_parts(pending.parts)
+                    content = '\n\n'.join([text, *[p['index_text'] for p in pending.attachments]]).strip()
+                    refs = [dict(p['attachment'], order=i) for i, p in enumerate(pending.attachments)]
+                    await GlobalRecorder.record_attachment_message(content, MessageType.USER_FILE,
+                        pending.update.effective_chat.id, refs, current_scope().generation)
+                    _pending_text_conversations.pop(key, None)
+                    if pending.prompt_message is not None:
+                        with contextlib.suppress(Exception):
+                            await pending.prompt_message.edit_text('✅ 已完成拼接，正在发送给 AI。', reply_markup=None)
+                    await process_conversation(pending.update, pending.context, content)
+                finally:
+                    pending.committing = False
+        return
     with _pending_text_conversations_lock:
         pending = _pending_text_conversations.pop(key, None)
 
@@ -1528,12 +1614,20 @@ async def finish_text_conversation(update: Update, context: ContextTypes.DEFAULT
 async def cancel_text_conversation(update: Update):
     key = get_text_conversation_buffer_key(update)
     with _pending_text_conversations_lock:
+        current = _pending_text_conversations.get(key)
+        if current is not None and current.committing:
+            return
         pending = _pending_text_conversations.pop(key, None)
+        _stitch_cancellations[key] = _stitch_cancellations.get(key, 0) + 1
 
     if pending is None:
         if update.callback_query:
             await update.callback_query.answer("没有正在拼接的内容", show_alert=True)
         return
+
+    if pending.attachments:
+        from xgent_app.file_ingress import cleanup_payloads
+        await asyncio.to_thread(cleanup_payloads, pending.attachments, ArtifactManager.UPLOAD_DIR)
 
     try:
         if pending.prompt_message is not None:

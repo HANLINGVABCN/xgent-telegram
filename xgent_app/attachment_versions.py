@@ -189,7 +189,10 @@ class AttachmentVersions:
         version = _digest(data)
         existing = next((item for item in index['entries'] if item['id'] == version), None)
         if existing:
-            self._read_snapshot(index, version)
+            from .file_ingress import fingerprint
+            size, digest = fingerprint(self._safe(self.directory / (version + '.bin')))
+            if size != existing['size'] or digest != version:
+                raise VersionError('版本副本校验失败')
         else:
             path = self._safe(self.directory / (version + '.bin'))
             self._write(path, data)
@@ -231,6 +234,23 @@ class AttachmentVersions:
     def original(self, data):
         with self.locked():
             return self._observe(data, inspect_version(data, self.reference), original=True)
+
+    def observe_file(self, *, original=False):
+        """Archive a disk-backed upload without allocating its entire body."""
+        import mmap
+        from .file_ingress import inspect_file
+        with self.locked(), open(self.path, 'rb') as handle:
+            before = os.fstat(handle.fileno())
+            info = inspect_file(self.path, self.reference['name'], self.reference.get('mime_type'))
+            info.pop('path_only', None)
+            if before.st_size:
+                with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                    summary = self._observe(data, info, original=original)
+            else:
+                summary = self._observe(b'', info, original=original)
+            if _signature(before) != _signature(os.fstat(handle.fileno())):
+                raise VersionError('文件在备份期间变化，请重试')
+            return summary
 
     def read_current(self):
         """Read once under the version lock. Archiving failures do not omit bytes."""

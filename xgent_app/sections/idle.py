@@ -1236,14 +1236,11 @@ def _web_submit_message(text: str, outbox: Any, *, conversation_id=None) -> None
 
 
 async def _web_deliver_file_to_tg(abs_path: str, filename: str, caption: str) -> None:
-    """把网页上传的文件同步发到 Telegram。三段分流对齐 agent_sendfile.py:79-174：
+    await sync_web_attachment_to_telegram(abs_path, filename, caption)
 
-      ≤ MAX_FILE_SIZE              → 原生 send_document 上传
-      > MAX_FILE_SIZE + 本地 server → 硬链到 .local-api-data/，用 file:// 容器路径直发
-      > MAX_FILE_SIZE 无 server     → 只在网页告警，不发（对话照常进行）
 
-    本函数刻意不抛异常：TG 同步失败用 outbox 推一条 sys 提示，网页对话不被拖崩。
-    """
+async def sync_web_attachment_to_telegram(abs_path, filename, caption, *, chat_id=None, transport_capabilities=None):
+    """Mirror accepted Web attachments; oversize notices are sent to Telegram."""
     from xgent_app.interaction import telegram_delivery_allowed
     if _web_real_bot is None or not telegram_delivery_allowed():
         return  # Filter before touching Telegram or creating a deferred upload.
@@ -1262,7 +1259,7 @@ async def _web_deliver_file_to_tg(abs_path: str, filename: str, caption: str) ->
             })
         return
 
-    chat_id = BotConfig.AUTHORIZED_USER_ID
+    chat_id = chat_id or BotConfig.AUTHORIZED_USER_ID
     # 发到 TG 的 caption 带 [网页] 标记，与网页文本消息的镜像标记一致，
     # 让 TG 端知道这文件来自网页。仅用于 TG 发送，不影响喂给模型的附言。
     from xgent_app.telegram_presentation import render_telegram_caption, render_telegram_text
@@ -1272,19 +1269,23 @@ async def _web_deliver_file_to_tg(abs_path: str, filename: str, caption: str) ->
             await _web_real_bot.send_message(chat_id=chat_id, text=await render_telegram_text(overflow_caption))
         file_size = os.path.getsize(abs_path)
         # AgentExecutor.MAX_FILE_SIZE 与发送侧同源（50MB），通过共享命名空间可见。
-        max_file_size = AgentExecutor.MAX_FILE_SIZE
-        api_base_url = BotConfig.API_BASE_URL
+        from xgent_app.file_ingress import FileTransportCapabilities
+        capabilities = transport_capabilities or FileTransportCapabilities.configured(BotConfig.API_BASE_URL)
+        max_file_size = 50 * 1024 * 1024
+        api_base_url = capabilities.mode == 'local_bot_api'
+        if file_size > capabilities.document_upload_limit:
+            limit_mb = capabilities.document_upload_limit // 1024 // 1024
+            notice = (f'附件 {filename} 已上传到服务器，但大小为 {file_size / 1024 / 1024:.2f} MB，'
+                      f'超过当前 Telegram Bot API 的 {limit_mb} MB 限制，未同步发送。\n服务器路径：{abs_path}')
+            await _web_real_bot.send_message(chat_id=chat_id, text=await render_telegram_text(notice))
+            return
 
         if file_size > max_file_size and api_base_url:
             # 大文件 + 本地 server：硬链到宿主机数据目录，用容器内 file:// 路径直发。
             # _LOCAL_API_HOST_DATA_DIR / _LOCAL_API_CONTAINER_DATA_DIR 来自 core.py。
             import uuid as _uuid
-            name_parts = filename.rsplit('.', 1)
-            unique_name = (
-                f"{name_parts[0]}_web_{_uuid.uuid4().hex[:8]}.{name_parts[1]}"
-                if len(name_parts) == 2
-                else f"{filename}_web_{_uuid.uuid4().hex[:8]}"
-            )
+            suffix = os.path.splitext(ArtifactManager._safe_name(filename, 'upload'))[1]
+            unique_name = f"web_{_uuid.uuid4().hex}{suffix}"
             temp_host_path = os.path.join(_LOCAL_API_HOST_DATA_DIR, unique_name)
 
             def _prepare() -> None:
@@ -1319,22 +1320,6 @@ async def _web_deliver_file_to_tg(abs_path: str, filename: str, caption: str) ->
                     logger.warning("清理 web 上传临时文件失败: %s", temp_host_path)
             return
 
-        if file_size > max_file_size:
-            # 大文件但没配本地 server：发不了。用 message 帧推一条 AI 侧提示——
-            # 不能用 turn_error（会让前端 setBusy(false) 中断本轮）；message 帧只
-            # hideTyping + 显示气泡，不动 busy，正好。显示在 AI 侧而非用户侧。
-            server_obj = _web_chat_server
-            if server_obj is not None:
-                server_obj.outbox.put({
-                    "type": "message",
-                    "text": (
-                        f"⚠️ 文件 {filename} 超过 50MB({file_size} bytes)，未启用本地 API，"
-                        "无法同步到 Telegram（仅网页处理）。如需同步大文件，请在 install.sh 菜单"
-                        "选项 8 启用本地 API 容器。"
-                    ),
-                    "ts": time.time(),
-                })
-            return
 
         # 小文件：原生上传。
         with open(abs_path, "rb") as f:
@@ -1474,6 +1459,149 @@ def _web_submit_upload(filename: str, content: bytes, caption: str, outbox: Any,
     task = asyncio.run_coroutine_threadsafe(receive(), loop)
     # Keep the scheduling future alive; input confirmation need not wait for AI.
     task.add_done_callback(lambda finished: finished.exception() if not finished.cancelled() else None)
+    return receipt
+
+
+_web_file_receipts = {}
+_web_file_receipts_lock = threading.RLock()
+
+
+async def _web_run_file_batch(data, mode, outbox, receipt):
+    from xgent_app.file_ingress import describe_file, cleanup_payloads
+    from xgent_app.attachment_versions import upload_receipt_scope
+    payloads, committed = [], False
+    try:
+        db = await BotMemoryDB.get_instance()
+        generation = await db.get_attachment_generation()
+        key = data.get('idempotency_key')
+        signature = hashlib.sha256(json.dumps([mode, data.get('modes', ''), data.get('text', ''), data.get('captions', ''),
+            [(f['filename'], f['size'], f['sha256']) for f in data['files']]], ensure_ascii=False).encode()).hexdigest()
+        if key:
+            conn = await db._get_conn()
+            cursor = await conn.execute("SELECT id,metadata FROM global_messages WHERE session_id=? AND json_extract(metadata,'$.upload_request_key')=? LIMIT 1",
+                                       (current_scope().conversation_id, key))
+            previous = await cursor.fetchone()
+            await cursor.close()
+            if previous:
+                metadata = json.loads(previous['metadata'])
+                if metadata.get('upload_signature') != signature:
+                    raise ValueError('相同上传标识对应不同文件，请重新提交')
+                receipt.set_result({'ok': True, 'duplicate': True, 'record_id': previous['id']})
+                outbox.put({'type': 'turn_end'})
+                return
+        state = UserDataManager.get('state')
+        configuration = is_prompt_edit_state(state) or state in {
+            BotState.IMPORT_PROVIDER_CONFIG, BotState.SET_COMMAND_BLACKLIST, BotState.SET_MEMORY}
+        if configuration:
+            if mode != 'attachment' or len(data['files']) != 1:
+                raise ValueError('配置录入请一次只提交一个附件；服务器上传请先退出配置录入')
+            item = data['files'][0]
+            # Configuration parsing has its own format/size limits, not transport limits.
+            if item['size'] > PROVIDER_CONFIG_MAX_BYTES:
+                raise ValueError('配置文件过大，请使用普通附件或服务器上传')
+            with open(item['path'], 'rb') as handle:
+                content = handle.read()
+            with upload_receipt_scope(receipt):
+                await _web_run_upload(item['filename'], content, data['text'], outbox)
+            return
+        captions = json.loads(data.get('captions') or '[]')
+        modes = json.loads(data.get('modes') or '[]')
+        if modes and (len(modes) != len(data['files']) or any(m not in {'attachment', 'server_upload'} for m in modes)):
+            raise ValueError('文件模式格式错误')
+        if not isinstance(captions, list) or any(not isinstance(c, str) for c in captions):
+            raise ValueError('文件说明格式错误')
+        for i, item in enumerate(data['files']):
+            item_mode = modes[i] if modes else mode
+            payloads.append(await asyncio.to_thread(ArtifactManager.adopt_upload,
+                item['filename'], item['path'], captions[i] if i < len(captions) else '',
+                order=i, backup=item_mode == 'attachment', path_only=item_mode == 'server_upload'))
+            payloads[-1]['mode'] = item_mode
+        refs = [p['attachment'] for p in payloads]
+        content = '\n\n'.join(filter(None, [data.get('text', ''), *[
+            describe_file(ref, ArtifactManager.UPLOAD_DIR) if p['mode'] == 'server_upload' else p['index_text']
+            for ref, p in zip(refs, payloads)]]))
+        metadata = {'upload_request_key': key, 'upload_signature': signature, 'file_ingress_mode': mode}
+        attachment_refs = [p['attachment'] for p in payloads if p['mode'] == 'attachment']
+        upload_refs = [p['attachment'] for p in payloads if p['mode'] == 'server_upload']
+        if upload_refs:
+            metadata['server_uploads'] = upload_refs
+        if attachment_refs:
+            row_id = await GlobalRecorder.record_attachment_message(content, MessageType.USER_FILE,
+                BotConfig.AUTHORIZED_USER_ID, attachment_refs, generation, metadata=metadata)
+        else:
+            row_id = await GlobalRecorder.record_user_message(content, MessageType.USER_TEXT,
+                BotConfig.AUTHORIZED_USER_ID, metadata={**metadata, 'server_uploads': refs,
+                                                      'attachment_generation': generation})
+            if row_id is None:
+                raise ValueError('上传记录未保存')
+        committed = True
+        receipt.set_result({'ok': True, 'record_id': row_id})
+        update, context, _ = build_web_mirror_objects(BotConfig.AUTHORIZED_USER_ID, outbox, _web_real_bot,
+                                                     channel=telegram_channel())
+        if attachment_refs:
+            async def synchronize():
+                for p in payloads:
+                    if p['mode'] != 'attachment':
+                        continue
+                    await sync_web_attachment_to_telegram(p['saved_file']['abs_path'],
+                        p['attachment']['name'], p['attachment'].get('caption', ''))
+            task = asyncio.create_task(synchronize())
+            get_conversations().track_background(task)
+        await process_conversation(update, context, content)
+        outbox.put({'type': 'turn_end'})
+    except Exception as exc:
+        if not receipt.done():
+            receipt.set_result({'ok': False, 'error': str(exc)})
+        outbox.put({'type': 'turn_error', 'text': str(exc)})
+    finally:
+        if not committed and payloads:
+            await asyncio.to_thread(cleanup_payloads, payloads, ArtifactManager.UPLOAD_DIR)
+        data['_temporary'].cleanup()
+
+
+def _web_submit_file_batch(data, mode, outbox, *, conversation_id=None):
+    from concurrent.futures import Future
+    key = data.get('idempotency_key') or data.get('batch_id') or uuid.uuid4().hex
+    data['idempotency_key'] = key
+    signature = hashlib.sha256(json.dumps([mode, data.get('modes', ''), data.get('text', ''), data.get('captions', ''),
+        [(f['filename'], f['size'], f['sha256']) for f in data['files']]], ensure_ascii=False).encode()).hexdigest()
+    cache_key = (conversation_id, key)
+    with _web_file_receipts_lock:
+        existing = _web_file_receipts.get(cache_key)
+        if existing:
+            data['_temporary'].cleanup()
+            if existing[0] != signature:
+                failed = Future()
+                failed.set_result({'ok': False, 'error': '上传标识已用于其他文件'})
+                return failed
+            if existing[1].done():
+                duplicate = Future()
+                duplicate.set_result({**existing[1].result(), 'duplicate': True})
+                return duplicate
+            return existing[1]
+        receipt = Future()
+        _web_file_receipts[cache_key] = (signature, receipt)
+    loop = _web_chat_server.config.loop if _web_chat_server else None
+    if loop is None:
+        data['_temporary'].cleanup()
+        receipt.set_result({'ok': False, 'error': '服务未就绪'})
+        _web_file_receipts.pop(cache_key, None)
+        return receipt
+    async def receive():
+        try:
+            await _web_scoped_call(_web_run_file_batch(data, mode, outbox, receipt), conversation_id,
+                outbox, execution=True)
+        except Exception as exc:
+            logger.exception('Web 文件批次接纳失败')
+            if not receipt.done():
+                receipt.set_result({'ok': False, 'error': str(exc)})
+        finally:
+            data['_temporary'].cleanup()
+            if not receipt.done():
+                receipt.set_result({'ok': False, 'error': '当前会话未接收文件，请稍后重试'})
+            if not receipt.result().get('ok'):
+                _web_file_receipts.pop(cache_key, None)
+    asyncio.run_coroutine_threadsafe(receive(), loop)
     return receipt
 
 
@@ -1693,13 +1821,7 @@ async def start_web_chat_if_enabled(app: Optional[Any] = None, *,
         submit_ui_callback=_web_submit_ui_callback,
         submit_command=_web_submit_command,
         submit_upload=_web_submit_upload,
-        # 上传上限按 API_BASE_URL 选档，与 agent_sendfile.py 发送侧阈值同源：
-        # 官方 API 50MB、本地 Bot API server 2GB。保证「web 放进来 → bot 发出去」
-        # 两端阈值一致，不会出现 web 放行却在 send_document 被 TG 拒。
-        upload_body_limit=(
-            2 * 1024 * 1024 * 1024 if BotConfig.API_BASE_URL
-            else 50 * 1024 * 1024
-        ),
+        submit_file_batch=_web_submit_file_batch,
         read_history=_web_read_history,
         read_conversations=get_conversations().state,
         read_history_message=_web_read_history_message,
@@ -1933,7 +2055,7 @@ async def _web_scoped_call(coro, conversation_id, outbox, *, execution=False, re
                 await UserDataManager.init()
                 expired = UserDataManager.bind_ui_state()
                 name = getattr(getattr(coro, 'cr_code', None), 'co_name', '')
-                user_input = name in {'_web_run_conversation', '_web_run_upload',
+                user_input = name in {'_web_run_conversation', '_web_run_upload', '_web_run_file_batch',
                                      '_web_run_photo_conversation', '_web_run_file_conversation'}
                 if expired and user_input:
                     raise ConversationChanged('之前的录入已因上下文变化取消；本次内容未提交，请重新操作。')

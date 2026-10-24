@@ -20,6 +20,9 @@
   var btnStop = document.getElementById("btn-stop");
   var btnAttach = document.getElementById("btn-attach");
   var fileInput = document.getElementById("file-input");
+  var serverUploadInput = document.getElementById('server-upload-input');
+  var fileModes = new WeakMap();
+  var fileBatchKeys = new WeakMap();
   var pendingFilesEl = document.getElementById("pending-files");
   var typing = document.getElementById("typing");
   var statusText = document.getElementById("status-text");
@@ -1933,11 +1936,15 @@
     if (selected) { pendingFiles=pendingFiles.filter(function(f){return selected.indexOf(f)<0;});renderPendingFiles(); }
     else clearPendingFiles();
     try {
-      for (var i = 0; i < batch.files.length && !batch.cancelled; i++) {
-        var f = batch.files[i];
+      // Submit a whole selection once; per-file modes preserve attachment/upload intent.
+      if (!batch.cancelled) {
+        var f = batch.files[0];
+        var modes = batch.files.map(file=>fileModes.get(file)||'attachment');
+        var mode = modes.every(value=>value==='server_upload') ? 'server_upload' : 'attachment';
+        batch.files.forEach(file=>fileStatuses.set(file,'上传中'));
         fileStatuses.set(f,"上传中");
-        var caption = i === 0 ? text : "";
-        var entry = makeBubble("user", "📎 " + f.name + (caption ? "\n" + caption : ""));
+        var caption = text;
+        var entry = makeBubble('user', (mode==='server_upload'?'↑ 上传到服务器：':'📎 ') + batch.files.map(file=>file.name).join('、') + (caption?'\n'+caption:''));
         if (mediaKindFromName(f.name) === "photo") {
           var url = URL.createObjectURL(f);
           entry.objectUrls = [url];
@@ -1955,30 +1962,50 @@
         batch.rejected = false;
         var turnDone = new Promise(function (resolve) { batch.finish = resolve; });
         var fd = new FormData();
-        fd.append("file", f, f.name);
+        batch.files.forEach(file=>fd.append('file',file,file.name));
         fd.append("text", caption);
+        fd.append('modes',JSON.stringify(modes));
+        var signature = JSON.stringify([mode,text,modes,batch.files.map(file=>[file.name,file.size,file.lastModified])]);
+        var previous = fileBatchKeys.get(f);
+        var requestKey = previous?.signature===signature ? previous.key : (crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random());
+        batch.files.forEach(file=>fileBatchKeys.set(file,{signature:signature,key:requestKey}));
+        fd.append('idempotency_key',requestKey);
         if(batch.conversation_id)fd.append("conversation_id",batch.conversation_id);
         try {
-          var response = await fetch("/api/upload", {
-            method: "POST", credentials: "same-origin", body: fd
+          var progress=document.createElement('small');progress.textContent='正在上传…';entry.body.appendChild(progress);
+          var response = await new Promise(function(resolve,reject){
+            var request=new XMLHttpRequest();
+            request.open('POST',mode==='server_upload'?'/api/server-uploads':'/api/attachments');
+            request.withCredentials=true;
+            request.upload.onprogress=function(event){
+              progress.textContent=event.lengthComputable?'上传 '+Math.round(event.loaded/event.total*100)+'%':'正在上传…';
+            };
+            request.onerror=()=>reject(new Error('网络中断，文件仍保留，可重试本批文件'));
+            request.onload=()=>resolve({ok:request.status>=200&&request.status<300,status:request.status,
+              json:async()=>{try{return JSON.parse(request.responseText);}catch(e){return {};}}});
+            request.send(fd);
           });
           var body = await response.json().catch(function () { return {}; });
-          if (!response.ok) throw new Error(body.error || ("HTTP " + response.status));
+          if (!response.ok) throw new Error(body.error || (response.status===413?'反向代理拒绝了上传（HTTP 413），请调整代理请求体限制后重试。':"HTTP " + response.status));
+          progress.textContent='已接收，正在处理';
+          if(body.duplicate){batch.next=batch.files.length;batch.awaitingTurn=false;reconcileAfterTurn=true;return;}
         } catch (err) {
           batch.awaitingTurn = false;
           removeEntry(entry);
-          fileStatuses.set(f,"上传失败：" + err.message);
+          batch.files.forEach(file=>fileStatuses.set(file,'上传失败：'+err.message));
           batch.error = f.name + " 上传失败：" + err.message;
-          break;
+          return;
         }
-        if(batch.rejected){fileStatuses.set(f,'未提交：'+batch.error);break;}
+        if(batch.rejected){fileStatuses.set(f,'未提交：'+batch.error);return;}
         fileStatuses.set(f,"已接收，处理中");
-        batch.next = i + 1;
+        batch.next = batch.files.length;
         var turnError=await turnDone;
-        if(batch.rejected){batch.next=i;fileStatuses.set(f,'未提交：'+batch.error);break;}
-        if (turnError) break;
+        if(batch.rejected){batch.next=0;fileStatuses.set(f,'未提交：'+batch.error);return;}
+        if (turnError) return;
         batch.finish = null;
       }
+    } catch(err) {
+      batch.awaitingTurn=false;batch.error=err.message;
     } finally {
       var remaining = batch.files.slice(batch.next);
       if(batch.conversation_id!==selectedConversationId){
@@ -2629,6 +2656,11 @@
     event.returnValue = "";
   });
   btnAttach.addEventListener("click", function () { fileInput.click(); });
+  document.getElementById('btn-server-upload').addEventListener('click',()=>serverUploadInput.click());
+  serverUploadInput.addEventListener('change',function(){
+    Array.from(serverUploadInput.files).forEach(file=>{fileModes.set(file,'server_upload');pendingFiles.push(file);});
+    serverUploadInput.value='';renderPendingFiles();
+  });
 
   fileInput.addEventListener("change", function () {
     for (var i = 0; i < fileInput.files.length; i++) pendingFiles.push(fileInput.files[i]);
@@ -2642,7 +2674,7 @@
       var chip = document.createElement("div");
       chip.className = "pending-file";
       var name = document.createElement("span");
-      name.textContent = "📎 " + f.name;
+      name.textContent = (fileModes.get(f)==='server_upload'?'↑ 上传：':'📎 附件：') + f.name;
       var del = document.createElement("button");
       del.className = "pf-del";
       del.type = "button";
@@ -2656,8 +2688,8 @@
       var fileState=fileStatuses.get(f);
       if(fileState){var note=document.createElement('span');note.textContent=fileState;note.className='wb-upload-status';chip.appendChild(note);}
       if(fileState && fileState.indexOf('上传失败')===0){
-        var retry=document.createElement('button');retry.type='button';retry.className='wb-btn';retry.textContent='重试此文件';
-        retry.onclick=function(){if(!uploadQueue&&!btnSend.disabled)sendFiles('',[f]);};chip.appendChild(retry);
+        var retry=document.createElement('button');retry.type='button';retry.className='wb-btn';retry.textContent='重试本批文件';
+        retry.onclick=function(){if(!uploadQueue&&!btnSend.disabled)sendFiles(input.value);};chip.appendChild(retry);
       }
       pendingFilesEl.appendChild(chip);
     });
