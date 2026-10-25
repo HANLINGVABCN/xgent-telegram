@@ -14,6 +14,14 @@ def test_full_tool_results_then_ordered_queue_across_providers_and_over():
     probe('tools_and_over')
 
 
+def test_native_telegram_timeout_cannot_lose_results_or_pause_queued_messages():
+    probe('native_telegram_delivery_failure')
+
+
+def test_native_storage_failure_still_pauses_and_can_resume_without_command_replay():
+    probe('native_storage_failure_still_pauses')
+
+
 def test_natural_end_batch_is_complete_in_all_stream_modes_and_not_reclassified_as_config():
     probe('natural_end')
 

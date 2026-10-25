@@ -18,7 +18,7 @@ class AgentHistoryTests(unittest.IsolatedAsyncioTestCase):
         calls = []
         recorder = AsyncMock()
         database = AsyncMock()
-        recorder.record.side_effect = lambda **kwargs: calls.append(("record", kwargs))
+        recorder.record.side_effect = lambda **kwargs: calls.append(("record", kwargs)) or 1
         database.add_chat_message.side_effect = lambda *args: calls.append(("db", args))
 
         await persist_agent_result(
@@ -38,6 +38,16 @@ class AgentHistoryTests(unittest.IsolatedAsyncioTestCase):
             chat_id=9,
         )
         database.add_chat_message.assert_awaited_once_with(7, "user", "notice")
+
+    async def test_missing_tool_record_is_a_failure_not_an_optional_log(self):
+        recorder, database = AsyncMock(), AsyncMock()
+        recorder.record.return_value = None
+        with self.assertRaisesRegex(AttachmentContextError, '工具结果保存失败'):
+            await persist_agent_result(
+                recorder=recorder, message_type='agent-result', database=database,
+                conversation_id=7, chat_id=9, notice='already executed',
+            )
+        database.add_chat_message.assert_not_awaited()
 
     async def test_standard_read_result_is_added_to_conversation_history(self):
         recorder = AsyncMock()

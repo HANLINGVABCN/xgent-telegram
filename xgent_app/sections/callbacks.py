@@ -320,7 +320,11 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             if mode == TEXT_STITCH_MODE_OFF:
                 key = get_text_conversation_buffer_key(update)
                 with _pending_text_conversations_lock:
-                    pending = _pending_text_conversations.pop(key, None)
+                    pending = _pending_text_conversations.get(key)
+                    if pending and pending.attachments:
+                        pending = None  # File-triggered stitching remains explicit Done/Clear.
+                    else:
+                        _pending_text_conversations.pop(key, None)
                 if pending and pending.prompt_message is not None:
                     with contextlib.suppress(Exception):
                         await pending.prompt_message.edit_text("🧹 已关闭文字拼接，并清空本次拼接内容。")

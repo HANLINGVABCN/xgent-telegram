@@ -217,7 +217,8 @@ def build_application() -> Any:
         # 注意：PTB v20 会自动在 base_url 后追加 token，这里只给前缀，不要带 token
         builder = builder.base_url(f"{BotConfig.API_BASE_URL}/bot")
         builder = builder.base_file_url(f"{BotConfig.API_BASE_URL}/file/bot")
-        builder = builder.local_mode(True)
+        from xgent_app.file_ingress import FileTransportCapabilities
+        builder = builder.local_mode(FileTransportCapabilities.configured(BotConfig.API_BASE_URL).mode == 'local_bot_api')
     app = builder.build()
     # 折叠块标准形态 → Telegram 形态，只在 Bot API 出口转换（多端显示一致的关键）
     from xgent_app.tg_html_adapter import install_telegram_html_adapter

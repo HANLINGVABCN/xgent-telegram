@@ -873,7 +873,7 @@ class Workbench:
         else:
             try:before=int(data.get('before') or 2**63-1)
             except (TypeError,ValueError,OverflowError):raise WorkbenchError('文件分页位置无效') from None
-            clauses=["m.id<?","s.deleting=0","(m.metadata LIKE '%attachments%' OR m.metadata LIKE '%display_media%' OR m.msg_type IN ('user_file','user_photo','media_reply'))"]
+            clauses=["m.id<?","s.deleting=0","(m.metadata LIKE '%attachments%' OR m.metadata LIKE '%server_uploads%' OR m.metadata LIKE '%display_media%' OR m.msg_type IN ('user_file','user_photo','media_reply'))"]
             params=[before]
             if source!='all':clauses.append('m.session_id=?');params.append(source)
             if start is not None:clauses.append('m.timestamp>=?');params.append(start)

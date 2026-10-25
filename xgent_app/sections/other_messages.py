@@ -107,6 +107,7 @@ async def _handle_album_attachment(update: Update, context: ContextTypes.DEFAULT
         pending.downloading += 1
         if pending.flush_task is not None and not pending.flush_task.done():
             pending.flush_task.cancel()
+    accepted = False
     try:
         payload = await prepare_payload() if prepare_payload else await _prepare_photo_payload(update)
         if pending.closed:
@@ -120,6 +121,7 @@ async def _handle_album_attachment(update: Update, context: ContextTypes.DEFAULT
                 'attachment_received_at_ns': received_at_ns,
             },
         )
+        accepted = True
         with _pending_album_conversations_lock:
             if not pending.closed:
                 pending.add_photo(payload, update, context)
@@ -134,6 +136,7 @@ async def _handle_album_attachment(update: Update, context: ContextTypes.DEFAULT
                 pending.flush_task = asyncio.create_task(
                     _flush_album_after(key, ALBUM_FLUSH_QUIET_SECONDS)
                 )
+    return accepted
 
 
 async def _flush_album_after(key: Tuple[int, str], delay: float):
@@ -311,52 +314,9 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if not caption:
         caption = _extract_rich_message_text(msg)
 
-    media_group_id = getattr(msg, "media_group_id", None)
-    if media_group_id:
-        async def prepare_media():
-            data = bytes(await download_telegram_file(media))
-            return await asyncio.to_thread(
-                build_document_attachment_payload, doc_name, data, caption,
-                build_incoming_context_prefix(msg), mime_type,
-                msg.message_id,
-            )
+    await receive_stitched_file(update, context, media, doc_name, caption)
+    return
 
-        await _handle_album_attachment(
-            update, context, media_group_id, prepare_media, MessageType.USER_FILE,
-            received_at_ns=received_at_ns,
-        )
-        return
-
-    # 处理中锁：与 handle_document_message 一致——给可见回执而非静默丢弃。
-    if _conversation_processing_lock.locked():
-        await msg.reply_text("⏳ 系统仍在处理上一个请求... 请稍等后重新发送该文件。")
-        return
-
-    try:
-        db = await BotMemoryDB.get_instance()
-        attachment_generation = await db.get_attachment_generation()
-        content_bytes = bytes(await download_telegram_file(media))
-        context_prefix = build_incoming_context_prefix(msg)
-        payload = await asyncio.to_thread(
-            build_document_attachment_payload,
-            doc_name, content_bytes, caption, context_prefix, mime_type,
-            msg.message_id,
-        )
-        memory_text = payload["index_text"]
-        if context_prefix:
-            memory_text = f"{context_prefix}\n{memory_text}"
-
-        await GlobalRecorder.record_attachment_message(
-            memory_text, MessageType.USER_FILE, update.effective_chat.id,
-            [payload["attachment"]], attachment_generation,
-            metadata={'attachment_received_at_ns': received_at_ns},
-        )
-        await process_conversation(update, context, memory_text)
-    except Exception as e:
-        logger.error(f"Native media save/process error: {e}")
-        await msg.reply_text(
-            f"文件 {safe_text(doc_name)} 未能完整交给模型：{safe_text(await GlobalRecorder.record_error(e, update.effective_chat.id, source='media_input'))}"
-        )
 
 
 def build_forward_origin_prefix(msg) -> str:

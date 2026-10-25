@@ -176,5 +176,7 @@ def queue_card_text(item):
               'claimed': '✅ 已接入本轮', 'completed': '✅ 已处理', 'interrupted': '⚠️ 执行中断',
               'cancelled': '❌ 已取消', 'edited': '✏️ 已取回编辑'}[item['status']]
     reason = REASONS.get(item.get('reason'), '')
+    if item['status'] == 'paused' and item.get('reason') != 'ask':
+        reason += '\n这条消息尚未交给 AI。点击“继续发送待发消息”，或用 /queue 管理；不会重发上一轮已执行的命令。'
     preview = item['text'][:240] + ('…' if len(item['text']) > 240 else '')
     return f"{status} · {item['id'][:8]}\n{reason}\n\n{preview}"

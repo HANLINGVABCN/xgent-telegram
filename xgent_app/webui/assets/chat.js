@@ -20,6 +20,9 @@
   var btnStop = document.getElementById("btn-stop");
   var btnAttach = document.getElementById("btn-attach");
   var fileInput = document.getElementById("file-input");
+  var serverUploadInput = document.getElementById('server-upload-input');
+  var fileModes = new WeakMap();
+  var fileBatchKeys = new WeakMap();
   var pendingFilesEl = document.getElementById("pending-files");
   var typing = document.getElementById("typing");
   var statusText = document.getElementById("status-text");
@@ -913,23 +916,93 @@
     if (e.target === lightbox || e.target.classList.contains("lightbox-img-wrap")) closeLightbox();
   });
 
+  function sizeImagePlaceholder(container, width, height) {
+    if (!(Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0)) return;
+    var scale=Math.min(1,440/width,420/height);
+    container.style.setProperty('--media-photo-width',(width*scale)+'px');
+    container.style.setProperty('--media-photo-ratio',width+' / '+height);
+  }
+
+  function updateMediaContent(container, item) {
+    container._mediaItem=item;
+    if(item.kind==='photo')sizeImagePlaceholder(container,item.width,item.height);
+    container.querySelectorAll('a.media-dl,a.fc-dl').forEach(function(link){
+      link.href=item.download_url;link.download=item.filename||'file';
+    });
+    var versions=container.querySelector('.media-versions');
+    if(item.versions_id&&!versions){
+      versions=document.createElement('button');versions.type='button';versions.className='media-versions';versions.textContent='版本';
+      versions.addEventListener('click',function(e){
+        e.stopPropagation();
+        if(window.XGentWorkbench?.attachmentVersions)window.XGentWorkbench.attachmentVersions(container._mediaItem);
+        else toast('附件详情模块未加载，请刷新后重试。',true);
+      });
+      container.appendChild(versions);
+    }else if(!item.versions_id&&versions)versions.remove();
+  }
+
+  function canReuseMediaContent(container, item) {
+    var previous=container._mediaItem;
+    if(!previous||previous.kind!==item.kind||previous.error!==item.error)return false;
+    if(previous.sha256&&item.sha256&&previous.sha256!==item.sha256)return false;
+    // Accepted uploads retain their decoded local preview. Only metadata and
+    // download links change; the same image element and blob URL stay visible.
+    if(previous.local_preview&&previous.filename===item.filename&&item.download_url)return true;
+    if(previous.path&&item.path)return previous.path===item.path;
+    return previous.download_url===item.download_url&&previous.filename===item.filename;
+  }
+
+  function imageSourceUrl(item) {
+    var url=item.download_url;
+    if(url&&!/^(blob:|data:)/.test(url)&&/^[0-9a-f]{64}$/.test(item.sha256||'')){
+      return url+(url.includes('?')?'&':'?')+'image_version='+item.sha256;
+    }
+    return url;
+  }
+
   function makeMediaContent(item) {
     var kind = item.kind, filename = item.filename, downloadUrl = item.download_url;
     var container = document.createElement("div");
     container.className = "media-item";
-    if (downloadUrl) {
+    if (downloadUrl || kind === 'photo') {
 
       var media = null;
       if (kind === "photo") {
+        container.classList.add('media-photo');
+        container.dataset.imageState='loading';
+        sizeImagePlaceholder(container,item.width,item.height);
+        var imageFrame=document.createElement('div');imageFrame.className='media-image-frame';
+        imageFrame.setAttribute('aria-busy','true');
+        var state=document.createElement('span');state.className='media-load-state';state.textContent='图片加载中…';
+        var retry=document.createElement('button');retry.type='button';retry.className='media-image-retry';retry.textContent='重新加载';retry.hidden=true;
         media = document.createElement("img");
-        media.src = downloadUrl;
         media.loading = "lazy";
+        media.decoding = 'async';
         media.className = "media-img";
         media.alt = filename || "图片";
-        media.addEventListener("click", function () { openLightbox(downloadUrl, filename); });
-        media.addEventListener("error", function () {
-          media.replaceWith(document.createTextNode("🖼️ " + (filename || "图片") + " (加载失败)"));
+        media.addEventListener("click", function () { openLightbox(media.src, container._mediaItem.filename); });
+        media.addEventListener('load',function(){
+          var source=media.src;
+          sizeImagePlaceholder(container,media.naturalWidth,media.naturalHeight);
+          var decoded=media.decode?media.decode().catch(function(){}):Promise.resolve();
+          decoded.then(function(){
+            if(media.src!==source||!media.naturalWidth)return;
+            container.dataset.imageState='ready';imageFrame.setAttribute('aria-busy','false');
+          });
         });
+        media.addEventListener("error", function () {
+          container.dataset.imageState='error';imageFrame.setAttribute('aria-busy','false');
+          state.textContent='图片加载失败';retry.hidden=!container._mediaItem.download_url;
+        });
+        retry.addEventListener('click',function(){
+          container.dataset.imageState='loading';imageFrame.setAttribute('aria-busy','true');
+          state.textContent='图片加载中…';retry.hidden=true;
+          var url=imageSourceUrl(container._mediaItem);
+          media.src=url+(url.startsWith('blob:')?'':(url.includes('?')?'&':'?')+'image_retry='+Date.now());
+        });
+        imageFrame.append(media,state,retry);container.appendChild(imageFrame);
+        if(downloadUrl)media.src=imageSourceUrl(item);
+        else{container.dataset.imageState='error';state.textContent=item.error||'图片暂不可下载';imageFrame.setAttribute('aria-busy','false');}
       } else if (kind === "video") {
         media = document.createElement("video");
         media.src = downloadUrl;
@@ -944,9 +1017,9 @@
         media.className = "media-audio";
       }
 
-      if (media) {
+      if (media && kind !== 'photo') {
         container.appendChild(media);
-      } else {
+      } else if (!media) {
         var card = document.createElement("div");
         card.className = "file-card";
         var fcIcon = document.createElement("div");
@@ -982,17 +1055,13 @@
       dlBtn.title = "下载文件";
       dlBtn.setAttribute("aria-label", "下载 " + (filename || "文件"));
       dlBtn.innerHTML = svgIcon("down");
-      if (media) container.appendChild(dlBtn);
+      if (media && downloadUrl) container.appendChild(dlBtn);
     } else {
       container.classList.add("media-error");
       container.textContent = (filename || (kind === "photo" ? "图片" : "文件")) +
         "\n" + (item.error || "文件暂不可下载");
     }
-    if(item.versions_id){
-      var versions=document.createElement('button');versions.type='button';versions.className='media-versions';versions.textContent='版本';
-      versions.addEventListener('click',function(e){e.stopPropagation();if(window.XGentWorkbench?.attachmentVersions)window.XGentWorkbench.attachmentVersions(item);else toast('附件详情模块未加载，请刷新后重试。',true);});
-      container.appendChild(versions);
-    }
+    updateMediaContent(container,item);
     return container;
   }
 
@@ -1010,20 +1079,34 @@
       entry.mediaContainer.className = "message-media";
       entry.bubble.insertBefore(entry.mediaContainer, entry.body);
     }
-    entry.mediaContainer.replaceChildren();
+    var previousItems=Array.from(entry.mediaContainer.children),retainedItems=new Set();
     var paths = [];
     var displayedText = String(entry.rawText || "").replace(/\\/g, "/");
-    items.forEach(function (item) {
-      entry.mediaContainer.appendChild(makeMediaContent(item));
+    items.forEach(function (item,index) {
+      var content=previousItems.find(node=>!retainedItems.has(node)&&canReuseMediaContent(node,item));
+      if(content)updateMediaContent(content,item);
+      else content=makeMediaContent(item);
+      retainedItems.add(content);
+      if(entry.mediaContainer.children[index]!==content)entry.mediaContainer.insertBefore(content,entry.mediaContainer.children[index]||null);
       if (item.path && displayedText.indexOf(item.path.replace(/\\/g, "/")) < 0) paths.push(item.path);
     });
+    previousItems.forEach(function(node){if(!retainedItems.has(node))node.remove();});
     entry.bubble.classList.toggle("has-media", items.length > 0);
     if (entry.mediaPaths) entry.mediaPaths.remove();
     entry.mediaPaths = null;
     if (paths.length) {
       entry.mediaPaths = document.createElement("div");
       entry.mediaPaths.className = "media-paths";
-      entry.mediaPaths.textContent = paths.join("\n");
+      if(entry.role==='user'){
+        entry.mediaPaths.classList.add('media-paths-compact');
+        paths.forEach(function(path){
+          var button=document.createElement('button');button.type='button';button.className='media-path-copy';
+          button.textContent='已保存 · '+path;button.title=path+'（点击复制）';
+          button.setAttribute('aria-label','复制服务器路径 '+path);
+          button.addEventListener('click',()=>copyText(path).then(()=>toast('已复制服务器路径')).catch(()=>toast('复制失败',true)));
+          entry.mediaPaths.appendChild(button);
+        });
+      }else entry.mediaPaths.textContent = paths.join("\n");
       entry.body.insertAdjacentElement("afterend", entry.mediaPaths);
     }
     if (stick) scrollDown();
@@ -1159,6 +1242,7 @@
     var id=message.ui_message_id?'ui:'+message.ui_message_id:
       (message.media_group_id||'history:'+(message.record_id??message.id));
     var aliases=message.replace_message_ids||[];
+    if(message.upload_request_key)aliases=aliases.concat('upload:'+message.upload_request_key);
     if(message.web_live&&message.web_live.epoch===epoch)aliases=aliases.concat(message.web_live.message_ids||[]);
     var existing=byMessageId[id];
     // Adopt the existing live bubble rather than throw away expanded blocks and
@@ -1170,6 +1254,7 @@
     var frame={...message,type:'message',text:message.content??message.text,
       record_id:message.record_id??message.id,replace_message_ids:aliases};
     var entry=putTextFrame(role,frame);
+    if(message.file_message&&entry.uploadProgress){entry.uploadProgress.remove();entry.uploadProgress=null;}
     entry.durable=!message.ui_message_id;
     aliases.forEach(function(mid){byMessageId[mid]=entry;});
     entry.row.dataset.historyCursor=message.history_cursor||entry.row.dataset.historyCursor||'';
@@ -1730,6 +1815,10 @@
           const entry=putTextFrame('ai',frame);retained.add(entry);log.appendChild(entry.row);
         });
       }
+      // A snapshot taken while HTTP is still receiving cannot contain this
+      // user message yet. Keep its one optimistic bubble until acceptance.
+      var uploading=uploadQueue?.conversation_id===requestedCid?uploadQueue.entry:null;
+      if(uploading&&!uploading.durable){retained.add(uploading);log.appendChild(uploading.row);}
       // Remove obsolete DOM only after incoming state is ready; no blank interstitial.
       Array.from(new Set(Object.values(byMessageId))).forEach(function(entry){
         if(!retained.has(entry)){
@@ -1750,9 +1839,9 @@
   function appendHistoryMedia(entry, message, role) {
     var previousMedia=entry.mediaEntries||[];
     entry.mediaEntries = [];
-    if (message.media_group_id || message.msg_type === "ai_reply" || message.msg_type === "media_reply") {
+    if (role === 'user' || message.media_group_id || message.msg_type === "ai_reply" || message.msg_type === "media_reply") {
       previousMedia.forEach(removeEntry);
-      setInlineMedia(entry, message.media || []);
+      setInlineMedia(entry, (message.media || []).map(item=>({...item,conversation_id:message.conversation_id||selectedConversationId})));
     } else {
       var after = entry.row;
       (message.media || []).forEach(function (item,index) {
@@ -1927,58 +2016,157 @@
     if (reason && uploadQueue.finish) uploadQueue.finish(reason);
   }
 
+  async function uploadFileChunks(batch, mode, modes, text, key, progress) {
+    var pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+    async function control(path, payload){
+      var last;
+      for(var attempt=0;attempt<4;attempt++){
+        var controller=new AbortController(),timer=setTimeout(()=>controller.abort(),20000);
+        try{return await api(path,payload===undefined?{signal:controller.signal}:{method:'POST',body:JSON.stringify(payload),signal:controller.signal});}
+        catch(error){last=error;if(error.status===507||error.status&&error.status<500)throw error;}
+        finally{clearTimeout(timer);}
+        await pause(400*(attempt+1));
+      }
+      throw new Error('暂时无法确认传输状态，重试会从已接收位置继续：'+last.message);
+    }
+    var transfer=await control('/api/file-transfers/init',{
+      idempotency_key:key,conversation_id:batch.conversation_id,mode:mode,text:text,modes:modes,
+      files:batch.files.map(file=>({filename:file.name,size:file.size}))
+    });
+    if(transfer.state==='accepted')return {...transfer,duplicate:true};
+    var id=transfer.transfer_id,total=batch.files.reduce((sum,file)=>sum+file.size,0);
+    var offsets=transfer.offsets.slice();
+    function setProgress(extra){
+      var received=offsets.reduce((sum,size)=>sum+size,0)+extra;
+      progress.textContent=received>=total?'传输完成，正在保存…':'上传 '+Math.min(99,Math.floor(received/total*100))+'%';
+    }
+    for(var index=0;index<batch.files.length;index++){
+      var file=batch.files[index],failures=0;
+      while(offsets[index]<file.size){
+        if(batch.cancelled)throw new Error('传输已暂停；重试将从已接收位置继续');
+        var start=offsets[index],chunk=file.slice(start,start+transfer.chunk_bytes);
+        try{
+          var result=await new Promise(function(resolve,reject){
+            var request=new XMLHttpRequest();
+            request.open('POST','/api/file-transfers/chunk/'+id+'?index='+index+'&offset='+start);
+            request.withCredentials=true;request.timeout=90000;
+            request.setRequestHeader('Content-Type','application/octet-stream');
+            request.upload.onprogress=event=>setProgress(event.loaded);
+            request.onerror=()=>reject(new Error('分块网络中断'));
+            request.ontimeout=()=>reject(new Error('分块响应超时'));
+            request.onload=function(){
+              var body;try{body=JSON.parse(request.responseText);}catch(error){body={};}
+              if(request.status>=200&&request.status<300)resolve(body);
+              else{var failure=new Error(body.error||'HTTP '+request.status);failure.status=request.status;reject(failure);}
+            };
+            request.send(chunk);
+          });
+          offsets[index]=result.offset;failures=0;setProgress(0);
+        }catch(error){
+          if(error.status===507||error.status&&error.status<500&&error.status!==409)throw error;
+          progress.textContent='正在核对已接收分块…';
+          var state=await control('/api/file-transfers/status/'+id);
+          offsets=state.offsets;
+          if(state.state==='accepted')return state;
+          if(offsets[index]>start){failures=0;continue;}
+          if(++failures>=4)throw new Error('连接暂时中断，已接收部分保留，重试可继续上传');
+          await pause(500*failures);
+        }
+      }
+    }
+    progress.textContent='传输完成，正在保存…';
+    await control('/api/file-transfers/complete/'+id,{});
+    for(;;){
+      var status=await control('/api/file-transfers/status/'+id);
+      if(status.state==='accepted')return status;
+      if(status.state==='failed')throw new Error(status.error||'服务器保存失败；已传数据保留，可重试');
+      if(status.state==='receiving')throw new Error('服务已重启，已传数据保留，请重试确认');
+      progress.textContent='传输完成，正在保存校验…';
+      await pause(800);
+    }
+  }
+
   async function sendFiles(text, selected) {
     var batch = { conversation_id:selectedConversationId, files: selected || pendingFiles.slice(), next: 0, cancelled: false, finish: null, awaitingTurn: false };
     uploadQueue = batch;
     if (selected) { pendingFiles=pendingFiles.filter(function(f){return selected.indexOf(f)<0;});renderPendingFiles(); }
     else clearPendingFiles();
     try {
-      for (var i = 0; i < batch.files.length && !batch.cancelled; i++) {
-        var f = batch.files[i];
+      // Submit a whole selection once; per-file modes preserve attachment/upload intent.
+      if (!batch.cancelled) {
+        var f = batch.files[0];
+        var modes = batch.files.map(file=>fileModes.get(file)||'attachment');
+        var mode = modes.every(value=>value==='server_upload') ? 'server_upload' : 'attachment';
+        batch.files.forEach(file=>fileStatuses.set(file,'上传中'));
         fileStatuses.set(f,"上传中");
-        var caption = i === 0 ? text : "";
-        var entry = makeBubble("user", "📎 " + f.name + (caption ? "\n" + caption : ""));
-        if (mediaKindFromName(f.name) === "photo") {
-          var url = URL.createObjectURL(f);
-          entry.objectUrls = [url];
-          var thumb = document.createElement("img");
-          thumb.src = url;
-          thumb.className = "user-thumb";
-          thumb.addEventListener("click", (function (src, name) {
-            return function () { openLightbox(src, name); };
-          })(url, f.name));
-          entry.body.appendChild(thumb);
-        }
+        var caption = text;
+        var entry = makeBubble('user', text);
+        batch.entry=entry;
+        entry.objectUrls = [];
+        setInlineMedia(entry,batch.files.map(function(file){
+          var url=URL.createObjectURL(file);entry.objectUrls.push(url);
+          return {kind:file.type.startsWith('image/')?'photo':mediaKindFromName(file.name),filename:file.name,download_url:url,local_preview:true};
+        }));
         setBusy(true);
         // HTTP 只确认接收，turn_end 才允许下一份上传进入对话核心。
         batch.awaitingTurn = true;
         batch.rejected = false;
         var turnDone = new Promise(function (resolve) { batch.finish = resolve; });
         var fd = new FormData();
-        fd.append("file", f, f.name);
+        batch.files.forEach(file=>fd.append('file',file,file.name));
         fd.append("text", caption);
+        fd.append('modes',JSON.stringify(modes));
+        var signature = JSON.stringify([mode,text,modes,batch.files.map(file=>[file.name,file.size,file.lastModified])]);
+        var previous = fileBatchKeys.get(f);
+        var requestKey = previous?.signature===signature ? previous.key : (crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random());
+        byMessageId['upload:'+requestKey]=entry;
+        batch.files.forEach(file=>fileBatchKeys.set(file,{signature:signature,key:requestKey}));
+        fd.append('idempotency_key',requestKey);
         if(batch.conversation_id)fd.append("conversation_id",batch.conversation_id);
         try {
-          var response = await fetch("/api/upload", {
-            method: "POST", credentials: "same-origin", body: fd
+          var progress=document.createElement('small');progress.className='upload-progress';progress.textContent='正在上传…';
+          entry.uploadProgress=progress;entry.bubble.insertBefore(progress,entry.bubble.querySelector('.ts'));
+          var body;
+          if(batch.files.reduce((sum,file)=>sum+file.size,0)>8*1024*1024){
+            body=await uploadFileChunks(batch,mode,modes,caption,requestKey,progress);
+          }else{
+          var response = await new Promise(function(resolve,reject){
+            var request=new XMLHttpRequest();
+            request.open('POST',mode==='server_upload'?'/api/server-uploads':'/api/attachments');
+            request.withCredentials=true;
+            request.upload.onprogress=function(event){
+              progress.textContent=event.lengthComputable?(event.loaded>=event.total?'传输完成，正在保存…':'上传 '+Math.round(event.loaded/event.total*100)+'%'):'正在上传…';
+            };
+            request.upload.onload=function(){progress.textContent='传输完成，正在保存…';};
+            request.onerror=()=>reject(new Error('网络中断，文件仍保留，可重试本批文件'));
+            request.onload=()=>resolve({ok:request.status>=200&&request.status<300,status:request.status,
+              json:async()=>{try{return JSON.parse(request.responseText);}catch(e){return {};}}});
+            request.send(fd);
           });
-          var body = await response.json().catch(function () { return {}; });
-          if (!response.ok) throw new Error(body.error || ("HTTP " + response.status));
+          body = await response.json().catch(function () { return {}; });
+          if (!response.ok) throw new Error(body.error || (response.status===413?'反向代理拒绝了上传（HTTP 413），请调整代理请求体限制后重试。':response.status===524?'代理等待服务器响应超时（HTTP 524），请先核对历史；不要重复提交已确认文件。':"HTTP " + response.status));
+          }
+          progress.textContent='已接收，正在处理';
+          if(body.message&&batch.conversation_id===selectedConversationId)putHistoryFrame(body.message,streamEpoch);
+          if(body.duplicate){batch.next=batch.files.length;batch.awaitingTurn=false;reconcileAfterTurn=true;return;}
         } catch (err) {
+          if(entry.durable){batch.next=batch.files.length;await turnDone;return;}
           batch.awaitingTurn = false;
           removeEntry(entry);
-          fileStatuses.set(f,"上传失败：" + err.message);
+          batch.files.forEach(file=>fileStatuses.set(file,'上传失败：'+err.message));
           batch.error = f.name + " 上传失败：" + err.message;
-          break;
+          return;
         }
-        if(batch.rejected){fileStatuses.set(f,'未提交：'+batch.error);break;}
+        if(batch.rejected){fileStatuses.set(f,'未提交：'+batch.error);return;}
         fileStatuses.set(f,"已接收，处理中");
-        batch.next = i + 1;
+        batch.next = batch.files.length;
         var turnError=await turnDone;
-        if(batch.rejected){batch.next=i;fileStatuses.set(f,'未提交：'+batch.error);break;}
-        if (turnError) break;
+        if(batch.rejected){batch.next=0;fileStatuses.set(f,'未提交：'+batch.error);return;}
+        if (turnError) return;
         batch.finish = null;
       }
+    } catch(err) {
+      batch.awaitingTurn=false;batch.error=err.message;
     } finally {
       var remaining = batch.files.slice(batch.next);
       if(batch.conversation_id!==selectedConversationId){
@@ -2629,6 +2817,11 @@
     event.returnValue = "";
   });
   btnAttach.addEventListener("click", function () { fileInput.click(); });
+  document.getElementById('btn-server-upload').addEventListener('click',()=>serverUploadInput.click());
+  serverUploadInput.addEventListener('change',function(){
+    Array.from(serverUploadInput.files).forEach(file=>{fileModes.set(file,'server_upload');pendingFiles.push(file);});
+    serverUploadInput.value='';renderPendingFiles();
+  });
 
   fileInput.addEventListener("change", function () {
     for (var i = 0; i < fileInput.files.length; i++) pendingFiles.push(fileInput.files[i]);
@@ -2642,7 +2835,7 @@
       var chip = document.createElement("div");
       chip.className = "pending-file";
       var name = document.createElement("span");
-      name.textContent = "📎 " + f.name;
+      name.textContent = (fileModes.get(f)==='server_upload'?'↑ 上传：':'📎 附件：') + f.name;
       var del = document.createElement("button");
       del.className = "pf-del";
       del.type = "button";
@@ -2656,8 +2849,8 @@
       var fileState=fileStatuses.get(f);
       if(fileState){var note=document.createElement('span');note.textContent=fileState;note.className='wb-upload-status';chip.appendChild(note);}
       if(fileState && fileState.indexOf('上传失败')===0){
-        var retry=document.createElement('button');retry.type='button';retry.className='wb-btn';retry.textContent='重试此文件';
-        retry.onclick=function(){if(!uploadQueue&&!btnSend.disabled)sendFiles('',[f]);};chip.appendChild(retry);
+        var retry=document.createElement('button');retry.type='button';retry.className='wb-btn';retry.textContent='重试本批文件';
+        retry.onclick=function(){if(!uploadQueue&&!btnSend.disabled)sendFiles(input.value);};chip.appendChild(retry);
       }
       pendingFilesEl.appendChild(chip);
     });

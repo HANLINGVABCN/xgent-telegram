@@ -318,20 +318,11 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     if not await check_authorized_user_middleware(update, context):
         return
 
-    # 处理中锁（仅对非提示词编辑状态生效）
     await UserDataManager.init()
     state = UserDataManager.get('state')
     configuration_upload = is_prompt_edit_state(state) or state in {
         BotState.SET_COMMAND_BLACKLIST, BotState.SET_MEMORY, BotState.IMPORT_PROVIDER_CONFIG,
     }
-    media_group_id = getattr(update.message, "media_group_id", None)
-    if not configuration_upload:
-        if _conversation_processing_lock.locked():
-            await update.message.reply_text(
-                "⏳ 系统仍在处理上一个请求... 请稍等。"
-            )
-            return
-
     doc = update.message.document
     doc_name = doc.file_name or f"document_{uuid.uuid4().hex[:8]}.bin"
     # caption 同样只取原文：格式属性丢弃，字符一字不差。
@@ -342,19 +333,8 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         if caption:
             logger.warning(f"handle_document_message: extracted caption via rich_message, len={len(caption)}: {caption[:200]}")
 
-    if media_group_id and not configuration_upload:
-        async def prepare_document():
-            data = bytes(await download_telegram_file(doc))
-            return await asyncio.to_thread(
-                build_document_attachment_payload, doc_name, data, caption,
-                build_incoming_context_prefix(update.message), doc.mime_type,
-                update.message.message_id,
-            )
-
-        await _handle_album_attachment(
-            update, context, media_group_id, prepare_document, MessageType.USER_FILE,
-            received_at_ns=received_at_ns,
-        )
+    if not configuration_upload:
+        await receive_stitched_file(update, context, doc, doc_name, caption)
         return
 
     db = await BotMemoryDB.get_instance()
@@ -1433,7 +1413,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 @conversation_entry()
 async def handle_normal_text_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    if has_pending_text_conversation(update):
+    if has_pending_text_conversation(update) or _stitch_receiving.get(get_text_conversation_buffer_key(update)):
         await queue_text_conversation(update, context, text)
         return
 
@@ -1455,9 +1435,87 @@ async def queue_text_conversation(update: Update, context: ContextTypes.DEFAULT_
             pending = PendingTextConversation(update, context, text)
             _pending_text_conversations[key] = pending
         else:
+            if pending.committing:
+                raise ConversationBusy('正在提交拼接，请稍后继续发送。')
             pending.append(update, context, text)
 
     await show_or_update_text_stitch_prompt(pending)
+
+
+async def receive_stitched_file(update, context, media, name, caption):
+    """Persist bytes now, join the existing manual Done/Clear text buffer."""
+    key = get_text_conversation_buffer_key(update)
+    mid = getattr(update.message, 'message_id', None)
+    pending = _pending_text_conversations.get(key)
+    if mid is not None and pending and any(p['attachment'].get('source_message_id') == mid for p in pending.attachments):
+        return
+    payload = None
+    retained = False
+    generation = current_scope().generation
+    cancel_epoch = _stitch_cancellations.get(key, 0)
+    _stitch_receiving[key] = _stitch_receiving.get(key, 0) + 1
+    try:
+        db = await BotMemoryDB.get_instance()
+        for record in await db.get_attachment_records():
+            metadata = record.get('metadata') or '{}'
+            metadata = json.loads(metadata) if isinstance(metadata, str) else metadata
+            if mid is not None and any(ref.get('source_message_id') == mid for ref in metadata.get('attachments', [])):
+                return
+        with tempfile.TemporaryDirectory(prefix='telegram-incoming-') as directory:
+            path = os.path.join(directory, 'file')
+            downloaded = await download_telegram_file(media, path)
+            if isinstance(downloaded, (bytes, bytearray)):
+                with open(path, 'wb') as handle:
+                    handle.write(downloaded)
+            payload = await asyncio.to_thread(ArtifactManager.adopt_upload, name, path, caption,
+                                             source_message_id=mid)
+            payload['attachment']['context_prefix'] = build_incoming_context_prefix(update.message)
+        if generation != await db.get_attachment_generation() or cancel_epoch != _stitch_cancellations.get(key, 0):
+            raise ValueError('拼接已清空或会话已改变，此文件未提交')
+        # Image documents preserve the image route instead of starting stitching.
+        if payload['attachment']['kind'] == 'image':
+            group = getattr(update.message, 'media_group_id', None)
+            if group:
+                async def prepared():
+                    return payload
+                scope = await admit_media_album(update, group)
+                with bind_conversation(scope):
+                    retained = bool(await _handle_album_attachment(update, context, group, prepared, MessageType.USER_PHOTO))
+                if not retained:
+                    from xgent_app.file_ingress import cleanup_payloads
+                    await asyncio.to_thread(cleanup_payloads, [payload], ArtifactManager.UPLOAD_DIR)
+            else:
+                async with conversation_operation(execution=True):
+                    await GlobalRecorder.record_attachment_message(payload['index_text'], MessageType.USER_PHOTO,
+                        update.effective_chat.id, [payload['attachment']], current_scope().generation)
+                    retained = True
+                    await process_conversation(update, context, payload['index_text'])
+            return
+        with _pending_text_conversations_lock:
+            pending = _pending_text_conversations.get(key)
+            if pending is None:
+                pending = PendingTextConversation(update, context, '')
+                pending.parts = []
+                _pending_text_conversations[key] = pending
+            if pending.committing:
+                raise ConversationBusy('正在提交拼接，请稍后重发此文件。')
+            if mid is not None and any(p['attachment'].get('source_message_id') == mid for p in pending.attachments):
+                from xgent_app.file_ingress import cleanup_payloads
+                cleanup_payloads([payload], ArtifactManager.UPLOAD_DIR)
+                return
+            pending.attachments.append(payload)
+            pending.attachments.sort(key=lambda p: p['attachment'].get('source_message_id') or 0)
+            retained = True
+        await show_or_update_text_stitch_prompt(pending)
+    except Exception as exc:
+        if payload is not None and not retained:
+            from xgent_app.file_ingress import cleanup_payloads
+            await asyncio.to_thread(cleanup_payloads, [payload], ArtifactManager.UPLOAD_DIR)
+        await update.message.reply_text(f'文件 {name} 未加入拼接：{exc}')
+    finally:
+        _stitch_receiving[key] -= 1
+        if not _stitch_receiving[key]:
+            _stitch_receiving.pop(key, None)
 
 
 async def show_or_update_text_stitch_prompt(pending: PendingTextConversation):
@@ -1487,6 +1545,34 @@ async def show_or_update_text_stitch_prompt(pending: PendingTextConversation):
 
 async def finish_text_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = get_text_conversation_buffer_key(update)
+    if _stitch_receiving.get(key):
+        if update.callback_query:
+            await update.callback_query.answer('附件仍在接收保存，请完成后再点发送。', show_alert=True)
+        return
+    pending = _pending_text_conversations.get(key)
+    if pending is not None and pending.attachments:
+        if pending.committing:
+            return
+        from xgent_app.conversations import replay_conversation
+        with replay_conversation(pending.conversation_context):
+            async with conversation_operation(execution=True):
+                if _pending_text_conversations.get(key) is not pending:
+                    return
+                pending.committing = True
+                try:
+                    text = merge_text_conversation_parts(pending.parts)
+                    content = '\n\n'.join([text, *[p['index_text'] for p in pending.attachments]]).strip()
+                    refs = [dict(p['attachment'], order=i) for i, p in enumerate(pending.attachments)]
+                    await GlobalRecorder.record_attachment_message(content, MessageType.USER_FILE,
+                        pending.update.effective_chat.id, refs, current_scope().generation)
+                    _pending_text_conversations.pop(key, None)
+                    if pending.prompt_message is not None:
+                        with contextlib.suppress(Exception):
+                            await pending.prompt_message.edit_text('✅ 已完成拼接，正在发送给 AI。', reply_markup=None)
+                    await process_conversation(pending.update, pending.context, content)
+                finally:
+                    pending.committing = False
+        return
     with _pending_text_conversations_lock:
         pending = _pending_text_conversations.pop(key, None)
 
@@ -1528,12 +1614,20 @@ async def finish_text_conversation(update: Update, context: ContextTypes.DEFAULT
 async def cancel_text_conversation(update: Update):
     key = get_text_conversation_buffer_key(update)
     with _pending_text_conversations_lock:
+        current = _pending_text_conversations.get(key)
+        if current is not None and current.committing:
+            return
         pending = _pending_text_conversations.pop(key, None)
+        _stitch_cancellations[key] = _stitch_cancellations.get(key, 0) + 1
 
     if pending is None:
         if update.callback_query:
             await update.callback_query.answer("没有正在拼接的内容", show_alert=True)
         return
+
+    if pending.attachments:
+        from xgent_app.file_ingress import cleanup_payloads
+        await asyncio.to_thread(cleanup_payloads, pending.attachments, ArtifactManager.UPLOAD_DIR)
 
     try:
         if pending.prompt_message is not None:
@@ -1646,47 +1740,42 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
     """处理对话（全局模式 + Agent 协议执行：命令 / 读文件 / 发文件 / 写文件 / 媒体）"""
     global _is_processing, _stop_generation_event
 
-    # TG -> Web 镜像：Web 运行中且本轮来自 Telegram（非网页 bot）时，临时把真实
-    # bot 的发送方法包成双通道，让网页同步看到这轮对话的 AI 输出；同时把用户消息
-    # 推一帧给网页。Web 发起的对话走 MirrorBot（Web->TG），这里会因标记位跳过。
-    restore_mirror = lambda: None
-    try:
-        # install 与 put 必须都在 try 内：若 put 抛异常，finally 仍能 restore，
-        # 否则补丁会残留，下次 install 把残留 wrapper 当“原方法”再次包裹，
-        # real_bot 被注入成 chat_id → “got multiple values for argument 'chat_id'”。
-        # 详见 web_bridge._ACTIVE_MIRRORS 的重入引用计数保护。
-        if not getattr(context.bot, "_is_xgent_web_bot", False) and not getattr(context.bot, "_is_xgent_cli_bot", False):
-            _web_outbox = get_web_outbox() or globals().get('_web_external_outbox')
-            restore_mirror = install_tg_to_web_mirror(context.bot, _web_outbox)
-            if _web_outbox is not None and not queued_messages:
-                _web_outbox.put({"type": "user_message", "text": str(text or ""), "ts": time.time()})
-        async with _conversation_processing_lock:
-            if lock_acquired_event is not None:
-                lock_acquired_event.set()
-            _is_processing = True
-            _stop_generation_event = get_conversations().stop_event() or asyncio.Event()
-            get_conversations().attach_stop_event(_stop_generation_event)
+    # Native Telegram used to await every notification while holding the turn
+    # lock. A timed-out result card then discarded an already executed command's
+    # result and paused all later input. Keep native input identity, but route
+    # output through the existing durable, ordered delivery worker.
+    if not getattr(context.bot, "_is_xgent_web_bot", False) and not getattr(context.bot, "_is_xgent_cli_bot", False):
+        _web_outbox = get_web_outbox() or globals().get('_web_external_outbox')
+        update, context, _ = build_telegram_conversation_objects(
+            update, context, _web_outbox, channel=telegram_channel(),
+        )
+        if _web_outbox is not None and not queued_messages:
+            _web_outbox.put({"type": "user_message", "text": str(text or ""), "ts": time.time()})
+    async with _conversation_processing_lock:
+        if lock_acquired_event is not None:
+            lock_acquired_event.set()
+        _is_processing = True
+        _stop_generation_event = get_conversations().stop_event() or asyncio.Event()
+        get_conversations().attach_stop_event(_stop_generation_event)
 
-            from xgent_app.error_reporting import runtime_error_scope
-            try:
-                db = await BotMemoryDB.get_instance()
-                generation = await db.get_attachment_generation()
-                with runtime_error_scope(update.effective_chat.id, generation):
-                    try:
-                        await _process_conversation_inner(
-                            update, context, text, content_override, force_agent_mode,
-                            reset_agent_iterations, agent_origin, resume_state, queued_messages,
-                        )
-                    except Exception as exc:
-                        mark_outcome('failed')
-                        await GlobalRecorder.record_error(exc, update.effective_chat.id, source='conversation')
-                        raise
-            finally:
-                _stop_generation_event = None
-                _is_processing = False
-                publish_conversation_event(context, {'type': 'generation_end'})
-    finally:
-        restore_mirror()
+        from xgent_app.error_reporting import runtime_error_scope
+        try:
+            db = await BotMemoryDB.get_instance()
+            generation = await db.get_attachment_generation()
+            with runtime_error_scope(update.effective_chat.id, generation):
+                try:
+                    await _process_conversation_inner(
+                        update, context, text, content_override, force_agent_mode,
+                        reset_agent_iterations, agent_origin, resume_state, queued_messages,
+                    )
+                except Exception as exc:
+                    mark_outcome('failed')
+                    await GlobalRecorder.record_error(exc, update.effective_chat.id, source='conversation')
+                    raise
+        finally:
+            _stop_generation_event = None
+            _is_processing = False
+            publish_conversation_event(context, {'type': 'generation_end'})
 
 
 async def _process_conversation_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
@@ -2061,13 +2150,6 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         operation_presentation = build_standard_operation_presentation(
                             standard_operation
                         )
-                        if operation_presentation is not None:
-                            await safe_send_message(
-                                context,
-                                update.effective_chat.id,
-                                operation_presentation,
-                                parse_mode=constants.ParseMode.HTML,
-                            )
                         await persist_standard_operation_result(
                             recorder=GlobalRecorder,
                             message_type=MessageType.AGENT_RESULT,
@@ -2078,6 +2160,15 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         await add_tool_context(
                             _ctx_with_notice(standard_operation['context_message'], smart_notice)
                         )
+                        # An operation has already happened. Save it and make it
+                        # visible to the model before attempting any UI output.
+                        if operation_presentation is not None:
+                            await safe_send_message(
+                                context,
+                                update.effective_chat.id,
+                                operation_presentation,
+                                parse_mode=constants.ParseMode.HTML,
+                            )
                         round_state.should_continue = True
                         continue
 
@@ -2291,13 +2382,6 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             display_output=display_output,
                             pause_note=pause_note,
                         )
-                        await safe_send_message(
-                            context,
-                            update.effective_chat.id,
-                            shell_presentation,
-                            parse_mode=constants.ParseMode.HTML
-                        )
-
                         shell_notice = build_shell_notice(
                             action_label,
                             shell_result,
@@ -2316,18 +2400,20 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                 "content": shell_presentation, "parse_mode": "HTML",
                             }},
                         )
-                        if shell_result.get('running'):
-                            await add_tool_context(
-                                _ctx_with_notice(build_shell_context_message(shell_notice, running=True), smart_notice)
-                            )
-                            round_state.should_continue = True
-                            # 会话仍在运行不代表本次回复的后续协议无效；继续按原顺序处理，
-                            # 这样同一回复中的 stdin/shellkill 不会被静默跳过。
-                            continue
                         await add_tool_context(
-                            _ctx_with_notice(build_shell_context_message(shell_notice, running=False), smart_notice)
+                            _ctx_with_notice(build_shell_context_message(
+                                shell_notice, running=bool(shell_result.get('running')),
+                            ), smart_notice)
+                        )
+                        await safe_send_message(
+                            context,
+                            update.effective_chat.id,
+                            shell_presentation,
+                            parse_mode=constants.ParseMode.HTML
                         )
                         round_state.should_continue = True
+                        # A running shell still allows later stdin/shellkill
+                        # blocks in this response, in their original order.
                         continue
 
                     if block_type == 'media':

@@ -29,6 +29,168 @@ async def settled(bot):
     await asyncio.wait_for(wait(), 25)
 
 
+async def native_telegram_delivery_failure(bot, root):
+    """Reproduce an executed command + Telegram timeout + queued user input."""
+    from types import SimpleNamespace
+    from telegram.error import TimedOut
+    from xgent_app.fanout import get_channel_registry
+    marker = 'DURABLE-COMMAND-RESULT'
+    async with Harness(bot, root) as h:
+        bot.UserDataManager.set('agent_mode', True)
+        bot.UserDataManager.set('readx_persist_context', True)
+        h.replies = [PROTOCOL, 'finished after command and queued instruction', 'next message works']
+        started, release = asyncio.Event(), asyncio.Event()
+        executed, sent, attempts = [], [], []
+
+        class NativeBot:
+            failed = False
+
+            async def send_message(self, **kwargs):
+                text = kwargs.get('text', '')
+                attempts.append(text)
+                if marker in text and not self.failed:
+                    # The result must be saved before its first network attempt.
+                    history = await h.db.get_conversation_messages(1000)
+                    assert any(marker in str(m['content']) for m in history), history
+                    started.set()
+                    await release.wait()
+                    self.failed = True
+                    raise TimedOut('fixture: result card timed out')
+                sent.append(kwargs)
+                return SimpleNamespace(message_id=len(attempts))
+
+            async def edit_message_text(self, **kwargs):
+                sent.append(kwargs)
+                return True
+
+            async def edit_message_reply_markup(self, **kwargs):
+                return True
+
+            async def delete_message(self, **kwargs):
+                return True
+
+            async def send_chat_action(self, **kwargs):
+                return True
+
+        async def tool(block, **kwargs):
+            executed.append(block['body'])
+            assert current_scope().origin == 'telegram'
+            await bot.submit_ordinary_text('queued native instruction', chat_id=1, request_key='tg:queued')
+            return {'kind': 'run', 'success': True, 'notice': marker, 'output': marker, 'return_code': 0,
+                    'context_message': {'role': 'user', 'content': marker + '-FULL-OUTPUT'}}
+
+        original = bot.ModelClient.think_and_reply
+
+        async def model(*args, **kwargs):
+            if len(h.requests) == 1:
+                await asyncio.wait_for(started.wait(), 10)
+                assert not release.is_set(), 'the model must not wait for Telegram'
+            return await original(*args, **kwargs)
+
+        scope = replace(current_scope(), origin='telegram', run_id=None)
+        try:
+            with patch.dict('os.environ', {'XGENT_CLI_NO_TG_MIRROR': '1'}), patch.object(
+                    bot, '_web_real_bot', NativeBot()), patch.object(bot, 'get_web_outbox', return_value=h.outbox), patch.object(
+                    bot, 'dispatch_standard_protocol', tool), patch.object(bot.ModelClient, 'think_and_reply', model), interaction(
+                    'telegram', 'chat'), bind_conversation(scope):
+                worker = bot.telegram_channel()
+                worker._timeout = 90
+                await bot.submit_ordinary_text('initial native request', chat_id=1, request_key='tg:initial')
+                await asyncio.wait_for(settled(bot), 20)
+                assert started.is_set() and not release.is_set()
+                assert len(executed) == 1 and len(h.requests) == 2
+                texts = '\n'.join(unpack_request(h.requests[1])[0])
+                assert texts.count(marker + '-FULL-OUTPUT') == 1, texts
+                assert texts.index(marker + '-FULL-OUTPUT') < texts.index('queued native instruction')
+                snapshot = await bot.get_text_queue().snapshot(scope.conversation_id)
+                assert not snapshot['paused'] and not snapshot['items'], snapshot
+                # A new native message is still runnable while notification is blocked.
+                await bot.submit_ordinary_text('after network glitch', chat_id=1, request_key='tg:after')
+                await asyncio.wait_for(settled(bot), 20)
+                assert len(h.requests) == 3 and len(executed) == 1
+                release.set()
+                assert await worker.wait_idle(timeout=6), worker.stats()
+                assert sum(marker in text for text in attempts) == 2, attempts
+                delivered = [m['text'] for m in sent]
+                result_index = next(i for i, text in enumerate(delivered) if marker in text)
+                reply_index = next(i for i, text in enumerate(delivered) if 'finished after command' in text)
+                assert result_index < reply_index, delivered
+                # The immutable full result also survives beyond the live round.
+                history = await h.db.get_conversation_messages(1000)
+                assert any(marker in str(m['content']) for m in history)
+                assert not bot.get_conversations().lock.busy()
+                return {'command_exactly_once': True, 'result_saved_before_network': True,
+                        'model_and_queue_continue_while_tg_blocked': True,
+                        'later_messages_not_paused': True, 'ordered_replay': True}
+        finally:
+            release.set()
+            await get_channel_registry().aclose_all()
+
+
+async def native_storage_failure_still_pauses(bot, root):
+    """Do not hide real storage failures or replay an already executed action."""
+    from types import SimpleNamespace
+    from xgent_app.fanout import get_channel_registry
+    from xgent_app.message_queue import queue_card_text
+    async with Harness(bot, root) as h:
+        bot.UserDataManager.set('agent_mode', True)
+        h.replies = [PROTOCOL, 'recovered pending input']
+        native = SimpleNamespace(
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=77)),
+            edit_message_text=AsyncMock(), edit_message_reply_markup=AsyncMock(),
+            delete_message=AsyncMock(), send_chat_action=AsyncMock(),
+        )
+        executed = []
+
+        async def tool(block, **kwargs):
+            executed.append(block['body'])
+            await bot.submit_ordinary_text('waiting after storage failure', chat_id=1, request_key='storage:queued')
+            return {'kind': 'run', 'success': True, 'notice': 'UNSAVED-RESULT', 'output': 'UNSAVED-RESULT',
+                    'context_message': {'role': 'user', 'content': 'full result'}}
+
+        scope = replace(current_scope(), origin='telegram', run_id=None)
+        save_record = h.db.record_global_message
+
+        async def broken_result_storage(*args, **kwargs):
+            if kwargs.get('msg_type') == bot.MessageType.AGENT_RESULT:
+                raise OSError('fixture storage unavailable')
+            return await save_record(*args, **kwargs)
+
+        try:
+            with patch.object(bot, '_web_real_bot', native), patch.object(bot, 'get_web_outbox', return_value=h.outbox), patch.object(
+                    bot, 'dispatch_standard_protocol', tool), interaction('telegram', 'chat'), bind_conversation(scope):
+                with patch.object(h.db, 'record_global_message', broken_result_storage):
+                    await bot.submit_ordinary_text('initial before storage failure', chat_id=1, request_key='storage:initial')
+                    await settled(bot)
+                queue = bot.get_text_queue()
+                snapshot = await queue.snapshot(scope.conversation_id)
+                assert snapshot['paused'] and snapshot['reason'] == 'failed', snapshot
+                assert len(executed) == len(h.requests) == len(snapshot['items']) == 1
+                assert '/queue' in queue_card_text(snapshot['items'][0])
+                assert await bot.telegram_channel().wait_idle(timeout=5)
+                assert not any('UNSAVED-RESULT' in str(call.kwargs) for call in native.send_message.call_args_list)
+                # Real paused receipts offer a direct recovery button with the
+                # queue's CAS revision, rather than an unexplained dead end.
+                buttons = [button for call in native.send_message.call_args_list + native.edit_message_text.call_args_list
+                           if call.kwargs.get('reply_markup') for row in call.kwargs['reply_markup'].inline_keyboard for button in row]
+                resume = [button.callback_data for button in buttons if str(button.callback_data).startswith('q:r:')]
+                assert resume, buttons
+                data = f"q:r:{snapshot['conversation_id']}:{snapshot['generation']}:{snapshot['revision']}"
+                query = SimpleNamespace(answer=AsyncMock(), data=data,
+                                        message=SimpleNamespace(message_id=78, edit_text=AsyncMock()))
+                update = SimpleNamespace(message=None, callback_query=query, xgent_origin='telegram',
+                                         effective_chat=SimpleNamespace(id=1), effective_user=SimpleNamespace(id=1))
+                await bot.handle_queue_callback(update, SimpleNamespace(bot=native, args=[]), data)
+                await settled(bot)
+                snapshot = await queue.snapshot(scope.conversation_id)
+                assert not snapshot['paused'] and not snapshot['items'], snapshot
+                assert len(executed) == 1 and len(h.requests) == 2
+                return {'storage_failure_still_pauses': True, 'clear_recovery_button': True,
+                        'resume_only_sends_pending_input': True, 'no_command_replay': True}
+        finally:
+            await get_channel_registry().aclose_all()
+
+
 async def tools_and_over(bot, root):
     results = {}
     for fmt in FORMATS:

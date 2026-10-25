@@ -37,13 +37,17 @@ async def persist_agent_result(
     media = delivered_file_reference(notice)
     if media:
         metadata["display_media"] = media
-    await recorder.record(
+    row_id = await recorder.record(
         msg_type=message_type,
         role="system",
         content=notice if display_content is None else display_content,
         chat_id=chat_id,
         **({"metadata": metadata} if metadata else {}),
     )
+    if row_id is None:
+        # The general recorder permits nonessential display logging to fail.
+        # A tool result is not optional: the action may already have happened.
+        raise AttachmentContextError('工具结果保存失败，已暂停后续执行；请勿直接重复运行已执行的命令。')
     await database.add_chat_message(conversation_id, "user", notice)
 
 

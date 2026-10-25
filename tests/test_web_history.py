@@ -73,6 +73,96 @@ class HistoryDescriptorTests(unittest.TestCase):
         self.assertEqual("HTML", message["parse_mode"])
         self.assertEqual("assistant", message["role"])
 
+    def test_web_file_message_keeps_original_caption_and_separate_path_metadata(self):
+        path = self.write('uploads/day/image.png')
+        caption = '这个不是neko，给你看看\n\n<tag> & 原文不转义、不丢失'
+        ref = {'path': 'day/image.png', 'name': 'image.png', 'mime_type': 'image/png', 'order': 0}
+        model_text = caption + '\n\n[文件] image.png，已保存到 ' + path.as_posix()
+        metadata = {'attachments': [ref], 'file_ingress_mode': 'attachment',
+                    'upload_request_key': 'original-user-message', 'web_file_message': {'version': 1, 'text': caption}}
+        message = self.build('user_file', model_text, metadata)
+        self.assertEqual(caption, message['content'])
+        self.assertTrue(message['file_message'])
+        self.assertEqual('original-user-message', message['upload_request_key'])
+        self.assertEqual(str(path.resolve()), message['media'][0]['path'])
+        self.assertNotIn('已保存到', message['content'])
+
+    def test_existing_web_uploads_recover_caption_without_rewriting_history(self):
+        path = self.write('uploads/day/image.png')
+        caption = '保留我的完整文字\n包括换行和 [文件] 这样的普通文字'
+        model_text = caption + '\n\n[文件] image.png，已保存到 ' + path.as_posix()
+        metadata = {'attachments': [{'path': 'day/image.png', 'name': 'image.png', 'mime_type': 'image/png'}],
+                    'file_ingress_mode': 'attachment', 'upload_request_key': 'old-upload'}
+        self.assertEqual(caption, self.build('user_file', model_text, metadata)['content'])
+        self.assertEqual('', self.build('user_file', model_text[len(caption)+2:], metadata)['content'])
+        self.assertTrue(model_text.endswith(path.as_posix()))
+
+    def test_mixed_web_files_keep_selection_order_and_file_captions(self):
+        first = self.write('uploads/day/upload.pdf')
+        self.write('uploads/day/attachment.png')
+        metadata = {'file_ingress_mode': 'attachment', 'web_file_message': {'version': 1, 'text': '消息正文'},
+                    'server_uploads': [{'path': 'day/upload.pdf', 'name': 'upload.pdf', 'mime_type': 'application/pdf', 'order': 0}],
+                    'attachments': [{'path': 'day/attachment.png', 'name': 'attachment.png', 'mime_type': 'image/png',
+                                     'order': 1, 'caption': '图片附言'}]}
+        message = self.build('user_file', 'model file index', metadata)
+        self.assertEqual(['upload.pdf', 'attachment.png'], [item['filename'] for item in message['media']])
+        self.assertEqual('消息正文\n\nattachment.png：图片附言', message['content'])
+        self.assertEqual(str(first), message['media'][0]['path'])
+
+    def test_telegram_photo_and_image_document_show_full_caption_without_index(self):
+        from tests.test_attachments import image_bytes
+        path = self.write('uploads/day/photo.jpg', image_bytes())
+        caption = '刚刚更新了一下，再给你发个图片测试\n\n' + '完整附言不能截断。' * 30
+        short = ' '.join(caption.split())[:80].rstrip() + '...'
+        for kind, label, note in [('user_photo', '图片', short), ('user_file', '文件', caption)]:
+            with self.subTest(kind=kind):
+                source = f'[{label}] photo.jpg，已保存到 {path.as_posix()}。说明：{note}'
+                message = self.build(kind, source, {'attachments': [{
+                    'path': 'day/photo.jpg', 'name': 'photo.jpg', 'mime_type': 'image/png',
+                    'caption': caption, 'source_message_id': 42,
+                }]})
+                self.assertEqual(caption, message['content'])
+                self.assertTrue(message['file_message'])
+                self.assertNotIn('已保存到', message['content'])
+                self.assertNotIn('photo.jpg', message['content'])
+                self.assertEqual(str(path), message['media'][0]['path'])
+                self.assertIn('已保存到', source)
+
+    def test_telegram_photo_without_caption_has_no_generated_body(self):
+        path = self.write('uploads/day/telegram_photo.jpg')
+        message = self.build('user_photo', f'[图片] telegram_photo.jpg，已保存到 {path.as_posix()}', {
+            'attachments': [{'path': 'day/telegram_photo.jpg', 'name': 'telegram_photo.jpg',
+                             'mime_type': 'image/jpeg', 'caption': ''}],
+        })
+        self.assertEqual('', message['content'])
+        self.assertTrue(message['file_message'])
+        self.assertEqual(1, len(message['media']))
+
+    def test_telegram_photo_keeps_forward_context_and_caption_path_literals(self):
+        path = self.write('uploads/day/photo.png')
+        context = '[转发消息，来源：朋友]'
+        caption = '用户本来就写了路径 /home/example，和 [文件] 这样的文字'
+        message = self.build('user_photo', f'{context}\n[图片] photo.png，已保存到 {path.as_posix()}。说明：{caption}', {
+            'attachments': [{'path': 'day/photo.png', 'name': 'photo.png', 'mime_type': 'image/png',
+                             'caption': caption, 'context_prefix': context}],
+        })
+        self.assertEqual(context + '\n\n' + caption, message['content'])
+
+    def test_legacy_merged_telegram_album_uses_captions_instead_of_indexes(self):
+        refs, indexes = [], []
+        for number in (1, 2):
+            name = f'photo-{number}.png'
+            path = self.write('uploads/day/' + name)
+            refs.append({'path': 'day/' + name, 'name': name, 'mime_type': 'image/png',
+                         'caption': f'第 {number} 张的附言', 'order': number - 1})
+            indexes.append(f'第{number}张: [图片] {name}，已保存到 {path.as_posix()}。说明：第 {number} 张的附言')
+        message = self.build('user_photo', '[相册] 共2张图片\n' + '\n'.join(indexes), {'attachments': refs})
+        self.assertNotIn('已保存到', message['content'])
+        self.assertNotIn('[相册]', message['content'])
+        self.assertIn('第 1 张的附言', message['content'])
+        self.assertIn('第 2 张的附言', message['content'])
+        self.assertEqual(2, len(message['media']))
+
     def test_multiple_attachments_order_names_and_deduplication(self):
         first = self.write("uploads/day/one.bin")
         second = self.write("uploads/day/two")
@@ -93,6 +183,28 @@ class HistoryDescriptorTests(unittest.TestCase):
         self.assertEqual([f"/api/history/media/7/{i}" for i in range(3)],
                          [m["download_url"] for m in message["media"]])
         self.assertNotIn("base64", json.dumps(message).lower())
+
+    def test_photo_descriptors_preserve_dimensions_and_version_for_layout(self):
+        from tests.test_attachments import image_bytes
+        self.write('uploads/day/photo.png', image_bytes(size=(1200, 900)))
+        message = self.build('user_file', metadata={'attachments': [{
+            'path': 'day/photo.png', 'name': 'photo.png', 'mime_type': 'image/png',
+            'width': 1200, 'height': 900, 'sha256': 'a' * 64,
+        }]})
+        medium = message['media'][0]
+        self.assertEqual((1200, 900), (medium['width'], medium['height']))
+        self.assertEqual('a' * 64, medium['sha256'])
+
+    def test_legacy_photo_dimensions_use_header_without_decoding_pixels(self):
+        from tests.test_attachments import image_bytes
+        self.write('uploads/day/photo.png', image_bytes(size=(640, 480)))
+        with patch('PIL.Image.Image.load', side_effect=AssertionError('history must not decode full image')):
+            message = self.build('user_file', metadata={'attachments': [{
+                'path': 'day/photo.png', 'name': 'photo.png', 'mime_type': 'image/png',
+                'width': -100, 'height': 'invalid',
+            }]})
+        medium = message['media'][0]
+        self.assertEqual((640, 480), (medium['width'], medium['height']))
 
     def test_more_than_token_registry_capacity_uses_stable_addresses(self):
         path = self.write("exports/report.html")

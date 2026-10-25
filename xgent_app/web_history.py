@@ -25,8 +25,8 @@ _GENERATED = re.compile(
 _DELIVERED = re.compile(
     r"^\[(?:sendfile|file(?::base64)?)\u7ed3\u679c\] "
     r"\u5df2(?:\u53d1\u9001\u670d\u52a1\u5668\u6587\u4ef6\u7ed9\u7528\u6237|"
-    r"\u5199\u5165\u670d\u52a1\u5668\u6587\u4ef6): "
-    r"(?P<path>.+) \(\d+ bytes(?:, [^)\r\n]+)?\)(?: \[\u672c\u5730API\u76f4\u53d1\])?$"
+    r"\u5199\u5165\u670d\u52a1\u5668\u6587\u4ef6|加入 Telegram 发送队列): "
+    r"(?P<path>.+) \(\d+ bytes(?:, [^)\r\n]+)?\)(?: \[\u672c\u5730API\u76f4\u53d1(?:；网络恢复后自动补发)?\])?$"
 )
 _EXPORT = re.compile(
     r"\u670d\u52a1\u5668\u6587\u4ef6\u8def\u5f84\uff1a(?P<path>.+?)"
@@ -159,12 +159,79 @@ def _describe_media(ref: Any, storage: Path, *, attachment: bool) -> dict[str, A
             raise ValueError(_INVALID)
         mime = mime.lower()
         item.update(mime_type=mime, kind=media_kind(mime))
+        if isinstance(ref.get('sha256'), str) and re.fullmatch(r'[0-9a-f]{64}', ref['sha256']):
+            item['sha256'] = ref['sha256']
         if not target.is_file():
             raise OSError(_MISSING)
         item["size"] = target.stat().st_size
+        if item['kind'] == 'photo':
+            width, height = ref.get('width'), ref.get('height')
+            if not all(type(value) is int and 0 < value <= 1_000_000 for value in (width, height)):
+                # Older records did not retain dimensions. Read only the image
+                # header so history can reserve its space without downloading it.
+                from PIL import Image
+                try:
+                    with Image.open(target) as image:
+                        width, height = image.size
+                except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+                    width = height = None
+            if all(type(value) is int and 0 < value <= 1_000_000 for value in (width, height)):
+                item.update(width=width, height=height)
     except (OSError, ValueError, RuntimeError, TypeError) as exc:
         item["error"] = str(exc) if isinstance(exc, ValueError) else _MISSING
     return item
+
+
+def _file_message_text(content, metadata, storage):
+    """Render all user file sources independently of the model's file index.
+
+    Web batches and native Telegram files retain captions beside generated indexes.
+    Remove only those exact suffixes; never strip arbitrary user path lines.
+    """
+    refs = [ref for key in ('attachments', 'server_uploads')
+            for ref in (metadata.get(key) if isinstance(metadata.get(key), list) else [])
+            if isinstance(ref, dict)]
+    refs.sort(key=lambda ref: ref.get('order', 0) if type(ref.get('order', 0)) is int else 0)
+    presentation = metadata.get('web_file_message')
+    if isinstance(presentation, dict) and isinstance(presentation.get('text'), str):
+        text = presentation['text']
+    else:
+        text = content
+        for number, ref in reversed(list(enumerate(refs, 1))):
+            try:
+                target = _within(ref['path'], storage / 'uploads')
+                if ref in metadata.get('server_uploads', []):
+                    from .file_ingress import describe_file
+                    candidates = [describe_file(ref, storage / 'uploads')]
+                else:
+                    caption = str(ref.get('caption') or '')
+                    compact = ' '.join(caption.split())
+                    short = compact[:80].rstrip() + '...' if len(compact) > 80 else compact
+                    candidates = [f'[{kind}] {ref.get("name") or target.name}，已保存到 {path}'
+                                  + (f'。说明：{note}' if note else '')
+                                  for kind in ('文件', '图片') for path in {str(target), target.as_posix()}
+                                  for note in {caption, short}]
+                candidates += [f'第{number}{unit}: {candidate}' for candidate in list(candidates) for unit in ('张', '份')]
+                for candidate in sorted(candidates, key=len, reverse=True):
+                    if text == candidate:
+                        text = ''
+                        break
+                    if text.endswith('\n\n' + candidate):
+                        text = text[:-len(candidate) - 2]
+                        break
+                    if text.endswith('\n' + candidate):
+                        text = text[:-len(candidate) - 1]
+                        break
+            except (ValueError, KeyError, TypeError):
+                continue
+        # Old merged albums have a generated heading after their indexes have
+        # been removed. Keep any actual forward/reply context before it.
+        heading = re.compile(rf'\[(?:相册|文件组)\] 共{len(refs)}(?:张图片|份附件)')
+        if heading.fullmatch(text.rsplit('\n', 1)[-1]):
+            text = text.rsplit('\n', 1)[0] if '\n' in text else ''
+    captions = [(ref['caption'] if len(refs) == 1 else f'{ref.get("name") or "文件"}：{ref["caption"]}') for ref in refs
+                if isinstance(ref.get('caption'), str) and ref['caption'] and ref['caption'] != text]
+    return '\n\n'.join([text, *captions]) if text else '\n\n'.join(captions)
 
 
 def _section_ns() -> dict | None:
@@ -299,14 +366,14 @@ def build_history_message(
         message['reply_markup'] = [[{
             'text': '\u91cd\u8bd5\u6062\u590d', 'callback_data': 'retry_compress:' + task['id'],
         }]]
-    if kind not in _FILE_TYPES:
+    if kind not in _FILE_TYPES and not metadata.get('server_uploads'):
         return message
     if (metadata.get("attachment_purpose") == "configuration"
             or kind in {"user_file", "user_photo"} and content.startswith(_CONFIG_PREFIXES)):
         return message
     storage, workspace = Path(storage_root), Path(workspace_root)
     groups = []
-    for key in ("display_media", "attachments"):
+    for key in ("display_media", "attachments", "server_uploads"):
         if key in metadata:
             refs = metadata[key]
             if not isinstance(refs, list):
@@ -321,8 +388,8 @@ def build_history_message(
                     else pair[0], pair[0],
                 ))
                 refs = [ref for _, ref in refs]
-            groups.extend((ref, key == "attachments") for ref in refs)
-    if "attachments" not in metadata and "display_media" not in metadata:
+            groups.extend((ref, key in {"attachments", "server_uploads"}) for ref in refs)
+    if "attachments" not in metadata and "display_media" not in metadata and "server_uploads" not in metadata:
         if not (kind in {"ai_reply", "media_reply"} and metadata.get("generated_media_processed") is True):
             legacy = _legacy_media(record, storage, workspace)
             if kind in {'user_file', 'user_photo'} and role == 'user':
@@ -340,6 +407,9 @@ def build_history_message(
             album = re.search(r"\[\u76f8\u518c\] \u5171(\d+)\u5f20\u56fe\u7247", content)
             if kind == "user_photo" and album and int(album[1]) != len(legacy):
                 message["media_error"] = "\u65e7\u76f8\u518c\u9644\u4ef6\u8bb0\u5f55\u4e0d\u5b8c\u6574"
+    if role == 'user' and metadata.get('file_ingress_mode') in {'attachment', 'server_upload'}:
+        groups.sort(key=lambda pair: pair[0].get('order', 0)
+                    if isinstance(pair[0], dict) and type(pair[0].get('order', 0)) is int else 0)
     seen = set()
     for ref, attachment in groups:
         item = _describe_media(ref, storage, attachment=attachment)
@@ -348,7 +418,8 @@ def build_history_message(
         if item.get("path"):
             seen.add(item["path"])
         index = len(message["media"])
-        if kind in {'user_file', 'user_photo'} and role == 'user' and attachment and isinstance(ref, dict) and ref.get('storage', 'uploads') == 'uploads':
+        if (kind in {'user_file', 'user_photo'} and role == 'user' and attachment and isinstance(ref, dict)
+                and ref.get('storage', 'uploads') == 'uploads' and ref not in metadata.get('server_uploads', [])):
             try:
                 from .attachment_versions import attachment_identity
                 identity, _ = attachment_identity(ref, storage / 'uploads')
@@ -362,4 +433,9 @@ def build_history_message(
         message['media_group_id'] = generated_media_group_id([
             item.get('path', '') for item in message['media']
         ])
+    if role == 'user' and (metadata.get('file_ingress_mode') in {'attachment', 'server_upload'}
+                           or kind in {'user_file', 'user_photo'} and isinstance(metadata.get('attachments'), list)):
+        message.update(content=_file_message_text(content, metadata, storage), parse_mode=None, file_message=True)
+        if isinstance(metadata.get('upload_request_key'), str):
+            message['upload_request_key'] = metadata['upload_request_key']
     return message

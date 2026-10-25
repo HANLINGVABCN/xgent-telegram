@@ -49,6 +49,29 @@ async def _remove_file(path: str, *, logger: Any) -> None:
         logger.warning("清理 sendfile 临时文件失败: %s (%s)", path, error)
 
 
+async def send_local_api_document(
+    source_path: str, *, host_data_dir: str, container_data_dir: str,
+    filename: str, send_document: Callable[..., Awaitable[Any]],
+    logger: Any, **kwargs: Any,
+) -> Any:
+    """Expose only during an actual delivery attempt, never during admission.
+
+    An asynchronous outbox may not send until after the turn (or a restart).
+    Store the original stable path; create/clean up the temporary mapping in
+    the delivery worker so neither early cleanup nor retries lose the file.
+    """
+    unique_dir = f"sendfile_{uuid.uuid4().hex}"
+    temp_host_dir = os.path.join(host_data_dir, unique_dir)
+    try:
+        await _prepare_local_api_file(source_path, temp_host_dir, filename, logger=logger)
+        return await send_document(
+            document=f"file://{container_data_dir}/{unique_dir}/{urllib.parse.quote(filename)}",
+            filename=filename, **kwargs,
+        )
+    finally:
+        await asyncio.to_thread(shutil.rmtree, temp_host_dir, True)
+
+
 async def execute_sendfile_protocol(
     requested_path: str,
     *,
@@ -79,6 +102,20 @@ async def execute_sendfile_protocol(
 
         file_size = os.path.getsize(resolved_path)
         filename = os.path.basename(resolved_path)
+
+        if (file_size > max_file_size and api_base_url
+                and getattr(context.bot, '_queues_telegram_output', False) is True):
+            read_timeout = max(120, min(1800, int(file_size / (50 * 1024 * 1024) * 60)))
+            await context.bot.send_document(
+                chat_id=chat_id, document=resolved_path, filename=filename,
+                caption=f"📄 {filename} ({file_size} bytes) [本地API直发]",
+                _local_api={'host_data_dir': local_api_host_data_dir,
+                            'container_data_dir': local_api_container_data_dir},
+                read_timeout=read_timeout, write_timeout=read_timeout,
+                connect_timeout=30, pool_timeout=30,
+            )
+            return (f"[sendfile结果] 已加入 Telegram 发送队列: "
+                    f"{resolved_path} ({file_size} bytes) [本地API直发；网络恢复后自动补发]")
 
         if file_size > max_file_size and api_base_url:
             # 目录级隔离替代文件名篡改：每次发送生成独立随机子目录，原名文件存入
@@ -178,8 +215,11 @@ async def execute_sendfile_protocol(
                 read_timeout=120,
                 write_timeout=120,
             )
+        delivery_status = ('已加入 Telegram 发送队列'
+                           if getattr(context.bot, '_queues_telegram_output', False) is True
+                           else '已发送服务器文件给用户')
         sendfile_notice = (
-            f"[sendfile结果] 已发送服务器文件给用户: "
+            f"[sendfile结果] {delivery_status}: "
             f"{resolved_path} ({file_size} bytes)"
         )
     except Exception as error:

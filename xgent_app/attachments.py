@@ -362,7 +362,7 @@ def _legacy_generated_references(record: dict, generated_root: str | Path | None
 
 def _restore_reference(reference: dict, upload_root: str | Path,
                        generated_root: str | Path | None = None, *,
-                       mutable: bool = False, strict: bool = False) -> tuple[Path, list]:
+                       mutable: bool = False, strict: bool = False, prefer_path: bool = False) -> tuple[Path, list]:
     name = str(reference.get("name") or "(unnamed)")
     if (type(reference.get("version")) is not int or reference["version"] != 1
             or not isinstance(reference.get("path"), str)
@@ -402,6 +402,23 @@ def _restore_reference(reference: dict, upload_root: str | Path,
     else:
         raise AttachmentContextError(f"{name}: unknown or unavailable attachment storage")
     path = _resolve_storage_path(reference["path"], root)
+    if reference.get('path_only') or prefer_path:
+        from .file_ingress import fingerprint, describe_file
+        try:
+            size, digest = fingerprint(path)
+        except (OSError, ValueError) as exc:
+            if strict:
+                raise AttachmentUnavailable(str(exc)) from exc
+            return path, _unavailable_parts(reference, path, str(exc))
+        reference.update(size=size, sha256=digest)
+        if mutable:
+            try:
+                from .attachment_versions import AttachmentVersions
+                reference['versions'] = AttachmentVersions(root, reference).observe_file()
+            except (OSError, ValueError):
+                pass
+        text = describe_file(reference, root)
+        return path, [{'type': 'text', 'text': text}]
     version_warning = None
     if mutable and storage == 'uploads':
         # The path identifies a working file, not an immutable blob. Read once,
@@ -503,7 +520,7 @@ def _restore_reference(reference: dict, upload_root: str | Path,
 
 def prepare_attachment_context(records: list[dict], upload_root: str | Path,
                                generated_root: str | Path | None = None, *,
-                               strict: bool = False) -> tuple[list, list, list]:
+                               strict: bool = False, file_limits=None) -> tuple[list, list, list]:
     """Return current parts, conditional metadata updates, and blocking errors.
 
     Ordinary uploads may change; missing/damaged uploads have explicit placeholders.
@@ -562,13 +579,34 @@ def prepare_attachment_context(records: list[dict], upload_root: str | Path,
                 )
         except AttachmentContextError as exc:
             errors.append(f"Attachment record #{record.get('id', '?')}: {exc}")
+    limits = file_limits or {}
+    remaining_bytes = min(8 * 1024 * 1024, limits.get('max_request_bytes', 32 * 1024 * 1024) // 4)
+    remaining_text = min(remaining_bytes, limits.get('max_input_tokens', limits.get('context_window', 32 * 1024 * 1024)) // 2)
+    inline_files = inline_images = 0
     for _upload, _group, _message, _order, row_id, reference, mutable in sorted(
         ordered_references,
         key=lambda item: (groups[item[1]] if item[1] else item[0], item[2], item[3]),
     ):
         try:
+            prefer_path = False
+            if reference.get('managed_ingress'):
+                size = reference.get('size', 0)
+                try:
+                    size = resolve_upload_path(reference['path'], upload_root).stat().st_size
+                except OSError:
+                    pass  # The normal reader supplies the explicit unavailable marker.
+                image = reference.get('kind') == 'image'
+                prefer_path = (size > min(remaining_bytes, limits.get('max_file_bytes', remaining_bytes))
+                    or inline_files >= limits.get('max_files', float('inf'))
+                    or (image and (limits.get('supports_images') is False or inline_images >= limits.get('max_images', float('inf'))))
+                    or (not image and size > remaining_text))
+                if not prefer_path and not reference.get('path_only'):
+                    remaining_bytes -= size
+                    remaining_text -= size if not image else limits.get('image_token_budget', 4096)
+                    inline_files += 1
+                    inline_images += int(image)
             path, restored = _restore_reference(reference, upload_root, generated_root,
-                                                mutable=mutable, strict=strict)
+                                                mutable=mutable, strict=strict, prefer_path=prefer_path)
             if path not in seen:
                 parts.extend(restored)
                 seen.add(path)

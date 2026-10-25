@@ -71,6 +71,12 @@ body,body.dark { --code-bg:#182334; --code-header:#101827; --code-fg:#eef3f9; --
 #message-queue button:disabled { opacity:.5; cursor:wait; }
 .queue-error { margin:5px 0; font-size:.9em; color:var(--wb-danger); }
 .media-versions { display:block; margin-top:8px; padding:5px 10px; border:1px solid var(--wb-border); border-radius:6px; background:var(--wb-panel); color:var(--wb-text); font:inherit; font-size:.85em; cursor:pointer; }
+.media-paths-compact { display:flex; flex-direction:column; align-items:flex-end; gap:3px; margin-top:6px; width:0; min-width:100%; max-width:100%; }
+.media-path-copy { display:block; max-width:100%; padding:0; border:0; background:none; color:var(--wb-muted,var(--text-3)); font:11px/1.4 var(--mono); text-align:right; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; cursor:pointer; }
+.media-path-copy:hover,.media-path-copy:focus-visible { color:var(--wb-text,var(--text)); text-decoration:underline; }
+.bubble.user .upload-progress { display:block; color:var(--wb-muted,var(--text-3)); font-size:11px; margin-top:6px; text-align:right; }
+.bubble.user.has-media .media-versions { position:absolute; right:8px; bottom:8px; margin:0; padding:3px 7px; font-size:11px; opacity:.8; }
+.bubble.user.has-media .message-media { margin-bottom:8px; }
 .attachment-versions .version-list { display:flex; flex-direction:column; gap:10px; margin:12px 0; }
 .version-card { border:1px solid var(--wb-border); border-radius:8px; padding:12px; }
 .version-card>code { display:block; margin-top:4px; overflow-wrap:anywhere; }

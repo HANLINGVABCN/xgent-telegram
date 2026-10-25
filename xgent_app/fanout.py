@@ -474,7 +474,8 @@ class ChannelWorker:
             op = self._pop()
             if op is None:
                 if self._deferred_rows and self._is_configured() and self._breaker.allow():
-                    # 队列空了才做补投：优先保证实时流量。
+                    # 空闲时补投；实时操作在 _handle 中也必须先排空旧待发，
+                    # 不能让新回复抢在先前的命令结果/用户消息前面。
                     await self._drain_store(0)
                 event = self._event
                 if event is not None:
@@ -508,6 +509,19 @@ class ChannelWorker:
             # 攒着只会在用户某天配上 token 时突然刷出几千条历史消息。
             await self._forget(op)
             return
+
+        # A failed earlier send is a FIFO barrier, not only a dependency for
+        # edits of that same logical message. Otherwise a recovered connection
+        # can deliver the final AI reply before its command result/user input.
+        if self._deferred_rows:
+            if self._breaker.allow():
+                await self._drain_store(0)
+            if self._deferred_rows:
+                if op.kind == OP_CHAT_ACTION:
+                    self._dropped += 1
+                else:
+                    await self._defer(op)
+                return
 
         native: Optional[int] = None
         if op.kind in TARGETING_KINDS:

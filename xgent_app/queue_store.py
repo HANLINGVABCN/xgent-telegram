@@ -10,7 +10,7 @@ from .conversations import ConversationChanged, ConversationError, current_scope
 WAITING = ('pending', 'paused', 'invalid')
 REASONS = {
     'waiting': '等待当前任务的安全接入点', 'stopped': '已停止，等待手动继续',
-    'failed': '执行未完成，等待手动继续', 'restart': '来源进程已退出，等待手动继续',
+    'failed': '上一轮异常结束，待发消息已保留', 'restart': '来源进程已退出，等待手动继续',
     'ask': '等待表单提交', 'ask_cancelled': '表单已取消，等待手动继续',
     'generation': '上下文已改变，请取回后重新发送', 'archived': '对话已归档',
     'interrupted': '已接入，但执行中断；不会自动重发',

@@ -182,7 +182,7 @@ _LOCAL_API_CONTAINER_DATA_DIR = "/var/lib/telegram-bot-api"
 _LOCAL_API_HOST_DATA_DIR = os.path.join(PROJECT_ROOT, ".local-api-data")
 
 
-async def download_telegram_file(telegram_obj) -> bytes:
+async def download_telegram_file(telegram_obj, destination=None):
     """统一下载 Telegram 文件（PhotoSize/Document/Audio/Voice/Video 等），返回字节。
 
     本地 Bot API server（local_mode）模式下，PTB 拿到的 file_path 是容器内路径
@@ -191,9 +191,14 @@ async def download_telegram_file(telegram_obj) -> bytes:
 
     官方 api.telegram.org 模式下，走 PTB 原生的 HTTP 下载，行为完全不变。
     """
+    from xgent_app.file_ingress import FileTransportCapabilities
+    capabilities = FileTransportCapabilities.configured(BotConfig.API_BASE_URL)
+    size = getattr(telegram_obj, 'file_size', None)
+    if capabilities.download_limit is not None and size and size > capabilities.download_limit:
+        raise ValueError('Telegram 云端 Bot API 只能下载不超过 20 MB 的文件；请通过 Web 上传，或启用本地 Bot API。')
     file_obj = await telegram_obj.get_file()
 
-    if BotConfig.API_BASE_URL:
+    if capabilities.mode == 'local_bot_api':
         # 本地模式：PTB 把 base_file_url + token + 容器内绝对路径拼成混合 URL，
         # 例如 http://localhost:8081/file/bot<TOKEN>//var/lib/telegram-bot-api/<TOKEN>/documents/file_X.zip
         # 从中提取 /var/lib/telegram-bot-api/... 这段容器路径，翻译到宿主机数据目录直接读取。
@@ -203,15 +208,35 @@ async def download_telegram_file(telegram_obj) -> bytes:
         if idx != -1:
             container_path = raw_path[idx:]
             host_path = _LOCAL_API_HOST_DATA_DIR + container_path[len(_LOCAL_API_CONTAINER_DATA_DIR):]
+            if not os.path.realpath(host_path).startswith(os.path.realpath(_LOCAL_API_HOST_DATA_DIR) + os.sep):
+                raise ValueError('Telegram 本地文件路径越界')
             try:
                 loop = asyncio.get_running_loop()
+                if destination is not None:
+                    await asyncio.to_thread(shutil.copyfile, host_path, destination)
+                    return destination
                 return await loop.run_in_executor(None, lambda: open(host_path, 'rb').read())
             except FileNotFoundError:
                 logger.warning(f"本地 API 文件宿主机路径不存在，回退原生下载: {host_path}")
         # 路径不符合预期或宿主机文件不存在，回退到 PTB 原生下载
+        if destination is not None:
+            raw_path = getattr(file_obj, 'file_path', '') or ''
+            if os.path.isfile(raw_path):
+                await asyncio.to_thread(shutil.copyfile, raw_path, destination)
+                return destination
+            async with httpx.AsyncClient(follow_redirects=True, timeout=1800) as client:
+                async with client.stream('GET', raw_path) as response:
+                    response.raise_for_status()
+                    with open(destination, 'wb') as output:
+                        async for chunk in response.aiter_bytes(64 * 1024):
+                            output.write(chunk)
+            return destination
         return bytes(await file_obj.download_as_bytearray())
 
     # 官方模式：PTB 原生 HTTP 下载
+    if destination is not None:
+        await file_obj.download_to_drive(custom_path=destination)
+        return destination
     return bytes(await file_obj.download_as_bytearray())
 UPDATE_SKIP_NAMES = {
     ".env",
@@ -966,6 +991,8 @@ class PendingTextConversation:
         self.update = update
         self.context = context
         self.parts: List[str] = [text]
+        self.attachments: List[Dict[str, Any]] = []
+        self.committing = False
         self.conversation_context = conversation_snapshot()
         self.first_at = time.monotonic()
         self.last_at = self.first_at
@@ -983,6 +1010,8 @@ class PendingTextConversation:
 
 _pending_text_conversations: Dict[Tuple[int, int], PendingTextConversation] = {}
 _pending_text_conversations_lock = threading.RLock()
+_stitch_receiving = {}
+_stitch_cancellations = {}
 
 
 def merge_text_conversation_parts(parts: List[str]) -> str:
@@ -1671,23 +1700,29 @@ async def authorize_before_conversation(update, context, *args, **kwargs):
     return await check_authorized_user_middleware(update, context)
 
 
+async def admit_media_album(update, group):
+    key = (update.effective_chat.id, group)
+    admission = _album_admissions.get(key)
+    if admission is None:
+        admission = SimpleNamespace(ready=asyncio.get_running_loop().create_future(), finished=asyncio.Event())
+        _album_admissions[key] = admission
+        task = asyncio.create_task(_supervise_album(key, admission))
+        get_conversations().track_background(task)
+    return await asyncio.shield(admission.ready)
+
+
 def media_conversation_entry(function):
     @wraps(function)
     async def wrapped(update, *args, **kwargs):
         if not await authorize_before_conversation(update, *args, **kwargs):
             return None
         group = getattr(getattr(update, 'message', None), 'media_group_id', None)
+        if function.__name__ in {'handle_document_message', 'handle_media_message'}:
+            group = None  # Documents use the existing explicit Done/Clear buffer.
         if not group:
-            async with conversation_operation(execution=True):
+            async with conversation_operation(execution=function.__name__ not in {'handle_document_message', 'handle_media_message'}):
                 return await function(update, *args, **kwargs)
-        key = (update.effective_chat.id, group)
-        admission = _album_admissions.get(key)
-        if admission is None:
-            admission = SimpleNamespace(ready=asyncio.get_running_loop().create_future(), finished=asyncio.Event())
-            _album_admissions[key] = admission
-            task = asyncio.create_task(_supervise_album(key, admission))
-            get_conversations().track_background(task)
-        scope = await asyncio.shield(admission.ready)
+        scope = await admit_media_album(update, group)
         with bind_conversation(scope):
             return await function(update, *args, **kwargs)
     return wrapped

@@ -305,7 +305,8 @@ def build_text_stitch_mode_text() -> str:
         f"当前模式: <b>{safe_text(mode)}</b>\n\n"
         f"自动判断：短消息直接问 AI；单条接近 Telegram 上限（约 {TEXT_STITCH_SPLIT_HINT_CHARS} 字）时进入拼接，点完成后发送。\n"
         "强制开启：每条普通文本都会先累计，适合连续发多段内容。\n"
-        "强制不拼接：所有普通文本都直接发送给 AI。"
+        "强制不拼接：普通文本直接发送给 AI；已有文件拼接时文字仍追加到该次内容。\n"
+        "收到非图片文件时会自动进入本页已有的拼接流程，点完成才统一发送；图片继续独立处理。"
     )
 
 
@@ -318,11 +319,12 @@ def get_text_stitch_pending_keyboard():
 
 def build_text_stitch_pending_text(pending: PendingTextConversation) -> str:
     return (
-        "🧩 <b>正在拼接文字</b>\n"
+        "🧩 <b>正在拼接消息</b>\n"
         "━━━━━━━━━━━━━━\n"
         f"已累计: <b>{len(pending.parts)} 段</b>\n"
-        f"总字数: <b>{pending.total_chars()}</b>\n\n"
-        "继续发送文字会追加到本次内容；全部发送完后点“完成，发送给AI”。"
+        f"总字数: <b>{pending.total_chars()}</b>\n"
+        f"文件: <b>{len(pending.attachments)} 个</b>，{sum(p['attachment']['size'] for p in pending.attachments)} bytes\n\n"
+        "继续发送文字或非图片文件会追加到本次内容；全部发送完后点“完成，发送给AI”。"
     )
 
 def get_more_settings_menu():
