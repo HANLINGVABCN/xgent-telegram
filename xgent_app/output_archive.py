@@ -26,7 +26,8 @@ def read_output_page(path: str, offset: int = 0, *, roots: Iterable[str | Path] 
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
         raise OutputArchiveError('无效的输出分页位置')
     try:
-        target = Path(path).resolve(strict=True)
+        from .data_paths import resolve_stored_path
+        target = resolve_stored_path(path).resolve(strict=True)
         allowed = [Path(root).resolve() for root in (roots if roots is not None else [DEFAULT_OUTPUT_ROOT])]
         if target.suffix.lower() != '.txt' or not any(target.is_relative_to(root) for root in allowed):
             raise OutputArchiveError('只能查看命令输出目录中的文本存档')
@@ -46,7 +47,7 @@ def read_output_page(path: str, offset: int = 0, *, roots: Iterable[str | Path] 
             pending = len(decoder.getstate()[0])
             next_offset = offset + len(raw) - pending
             return {'text': text, 'offset': offset, 'next_offset': next_offset,
-                    'size': info.st_size, 'eof': eof, 'filename': target.name}
+                    'size': info.st_size, 'eof': eof, 'filename': target.name, 'path': str(target)}
     except OutputArchiveError:
         raise
     except (OSError, ValueError, RuntimeError) as exc:

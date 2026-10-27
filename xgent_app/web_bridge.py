@@ -864,6 +864,9 @@ async def deliver_op_to_bot(bot: Any, op: Op, native_id: Optional[int], *,
             opened = None
             if handle is None:
                 path = payload.get("path")
+                if path:
+                    from xgent_app.data_paths import resolve_stored_path
+                    path = resolve_stored_path(path)
                 if not path or not os.path.isfile(str(path)):
                     # 补投时文件已经没了。跳过——为一个临时文件卡住整条待发队列不值得，
                     # 与 _replay_relay_op 对同一情况的处理一致。

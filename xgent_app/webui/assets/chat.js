@@ -55,6 +55,7 @@
   var preferPolling = /(^|\.)trycloudflare\.com$/i.test(location.hostname);
   var msgCount = 0;
   var pendingFiles = [];
+  var pendingPreviews = new Map();
   var fileStatuses = new WeakMap();
   var uploadQueue = null;
   var queueEnabled=false,queueState=null,queueController=null,queueVersion=0,queueExpanded=false,queueRefreshPending=false;
@@ -450,6 +451,22 @@
     return (d.getHours() < 10 ? "0" : "") + d.getHours() + ":" + (d.getMinutes() < 10 ? "0" : "") + d.getMinutes();
   }
 
+  function detailedTime(timestamp) {
+    var d = timestamp == null ? new Date() : new Date(Number(timestamp) * 1000);
+    if (isNaN(d.getTime())) d = new Date();
+    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, '0') + "-" +
+      String(d.getDate()).padStart(2, '0') + " " + String(d.getHours()).padStart(2, '0') + ":" +
+      String(d.getMinutes()).padStart(2, '0') + ":" + String(d.getSeconds()).padStart(2, '0');
+  }
+
+  function applyAiGeneration(entry, timestamp, generation) {
+    if (!entry || entry.role !== 'ai' || !entry.aiMeta) return;
+    entry.aiGeneration = generation || entry.aiGeneration || null;
+    var provider = entry.aiGeneration?.provider || '', model = entry.aiGeneration?.model || '';
+    entry.aiMeta.textContent = detailedTime(entry.aiGeneration?.generated_at || timestamp) + ' · 模型：' +
+      (provider || model ? (provider && model ? provider + ' / ' + model : provider || model) : '历史记录未记录模型');
+  }
+
   function toast(msg, alert) {
     if (!msg) return;
     toastEl.textContent = msg;
@@ -763,10 +780,10 @@
   }
 
   var lastStreamEntry = null;
-  function makeBubble(role, text, messageId, parseMode, markup, messageType, timestamp, webDisplay) {
-    var stick = isNearBottom();
-    msgCount++;
-    updateEmptyState();
+  function makeBubble(role, text, messageId, parseMode, markup, messageType, timestamp, webDisplay, aiGeneration, renderTarget) {
+    var targetLog=renderTarget||log;
+    var stick = !renderTarget && isNearBottom();
+    if(!renderTarget){msgCount++;updateEmptyState();}
 
     role = classifyMessageText(role, text, messageType);
 
@@ -779,7 +796,7 @@
       pill.innerHTML = renderText(text, parseMode);
       enhanceBubbleContent(pill);
       row.appendChild(pill);
-      log.appendChild(row);
+      targetLog.appendChild(row);
       if (stick) scrollDown();
       var tEntry = { row: row, body: pill, bubble: pill, head: null, btns: null, rawText: text, role: role };
       if (messageId != null) byMessageId[messageId] = tEntry;
@@ -797,6 +814,12 @@
       var iconText = role === "ai" ? "X" : "◇";
       var authorName = role === "ai" ? "XGent" : role === "user" ? "你" : (role === "cmd" ? "工具结果" : "系统");
       head.innerHTML = '<div class="bubble-author"><span class="bubble-author-icon' + iconCls + '">' + iconText + '</span> ' + authorName + '</div>';
+      if (role === "ai") {
+        var aiMeta = document.createElement("span");
+        aiMeta.className = "ai-generation-meta";
+        head.appendChild(aiMeta);
+        head._aiMeta = aiMeta;
+      }
       bubble.appendChild(head);
     }
 
@@ -821,6 +844,7 @@
     btnCp.className = "act-btn";
     btnCp.type = "button";
     btnCp.title = "复制全文";
+    btnCp.setAttribute('aria-label', role==='user'?'复制用户消息':role==='ai'?'复制 AI 回复':'复制'+authorName);
     btnCp.innerHTML = svgIcon("copy");
     btnCp.addEventListener("click", function (e) {
       e.stopPropagation();
@@ -834,6 +858,7 @@
       btnQt.className = "act-btn";
       btnQt.type = "button";
       btnQt.title = "引用回复";
+      btnQt.setAttribute('aria-label','引用'+authorName+'回复');
       btnQt.innerHTML = svgIcon("quote");
       btnQt.addEventListener("click", function (e) {
         e.stopPropagation();
@@ -847,6 +872,7 @@
       btnSpk.className = "act-btn";
       btnSpk.type = "button";
       btnSpk.title = "朗读消息";
+      btnSpk.setAttribute('aria-label','朗读'+authorName+'消息');
       btnSpk.innerHTML = svgIcon("speaker");
       btnSpk.addEventListener("click", function (e) {
         e.stopPropagation();
@@ -865,12 +891,14 @@
     }
 
     row.appendChild(bubble);
-    log.appendChild(row);
+    targetLog.appendChild(row);
     if (stick) scrollDown();
 
-    var entry = { row: row, body: body, bubble: bubble, head: head, btns: btns, rawText: text, parseMode: parseMode, role: role };
+    var entry = { row: row, body: body, bubble: bubble, head: head, btns: btns, rawText: text, parseMode: parseMode, role: role, aiGeneration: aiGeneration || null };
+    entry.aiMeta = head && head._aiMeta;
+    applyAiGeneration(entry, timestamp, aiGeneration);
     if (messageId != null) byMessageId[messageId] = entry;
-    if (role === "ai" || role === "cmd" || role === "sys") lastStreamEntry = entry;
+    if (!renderTarget && (role === "ai" || role === "cmd" || role === "sys")) lastStreamEntry = entry;
     return entry;
   }
 
@@ -903,6 +931,33 @@
     lightboxExt.href = url;
     lightbox.classList.add("open");
   }
+  function previewMedia(url,name,kind){
+    if(!url||!(url.startsWith('blob:')||/^\/api\//.test(url)))return;
+    document.getElementById('media-preview-dialog')?.close();
+    const dialog=document.createElement('dialog');dialog.id='media-preview-dialog';dialog.setAttribute('aria-label','媒体预览');
+    const header=document.createElement('header'),title=document.createElement('strong'),close=document.createElement('button');
+    title.textContent=name||'媒体预览';close.type='button';close.textContent='×';close.setAttribute('aria-label','关闭媒体预览');close.onclick=()=>dialog.close();header.append(title,close);
+    const area=document.createElement('div');area.className='media-preview-stage';
+    const media=document.createElement(kind==='video'?'video':kind==='audio'?'audio':'img');
+    if(kind==='video'||kind==='audio'){media.controls=true;media.preload='none';media.playsInline=true;}else{media.alt=name||'图片';media.decoding='async';}
+    media.src=url;area.appendChild(media);dialog.append(header,area);
+    const hint=document.createElement('div');hint.className='media-preview-error';hint.hidden=true;hint.setAttribute('role','alert');
+    const errorText=document.createElement('span'),retry=document.createElement('button'),download=document.createElement('a');
+    errorText.textContent=(kind==='photo'?'图片':'媒体')+'暂时加载失败，可重试或下载原文件。';
+    retry.type='button';retry.textContent='重新加载';retry.onclick=()=>{
+      hint.hidden=true;
+      if(url.startsWith('blob:'))media.src=url;
+      else{const next=new URL(url,location.origin);next.searchParams.set('preview_retry',Date.now());media.src=next.pathname+next.search;}
+      if(media.play)media.play().catch(()=>{});
+    };
+    download.href=url;download.download=name||'file';download.textContent='下载原文件';hint.append(errorText,retry,download);area.append(hint);
+    media.onerror=()=>{hint.hidden=false;};media.addEventListener(kind==='photo'?'load':'loadeddata',()=>{hint.hidden=true;});
+    const focused=document.activeElement;
+    dialog.addEventListener('close',()=>{if(media.pause)media.pause();media.removeAttribute('src');if(media.load)media.load();dialog.remove();focused?.focus({preventScroll:true});},{once:true});
+    dialog.addEventListener('click',event=>{if(event.target===dialog)dialog.close();});
+    document.body.append(dialog);dialog.showModal();close.focus();
+    if(kind==='video'||kind==='audio')media.play().catch(()=>{});
+  }
   function closeLightbox() {
     lightbox.classList.remove("open");
     lightboxImg.src = "";
@@ -925,6 +980,15 @@
 
   function updateMediaContent(container, item) {
     container._mediaItem=item;
+    let modeBadge=container.querySelector('.media-ingress-badge');
+    if(item.ingress_mode){
+      if(!modeBadge){modeBadge=document.createElement('span');modeBadge.className='media-ingress-badge';container.appendChild(modeBadge);}
+      modeBadge.dataset.mode=item.ingress_mode;
+      modeBadge.textContent=item.ingress_mode==='server_upload'?'↑ 上传 · 仅路径':'📎 附件';
+      modeBadge.title=item.ingress_mode==='server_upload'?'保存在服务器，AI 仅收到路径和元数据':'附件按类型交给 AI；两种模式均按 Bot 能力同步 Telegram';
+    }else if(modeBadge)modeBadge.remove();
+    const body=container.querySelector('.fc-body');
+    if(body){let details=body.querySelector('.fc-details');if(!details){details=document.createElement('small');details.className='fc-details';body.appendChild(details);}details.textContent=[item.size!=null?(item.size/1024/1024>=1?(item.size/1024/1024).toFixed(1)+' MiB':Math.ceil(item.size/1024)+' KiB'):null,item.mime_type].filter(Boolean).join(' · ');}
     if(item.kind==='photo')sizeImagePlaceholder(container,item.width,item.height);
     container.querySelectorAll('a.media-dl,a.fc-dl').forEach(function(link){
       link.href=item.download_url;link.download=item.filename||'file';
@@ -954,6 +1018,9 @@
 
   function imageSourceUrl(item) {
     var url=item.download_url;
+    if(url&&url.startsWith('/api/')&&item.conversation_id){
+      const scoped=new URL(url,location.origin);scoped.searchParams.set('conversation_id',item.conversation_id);url=scoped.pathname+scoped.search;
+    }
     if(url&&!/^(blob:|data:)/.test(url)&&/^[0-9a-f]{64}$/.test(item.sha256||'')){
       return url+(url.includes('?')?'&':'?')+'image_version='+item.sha256;
     }
@@ -1220,7 +1287,7 @@
     } else {
       var next = entry && entry.row.nextSibling;
       removeEntry(entry);
-      entry = makeBubble(role, frame.text, id, frame.parse_mode, null, frame.msg_type, frame.timestamp || frame.ts, frame.web_display);
+      entry = makeBubble(role, frame.text, id, frame.parse_mode, null, frame.msg_type, frame.timestamp || frame.ts, frame.web_display, frame.ai_generation);
       if (next && next.parentNode === log) log.insertBefore(entry.row, next);
     }
     entry.rawText=frame.text;entry.parseMode=frame.parse_mode;entry.displayKey=displayKey;
@@ -1228,6 +1295,7 @@
       var ts=entry.row.querySelector('.ts');
       if(ts){ts.textContent=nowTime(frame.timestamp);ts.title=new Date(Number(frame.timestamp)*1000).toLocaleString();}
     }
+    applyAiGeneration(entry, frame.timestamp || frame.ts, frame.ai_generation);
     bindUiMessage(entry, frame);
     if (frame.reply_markup !== undefined) {
       setButtons(entry, frame.reply_markup, frame.message_id != null ? frame.message_id : (frame.record_id || 0));
@@ -1258,6 +1326,7 @@
     entry.durable=!message.ui_message_id;
     aliases.forEach(function(mid){byMessageId[mid]=entry;});
     entry.row.dataset.historyCursor=message.history_cursor||entry.row.dataset.historyCursor||'';
+    entry.row._historyOrder=[Number(message.timestamp)||0,message.ui_message_id?1:0,String(message.ui_message_id||message.record_id||message.id||'').padStart(20,'0')];
     if(frame.record_id!=null&&!message.ui_message_id)entry.row.dataset.recordId=String(frame.record_id);
     return entry;
   }
@@ -1366,6 +1435,7 @@
        (!frame.ui_generation || frame.ui_generation===uiGeneration) && !displayedFrameEntry(frame)) {
       var newId=frame.web_display?.reply_message_id??frame.ui_message_id??frame.record_id??frame.message_id;
       if(newId==null||!unseenHistoryFrames.has(newId)){newFrames++;unseenHistoryFrames.add(newId);}
+      invalidateHistoryPreloads(true);
       newerAvailable=true;updateHistoryState();return;
     }
     if (isNearBottom()) requestAnimationFrame(function(){boundMessages(false);});
@@ -1663,14 +1733,16 @@
   var historyAnchor = null;
   var viewingPast = false;
   var newerAvailable = false;
+  var historyForwardCursor = null;
+  var historyPreloads = new Map(),historyNetworkMs=500,historyVelocity=0,historyDirection=0,historyScrollAt=0,historyScrollTop=0;
   var newFrames = 0;
   function historyUrl() {
     return "/api/workbench/history?limit=50" + (historyAnchor ? "&anchor=" + encodeURIComponent(historyAnchor) : "");
   }
   function boundMessages(prepend) {
     var rows = Array.from(log.children);
-    var removedFront=false;
-    while (rows.length > 200) {
+    var removedFront=false,remaining=rows.length;
+    while (remaining > 200 && rows.length) {
       var row = prepend ? rows.pop() : rows.shift();
       var selection=window.getSelection();
       var box=row.getBoundingClientRect(),viewport=log.getBoundingClientRect();
@@ -1680,6 +1752,7 @@
       var entry=null;
       Object.keys(byMessageId).forEach(function(key){if(byMessageId[key].row===row){entry=byMessageId[key];delete byMessageId[key];}});
       if(entry)removeEntry(entry);else row.remove();
+      remaining--;
       if(prepend){newerAvailable=true;viewingPast=true;}else removedFront=true;
     }
     if(removedFront)historyCursor=edgeCursor(false)||historyCursor;
@@ -1701,48 +1774,106 @@
     historyPageVersion++;
     historyPageRequest?.controller.abort();historyPageRequest=null;
     historyLoading=false;historyError=null;
+    historyPreloads.forEach(item=>item.controller.abort());historyPreloads.clear();
+    historyDirection=0;historyVelocity=0;historyScrollAt=0;
+  }
+  function historyFetch(forward,cursor){
+    const key=historyGen+'|'+selectedConversationId+'|'+forward+'|'+cursor;
+    const cached=historyPreloads.get(key),now=performance.now();
+    if(cached&&(!cached.done||(!cached.dirty&&now-cached.finished<15000))){
+      historyPreloads.delete(key);historyPreloads.set(key,cached);return cached.promise;
+    }
+    if(cached)historyPreloads.delete(key);
+    const item={controller:new AbortController(),started:now,forward:forward,done:false,dirty:false};
+    item.promise=api('/api/workbench/history?limit=50&'+(forward?'after=':'before=')+encodeURIComponent(cursor),{signal:item.controller.signal}).then(data=>{
+      historyNetworkMs=Math.max(150,historyNetworkMs*.5+(performance.now()-item.started)*.5);return data;
+    }).finally(()=>{item.done=true;item.finished=performance.now();
+    });
+    item.promise.catch(function(){});historyPreloads.set(key,item);
+    if(historyPreloads.size>8){
+      const active=historyPageRequest?.cacheKey;
+      const oldest=[...historyPreloads].find(([id,value])=>id!==active&&value.done)?.[0];
+      if(oldest)historyPreloads.delete(oldest);
+    }
+    return item.promise;
+  }
+  function invalidateHistoryPreloads(forward){
+    historyPreloads.forEach((item,key)=>{
+      if(item.forward===forward){if(item.done)historyPreloads.delete(key);else item.dirty=true;}
+    });
+  }
+  function primeHistory(forward,cursor,depth=1){
+    if(!cursor)return;
+    const generation=historyGen,cid=selectedConversationId;
+    historyFetch(forward,cursor).then(data=>{
+      if(depth>0&&generation===historyGen&&cid===selectedConversationId&&!data.reset){
+        const next=forward?(data.next_cursor?data.last_cursor:null):data.next_cursor;
+        if(next&&next!==cursor)primeHistory(forward,next,depth-1);
+      }
+    }).catch(function(){});
   }
   function scheduleHistoryPrefetch(){
     if(historyPrefetchScheduled)return;
     historyPrefetchScheduled=true;
     requestAnimationFrame(function(){
       historyPrefetchScheduled=false;
-      if(historyReady&&!loggedOut&&!historyLoading&&!historyError&&historyCursor&&
-         log.clientHeight>0&&log.scrollTop<=Math.max(800,1.5*log.clientHeight))historyPage(false);
+      if(!historyReady||loggedOut||historyLoadController||historyError||!log.clientHeight)return;
+      // Two pages are already in flight/buffered while the reader is several
+      // screens away; inserting them later never waits for a button click.
+      primeHistory(false,historyCursor);
+      const forwardCursor=historyForwardCursor||edgeCursor(true);
+      if(newerAvailable&&viewingPast)primeHistory(true,forwardCursor);
+      const lead=Math.min(10000,Math.max(1800,log.clientHeight*3,historyVelocity*(historyNetworkMs+600)));
+      const nearTop=historyCursor&&log.scrollTop<=lead;
+      const nearBottom=newerAvailable&&viewingPast&&log.scrollHeight-log.scrollTop-log.clientHeight<=lead;
+      if(!historyLoading){
+        if(nearBottom&&historyDirection>0)historyPage(true);
+        else if(nearTop&&historyDirection<=0)historyPage(false);
+        else if(nearBottom&&!historyCursor)historyPage(true);
+      }
     });
   }
   function edgeCursor(last) {
     var rows=Array.from(log.querySelectorAll('[data-history-cursor]'));
     return (last?rows.at(-1):rows[0])?.dataset.historyCursor;
   }
+  function sortHistoryRows(){
+    const rows=Array.from(log.children).filter(row=>row._historyOrder);
+    rows.sort((a,b)=>a._historyOrder[0]-b._historyOrder[0]||a._historyOrder[1]-b._historyOrder[1]||a._historyOrder[2].localeCompare(b._historyOrder[2]));
+    const fragment=document.createDocumentFragment();rows.forEach(row=>fragment.append(row));log.prepend(fragment);
+  }
   function updateHistoryState() {
     document.getElementById('wb-chat').classList.toggle('history-past',viewingPast);
     document.getElementById('wb-chat').classList.toggle('history-top',log.scrollTop<8&&!!historyCursor);
     document.getElementById('wb-chat').classList.toggle('history-error',!!historyError);
-    document.getElementById('wb-earlier').disabled=historyLoading||!historyCursor;
-    document.getElementById('wb-newer').disabled=historyLoading||!newerAvailable;
-    document.getElementById('wb-earlier').textContent=historyError&&!historyError.forward?'重试加载历史':'加载更早消息';
-    document.getElementById('wb-newer').textContent=historyError?.forward?'重试较新消息':'加载较新消息';
+    const status=document.getElementById('history-loading-state');
+    status.hidden=!historyError;
+    status.setAttribute('aria-busy',String(historyLoading));
+    document.getElementById('history-retry').hidden=!historyError;
+    document.getElementById('history-retry').textContent=historyError?.forward?'重试较新消息':'重试加载历史';
     document.getElementById('wb-history-state').textContent=historyError?'加载失败：'+historyError.message:
-      historyLoading?'正在加载…':viewingPast?
-      ('浏览历史'+(newFrames?' · 有 '+newFrames+' 条新动态':'')+' · 可向前/后翻页'):'';
+      historyLoading?'正在提前加载历史…':newFrames?'有 '+newFrames+' 条新动态':'';
   }
   function historyControls(data) {
-    historyCursor=data.next_cursor||null;
-    newerAvailable=!!historyAnchor;
+    historyCursor=data.before ? (data.before.has_more?data.before.cursor:null) : data.next_cursor||null;
+    historyForwardCursor=data.after?.cursor||data.last_cursor||null;
+    // A source location keeps a forward window open for later live results,
+    // even if the database has no following page at the time of this snapshot.
+    newerAvailable=data.after ? (!!data.after.has_more || !!historyAnchor) : !!historyAnchor;
     viewingPast=!!historyAnchor;
     newFrames=0;unseenHistoryFrames.clear();
     updateHistoryState();
   }
   async function historyPage(forward) {
-    var cursor=forward?edgeCursor(true):historyCursor;
+    var cursor=forward?(historyForwardCursor||edgeCursor(true)):historyCursor;
     if(!cursor||historyLoading||(forward&&!newerAvailable))return;
-    var request={controller:new AbortController(),version:++historyPageVersion,generation:historyGen,cid:selectedConversationId};
+    var request={controller:new AbortController(),version:++historyPageVersion,generation:historyGen,cid:selectedConversationId,
+      cacheKey:historyGen+'|'+selectedConversationId+'|'+forward+'|'+cursor,newFrames:newFrames};
     historyPageRequest=request;historyLoading=true;historyError=null;updateHistoryState();
     var current=()=>historyPageRequest===request&&request.version===historyPageVersion&&
       request.generation===historyGen&&request.cid===selectedConversationId;
     try{
-      var data=await api('/api/workbench/history?limit=50&'+(forward?'after=':'before=')+encodeURIComponent(cursor),{signal:request.controller.signal});
+      var data=await historyFetch(forward,cursor);
       if(!current())return;
       if(data.conversation_id&&request.cid&&data.conversation_id!==request.cid){
         throw new Error('会话已变化，请重试加载历史');
@@ -1764,19 +1895,22 @@
           if(!forward){log.insertBefore(entry.row,first);(entry.mediaEntries||[]).forEach(media=>log.insertBefore(media.row,first));}
         });
         // Restore before pruning so the visible rows are protected by the window.
+        if(historyAnchor)sortHistoryRows();
         restoreScrollAnchor(anchor);boundMessages(!forward);
-        if(forward){newerAvailable=!!data.next_cursor;historyCursor=edgeCursor(false)||historyCursor;}
-        else historyCursor=(data.messages?.length&&data.next_cursor!==cursor)?data.next_cursor||null:null;
+        if(forward){historyForwardCursor=data.last_cursor||historyForwardCursor;newerAvailable=!!data.next_cursor||newFrames>request.newFrames;historyCursor=edgeCursor(false)||historyCursor;}
+        else { historyForwardCursor=edgeCursor(true)||historyForwardCursor; historyCursor=(data.messages?.length&&data.next_cursor!==cursor)?data.next_cursor||null:null; }
         updateHistoryState();restoreScrollAnchor(anchor);
       }finally{renderingHistory--;}
     }catch(err){if(current()&&err.name!=='AbortError')historyError={forward:forward,message:err.message};}
     finally{
-      if(current()){historyPageRequest=null;historyLoading=false;updateHistoryState();scheduleHistoryPrefetch();}
+      if(current()){
+        if(!historyError)historyPreloads.delete(request.cacheKey);
+        historyPageRequest=null;historyLoading=false;historyScrollTop=log.scrollTop;updateHistoryState();scheduleHistoryPrefetch();
+      }
     }
   }
-  document.getElementById('wb-earlier').onclick=function(){historyPage(false);};
-  document.getElementById('wb-newer').onclick=function(){historyPage(true);};
-  document.getElementById('wb-latest').onclick=function(){if(location.hash.includes('?conversation=')){history.replaceState(null,'','#/chat');document.getElementById('source-navigation').hidden=true;}historyAnchor=null;viewingPast=false;newFrames=0;resync(true).then(scrollDown).catch(function(){});};
+  document.getElementById('history-retry').onclick=function(){const direction=!!historyError?.forward;historyPreloads.forEach(item=>item.controller.abort());historyPreloads.clear();historyPage(direction);};
+  function returnToLatest(){if(location.hash.includes('?conversation=')){history.replaceState(null,'','#/chat');document.getElementById('source-navigation').hidden=true;}historyAnchor=null;viewingPast=false;newFrames=0;resync(true).then(scrollDown).catch(function(){});}
   function loadHistory() {
     cancelHistoryPage();historyLoadController?.abort();
     var controller=historyLoadController=new AbortController();
@@ -1801,6 +1935,7 @@
       uiGeneration=Number.isSafeInteger(data.ui_generation)?data.ui_generation:null;
       (data.ui_tombstones||[]).forEach(function(item){uiRevisions[item.ui_message_id]=item.revision;uiDeleted[item.ui_message_id]=true;});
       const retained=new Set();
+      if(historyAnchor&&sameGeneration){Object.values(byMessageId).forEach(entry=>{if(entry?.row.isConnected)retained.add(entry);});}
       (data.messages||[]).forEach(function(m){
         if(m.ui_message_id&&uiDeleted[m.ui_message_id])return;
         const entry=putHistoryFrame(m,data.live?.epoch);
@@ -1827,10 +1962,13 @@
       });
       const retainedRows=new Set();retained.forEach(entry=>{retainedRows.add(entry.row);(entry.mediaEntries||[]).forEach(child=>retainedRows.add(child.row));});
       Array.from(log.children).forEach(row=>{if(!retainedRows.has(row))row.remove();});
+      if(historyAnchor)sortHistoryRows();
       if(typeof data.busy==='boolean')setBusy(data.busy);
       if(data.busy && !(live?.frames||[]).length && (!data.running || data.running.conversation_id===selectedConversationId))showTyping();else hideTyping();
-      updateEmptyState();boundMessages(false);
-      if(wasNearBottom||historyAnchor)scrollDown();else log.scrollTop=top;
+      if(historyAnchor){const target=byMessageId[historyAnchor];if(target)target.row.scrollIntoView({block:'center'});}
+      updateEmptyState();boundMessages(!!historyAnchor);
+      if(historyAnchor){const target=byMessageId[historyAnchor];if(target)target.row.scrollIntoView({block:'center'});}
+      else if(wasNearBottom)scrollDown();else log.scrollTop=top;
       updateHistoryState();
       if(historyAnchor){const entry=byMessageId[historyAnchor];if(entry){entry.row.classList.add('wb-focus');setTimeout(()=>entry.row.classList.remove('wb-focus'),2000);}}
     }).finally(function(){if(historyLoadController===controller)historyLoadController=null;});
@@ -2105,7 +2243,7 @@
         entry.objectUrls = [];
         setInlineMedia(entry,batch.files.map(function(file){
           var url=URL.createObjectURL(file);entry.objectUrls.push(url);
-          return {kind:file.type.startsWith('image/')?'photo':mediaKindFromName(file.name),filename:file.name,download_url:url,local_preview:true};
+          return {kind:file.type.startsWith('image/')?'photo':mediaKindFromName(file.name),filename:file.name,download_url:url,local_preview:true,ingress_mode:fileModes.get(file)||'attachment'};
         }));
         setBusy(true);
         // HTTP 只确认接收，turn_end 才允许下一份上传进入对话核心。
@@ -2830,16 +2968,36 @@
   });
 
   function renderPendingFiles() {
+    if(selectedConversationId)conversationFiles[selectedConversationId]=pendingFiles.slice();
+    const retained=new Set([...pendingFiles,...Object.values(conversationFiles).flat(),...(uploadQueue?.files||[])]);
+    pendingPreviews.forEach((value,file)=>{if(!retained.has(file)){URL.revokeObjectURL(value.url);pendingPreviews.delete(file);}});
     pendingFilesEl.innerHTML = "";
     pendingFiles.forEach(function (f, idx) {
       var chip = document.createElement("div");
       chip.className = "pending-file";
+      const mode=fileModes.get(f)||'attachment';chip.dataset.mode=mode;
+      const mediaKind=f.type.startsWith('image/')?'photo':f.type.startsWith('video/')?'video':mediaKindFromName(f.name);
+      if(mediaKind==='photo'||mediaKind==='video'){
+        let preview=pendingPreviews.get(f);
+        if(!preview){preview={url:URL.createObjectURL(f)};pendingPreviews.set(f,preview);}
+        const open=document.createElement('button');open.type='button';open.className='pending-media-preview';open.setAttribute('aria-label','预览 '+f.name);
+        open.onclick=()=>previewMedia(preview.url,f.name,mediaKind);
+        if(mediaKind==='photo'){const image=document.createElement('img');image.src=preview.url;image.alt=f.name;image.decoding='async';open.append(image);}
+        else{
+          const video=document.createElement('video');video.src=preview.url;video.preload='metadata';video.muted=true;video.playsInline=true;video.tabIndex=-1;video.setAttribute('aria-hidden','true');
+          video.addEventListener('loadedmetadata',()=>{if(video.duration>0)video.currentTime=Math.min(.1,video.duration/2);},{once:true});
+          const play=document.createElement('span');play.textContent='▶';open.append(video,play);
+        }
+        chip.appendChild(open);
+      }
       var name = document.createElement("span");
+      name.className='pending-file-name';
       name.textContent = (fileModes.get(f)==='server_upload'?'↑ 上传：':'📎 附件：') + f.name;
       var del = document.createElement("button");
       del.className = "pf-del";
       del.type = "button";
       del.textContent = "×";
+      del.setAttribute('aria-label','移除 '+f.name);
       del.addEventListener("click", function () {
         pendingFiles.splice(idx, 1);
         renderPendingFiles();
@@ -2874,12 +3032,15 @@
   });
 
   log.addEventListener("scroll", function () {
+    const now=performance.now(),delta=log.scrollTop-historyScrollTop,elapsed=now-historyScrollAt;
+    if(historyScrollAt&&Math.abs(delta)>3&&elapsed<1500){historyDirection=Math.sign(delta);historyVelocity=Math.abs(delta)/Math.max(16,elapsed);}
+    historyScrollTop=log.scrollTop;historyScrollAt=now;
     document.getElementById('wb-chat').classList.toggle('history-top',log.scrollTop<8&&!!historyCursor);
     if (isNearBottom()) hideScrollBtn(); else showScrollBtn();
     scheduleHistoryPrefetch();
   });
   new ResizeObserver(scheduleHistoryPrefetch).observe(log);
-  scrollBtn.addEventListener("click", function () { scrollDown(); triggerHaptic(); });
+  scrollBtn.addEventListener("click", function () { if(viewingPast)returnToLatest();else scrollDown(); triggerHaptic(); });
 
   // These essentials belong to the standalone chat entry, not to the optional
   // admin module graph (a failed usage/settings import must not disable logout).
@@ -3108,7 +3269,26 @@
       input.value=command;syncSendState();send();return true;
     },
     reload: function(){historyAnchor=null;viewingPast=false;newFrames=0;return resync();},
-    locate: async function(key){if(document.body.dataset.page!=='chat')location.hash='/chat';historyAnchor=key;const cid=selectedConversationId;await resync(true);const entry=cid===selectedConversationId&&key&&byMessageId[key];if(entry){entry.row.classList.add('source-target');entry.row.scrollIntoView({block:'center'});setTimeout(()=>entry.row.classList.remove('source-target'),3500);}},
+    locate: async function(key){
+      if(document.body.dataset.page!=='chat')location.hash='/chat';
+      const cid=selectedConversationId;
+      if(key&&!byMessageId[key]){historyAnchor=key;await resync(true);}
+      const entry=cid===selectedConversationId&&key&&byMessageId[key];
+      if(entry){entry.row.classList.add('source-target');entry.row.scrollIntoView({block:'center'});setTimeout(()=>entry.row.classList.remove('source-target'),3500);}
+    },
+    dismissLocation: function(){
+      log.querySelectorAll('.source-target,.wb-focus').forEach(row=>row.classList.remove('source-target','wb-focus'));
+      // Do not reload the conversation or change drafts/scroll position.
+    },
+    renderRecord: function(message,target){
+      const role=message.role==='user'?'user':message.role==='assistant'?'ai':'sys';
+      const entry=makeBubble(role,message.content,null,message.parse_mode,null,message.msg_type,message.timestamp,message.web_display,message.ai_generation,target);
+      if(message.media?.length)setInlineMedia(entry,message.media);
+      entry.row.dataset.sourceMessage=message.history_key||'history:'+message.id;
+      return entry.row;
+    },
+    bindContent: bindContentClicks,
+    previewMedia: previewMedia,
     settings: function(){return loadSettings();},
     commands: function(commands){
       if (!commands.length) return;
@@ -3127,7 +3307,8 @@
     loggedOut=true;stopLiveTransport();cancelHistoryPage();historyLoadController?.abort();historyGen++;historyReady=false;pendingFrames=[];
     queueController?.abort();queueController=null;queueVersion++;queueState=null;queueEnabled=false;queueActions.clear();recoveredEdits.clear();textSubmission=null;drawQueue();
     try{sessionStorage.removeItem('xgent_queue_edits');sessionStorage.removeItem('xgent_queue_recovered');}catch(e){}
-    cancelUploads('已退出登录');clearPendingFiles();input.value='';try { sessionStorage.removeItem(draftKey()); } catch(e) {}
+    document.getElementById('media-preview-dialog')?.close();
+    cancelUploads('已退出登录');conversationFiles=Object.create(null);clearPendingFiles();pendingPreviews.forEach(value=>URL.revokeObjectURL(value.url));pendingPreviews.clear();input.value='';try { sessionStorage.removeItem(draftKey()); } catch(e) {}
     Array.from(new Set(Object.values(byMessageId))).forEach(removeEntry);
     log.replaceChildren();byMessageId={};uiRevisions={};uiDeleted={};uiGeneration=null;streamEpoch=null;streamCursor=null;
     hideSuggest();setBusy(false);document.getElementById('terminal-iframe').src='about:blank';

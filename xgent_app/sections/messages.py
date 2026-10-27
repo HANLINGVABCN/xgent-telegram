@@ -1715,13 +1715,13 @@ async def _send_agent_iteration_limit_notice(
     await safe_send_message(context, chat_id, message)
 
 
-async def _record_user_stopped_reply(db, cid, chat_id, partial_text: str) -> str:
+async def _record_user_stopped_reply(db, cid, chat_id, partial_text: str, *, provider=None, model=None) -> str:
     """用户在接收 AI 回复期间手动停止：把已生成的部分文本 + 停止标记写入
     全局记录与模型可见历史，返回写入内容。与正常回复保存路径一致。"""
     marker = "⏹️ 当前回复已被用户手动停止"
     partial = (partial_text or "").strip()
     content = f"{partial}\n\n{marker}" if partial else marker
-    await GlobalRecorder.record_ai_reply(content, chat_id)
+    await GlobalRecorder.record_ai_reply(content, chat_id, provider=provider, model=model)
     await db.add_chat_message(cid, 'assistant', content)
     return content
 
@@ -1941,6 +1941,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 await _record_user_stopped_reply(
                     db, cid, update.effective_chat.id,
                     stop_partial[0] if stop_partial else "",
+                    provider=prov_name, model=model,
                 )
             return
         if trigger_status_msg is not None and trigger_status_iteration is not None:
@@ -1961,6 +1962,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     if not generated_reply.recorded:
         generated_reply.record_id = await GlobalRecorder.record_ai_reply(
             response, update.effective_chat.id,
+            provider=prov_name, model=model,
             metadata={**(await generated_image_metadata(generated_reply.artifacts, attachment_generation) or {}),
                       **live_reply_metadata(generated_reply)},
         )
@@ -2429,9 +2431,10 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             notice, artifacts = build_external_media_output(result, media_prompt)
                             metadata = await generated_image_metadata(artifacts, attachment_generation) or {}
                             metadata['attachment_generation'] = attachment_generation
+                            metadata['ai_generation'] = {'provider':result.get('provider_name',''), 'model':result.get('model_name',''), 'generated_at':time.time()}
                             if result.get('input_files'):
                                 metadata['media_inputs'] = result['input_files']
-                            await persist_media_result(
+                            result['record_id'] = await persist_media_result(
                                 recorder=GlobalRecorder,
                                 database=db,
                                 conversation_id=cid,
@@ -2488,6 +2491,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             safe_text=safe_text,
                             logger=logger,
                         )
+                        await publish_saved_reply(context, media_result.get('record_id'))
 
                         await add_tool_context(
                             _ctx_with_notice(await build_media_continuation_message(media_result, media_prompt), smart_notice)
@@ -2675,6 +2679,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         await _record_user_stopped_reply(
                             db, cid, update.effective_chat.id,
                             stop_partial[0] if stop_partial else "",
+                            provider=prov_name, model=model,
                         )
                     break
                 if pending_round_status_msg is not None and pending_round_iteration is not None:
@@ -2695,6 +2700,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             if not generated_reply.recorded:
                 generated_reply.record_id = await GlobalRecorder.record_ai_reply(
                     response, update.effective_chat.id,
+                    provider=prov_name, model=model,
                     metadata={**(await generated_image_metadata(generated_reply.artifacts, attachment_generation) or {}),
                       **live_reply_metadata(generated_reply)},
                 )

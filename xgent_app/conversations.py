@@ -19,7 +19,7 @@ from typing import Any
 
 DEFAULT_CONVERSATION_ID = 'global_memory'
 DEFAULT_CONVERSATION_NAME = '默认会话'
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class ConversationError(ValueError):
@@ -116,12 +116,28 @@ def restore_reply_route(snapshot):
                                   telegram_delivery=snapshot.get('telegram_delivery')))
 
 
+_reply_generation = contextvars.ContextVar('reply_generation', default=None)
+
+
+def set_reply_generation(provider, model):
+    scope = current_scope(required=False)
+    if scope is not None:
+        _reply_generation.set({'conversation_id':scope.conversation_id,'run_id':scope.run_id,
+            'provider':str(provider or ''),'model':str(model or ''),'generated_at':time.time()})
+
+
 def stamp_frame(frame: dict) -> dict:
     scope = current_scope(required=False)
     if scope is None or frame.get('type') in {'conversation_state', 'settings_state', 'knowledge_state', 'queue_state'}:
         return dict(frame)
-    return {'conversation_id': scope.conversation_id, 'generation': scope.generation,
-            'run_id': scope.run_id, 'conversation_name': scope.name, **frame}
+    result = {'conversation_id': scope.conversation_id, 'generation': scope.generation,
+              'run_id': scope.run_id, 'conversation_name': scope.name, **frame}
+    generated = _reply_generation.get()
+    if (scope.run_id and generated and generated['run_id'] == scope.run_id
+            and generated['conversation_id'] == scope.conversation_id
+            and frame.get('type') in {'message','edit','document','photo'}):
+        result.setdefault('ai_generation', {key:generated[key] for key in ('provider','model','generated_at')})
+    return result
 
 
 def require_conversation_id(explicit=None) -> str:

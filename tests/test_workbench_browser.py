@@ -65,7 +65,7 @@ def test_asset_etag_and_authenticated_management_routes(workspace_url):
     with pytest.raises(urllib.error.HTTPError) as caught:
         urllib.request.urlopen(urllib.request.Request(base+'/assets/workbench.js',headers={'If-None-Match':etag}))
     assert caught.value.code==304
-    for path in ['/api/workbench/providers','/api/workbench/tasks','/api/workbench/history','/api/term/sessions']:
+    for path in ['/api/workbench/providers','/api/workbench/tasks','/api/workbench/history','/api/workbench/global-search?q=test','/api/term/sessions']:
         with pytest.raises(urllib.error.HTTPError) as caught:urllib.request.urlopen(base+path)
         assert caught.value.code==401
     with pytest.raises(urllib.error.HTTPError) as caught:urllib.request.urlopen(base+'/assets/../workbench.py')
@@ -110,14 +110,12 @@ def test_history_is_paged_search_locates_unloaded_messages_and_draft_survives(br
         page.wait_for_timeout(80)
     assert page.locator('#log>.msg-row').count()<=200
     before=page.locator('#log').inner_text()
-    with page.expect_response('**/api/workbench/history?limit=50&after=*'):
-        page.locator('#wb-newer').click()
-    page.wait_for_timeout(100)
-    assert page.locator('#log').inner_text()!=before
+    page.locator('#log').evaluate('(e)=>e.scrollTop=e.scrollHeight')
+    page.wait_for_function('(before)=>document.querySelector("#log").innerText!==before',arg=before)
     page.locator('#workspace-settings').click();page.locator('#btn-search').click()
-    page.get_by_placeholder('搜索当前会话历史…').fill('历史记录 1234：')
-    page.locator('#wb-dialog .wb-command-result').first.wait_for()
-    page.locator('#wb-dialog .wb-command-result').first.click()
+    page.get_by_placeholder('搜索全部对话名称和消息内容…').fill('历史记录 1234：')
+    page.locator('#global-search-dialog .global-search-hit').first.wait_for()
+    page.locator('#global-search-dialog .global-search-hit').first.click()
     page.wait_for_function('document.querySelector("#log").textContent.includes("历史记录 1234：")')
     assert page.locator('#input').input_value()=='跨页保留的输入草稿'
     t=time.perf_counter();page.locator('#input').fill('快速输入');assert time.perf_counter()-t<1

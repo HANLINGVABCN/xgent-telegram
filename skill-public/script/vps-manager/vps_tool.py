@@ -50,10 +50,16 @@ if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
 # 自动推断项目根目录: 脚本位于 skill-public/script/vps-manager/
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
-WORKSPACE_DIR = PROJECT_ROOT / "workspace"
-CONFIG_DIR = Path.home() / ".config" / "vps-manager"
+sys.path.insert(0, str(PROJECT_ROOT))
+from xgent_app.data_paths import DataPaths
+_DATA_PATHS = DataPaths.discover(PROJECT_ROOT)
+if not _DATA_PATHS.legacy:
+    _DATA_PATHS.ensure()
+WORKSPACE_DIR = _DATA_PATHS.workspace
+CONFIG_DIR = _DATA_PATHS.assets / 'vps-manager'
 CONFIG_FILE = CONFIG_DIR / "servers.json"
 OLD_WORKSPACE_CONFIG = PROJECT_ROOT / "workspace" / "vps_servers.json"
+LEGACY_USER_CONFIG = Path.home() / '.config' / 'vps-manager' / 'servers.json'
 
 # SSH 通用选项（不含 BatchMode，由 _build_ssh_cmd 按认证方式动态决定）
 SSH_COMMON_OPTS = [
@@ -78,10 +84,13 @@ class VPSConfig:
     def _ensure_config(self):
         """确保配置文件和目录存在"""
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.config_path.exists() and OLD_WORKSPACE_CONFIG.exists():
+        legacy = LEGACY_USER_CONFIG if LEGACY_USER_CONFIG.is_file() else OLD_WORKSPACE_CONFIG
+        if not self.config_path.exists() and legacy.is_file():
             try:
                 import shutil
-                shutil.copy2(OLD_WORKSPACE_CONFIG, self.config_path)
+                shutil.copy2(legacy, self.config_path)
+                from xgent_app.data_bundles import protect
+                protect(self.config_path)
             except Exception:
                 pass
         if not self.config_path.exists():
@@ -105,8 +114,8 @@ class VPSConfig:
 
     def _write(self, data: dict):
         """写入配置文件"""
-        with open(self.config_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        from xgent_app.data_bundles import write_json
+        write_json(self.config_path, data)
 
     def list_servers(self) -> list:
         """获取所有服务器列表"""

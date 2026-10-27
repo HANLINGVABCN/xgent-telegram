@@ -9,6 +9,7 @@
 <link rel="stylesheet" href="/assets/chat.css">
 <link rel="stylesheet" href="/assets/workbench.css">
 <link rel="stylesheet" href="/assets/conversations.css">
+<link rel="stylesheet" href="/assets/global-search.css">
 <link rel="stylesheet" href="/assets/reading.css">
 <link rel="stylesheet" href="/assets/knowledge.css">
 </head>
@@ -50,8 +51,13 @@
   <button id="conversation-new" class="conv-new" type="button" disabled><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M13.5 5.5 18.5.5l5 5-5 5M16 3 5 14l-1 6 6-1L21 8M12 4H5a2 2 0 0 0-2 2v15a2 2 0 0 0 2 2h15a2 2 0 0 0 2-2v-7" transform="translate(1 0) scale(.86)"/></svg><span>新对话</span></button>
   <div class="conv-search-wrap">
     <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-search"/></svg>
-    <input id="conversation-search" type="search" aria-label="搜索对话" placeholder="搜索对话" autocomplete="off" spellcheck="false">
+    <input id="conversation-search" type="search" aria-label="搜索对话名称和内容" placeholder="搜索对话名称和内容" maxlength="200" autocomplete="off" spellcheck="false">
     <button id="conversation-search-clear" class="conv-icon-button" type="button" aria-label="清除对话搜索" hidden><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-close"/></svg></button>
+  </div>
+  <div id="conversation-groups" class="conv-groups" aria-label="对话分组">
+    <select id="conversation-group-select" aria-label="选择对话分组"></select>
+    <button id="conversation-group-new" class="conv-icon-button" type="button" aria-label="新建分组" title="新建分组">+</button>
+    <button id="conversation-group-edit" class="conv-icon-button" type="button" aria-label="管理当前分组" title="管理当前分组">⋯</button>
   </div>
   <div class="conv-section-head"><h2 id="conversation-list-title">最近对话</h2><button id="conversation-view-back" type="button" hidden>返回最近</button></div>
   <div id="conversation-sync-error" class="conv-sync-error" role="status" hidden></div>
@@ -65,7 +71,7 @@
       <nav id="wb-nav-links" aria-label="工作台导航"></nav>
       <div class="workspace-menu-label">对话与账户</div>
   <button id="conversation-archive-view" class="conv-archive-link" type="button"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h16v12H4zM3 4h18v4H3zM10 12h4"/></svg><span>已归档</span><span id="conversation-archive-count" class="conv-count" hidden></span></button>
-      <button id="btn-search" type="button" role="menuitem" title="查找消息 (Ctrl+F)" aria-label="查找消息"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-search"/></svg><span>查找当前对话</span></button>
+      <button id="btn-search" type="button" role="menuitem" title="全局搜索 (Ctrl+F)" aria-label="全局搜索"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-search"/></svg><span>全局搜索</span></button>
       <button id="btn-settings" type="button" role="menuitem" aria-label="偏好与安全"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-settings"/></svg><span>偏好与安全</span></button>
       <button id="wb-logout" type="button" role="menuitem" aria-label="退出登录"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 4H4v16h6M14 8l4 4-4 4M8 12h10"/></svg><span>退出登录</span></button>
     </div>
@@ -101,7 +107,7 @@
 
 <section id="wb-chat" aria-label="对话">
 <div id="conversation-running" class="conv-running" role="status" hidden></div>
-<div id="wb-history-controls"><button id="wb-earlier">↑ 加载更早记录</button><button id="wb-newer" disabled>加载较新记录 ↓</button><span id="wb-history-state" role="status"></span><button id="wb-latest">回到最新 ↓</button></div>
+<div id="history-loading-state" role="status" hidden><span id="wb-history-state"></span><button id="history-retry" type="button" hidden>重试加载</button></div>
 <main id="log" aria-label="消息记录"></main>
 
 <div id="empty-state" class="hidden">

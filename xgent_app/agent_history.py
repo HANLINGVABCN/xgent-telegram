@@ -88,10 +88,10 @@ async def persist_media_result(
     chat_id: Any,
     notice: str,
     metadata: Optional[dict[str, Any]] = None,
-) -> None:
+) -> Optional[int]:
     """Preserve the media-specific recorder and conversation-history format."""
     if metadata is None:
-        await recorder.record_media_reply(notice, chat_id)
+        row_id = await recorder.record_media_reply(notice, chat_id)
     else:
         row_id = await recorder.record_media_reply(notice, chat_id, metadata=metadata)
         if metadata.get("attachments") and row_id is None:
@@ -107,3 +107,4 @@ async def persist_media_result(
         if kwargs:
             raise AttachmentContextError(f"Generated-image history sync failed: {exc}") from exc
         raise
+    return row_id

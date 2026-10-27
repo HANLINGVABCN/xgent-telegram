@@ -120,15 +120,16 @@ def test_search_and_empty_results_do_not_rebuild_input(conversation_page, browse
     page = conversation_page
     target = create(browser_context, workspace_url['url'], 'Python 日志分析与配置排查')
     page.evaluate('window.XGentConversations.refresh()')
-    search = page.get_by_role('searchbox', name='搜索对话', exact=True)
+    search = page.get_by_role('searchbox', name='搜索对话名称和内容', exact=True)
     search.fill('python 日志')
-    assert page.locator('.conv-row').count() == 1
-    assert row(page, target).is_visible()
+    page.locator('#conversation-list .global-search-hit').first.wait_for()
+    assert page.locator('#conversation-list .global-search-hit').count() == 1
+    assert 'Python 日志分析与配置排查' in page.locator('#conversation-list').inner_text()
     page.evaluate('window.XGentConversations.refresh()')
     assert search.input_value() == 'python 日志'
     search.fill('不存在的唯一关键词98765')
-    assert page.locator('.conv-row').count() == 0
-    assert '没有找到对话' in page.locator('#conversation-list').inner_text()
+    page.get_by_text('没有匹配的对话或消息，试试其他关键词。', exact=True).wait_for()
+    assert page.locator('#conversation-list .global-search-hit').count() == 0
     page.get_by_role('button', name='清除对话搜索', exact=True).click()
     assert page.locator('.conv-row').count() > 1
 
@@ -202,12 +203,12 @@ def test_cross_tab_switch_updates_sidebar_without_stealing_search(browser_contex
     ready(first, workspace_url['url']); ready(second, workspace_url['url'])
     first.locator('.conv-row').first.wait_for(); second.locator('.conv-row').first.wait_for()
     original = current(first)
-    first.get_by_role('searchbox', name='搜索对话').fill('保留搜索输入')
+    first.get_by_role('searchbox', name='搜索对话名称和内容').fill('保留搜索输入')
     second.get_by_role('button', name='新对话', exact=True).click()
     second.wait_for_function('(id)=>window.XGentConversations.current!==id', arg=original)
     selected = current(second)
     first.wait_for_function('(id)=>window.XGentConversations.current===id', arg=selected)
-    assert first.get_by_role('searchbox', name='搜索对话').input_value() == '保留搜索输入'
+    assert first.get_by_role('searchbox', name='搜索对话名称和内容').input_value() == '保留搜索输入'
     first.close(); second.close()
 
 
@@ -313,7 +314,7 @@ def test_long_title_and_dialog_fit_both_themes(browser_context, workspace_url, w
 
 def test_list_and_row_menu_support_keyboard_navigation(conversation_page):
     page = conversation_page
-    search = page.get_by_role('searchbox', name='搜索对话', exact=True)
+    search = page.get_by_role('searchbox', name='搜索对话名称和内容', exact=True)
     search.focus(); page.keyboard.press('ArrowDown')
     assert page.locator('.conv-open').first.evaluate('(element)=>document.activeElement===element')
     page.keyboard.press('End')

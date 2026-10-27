@@ -72,7 +72,28 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 
-load_dotenv()
+from xgent_app.data_paths import DataPaths, configure_paths, resolve_stored_path
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_explicit_environment = dict(os.environ)
+_legacy_env = os.path.join(PROJECT_ROOT, '.env')
+DATA_PATHS = DataPaths.discover(PROJECT_ROOT)
+DATA_PATHS.ensure()
+configure_paths(DATA_PATHS)
+# The external data .env is authoritative for persisted settings, while an
+# explicit process variable always wins over both files.
+if os.path.isfile(str(DATA_PATHS.env)):
+    load_dotenv(str(DATA_PATHS.env), override=True)
+if os.path.isfile(_legacy_env) and os.path.abspath(_legacy_env) != str(DATA_PATHS.env):
+    load_dotenv(_legacy_env, override=False)
+for _key, _value in _explicit_environment.items():
+    os.environ[_key] = _value
+if not DATA_PATHS.legacy:
+    # Restored .env may carry the original host's location. Child processes
+    # must inherit the active resolver, not silently reopen the old instance.
+    os.environ['XGENT_DATA_DIR'] = str(DATA_PATHS.root)
+    from xgent_app.data_bundles import protect
+    if DATA_PATHS.env.is_file(): protect(DATA_PATHS.env)
+    if DATA_PATHS.database.is_file(): protect(DATA_PATHS.database)
 
 from xgent_app.conversations import (
     ConversationScope, ConversationError, ConversationBusy, ConversationChanged,
@@ -123,7 +144,7 @@ class BotConfig:
         AUTHORIZED_USER_ID = 0
     # 本地 Telegram Bot API server 支持（不配置则用官方 api.telegram.org）
     API_BASE_URL = (os.getenv("TELEGRAM_API_URL") or "").strip().rstrip("/")
-    DB_FILE = "xgent_memory.db"
+    DB_FILE = str(DATA_PATHS.database)
     NORMAL_UPDATE_ZIP_URL = "https://api.github.com/repos/HANLINGVABCN/xgent-telegram/zipball/main"
     TEST_UPDATE_ZIP_URL = "https://api.github.com/repos/HANLINGVABCN/xgent-telegram-test/zipball/main"
     DEFAULT_UPDATE_ZIP_URL = NORMAL_UPDATE_ZIP_URL
@@ -179,7 +200,7 @@ def log_runtime_code_version() -> None:
 # 本地 Bot API server 容器内的数据根路径（卷映射的另一端）
 _LOCAL_API_CONTAINER_DATA_DIR = "/var/lib/telegram-bot-api"
 # 宿主机上对应的本地 API 数据目录
-_LOCAL_API_HOST_DATA_DIR = os.path.join(PROJECT_ROOT, ".local-api-data")
+_LOCAL_API_HOST_DATA_DIR = str(DATA_PATHS.root / '.local-api-data')
 
 
 async def download_telegram_file(telegram_obj, destination=None):
@@ -246,6 +267,12 @@ UPDATE_SKIP_NAMES = {
     "xgent_server.log",
     "xgent.pid",
     "xgent_storage",
+    "data-location.json",
+    ".install-state",
+    ".local-api-data",
+    "workspace",
+    "memory",
+    "skill-private",
     "venv",
     "__pycache__",
 }
@@ -255,15 +282,15 @@ UPDATE_SKIP_SUFFIXES = (
     ".pyc",
 )
 UPDATE_LOCAL_CUSTOM_DIRS = ("prompts", "skill-public", "skill")
-UPDATE_BACKUP_DIR = os.path.join(PROJECT_ROOT, "xgent_storage", "update_backups")
-COMMAND_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "xgent_storage", "command_outputs")
+UPDATE_BACKUP_DIR = str(DATA_PATHS.storage / 'update_backups')
+COMMAND_OUTPUT_DIR = str(DATA_PATHS.storage / 'command_outputs')
 _TRACE_LOG_OVERRIDE = (
     os.environ.get("XGENT_TRACE_LOG_FILE")
     or os.environ.get("TELEGRAM_AI_BOT_TRACE_LOG_FILE")
     or ""
 ).strip()
 FULL_TRACE_LOG_FILE = os.path.abspath(
-    os.path.expanduser(_TRACE_LOG_OVERRIDE or os.path.join(PROJECT_ROOT, "xgent_full_trace.log"))
+    os.path.expanduser(_TRACE_LOG_OVERRIDE or str(DATA_PATHS.logs / 'xgent_full_trace.log'))
 )
 FULL_TRACE_LOCK = threading.Lock()
 DEFAULT_AGENT_COMMAND_TIMEOUT = 30
@@ -875,7 +902,7 @@ def setup_logging():
     stream_handler.setFormatter(log_format)
     _logger.addHandler(stream_handler)
     
-    log_file = os.path.join(os.getcwd(), "xgent_server.log")
+    log_file = str(DATA_PATHS.logs / 'xgent_server.log')
     file_handler = RotatingFileHandler(
         log_file, encoding='utf-8',
         maxBytes=10 * 1024 * 1024,  # 10MB per file

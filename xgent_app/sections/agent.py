@@ -15,7 +15,9 @@ class AgentExecutor:
     
     TIMEOUT = DEFAULT_AGENT_COMMAND_TIMEOUT  # 秒
     MAX_FILE_SIZE = 50 * 1024 * 1024
-    WORK_DIR = os.path.dirname(os.path.abspath(__file__))
+    # User-created files and shell working state live with the external data,
+    # never inside the code checkout.
+    WORK_DIR = str(DATA_PATHS.root)
     # 当前对话上下文：run-x 子进程需要它来登记 trigger 任务（xgent_trigger.py 读
     # XGENT_CHAT_ID/XGENT_CONVERSATION_ID）。由 _process_conversation_inner 在每轮
     # 处理开始时暂存。单用户 + _conversation_processing_lock 保证同时只有一个对话
@@ -875,7 +877,7 @@ class AgentExecutor:
             raise ValueError("文件路径为空")
         if not os.path.isabs(cleaned):
             raise ValueError(f"路径必须是绝对路径（以 / 开头），收到: {cleaned}。请使用项目根目录等绝对路径。")
-        return os.path.abspath(cleaned)
+        return os.path.abspath(resolve_stored_path(cleaned))
 
     @classmethod
     def resolve_write_path(cls, requested_path: str) -> str:
@@ -892,7 +894,7 @@ class AgentExecutor:
                 f"file 协议路径必须是绝对路径，收到: {cleaned}；"
                 f"未指定保存位置时，请使用 {default_workspace}/文件名"
             )
-        return os.path.abspath(cleaned)
+        return os.path.abspath(resolve_stored_path(cleaned))
 
     @classmethod
     async def write_file(cls, requested_path: str, content: str) -> Dict[str, Any]:

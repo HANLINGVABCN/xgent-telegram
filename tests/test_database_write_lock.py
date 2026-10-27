@@ -66,15 +66,15 @@ BotMemoryDB = _load_db_class()
 
 class WriteSerializationTests(unittest.TestCase):
     def setUp(self):
-        fd, self.db_path = tempfile.mkstemp(suffix='.db')
-        os.close(fd)
-        self.addCleanup(self._cleanup)
-
-    def _cleanup(self):
-        try:
-            os.unlink(self.db_path)
-        except OSError:
-            pass
+        # A database lives in a dedicated instance directory. A bare mkstemp
+        # under /tmp incorrectly makes /tmp the instance root, so the stable
+        # sibling maintenance lock would have to be created at /. Root/admin
+        # test runs hid that fixture error; an ordinary Linux CI user cannot.
+        self.instance = tempfile.TemporaryDirectory(prefix='xgent-write-lock-')
+        self.addCleanup(self.instance.cleanup)
+        data = Path(self.instance.name) / 'data'
+        data.mkdir(mode=0o700)
+        self.db_path = str(data / 'xgent_memory.db')
 
     def _run(self, coro):
         from xgent_app.conversations import ConversationScope, bind_conversation
@@ -176,6 +176,7 @@ class WriteSerializationTests(unittest.TestCase):
                 failed = True
 
             cached = db._config_cache.get('bad', '<absent>')
+            await db.close()
             return failed, cached
 
         failed, cached = self._run(scenario())

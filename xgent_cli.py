@@ -46,6 +46,11 @@ import uuid
 from pathlib import Path
 from typing import Any, List, Optional, Sequence
 
+# Data operations must run BEFORE sections open SQLite/logs or migrate schema.
+if __name__ == '__main__' and len(sys.argv) > 1 and sys.argv[1] == 'data':
+    from xgent_app.data_cli import main as data_main
+    raise SystemExit(data_main(sys.argv[2:]))
+
 from xgent_app.bootstrap import (
     load_sections as _load_sections,
     migrate_legacy_runtime_paths as _migrate_legacy_runtime_paths,
@@ -1964,6 +1969,8 @@ def _run_tui_main() -> None:
     # pt full_screen 退出时已还原主屏与终端状态，普通 print 收尾即可。
     print()
     print("再见。")
+
+
 
 
 def _configure_frontend_args(args=None):

@@ -98,7 +98,8 @@ def _generated_notice_lines(content: str) -> list[str]:
 def _resolve_storage_path(path: str, storage_root: str | Path) -> Path:
     try:
         root = Path(storage_root).resolve()
-        target = Path(path)
+        from .data_paths import resolve_stored_path
+        target = resolve_stored_path(path)
         if not target.is_absolute():
             target = root / target
         target = target.resolve()

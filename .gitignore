@@ -114,6 +114,11 @@ id_ed25519*
 *.7z
 *.rar
 .install-state/
+data-location.json
+.pytest-run/
+.pytest-regression/
+.pytest-focused/
+.pytest-single/
 .local-api-data/
 
 # Jupyter Notebook

@@ -17,6 +17,8 @@ from zoneinfo import ZoneInfo
 from .web_history import build_history_message
 from .ui_history import ui_record, hide_audit_record
 from .workbench_sources import owners as resource_owners, source_info, reference_anchor, output_sources
+from .data_bundles import BundleError
+from .data_operations import DataOperations
 
 class WorkbenchError(ValueError):
     def __init__(self, message, status=400):
@@ -40,6 +42,19 @@ def _unpack(value):
         return data
     except Exception: raise WorkbenchError('历史游标无效，请重新加载') from None
 
+
+def task_timing(item, *, task=False):
+    start = item.get('last_started_at' if task else 'started_at')
+    finish = item.get('last_finished_at' if task else 'finished_at')
+    if item.get('status') == 'running':
+        finish = None  # A repeated task may still carry the previous finish.
+    if not start:
+        start = finish = None
+    item.update(started_at=start, finished_at=finish,
+                elapsed_seconds=max(0, time.time() - start) if start and not finish else None,
+                duration_seconds=max(0, finish - start) if start and finish else None)
+    return item
+
 from xgent_app.conversations import conversation_operation, current_scope, get_conversations, stamp_frame, ConversationError
 
 
@@ -51,6 +66,7 @@ class Workbench:
         self._mutation_lock = asyncio.Lock()
         self._background = set()
         self._settings_lock = asyncio.Lock()
+        self._data_operations = None
 
     async def db(self):
         db = await self.ns['BotMemoryDB'].get_instance()
@@ -76,7 +92,7 @@ class Workbench:
 
     async def handle(self, method, resource, data):
         version_operation = resource in {'artifacts/versions', 'artifacts/version_preview', 'artifacts/version_download', 'artifacts/restore_version'}
-        navigation = resource == 'conversations' or resource.startswith('conversations/') or resource in {'tasks','tasks/cancel','skills','memories'} or resource.startswith(('skills/','memories/'))
+        navigation = resource in {'conversations', 'global-search'} or resource.startswith(('conversations/', 'conversation-groups','data/')) or resource in {'tasks','tasks/cancel','skills','memories'} or resource.startswith(('skills/','memories/'))
         cid = None if navigation else data.get('conversation_id')
         if version_operation and not cid:
             raise WorkbenchError('缺少附件所属会话', 409)
@@ -85,13 +101,48 @@ class Workbench:
         from xgent_app.interaction import interaction
         try:
             with interaction('web', 'management'):
-                async with conversation_operation(cid, expected=method != 'GET' and not navigation and not version_operation, allow_archived=method=='GET' and (version_operation or resource in {'history','search','artifacts/preview'}), fresh=True, selector='shared'):
+                async with conversation_operation(cid, expected=method != 'GET' and not navigation and not version_operation, allow_archived=method=='GET' and (version_operation or resource in {'history','search','artifacts/preview','artifacts/cover'}), fresh=True, selector='shared'):
                     return await self._handle_scoped(method, resource, data)
         except ConversationError as exc:
             raise WorkbenchError(str(exc), exc.status) from exc
 
     async def _handle_scoped(self, method, resource, data):
         await self.db()
+        if resource.startswith('data/'):
+            if self._data_operations is None:
+                self._data_operations = DataOperations(self.ns)
+            operations = self._data_operations
+            try:
+                if resource == 'data/estimate' and method == 'GET':
+                    include = data.get('include_command_outputs') in (True, 'true', '1')
+                    return await asyncio.to_thread(operations.bundles.estimate, include)
+                if resource == 'data/export' and method == 'POST':
+                    return await operations.export(data)
+                if resource == 'data/import' and method == 'POST' and data.get('_bundle_path'):
+                    return await operations.upload_import(data)
+                if resource == 'data/activate' and method == 'POST':
+                    return operations.activate(data)
+                if resource == 'data/status' and method == 'GET':
+                    return operations.status(data.get('id'))
+                if resource == 'data/download' and method == 'GET':
+                    return operations.download(data.get('id'))
+                raise WorkbenchError('数据维护接口不存在',404)
+            except BundleError as exc:
+                raise WorkbenchError(str(exc),409) from exc
+        if resource == 'conversation-groups' and method == 'GET':
+            return await self.conversations({})
+        organization = {'conversation-groups/create': 'create_group',
+                        'conversation-groups/rename': 'rename_group',
+                        'conversation-groups/delete': 'delete_group',
+                        'conversations/move': 'move', 'conversations/pin': 'pin',
+                        'conversations/unpin': 'unpin'}
+        if resource in organization:
+            if method != 'POST':
+                raise WorkbenchError('请使用 POST 修改分组', 405)
+            db = await self.db()
+            gid = await db.organize_conversations(organization[resource], data)
+            await get_conversations().poll_once()
+            return {'ok': True, 'group_id': gid, **await self.conversations({})}
         if resource == 'conversations/set_bot':
             if method != 'POST':
                 raise WorkbenchError('请使用设置操作', 405)
@@ -124,10 +175,16 @@ class Workbench:
                 # Expected version conflicts are UI feedback, not new chat/error rows.
                 raise WorkbenchError(str(exc), getattr(exc, 'status', 409)) from exc
         if method == 'GET':
+            if resource == 'global-search':
+                from .conversation_search import SearchError, global_search
+                try:
+                    return await global_search(await (await self.db())._get_conn(), data)
+                except SearchError as exc:
+                    raise WorkbenchError(str(exc)) from exc
             operations = {'conversations': self.conversations, 'conversations/delete_info': self.conversation_delete_info, 'conversations/search': self.search_conversations, 'bootstrap': self.bootstrap, 'history': self.history, 'search': self.search,
                           'tasks': self.tasks, 'artifacts': self.artifacts, 'providers': self.providers,
                           'skills': self.skills, 'memories': self.memories, 'usage': self.usage, 'usage/records': self.usage_records,
-                          'artifacts/preview': self.artifact_preview, 'settings/blacklist': self.blacklist, 'settings': self.read_settings}
+                          'artifacts/preview': self.artifact_preview, 'artifacts/cover': self.artifact_cover, 'settings/blacklist': self.blacklist, 'settings': self.read_settings}
         else:
             operations = {**{f'{kind}/{action}': self.document_action for kind in ('skills','memories') for action in ('create','update','rename','delete')}, **{f'conversations/{action}': self.conversation_action for action in ('create','switch','rename','archive','restore','reset_context','delete')},
                           'tasks/create': self.create_task, 'tasks/cancel': self.cancel_tasks,
@@ -183,6 +240,21 @@ class Workbench:
                                 'model': self.ns['UserDataManager'].get('default_media_model', '')}}
 
     async def history(self, data):
+        if data.get('anchor') and not data.get('_anchor_side'):
+            # A location is a window, not a cut-off point. Return both sides
+            # with independent cursors while keeping the old fields compatible.
+            half = max(1, _integer(data.get('limit')) // 2)
+            left = await self.history({**data, 'limit': half, '_anchor_side': True})
+            anchor_cursor = (left.get('messages') or [{}])[-1].get('history_cursor')
+            right = await self.history({**data, 'anchor': '', 'before': '',
+                'after': anchor_cursor, 'limit': half, '_anchor_side': True}) if anchor_cursor else {**left, 'messages': []}
+            if left.get('ui_generation') != right.get('ui_generation'):
+                return {**left, 'reset': True, 'messages': []}
+            return {**left, 'anchor': data['anchor'],
+                    'messages': left['messages'] + right['messages'],
+                    'last_cursor': right['last_cursor'] or left['last_cursor'],
+                    'before': {'cursor': left['first_cursor'], 'has_more': bool(left['next_cursor'])},
+                    'after': {'cursor': right['last_cursor'] or left['last_cursor'], 'has_more': bool(right['next_cursor'])}}
         db = await self.db()
         conn = await db._get_conn()
         generation = await db.get_attachment_generation()
@@ -289,6 +361,7 @@ class Workbench:
             task['conversation_name'] = owner['name']
             task['conversation_archived'] = bool(owner['archived'])
             task['source'] = source_info(owner, await reference_anchor(conn, task['conversation_id'], task_id))
+            task_timing(task, task=True)
             before = data.get('before')
             boundary = json.loads(before) if before else [time.time()+1, '\uffff']
             if not isinstance(boundary,list) or len(boundary)!=2: raise WorkbenchError('运行记录游标无效')
@@ -296,6 +369,7 @@ class Workbench:
             runs = [dict(row) for row in await cur.fetchall()]; await cur.close()
             for run in runs:
                 run['source'] = source_info(owner, await reference_anchor(conn, task['conversation_id'], run['run_id']))
+                task_timing(run)
             return {'task': task, 'runs': runs[:50], 'next_cursor': json.dumps([runs[49]['created_at'],runs[49]['run_id']]) if len(runs)>50 else None}
         status = str(data.get('status') or '')
         kind = str(data.get('kind') or '')
@@ -334,6 +408,7 @@ class Workbench:
         sources = await db.get_all_sessions()
         owners = {item['id']: item for item in sources}
         for task in rows:
+            task_timing(task, task=True)
             owner = owners.get(task['conversation_id'], {})
             task['conversation_name'] = owner.get('name', task['conversation_id'])
             task['conversation_archived'] = bool(owner.get('archived'))
@@ -729,7 +804,23 @@ class Workbench:
         self.background(apply())
         return {'ok': True, 'settings': values, 'reconnect': current['web_port'] != values['web_port'] or not values['web_enabled']}
 
-    async def artifact_preview(self, data):
+    async def artifact_cover(self, data):
+        from .artifact_covers import cover
+        if data.get('kind') == 'outputs':
+            root = Path(self.ns['COMMAND_OUTPUT_DIR']).resolve()
+            relative = Path(str(data.get('id') or ''))
+            if relative.is_absolute() or '..' in relative.parts or not relative.parts:
+                raise WorkbenchError('无效输出标识', 404)
+            original = root / relative
+            path = original.resolve()
+            if (path == root or not path.is_relative_to(root) or path.suffix != '.txt'
+                    or any(part.is_symlink() for part in (original, *original.parents) if part != root and part.is_relative_to(root))):
+                raise WorkbenchError('无效输出标识', 404)
+            return await asyncio.to_thread(cover, path, 'output', 'text/plain')
+        item = await self._artifact_item(data)
+        return await asyncio.to_thread(cover, item['path'], item['kind'], item.get('mime_type', ''))
+
+    async def _artifact_item(self, data):
         match = re.fullmatch(r'(\d+):(\d+)', str(data.get('id') or ''))
         if not match: raise WorkbenchError('无效附件标识')
         db = await self.db()
@@ -740,7 +831,10 @@ class Workbench:
         items = message.get('media', [])
         index = int(match[2])
         if index >= len(items) or items[index].get('error'): raise WorkbenchError('附件不存在或不可读取',404)
-        item = items[index]
+        return items[index]
+
+    async def artifact_preview(self, data):
+        item = await self._artifact_item(data)
         path = Path(item['path'])
         mime = item.get('mime_type','')
         text_types = {'.txt','.md','.json','.csv','.tsv','.log','.py','.js','.ts','.css','.html','.xml','.yaml','.yml','.toml','.ini','.sh','.sql','.svg'}
@@ -912,6 +1006,7 @@ class Workbench:
     async def conversations(self, data):
         db = await self.db()
         return {**await get_conversations().state(), 'items': await db.get_all_sessions(),
+                'groups': await db.get_conversation_groups(),
                 'telegram_configured': bool(self.ns['BotConfig'].TOKEN)}
 
     async def conversation_action(self, data):

@@ -7,7 +7,7 @@ import time as _time
 import traceback as _traceback
 
 # sections 共享入口的 __file__；PROJECT_ROOT 已由 core.py 按入口位置计算。
-_CRASH_LOG = _os.path.join(PROJECT_ROOT, 'xgent_crash.log')
+_CRASH_LOG = str(DATA_PATHS.logs / 'xgent_crash.log') if 'DATA_PATHS' in globals() else _os.path.join(PROJECT_ROOT, 'xgent_crash.log')
 
 
 def _write_crash(reason: str, exc_type=None, exc_value=None, exc_tb=None) -> None:

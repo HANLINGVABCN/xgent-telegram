@@ -36,6 +36,9 @@ class CliProbeMixin:
         })
         with tempfile.TemporaryDirectory() as cwd:
             env["XGENT_TRACE_LOG_FILE"] = str(Path(cwd) / "xgent_full_trace.log")
+            # Runtime paths no longer depend on cwd. Give each real CLI import
+            # an explicit external directory instead of sharing the checkout DB.
+            env['XGENT_DATA_DIR'] = str(Path(cwd) / 'data')
             result = subprocess.run(
                 [sys.executable, "-c", PROBE_PREAMBLE + code],
                 cwd=cwd,

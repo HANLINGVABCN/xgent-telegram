@@ -176,7 +176,73 @@ class ConversationStore(QueueStore):
             if version < 4:
                 await migrate_queue(conn)
                 await _set_config(conn, 'conversation_schema_version', 4)
+            if version < 5:
+                await conn.execute('CREATE TABLE IF NOT EXISTS conversation_groups ('
+                    'id TEXT PRIMARY KEY,name TEXT NOT NULL,sort_order INTEGER NOT NULL DEFAULT 0,'
+                    'created_at REAL NOT NULL,updated_at REAL NOT NULL)')
+                now = time.time()
+                await conn.execute('INSERT OR IGNORE INTO conversation_groups VALUES(?,?,?,?,?)',
+                                   ('ungrouped', '未分组', 0, now, now))
+                cursor = await conn.execute('PRAGMA table_info(chat_sessions)')
+                columns = {row['name'] for row in await cursor.fetchall()}
+                for column, definition in (('group_id', "TEXT NOT NULL DEFAULT 'ungrouped'"), ('pinned', 'INTEGER NOT NULL DEFAULT 0')):
+                    if column not in columns:
+                        await conn.execute(f'ALTER TABLE chat_sessions ADD COLUMN {column} {definition}')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_conversation_group ON chat_sessions(group_id,archived,pinned)')
+                await _set_config(conn, 'conversation_schema_version', 5)
         self._config_cache.clear()
+
+    async def get_conversation_groups(self):
+        conn = await self._get_conn()
+        cursor = await conn.execute('SELECT * FROM conversation_groups ORDER BY sort_order,created_at,id')
+        rows = [dict(row) for row in await cursor.fetchall()]
+        await cursor.close()
+        return rows
+
+    async def organize_conversations(self, action, data):
+        """Group and pin changes are metadata only; never rebind a live run."""
+        name = str(data.get('name') or '').strip()
+        if action in {'create_group', 'rename_group'} and (not name or len(name) > 80):
+            raise ConversationError('分组名称需要 1–80 个字符。')
+        async with self._transaction() as conn:
+            revision = int(await _config(conn, 'conversation_revision', 0))
+            if type(data.get('revision')) is not int or data['revision'] != revision:
+                raise ConversationError('对话列表已变化，请刷新后重试。')
+            gid = str(data.get('group_id') or 'ungrouped')
+            cursor = await conn.execute('SELECT id FROM conversation_groups WHERE id=?', (gid,))
+            if not await cursor.fetchone():
+                raise ConversationError('分组不存在，请刷新列表。')
+            if action == 'create_group':
+                gid = uuid.uuid4().hex
+                now = time.time()
+                await conn.execute('INSERT INTO conversation_groups VALUES(?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM conversation_groups),?,?)',
+                                   (gid, name, now, now))
+            elif action in {'rename_group', 'delete_group'}:
+                if gid == 'ungrouped':
+                    raise ConversationError('“未分组”是保留分组，不能重命名或删除。')
+                if action == 'rename_group':
+                    await conn.execute('UPDATE conversation_groups SET name=?,updated_at=? WHERE id=?', (name, time.time(), gid))
+                else:
+                    await conn.execute("UPDATE chat_sessions SET group_id='ungrouped',pinned=0 WHERE group_id=?", (gid,))
+                    await conn.execute('DELETE FROM conversation_groups WHERE id=?', (gid,))
+            else:
+                cid = str(data.get('id') or '')
+                cursor = await conn.execute('SELECT * FROM chat_sessions WHERE id=? AND deleting=0', (cid,))
+                item = await cursor.fetchone()
+                if item is None:
+                    raise ConversationError('对话不存在。')
+                if action == 'move':
+                    if item['group_id'] != gid:
+                        await conn.execute('UPDATE chat_sessions SET group_id=?,pinned=0 WHERE id=?', (gid, cid))
+                elif action in {'pin', 'unpin'}:
+                    # A stale UI cannot pin a conversation after it moved groups.
+                    if item['group_id'] != gid:
+                        raise ConversationError('对话所属分组已变化，请刷新后重试。')
+                    await conn.execute('UPDATE chat_sessions SET pinned=? WHERE id=?', (int(action == 'pin'), cid))
+                else:
+                    raise ConversationError('未知分组操作。')
+            await self._bump_conversation_revision(conn)
+        return gid
 
     async def _context_start(self, conn):
         cursor = await conn.execute('SELECT context_start_record_id FROM chat_sessions WHERE id=?', (self._conversation_id(),))

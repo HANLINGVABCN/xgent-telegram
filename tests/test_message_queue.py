@@ -229,14 +229,15 @@ class MessageQueueTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_v3_upgrade_backs_up_preserves_history_and_is_idempotent(self):
         from pathlib import Path
+        from xgent_app.conversations import SCHEMA_VERSION
         with bind_conversation(self.scope):
             await self.write('historical text')
         await self.db.set_config('conversation_schema_version', 3)
         await self.db.close()
         await self.db._init_db()
-        self.assertTrue(Path(self.path + '.pre-conversations-v4.sqlite3').exists())
+        self.assertTrue(Path(self.path + f'.pre-conversations-v{SCHEMA_VERSION}.sqlite3').exists())
         await self.db.migrate_conversations()
-        self.assertEqual(4, await self.db.get_config_fresh('conversation_schema_version'))
+        self.assertEqual(SCHEMA_VERSION, await self.db.get_config_fresh('conversation_schema_version'))
         with bind_conversation(self.scope):
             self.assertEqual('historical text', (await self.db.get_conversation_messages())[0]['content'])
 

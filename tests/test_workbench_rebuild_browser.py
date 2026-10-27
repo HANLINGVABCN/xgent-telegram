@@ -94,7 +94,7 @@ def test_task_source_tokens_rounds_and_dark_code_unchanged(browser_context,works
     target=page.locator('.wb-task-table tr').filter(has=page.get_by_role('button',name='每日服务健康检查',exact=True))
     target.locator('.wb-source-link').click()
     page.locator('.msg-row[data-record-id="'+str(workspace_url['demo']['task_message'])+'"]').wait_for()
-    page.locator('#wb-latest').click()
+    page.evaluate('window.XGentChat.reload()')
     token=page.locator('.msg-row[data-record-id="'+str(workspace_url['demo']['token_message'])+'"]');token.wait_for()
     before=token.inner_text()
     assert '2400' in before and '800' in before and 'cached' in before

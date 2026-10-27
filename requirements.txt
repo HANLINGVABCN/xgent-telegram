@@ -17,6 +17,8 @@ pyyaml>=6.0,<7.0
 Pillow>=13.0,<14.0
 # Identify native media/document types from file signatures, without conversion.
 filetype>=1.2,<2.0
+# Bundled FFmpeg supplies lightweight video covers even without a system install.
+imageio-ffmpeg>=0.6.0,<1.0
 # Full-screen CLI TUI (xgent_cli --tui / XGENT_CLI_TUI): in-place expand of folded
 # protocol blocks. Pure-Python + wcwidth, Windows/Termux-friendly. Optional at
 # runtime — the CLI falls back to the legacy line renderer if it is missing.

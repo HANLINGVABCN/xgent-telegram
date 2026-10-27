@@ -1,9 +1,11 @@
 /* Conversation navigation is independent of optional workbench pages. */
+import {ConversationSearch} from './global-search.js';
 const $ = id => document.getElementById(id);
 const sidebar = $('wb-nav');
 const list = $('conversation-list');
 const scroll = $('conversation-scroll');
 const search = $('conversation-search');
+const globalResults = new ConversationSearch(list, {compact: true});
 const menu = $('conversation-item-menu');
 const renameDialog = $('conversation-rename-dialog');
 const mobile = matchMedia('(max-width: 767px)');
@@ -19,6 +21,7 @@ const paths = {
 let state = {current_chat_id: null, telegram_conversation_id: null, revision: -1, items: [], running: null};
 let authenticated = false, authEpoch = 0, request = null, mutation = null;
 let view = 'recent', listSignature = '', menuTarget = null, menuTrigger = null;
+let groupView = 'all';
 let drawerOpen = false, drawerReturn = null, previousInert = null;
 let renameTarget = null, renameReturn = null, renameSaving = false;
 let feedbackTimer = null;
@@ -53,6 +56,8 @@ function button(text, fn, attributes = {}) {
 function title(item) { return item?.display_title || item?.name || '新对话'; }
 function timestamp(item) { return Number(item.activity_at ?? item.last_active ?? item.created_at) || 0; }
 function itemById(id) { return itemIndex.get(id); }
+function groups() { return Array.isArray(state.groups) ? state.groups : [{id:'ungrouped',name:'未分组'}]; }
+function groupName(id) { return groups().find(group => group.id === id)?.name || '未分组'; }
 function isArchived(item) { return item.archived === true || Number(item.archived) === 1; }
 function groupFor(item) {
   const now = new Date(), date = new Date(timestamp(item) * 1000);
@@ -90,6 +95,12 @@ async function api(resource, data) {
     if (timedOut) throw new Error('请求超时，请重试。');
     throw error;
   } finally { clearTimeout(timer); controllers.delete(controller); }
+}
+
+async function groupMutation(resource, data = {}) {
+  const result = await api(resource, {...data, revision: state.revision});
+  accept(result);
+  return result;
 }
 
 function accept(next) {
@@ -156,7 +167,8 @@ async function createConversation() {
   if (mutation || !state.current_chat_id || !await prepareChat()) return;
   try {
     view = 'recent'; search.value = '';
-    if (!await mutate('create')) return;
+    const result = await mutate('create');if(!result)return;
+    if(groupView!=='all'&&groupView!=='ungrouped')await groupMutation('/api/workbench/conversations/move',{id:result.conversation_id||result.current_chat_id,group_id:groupView});
     scroll.scrollTop = 0;
     closeMenu(false); setDrawer(false, false);
     requestAnimationFrame(() => $('input')?.focus({preventScroll: true}));
@@ -228,11 +240,22 @@ function createRow(item) {
   return {row, open, name, more, dot, restore, bot};
 }
 function renderList() {
+  if (search.value.trim()) {
+    listSignature = '';
+    globalResults.search(search.value);
+    return;
+  }
+  if (globalResults.options) globalResults.reset();
   const query = search.value.trim().toLocaleLowerCase();
-  const visible = state.items.filter(item => isArchived(item) === (view === 'archived') && title(item).toLocaleLowerCase().includes(query))
-    .sort((a, b) => timestamp(b) - timestamp(a) || a.id.localeCompare(b.id));
-  const signature = JSON.stringify([view, query, state.current_chat_id, state.telegram_conversation_id, state.running?.conversation_id, mutation,
-    visible.map(item => [item.id, title(item), groupFor(item)])]);
+  const visible = state.items.filter(item => isArchived(item) === (view === 'archived')
+      && (groupView === 'all' || item.group_id === groupView)
+      && title(item).toLocaleLowerCase().includes(query))
+    .sort((a, b) => {
+      const pinned = !query && groupView !== 'all' ? Number(b.pinned || 0) - Number(a.pinned || 0) : 0;
+      return pinned || timestamp(b) - timestamp(a) || a.id.localeCompare(b.id);
+    });
+  const signature = JSON.stringify([view, groupView, query, state.current_chat_id, state.telegram_conversation_id, state.running?.conversation_id, mutation,
+    visible.map(item => [item.id, title(item), groupFor(item), item.group_id, item.pinned])]);
   if (signature === listSignature) return;
   listSignature = signature;
   const oldScroll = scroll.scrollTop;
@@ -240,13 +263,15 @@ function renderList() {
   const children = [];
   let group = '';
   for (const item of visible) {
-    const next = query ? '搜索结果 · ' + visible.length : view === 'archived' ? '已归档的对话' : groupFor(item);
+    const next = query ? '搜索结果 · ' + visible.length : view === 'archived' ? '已归档的对话' :
+      (groupView === 'all' ? groupFor(item) : groupName(groupView));
     if (next !== group) { group = next; children.push(node('h3', {class: 'conv-date-group'}, group)); }
     const entry = rows.get(item.id) || createRow(item);
     rows.set(item.id, entry);
     const current = item.id === state.current_chat_id;
     entry.row.classList.toggle('is-current', current);
     entry.row.classList.toggle('is-archived', isArchived(item));
+    entry.row.classList.toggle('is-pinned',!!item.pinned&&groupView!=='all'&&!query);
     entry.row.classList.toggle('is-pending', mutation?.name === 'switch' && mutation.id === item.id);
     entry.bot.hidden = item.id !== state.telegram_conversation_id;
     entry.name.textContent = title(item);
@@ -306,12 +331,19 @@ function render() {
   $('conversation-new').disabled = !state.current_chat_id || !!mutation;
   $('conversation-new').setAttribute('aria-busy', String(mutation?.name === 'create'));
   $('conversation-search-clear').hidden = !search.value;
-  $('conversation-list-title').textContent = view === 'archived' ? '已归档' : '最近对话';
+  $('conversation-list-title').textContent = search.value.trim() ? '全局搜索' : view === 'archived' ? '已归档' : groupView === 'all' ? '最近对话' : groupName(groupView);
   $('conversation-view-back').hidden = view !== 'archived';
   $('conversation-archive-view').setAttribute('aria-pressed', String(view === 'archived'));
   const count = state.items.filter(isArchived).length;
   $('conversation-archive-count').textContent = String(count);
   $('conversation-archive-count').hidden = !count;
+  const select = $('conversation-group-select');
+  if (select) {
+    const options = [{id:'all',name:'全部对话'}, ...groups()];
+    select.replaceChildren(...options.map(item => node('option',{value:item.id},item.name)));
+    if(!options.some(item => item.id === groupView))groupView='all';
+    select.value = groupView;
+  }
   if (state.current_chat_id) renderList();
   renderRunning();
 }
@@ -346,7 +378,17 @@ function openMenu(id, trigger) {
   const setBot=button(botCurrent?'🤖 Bot 当前对话':'🤖 设为 Bot 当前对话',()=>setBotConversation(item),{role:'menuitem'});
   setBot.disabled=botCurrent||isArchived(item)||!state.telegram_configured;
   setBot.title=!state.telegram_configured?'此部署未配置 Telegram Bot':isArchived(item)?'请先恢复已归档会话':botCurrent?'Bot 已使用此对话':'只改变 Bot 的选择，不切换网页或终端，不改投运行任务';
-  menu.replaceChildren(rename, setBot, other, reset, remove); menu.hidden = false; positionMenu();
+  const pin=button(item.pinned?'📌 取消组内置顶':'📌 组内置顶',async()=>{
+    closeMenu(false);
+    try{await groupMutation('/api/workbench/conversations/'+(item.pinned?'unpin':'pin'),{id:item.id,group_id:item.group_id});notify(item.pinned?'已取消组内置顶':'已在当前分组置顶');}
+    catch(error){notify(error.message,{error:true,retry:refresh});}
+  },{role:'menuitem'});
+  const moveButtons=groups().filter(group=>group.id!==item.group_id).map(group=>button('移动到：'+group.name,async()=>{
+    closeMenu(false);
+    try{await groupMutation('/api/workbench/conversations/move',{id:item.id,group_id:group.id});notify('已移动到「'+group.name+'」');}
+    catch(error){notify(error.message,{error:true,retry:refresh});}
+  },{role:'menuitem'}));
+  menu.replaceChildren(rename, other, pin, ...moveButtons, setBot, reset, remove); menu.hidden = false; positionMenu();
   rename.focus({preventScroll: true});
 }
 async function setBotConversation(item){
@@ -449,10 +491,13 @@ $('conversation-backdrop').addEventListener('click', () => setDrawer(false));
 $('workspace-menu').addEventListener('click',event=>{if(event.target.closest('a, #btn-settings, #btn-search, #wb-logout'))setDrawer(false,false);});
 $('conversation-archive-view').addEventListener('click', () => setView(view === 'archived' ? 'recent' : 'archived'));
 $('conversation-view-back').addEventListener('click', () => setView('recent'));
-search.addEventListener('input', () => { closeMenu(false); render(); scroll.scrollTop = 0; });
+search.addEventListener('input', event => { if (!event.isComposing) { closeMenu(false); render(); scroll.scrollTop = 0; } });
+search.addEventListener('compositionend', () => { closeMenu(false); render(); scroll.scrollTop = 0; });
 $('conversation-search-clear').addEventListener('click', () => { search.value = ''; render(); search.focus(); });
 search.addEventListener('keydown', event => {
-  if (event.key === 'ArrowDown') { event.preventDefault(); list.querySelector('.conv-open:not(:disabled),.conv-restore:not([hidden])')?.focus(); }
+  if (event.isComposing) return;
+  if (event.key === 'Enter' && search.value.trim()) { event.preventDefault(); clearTimeout(globalResults.timer); globalResults.load(); }
+  if (event.key === 'ArrowDown') { event.preventDefault(); list.querySelector('.global-search-hit,.conv-open:not(:disabled),.conv-restore:not([hidden])')?.focus(); }
 });
 list.addEventListener('keydown', event => {
   if (!event.target.matches('.conv-open') || !['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
@@ -475,10 +520,11 @@ document.addEventListener('pointerdown', event => {
   if (!menu.hidden && !menu.contains(event.target) && !event.target.closest('.conv-more')) closeMenu(false);
 }, true);
 document.addEventListener('keydown', event => {
+  if (document.getElementById('global-search-dialog')?.open) return;
   if (!$('workspace-menu').hidden) { if(event.key==='Escape'){event.preventDefault();event.stopImmediatePropagation();window.XGentWorkspaceMenu?.close(true);}return; }
   if (event.isComposing || renameDialog.open) return;
   if (!menu.hidden) {
-    const choices = Array.from(menu.querySelectorAll('button'));
+    const choices = Array.from(menu.querySelectorAll('button')).filter(button=>!button.disabled);
     if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
       event.preventDefault();
       let index = choices.indexOf(document.activeElement);
@@ -503,9 +549,36 @@ window.XGentConversations = {
   async select(id){if(mutation)throw new Error('正在切换对话，请稍后重试');if(id!==state.current_chat_id)await mutate('switch',{id});closeMenu(false);setDrawer(false);return state.current_chat_id===id;},
   get current() { return state.current_chat_id; }, get running() { return state.running; },
 };
+const groupSelect = $('conversation-group-select');
+groupSelect?.addEventListener('change', () => { groupView = groupSelect.value || 'all'; render(); scroll.scrollTop = 0; });
+function groupDialog(group = null) {
+  if(group?.id==='ungrouped'){notify('“未分组”是保留分组，不能删除或重命名');return;}
+  const dialog=node('dialog',{class:'conv-dialog','aria-label':group?'管理分组':'新建分组'});
+  const input=node('input',{type:'text',maxlength:80,required:'', 'aria-label':'分组名称'});input.value=group?.name||'';
+  const error=node('p',{role:'alert'}),form=node('form',{},node('h2',{},group?'管理分组':'新建分组'),node('label',{},'分组名称',input),error);
+  const cancel=button('取消',()=>dialog.close());
+  const save=node('button',{type:'submit',class:'conv-save'},'保存');
+  form.onsubmit=async event=>{event.preventDefault();save.disabled=true;
+    try{const result=await groupMutation('/api/workbench/conversation-groups/'+(group?'rename':'create'),{group_id:group?.id,name:input.value.trim()});if(!group)groupView=result.group_id;dialog.close();render();}
+    catch(exc){error.textContent=exc.message;}finally{save.disabled=false;}
+  };
+  const controls=node('div',{class:'conv-dialog-actions'},cancel,save);
+  if(group)controls.prepend(button('删除分组',async()=>{
+    if(!confirm('删除「'+group.name+'」？其中对话将移到“未分组”，组内置顶会清除，不会删除对话。'))return;
+    try{await groupMutation('/api/workbench/conversation-groups/delete',{group_id:group.id});groupView='ungrouped';dialog.close();render();}
+    catch(exc){error.textContent=exc.message;}
+  },{class:'danger'}));
+  form.append(controls);dialog.append(form);document.body.append(dialog);dialog.addEventListener('close',()=>dialog.remove(),{once:true});dialog.showModal();input.focus();
+}
+$('conversation-group-new')?.addEventListener('click',()=>groupDialog());
+$('conversation-group-edit')?.addEventListener('click',()=>{
+  if(groupView==='all'){notify('请先选择一个分组');return;}
+  groupDialog(groups().find(item=>item.id===groupView));
+});
 function start() { authenticated = true; refresh(); }
 window.addEventListener('xgent-authenticated', start);
 window.addEventListener('xgent-auth-expired', () => {
+  globalResults.reset();
   authenticated = false; authEpoch++; controllers.forEach(controller => controller.abort()); request = null;
   setDrawer(false, false); closeMenu(false); renameDialog.close();
   clearTimeout(feedbackTimer); $('conversation-feedback').hidden = true;

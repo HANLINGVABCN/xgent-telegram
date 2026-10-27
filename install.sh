@@ -11,6 +11,35 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Resolve mutable state without importing the application or printing secrets.
+# A normal upgrade keeps a legacy checkout intact until `data migrate` succeeds.
+DATA_DIR="$SCRIPT_DIR"
+for data_python in python3 python; do
+    if command -v "$data_python" >/dev/null 2>&1; then
+        if resolved_data_dir="$("$data_python" -c 'from xgent_app.data_paths import DataPaths; from pathlib import Path; print(DataPaths.discover(Path.cwd()).root)' 2>/dev/null)"; then
+            DATA_DIR="$resolved_data_dir"
+            break
+        fi
+    fi
+done
+if [ "${1:-}" = "data-start-internal" ]; then
+    if [ "${XGENT_MAINTENANCE_CODE_DIR:-}" != "$SCRIPT_DIR" ] || [ -z "${XGENT_MAINTENANCE_DATA_DIR:-}" ]; then
+        echo "[错误] 数据维护启动请求缺少当前项目/数据目录校验。" >&2
+        exit 1
+    fi
+    DATA_DIR="$XGENT_MAINTENANCE_DATA_DIR"
+    if ! "${XGENT_PYTHON:-python3}" -c 'import sys; from pathlib import Path; from xgent_app.data_discovery import validate_target; code=Path(sys.argv[1]).resolve(); root=Path(sys.argv[2]).resolve(); assert Path(sys.argv[2]).is_absolute(); root == code or validate_target(code,root)' "$SCRIPT_DIR" "$DATA_DIR"; then
+        echo "[错误] 数据维护目录无效，未启动服务。" >&2
+        exit 1
+    fi
+fi
+ENV_FILE="$DATA_DIR/.env"
+LOG_DIR="$DATA_DIR/logs"
+if [ "$DATA_DIR" = "$SCRIPT_DIR" ]; then LOG_DIR="$SCRIPT_DIR"; else export XGENT_DATA_DIR="$DATA_DIR"; fi
+if [ "${1:-}" = "data-start-internal" ] && [ "$DATA_DIR" = "$SCRIPT_DIR" ]; then unset XGENT_DATA_DIR; fi
+PID_FILE="$DATA_DIR/xgent.pid"
+OUTPUT_LOG="$LOG_DIR/xgent_output.log"
+
 VENV_DIR="$SCRIPT_DIR/venv"
 VENV_ACTIVATE="$VENV_DIR/bin/activate"
 VENV_PYTHON="$VENV_DIR/bin/python3"
@@ -18,7 +47,7 @@ APP_ENTRY="xgent_server.py"
 PM2_APP_NAME="xgent-telegram"
 LEGACY_PM2_APP_NAME="telegram-ai-bot"
 LEGACY_APP_ENTRY="bot_server.py"
-STATE_DIR="$SCRIPT_DIR/.install-state"
+STATE_DIR="$DATA_DIR/.install-state"
 APT_STATE_FILE="$STATE_DIR/apt-packages.txt"
 RUNTIME_MODE_FILE="$STATE_DIR/runtime-mode"
 # 上次装依赖时 requirements.txt 的原样副本。重启路径靠它判断还要不要再联网装一遍。
@@ -43,7 +72,7 @@ SYSTEMD_UNIT_PATH="/etc/systemd/system/${SYSTEMD_SERVICE_NAME}.service"
 
 LOCAL_API_CONTAINER="telegram-local-bot-api"
 LOCAL_API_PORT="8081"
-LOCAL_API_DATA_DIR="$SCRIPT_DIR/.local-api-data"
+LOCAL_API_DATA_DIR="$DATA_DIR/.local-api-data"
 LOCAL_API_IMAGE="aiogram/telegram-bot-api:latest"
 LOCAL_API_ALLOWED_IPS_FILE="$STATE_DIR/local-api-allowed-ips"
 
@@ -82,7 +111,7 @@ ensure_state_dir() {
 
 migrate_env_key() {
     local old_key="$1" new_key="$2" old_value="" new_value=""
-    [ -f ".env" ] || return 0
+    [ -f "$ENV_FILE" ] || return 0
 
     old_value="$(env_get "$old_key")"
     [ -n "$old_value" ] || return 0
@@ -102,8 +131,8 @@ migrate_legacy_installation() {
     # Runtime database/storage/log migration is performed by the new Python
     # bootstrap before those paths are opened. Renaming only the PID marker here
     # lets the installer stop a legacy nohup process safely.
-    if [ -f "bot.pid" ] && [ ! -e "xgent.pid" ]; then
-        mv -- "bot.pid" "xgent.pid"
+    if [ -f "bot.pid" ] && [ ! -e "$PID_FILE" ]; then
+        mv -- "bot.pid" "$PID_FILE"
         success "已迁移旧进程标记: bot.pid -> xgent.pid"
     fi
 }
@@ -154,7 +183,7 @@ ip_mode_label() {
 # 不依赖 .install-state/deploy-mode——那个文件是同步出来的副本，单独读它会在
 # "刚手动往 .env 填了 Token 但还没跑过安装流程"时显示过期的模式。
 deploy_mode_label() {
-    if [ -f ".env" ] && [ -n "$(env_get BOT_TOKEN)" ]; then
+    if [ -f "$ENV_FILE" ] && [ -n "$(env_get BOT_TOKEN)" ]; then
         printf 'Telegram + Web'
     else
         printf '仅 Web'
@@ -657,13 +686,13 @@ stop_background_process() {
     local pid cmdline
     local found_extra=0
 
-    if [ -f "xgent.pid" ]; then
-        pid="$(cat xgent.pid 2>/dev/null || true)"
+    if [ -f "$PID_FILE" ]; then
+        pid="$(cat "$PID_FILE" 2>/dev/null || true)"
         if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
             warn "   xgent.pid 内容不是有效 PID，已移除 PID 文件。"
-            rm -f xgent.pid
+            rm -f "$PID_FILE"
         elif ! ps -p "$pid" >/dev/null 2>&1; then
-            rm -f xgent.pid
+            rm -f "$PID_FILE"
             success "已清理过期 xgent.pid"
         else
             cmdline="$(ps -p "$pid" -o args= 2>/dev/null || true)"
@@ -677,7 +706,7 @@ stop_background_process() {
                     # 那个进程就此失联，还占着端口和数据库。
                     kill -9 "$pid" 2>/dev/null || true
                 fi
-                rm -f xgent.pid
+                rm -f "$PID_FILE"
                 success "nohup 后台进程已停止"
             else
                 warn "   xgent.pid 指向的进程不像本项目进程，已跳过停止: $pid"
@@ -852,7 +881,7 @@ remove_recorded_apt_packages() {
 remove_ip_mode_state() {
     # 只清 .env 里那四个键。原来这里还删一个 .install-state/ip-mode 文件，
     # 但全脚本没有任何地方写它——早期设计的残留。
-    if [ -f ".env" ] && grep -qE "^(XGENT_IP_MODE|XGENT_SOCKS5_PROXY|TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" .env 2>/dev/null; then
+    if [ -f "$ENV_FILE" ] && grep -qE "^(XGENT_IP_MODE|XGENT_SOCKS5_PROXY|TELEGRAM_AI_BOT_IP_MODE|TELEGRAM_AI_BOT_SOCKS5_PROXY)=" "$ENV_FILE" 2>/dev/null; then
         info "[卸载] 正在清理 .env 中的 IP 出站模式 / SOCKS5 代理设置"
         env_unset XGENT_IP_MODE XGENT_SOCKS5_PROXY \
             TELEGRAM_AI_BOT_IP_MODE TELEGRAM_AI_BOT_SOCKS5_PROXY
@@ -1019,73 +1048,74 @@ install_requirements() {
 # Telegram 直接鉴权失败，两种症状都完全看不出根因在换行符上。
 env_get() {
     local key="$1"
-    [ -f ".env" ] || return 0
-    awk -F= -v k="$key" '$1==k{print substr($0,length(k)+2)}' .env 2>/dev/null \
+    [ -f "$ENV_FILE" ] || return 0
+    awk -F= -v k="$key" '$1==k{print substr($0,length(k)+2)}' "$ENV_FILE" 2>/dev/null \
         | tail -n 1 | tr -d '\r' || true
 }
 
 # 写入/覆盖一个键。
 env_set() {
     local key="$1" value="$2" tmp_file
+    mkdir -p "$DATA_DIR"
 
     # 临时文件建在 .env 同目录：mktemp 默认落在 /tmp，跨文件系统时 mv 会退化成
     # 复制+删除，复制中途失败会把含 BOT_TOKEN 和全部 api_key 的 .env 截断且无备份。
     # 同目录下 mv 是原子 rename。
-    tmp_file="$(mktemp ./.env.XXXXXX)"
+    tmp_file="$(mktemp "$DATA_DIR/.env.XXXXXX")"
     chmod 600 "$tmp_file"
-    if [ -f ".env" ]; then
+    if [ -f "$ENV_FILE" ]; then
         # 必须锚定到行首：grep -vF "KEY=" 会匹配行内任意位置，
         # 写 BOT_TOKEN 会顺手删掉 XGENT_BOT_TOKEN 等所有含该串的行。
-        grep -v "^${key}=" .env > "$tmp_file" || true
+        grep -v "^${key}=" "$ENV_FILE" > "$tmp_file" || true
     fi
     printf '%s=%s\n' "$key" "$value" >> "$tmp_file"
-    mv "$tmp_file" .env
-    chmod 600 .env
+    mv "$tmp_file" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
 }
 
 # 删掉一个或多个键。
 env_unset() {
     local pattern tmp_file
-    [ -f ".env" ] || return 0
+    [ -f "$ENV_FILE" ] || return 0
     [ "$#" -gt 0 ] || return 0
 
     pattern="$(printf '%s|' "$@")"
     pattern="^(${pattern%|})="
 
-    tmp_file="$(mktemp ./.env.XXXXXX)"
+    tmp_file="$(mktemp "$DATA_DIR/.env.XXXXXX")"
     chmod 600 "$tmp_file"
-    grep -vE "$pattern" .env > "$tmp_file" || true
-    mv "$tmp_file" .env
-    chmod 600 .env
+    grep -vE "$pattern" "$ENV_FILE" > "$tmp_file" || true
+    mv "$tmp_file" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
 }
 
 # 注释掉一个键（在行首加 #）— 用于"关闭 Bot"时保留 Token。
 env_comment() {
     local key="$1" tmp_file
-    [ -f ".env" ] || return 0
-    tmp_file="$(mktemp ./.env.XXXXXX)"
+    [ -f "$ENV_FILE" ] || return 0
+    tmp_file="$(mktemp "$DATA_DIR/.env.XXXXXX")"
     chmod 600 "$tmp_file"
-    sed "s/^${key}=/#${key}=/" .env > "$tmp_file"
-    mv "$tmp_file" .env
-    chmod 600 .env
+    sed "s/^${key}=/#${key}=/" "$ENV_FILE" > "$tmp_file"
+    mv "$tmp_file" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
 }
 
 # 取消注释一个键（去掉行首 #）— 用于"开启 Bot"时恢复 Token。
 env_uncomment() {
     local key="$1" tmp_file
-    [ -f ".env" ] || return 0
-    tmp_file="$(mktemp ./.env.XXXXXX)"
+    [ -f "$ENV_FILE" ] || return 0
+    tmp_file="$(mktemp "$DATA_DIR/.env.XXXXXX")"
     chmod 600 "$tmp_file"
-    sed "s/^#${key}=/${key}=/" .env > "$tmp_file"
-    mv "$tmp_file" .env
-    chmod 600 .env
+    sed "s/^#${key}=/${key}=/" "$ENV_FILE" > "$tmp_file"
+    mv "$tmp_file" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
 }
 
 # 检查某个键是否被注释（即存在 #KEY=... 行）
 env_is_commented() {
     local key="$1"
-    [ -f ".env" ] || return 1
-    grep -q "^#${key}=" .env
+    [ -f "$ENV_FILE" ] || return 1
+    grep -q "^#${key}=" "$ENV_FILE"
 }
 
 # 容器运行状态：running / exited / missing / docker-unavailable
@@ -1570,9 +1600,9 @@ PY
 check_database() {
     info "[检查] 正在检查数据库..."
 
-    if [ -f "xgent_memory.db" ]; then
+    if [ -f "$DATA_DIR/xgent_memory.db" ]; then
         local db_size
-        db_size="$(du -h xgent_memory.db | cut -f1)"
+        db_size="$(du -h "$DATA_DIR/xgent_memory.db" | cut -f1)"
         echo "   数据库已存在，大小: $db_size"
     elif [ -f "bot_memory.db" ]; then
         echo "   检测到旧版数据库，将在 XGent for Telegram 下次启动前自动迁移。"
@@ -1799,13 +1829,14 @@ start_foreground() {
 
 start_background() {
     local mode pythonpath code socks5_url
+    mkdir -p "$LOG_DIR"
 
     info "[运行] 正在后台启动 XGent for Telegram..."
 
     # 彻底停止旧进程
-    if [ -f "xgent.pid" ]; then
+    if [ -f "$PID_FILE" ]; then
         local old_pid
-        old_pid="$(cat xgent.pid)"
+        old_pid="$(cat "$PID_FILE")"
         if [[ "$old_pid" =~ ^[0-9]+$ ]] && ps -p "$old_pid" >/dev/null 2>&1; then
             echo "   正在停止旧进程: $old_pid"
             kill "$old_pid" 2>/dev/null || true
@@ -1814,7 +1845,7 @@ start_background() {
                 kill -9 "$old_pid" 2>/dev/null || true
             fi
         fi
-        rm -f xgent.pid
+        rm -f "$PID_FILE"
     fi
 
     echo "   IP 出站模式: $(ip_mode_label)"
@@ -1827,7 +1858,7 @@ start_background() {
                 -u TELEGRAM_AI_BOT_IP_MODE -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
                 -u TELEGRAM_AI_BOT_APP_ENTRY \
                 XGENT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" \
-                nohup "$VENV_PYTHON" -c "$code" > xgent_output.log 2>&1 &
+                nohup "$VENV_PYTHON" -c "$code" > "$OUTPUT_LOG" 2>&1 &
             ;;
         sock5)
             socks5_url="$(get_socks5_proxy)"
@@ -1839,18 +1870,18 @@ start_background() {
                 -u TELEGRAM_AI_BOT_APP_ENTRY \
                 XGENT_IP_MODE="$mode" XGENT_SOCKS5_PROXY="$socks5_url" \
                 XGENT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" \
-                nohup "$VENV_PYTHON" -c "$code" > xgent_output.log 2>&1 &
+                nohup "$VENV_PYTHON" -c "$code" > "$OUTPUT_LOG" 2>&1 &
             ;;
         *)
             env -u XGENT_SOCKS5_PROXY -u TELEGRAM_AI_BOT_IP_MODE -u TELEGRAM_AI_BOT_SOCKS5_PROXY \
                 -u TELEGRAM_AI_BOT_APP_ENTRY \
                 XGENT_IP_MODE="$mode" \
                 XGENT_APP_ENTRY="$APP_ENTRY" PYTHONPATH="$pythonpath" \
-                nohup "$VENV_PYTHON" -c "$code" > xgent_output.log 2>&1 &
+                nohup "$VENV_PYTHON" -c "$code" > "$OUTPUT_LOG" 2>&1 &
             ;;
     esac
     local pid=$!
-    echo "$pid" > xgent.pid
+    echo "$pid" > "$PID_FILE"
     sleep 2
 
     if ps -p "$pid" >/dev/null 2>&1; then
@@ -1861,7 +1892,7 @@ start_background() {
         echo "   彻底重启: bash install.sh restart"
     else
         error "[错误] 后台启动失败，请查看 xgent_output.log。"
-        tail -20 xgent_output.log || true
+        tail -20 "$OUTPUT_LOG" || true
         exit 1
     fi
 }
@@ -2058,7 +2089,7 @@ restart_app() {
             restart_pm2_detached
             ;;
         nohup)
-            if [ -f "xgent.pid" ]; then
+            if [ -f "$PID_FILE" ]; then
                 echo "   将彻底停止后台进程再重新启动，确保加载最新配置。"
                 stop_background_process
                 sleep 1
@@ -2068,7 +2099,7 @@ restart_app() {
         *)
             # foreground 的"重启"就是在当前终端重新跑一次；mode 还是 none 时由
             # start_service 去问一次保活方式（只有交互式菜单会走到这条）。
-            if [ -f "xgent.pid" ]; then
+            if [ -f "$PID_FILE" ]; then
                 stop_background_process
                 sleep 1
             fi
@@ -2805,7 +2836,7 @@ stop_service_in_mode() {
             pm2 save >/dev/null 2>&1 || true
             ;;
         nohup|foreground)
-            [ -f "xgent.pid" ] || return 0
+            [ -f "$PID_FILE" ] || return 0
             info "[切换] 正在停止原来的后台进程..."
             stop_background_process
             ;;
@@ -2824,8 +2855,8 @@ service_running() {
             command_exists pm2 && pm2 describe "$PM2_APP_NAME" 2>/dev/null | grep -q "online"
             ;;
         *)
-            [ -f "xgent.pid" ] || return 1
-            pid="$(cat xgent.pid 2>/dev/null || true)"
+            [ -f "$PID_FILE" ] || return 1
+            pid="$(cat "$PID_FILE" 2>/dev/null || true)"
             case "$pid" in
                 ""|*[!0-9]*) return 1 ;;
             esac
@@ -3459,6 +3490,106 @@ show_status() {
     render_component_board
 }
 
+data_migration_python() {
+    local candidate resolved
+    for candidate in "${XGENT_PYTHON:-}" "$VENV_PYTHON" python3 python; do
+        [ -n "$candidate" ] || continue
+        resolved="$(command -v "$candidate" 2>/dev/null || true)"
+        [ -n "$resolved" ] || continue
+        if "$resolved" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,11) else 1)' >/dev/null 2>&1; then
+            printf '%s\n' "$resolved"
+            return 0
+        fi
+    done
+    error "[错误] 未找到 Python 3.11+；请先使用菜单的安装/更新功能准备运行环境。" >&2
+    return 1
+}
+
+manage_data_migration() {
+    local migration_python helpers_dir result
+    migration_python="$(data_migration_python)" || return 1
+    # Stdlib-only maintenance entry: no AI, no Telegram requests and no schema
+    # creation while merely viewing the menu or choosing a destination.
+    if "$migration_python" -c 'from xgent_app.data_migration import MigrationMenu; from xgent_app.data_discovery import DiscoveredBundles' >/dev/null 2>&1; then
+        XGENT_PYTHON="$migration_python" "$migration_python" -m xgent_app.data_migration
+        return $?
+    fi
+    # A newly downloaded installer can export an old deployment even when its
+    # application never had these helper modules. Only isolated stdlib helpers
+    # are downloaded; do not upgrade/overwrite the old application behind users.
+    info "[数据迁移] 正在自动准备兼容工具；不会改动原程序或数据，无需选择版本。"
+    helpers_dir="$(mktemp -d "${TMPDIR:-/tmp}/xgent-data-tools.XXXXXXXX")" || return 1
+    if ! "$migration_python" - "$helpers_dir" <<'PY'
+import io,os,stat,sys,urllib.request,zipfile
+from pathlib import Path
+target=Path(sys.argv[1]);required={'__init__.py','data_migration.py','data_service.py','data_discovery.py','data_bundles.py','data_paths.py','data_lock.py','conversations.py'}
+try:
+    request=urllib.request.Request('https://github.com/HANLINGVABCN/xgent-telegram/archive/refs/heads/main.zip',headers={'User-Agent':'XGent-data-migration'})
+    with urllib.request.urlopen(request,timeout=60) as response:
+        raw=response.read(32*1024*1024+1)
+    if len(raw)>32*1024*1024:raise ValueError('代码包大小异常')
+    package=target/'xgent_app';package.mkdir(mode=0o700)
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        for name in sorted(required):
+            matches=[info for info in archive.infolist() if info.filename.endswith('/xgent_app/'+name)]
+            if len(matches)!=1 or matches[0].file_size>2*1024*1024 or stat.S_ISLNK(matches[0].external_attr>>16):raise ValueError('兼容工具文件不完整')
+            source=archive.read(matches[0]);compile(source,name,'exec')
+            path=package/name
+            with path.open('xb') as output:output.write(source)
+            path.chmod(0o600)
+except Exception:
+    print('兼容工具下载或校验失败；原服务和数据未改动，请稍后在菜单重试。',file=sys.stderr)
+    raise SystemExit(1)
+PY
+    then
+        rmdir "$helpers_dir" 2>/dev/null || true
+        return 1
+    fi
+    result=0
+    XGENT_PYTHON="$migration_python" XGENT_MIGRATION_CODE_ROOT="$SCRIPT_DIR" \
+        "$migration_python" -c 'import runpy,sys; sys.path.insert(0,sys.argv[1]); runpy.run_module("xgent_app.data_migration",run_name="__main__")' "$helpers_dir" || result=$?
+    # Delete only the exact temporary helper files created above, never an
+    # instance directory or paths enumerated from user input.
+    "$migration_python" - "$helpers_dir" <<'PY'
+import sys
+from pathlib import Path
+root=Path(sys.argv[1]).resolve()
+if root.name.startswith('xgent-data-tools.'):
+    package=root/'xgent_app'
+    for name in ('__init__.py','data_migration.py','data_service.py','data_discovery.py','data_bundles.py','data_paths.py','data_lock.py','conversations.py'):
+        (package/name).unlink(missing_ok=True)
+    # Bytecode is confined to this private temp directory.
+    import shutil
+    cache=package/'__pycache__'
+    if cache.is_dir() and cache.resolve().parent==package:shutil.rmtree(cache)
+    if package.is_dir():package.rmdir()
+    root.rmdir()
+PY
+    return "$result"
+}
+
+data_start_internal() {
+    local maintenance_mode="${1:-nohup}"
+    case "$maintenance_mode" in pm2|systemd|nohup) ;; *) error "[错误] 无效的保活方式"; return 1 ;; esac
+    # Use the installed runtime when usable; unlike ordinary install/start,
+    # restoring data must never wait for a Bot token test or interactive setup.
+    if [ -x "$VENV_PYTHON" ] && python_version_ok "$VENV_PYTHON"; then
+        activate_virtualenv
+        if ! core_imports_ok; then install_requirements; fi
+    else
+        ensure_python
+        ensure_virtualenv
+        activate_virtualenv
+        install_requirements
+    fi
+    set_runtime_mode "$maintenance_mode"
+    case "$maintenance_mode" in
+        pm2) start_with_pm2 ;;
+        systemd) start_with_systemd ;;
+        nohup) start_background ;;
+    esac
+}
+
 show_menu() {
     echo ""
     echo "请选择操作:"
@@ -3473,6 +3604,7 @@ show_menu() {
     echo "  9) 彻底重建 PM2 进程       重新加载 PM2 启动参数，进程 ID 会 +1"
     echo " 10) 卸载本脚本安装的运行内容"
     echo " 11) 完整更新                 下载最新代码，并更新 Python 环境与全部依赖（保留用户数据）"
+    echo " 12) 数据迁移                 导入 / 导出，自动识别新旧数据与管理服务"
     echo "  0) 退出"
     echo ""
 }
@@ -3480,6 +3612,7 @@ show_menu() {
 show_usage() {
     echo "用法:"
     echo "  ./install.sh                 打开数字菜单"
+    echo "  ./install.sh data            打开数据迁移菜单（导入 / 导出）"
     echo "  ./install.sh install         打开数字菜单"
     echo "  ./install.sh status          打印保活方式、服务状态和组件清单"
     echo "  ./install.sh start           按当前保活方式启动服务"
@@ -3525,10 +3658,11 @@ prepare_base_environment() {
 # 保证 .env 存在，并把部署模式状态和 .env 的实际内容对齐。不问任何问题。
 ensure_env_skeleton() {
     info "[检查] 正在检查 .env..."
-    if [ ! -f ".env" ]; then
+    if [ ! -f "$ENV_FILE" ]; then
         warn "   未找到 .env，正在创建新文件..."
-        : > .env
-        chmod 600 .env 2>/dev/null || true
+        mkdir -p "$DATA_DIR"
+        : > "$ENV_FILE"
+        chmod 600 "$ENV_FILE" 2>/dev/null || true
     fi
     sync_deploy_mode_state
     success ".env 已就绪（部署模式: $(deploy_mode_label)）"
@@ -3542,7 +3676,7 @@ prepare_environment() {
     # 先做一次不需要 venv 的粗判。deployment_configured 要读数据库，得等 venv
     # 就绪才能问；但"连 .env 和 venv 都没有"是全新机器的确凿信号，没必要先花
     # 几分钟建 venv、装依赖，最后才告诉用户"你还没配置任何组件"。
-    if [ ! -f ".env" ] && [ ! -x "$VENV_PYTHON" ]; then
+    if [ ! -f "$ENV_FILE" ] && [ ! -x "$VENV_PYTHON" ]; then
         error "[错误] 还没安装过。"
         error "       请先运行 ./install.sh，选择 1) 安装 / 部署 / 配置。"
         exit 1
@@ -3558,7 +3692,7 @@ main() {
 
     print_banner
     show_menu
-    read -r -p "请输入选项 [0-11，默认 1]: " choice
+    read -r -p "请输入选项 [0-12，默认 1]: " choice
 
     case "$choice" in
         ""|1)
@@ -3610,6 +3744,9 @@ main() {
         11)
             update_code
             ;;
+        12)
+            if manage_data_migration; then exit 0; else exit 1; fi
+            ;;
         0|q|Q)
             warn "已退出。"
             exit 0
@@ -3654,6 +3791,17 @@ if [ "${XGENT_INSTALL_SH_LIB:-}" = "1" ]; then
 fi
 
 case "${1:-}" in
+    data)
+        shift
+        if [ "$#" -eq 0 ]; then
+            if manage_data_migration; then exit 0; else exit 1; fi
+        fi
+        migration_python="$(data_migration_python)" || exit 1
+        exec "$migration_python" -m xgent_app.data_cli "$@"
+        ;;
+    data-start-internal)
+        data_start_internal "${2:-nohup}"
+        ;;
     install|--install)
         main
         ;;

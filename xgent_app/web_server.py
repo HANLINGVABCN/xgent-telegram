@@ -338,7 +338,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if not self._require_same_origin():
                 return
             if path.startswith("/api/workbench/"):
-                self._handle_workbench("POST", path[len("/api/workbench/"):])
+                if path == '/api/workbench/data/import':
+                    self._handle_data_import()
+                else:
+                    self._handle_workbench("POST", path[len("/api/workbench/"):])
             elif path == "/api/login":
                 self._handle_login()
             elif path == "/api/logout":
@@ -389,7 +392,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     # --- 处理器 ---
 
     def _serve_workbench_asset(self, path: str) -> None:
-        allowed = {"knowledge.js", "knowledge.css", "appearance.js", "composer-controls.js", "reading.css", "chat.js", "chat.css", "conversations.js", "conversations.css", "workbench.js", "workbench.css", "components.js", "page-cache.js", "settings.js", "usage.js", "terminal.js", "terminal.css"}
+        allowed = {"knowledge.js", "knowledge.css", "appearance.js", "composer-controls.js", "reading.css", "chat.js", "chat.css", "conversations.js", "conversations.css", "global-search.js", "global-search.css", "workbench.js", "workbench.css", "components.js", "page-cache.js", "settings.js", "usage.js", "terminal.js", "terminal.css"}
         name = path.removeprefix("/assets/")
         if name not in allowed:
             self._send_json({"error": "not found"}, status=404)
@@ -428,6 +431,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             live = self.server.outbox.snapshot() if method == 'GET' and resource == 'history' else None
             if self.config.workbench is not None:
                 result = self._run_coro(self.config.workbench(method, resource, data), timeout=45)
+                from .data_operations import BackupDownload
+                if isinstance(result, BackupDownload):
+                    self._serve_media_file(str(result.path), result.path.name, 'application/zip')
+                    return
                 from .attachment_version_api import VersionDownload
                 if isinstance(result, VersionDownload):
                     self._send_version_download(result)
@@ -804,6 +811,33 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             disk_full = isinstance(exc, OSError) and exc.errno == 28
             error = '服务器磁盘空间不足，已传分块保留，请释放空间后重试。' if disk_full else str(exc)
             self._send_json({'error': error}, status=507 if disk_full else getattr(exc, 'status', 400))
+
+    def _handle_data_import(self):
+        if not self._require_auth() or not self._require_web_enabled():
+            return
+        if self.config.workbench is None:
+            self._send_json({'error':'数据恢复未启用'},status=404)
+            return
+        batch = self._read_multipart()
+        if batch is None:
+            return
+        handed_off = False
+        try:
+            if len(batch['files']) != 1 or batch.get('text') != 'confirm-instance-restore':
+                raise WorkbenchError('请选择一个实例备份并确认含密钥数据。')
+            item = batch['files'][0]
+            result = self._run_coro(self.config.workbench('POST','data/import',{
+                '_bundle_path':item['path'],'confirm_secrets':True,
+                'request_id':batch.get('request_id') or batch.get('idempotency_key'),
+                '_temporary':batch['_temporary'],
+            }),timeout=45)
+            handed_off = True
+            self._send_json(result)
+        except WorkbenchError as exc:
+            self._send_json({'error':str(exc)},status=exc.status)
+        finally:
+            if not handed_off:
+                batch['_temporary'].cleanup()
 
     def _handle_upload(self, mode='attachment') -> None:
         """Accept a disk-backed batch; HTTP confirms durable association, not AI completion."""

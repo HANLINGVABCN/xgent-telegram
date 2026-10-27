@@ -132,7 +132,10 @@ async def _check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
             
             # 记录到全局消息
             if not generated_reply.recorded:
-                await GlobalRecorder.record_ai_reply(f"[空闲提醒] {response_text}")
+                row_id = await GlobalRecorder.record_ai_reply(
+                    f"[空闲提醒] {response_text}", provider=prov_name, model=model,
+                )
+                await publish_saved_reply(context, row_id, generated_reply)
             
             logger.info("已发送提醒消息给用户")
     
@@ -364,15 +367,19 @@ async def _web_read_history(limit: int) -> List[Dict[str, Any]]:
     return result
 
 
-@conversation_entry()
-async def _web_read_history_message(row_id: int) -> Optional[Dict[str, Any]]:
-    db = await BotMemoryDB.get_instance()
-    row = await db.get_display_message(row_id)
-    if row is None:
-        return None
-    return await asyncio.to_thread(
-        build_history_message, row, ArtifactManager.ROOT_DIR, os.path.join(AgentExecutor.WORK_DIR, 'workspace'),
-    )
+async def _web_read_history_message(row_id: int, *, conversation_id=None) -> Optional[Dict[str, Any]]:
+    # Downloading from a library or archived source is a scoped read, not a
+    # conversation switch or an archived execution attempt.
+    from xgent_app.interaction import interaction
+    with interaction('web', 'management'):
+        async with conversation_operation(conversation_id, allow_archived=True, fresh=True, selector='shared'):
+            db = await BotMemoryDB.get_instance()
+            row = await db.get_display_message(row_id)
+            if row is None:
+                return None
+            return await asyncio.to_thread(
+                build_history_message, row, ArtifactManager.ROOT_DIR, os.path.join(AgentExecutor.WORK_DIR, 'workspace'),
+            )
 
 
 def _relay_markup_to_telegram(rows: Any) -> Optional[Any]:
@@ -654,6 +661,8 @@ async def _replay_relay_op_with_presentation(mirror: Any, op: str, payload: Dict
         # 路径，这里按路径把真文件发给 Telegram。文件没了就跳过——CLI 那边
         # 早就把路径打在终端上了，为一个临时文件中断整条流不值得。
         path = payload.get('path')
+        if path:
+            path = resolve_stored_path(path)
         if not path or not os.path.exists(str(path)):
             return
         caption = payload.get('caption')

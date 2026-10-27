@@ -282,9 +282,16 @@ class GlobalRecorder:
     @staticmethod
     async def record_ai_reply(content: str, chat_id: Optional[int] = None,
                               metadata: Optional[Dict[str, Any]] = None,
-                              stop_event: Optional[asyncio.Event] = None):
+                              stop_event: Optional[asyncio.Event] = None,
+                              provider: Optional[str] = None,
+                              model: Optional[str] = None):
         """Keep a display snapshot separate from the original model-visible text."""
         metadata = {'generated_media_processed': True, **(metadata or {})}
+        if provider or model:
+            metadata.setdefault('ai_generation', {
+                'provider': str(provider or ''), 'model': str(model or ''),
+                'generated_at': time.time(),
+            })
         if 'display' not in metadata:
             display = (_folded_display_html(content) if _should_hide_protocol_blocks()
                        else markdown_to_telegram_html(content))
@@ -442,7 +449,7 @@ def backup_local_custom_dirs() -> Optional[str]:
     return to_display_path(backup_dir)
 
 def update_env_values(values: Dict[str, str]):
-    env_path = os.path.join(PROJECT_ROOT, ".env")
+    env_path = str(DATA_PATHS.env)
     existing_lines: List[str] = []
     if os.path.exists(env_path):
         with open(env_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -1064,7 +1071,7 @@ def get_provider_usage_badges(provider_name: str) -> str:
     return ''.join(badges) or '⚪'
 
 SKILL_PUBLIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'skill-public')
-SKILL_PRIVATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'skill-private')
+SKILL_PRIVATE_DIR = str(DATA_PATHS.private_skills)
 # 兼容：旧部署可能还有 skill/ 目录，一并扫描避免 skill 丢失。
 SKILL_LEGACY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'skill')
 SKILL_FILE_EXTENSIONS = {'.md', '.markdown', '.txt'}
@@ -1086,7 +1093,7 @@ def _skill_dirs() -> list:
         dirs.append((SKILL_PRIVATE_DIR, 'private/'))
     return dirs
 
-MEMORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'memory')
+MEMORY_DIR = str(DATA_PATHS.memory)
 MEMORY_FILE_PREFIX = 'memory_'
 MEMORY_FILE_SUFFIX = '.txt'
 
@@ -1236,7 +1243,7 @@ def build_absolute_path_prompt_section() -> str:
     project_root = to_display_path(os.path.dirname(os.path.abspath(__file__)))
     skill_public_dir = to_display_path(SKILL_PUBLIC_DIR)
     skill_private_dir = to_display_path(SKILL_PRIVATE_DIR)
-    upload_dir = to_display_path(os.path.join(project_root, 'xgent_storage', 'uploads'))
+    upload_dir = to_display_path(ArtifactManager.UPLOAD_DIR)
     return (
         "\n\n---\n"
         "【当前运行目录绝对路径】\n"
@@ -1244,7 +1251,9 @@ def build_absolute_path_prompt_section() -> str:
         f"- skill 公有目录: {skill_public_dir}\n"
         f"- skill 私有目录: {skill_private_dir}\n"
         f"- 上传目录: {upload_dir}\n"
-        "所有协议的路径参数（read、edit、file、grep 的 path:、sendfile 等）必须使用上述绝对路径，禁止使用相对路径。需要新建文件时，在项目根目录下选择合适的子路径。\n"
+        f"- 数据根目录: {to_display_path(DATA_PATHS.root)}\n"
+        f"- 用户工作目录: {to_display_path(DATA_PATHS.workspace)}\n"
+        "所有协议的路径参数必须使用绝对路径。新建用户文件默认保存在数据目录的 workspace/；不要把用户数据、附件、密钥和私有脚本写入代码目录。执行公开技能或 xgent_trigger.py 时使用项目根目录下的绝对脚本路径。\n"
         "---\n"
     )
 
@@ -1440,7 +1449,7 @@ async def publish_saved_reply(context, row_id, reply=None):
 
 
 class ArtifactManager:
-    ROOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'xgent_storage')
+    ROOT_DIR = str(DATA_PATHS.storage)
     UPLOAD_DIR = os.path.join(ROOT_DIR, 'uploads')
     GENERATED_MEDIA_DIR = os.path.join(ROOT_DIR, 'generated_media')
     MAX_INLINE_TEXT_BYTES = 120 * 1024
@@ -2154,6 +2163,8 @@ async def generated_image_metadata(artifacts: List[Dict[str, Any]],
 def make_generated_reply_persistence(db, conversation_id, chat_id: int,
                                      generation: int, provider_name: str,
                                      model_name: str, *, record_prefix: str = "") -> GeneratedMediaReply:
+    from xgent_app.conversations import set_reply_generation
+    set_reply_generation(provider_name, model_name)
     async def persist(text, artifacts, stopped):
         for artifact in artifacts:
             artifact.update(
@@ -2165,7 +2176,9 @@ def make_generated_reply_persistence(db, conversation_id, chat_id: int,
         if stopped:
             content = (content.rstrip() + "\n\n⏹️ 当前回复已被用户手动停止").strip()
         metadata = {**(metadata or {}), **live_reply_metadata(reply)}
-        row_id = await GlobalRecorder.record_ai_reply(content, chat_id, metadata=metadata)
+        row_id = await GlobalRecorder.record_ai_reply(
+            content, chat_id, metadata=metadata, provider=provider_name, model=model_name,
+        )
         reply.record_id = row_id
         if row_id is None:
             raise AttachmentContextError("生成图片关联未成功保存，未调用后续模型。")

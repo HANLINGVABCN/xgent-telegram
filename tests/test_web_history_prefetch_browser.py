@@ -69,7 +69,7 @@ def test_prefetch_before_top_single_flight_current_anchor_and_live_updates(histo
     page.route('**/api/workbench/history?*', route)
     ready(page, base)
     page.locator('#log').evaluate('(e)=>e.scrollTop=Math.max(800,e.clientHeight*1.5)-20')
-    page.wait_for_function('document.querySelector("#wb-earlier").disabled')
+    page.wait_for_function('document.querySelector("#history-loading-state").getAttribute("aria-busy")==="true"')
     assert len(held) == 1
     assert page.locator('#log').evaluate('(e)=>e.scrollTop') > 0
     # The reader keeps moving while the first page is slow. Do not use the
@@ -85,7 +85,9 @@ def test_prefetch_before_top_single_flight_current_anchor_and_live_updates(histo
     held.pop().fulfill(json=page_data(server, 251, 301, next_cursor='251'))
     page.locator('[data-record-id="251"]').wait_for()
     assert_anchor(page, anchor)
-    assert len(requests) == 1
+    page.wait_for_timeout(80)
+    assert len(requests) == 2  # The following page is already preparing off-screen.
+    assert page.locator('#wb-earlier,#wb-newer,#wb-history-controls').count() == 0
 
 
 def test_failed_page_waits_for_explicit_retry_and_stops_at_earliest(history_browser):
@@ -132,7 +134,7 @@ def test_switch_cancels_old_page_and_rejects_late_results(history_browser):
     page.route('**/api/workbench/history?*', route)
     ready(page, base)
     page.locator('#log').evaluate('(e)=>e.scrollTop=400')
-    page.wait_for_function('document.querySelector("#wb-earlier").disabled')
+    page.wait_for_function('document.querySelector("#history-loading-state").getAttribute("aria-busy")==="true"')
     assert len(held) == 1
     page.evaluate('window.dispatchEvent(new CustomEvent("xgent-conversation-changed",{detail:{conversation_id:"B"}}))')
     page.wait_for_function('document.querySelector("#log").innerText.includes("历史 B-301")')
@@ -240,7 +242,7 @@ def test_locate_or_reset_cancels_inflight_preload(history_browser, action):
     page.route('**/api/workbench/history?*', route)
     ready(page, base)
     page.locator('#log').evaluate('(e)=>e.scrollTop=400')
-    page.wait_for_function('document.querySelector("#wb-earlier").disabled')
+    page.wait_for_function('document.querySelector("#history-loading-state").getAttribute("aria-busy")==="true"')
     assert len(held) == 1
     changed = True
     if action == 'locate':
@@ -284,11 +286,10 @@ def test_bounded_history_forward_page_and_latest_restore_inflight_reply(history_
     assert_anchor(page, anchor)
     assert page.get_by_text('正在生成的新回复，已追加内容', exact=True).count() == 0
     page.locator('#log').evaluate('(e)=>e.scrollTop=e.scrollHeight')
-    page.get_by_role('button', name='加载较新消息', exact=True).click()
     page.locator('[data-record-id="450"]').wait_for()
     assert page.locator('#log>.msg-row').count() <= 200
     assert page.locator('#wb-chat').evaluate('(e)=>e.classList.contains("history-past")')
-    page.locator('#wb-latest').click()
+    page.locator('#scroll-bottom').click()
     page.get_by_text('正在生成的新回复，已追加内容', exact=True).wait_for()
     assert page.locator('#log>.msg-row').count() == 51
     assert not page.locator('#wb-chat').evaluate('(e)=>e.classList.contains("history-past")')

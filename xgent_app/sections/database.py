@@ -5,6 +5,7 @@ import inspect
 from xgent_app.conversation_store import ConversationStore
 from xgent_app.conversations import current_scope, advance_generation, ConversationError, ConversationScope, bind_conversation
 from xgent_app.ui_history import UiHistoryError, UiHistorySnapshot, hide_audit_record, ui_record, EXPIRED, CHANGED
+from xgent_app.data_lock import DataLease
 
 class BotMemoryDB(ConversationStore):
     """Bot的永久记忆系统 - 异步SQLite + 连接池"""
@@ -22,6 +23,7 @@ class BotMemoryDB(ConversationStore):
         # 都必须持这把锁，才能保证事务的原子性。
         self._write_lock = asyncio.Lock()
         self._initialized = False
+        self._data_lease = None
         # 内存缓存
         self._config_cache: Dict[str, Any] = {}
         self._providers_cache: Optional[Dict] = None
@@ -75,10 +77,16 @@ class BotMemoryDB(ConversationStore):
             if connection is not None:
                 return connection
 
-            connection = await aiosqlite.connect(
-                self.db_path,
-                isolation_level=None  # 自动提交
-            )
+            if self.db_path != ':memory:':
+                self._data_lease = DataLease(os.path.dirname(os.path.abspath(self.db_path)))
+                if not self._data_lease.acquire():
+                    raise RuntimeError('数据目录正在维护，暂不能打开数据库。')
+            try:
+                connection = await aiosqlite.connect(self.db_path, isolation_level=None)
+            except BaseException:
+                if self._data_lease is not None:
+                    self._data_lease.release()
+                raise
             try:
                 connection.row_factory = aiosqlite.Row
                 # WAL 提升读写并发；busy_timeout 避免短暂写锁直接报错。
@@ -91,6 +99,8 @@ class BotMemoryDB(ConversationStore):
                 # 写入开始报错，需要配套的数据清理和回归测试再动。
             except Exception:
                 await connection.close()
+                if self._data_lease is not None:
+                    self._data_lease.release()
                 raise
 
             self._connection = connection
@@ -840,6 +850,7 @@ class BotMemoryDB(ConversationStore):
                            generation=await self._conversation_generation(conn))
             metadata = {'compression_job_id': current['job_id'], 'compression_complete': True,
                         'generated_media_processed': True,
+                        'ai_generation': {'provider': current.get('provider',''), 'model': current.get('model',''), 'generated_at': now},
                         'compression_sequence': current['sequence'],
                         'attachment_generation': current['generation'], 'src': current.get('src')}
             row_id = await self._insert_global_record(
@@ -1081,10 +1092,13 @@ class BotMemoryDB(ConversationStore):
         """下载历史附件时重新读取关联；清空后旧地址立即失效。"""
         conn = await self._get_conn()
         cursor = await conn.execute('''
-            SELECT id, role, content, timestamp, msg_type, metadata FROM global_messages
+            SELECT id, role, content, timestamp, msg_type, metadata, session_id FROM global_messages
             WHERE id = ? AND session_id = ?
         ''', (row_id, self._conversation_id()))
-        row = await cursor.fetchone()
+        try:
+            row = await cursor.fetchone()
+        finally:
+            await cursor.close()
         return dict(row) if row else None
 
     async def get_max_relay_op_id(self) -> int:
@@ -1973,6 +1987,9 @@ class BotMemoryDB(ConversationStore):
             self._providers_cache = None
             if connection is not None:
                 await connection.close()
+            if self._data_lease is not None:
+                self._data_lease.release()
+                self._data_lease = None
 
 # --- ☆ 用户数据管理（内存缓存 + 数据库同步）☆ ---
 class UserDataManager:

@@ -7,6 +7,7 @@ import mimetypes
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from xgent_app.web_media import generated_media_group_id
 
@@ -80,7 +81,8 @@ def delivered_file_reference(notice: str) -> list[dict[str, Any]]:
 
 def _within(path: str, root: Path) -> Path:
     root = root.resolve()
-    target = Path(path)
+    from .data_paths import resolve_stored_path
+    target = resolve_stored_path(path)
     if not target.is_absolute():
         target = root / target
     target = target.resolve()
@@ -144,7 +146,8 @@ def _describe_media(ref: Any, storage: Path, *, attachment: bool) -> dict[str, A
             if target is None:
                 raise ValueError("\u65e7\u8bb0\u5f55\u8def\u5f84\u4e0d\u5728\u53ef\u6062\u590d\u76ee\u5f55\u5185")
         else:
-            target = Path(ref["path"])
+            from .data_paths import resolve_stored_path
+            target = resolve_stored_path(ref["path"])
             if ref.get("version") != 1 or not target.is_absolute() or target.resolve() != target:
                 raise ValueError(_INVALID)
         if ref.get("_legacy_pattern"):
@@ -327,6 +330,8 @@ def build_history_message(
         "id": record.get("id"), "timestamp": record.get("timestamp"), "msg_type": kind,
         "role": role, "content": content, "media": [],
     }
+    if record.get('session_id'):
+        message['conversation_id'] = record['session_id']
     raw_metadata = record.get("metadata") or {}
     try:
         metadata = json.loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
@@ -341,6 +346,13 @@ def build_history_message(
     if (isinstance(live, dict) and isinstance(live.get('epoch'), str)
             and isinstance(live.get('message_ids'), list)):
         message['web_live'] = {'epoch': live['epoch'], 'message_ids': [mid for mid in live['message_ids'] if type(mid) is int]}
+    generation = metadata.get('ai_generation')
+    if isinstance(generation, dict):
+        message['ai_generation'] = {
+            'provider': str(generation.get('provider') or ''),
+            'model': str(generation.get('model') or ''),
+            'generated_at': generation.get('generated_at', record.get('timestamp')),
+        }
     display = metadata.get("display")
     if kind in {'ai_reply', 'media_reply'}:
         web_display = metadata.get('web_display')
@@ -418,6 +430,8 @@ def build_history_message(
         if item.get("path"):
             seen.add(item["path"])
         index = len(message["media"])
+        if role == 'user' and attachment:
+            item['ingress_mode'] = 'server_upload' if ref in metadata.get('server_uploads', []) else 'attachment'
         if (kind in {'user_file', 'user_photo'} and role == 'user' and attachment and isinstance(ref, dict)
                 and ref.get('storage', 'uploads') == 'uploads' and ref not in metadata.get('server_uploads', [])):
             try:
@@ -428,6 +442,9 @@ def build_history_message(
                 pass  # Unsafe/damaged associations never expose a version capability.
         if not item.get("error") and type(record.get("id")) is int:
             item["download_url"] = f"/api/history/media/{record['id']}/{index}"
+            if record.get('session_id'):
+                item['conversation_id'] = record['session_id']
+                item['download_url'] += '?' + urlencode({'conversation_id': record['session_id']})
         message["media"].append(item)
     if kind in {'ai_reply', 'media_reply'} and message['media']:
         message['media_group_id'] = generated_media_group_id([

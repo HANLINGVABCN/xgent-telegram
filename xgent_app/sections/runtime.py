@@ -618,6 +618,14 @@ async def run_app() -> int:
 
     _install_signal_handlers()
     _log_ready_banner()
+    # A detached, verified restore uses this process-stamped readiness record
+    # instead of guessing from an old PID file or a merely open TCP port.
+    from xgent_app.data_bundles import write_json
+    await asyncio.to_thread(write_json, DATA_PATHS.root / 'runtime-ready.json', {
+        'pid': os.getpid(), 'at': time.time(), 'data_dir': str(DATA_PATHS.root),
+        'code_version': runtime_code_version(), 'web_ready': is_web_chat_running(),
+        'web_healthy': is_web_chat_running() or (bool(BotConfig.TOKEN) and not normalize_bool(UserDataManager.get('web_enabled', False), False)),
+    })
 
     try:
         await stop_event.wait()

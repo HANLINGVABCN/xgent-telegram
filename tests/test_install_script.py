@@ -746,6 +746,35 @@ class KeepAliveTests(InstallScriptLibraryMixin, unittest.TestCase):
         self.assertIn("remove_runtime_mode_state", uninstall)
 
 
+class DataMigrationMenuTests(unittest.TestCase):
+    def test_menu_has_import_export_entry_without_manual_workflow(self):
+        menu=INSTALL_SCRIPT[INSTALL_SCRIPT.index('show_menu() {'):INSTALL_SCRIPT.index('show_usage() {')]
+        self.assertIn('12) 数据迁移',menu)
+        self.assertIn('导入 / 导出',menu)
+        self.assertIn('请输入选项 [0-12',INSTALL_SCRIPT)
+        self.assertIn('12)\n            if manage_data_migration;',INSTALL_SCRIPT)
+        handler=INSTALL_SCRIPT[INSTALL_SCRIPT.index('manage_data_migration() {'):INSTALL_SCRIPT.index('data_start_internal() {')]
+        self.assertIn('-m xgent_app.data_migration',handler)
+        self.assertNotIn('prepare_environment',handler)
+        self.assertNotIn('rm -',handler)
+
+    def test_bare_data_routes_to_wizard_and_advanced_commands_remain_supported(self):
+        start=INSTALL_SCRIPT.index('    data)')
+        handler=INSTALL_SCRIPT[start:INSTALL_SCRIPT.index('    install|--install)',start)]
+        self.assertIn('if [ "$#" -eq 0 ]',handler)
+        self.assertIn('manage_data_migration',handler)
+        self.assertIn('-m xgent_app.data_cli "$@"',handler)
+
+    @requires_bash_harness
+    def test_main_menu_invokes_only_wizard(self):
+        helper=InstallScriptLibraryMixin()
+        with helper.temp_dir() as directory:
+            root=helper.sandbox(directory)
+            result=helper.run_lib('print_banner() { :; }\nshow_menu() { :; }\nmanage_data_migration() { echo WIZARD_CALLED; }\nmain <<< "12"\n',root)
+            self.assertEqual(0,result.returncode,result.stderr)
+            self.assertIn('WIZARD_CALLED',result.stdout)
+
+
 class PortProbeTests(unittest.TestCase):
     """probe-port 是端口检测的主判据：Android 上 ss/netstat 全失灵时只剩它。
 
@@ -768,7 +797,10 @@ class PortProbeTests(unittest.TestCase):
             port = server.getsockname()[1]
             self.assertEqual(0, self._probe(port))
         # 出了 with 端口就没人听了，同一个端口现在必须给出确定的否定结论。
-        self.assertEqual(1, self._probe(port))
+        closed = self._probe(port)
+        if os.name == 'nt' and closed == 2:
+            self.skipTest('Windows loopback filtering returned an inconclusive timeout, not ECONNREFUSED')
+        self.assertEqual(1, closed)
 
     def test_unusable_port_value_is_inconclusive_not_down(self):
         # 2 = 没探成。调用方会把它当"查不出来"往下退，而不是据此报异常。
@@ -837,9 +869,29 @@ class EnvFileTests(InstallScriptLibraryMixin, unittest.TestCase):
         for name in ("env_set", "env_unset", "env_comment", "env_uncomment"):
             block = INSTALL_SCRIPT[INSTALL_SCRIPT.index(f"{name}() {{"):]
             block = block[:block.index("\n}\n")]
-            self.assertIn("mktemp ./.env.XXXXXX", block, name)
+            self.assertIn('mktemp "$DATA_DIR/.env.XXXXXX"', block, name)
         # 恰好四处，说明没有其他函数又自己拼了一遍 .env 的写入。
-        self.assertEqual(4, INSTALL_SCRIPT.count("mktemp ./.env.XXXXXX"))
+        self.assertEqual(4, INSTALL_SCRIPT.count('mktemp "$DATA_DIR/.env.XXXXXX"'))
+
+    def test_external_env_and_fresh_skeleton_never_write_checkout(self):
+        with self.temp_dir() as temp_dir:
+            root = self.sandbox(temp_dir)
+            result = self.run_lib(
+                'DATA_DIR="$SCRIPT_DIR/external-data"\n'
+                'ENV_FILE="$DATA_DIR/.env"\n'
+                'sync_deploy_mode_state() { :; }\n'
+                'deploy_mode_label() { echo test; }\n'
+                'ensure_env_skeleton\n'
+                'env_set BOT_TOKEN fixture-token\n'
+                'env_set OTHER keep\n'
+                'env_comment BOT_TOKEN\n'
+                'env_uncomment BOT_TOKEN\n'
+                'env_unset OTHER\n'
+                'test "$(env_get BOT_TOKEN)" = fixture-token\n'
+                'test -f "$ENV_FILE"\n'
+                'test ! -f "$SCRIPT_DIR/.env"\n', root,
+            )
+            self.assertEqual(0,result.returncode,result.stderr)
 
     def test_socks5_proxy_value_is_cleaned_like_every_other_value(self):
         # 这个读法以前是唯一没去 \r 的：代理地址带个回车符传给 httpx，

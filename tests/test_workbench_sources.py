@@ -4,6 +4,27 @@ from tests.test_external_sync import SectionsProbeMixin
 
 
 class WorkbenchSourcesTests(SectionsProbeMixin, unittest.TestCase):
+    def test_global_search_is_a_read_only_cross_conversation_navigation(self):
+        result = self.run_probe(self.SECTIONS_PREAMBLE+r'''
+import asyncio,time
+from xgent_app.workbench import Workbench
+async def main():
+    await ns['UserDataManager'].init();w=Workbench(ns);db=await w.db();conn=await db._get_conn()
+    b=(await db.manage_conversation('create',name='另一段对话'))['conversation_id']
+    row=await conn.execute("INSERT INTO global_messages(chat_id,user_id,msg_type,role,content,timestamp,session_id) VALUES(1,1,'user_text','user','全局正文独有关键词',?,?)",(time.time(),b))
+    key='history:'+str(row.lastrowid)
+    await db.manage_conversation('archive',b)
+    before=await ns['get_conversations']().state()
+    found=await w.handle('GET','global-search',{'q':'全局正文独有关键词','conversation_id':'does-not-exist'})
+    after=await ns['get_conversations']().state()
+    located=await w.handle('GET','history',{'conversation_id':b,'anchor':key})
+    print(json.dumps({'exact':found['items'][0]['message_key']==key,'owner':found['items'][0]['conversation_id']==b,
+      'archived':bool(found['items'][0]['archived']),'unchanged':before==after,'located':any(m['history_key']==key for m in located['messages'])}))
+    await db.close()
+asyncio.run(main())
+''')
+        self.assertTrue(all(result.values()), result)
+
     def test_cross_conversation_sources_filters_and_read_only_history(self):
         result=self.run_probe(self.SECTIONS_PREAMBLE+r'''
 import asyncio,time,hashlib

@@ -32,7 +32,9 @@ class WebTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 cancelled.set()
         handler = SimpleNamespace(config=SimpleNamespace(loop=asyncio.get_running_loop()))
         with self.assertRaises(WebOperationTimeout):
-            await asyncio.to_thread(_Handler._run_coro, handler, write(), 0.02)
+            # Allow Windows worker/proactor dispatch to enter the coroutine;
+            # the assertion tests cancellation, not a 20 ms scheduler race.
+            await asyncio.to_thread(_Handler._run_coro, handler, write(), 0.5)
         await asyncio.wait_for(cancelled.wait(), 1)
         self.assertEqual([], writes)
 
@@ -47,7 +49,7 @@ class WebTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 cancelled.set()
         handler = SimpleNamespace(config=SimpleNamespace(loop=asyncio.get_running_loop()))
         with self.assertRaisesRegex(WebOperationTimeout, '可能已完成'):
-            await asyncio.to_thread(_Handler._run_coro, handler, write(), 0.02)
+            await asyncio.to_thread(_Handler._run_coro, handler, write(), 0.5)
         await asyncio.wait_for(cancelled.wait(), 1)
         self.assertEqual(['already committed'], writes)
 

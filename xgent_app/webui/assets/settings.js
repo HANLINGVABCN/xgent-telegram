@@ -1,13 +1,61 @@
-import {el,button,field,select,check,wb,message,tag} from './components.js';
+import {el,button,field,select,check,wb,message,tag,bytes,requestId} from './components.js';
 
 export async function settingsView({logout,boot,health,state,render,dialog,closeDialog,submit,dirtyForm,confirmAction,refreshBootstrap,setTheme,filter,heading,card,actions}) {
   const settings=boot.settings;
   const page=el('div',{},heading('设置','业务设置与 Telegram、CLI 共享。字号保存到服务端并跨网页设备同步；主题与动效仅影响当前浏览器。',[button('退出登录',logout,'danger')]));
-  const sections=[['appearance','外观'],['conversation','对话与记忆'],['agent','Agent'],['web','Web 与安全'],['health','系统状态']];
+  const sections=[['appearance','外观'],['conversation','对话与记忆'],['agent','Agent'],['web','Web 与安全'],['data','数据与备份'],['health','系统状态']];
   const active=filter('section')||'appearance';
   page.append(el('div',{class:'wb-tabs',role:'tablist'},sections.map(([id,title])=>el('button',{role:'tab','aria-selected':id===active,class:id===active?'active':'',onclick:()=>{if(state.dirty&&!confirm('尚有未保存设置，放弃修改？'))return;state.dirty=false;if(active==='appearance'&&id!==active)window.XGentAppearance?.cancelPreview();filter('section',id);render();}},title))));
   const grid=el('div',{class:'wb-settings-grid'});
   page.classList.add('wb-preferences-page');
+  if(active==='data'){
+    const estimate=await wb('data/estimate');
+    const outputs=check('包含历史命令完整回执 command_outputs/（默认不选）','include_command_outputs');
+    const size=el('p',{class:'wb-note'},'核心数据：'+bytes(estimate.size)+' · '+estimate.file_count+' 个文件');
+    const progress=el('div',{class:'wb-data-progress',role:'status'});
+    const warning=el('p',{class:'wb-note'},'不包含命令回执不会影响数据库中的历史聊天、调用摘要与上下文，但无法从此备份恢复历史命令的完整原始终端输出。勾选将额外加入约 '+bytes(estimate.command_outputs_size)+'，显著增加打包、下载和同步时间。');
+    outputs.onchange=async()=>{try{const value=await wb('data/estimate?include_command_outputs='+outputs.querySelector('input').checked);size.textContent='估算：'+bytes(value.size)+' · '+value.file_count+' 个文件';}catch(error){progress.replaceChildren(message(error.message));}};
+    let polling=null;
+    async function poll(id){
+      clearTimeout(polling);
+      try{
+        const job=await wb('data/status?id='+encodeURIComponent(id));
+        if(!page.isConnected)return;
+        progress.replaceChildren(el('p',{},({packing:'正在打包',verifying:'正在校验',pending:'等待开始',verified:'校验通过',completed:'已完成',restarting:'正在切换并重启'})[job.phase]||job.phase||job.state));
+        if(job.total_bytes)progress.append(el('progress',{value:job.completed_bytes||0,max:job.total_bytes}),el('small',{},bytes(job.completed_bytes)+' / '+bytes(job.total_bytes)));
+        if(job.state==='failed'){progress.append(message(job.error||'操作未完成，原数据仍保留'));return;}
+        if(job.state==='completed'&&job.download_url){progress.append(el('a',{class:'wb-btn primary',href:job.download_url,download:''},'下载含密钥备份'),el('small',{class:'wb-file-path'},job.result?.path||''));sessionStorage.removeItem('xgent-data-job');return;}
+        if(job.state==='ready'){
+          progress.append(el('p',{},'SHA-256 和 SQLite 校验通过，共 '+job.file_count+' 个文件。'),button('确认切换整套数据并重启',async()=>{
+            if(!confirm('将停止服务并切换整套数据，当前数据目录会保留用于回退。恢复后的 Web 密码、端口和 Bot 配置以备份为准。确定继续？'))return;
+            try{await wb('data/activate',{data:{id:job.id,confirm_replace:true}});progress.replaceChildren(message('正在切换并重启，请稍后刷新并使用备份中的密码登录。','note'));}
+            catch(error){progress.append(message(error.message));}
+          },'danger'));return;
+        }
+        if(job.state==='activating'){progress.append(message('服务正在重启；重新连接后可继续查看状态。','note'));return;}
+        polling=setTimeout(()=>poll(id),800);
+      }catch(error){if(page.isConnected)progress.replaceChildren(message(error.message),button('重试查询',()=>poll(id)));}
+    }
+    const exportButton=button('创建核心数据备份',async()=>{
+      if(!confirm('此备份包含 .env 原文、Bot/API 密钥及完整数据库。请仅保存到可信位置，不要公开上传。确认创建？'))return;
+      exportButton.disabled=true;
+      try{const job=await wb('data/export',{data:{request_id:requestId(),confirm_secrets:true,include_command_outputs:outputs.querySelector('input').checked}});sessionStorage.setItem('xgent-data-job',job.id);await poll(job.id);}
+      catch(error){progress.replaceChildren(message(error.message));}finally{exportButton.disabled=false;}
+    },'primary');
+    const file=el('input',{type:'file',accept:'.zip,application/zip','aria-label':'选择实例备份 ZIP'});
+    const importButton=button('上传并校验备份',async()=>{
+      if(!file.files[0]){progress.replaceChildren(message('请选择实例备份 ZIP'));return;}
+      if(!confirm('备份可能含密钥。先上传和校验，不会立即替换当前数据；校验后还需确认切换。继续？'))return;
+      importButton.disabled=true;
+      const data=new FormData();data.append('file',file.files[0]);data.append('text','confirm-instance-restore');data.append('idempotency_key',requestId());
+      const xhr=new XMLHttpRequest();xhr.open('POST','/api/workbench/data/import');
+      xhr.upload.onprogress=event=>{if(event.lengthComputable)progress.replaceChildren(el('progress',{max:event.total,value:event.loaded}),el('span',{},'上传 '+Math.floor(event.loaded/event.total*100)+'%'+(event.loaded===event.total?' · 正在接收确认':'')));};
+      xhr.onload=()=>{importButton.disabled=false;let body={};try{body=JSON.parse(xhr.responseText);}catch{}if(xhr.status!==200){progress.replaceChildren(message(body.error||'备份上传失败'));return;}sessionStorage.setItem('xgent-data-job',body.id);poll(body.id);};
+      xhr.onerror=()=>{importButton.disabled=false;progress.replaceChildren(message('上传连接失败，请重试；当前数据未修改。'));};xhr.send(data);
+    });
+    grid.append(card('标准化实例备份',el('p',{},'包含数据库、.env 原文、长期记忆、私有技能、附件原件、附件版本、生成媒体、对话导出与服务器资产；不含日志、虚拟环境或缓存。'),size,outputs,warning,exportButton),card('整套导入恢复',el('p',{},'只恢复到代码外的独立数据目录。先校验文件哈希和 SQLite，再确认切换；原目录保留为回退目录，不与当前实例合并。'),file,importButton),card('处理状态',progress));
+    const pending=sessionStorage.getItem('xgent-data-job');if(pending)setTimeout(()=>poll(pending),0);
+  }
   if(active==='appearance'){
     const appearance=card('文字字号',el('p',{},'消息、界面和网页终端字号都在这里调整。预览只影响本页，保存后写入服务端配置并同步到其他网页设备。'));
     const theme=select('主题','theme',[{value:'system',label:'跟随系统'},{value:'light',label:'浅色'},{value:'dark',label:'深色'}],localStorage.getItem('xgent-theme')||'system');theme.querySelector('select').onchange=e=>setTheme(e.target.value);
