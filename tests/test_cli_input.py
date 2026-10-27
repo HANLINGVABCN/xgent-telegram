@@ -7,6 +7,7 @@ xgent_cli 在 import 期就会加载全部 section（需要 AUTHORIZED_USER_ID�
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,10 +18,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 PROBE_PREAMBLE = """
-import json, sys
-sys.path.insert(0, %r)
+import json
 import xgent_cli
-""" % str(ROOT)
+"""
 
 
 class CliProbeMixin:
@@ -35,10 +35,13 @@ class CliProbeMixin:
             "NO_COLOR": "1",
         })
         with tempfile.TemporaryDirectory() as cwd:
+            # Single-directory mode intentionally ignores XGENT_DATA_DIR. Give
+            # every probe its own checkout entrypoint so parallel xdist workers
+            # never share the repository database while still importing the
+            # real xgent_app package through PYTHONPATH.
+            shutil.copy2(ROOT / "xgent_cli.py", Path(cwd) / "xgent_cli.py")
             env["XGENT_TRACE_LOG_FILE"] = str(Path(cwd) / "xgent_full_trace.log")
-            # Runtime paths no longer depend on cwd. Give each real CLI import
-            # an explicit external directory instead of sharing the checkout DB.
-            env['XGENT_DATA_DIR'] = str(Path(cwd) / 'data')
+            env.pop("XGENT_DATA_DIR", None)
             result = subprocess.run(
                 [sys.executable, "-c", PROBE_PREAMBLE + code],
                 cwd=cwd,

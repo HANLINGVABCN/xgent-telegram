@@ -46,6 +46,8 @@ def main(argv=None, code_root=None):
             if args.action == "export"
             else DataPaths.discover(code)
         )
+        if args.action == 'migrate':
+            raise BundleError('已恢复单目录模式，无需迁出；使用数据导入/导出菜单即可')
         bundles = (
             DiscoveredBundles(paths) if args.action == "export" else DataBundles(paths)
         )
@@ -61,27 +63,15 @@ def main(argv=None, code_root=None):
 
             shutil.rmtree(staging)
             result = {"ok": True, "manifest": manifest}
-        elif args.action == "migrate" and args.dry_run:
-            result = bundles.migrate(
-                args.target or str(code.parent / "xgent-data"), dry_run=True
-            )
         else:
             if args.action in {"export", "import"} and not args.yes:
                 raise BundleError(
                     "请用 --yes 确认：备份包含 .env/Bot/API 密钥；导入按整套恢复并保留旧目录，不合并。"
                 )
-            # Also rejects other live CLI instances. This is intentionally not
-            # a PID-file heuristic; the database holds a shared OS lease.
-            with DataLease(paths.root, exclusive=True):
-                if args.action == "migrate":
-                    result = bundles.migrate(
-                        args.target or str(code.parent / "xgent-data")
-                    )
-                elif args.action == "export":
-                    result = bundles.export(
-                        args.output, outputs=args.with_command_outputs
-                    )
-                else:
+            if args.action == 'export':
+                result = bundles.export(args.output, outputs=args.with_command_outputs)
+            else:
+                with DataLease(paths.root, exclusive=True):
                     staging, manifest = bundles.prepare_import(args.bundle)
                     result = bundles.activate(staging)
         print(json.dumps(result, ensure_ascii=False, indent=2))

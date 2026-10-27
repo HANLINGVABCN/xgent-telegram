@@ -50,7 +50,9 @@ def test_group_pins_are_isolated_and_switching_groups_never_switches_chat(
     )
     assert ids.index(b) < ids.index(a)
     page.locator("#conversation-search").fill("pin isolation")
-    assert page.locator(".conv-row").first.get_attribute("data-conversation-id") == b
+    result = page.locator(".global-search-hit").first
+    result.wait_for()
+    assert result.get_attribute("data-search-key").startswith(b + ":")
     page.close()
 
 
@@ -63,8 +65,11 @@ def test_backup_ui_is_explicit_separate_from_chat(browser_context, workspace_url
         "checkbox", name="包含历史命令完整回执 command_outputs/（默认不选）"
     )
     assert not checkbox.is_checked()
-    assert "不包含命令回执不会影响数据库" in page.locator("#wb-page").inner_text()
-    assert page.get_by_role("button", name="上传并校验备份").count() == 1
+    text = page.locator("#wb-page").inner_text()
+    assert "不含命令回执不会影响聊天" in text
+    assert "服务器备份文件" in text
+    assert page.get_by_role("button", name="上传并校验本地备份").count() == 1
+    assert page.get_by_role("button", name="校验所选服务器备份").count() == 1
     page.close()
 
 

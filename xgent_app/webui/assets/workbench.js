@@ -77,7 +77,7 @@ function closeDetail(force=false){if(!force&&state.detailSaving)return false;if(
 $('wb-detail-close').onclick=()=>closeDetail();
 function errorOr(node,fn){return async()=>{try{await fn();}catch(e){showError(node,e);}};}
 async function outputViewer(path,title='完整输出',onBack,source){let current=0,previous=[];const area=el('div');detail(title,area);const signal=state.detailRequest.signal;async function load(offset,back){area.replaceChildren(message('正在读取完整输出…','loading'));try{const page=await api('/api/output/page',{data:{path,offset},signal});current=offset;previous=back;area.replaceChildren(el('p',{class:'wb-note'},`${page.filename} · ${bytes(page.offset)} — ${bytes(page.next_offset)} / ${bytes(page.size)}`),actions(button('上一页',()=>load(previous.at(-1),previous.slice(0,-1))),button('下一页',()=>load(page.next_offset,[...previous,current])),button('复制本页',()=>copyText(page.text).catch(e=>showError(area,e)))),el('pre',{class:'wb-pre wb-output-text'},page.text));area.querySelectorAll('button')[0].disabled=!previous.length;area.querySelectorAll('button')[1].disabled=page.eof;area.append(el('div',{class:'wb-file-path'},el('code',{},page.path||path),button('复制完整路径',()=>copyText(page.path||path).catch(e=>showError(area,e)))));if(source)area.prepend(sourceLink(source));area.prepend(button('收起完整输出',()=>closeDetail()));if(onBack)area.prepend(button('返回任务详情',onBack));}catch(e){area.replaceChildren(message(e.message),button('重试读取',()=>load(offset,back)),onBack?button('返回任务详情',onBack):null);}}await load(0,[]);}
-async function refreshBootstrap(){const epoch=state.authEpoch;const boot=await wb('bootstrap');if(epoch!==state.authEpoch)throw new DOMException('登录状态已改变','AbortError');state.boot=boot;window.XGentAppearance?.accept(boot.settings);window.XGentChat?.commands(state.boot.commands||[]);chatControls();return state.boot;}
+async function refreshBootstrap(){const epoch=state.authEpoch,previous=state.boot?.asset_version;const boot=await wb('bootstrap');if(epoch!==state.authEpoch)throw new DOMException('登录状态已改变','AbortError');if(previous&&boot.asset_version&&previous!==boot.asset_version){const key='xgent-assets-reloaded:'+boot.asset_version;if(sessionStorage.getItem(key)!=='1'){sessionStorage.setItem(key,'1');location.reload();throw new DOMException('前端已更新','AbortError');}}state.boot=boot;window.XGentAppearance?.accept(boot.settings);window.XGentChat?.commands(state.boot.commands||[]);chatControls();return state.boot;}
 function chatControls(){if(!state.boot)return;window.XGentConversations?.accept(state.boot.conversations);updateComposerControls(state.boot.settings,changeQuick);}
 async function changeQuick(key,value){await wb('settings',{data:{key,value}});await refreshBootstrap();}
 function logout(){return window.XGentChat?.logout();}
@@ -642,7 +642,7 @@ function localFilters(values){
   if(entry){pageCache.set(state.pageKey,entry.route,entry.content,entry.revision,root.scrollTop);Object.assign(pageCache.get(state.pageKey),entry);}
 }
 async function managementModule(name){
-  try{return await import('./'+name+'.js');}
+  try{return await import('./'+name+'.js?v='+encodeURIComponent(state.boot?.asset_version||'current'));}
   catch{throw new Error('管理页面脚本加载失败。若刚更新代码，请重启 XGent 服务并刷新网页；聊天、菜单和退出登录仍可使用。');}
 }
 async function usagePage(read){const {usageView}=await managementModule('usage');return usageView(read,{filter,render,heading,card,actions,priceSettings,state});}

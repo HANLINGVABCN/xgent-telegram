@@ -496,6 +496,7 @@ def _log_ready_banner() -> None:
 
 _memory_maintenance_task: Optional[asyncio.Task] = None
 _memory_limit_task: Optional[asyncio.Task] = None
+_scheduled_backups = None
 
 
 def start_memory_maintenance() -> None:
@@ -537,6 +538,8 @@ async def shutdown_components(app: Any = None) -> None:
     """唯一的停机路径。曾经有两份（on_shutdown / on_shutdown_web_only），
     差别只有一个 TelegramRichAPI 客户端要不要关——那个关闭本身是幂等的，
     于是两份代码里必然有一份会在改动时被忘掉。现在只有这一条。"""
+    if _scheduled_backups is not None:
+        await _scheduled_backups.stop()
     await stop_memory_maintenance()
     for state in _COMPONENT_STATES.values():
         if state.state in (COMPONENT_UP, COMPONENT_STARTING, COMPONENT_DEGRADED):
@@ -559,6 +562,7 @@ async def run_app() -> int:
     Telegram 的组件，最后才把 Telegram 作为受监督任务放出去。这样"TG 连不上"
     这件事发生时，网页和 CLI 同步早就在服务了。
     """
+    global _scheduled_backups
     stop_event = get_app_stop_event()
 
     # 游离 task（create_task）抛的未捕获异常，PTB 的 add_error_handler 接不到。
@@ -573,6 +577,9 @@ async def run_app() -> int:
     #    时连它都不会执行。
     await boot_core()
     start_memory_maintenance()
+    from xgent_app.backup_schedule import ScheduledBackups
+    _scheduled_backups = ScheduledBackups(globals())
+    _scheduled_backups.start()
 
     # 1.5) 抢在任何 MirrorBot 之前把共享 Telegram 通道注册好。晚了的话早期的
     #      MirrorBot 会各自建一个没有持久层的本地通道——断连期间的消息不落库，

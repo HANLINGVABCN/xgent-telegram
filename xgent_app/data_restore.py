@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+import shutil
 import subprocess
 import sys
 import time
-import uuid
 from pathlib import Path
 
 from .data_bundles import DataBundles, write_json
@@ -50,6 +49,13 @@ def main(job_file, code_dir, data_dir):
         time.sleep(1)
         service("stop")
         with DataLease(root, exclusive=True):
+            state(phase="backing_up")
+            pre_import = bundles.export(
+                outputs=True,
+                name_prefix="pre-import",
+                _maintenance_locked=True,
+            )
+            state(pre_import_backup=pre_import, phase="activating")
             result = bundles.activate(saved["staging"])
             rollback = Path(result["rollback_dir"]) if result["rollback_dir"] else None
             state(rollback_dir=str(rollback) if rollback else None, phase="starting")
@@ -65,7 +71,14 @@ def main(job_file, code_dir, data_dir):
                     and status.get("data_dir") == str(root)
                     and status.get("web_healthy", True)
                 ):
-                    state(state="completed", phase="completed", result=result)
+                    if rollback and rollback.is_dir():
+                        shutil.rmtree(rollback)
+                    result["rollback_dir"] = None
+                    state(
+                        state="completed",
+                        phase="completed",
+                        result={**result, "pre_import_backup": pre_import},
+                    )
                     return 0
             time.sleep(0.5)
         raise RuntimeError("恢复后的启动健康检查未通过")
@@ -74,12 +87,7 @@ def main(job_file, code_dir, data_dir):
             try:
                 service("stop")
                 with DataLease(root, exclusive=True):
-                    failed = root.with_name(
-                        root.name + ".failed-" + uuid.uuid4().hex[:8]
-                    )
-                    if root.exists():
-                        os.replace(root, failed)
-                    os.replace(rollback, root)
+                    bundles.rollback_activation(result)
                 service("start")
                 state(
                     state="failed",

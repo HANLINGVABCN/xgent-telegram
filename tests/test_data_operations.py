@@ -19,8 +19,7 @@ class DataOperationsTests(unittest.IsolatedAsyncioTestCase):
         base = Path(self.temp.name)
         code = base / "code"
         code.mkdir()
-        root = base / "data"
-        root.mkdir()
+        root = code
         self.paths = DataPaths(code, root)
         connection = sqlite3.connect(self.paths.database)
         connection.executescript(
@@ -64,13 +63,13 @@ class DataOperationsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(download.path.is_file())
         self.assertFalse(self.manager.lock.busy())
 
-    async def test_running_command_is_not_killed_or_included_in_export(self):
+    async def test_export_succeeds_during_running_command_and_keeps_turn_lock(self):
         self.assertTrue(self.manager.lock.acquire())
         saved = await self.ops.export(
             {"request_id": "blocked-export-key-123", "confirm_secrets": True}
         )
         await asyncio.gather(*self.ops.tasks)
-        self.assertEqual("failed", self.ops.status(saved["id"])["state"])
+        self.assertEqual("completed", self.ops.status(saved["id"])["state"])
         self.assertIsNotNone(self.manager.lock.fd)
 
     async def test_import_only_prepares_until_separately_confirmed_and_takes_temp_ownership(
@@ -99,6 +98,47 @@ class DataOperationsTests(unittest.IsolatedAsyncioTestCase):
             self.ops.activate({"id": saved["id"]})
         self.assertEqual("ready", self.ops.status(saved["id"])["state"])
         self.assertFalse(list(self.paths.root.parent.glob("data.rollback-*")))
+
+    async def test_shared_rules_catalog_delete_and_import_existing_backup(self):
+        custom = self.paths.code.parent / "custom-backups"
+        settings = self.ops.save_backup_settings(
+            {
+                "enabled": True,
+                "frequency": "6h",
+                "mode": "accumulate",
+                "max_backups": 4,
+                "include_command_outputs": False,
+                "backup_directory": str(custom),
+            }
+        )
+        self.assertEqual(str(custom.resolve()), settings["backup_directory"])
+        self.assertEqual(custom.resolve(), self.paths.backups)
+        exported = self.ops.bundles.export()
+        name = Path(exported["path"]).name
+        catalog = self.ops.list_backups()
+        self.assertEqual(str(custom.resolve()), catalog["directory"])
+        item = next(item for item in catalog["items"] if item["name"] == name)
+        self.assertEqual("manual", item["kind"])
+        self.assertTrue(item["valid_manifest"])
+        self.assertEqual(
+            Path(exported["path"]).resolve(), self.ops.download_backup(name).path
+        )
+
+        saved = await self.ops.import_stored(
+            {
+                "name": name,
+                "request_id": "stored-import-key-123456",
+                "confirm_secrets": True,
+            }
+        )
+        await asyncio.gather(*self.ops.tasks)
+        ready = self.ops.status(saved["id"])
+        self.assertEqual("ready", ready["state"], ready)
+        self.assertEqual(name, ready["source_name"])
+
+        deleted = self.ops.delete_backups({"names": [name], "confirm": True})
+        self.assertEqual([name], deleted["deleted"])
+        self.assertFalse(Path(exported["path"]).exists())
 
     async def test_restarted_process_exposes_interrupted_job_not_false_success(self):
         saved, _ = self.ops.create("export", "interrupted-key-123456")

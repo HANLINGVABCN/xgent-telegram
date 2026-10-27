@@ -79,21 +79,15 @@ _legacy_env = os.path.join(PROJECT_ROOT, '.env')
 DATA_PATHS = DataPaths.discover(PROJECT_ROOT)
 DATA_PATHS.ensure()
 configure_paths(DATA_PATHS)
-# The external data .env is authoritative for persisted settings, while an
-# explicit process variable always wins over both files.
+# The project's .env is the only persisted environment configuration.
 if os.path.isfile(str(DATA_PATHS.env)):
     load_dotenv(str(DATA_PATHS.env), override=True)
 if os.path.isfile(_legacy_env) and os.path.abspath(_legacy_env) != str(DATA_PATHS.env):
     load_dotenv(_legacy_env, override=False)
 for _key, _value in _explicit_environment.items():
     os.environ[_key] = _value
-if not DATA_PATHS.legacy:
-    # Restored .env may carry the original host's location. Child processes
-    # must inherit the active resolver, not silently reopen the old instance.
-    os.environ['XGENT_DATA_DIR'] = str(DATA_PATHS.root)
-    from xgent_app.data_bundles import protect
-    if DATA_PATHS.env.is_file(): protect(DATA_PATHS.env)
-    if DATA_PATHS.database.is_file(): protect(DATA_PATHS.database)
+# Old environment keys cannot switch this instance or its child tools elsewhere.
+os.environ.pop('XGENT_DATA_DIR', None)
 
 from xgent_app.conversations import (
     ConversationScope, ConversationError, ConversationBusy, ConversationChanged,

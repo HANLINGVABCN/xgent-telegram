@@ -18,8 +18,7 @@ class DataBundlesTests(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.code = self.base / "code"
         (self.code / "xgent_app").mkdir(parents=True)
-        self.root = self.base / "data"
-        self.root.mkdir()
+        self.root = self.code
         self.paths = DataPaths(self.code, self.root)
         self.service = DataBundles(self.paths)
         with sqlite3.connect(self.paths.database) as conn:
@@ -64,10 +63,10 @@ class DataBundlesTests(unittest.TestCase):
             self.assertIn("xgent_storage/command_outputs/old.txt", archive.namelist())
         staging, manifest = self.service.prepare_import(basic["path"])
         self.assertFalse(manifest["include_command_outputs"])
-        (self.root / "keep-old").write_text("rollback", encoding="utf-8")
+        (self.root / 'memory/keep-old').write_text('rollback', encoding='utf-8')
         result = self.service.activate(staging)
         self.assertEqual(
-            "rollback", (Path(result["rollback_dir"]) / "keep-old").read_text()
+            'rollback', (Path(result['rollback_dir']) / 'memory/keep-old').read_text()
         )
         self.assertEqual(
             b"\0\xff\x01",
@@ -112,32 +111,29 @@ class DataBundlesTests(unittest.TestCase):
         self.assertFalse((self.base / "escape.txt").exists())
         self.assertFalse(list(self.base.glob(".xgent-restore-*")))
 
-    def test_migration_dry_run_preserves_source_and_maps_old_absolute_paths(self):
-        target = self.base / "new-data"
-        dry = self.service.migrate(target, dry_run=True)
-        self.assertTrue(dry["dry_run"])
-        self.assertFalse(target.exists())
-        with patch.object(Path, "home", return_value=self.base / "empty-home"):
-            result = self.service.migrate(target)
-        self.assertTrue(result["old_data_preserved"])
-        self.assertTrue(self.paths.database.exists())
-        discovered = DataPaths.discover(self.code, {})
-        self.assertEqual(target, discovered.root)
-        configure_paths(discovered)
+    def test_import_in_new_project_maps_paths_without_moving_public_code(self):
+        bundle = self.service.export(self.base / 'portable.zip')
+        target = self.base / 'new-project'
+        target.mkdir()
+        script = target / 'install.sh'
+        script.write_text('keep-code', encoding='utf-8')
+        public = target / 'skill-public'
+        public.mkdir()
+        (public / 'skill.md').write_text('keep-public', encoding='utf-8')
+        new_paths = DataPaths.discover(target)
+        new_service = DataBundles(new_paths)
+        staging, _ = new_service.prepare_import(bundle['path'])
+        new_service.activate(staging)
+        configure_paths(new_paths)
         try:
-            old = self.root / "xgent_storage/uploads/original.bin"
-            self.assertEqual(
-                target / "xgent_storage/uploads/original.bin",
-                resolve_stored_path(str(old)),
-            )
-            self.assertEqual(
-                self.code / "xgent_server.py",
-                resolve_stored_path(str(self.code / "xgent_server.py")),
-            )
+            old = self.root / 'xgent_storage/uploads/original.bin'
+            self.assertEqual(target / 'xgent_storage/uploads/original.bin', resolve_stored_path(str(old)))
+            self.assertEqual('keep-code', script.read_text())
+            self.assertEqual('keep-public', (public / 'skill.md').read_text())
         finally:
             configure_paths(None)
         with self.assertRaises(BundleError):
-            self.service.migrate(self.code / "nested")
+            self.service.migrate(self.base / 'external')
 
     def test_lock_shared_runtime_refuses_exclusive_maintenance(self):
         first = DataLease(self.root)
@@ -157,18 +153,13 @@ class DataBundlesTests(unittest.TestCase):
             second.release()
             maintenance.release()
 
-    def test_explicit_external_default_and_legacy_guard(self):
-        self.assertEqual(
-            self.code.parent / "xgent-data", DataPaths.discover(self.code, {}).root
-        )
-        self.assertEqual(
-            self.root,
-            DataPaths.discover(self.code, {"XGENT_DATA_DIR": str(self.root)}).root,
-        )
-        (self.code / ".env").write_text("BOT_TOKEN=old", encoding="utf-8")
-        self.assertTrue(DataPaths.discover(self.code, {}).legacy)
-        with self.assertRaises(ValueError):
-            DataPaths.discover(self.code, {"XGENT_DATA_DIR": str(self.code / "data")})
+    def test_single_directory_ignores_old_location_settings(self):
+        (self.code / '.env').write_text('XGENT_DATA_DIR=/stale/external\n', encoding='utf-8')
+        (self.code / 'data-location.json').write_text('{"data_dir":"/stale/external"}', encoding='utf-8')
+        for environment in ({}, {'XGENT_DATA_DIR': str(self.base / 'external')}):
+            paths = DataPaths.discover(self.code, environment)
+            self.assertEqual(self.code, paths.root)
+            self.assertEqual(self.code.parent / 'xgent-backups', paths.backups)
 
     def test_failed_activation_preserves_old_directory(self):
         bundle = self.service.export(self.base / "backup.zip")
@@ -178,7 +169,7 @@ class DataBundlesTests(unittest.TestCase):
         replace = os.replace
 
         def fail_switch(src, dst):
-            if Path(src) == staging and Path(dst) == self.root:
+            if Path(src) == staging / 'xgent_memory.db' and Path(dst) == self.paths.database:
                 raise OSError("injected switch failure")
             return replace(src, dst)
 
@@ -188,3 +179,27 @@ class DataBundlesTests(unittest.TestCase):
         ):
             self.service.activate(staging)
         self.assertEqual(b"BOT_TOKEN=private-token\n", self.paths.env.read_bytes())
+
+    def test_integrity_failure_reports_specific_index_damage_without_values(self):
+        class BrokenConnection:
+            def execute(self, statement):
+                self.statement = statement
+                return self
+
+            def fetchall(self):
+                return [
+                    ("row 39 missing from index sqlite_autoindex_config_1",),
+                    ("row 40 missing from index sqlite_autoindex_config_1",),
+                ]
+
+            def close(self):
+                pass
+
+        with (
+            patch("xgent_app.data_bundles.sqlite3.connect", return_value=BrokenConnection()),
+            self.assertRaisesRegex(
+                BundleError,
+                "row 39 missing from index sqlite_autoindex_config_1",
+            ),
+        ):
+            check_database(self.paths.database)

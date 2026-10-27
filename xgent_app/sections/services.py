@@ -1253,7 +1253,7 @@ def build_absolute_path_prompt_section() -> str:
         f"- 上传目录: {upload_dir}\n"
         f"- 数据根目录: {to_display_path(DATA_PATHS.root)}\n"
         f"- 用户工作目录: {to_display_path(DATA_PATHS.workspace)}\n"
-        "所有协议的路径参数必须使用绝对路径。新建用户文件默认保存在数据目录的 workspace/；不要把用户数据、附件、密钥和私有脚本写入代码目录。执行公开技能或 xgent_trigger.py 时使用项目根目录下的绝对脚本路径。\n"
+        "命令默认工作目录就是上述项目根目录；命令中的 skill-public/、skill-private/、memory/、workspace/、xgent_storage/ 相对路径均以项目根目录为基准。所有协议的路径参数必须使用绝对路径；新建用户文件默认保存到项目内 workspace/。公开技能与脚本跟随 GitHub 更新，私有技能和用户数据保存在项目内并由备份保护。\n"
         "---\n"
     )
 

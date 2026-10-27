@@ -1,13 +1,8 @@
-"""One source of truth for state paths, independent of the working directory.
-
-Legacy installations remain on their existing data until the explicit migration
-command succeeds. New installations default to a sibling ``xgent-data`` folder.
-"""
+"""One project directory for code and runtime data, independent of shell cwd."""
 
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,51 +15,14 @@ class DataPaths:
 
     @classmethod
     def discover(cls, code_root, environ=None):
-        env = os.environ if environ is None else environ
         code = Path(code_root).resolve()
-        value = env.get("XGENT_DATA_DIR", "").strip()
-        marker = code / "data-location.json"
-        if not value and marker.is_file():
-            value = json.loads(marker.read_text(encoding="utf-8"))["data_dir"]
-        if not value and (code / ".env").is_file():
-            # Bootstrap/install tools must resolve this one path without
-            # importing dotenv or executing any shell content from .env.
-            for line in (code / ".env").read_text(encoding="utf-8-sig").splitlines():
-                key, sep, raw = line.partition("=")
-                if sep and key.strip().removeprefix('export ') == "XGENT_DATA_DIR":
-                    value = raw.strip().strip("\"'")
-        if value:
-            root = Path(value).expanduser()
-            if not root.is_absolute():
-                raise ValueError("XGENT_DATA_DIR 必须是绝对路径")
-            root = root.resolve()
-            if root == Path(root.anchor) or root == Path.home().resolve():
-                raise ValueError("数据目录不能是磁盘根目录或用户主目录，请使用专用目录")
-            if root == code or root.is_relative_to(code):
-                raise ValueError(
-                    "数据目录必须位于代码目录之外；旧部署请执行 data migrate"
-                )
-            return cls(code, root)
-        # Section probes and other isolated test runners execute a temporary
-        # ``xgent_server.py`` without a checkout beside it. Keep their state
-        # under that temporary root instead of sharing the host's sibling data
-        # directory between independent processes.
-        if not (code / "xgent_app").is_dir():
-            return cls(code, code, True)
-        # Do not silently start an empty database after a normal code update.
-        legacy = any(
-            (code / name).exists()
-            for name in (
-                ".env",
-                "xgent_memory.db",
-                "bot_memory.db",
-                "xgent_storage",
-                "memory",
-                "skill-private",
-                "workspace",
-            )
-        )
-        return cls(code, code if legacy else code.parent / "xgent-data", legacy)
+        return cls(code, code, True)
+
+    @property
+    def backups(self):
+        from .backup_storage import configured_backup_directory
+
+        return configured_backup_directory(self.code)
 
     @property
     def env(self):

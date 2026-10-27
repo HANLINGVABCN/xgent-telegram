@@ -52,6 +52,29 @@ MAX_UPLOAD_BODY_LOCAL_API = 2 * 1024 * 1024 * 1024
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui")
 VENDOR_DIR = os.path.join(STATIC_DIR, "vendor")
+_ASSET_REFERENCE_RE = re.compile(
+    r"(?P<quote>['\"])(?P<path>(?:/assets/|\./)[A-Za-z0-9._-]+\.(?:js|css))(?P=quote)"
+)
+
+
+def _asset_version(name: str) -> str:
+    path = os.path.join(STATIC_DIR, "assets", os.path.basename(name))
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()[:16]
+    except OSError:
+        return "missing"
+
+
+def _version_asset_references(body: bytes) -> bytes:
+    text = body.decode("utf-8")
+
+    def replace(match: re.Match) -> str:
+        path = match.group("path")
+        name = path.rsplit("/", 1)[-1]
+        return match.group("quote") + path + "?v=" + _asset_version(name) + match.group("quote")
+
+    return _ASSET_REFERENCE_RE.sub(replace, text).encode("utf-8")
 # 允许直接访问的静态资源白名单：路径 -> (磁盘文件名, Content-Type)。
 # 只列出这几个固定文件，不做通用目录遍历——避免 /vendor/../xxx 这类路径
 # 逃逸到 webui 之外读取任意文件。这几个文件本地自带，纯 Web 模式下不再需要
@@ -403,6 +426,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         except OSError:
             self._send_json({"error": "asset missing"}, status=404)
             return
+        if name.endswith(".js"):
+            body = _version_asset_references(body)
         etag = '"' + hashlib.sha256(body).hexdigest() + '"'
         self.send_response(304 if self.headers.get('If-None-Match') == etag else 200)
         self.send_header('ETag', etag)
@@ -534,7 +559,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         except OSError:
             self._send_html(b"<h1>webui/index.html missing</h1>", status=500)
             return
-        self._send_html(body)
+        self._send_html(_version_asset_references(body))
 
     def _handle_login(self) -> None:
         ip = self._client_ip()

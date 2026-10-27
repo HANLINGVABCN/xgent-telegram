@@ -1,8 +1,8 @@
-"""Verified, streaming instance backups and cold data-directory migration.
+"""Verified streaming backups and in-project state restoration.
 
 This module deliberately has no Telegram/model dependencies. CLI and Web call
-the same service; archives are data-only and can be extracted directly as a
-data directory. A failed validation never touches the active directory.
+the same service. Archives contain state only, and failed validation never
+touches the active checkout.
 """
 
 from __future__ import annotations
@@ -18,10 +18,11 @@ import subprocess
 import tempfile
 import uuid
 import zipfile
-from contextlib import closing
+from contextlib import closing, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
+from .data_lock import DataLease
 from .data_paths import DataPaths
 
 CHUNK = 1024 * 1024
@@ -53,6 +54,10 @@ SKIP_DIRS = {
 
 class BundleError(ValueError):
     pass
+
+
+class BundleChanged(BundleError):
+    """A live file changed; retry a fresh snapshot instead of publishing it."""
 
 
 def protect(path, directory=False):
@@ -111,8 +116,15 @@ def check_database(path):
         with closing(
             sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
         ) as conn:
-            if conn.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
-                raise BundleError("SQLite 完整性检查失败")
+            integrity = [
+                str(row[0])
+                for row in conn.execute("PRAGMA integrity_check").fetchall()
+            ]
+            if integrity != ["ok"]:
+                details = "；".join(integrity[:5])
+                if len(integrity) > 5:
+                    details += f"；另有 {len(integrity) - 5} 项"
+                raise BundleError("SQLite 完整性检查失败：" + details)
             tables = {
                 row[0]
                 for row in conn.execute(
@@ -139,7 +151,9 @@ def sqlite_snapshot(source, target):
         ) as incoming,
         closing(sqlite3.connect(target)) as outgoing,
     ):
-        incoming.backup(outgoing)
+        # Incremental SQLite backup yields between page batches. WAL writers
+        # continue while the separate reader produces a consistent database.
+        incoming.backup(outgoing, pages=256, sleep=0.01)
     protect(target)
     check_database(target)
 
@@ -160,7 +174,7 @@ def safe_name(name):
         )
     ):
         raise BundleError("备份包含不安全路径")
-    allowed = name in {".env", "xgent_memory.db", "path-map.json"} or any(
+    allowed = name in {".env", "xgent_memory.db", "path-map.json", "backup-schedule.json"} or any(
         name.startswith(root + "/")
         for root in (*TREES, "xgent_storage/command_outputs")
     )
@@ -179,7 +193,7 @@ class DataBundles:
 
     def files(self, outputs=False, *, migration=False):
         root = self.paths.root
-        for name in (".env", "xgent_memory.db", "path-map.json"):
+        for name in (".env", "xgent_memory.db", "path-map.json", "backup-schedule.json"):
             path = root / name
             if path.is_symlink():
                 raise BundleError("数据文件不能是符号链接：" + name)
@@ -248,33 +262,80 @@ class DataBundles:
             "data_dir": str(self.paths.root),
         }
 
-    def export(self, destination=None, *, outputs=False, progress=lambda **state: None):
+    def export(
+        self,
+        destination=None,
+        *,
+        outputs=False,
+        progress=lambda **state: None,
+        overwrite=False,
+        name_prefix="manual",
+        _maintenance_locked=False,
+    ):
+        # Shared with the live application's lease, exclusive only against
+        # another export. Never acquire the AI turn lock or database writer.
+        with (
+            nullcontext()
+            if _maintenance_locked
+            else DataLease(self.paths.root)
+        ), DataLease(self.paths.root / "backup-export", exclusive=True):
+            for attempt in range(3):
+                try:
+                    return self._export_once(
+                        destination,
+                        outputs=outputs,
+                        progress=progress,
+                        overwrite=overwrite,
+                        name_prefix=name_prefix,
+                    )
+                except (BundleChanged, FileNotFoundError):
+                    if attempt == 2:
+                        raise BundleError(
+                            "文件持续变化，本次备份未发布；服务继续运行，旧备份保留"
+                        ) from None
+                    progress(phase="retrying", attempt=attempt + 2)
+
+    def _export_once(
+        self,
+        destination=None,
+        *,
+        outputs=False,
+        progress=lambda **state: None,
+        overwrite=False,
+        name_prefix="manual",
+    ):
         if not self.paths.database.is_file():
             raise BundleError("核心数据库不存在，不能创建空备份")
         folder = (
             Path(destination).parent
             if destination
-            else self.paths.root.parent / "xgent-backups"
+            else self.paths.backups
         )
         folder.mkdir(parents=True, exist_ok=True, mode=0o700)
         protect(folder, True)
+        if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", name_prefix):
+            raise BundleError("备份名称前缀无效")
         target = (
             Path(destination)
             if destination
             else folder
             / (
-                "xgent-"
+                name_prefix
+                + "-"
                 + datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S")
                 + "-"
                 + uuid.uuid4().hex[:8]
                 + ".zip"
             )
         )
-        if target.exists() or target.resolve().is_relative_to(
-            self.paths.storage / "exports"
+        resolved_target = target.resolve()
+        if (
+            (target.exists() and not overwrite)
+            or target.is_symlink()
+            or resolved_target.is_relative_to(self.paths.code.resolve())
         ):
-            raise BundleError("备份目标已存在，或位于会递归打包的 exports 目录中")
-        temporary = target.with_name(target.name + ".part")
+            raise BundleError("备份目标已存在，或位于项目目录内部")
+        temporary = target.with_name(target.name + '.' + uuid.uuid4().hex + '.part')
         entries = list(self.files(outputs))
         total = sum(path.stat().st_size for _, path in entries)
         if shutil.disk_usage(folder).free < total + self.paths.database.stat().st_size:
@@ -301,7 +362,7 @@ class DataBundles:
                 database = Path(snapshot) / "xgent_memory.db"
                 sqlite_snapshot(self.paths.database, database)
                 with zipfile.ZipFile(
-                    temporary, "x", zipfile.ZIP_DEFLATED, allowZip64=True
+                    temporary, "x", zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True
                 ) as archive:
                     protect(temporary)
                     done = 0
@@ -335,7 +396,7 @@ class DataBundles:
                             after.st_size,
                             after.st_mtime_ns,
                         ) or size != before.st_size:
-                            raise BundleError("备份期间文件发生变化，请重试：" + name)
+                            raise BundleChanged("备份期间文件发生变化，请重试：" + name)
                         manifest["files"][name] = {
                             "size": size,
                             "sha256": sha.hexdigest(),
@@ -483,125 +544,100 @@ class DataBundles:
             raise
 
     def activate(self, staging):
-        staging = Path(staging).resolve()
-        active = self.paths.root.resolve()
-        if active == self.paths.code or active.is_relative_to(self.paths.code):
-            raise BundleError("请先迁出代码目录，再恢复整套数据")
-        if staging.parent != active.parent or not staging.name.startswith(
+        if self.paths.root.resolve() != self.paths.code.resolve():
+            raise BundleError('单目录模式只允许恢复当前项目的数据')
+        return self._activate_project(Path(staging).resolve())
+
+    PROJECT_STATE = (
+        ".env",
+        "xgent_memory.db",
+        "bot_memory.db",
+        "memory",
+        "skill-private",
+        "workspace",
+        "server_assets",
+        "xgent_storage",
+        "bot_storage",
+        "path-map.json",
+        "restore-info.json",
+        "backup-schedule.json",
+        *(
+            name + suffix
+            for name in ("xgent_memory.db", "bot_memory.db")
+            for suffix in ("-wal", "-shm", "-journal")
+        ),
+    )
+
+    def _activate_project(self, staging):
+        """Replace whitelisted state in place; never move code/public skills."""
+        root = self.paths.code.resolve()
+        if staging.parent != root.parent or not staging.name.startswith(
             ".xgent-restore-"
         ):
-            raise BundleError("恢复 staging 目录无效")
+            raise BundleError("恢复临时目录无效")
         check_database(staging / "xgent_memory.db")
-        rollback = active.with_name(
-            active.name
-            + ".rollback-"
-            + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-            + "-"
-            + uuid.uuid4().hex[:6]
-        )
-        existed = active.exists()
-        old_moved = new_moved = False
+        for name in self.PROJECT_STATE:
+            if (root / name).is_symlink():
+                raise BundleError("项目数据不能是符号链接：" + name)
+        rollback_root = root / ".install-state" / "restore-rollback"
+        rollback_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        protect(rollback_root, True)
+        rollback = rollback_root / ("restore-rollback-" + uuid.uuid4().hex)
+        rollback.mkdir(parents=True, mode=0o700)
+        protect(rollback, True)
+        installed, moved = [], []
         try:
-            if existed:
-                os.replace(active, rollback)
-                old_moved = True
-            os.replace(staging, active)
-            new_moved = True
-            check_database(active / "xgent_memory.db")
+            for name in self.PROJECT_STATE:
+                old, new = root / name, staging / name
+                if old.exists():
+                    os.replace(old, rollback / name)
+                    moved.append(name)
+                if new.exists():
+                    os.replace(new, old)
+                    installed.append(name)
+            check_database(root / 'xgent_memory.db')
         except BaseException:
-            if active.exists() and new_moved:
-                failed = active.with_name(
-                    active.name + ".failed-" + uuid.uuid4().hex[:8]
-                )
-                os.replace(active, failed)
-            if old_moved and rollback.exists():
-                os.replace(rollback, active)
+            failed_root = root / ".install-state" / "restore-failed"
+            failed_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            failed = failed_root / ("restore-failed-" + uuid.uuid4().hex)
+            failed.mkdir(mode=0o700)
+            for name in reversed(installed):
+                if (root / name).exists():
+                    os.replace(root / name, failed / name)
+            for name in reversed(moved):
+                os.replace(rollback / name, root / name)
             raise
-        return {
-            "data_dir": str(active),
-            "rollback_dir": str(rollback) if existed else None,
-        }
-
-    def migrate(self, target, *, dry_run=False):
-        target = Path(target).expanduser().resolve()
-        source = self.paths.root.resolve()
-        if (
-            target == source
-            or target == self.paths.code
-            or target.is_relative_to(self.paths.code)
-            or source.is_relative_to(target)
-        ):
-            raise BundleError("目标必须是代码/源目录之外的独立目录")
-        if target.exists():
-            raise BundleError("迁移目标已存在，拒绝合并或覆盖")
-        entries = list(self.files(True, migration=True))
-        result = {
-            "source": str(source),
-            "data_dir": str(target),
-            "file_count": len(entries),
-            "size": sum(p.stat().st_size for _, p in entries),
-            "dry_run": dry_run,
-        }
-        if dry_run:
-            return result
-        target.parent.mkdir(parents=True, exist_ok=True)
-        staging = Path(tempfile.mkdtemp(prefix=".xgent-restore-", dir=target.parent))
-        protect(staging, True)
-        try:
-            checks = {}
-            for name, path in entries:
-                destination = staging / name
-                destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                if name == "xgent_memory.db":
-                    sqlite_snapshot(path, destination)
-                else:
-                    before = digest_file(path)
-                    shutil.copy2(path, destination)
-                    if before != digest_file(destination) or before != digest_file(
-                        path
-                    ):
-                        raise BundleError("迁移文件校验失败：" + name)
-                checks[name] = digest_file(destination)[1]
-            # Runtime logs/local Bot API cache are moved out too, but never
-            # included in a portable core backup.
-            if self.paths.logs.exists():
-                (staging / "logs").mkdir(exist_ok=True)
-                for path in self.paths.logs.glob("*.log*"):
-                    if path.is_file() and not path.is_symlink():
-                        shutil.copy2(path, staging / "logs" / path.name)
-            local_api = source / ".local-api-data"
-            if local_api.exists():
-                shutil.copytree(local_api, staging / ".local-api-data", symlinks=True)
-            legacy_asset = Path.home() / ".config" / "vps-manager" / "servers.json"
-            asset = staging / "server_assets/vps-manager/servers.json"
-            if not asset.exists() and legacy_asset.is_file():
-                asset.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                shutil.copy2(legacy_asset, asset)
-                protect(asset)
-            mapping = []
-            if (staging / "path-map.json").is_file():
-                mapping = json.loads(
-                    (staging / "path-map.json").read_text(encoding="utf-8")
-                ).get("previous_roots", [])
-            write_json(
-                staging / "path-map.json",
-                {
-                    "previous_roots": sorted(
-                        set(mapping + [str(source), str(self.paths.code)])
-                    )
-                },
-            )
-            write_json(staging / "migration-checks.json", checks)
-            check_database(staging / "xgent_memory.db")
-            if (staging / ".env").exists():
-                protect(staging / ".env")
-            os.replace(staging, target)
-            write_json(
-                self.paths.code / "data-location.json",
-                {"data_dir": str(target), "previous_data_dir": str(source)},
-            )
-            return {**result, "old_data_preserved": True}
-        except BaseException:
+        finally:
             if staging.exists():
                 shutil.rmtree(staging)
-            raise
+        return {
+            "data_dir": str(root),
+            "rollback_dir": str(rollback),
+            "in_project": True,
+            "installed_state": installed,
+            "moved_state": moved,
+        }
+
+    def rollback_activation(self, result):
+        if not result.get('in_project'):
+            raise BundleError("此回退只支持项目内数据")
+        root = self.paths.code.resolve()
+        rollback = Path(result['rollback_dir']).resolve()
+        rollback_root = (root / ".install-state" / "restore-rollback").resolve()
+        if rollback.parent != rollback_root or not rollback.name.startswith(
+            "restore-rollback-"
+        ):
+            raise BundleError("数据回退目录无效")
+        failed_root = root / ".install-state" / "restore-failed"
+        failed_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        failed = failed_root / ("restore-failed-" + uuid.uuid4().hex)
+        failed.mkdir(mode=0o700)
+        for name in result['installed_state']:
+            if (root / name).exists():
+                os.replace(root / name, failed / name)
+        for name in result['moved_state']:
+            os.replace(rollback / name, root / name)
+        return failed
+
+    def migrate(self, target, *, dry_run=False):
+        raise BundleError("已恢复单目录模式，无需迁出；使用导入/导出功能即可")

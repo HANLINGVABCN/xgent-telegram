@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import subprocess
@@ -11,10 +12,15 @@ import sys
 import threading
 import time
 import uuid
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from .backup_schedule import configure as configure_backup_schedule
+from .backup_schedule import read_settings as read_backup_settings
+from .backup_storage import default_backup_directory
 from .data_bundles import BundleError, DataBundles, protect, write_json
+from .data_lock import DataLease
 
 
 @dataclass(frozen=True)
@@ -27,10 +33,8 @@ class DataOperations:
         self.ns = namespace
         self.paths = namespace["DATA_PATHS"]
         self.bundles = DataBundles(self.paths)
-        self.directory = self.paths.root.parent / (
-            ".xgent-jobs-" + self.paths.root.name
-        )
-        self.directory.mkdir(mode=0o700, exist_ok=True)
+        self.directory = self.paths.root / '.install-state/data-jobs'
+        self.directory.mkdir(mode=0o700, exist_ok=True, parents=True)
         protect(self.directory, True)
         self.jobs = {}
         self.tasks = set()
@@ -105,16 +109,109 @@ class DataOperations:
             )
         return {"ok": True, **saved}
 
+    def backup_settings(self):
+        settings = read_backup_settings(self.paths.code)
+        return {
+            "ok": True,
+            **settings,
+            "default_backup_directory": str(
+                default_backup_directory(self.paths.code).resolve()
+            ),
+        }
+
+    def save_backup_settings(self, data):
+        settings = configure_backup_schedule(
+            self.paths.code,
+            enabled=data.get("enabled") is True,
+            frequency=str(data.get("frequency") or "1d"),
+            mode=str(data.get("mode") or "accumulate"),
+            outputs=data.get("include_command_outputs") is True,
+            max_backups=int(data.get("max_backups") or 7),
+            backup_directory=data.get("backup_directory"),
+        )
+        return {"ok": True, **self.backup_settings(), "saved": settings}
+
+    def _backup_file(self, name):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,180}\.zip", str(name)):
+            raise BundleError("备份文件名无效")
+        directory = self.paths.backups.resolve()
+        path = (directory / str(name)).resolve()
+        if path.parent != directory or path.is_symlink() or not path.is_file():
+            raise BundleError("备份文件不存在")
+        return path
+
+    @staticmethod
+    def _backup_kind(name):
+        if name == "scheduled-latest.zip":
+            return "scheduled_overwrite", "定时备份（覆盖）"
+        if name.startswith("scheduled-"):
+            return "scheduled", "定时备份（累计）"
+        if name.startswith("pre-import-target-"):
+            return "pre_import_target", "导入前目标备份"
+        if name.startswith("pre-import-"):
+            return "pre_import", "导入前自动备份"
+        if name.startswith("manual-"):
+            return "manual", "手动备份"
+        return "legacy", "兼容备份"
+
+    def list_backups(self):
+        directory = self.paths.backups
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        protect(directory, True)
+        items = []
+        for path in directory.glob("*.zip"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            stat_result = path.stat()
+            kind, label = self._backup_kind(path.name)
+            item = {
+                "name": path.name,
+                "path": str(path.resolve()),
+                "size": stat_result.st_size,
+                "created_at": stat_result.st_mtime,
+                "kind": kind,
+                "label": label,
+                "valid_manifest": False,
+                "include_command_outputs": None,
+                "file_count": None,
+            }
+            try:
+                with zipfile.ZipFile(path) as archive:
+                    manifest = json.loads(archive.read("manifest.json"))
+                item.update(
+                    valid_manifest=manifest.get("format") == "xgent-instance",
+                    include_command_outputs=bool(
+                        manifest.get("include_command_outputs")
+                    ),
+                    file_count=len(manifest.get("files") or {}),
+                    manifest_created_at=manifest.get("created_at"),
+                )
+            except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+                pass
+            items.append(item)
+        items.sort(key=lambda item: (item["created_at"], item["name"]), reverse=True)
+        return {
+            "ok": True,
+            "directory": str(directory.resolve()),
+            "items": items,
+        }
+
+    def delete_backups(self, data):
+        names = data.get("names")
+        if data.get("confirm") is not True or not isinstance(names, list) or not names:
+            raise BundleError("请选择备份并确认删除")
+        if len(names) > 200 or len(set(map(str, names))) != len(names):
+            raise BundleError("备份删除列表无效")
+        paths = [self._backup_file(name) for name in names]
+        deleted = []
+        with DataLease(self.paths.root / "backup-export", exclusive=True):
+            for path in paths:
+                path.unlink()
+                deleted.append(path.name)
+        return {"ok": True, "deleted": deleted, **self.list_backups()}
+
     async def _export(self, identifier, outputs):
-        manager = self.ns["get_conversations"]()
-        acquired = False
         try:
-            # Lock admissions, not Telegram delivery. Already running commands
-            # are never killed for a backup; the caller may retry when idle.
-            acquired = manager.lock.acquire()
-            if not acquired:
-                raise BundleError("有对话/命令正在运行，请结束后再创建备份。")
-            db = await self.ns["BotMemoryDB"].get_instance()
             last_write = [0.0]
 
             def progress(**changes):
@@ -125,10 +222,18 @@ class DataOperations:
                     self.update(identifier, **changes)
                     last_write[0] = time.monotonic()
 
-            async with db._write_lock:
-                result = await asyncio.to_thread(
-                    self.bundles.export, outputs=outputs, progress=progress
-                )
+            operation = asyncio.create_task(asyncio.to_thread(
+                self.bundles.export, outputs=outputs, progress=progress))
+            try:
+                result = await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                try:
+                    await operation
+                except Exception as exc:  # noqa: BLE001 - cancellation still wins
+                    logging.getLogger(__name__).warning(
+                        "停止 Web 备份任务时，后台写入失败：%s", exc
+                    )
+                raise
             self.update(
                 identifier,
                 state="completed",
@@ -137,9 +242,6 @@ class DataOperations:
             )
         except Exception as exc:  # noqa: BLE001 - detached job must persist all failures
             self.update(identifier, state="failed", error=str(exc), phase="failed")
-        finally:
-            if acquired:
-                manager.lock.release()
 
     async def upload_import(self, data):
         if data.get("confirm_secrets") is not True:
@@ -147,12 +249,29 @@ class DataOperations:
         saved, created = self.create("import", data.get("request_id"))
         if created:
             source = Path(data["_bundle_path"])
-            self.start(self._prepare_import(saved["id"], source, data["_temporary"]))
+            self.start(
+                self._prepare_import(
+                    saved["id"], source, data["_temporary"], source_name=source.name
+                )
+            )
         else:
             data["_temporary"].cleanup()
         return {"ok": True, **saved}
 
-    async def _prepare_import(self, identifier, bundle, temporary):
+    async def import_stored(self, data):
+        if data.get("confirm_secrets") is not True:
+            raise BundleError("请确认按整套备份校验和恢复")
+        source = self._backup_file(data.get("name"))
+        saved, created = self.create("import", data.get("request_id"))
+        if created:
+            self.start(
+                self._prepare_import(
+                    saved["id"], source, None, source_name=source.name
+                )
+            )
+        return {"ok": True, **saved}
+
+    async def _prepare_import(self, identifier, bundle, temporary, source_name=None):
         try:
             self.update(identifier, phase="verifying")
             staging, manifest = await asyncio.to_thread(
@@ -165,11 +284,13 @@ class DataOperations:
                 staging=str(staging),
                 include_outputs=manifest["include_command_outputs"],
                 file_count=len(manifest["files"]),
+                source_name=source_name or Path(bundle).name,
             )
         except Exception as exc:  # noqa: BLE001 - detached job must persist all failures
             self.update(identifier, state="failed", phase="failed", error=str(exc))
         finally:
-            temporary.cleanup()
+            if temporary is not None:
+                temporary.cleanup()
 
     def activate(self, data):
         saved = self.status(data.get("id"))
@@ -179,8 +300,6 @@ class DataOperations:
             or saved["state"] != "ready"
         ):
             raise BundleError("必须先完整校验并确认整套恢复。")
-        if self.paths.legacy:
-            raise BundleError("此实例仍使用代码内数据；请先执行 xgent data migrate。")
         installer = self.paths.code / "install.sh"
         if os.name != "posix" or not installer.is_file():
             raise BundleError(
@@ -213,9 +332,12 @@ class DataOperations:
             raise BundleError("备份尚未完成")
         path = Path(saved["result"]["path"]).resolve()
         if (
-            path.parent != (self.paths.root.parent / "xgent-backups").resolve()
+            path.parent != self.paths.backups.resolve()
             or not path.is_file()
             or path.is_symlink()
         ):
             raise BundleError("备份文件已不存在")
         return BackupDownload(path)
+
+    def download_backup(self, name):
+        return BackupDownload(self._backup_file(name))

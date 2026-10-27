@@ -1,6 +1,6 @@
 # XGent for Telegram
 
-运行数据外置、整套实例备份/恢复、Web 分组与消息展示的新约定见 [数据管理与迁移说明](docs/data-management.md)。旧实例升级不会自动搬数据；请先 dry-run，再在维护窗口迁移。
+项目内单目录数据、无感导出、定时备份、整套恢复，以及 Web 分组与消息展示的新约定见 [数据管理与迁移说明](docs/data-management.md)。导出不停服、不重启；导入只替换数据并保留源码、公共技能和依赖。
 
 <p align="center">
   <strong>把你的 Linux 服务器装进 Telegram。</strong>

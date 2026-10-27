@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import time
 import uuid
 from contextlib import ExitStack
 from pathlib import Path
 
-from .data_bundles import BundleError, DataBundles, check_database, protect, write_json
+from .data_bundles import BundleError, DataBundles, check_database, protect
 from .data_discovery import (
     DiscoveredBundles,
     DiscoveredPaths,
-    configured_directory,
     discover_instance,
     prepare_compatible_import,
     validate_target,
@@ -32,34 +30,6 @@ def size_text(size):
     )
 
 
-def replace_location(env_file, target):
-    """Change only the directory setting; never print or replace other secrets."""
-    env_file = Path(env_file)
-    if not env_file.is_file():
-        return
-    original_stat = env_file.stat()
-    raw = env_file.read_text(encoding="utf-8-sig")
-    if not re.search(r"^\s*(?:export\s+)?XGENT_DATA_DIR\s*=", raw, re.MULTILINE):
-        return
-    updated = re.sub(
-        r"^\s*(?:export\s+)?XGENT_DATA_DIR\s*=.*$",
-        lambda _: "XGENT_DATA_DIR=" + str(target),
-        raw,
-        flags=re.MULTILINE,
-    )
-    temporary = env_file.with_name(
-        env_file.name + ".location-" + uuid.uuid4().hex + ".tmp"
-    )
-    with temporary.open("x", encoding="utf-8", newline="\n") as handle:
-        protect(temporary)
-        handle.write(updated)
-        handle.flush()
-        os.fsync(handle.fileno())
-    if os.name == "posix" and os.geteuid() == 0:
-        os.chown(temporary, original_stat.st_uid, original_stat.st_gid)
-    os.replace(temporary, env_file)
-
-
 class MigrationWorkflow:
     def __init__(self, code, *, service=None, report=print, environ=None):
         self.code = Path(code).resolve()
@@ -70,7 +40,14 @@ class MigrationWorkflow:
     def source(self, required=True):
         return discover_instance(self.code, self.environ, required=required)
 
-    def _backup(self, paths, outputs=True):
+    def _backup(
+        self,
+        paths,
+        outputs=True,
+        *,
+        maintenance_locked=False,
+        name_prefix="manual",
+    ):
         self.report("正在自动查找并备份：" + str(paths.root))
         last = [0.0]
 
@@ -92,47 +69,25 @@ class MigrationWorkflow:
                 )
                 last[0] = time.monotonic()
 
-        result = DiscoveredBundles(paths).export(outputs=outputs, progress=progress)
+        result = DiscoveredBundles(paths).export(
+            outputs=outputs,
+            progress=progress,
+            name_prefix=name_prefix,
+            _maintenance_locked=maintenance_locked,
+        )
         self.report("备份已校验：" + result["path"])
         return result
 
     def export(self, *, outputs=False):
         paths = self.source()
-        state = self.service.inspect(paths)
-        self.service.ensure_idle(paths)
-        paused = False
-        result = None
-        try:
-            if state.running:
-                self.report("正在安全暂停当前实例，导出后自动恢复……")
-                self.service.stop(state)
-                paused = True
-            with DataLease(paths.root, exclusive=True):
-                result = self._backup(paths, outputs)
-        finally:
-            if paused:
-                self.report("正在恢复原服务……")
-                try:
-                    resume = getattr(self.service, "resume", self.service.start)
-                    resume(paths, state)
-                except Exception as exc:
-                    # Backup remains valid even if startup fails. The message
-                    # must distinguish a successful export from service health.
-                    raise BundleError(
-                        (
-                            "备份已成功，文件为 " + result["path"] + "；"
-                            if result
-                            else ""
-                        )
-                        + "原数据未删除，但服务未能恢复，请查看脚本“运行状态”"
-                    ) from exc
-        self.report(
-            "导出完成。"
-            + ("原服务已恢复。" if paused else "服务原本未运行，保持停止状态。")
-        )
+        self.report('正在无感导出备份，服务和对话继续运行……')
+        result = self._backup(paths, outputs)
+        self.report('导出完成，无需重启服务。')
         return result
 
     def prepare_import(self, source, target):
+        if Path(target).resolve() != self.code:
+            raise BundleError('单目录模式只允许导入当前项目目录')
         target = validate_target(self.code, target)
         paths = DataPaths(self.code, target)
         validate = getattr(self.service, "validate_import_target", None)
@@ -171,6 +126,8 @@ class MigrationWorkflow:
                     os.chown(file, owner.st_uid, owner.st_gid)
 
     def activate_import(self, staging, target, *, start_after=True):
+        if Path(target).resolve() != self.code:
+            raise BundleError('单目录模式只允许恢复当前项目的数据')
         target = validate_target(self.code, target)
         staging = Path(staging).resolve()
         if staging.parent != target.parent or not staging.name.startswith(
@@ -181,17 +138,13 @@ class MigrationWorkflow:
         before = self.source(required=False)
         state = self.service.inspect(before)
         self.service.ensure_idle(before)
-        local_api = (
-            self.service.local_api(before)
-            if hasattr(self.service, "local_api")
-            else None
-        )
+        local_api = None  # The local Bot API volume remains in this project.
         configs = {
-            path: path.read_bytes() if path.is_file() else None
-            for path in (self.code / "data-location.json", self.code / ".env")
+            self.code / ".env": (self.code / ".env").read_bytes()
+            if (self.code / ".env").is_file()
+            else None
         }
         config_stats = {path: path.stat() for path in configs if path.is_file()}
-        rollback = None
         switched = False
         paused = False
         start_attempted = False
@@ -211,37 +164,41 @@ class MigrationWorkflow:
                 # user selected a different destination. A third existing target
                 # is backed up separately, never silently merged or destroyed.
                 if before.database.is_file():
-                    backups.append(self._backup(before, True))
+                    backups.append(
+                        self._backup(
+                            before,
+                            True,
+                            maintenance_locked=True,
+                            name_prefix="pre-import",
+                        )
+                    )
                 destination = DiscoveredPaths(self.code, target)
                 if target != before.root and destination.database.is_file():
-                    backups.append(self._backup(destination, True))
+                    backups.append(
+                        self._backup(
+                            destination,
+                            True,
+                            maintenance_locked=True,
+                            name_prefix="pre-import-target",
+                        )
+                    )
                 if local_api:
                     local_api.copy_cache(staging)
                 self._preserve_owner(staging, before, destination)
                 self.report("校验通过，正在切换整套数据（不合并、不改项目名）……")
                 result = DataBundles(DataPaths(self.code, target)).activate(staging)
-                rollback = (
-                    Path(result["rollback_dir"]) if result["rollback_dir"] else None
-                )
                 switched = True
-                replace_location(target / ".env", target)
-                replace_location(self.code / ".env", target)
-                write_json(
-                    self.code / "data-location.json",
-                    {"data_dir": str(target), "previous_data_dir": str(before.root)},
-                )
-                if os.name == "posix" and os.geteuid() == 0:
-                    owner = self.code.stat()
-                    os.chown(
-                        self.code / "data-location.json", owner.st_uid, owner.st_gid
-                    )
             if local_api:
                 local_api.switch(target)
             if start_after or state.running:
                 self.report("正在启动并检查新数据目录……")
                 start_attempted = True
                 self.service.start(DataPaths(self.code, target), state)
-            self.environ["XGENT_DATA_DIR"] = str(target)
+            rollback_path = Path(result["rollback_dir"])
+            if rollback_path.is_dir():
+                shutil.rmtree(rollback_path)
+            result["rollback_dir"] = None
+            self.environ.pop('XGENT_DATA_DIR', None)
             self.report("导入完成。当前数据目录：" + str(target))
             return {
                 **result,
@@ -254,13 +211,7 @@ class MigrationWorkflow:
                     if start_attempted:
                         self.service.stop_started(DataPaths(self.code, target))
                     with DataLease(target, exclusive=True):
-                        failed = target.with_name(
-                            target.name + ".failed-" + uuid.uuid4().hex[:8]
-                        )
-                        if target.exists():
-                            os.replace(target, failed)
-                        if rollback and rollback.exists():
-                            os.replace(rollback, target)
+                        failed = DataBundles(DataPaths(self.code, target)).rollback_activation(result)
                         for path, raw in configs.items():
                             if raw is None:
                                 path.unlink(missing_ok=True)
@@ -322,37 +273,16 @@ class MigrationMenu:
         return default if not answer else answer in {"y", "yes", "是", "确定"}
 
     def choose_directory(self):
-        configured, origin = configured_directory(self.code, self.environ)
-        if configured is not None:
-            self.report(f"已配置的数据目录：{configured}（{origin}）")
-            if not self.confirm("是否修改这个数据目录？"):
-                return validate_target(self.code, configured)
-        default = self.code.parent / "xgent-data"
-        self.report("选择导入后的数据保存目录；项目名称和代码位置保持不变。")
-        self.report("  1) 默认目录：" + str(default))
-        self.report("  2) 自定义目录")
-        self.report("  0) 取消")
-        choice = self.ask("请选择 [默认 1]：").strip()
-        if choice in {"0", "q"}:
-            return None
-        if choice in {"", "1"}:
-            return validate_target(self.code, default)
-        if choice == "2":
-            value = (
-                self.ask("请输入数据目录的绝对路径（无需填写变量名）：")
-                .strip()
-                .strip("\"'")
-            )
-            if not value:
-                return None
-            return validate_target(self.code, value)
-        raise BundleError("无效的目录选项")
+        self.report('数据将恢复到当前项目：' + str(self.code))
+        self.report('只替换数据；源码、公共技能、依赖环境和已有备份保留。')
+        return self.code
 
     def choose_source(self):
-        folders = {self.code.parent / "xgent-backups"}
-        configured, _ = configured_directory(self.code, self.environ)
-        if configured:
-            folders.add(configured.parent / "xgent-backups")
+        folders = {
+            DataPaths.discover(self.code).backups,
+            self.code / "backups",
+            self.code.parent / "xgent-backups",
+        }
         files = sorted(
             {
                 p
@@ -399,7 +329,7 @@ class MigrationMenu:
                 )
                 outputs = self.confirm("是否额外包含完整命令回执？")
                 if not self.confirm(
-                    "备份包含密钥；脚本会自动停服、备份并恢复原服务。确认导出？"
+                    "备份包含密钥；导出不停服、不重启。确认导出？"
                 ):
                     return 0
                 result = self.workflow.export(outputs=outputs)

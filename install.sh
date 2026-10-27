@@ -11,32 +11,25 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Resolve mutable state without importing the application or printing secrets.
-# A normal upgrade keeps a legacy checkout intact until `data migrate` succeeds.
+# All runtime state belongs to this checkout; shell cwd never selects data.
 DATA_DIR="$SCRIPT_DIR"
-for data_python in python3 python; do
-    if command -v "$data_python" >/dev/null 2>&1; then
-        if resolved_data_dir="$("$data_python" -c 'from xgent_app.data_paths import DataPaths; from pathlib import Path; print(DataPaths.discover(Path.cwd()).root)' 2>/dev/null)"; then
-            DATA_DIR="$resolved_data_dir"
-            break
-        fi
-    fi
-done
+unset XGENT_DATA_DIR
 if [ "${1:-}" = "data-start-internal" ]; then
     if [ "${XGENT_MAINTENANCE_CODE_DIR:-}" != "$SCRIPT_DIR" ] || [ -z "${XGENT_MAINTENANCE_DATA_DIR:-}" ]; then
         echo "[错误] 数据维护启动请求缺少当前项目/数据目录校验。" >&2
         exit 1
     fi
-    DATA_DIR="$XGENT_MAINTENANCE_DATA_DIR"
+    if [ "$XGENT_MAINTENANCE_DATA_DIR" != "$SCRIPT_DIR" ]; then
+        echo "[错误] 单目录模式只允许在当前项目恢复数据。" >&2
+        exit 1
+    fi
     if ! "${XGENT_PYTHON:-python3}" -c 'import sys; from pathlib import Path; from xgent_app.data_discovery import validate_target; code=Path(sys.argv[1]).resolve(); root=Path(sys.argv[2]).resolve(); assert Path(sys.argv[2]).is_absolute(); root == code or validate_target(code,root)' "$SCRIPT_DIR" "$DATA_DIR"; then
         echo "[错误] 数据维护目录无效，未启动服务。" >&2
         exit 1
     fi
 fi
 ENV_FILE="$DATA_DIR/.env"
-LOG_DIR="$DATA_DIR/logs"
-if [ "$DATA_DIR" = "$SCRIPT_DIR" ]; then LOG_DIR="$SCRIPT_DIR"; else export XGENT_DATA_DIR="$DATA_DIR"; fi
-if [ "${1:-}" = "data-start-internal" ] && [ "$DATA_DIR" = "$SCRIPT_DIR" ]; then unset XGENT_DATA_DIR; fi
+LOG_DIR="$SCRIPT_DIR"
 PID_FILE="$DATA_DIR/xgent.pid"
 OUTPUT_LOG="$LOG_DIR/xgent_output.log"
 
@@ -2180,6 +2173,8 @@ update_via_download() {
                  --exclude='*.db' --exclude='*.db-*' \
                  --exclude='venv/' --exclude='.venv/' \
                  --exclude='.install-state/' \
+                 --exclude='backups/' --exclude='backup-schedule.json' \
+                 --exclude='server_assets/' --exclude='path-map.json' \
                  --exclude='skill-private/' \
                  --exclude='memory/' \
                  --exclude='workspace/' \
@@ -2214,7 +2209,7 @@ update_code() {
     echo ""
     echo "   将执行: 下载最新代码覆盖 → 检查/重建 Python 环境 → 升级 pip 与全部依赖"
     echo "           → 刷新 xgent 命令 → 检查数据库 → 重启服务"
-    echo "   保留: .env、数据库、会话历史、workspace、日志、私有技能"
+    echo "   保留: .env、数据库、会话历史、附件、workspace、服务器资产、备份、私有技能"
     read -r -p "   是否继续？[Y/n]: " do_update
     case "$do_update" in
         n|N) return 0 ;;
@@ -3522,7 +3517,7 @@ manage_data_migration() {
     if ! "$migration_python" - "$helpers_dir" <<'PY'
 import io,os,stat,sys,urllib.request,zipfile
 from pathlib import Path
-target=Path(sys.argv[1]);required={'__init__.py','data_migration.py','data_service.py','data_discovery.py','data_bundles.py','data_paths.py','data_lock.py','conversations.py'}
+target=Path(sys.argv[1]);required={'__init__.py','backup_storage.py','data_migration.py','data_service.py','data_discovery.py','data_bundles.py','data_paths.py','data_lock.py','conversations.py'}
 try:
     request=urllib.request.Request('https://github.com/HANLINGVABCN/xgent-telegram/archive/refs/heads/main.zip',headers={'User-Agent':'XGent-data-migration'})
     with urllib.request.urlopen(request,timeout=60) as response:
@@ -3556,7 +3551,7 @@ from pathlib import Path
 root=Path(sys.argv[1]).resolve()
 if root.name.startswith('xgent-data-tools.'):
     package=root/'xgent_app'
-    for name in ('__init__.py','data_migration.py','data_service.py','data_discovery.py','data_bundles.py','data_paths.py','data_lock.py','conversations.py'):
+    for name in ('__init__.py','backup_storage.py','data_migration.py','data_service.py','data_discovery.py','data_bundles.py','data_paths.py','data_lock.py','conversations.py'):
         (package/name).unlink(missing_ok=True)
     # Bytecode is confined to this private temp directory.
     import shutil
@@ -3566,6 +3561,12 @@ if root.name.startswith('xgent-data-tools.'):
     root.rmdir()
 PY
     return "$result"
+}
+
+manage_backup_schedule() {
+    local backup_python
+    backup_python="$(data_migration_python)" || return 1
+    "$backup_python" -m xgent_app.backup_schedule "$SCRIPT_DIR"
 }
 
 data_start_internal() {
@@ -3605,6 +3606,7 @@ show_menu() {
     echo " 10) 卸载本脚本安装的运行内容"
     echo " 11) 完整更新                 下载最新代码，并更新 Python 环境与全部依赖（保留用户数据）"
     echo " 12) 数据迁移                 导入 / 导出，自动识别新旧数据与管理服务"
+    echo " 13) 定时导出备份             开关 / 频率 / 覆盖或累计 / 保留份数"
     echo "  0) 退出"
     echo ""
 }
@@ -3613,6 +3615,7 @@ show_usage() {
     echo "用法:"
     echo "  ./install.sh                 打开数字菜单"
     echo "  ./install.sh data            打开数据迁移菜单（导入 / 导出）"
+    echo "  ./install.sh backup          设置备份目录、定时开关、频率、方式和保留份数"
     echo "  ./install.sh install         打开数字菜单"
     echo "  ./install.sh status          打印保活方式、服务状态和组件清单"
     echo "  ./install.sh start           按当前保活方式启动服务"
@@ -3692,7 +3695,7 @@ main() {
 
     print_banner
     show_menu
-    read -r -p "请输入选项 [0-12，默认 1]: " choice
+    read -r -p "请输入选项 [0-13，默认 1]: " choice
 
     case "$choice" in
         ""|1)
@@ -3747,6 +3750,9 @@ main() {
         12)
             if manage_data_migration; then exit 0; else exit 1; fi
             ;;
+        13)
+            if manage_backup_schedule; then exit 0; else exit 1; fi
+            ;;
         0|q|Q)
             warn "已退出。"
             exit 0
@@ -3791,6 +3797,9 @@ if [ "${XGENT_INSTALL_SH_LIB:-}" = "1" ]; then
 fi
 
 case "${1:-}" in
+    backup)
+        if manage_backup_schedule; then exit 0; else exit 1; fi
+        ;;
     data)
         shift
         if [ "$#" -eq 0 ]; then

@@ -48,38 +48,7 @@ STATE_NAMES = {
 
 
 def configured_directory(code, environ=None):
-    env = os.environ if environ is None else environ
-    code = Path(code).resolve()
-    explicit = str(env.get("XGENT_DATA_DIR") or "").strip()
-
-    def location(value, origin):
-        path = Path(value).expanduser()
-        if not path.is_absolute():
-            raise BundleError("已配置的数据目录不是绝对路径，未猜测位置")
-        path = path.resolve()
-        if path in {Path(path.anchor), Path.home().resolve()}:
-            raise BundleError("数据目录不能是磁盘根目录或主目录")
-        return path, origin
-
-    if explicit:
-        return location(explicit, "启动配置")
-    marker = code / "data-location.json"
-    if marker.is_file():
-        try:
-            value = json.loads(marker.read_text(encoding="utf-8"))["data_dir"]
-            return location(value, "已保存的数据目录")
-        except (ValueError, KeyError, TypeError) as exc:
-            raise BundleError("数据目录配置损坏，未猜测或创建空数据库") from exc
-    if (code / ".env").is_file():
-        for line in (code / ".env").read_text(encoding="utf-8-sig").splitlines():
-            key, sep, value = line.partition("=")
-            if (
-                sep
-                and key.strip().removeprefix("export ") == "XGENT_DATA_DIR"
-                and value.strip()
-            ):
-                return location(value.strip().strip("\"'"), "旧 .env 中的数据目录")
-    return None, None
+    return Path(code).resolve(), '项目目录（单目录模式）'
 
 
 class DiscoveredPaths(DataPaths):
@@ -97,40 +66,11 @@ class DiscoveredPaths(DataPaths):
 
 def discover_instance(code, environ=None, *, required=True):
     code = Path(code).resolve()
-    configured, origin = configured_directory(code, environ)
-    if configured is not None:
-        if any((configured / name).is_file() for name in DATABASE_NAMES):
-            return DiscoveredPaths(code, configured, configured == code)
-        if required:
-            raise BundleError(
-                f"{origin}指向 {configured}，但未找到数据库；未改用可能过期的另一份数据"
-            )
-        return DiscoveredPaths(code, configured, configured == code)
-    # A live in-checkout installation is authoritative over sibling backups.
     if any((code / name).is_file() for name in DATABASE_NAMES):
         return DiscoveredPaths(code, code, True)
-    candidates = [
-        code / "data",
-        code / ".xgent_state",
-        code.parent / "xgent-data",
-        code.parent / "telegram-ai-bot-data",
-    ]
-    found = [
-        folder
-        for folder in candidates
-        if any((folder / name).is_file() for name in DATABASE_NAMES)
-    ]
-    if len(found) > 1:
-        raise BundleError(
-            "发现多套独立数据库，不能自动混合：" + "、".join(map(str, found))
-        )
-    if found:
-        return DiscoveredPaths(code, found[0].resolve())
     if required:
-        raise BundleError(
-            "未找到实例数据库；已检查当前项目、已配置目录和相邻数据目录，不会导出空包"
-        )
-    return DiscoveredPaths(code, code.parent / "xgent-data")
+        raise BundleError('项目目录内未找到实例数据库，不能导出空包')
+    return DiscoveredPaths(code, code, True)
 
 
 def canonical_asset(name):
@@ -200,6 +140,7 @@ class DiscoveredBundles(DataBundles):
         for name in (
             ".env",
             "path-map.json",
+            "backup-schedule.json",
             "config.ini",
             "secrets.json",
             "credentials.yaml",
@@ -246,6 +187,8 @@ class DiscoveredBundles(DataBundles):
 def validate_target(code, target):
     code = Path(code).resolve()
     target = Path(target).expanduser()
+    if target.resolve() == code and not target.is_symlink():
+        return code  # In-place restore replaces state only, never the checkout.
     if any(ord(char) < 32 for char in str(target)):
         raise BundleError("数据目录不能包含控制字符")
     if not target.is_absolute():

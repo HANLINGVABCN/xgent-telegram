@@ -20,6 +20,19 @@ from .workbench_sources import owners as resource_owners, source_info, reference
 from .data_bundles import BundleError
 from .data_operations import DataOperations
 
+
+def _web_asset_version():
+    root = Path(__file__).resolve().parent / "webui" / "assets"
+    digest = hashlib.sha256()
+    for path in sorted(root.glob("*")):
+        if path.is_file() and path.suffix in {".js", ".css"}:
+            digest.update(path.name.encode("utf-8"))
+            digest.update(path.read_bytes())
+    return digest.hexdigest()[:16]
+
+
+WEB_ASSET_VERSION = _web_asset_version()
+
 class WorkbenchError(ValueError):
     def __init__(self, message, status=400):
         super().__init__(message)
@@ -118,6 +131,16 @@ class Workbench:
                     return await asyncio.to_thread(operations.bundles.estimate, include)
                 if resource == 'data/export' and method == 'POST':
                     return await operations.export(data)
+                if resource == 'data/backup-settings' and method == 'GET':
+                    return operations.backup_settings()
+                if resource == 'data/backup-settings' and method == 'POST':
+                    return operations.save_backup_settings(data)
+                if resource == 'data/backups' and method == 'GET':
+                    return operations.list_backups()
+                if resource == 'data/backups/delete' and method == 'POST':
+                    return operations.delete_backups(data)
+                if resource == 'data/import-stored' and method == 'POST':
+                    return await operations.import_stored(data)
                 if resource == 'data/import' and method == 'POST' and data.get('_bundle_path'):
                     return await operations.upload_import(data)
                 if resource == 'data/activate' and method == 'POST':
@@ -126,8 +149,10 @@ class Workbench:
                     return operations.status(data.get('id'))
                 if resource == 'data/download' and method == 'GET':
                     return operations.download(data.get('id'))
+                if resource == 'data/backup-download' and method == 'GET':
+                    return operations.download_backup(data.get('name'))
                 raise WorkbenchError('数据维护接口不存在',404)
-            except BundleError as exc:
+            except (BundleError, TypeError, ValueError) as exc:
                 raise WorkbenchError(str(exc),409) from exc
         if resource == 'conversation-groups' and method == 'GET':
             return await self.conversations({})
@@ -235,6 +260,7 @@ class Workbench:
                 'capabilities': {'tasks': True, 'providers': True, 'skills': True, 'usage': True, 'artifacts': True, 'shared_memory': True},
                 'timezone': self.ns['SelfTriggerManager'].DEFAULT_TIMEZONE,
                 'version': self.ns.get('RUNTIME_CODE_VERSION', self.ns.get('CODE_VERSION', '')),
+                'asset_version': WEB_ASSET_VERSION,
                 'web': await self.read_settings({}),
                 'media_model': {'provider': self.ns['get_model_target_provider_name']('media'),
                                 'model': self.ns['UserDataManager'].get('default_media_model', '')}}

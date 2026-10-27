@@ -9,52 +9,9 @@ export async function settingsView({logout,boot,health,state,render,dialog,close
   const grid=el('div',{class:'wb-settings-grid'});
   page.classList.add('wb-preferences-page');
   if(active==='data'){
-    const estimate=await wb('data/estimate');
-    const outputs=check('包含历史命令完整回执 command_outputs/（默认不选）','include_command_outputs');
-    const size=el('p',{class:'wb-note'},'核心数据：'+bytes(estimate.size)+' · '+estimate.file_count+' 个文件');
-    const progress=el('div',{class:'wb-data-progress',role:'status'});
-    const warning=el('p',{class:'wb-note'},'不包含命令回执不会影响数据库中的历史聊天、调用摘要与上下文，但无法从此备份恢复历史命令的完整原始终端输出。勾选将额外加入约 '+bytes(estimate.command_outputs_size)+'，显著增加打包、下载和同步时间。');
-    outputs.onchange=async()=>{try{const value=await wb('data/estimate?include_command_outputs='+outputs.querySelector('input').checked);size.textContent='估算：'+bytes(value.size)+' · '+value.file_count+' 个文件';}catch(error){progress.replaceChildren(message(error.message));}};
-    let polling=null;
-    async function poll(id){
-      clearTimeout(polling);
-      try{
-        const job=await wb('data/status?id='+encodeURIComponent(id));
-        if(!page.isConnected)return;
-        progress.replaceChildren(el('p',{},({packing:'正在打包',verifying:'正在校验',pending:'等待开始',verified:'校验通过',completed:'已完成',restarting:'正在切换并重启'})[job.phase]||job.phase||job.state));
-        if(job.total_bytes)progress.append(el('progress',{value:job.completed_bytes||0,max:job.total_bytes}),el('small',{},bytes(job.completed_bytes)+' / '+bytes(job.total_bytes)));
-        if(job.state==='failed'){progress.append(message(job.error||'操作未完成，原数据仍保留'));return;}
-        if(job.state==='completed'&&job.download_url){progress.append(el('a',{class:'wb-btn primary',href:job.download_url,download:''},'下载含密钥备份'),el('small',{class:'wb-file-path'},job.result?.path||''));sessionStorage.removeItem('xgent-data-job');return;}
-        if(job.state==='ready'){
-          progress.append(el('p',{},'SHA-256 和 SQLite 校验通过，共 '+job.file_count+' 个文件。'),button('确认切换整套数据并重启',async()=>{
-            if(!confirm('将停止服务并切换整套数据，当前数据目录会保留用于回退。恢复后的 Web 密码、端口和 Bot 配置以备份为准。确定继续？'))return;
-            try{await wb('data/activate',{data:{id:job.id,confirm_replace:true}});progress.replaceChildren(message('正在切换并重启，请稍后刷新并使用备份中的密码登录。','note'));}
-            catch(error){progress.append(message(error.message));}
-          },'danger'));return;
-        }
-        if(job.state==='activating'){progress.append(message('服务正在重启；重新连接后可继续查看状态。','note'));return;}
-        polling=setTimeout(()=>poll(id),800);
-      }catch(error){if(page.isConnected)progress.replaceChildren(message(error.message),button('重试查询',()=>poll(id)));}
-    }
-    const exportButton=button('创建核心数据备份',async()=>{
-      if(!confirm('此备份包含 .env 原文、Bot/API 密钥及完整数据库。请仅保存到可信位置，不要公开上传。确认创建？'))return;
-      exportButton.disabled=true;
-      try{const job=await wb('data/export',{data:{request_id:requestId(),confirm_secrets:true,include_command_outputs:outputs.querySelector('input').checked}});sessionStorage.setItem('xgent-data-job',job.id);await poll(job.id);}
-      catch(error){progress.replaceChildren(message(error.message));}finally{exportButton.disabled=false;}
-    },'primary');
-    const file=el('input',{type:'file',accept:'.zip,application/zip','aria-label':'选择实例备份 ZIP'});
-    const importButton=button('上传并校验备份',async()=>{
-      if(!file.files[0]){progress.replaceChildren(message('请选择实例备份 ZIP'));return;}
-      if(!confirm('备份可能含密钥。先上传和校验，不会立即替换当前数据；校验后还需确认切换。继续？'))return;
-      importButton.disabled=true;
-      const data=new FormData();data.append('file',file.files[0]);data.append('text','confirm-instance-restore');data.append('idempotency_key',requestId());
-      const xhr=new XMLHttpRequest();xhr.open('POST','/api/workbench/data/import');
-      xhr.upload.onprogress=event=>{if(event.lengthComputable)progress.replaceChildren(el('progress',{max:event.total,value:event.loaded}),el('span',{},'上传 '+Math.floor(event.loaded/event.total*100)+'%'+(event.loaded===event.total?' · 正在接收确认':'')));};
-      xhr.onload=()=>{importButton.disabled=false;let body={};try{body=JSON.parse(xhr.responseText);}catch{}if(xhr.status!==200){progress.replaceChildren(message(body.error||'备份上传失败'));return;}sessionStorage.setItem('xgent-data-job',body.id);poll(body.id);};
-      xhr.onerror=()=>{importButton.disabled=false;progress.replaceChildren(message('上传连接失败，请重试；当前数据未修改。'));};xhr.send(data);
-    });
-    grid.append(card('标准化实例备份',el('p',{},'包含数据库、.env 原文、长期记忆、私有技能、附件原件、附件版本、生成媒体、对话导出与服务器资产；不含日志、虚拟环境或缓存。'),size,outputs,warning,exportButton),card('整套导入恢复',el('p',{},'只恢复到代码外的独立数据目录。先校验文件哈希和 SQLite，再确认切换；原目录保留为回退目录，不与当前实例合并。'),file,importButton),card('处理状态',progress));
-    const pending=sessionStorage.getItem('xgent-data-job');if(pending)setTimeout(()=>poll(pending),0);
+    grid.append(...await dataBackupCards({page,card}));
+    page.append(grid);
+    return page;
   }
   if(active==='appearance'){
     const appearance=card('文字字号',el('p',{},'消息、界面和网页终端字号都在这里调整。预览只影响本页，保存后写入服务端配置并同步到其他网页设备。'));
@@ -98,6 +55,78 @@ export async function settingsView({logout,boot,health,state,render,dialog,close
     grid.append(card('维护操作',el('p',{},'操作将通过现有命令处理器执行，可能中断连接。'),button('检查服务状态',()=>{location.hash='/chat';window.XGentChat?.command('/status');}),button('重启服务',()=>confirmAction('重启服务','当前连接和终端可能被关闭。确认重启？',async()=>{location.hash='/chat';window.XGentChat?.command('/restart');}))));
   }
   page.append(grid);return page;
+}
+
+async function dataBackupCards({page,card}){
+  const [estimate,rules,initialCatalog]=await Promise.all([wb('data/estimate'),wb('data/backup-settings'),wb('data/backups')]);
+  let catalog=initialCatalog,polling=null;
+  const progress=el('div',{class:'wb-data-progress',role:'status'}),listBox=el('div',{class:'wb-backup-list'});
+  const storedSelect=el('select',{'aria-label':'选择服务器备份'});
+  function storedField(){return el('label',{class:'wb-field'},el('span',{},'从服务器备份列表选择'),storedSelect,el('small',{},'先校验，不会立即替换；校验通过后仍需二次确认。'));}
+  function backupDownload(name){return '/api/workbench/data/backup-download?name='+encodeURIComponent(name);}
+  function renderCatalog(next){
+    catalog=next;
+    const selected=storedSelect.value;
+    storedSelect.replaceChildren(el('option',{value:''},'请选择备份…'),...catalog.items.map(item=>el('option',{value:item.name},item.label+' · '+item.name)));
+    if(catalog.items.some(item=>item.name===selected))storedSelect.value=selected;
+    if(!catalog.items.length){listBox.replaceChildren(el('div',{class:'wb-empty'},el('h3',{},'还没有备份'),el('p',{},'手动导出、定时备份和导入前自动备份会显示在这里。')));return;}
+    const body=el('tbody');
+    for(const item of catalog.items){
+      const box=el('input',{type:'checkbox','data-backup-name':item.name,'aria-label':'选择 '+item.name});
+      body.append(el('tr',{},el('td',{},box),el('td',{},el('strong',{},item.name),el('small',{},item.label+' · '+(item.valid_manifest?'清单可读':'清单未知'))),el('td',{},bytes(item.size),el('small',{},new Date(item.created_at*1000).toLocaleString())),el('td',{},item.file_count==null?'—':item.file_count+' 个文件',el('small',{},item.include_command_outputs===true?'含命令回执':item.include_command_outputs===false?'不含命令回执':'未知')),el('td',{},el('a',{class:'wb-btn',href:backupDownload(item.name),download:''},'下载'))));
+    }
+    const table=el('div',{class:'wb-table-wrap wb-backup-table'},el('table',{class:'wb-table'},el('thead',{},el('tr',{},el('th',{},''),el('th',{},'备份文件'),el('th',{},'大小与时间'),el('th',{},'内容'),el('th',{},'操作'))),body));
+    const remove=button('删除选中备份',async()=>{const names=[...listBox.querySelectorAll('[data-backup-name]:checked')].map(input=>input.dataset.backupName);if(!names.length){progress.replaceChildren(message('请先选择要删除的备份'));return;}if(!confirm('永久删除选中的 '+names.length+' 个备份？此操作不可撤销。'))return;remove.disabled=true;try{renderCatalog(await wb('data/backups/delete',{data:{names,confirm:true}}));progress.replaceChildren(message('已删除选中的备份','success'));}catch(error){progress.replaceChildren(message(error.message));}finally{remove.disabled=false;}},'danger');
+    listBox.replaceChildren(el('p',{class:'wb-file-path'},'目录：',el('code',{},catalog.directory)),table,el('div',{class:'wb-actions'},remove,button('刷新列表',refreshCatalog)));
+  }
+  async function refreshCatalog(){renderCatalog(await wb('data/backups'));}
+  renderCatalog(catalog);
+
+  async function poll(id){
+    clearTimeout(polling);
+    try{
+      const job=await wb('data/status?id='+encodeURIComponent(id));if(!page.isConnected)return;
+      progress.replaceChildren(el('p',{},({packing:'正在打包',verifying:'正在校验',pending:'等待开始',verified:'校验通过',backing_up:'正在生成导入前自动备份',activating:'正在替换数据',completed:'已完成',restarting:'正在切换并重启'})[job.phase]||job.phase||job.state));
+      if(job.total_bytes)progress.append(el('progress',{value:job.completed_bytes||0,max:job.total_bytes}),el('small',{},bytes(job.completed_bytes)+' / '+bytes(job.total_bytes)));
+      if(job.state==='failed'){progress.append(message(job.error||'操作未完成，原数据仍保留'));sessionStorage.removeItem('xgent-data-job');return;}
+      if(job.state==='completed'){if(job.download_url)progress.append(el('a',{class:'wb-btn primary',href:job.download_url,download:''},'下载含密钥备份'));if(job.result?.path)progress.append(el('small',{class:'wb-file-path'},job.result.path));sessionStorage.removeItem('xgent-data-job');await refreshCatalog();return;}
+      if(job.state==='ready'){
+        progress.append(el('p',{},'“'+(job.source_name||'备份')+'”的 SHA-256 和 SQLite 校验通过，共 '+job.file_count+' 个文件。'),button('确认切换整套数据并重启',async()=>{if(!confirm('将停止服务并切换整套数据。切换前会自动生成“导入前自动备份”，源码和公共技能不变。确定继续？'))return;try{await wb('data/activate',{data:{id:job.id,confirm_replace:true}});progress.replaceChildren(message('正在切换并重启，请稍后刷新并使用备份中的密码登录。','note'));}catch(error){progress.append(message(error.message));}},'danger'));return;
+      }
+      if(job.state==='activating'){progress.append(message('服务正在重启；重新连接后可继续查看状态。','note'));return;}
+      polling=setTimeout(()=>poll(id),800);
+    }catch(error){if(page.isConnected)progress.replaceChildren(message(error.message),button('重试查询',()=>poll(id)));}
+  }
+
+  const ruleForm=el('form');
+  const directory=field('服务器备份目录','backup_directory',rules.backup_directory,'text','必须是项目目录之外的绝对路径。默认：'+rules.default_backup_directory);
+  const directoryInput=directory.querySelector('input');
+  const enabled=check('开启定时备份','enabled',rules.enabled),frequency=field('导出频率','frequency',rules.frequency||'1d','text','例如 30m、6h、1d；最低 1 分钟。');
+  const mode=select('保存方式','mode',[{value:'overwrite',label:'覆盖上一份'},{value:'accumulate',label:'累计保留'}],rules.mode);
+  const limit=field('累计最多保留份数','max_backups',rules.max_backups||7,'number');limit.querySelector('input').min='1';limit.querySelector('input').step='1';
+  const scheduleOutputs=check('定时备份包含 command_outputs/','include_command_outputs',rules.include_command_outputs);
+  const ruleFeedback=el('div');
+  const resetDirectory=button('使用默认目录',()=>{directoryInput.value=rules.default_backup_directory;});
+  const syncMode=()=>{limit.querySelector('input').disabled=mode.querySelector('select').value==='overwrite';};mode.onchange=syncMode;syncMode();
+  ruleForm.append(directory,resetDirectory,enabled,frequency,mode,limit,scheduleOutputs,ruleFeedback,el('button',{type:'submit',class:'wb-btn primary'},'保存备份规则'));
+  ruleForm.onsubmit=async event=>{event.preventDefault();const submit=ruleForm.querySelector('[type=submit]');submit.disabled=true;try{const saved=await wb('data/backup-settings',{data:{backup_directory:directoryInput.value.trim(),enabled:enabled.querySelector('input').checked,frequency:frequency.querySelector('input').value.trim(),mode:mode.querySelector('select').value,max_backups:Number(limit.querySelector('input').value),include_command_outputs:scheduleOutputs.querySelector('input').checked}});directoryInput.value=saved.backup_directory;ruleFeedback.replaceChildren(message('备份规则已保存，安装脚本与后台任务同步使用。','success'));await refreshCatalog();}catch(error){ruleFeedback.replaceChildren(message(error.message));}finally{submit.disabled=false;}};
+
+  const manualOutputs=check('包含历史命令完整回执 command_outputs/（默认不选）','manual_outputs');
+  const estimateText=el('p',{class:'wb-note'},'核心数据：'+bytes(estimate.size)+' · '+estimate.file_count+' 个文件');
+  manualOutputs.onchange=async()=>{try{const value=await wb('data/estimate?include_command_outputs='+manualOutputs.querySelector('input').checked);estimateText.textContent='估算：'+bytes(value.size)+' · '+value.file_count+' 个文件';}catch(error){progress.replaceChildren(message(error.message));}};
+  const exportButton=button('创建核心数据备份',async()=>{if(!confirm('此备份包含 .env 原文、Bot/API 密钥及完整数据库。确认创建到服务器备份目录？'))return;exportButton.disabled=true;try{const job=await wb('data/export',{data:{request_id:requestId(),confirm_secrets:true,include_command_outputs:manualOutputs.querySelector('input').checked}});sessionStorage.setItem('xgent-data-job',job.id);await poll(job.id);}catch(error){progress.replaceChildren(message(error.message));}finally{exportButton.disabled=false;}},'primary');
+
+  const importStored=button('校验所选服务器备份',async()=>{if(!storedSelect.value){progress.replaceChildren(message('请选择服务器备份'));return;}if(!confirm('先校验所选备份，不会立即替换当前数据。继续？'))return;try{const job=await wb('data/import-stored',{data:{name:storedSelect.value,request_id:requestId(),confirm_secrets:true}});sessionStorage.setItem('xgent-data-job',job.id);await poll(job.id);}catch(error){progress.replaceChildren(message(error.message));}});
+  const file=el('input',{type:'file',accept:'.zip,application/zip','aria-label':'选择本地实例备份 ZIP'});
+  const upload=button('上传并校验本地备份',async()=>{if(!file.files[0]){progress.replaceChildren(message('请选择本地实例备份 ZIP'));return;}if(!confirm('先上传和校验，不会立即替换当前数据。继续？'))return;upload.disabled=true;const data=new FormData();data.append('file',file.files[0]);data.append('text','confirm-instance-restore');data.append('idempotency_key',requestId());const xhr=new XMLHttpRequest();xhr.open('POST','/api/workbench/data/import');xhr.upload.onprogress=event=>{if(event.lengthComputable)progress.replaceChildren(el('progress',{max:event.total,value:event.loaded}),el('span',{},'上传 '+Math.floor(event.loaded/event.total*100)+'%'+(event.loaded===event.total?' · 正在接收确认':'')));};xhr.onload=()=>{upload.disabled=false;let body={};try{body=JSON.parse(xhr.responseText);}catch{}if(xhr.status!==200){progress.replaceChildren(message(body.error||'备份上传失败'));return;}sessionStorage.setItem('xgent-data-job',body.id);poll(body.id);};xhr.onerror=()=>{upload.disabled=false;progress.replaceChildren(message('上传连接失败，请重试；当前数据未修改。'));};xhr.send(data);});
+
+  const rulesCard=card('备份规则',el('p',{},'Web 与安装脚本共用同一配置。备份保存到项目目录之外；定时模式支持覆盖或按数量自动清理最老文件。'),ruleForm);
+  const manualCard=card('立即导出',el('p',{},'后台无感导出，不停服、不重启，也不等待 AI 或命令结束。'),estimateText,manualOutputs,el('p',{class:'wb-note'},'不含命令回执不会影响聊天、摘要和上下文。'),exportButton);
+  const importCard=card('整套导入恢复',el('p',{},'可以直接选择服务器已有备份，也可以上传本地 ZIP。校验通过后才会显示切换按钮。'),storedField(),importStored,el('hr'),el('label',{class:'wb-field'},el('span',{},'上传本地备份'),file),upload);
+  const statusCard=card('处理状态',progress);
+  const listCard=card('服务器备份文件',el('p',{},'包含手动、定时和导入前自动备份。可以下载、选择恢复或永久删除。'),listBox);listCard.classList.add('wide');
+  const pending=sessionStorage.getItem('xgent-data-job');if(pending)setTimeout(()=>poll(pending),0);
+  return [rulesCard,manualCard,importCard,statusCard,listCard];
 }
 
 async function blacklistEditor({dialog,submit,dirtyForm}){

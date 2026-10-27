@@ -37,6 +37,11 @@ skill-private/
 # 运行时工作区（用户生成文件、VPS配置等，不进仓库）
 workspace/
 
+# Instance-local server assets and restored path metadata
+server_assets/
+path-map.json
+restore-info.json
+
 # Logs
 xgent_output.log
 xgent_server.log
@@ -143,3 +148,7 @@ ehthumbs_vista.db
 
 # 本地工具会话目录（非项目内容）
 .zcode/
+
+# Instance backups and scheduled-backup settings
+backups/
+backup-schedule.json

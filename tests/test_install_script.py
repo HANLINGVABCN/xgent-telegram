@@ -751,12 +751,18 @@ class DataMigrationMenuTests(unittest.TestCase):
         menu=INSTALL_SCRIPT[INSTALL_SCRIPT.index('show_menu() {'):INSTALL_SCRIPT.index('show_usage() {')]
         self.assertIn('12) 数据迁移',menu)
         self.assertIn('导入 / 导出',menu)
-        self.assertIn('请输入选项 [0-12',INSTALL_SCRIPT)
+        self.assertIn('13) 定时导出备份',menu)
+        self.assertIn('请输入选项 [0-13',INSTALL_SCRIPT)
         self.assertIn('12)\n            if manage_data_migration;',INSTALL_SCRIPT)
+        self.assertIn('13)\n            if manage_backup_schedule;',INSTALL_SCRIPT)
         handler=INSTALL_SCRIPT[INSTALL_SCRIPT.index('manage_data_migration() {'):INSTALL_SCRIPT.index('data_start_internal() {')]
         self.assertIn('-m xgent_app.data_migration',handler)
+        self.assertIn('-m xgent_app.backup_schedule',handler)
         self.assertNotIn('prepare_environment',handler)
         self.assertNotIn('rm -',handler)
+        self.assertIn("--exclude='backups/'", INSTALL_SCRIPT)
+        self.assertIn("--exclude='backup-schedule.json'", INSTALL_SCRIPT)
+        self.assertIn("--exclude='server_assets/'", INSTALL_SCRIPT)
 
     def test_bare_data_routes_to_wizard_and_advanced_commands_remain_supported(self):
         start=INSTALL_SCRIPT.index('    data)')
@@ -764,6 +770,11 @@ class DataMigrationMenuTests(unittest.TestCase):
         self.assertIn('if [ "$#" -eq 0 ]',handler)
         self.assertIn('manage_data_migration',handler)
         self.assertIn('-m xgent_app.data_cli "$@"',handler)
+
+    def test_backup_command_routes_to_schedule_menu(self):
+        start=INSTALL_SCRIPT.index('    backup)')
+        handler=INSTALL_SCRIPT[start:INSTALL_SCRIPT.index('    data)',start)]
+        self.assertIn('manage_backup_schedule',handler)
 
     @requires_bash_harness
     def test_main_menu_invokes_only_wizard(self):
@@ -873,12 +884,10 @@ class EnvFileTests(InstallScriptLibraryMixin, unittest.TestCase):
         # 恰好四处，说明没有其他函数又自己拼了一遍 .env 的写入。
         self.assertEqual(4, INSTALL_SCRIPT.count('mktemp "$DATA_DIR/.env.XXXXXX"'))
 
-    def test_external_env_and_fresh_skeleton_never_write_checkout(self):
+    def test_single_directory_env_writes_project_checkout(self):
         with self.temp_dir() as temp_dir:
             root = self.sandbox(temp_dir)
             result = self.run_lib(
-                'DATA_DIR="$SCRIPT_DIR/external-data"\n'
-                'ENV_FILE="$DATA_DIR/.env"\n'
                 'sync_deploy_mode_state() { :; }\n'
                 'deploy_mode_label() { echo test; }\n'
                 'ensure_env_skeleton\n'
@@ -889,7 +898,7 @@ class EnvFileTests(InstallScriptLibraryMixin, unittest.TestCase):
                 'env_unset OTHER\n'
                 'test "$(env_get BOT_TOKEN)" = fixture-token\n'
                 'test -f "$ENV_FILE"\n'
-                'test ! -f "$SCRIPT_DIR/.env"\n', root,
+                'test "$ENV_FILE" = "$SCRIPT_DIR/.env"\n', root,
             )
             self.assertEqual(0,result.returncode,result.stderr)
 

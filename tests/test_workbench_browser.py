@@ -58,9 +58,15 @@ def test_asset_etag_and_authenticated_management_routes(workspace_url):
     import urllib.request
     import urllib.error
     base=workspace_url['url']
+    with urllib.request.urlopen(base+'/') as response:
+        html=response.read().decode('utf-8')
+        assert '/assets/workbench.js?v=' in html
+        assert '/assets/workbench.css?v=' in html
     with urllib.request.urlopen(base+'/assets/workbench.js') as response:
         assert 'javascript' in response.headers['Content-Type']
         assert response.headers['Cache-Control']=='no-cache'
+        script=response.read().decode('utf-8')
+        assert "./components.js?v=" in script
         etag=response.headers['ETag']
     with pytest.raises(urllib.error.HTTPError) as caught:
         urllib.request.urlopen(urllib.request.Request(base+'/assets/workbench.js',headers={'If-None-Match':etag}))

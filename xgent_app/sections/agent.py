@@ -15,7 +15,7 @@ class AgentExecutor:
     
     TIMEOUT = DEFAULT_AGENT_COMMAND_TIMEOUT  # 秒
     MAX_FILE_SIZE = 50 * 1024 * 1024
-    # User-created files and shell working state live with the external data,
+    # User-created files and shell working state live in the project workspace,
     # never inside the code checkout.
     WORK_DIR = str(DATA_PATHS.root)
     # 当前对话上下文：run-x 子进程需要它来登记 trigger 任务（xgent_trigger.py 读
