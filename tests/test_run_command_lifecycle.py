@@ -47,6 +47,8 @@ def load_run_namespace(directory):
     method = next(n for n in cls.body if getattr(n, 'name', '') == 'run_command')
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), 'exec'), ns)
     agent = type('Agent', (), dict(run_command=ns['run_command'], WORK_DIR=directory,
+                 map_command_paths=staticmethod(lambda cmd: cmd),
+                 current_work_dir=staticmethod(lambda: directory),
                  get_timeout=staticmethod(lambda: 10), _current_chat_id=42,
                  _current_conversation_id='test-conversation'))
     ns['Agent'] = agent

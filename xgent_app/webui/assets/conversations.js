@@ -17,6 +17,7 @@ const paths = {
   archive: 'M4 8h16v12H4zM3 4h18v4H3zM10 12h4',
   restore: 'M4 8h16v12H4zM3 4h18v4H3zM12 17v-6m-3 3 3-3 3 3',
   close: 'm6 6 12 12M6 18 18 6',
+  branch: 'M6 3v12M18 9a9 9 0 0 1-9 9M15 6a3 3 0 1 0 6 0 3 3 0 1 0-6 0M3 18a3 3 0 1 0 6 0 3 3 0 1 0-6 0',
 };
 let state = {current_chat_id: null, telegram_conversation_id: null, revision: -1, items: [], running: null};
 let authenticated = false, authEpoch = 0, request = null, mutation = null;
@@ -59,6 +60,7 @@ function itemById(id) { return itemIndex.get(id); }
 function groups() { return Array.isArray(state.groups) ? state.groups : [{id:'ungrouped',name:'未分组'}]; }
 function groupName(id) { return groups().find(group => group.id === id)?.name || '未分组'; }
 function isArchived(item) { return item.archived === true || Number(item.archived) === 1; }
+function isBranch(item) { return Boolean(item?.parent_conversation_id || item?.branch_mode); }
 function groupFor(item) {
   const now = new Date(), date = new Date(timestamp(item) * 1000);
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
@@ -221,10 +223,11 @@ function notify(text, options = {}) {
 
 function createRow(item) {
   const row = node('div', {class: 'conv-row', 'data-conversation-id': item.id});
+  const branch = node('span', {class: 'conv-branch-badge', hidden: '', title: '分支对话'}, icon('branch'), node('span', {}, '分支'));
   const name = node('span', {class: 'conv-row-title'});
   const bot = node('span', {class: 'conv-bot-badge', hidden: '', title: 'Telegram 当前使用此对话，不代表正在执行任务'}, 'Bot 当前');
   const dot = node('span', {class: 'conv-running-dot', 'aria-label': '正在生成', hidden: ''});
-  const open = button([name, bot, dot], () => {
+  const open = button([branch, name, bot, dot], () => {
     const current = itemById(item.id);
     if (current && isArchived(current)) restoreConversation(item.id, true);
     else selectConversation(item.id);
@@ -237,7 +240,7 @@ function createRow(item) {
   });
   const restore = button(icon('restore'), () => restoreConversation(item.id), {class: 'conv-restore conv-icon-button', hidden: ''});
   row.append(open, restore, more);
-  return {row, open, name, more, dot, restore, bot};
+  return {row, open, branch, name, more, dot, restore, bot};
 }
 function renderList() {
   if (search.value.trim()) {
@@ -255,7 +258,7 @@ function renderList() {
       return pinned || timestamp(b) - timestamp(a) || a.id.localeCompare(b.id);
     });
   const signature = JSON.stringify([view, groupView, query, state.current_chat_id, state.telegram_conversation_id, state.running?.conversation_id, mutation,
-    visible.map(item => [item.id, title(item), groupFor(item), item.group_id, item.pinned])]);
+    visible.map(item => [item.id, title(item), groupFor(item), item.group_id, item.pinned, item.parent_conversation_id, item.branch_mode])]);
   if (signature === listSignature) return;
   listSignature = signature;
   const oldScroll = scroll.scrollTop;
@@ -269,10 +272,18 @@ function renderList() {
     const entry = rows.get(item.id) || createRow(item);
     rows.set(item.id, entry);
     const current = item.id === state.current_chat_id;
+    const branched = isBranch(item);
     entry.row.classList.toggle('is-current', current);
     entry.row.classList.toggle('is-archived', isArchived(item));
+    entry.row.classList.toggle('is-branch', branched);
     entry.row.classList.toggle('is-pinned',!!item.pinned&&groupView!=='all'&&!query);
     entry.row.classList.toggle('is-pending', mutation?.name === 'switch' && mutation.id === item.id);
+    entry.branch.hidden = !branched;
+    if (branched) {
+      const parent = item.parent_conversation_id ? itemById(item.parent_conversation_id) : null;
+      const modeText = item.branch_mode === 'exact' ? '精确文件现场' : '仅上下文';
+      entry.branch.title = (parent ? '分支来源：' + title(parent) + ' · ' : '分支对话 · ') + modeText;
+    }
     entry.bot.hidden = item.id !== state.telegram_conversation_id;
     entry.name.textContent = title(item);
     entry.open.title = title(item);

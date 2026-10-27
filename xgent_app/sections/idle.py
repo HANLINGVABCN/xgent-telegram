@@ -1541,6 +1541,19 @@ async def _web_run_file_batch(data, mode, outbox, receipt):
             raise ValueError('文件模式格式错误')
         if not isinstance(captions, list) or any(not isinstance(c, str) for c in captions):
             raise ValueError('文件说明格式错误')
+        conn = await db._get_conn()
+        cursor = await conn.execute('SELECT * FROM conversation_branch_drafts WHERE conversation_id=?',
+                                    (current_scope().conversation_id,))
+        draft_row = await cursor.fetchone()
+        await cursor.close()
+        draft_metadata = {}
+        if draft_row is not None:
+            try:
+                draft_metadata = json.loads(draft_row['metadata'] or '{}')
+            except (TypeError, ValueError):
+                draft_metadata = {}
+            if not isinstance(draft_metadata, dict):
+                draft_metadata = {}
         for i, item in enumerate(data['files']):
             item_mode = modes[i] if modes else mode
             payloads.append(await asyncio.to_thread(ArtifactManager.adopt_upload,
@@ -1551,10 +1564,12 @@ async def _web_run_file_batch(data, mode, outbox, receipt):
         content = '\n\n'.join(filter(None, [data.get('text', ''), *[
             describe_file(ref, ArtifactManager.UPLOAD_DIR) if p['mode'] == 'server_upload' else p['index_text']
             for ref, p in zip(refs, payloads)]]))
-        metadata = {'upload_request_key': key, 'upload_signature': signature, 'file_ingress_mode': mode,
+        metadata = {**draft_metadata, 'upload_request_key': key, 'upload_signature': signature, 'file_ingress_mode': mode,
                     'web_file_message': {'version': 1, 'text': data.get('text', '')}}
-        attachment_refs = [p['attachment'] for p in payloads if p['mode'] == 'attachment']
-        upload_refs = [p['attachment'] for p in payloads if p['mode'] == 'server_upload']
+        attachment_refs = [*draft_metadata.get('attachments', []),
+                           *[p['attachment'] for p in payloads if p['mode'] == 'attachment']]
+        upload_refs = [*draft_metadata.get('server_uploads', []),
+                       *[p['attachment'] for p in payloads if p['mode'] == 'server_upload']]
         if upload_refs:
             metadata['server_uploads'] = upload_refs
         if attachment_refs:
@@ -1567,6 +1582,10 @@ async def _web_run_file_batch(data, mode, outbox, receipt):
             if row_id is None:
                 raise ValueError('上传记录未保存')
         committed = True
+        if draft_row is not None:
+            async with db._write() as conn:
+                await conn.execute('DELETE FROM conversation_branch_drafts WHERE conversation_id=?',
+                                   (current_scope().conversation_id,))
         row = await db.get_display_message(row_id)
         message = build_history_message(row, ArtifactManager.ROOT_DIR, AgentExecutor.WORK_DIR)
         message['conversation_id'] = current_scope().conversation_id

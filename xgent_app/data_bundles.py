@@ -35,6 +35,8 @@ TREES = (
     "xgent_storage/generated_media",
     "xgent_storage/exports",
     "xgent_storage/attachment_versions",
+    "xgent_storage/conversation_objects",
+    "xgent_storage/conversation_workspaces",
 )
 SKIP_DIRS = {
     "venv",
@@ -236,7 +238,7 @@ class DataBundles:
                         raise BundleError(
                             "数据文件是符号链接，未静默漏备份：" + str(path)
                         )
-                    filtered = re.search(
+                    filtered = filename in SKIP_DIRS or re.search(
                         r"\.log(?:$|\.)", filename, re.IGNORECASE
                     ) or filename.endswith((".pyc", ".tmp", ".pid", ".lock", ".part"))
                     if (

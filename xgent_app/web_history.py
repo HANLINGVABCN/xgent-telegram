@@ -330,8 +330,17 @@ def build_history_message(
         "id": record.get("id"), "timestamp": record.get("timestamp"), "msg_type": kind,
         "role": role, "content": content, "media": [],
     }
+    if record.get('turn_id'):
+        message['turn_id'] = record['turn_id']
+    if record.get('source_record_id'):
+        message['source_record_id'] = record['source_record_id']
     if record.get('session_id'):
         message['conversation_id'] = record['session_id']
+    if isinstance(record.get('id'), int):
+        if role == 'user' and kind in {'user_text', 'user_file', 'user_photo', 'command'}:
+            message['conversation_actions'] = {'branch_mode': 'user', 'withdraw': True}
+        elif kind == 'ai_reply':
+            message['conversation_actions'] = {'branch_mode': 'assistant'}
     raw_metadata = record.get("metadata") or {}
     try:
         metadata = json.loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
@@ -433,7 +442,8 @@ def build_history_message(
         if role == 'user' and attachment:
             item['ingress_mode'] = 'server_upload' if ref in metadata.get('server_uploads', []) else 'attachment'
         if (kind in {'user_file', 'user_photo'} and role == 'user' and attachment and isinstance(ref, dict)
-                and ref.get('storage', 'uploads') == 'uploads' and ref not in metadata.get('server_uploads', [])):
+                and ref.get('storage', 'uploads') == 'uploads' and not ref.get('immutable_object')
+                and ref not in metadata.get('server_uploads', [])):
             try:
                 from .attachment_versions import attachment_identity
                 identity, _ = attachment_identity(ref, storage / 'uploads')

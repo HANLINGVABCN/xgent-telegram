@@ -53,6 +53,14 @@ class DataPaths:
         return self.root / "workspace"
 
     @property
+    def conversation_objects(self):
+        return self.storage / "conversation_objects"
+
+    @property
+    def conversation_workspaces(self):
+        return self.storage / "conversation_workspaces"
+
+    @property
     def logs(self):
         return self.root if self.legacy else self.root / "logs"
 
@@ -68,6 +76,8 @@ class DataPaths:
             protect(self.root, True)
         self.logs.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.conversation_objects.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.conversation_workspaces.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 
 _active: DataPaths | None = None

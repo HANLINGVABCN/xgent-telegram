@@ -146,6 +146,8 @@ def _read(path, options, cancelled):
         conn.create_function('search_text', 4, visible_text, deterministic=True)
         conn.create_function('casefold', 1, lambda text: str(text or '').casefold(), deterministic=True)
         conn.execute('BEGIN')
+        message_columns = {row[1] for row in conn.execute('PRAGMA table_info(global_messages)')}
+        active_messages = ' AND m.withdrawn=0' if 'withdrawn' in message_columns else ''
         if snapshot is None:
             snapshot = conn.execute('SELECT COALESCE(MAX(id),0) FROM global_messages').fetchone()[0]
         scope = 's.deleting=0'
@@ -168,7 +170,7 @@ def _read(path, options, cancelled):
                 CASE WHEN m.msg_type='agent_result' THEN 'tool' ELSE m.role END role,
                 search_text(m.msg_type,m.role,m.content,m.metadata) text
                 FROM global_messages m JOIN chat_sessions s ON m.session_id=s.id
-                WHERE {scope} AND m.id<={snapshot} {role}
+                WHERE {scope}{active_messages} AND m.id<={snapshot} {role}
                 AND m.msg_type IN ('user_text','ai_reply','user_file','user_photo','media_reply','agent_result','runtime_error')""")
         where = 'instr(casefold(text),?)>0'
         params.append(query.casefold())

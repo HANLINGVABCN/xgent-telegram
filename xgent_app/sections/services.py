@@ -5,6 +5,8 @@
 # This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
+from pathlib import Path
+
 from xgent_app.shell_output import (
     build_run_notice,
     build_shell_notice,
@@ -52,6 +54,7 @@ from xgent_app.fanout import (
     ChannelWorker,
     Op,
     OP_SEND,
+    OP_DELETE,
     get_channel_registry,
 )
 from xgent_app.web_server import WebChatConfig, WebChatServer
@@ -67,6 +70,23 @@ from xgent_app.web_media import build_media_presentation, current_media_presenta
 # _web_external_record_watcher）靠它区分"本进程写的（SSE 已直发，跳过）"和
 # "别的进程写的（CLI 的对话，要推成帧）"，否则同一句话会在网页上显示两遍。
 _RECORDER_SOURCE_ID = f"pid{os.getpid()}-{uuid.uuid4().hex[:6]}"
+
+
+async def _delete_withdrawn_telegram(native_ids, logical_ids):
+    """Best effort only; local history/file withdrawal is already committed."""
+    if not BotConfig.TOKEN:
+        return
+    bot = globals().get('_web_real_bot')
+    for message_id in native_ids or []:
+        if bot is not None:
+            with contextlib.suppress(Exception):
+                await bot.delete_message(chat_id=BotConfig.AUTHORIZED_USER_ID, message_id=int(message_id))
+    channel = telegram_channel()
+    channel.ensure_started()
+    for logical_id in logical_ids or []:
+        with contextlib.suppress(Exception):
+            channel.offer(Op(OP_DELETE, logical_id=int(logical_id),
+                             chat_id=BotConfig.AUTHORIZED_USER_ID, payload={}))
 
 
 def current_ui_workflow_guard() -> str:
@@ -1079,6 +1099,11 @@ SKILL_SUMMARY_BLOCK_TAG = '!'
 SINGLE_MEMORY_SESSION_ID = "global_memory"
 SINGLE_MEMORY_SESSION_NAME = "全局记忆"
 
+
+def _conversation_state_dir(name: str, fallback: str) -> str:
+    root = AgentExecutor.current_work_dir()
+    return os.path.join(root, name) if os.path.abspath(root) != os.path.abspath(AgentExecutor.WORK_DIR) else fallback
+
 def _skill_dirs() -> list:
     """返回所有要扫描的 skill 目录：(目录路径, 前缀) 对。
 
@@ -1086,11 +1111,15 @@ def _skill_dirs() -> list:
     （路径如 private/my-skill.md），旧 skill/ 目录前缀为空（兼容历史部署）。
     """
     dirs = []
-    for d in (SKILL_PUBLIC_DIR, SKILL_LEGACY_DIR):
+    root = AgentExecutor.current_work_dir()
+    public_dir = os.path.join(root, 'skill-public')
+    legacy_dir = os.path.join(root, 'skill')
+    private_dir = _conversation_state_dir('skill-private', SKILL_PRIVATE_DIR)
+    for d in (public_dir, legacy_dir):
         if os.path.isdir(d):
             dirs.append((d, ''))
-    if os.path.isdir(SKILL_PRIVATE_DIR):
-        dirs.append((SKILL_PRIVATE_DIR, 'private/'))
+    if os.path.isdir(private_dir):
+        dirs.append((private_dir, 'private/'))
     return dirs
 
 MEMORY_DIR = str(DATA_PATHS.memory)
@@ -1167,13 +1196,14 @@ def resolve_skill_abs_path(rel_path: str) -> str:
     """
     if rel_path.startswith("private/"):
         real_rel = rel_path[len("private/"):]
-        return os.path.join(SKILL_PRIVATE_DIR, real_rel.replace('/', os.sep))
-    for d in (SKILL_PUBLIC_DIR, SKILL_LEGACY_DIR):
+        return os.path.join(_conversation_state_dir('skill-private', SKILL_PRIVATE_DIR), real_rel.replace('/', os.sep))
+    root = AgentExecutor.current_work_dir()
+    for d in (os.path.join(root, 'skill-public'), os.path.join(root, 'skill')):
         candidate = os.path.join(d, rel_path.replace('/', os.sep))
         if os.path.exists(candidate):
             return candidate
     # 文件不存在时仍返回公有目录拼出来的路径（保持旧行为，read_skill_text 会返回空）
-    return os.path.join(SKILL_PUBLIC_DIR, rel_path.replace('/', os.sep))
+    return os.path.join(root, 'skill-public', rel_path.replace('/', os.sep))
 
 def extract_skill_summary(rel_path: str) -> str:
     full_path = resolve_skill_abs_path(rel_path)
@@ -1240,9 +1270,10 @@ async def save_skill_state(path: str, state: str) -> None:
         await _sync_knowledge_state(db, force=True)
 
 def build_absolute_path_prompt_section() -> str:
-    project_root = to_display_path(os.path.dirname(os.path.abspath(__file__)))
-    skill_public_dir = to_display_path(SKILL_PUBLIC_DIR)
-    skill_private_dir = to_display_path(SKILL_PRIVATE_DIR)
+    project_root_raw = AgentExecutor.current_work_dir()
+    project_root = to_display_path(project_root_raw)
+    skill_public_dir = to_display_path(os.path.join(project_root_raw, 'skill-public'))
+    skill_private_dir = to_display_path(os.path.join(project_root_raw, 'skill-private'))
     upload_dir = to_display_path(ArtifactManager.UPLOAD_DIR)
     return (
         "\n\n---\n"
@@ -1252,8 +1283,8 @@ def build_absolute_path_prompt_section() -> str:
         f"- skill 私有目录: {skill_private_dir}\n"
         f"- 上传目录: {upload_dir}\n"
         f"- 数据根目录: {to_display_path(DATA_PATHS.root)}\n"
-        f"- 用户工作目录: {to_display_path(DATA_PATHS.workspace)}\n"
-        "命令默认工作目录就是上述项目根目录；命令中的 skill-public/、skill-private/、memory/、workspace/、xgent_storage/ 相对路径均以项目根目录为基准。所有协议的路径参数必须使用绝对路径；新建用户文件默认保存到项目内 workspace/。公开技能与脚本跟随 GitHub 更新，私有技能和用户数据保存在项目内并由备份保护。\n"
+        f"- 用户工作目录: {to_display_path(os.path.join(project_root_raw, 'workspace'))}\n"
+        "命令默认工作目录就是上述项目根目录；read/edit/file/grep 的相对路径也以此目录为基准，不能用 .. 越出当前对话工作区。绝对路径仍可使用；分支对话会把原项目绝对路径安全映射到自己的独立工作区。xgent_storage/ 是共享运行存储，不随分支改写；新建用户文件默认保存到 workspace/。\n"
         "---\n"
     )
 
@@ -1275,13 +1306,14 @@ def get_agent_runtime_prompt(agent_mode: bool) -> str:
 # --- 记忆（memory）文件管理：一条记忆 = 一个文件，按需读取拼进 system prompt ---
 def list_memory_files() -> List[str]:
     """列出 memory/ 下所有记忆文件名，按文件名（即时间戳）升序排序。"""
-    if not os.path.isdir(MEMORY_DIR):
+    memory_dir = _conversation_state_dir('memory', MEMORY_DIR)
+    if not os.path.isdir(memory_dir):
         return []
     result = []
-    for filename in os.listdir(MEMORY_DIR):
+    for filename in os.listdir(memory_dir):
         if filename.startswith('.') or not filename.endswith(MEMORY_FILE_SUFFIX):
             continue
-        full_path = os.path.join(MEMORY_DIR, filename)
+        full_path = os.path.join(memory_dir, filename)
         if not os.path.isfile(full_path):
             continue
         result.append(filename)
@@ -1291,17 +1323,18 @@ def list_memory_files() -> List[str]:
 def read_memory_file(filename: str) -> str:
     """读取单条记忆内容，复用 skill 的 utf-8/gbk 回退解码。"""
     safe_name = os.path.basename(filename)
-    full_path = os.path.join(MEMORY_DIR, safe_name)
+    full_path = os.path.join(_conversation_state_dir('memory', MEMORY_DIR), safe_name)
     return read_skill_text(full_path)
 
 
 def save_memory_file(content: str) -> str:
     """保存一条记忆为新文件（文件名带时间戳+随机后缀，避免重名），返回文件名。"""
-    os.makedirs(MEMORY_DIR, exist_ok=True)
+    memory_dir = _conversation_state_dir('memory', MEMORY_DIR)
+    os.makedirs(memory_dir, exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     rand_suffix = uuid.uuid4().hex[:6]
     filename = f"{MEMORY_FILE_PREFIX}{timestamp}_{rand_suffix}{MEMORY_FILE_SUFFIX}"
-    full_path = os.path.join(MEMORY_DIR, filename)
+    full_path = os.path.join(memory_dir, filename)
     with open(full_path, 'w', encoding='utf-8') as f:
         f.write(content)
     return filename
@@ -1310,7 +1343,7 @@ def save_memory_file(content: str) -> str:
 def delete_memory_file(filename: str) -> bool:
     """删除指定记忆文件，成功返回 True。"""
     safe_name = os.path.basename(filename)
-    full_path = os.path.join(MEMORY_DIR, safe_name)
+    full_path = os.path.join(_conversation_state_dir('memory', MEMORY_DIR), safe_name)
     if not os.path.isfile(full_path):
         return False
     try:
@@ -2268,7 +2301,8 @@ async def _conversation_state_changed(state):
         notifier(frame)
 
 
-configure_conversations(lambda: BotMemoryDB.get_instance(), BotConfig.DB_FILE, _conversation_state_changed)
+configure_conversations(lambda: BotMemoryDB.get_instance(), BotConfig.DB_FILE,
+                        _conversation_state_changed, code_root=DATA_PATHS.root)
 configure_callback_encoder(lambda value: CallbackDataStore.store(value), lambda value: CallbackDataStore.get(value))
 
 
@@ -2328,6 +2362,7 @@ _conversation_delete_tasks = {}
 async def _finish_conversation_deletion(cid):
     manager = get_conversations()
     db = await BotMemoryDB.get_instance()
+    deleting_session = await db.get_session(cid)
     # Only the scheduler owner can confirm that remote command processes stopped.
     from xgent_app.conversations import ExecutionFileLock
     if SelfTriggerManager._scheduler is None and ExecutionFileLock(str(db.db_path) + '.scheduler').busy():
@@ -2357,6 +2392,23 @@ async def _finish_conversation_deletion(cid):
                 if pending.flush_task is not None:
                     pending.flush_task.cancel()
                 _pending_album_conversations.pop(key, None)
+    workspace_path = (deleting_session or {}).get('workspace_path')
+    if workspace_path:
+        workspace = Path(workspace_path).resolve()
+        root = DATA_PATHS.conversation_workspaces.resolve()
+        if workspace.parent != root or not re.fullmatch(r'[0-9a-f]{32}', workspace.name):
+            raise ConversationError('分支工作区路径无效，已停止删除以保护其它文件。')
+        await asyncio.to_thread(
+            subprocess.run,
+            ['git', '-C', str(DATA_PATHS.root), 'worktree', 'remove', '--force', str(workspace)],
+            check=False, capture_output=True, timeout=60,
+        )
+        if workspace.exists():
+            await asyncio.to_thread(shutil.rmtree, workspace)
+    branch_uploads = (DATA_PATHS.uploads / 'branches' / cid).resolve()
+    branch_upload_root = (DATA_PATHS.uploads / 'branches').resolve()
+    if branch_uploads.parent == branch_upload_root and branch_uploads.exists():
+        await asyncio.to_thread(shutil.rmtree, branch_uploads)
     await db.finish_conversation_delete(cid)
     from xgent_app.web_bridge import MEDIA_TOKEN_REGISTRY
     MEDIA_TOKEN_REGISTRY.purge_conversation(cid)

@@ -353,13 +353,15 @@
   /* 每个气泡自己的底部操作栏，给相邻用户/AI 消息保留明确间距。 */
   .bubble .msg-actions {
     position: relative; right: auto; top: auto; z-index: 1;
-    display: flex; align-items: center; gap: 4px; width:fit-content; clear:both;
+    display: flex; align-items: center; gap: 2px; width:fit-content; clear:both;
     background: var(--surface); border: 1px solid var(--line-2);
     border-radius: var(--r-full); padding: 2px 4px;
     box-shadow: 0 4px 14px rgba(0, 0, 0, 0.16);
-    opacity: .72; transform: none; pointer-events: auto; margin-top: 10px; margin-left: auto;
+    opacity: .72; transform: none; pointer-events: auto; margin-top: 8px; margin-left: auto;
     transition: opacity var(--t);
   }
+  .bubble.user > .ts { float: left; margin: 7px 8px 0 0; line-height: 20px; }
+  .bubble.user > .msg-actions { clear: none; margin-top: 4px; margin-left: auto; }
   .bubble:hover .msg-actions, .bubble .msg-actions:focus-within {
     opacity: 1;
   }
@@ -372,6 +374,22 @@
   .act-btn:hover { background: var(--surface-2); color: var(--accent); }
   .act-btn.done { color: var(--ok) !important; }
   .act-btn .icon { width: 13px; height: 13px; }
+
+  .conversation-lineage {
+    margin: 2px 4px 6px; padding: 8px 10px;
+    border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--line)); border-radius: 10px;
+    background: color-mix(in srgb, var(--surface-2) 88%, var(--accent) 12%); color: var(--text-2);
+    font-size: 12px; line-height: 1.45; display: flex; flex-direction: column; gap: 6px; flex-shrink:0;
+  }
+  .conversation-lineage[hidden] { display:none; }
+  .conversation-lineage .lineage-head { display:flex; align-items:baseline; gap:6px; flex-wrap:wrap; overflow-wrap:anywhere; }
+  .conversation-lineage .lineage-actions { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .conversation-lineage strong { color:var(--text); }
+  .conversation-lineage .lineage-warning { color:var(--warn); }
+  .conversation-lineage button { border:1px solid var(--line-2); border-radius:8px; background:var(--surface); color:var(--text); padding:4px 8px; font-size:11.5px; cursor:pointer; }
+  .conversation-lineage button:hover { border-color:var(--accent); }
+  .branch-draft-files { display:flex; gap:6px; flex-wrap:wrap; }
+  .branch-draft-file { font-size:11px; padding:3px 7px; border-radius:999px; background:var(--surface-3); color:var(--text-2); }
 
   /* ---- Markdown 排版引擎与增强 ---- */
   .bubble h1, .bubble h2, .bubble h3, .bubble h4, .bubble h5, .bubble h6 {

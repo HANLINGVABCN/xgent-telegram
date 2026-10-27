@@ -214,8 +214,8 @@ def test_cross_tab_switch_updates_sidebar_without_stealing_search(browser_contex
 
 def test_sidebar_survives_optional_workbench_script_failure(browser_context, workspace_url):
     page = browser_context.new_page()
-    page.route('**/assets/workbench.js', lambda route: route.fulfill(status=404, body='not found'))
-    page.route('**/assets/components.js', lambda route: route.fulfill(status=404, body='not found'))
+    page.route('**/assets/workbench.js*', lambda route: route.fulfill(status=404, body='not found'))
+    page.route('**/assets/components.js*', lambda route: route.fulfill(status=404, body='not found'))
     page.goto(workspace_url['url'])
     page.locator('.conv-row').first.wait_for()
     original = current(page)

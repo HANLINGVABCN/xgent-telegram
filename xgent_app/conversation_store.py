@@ -6,6 +6,7 @@ shared; there is no SQL rewriting or context-dependent database connection.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import sqlite3
@@ -144,6 +145,44 @@ class ConversationStore(QueueStore):
             await _set_config(conn, 'conversation_schema_version', 1)
         self._config_cache.clear()
 
+    async def _repair_turn_and_branch_tokens(self, conn):
+        await conn.execute(
+            "UPDATE global_messages SET turn_id=NULL WHERE turn_id IS NOT NULL AND ("
+            "msg_type='command' OR (msg_type<>'token_usage' AND id > COALESCE((SELECT final_record_id FROM conversation_turns "
+            "WHERE conversation_turns.id=global_messages.turn_id AND final_record_id IS NOT NULL), id)))"
+        )
+        await conn.execute(
+            "UPDATE global_messages SET turn_id=("
+            "SELECT m.turn_id FROM global_messages m "
+            "WHERE m.session_id=global_messages.session_id AND m.id<global_messages.id "
+            "ORDER BY m.id DESC LIMIT 1"
+            ") WHERE msg_type='token_usage' AND turn_id IS NULL"
+        )
+        branch_cursor = await conn.execute(
+            "SELECT b.id branch_id, b.parent_conversation_id parent_id, "
+            "m.source_record_id, m.turn_id branch_turn_id "
+            "FROM chat_sessions b JOIN global_messages m ON m.session_id=b.id "
+            "WHERE b.parent_conversation_id IS NOT NULL AND b.deleting=0 "
+            "AND m.id=(SELECT MAX(id) FROM global_messages WHERE session_id=b.id AND withdrawn=0) "
+            "AND m.msg_type='ai_reply' AND m.source_record_id IS NOT NULL"
+        )
+        for br in await branch_cursor.fetchall():
+            tok_cursor = await conn.execute(
+                "SELECT * FROM global_messages WHERE session_id=? AND id>? AND withdrawn=0 ORDER BY id LIMIT 1",
+                (br['parent_id'], br['source_record_id']),
+            )
+            tok = await tok_cursor.fetchone()
+            await tok_cursor.close()
+            if tok and tok['msg_type'] == 'token_usage':
+                await conn.execute(
+                    '''INSERT INTO global_messages
+                    (chat_id,user_id,msg_type,role,content,timestamp,session_id,metadata,turn_id,withdrawn,source_record_id)
+                    VALUES(?,?,?,?,?,?,?,?,?,0,?)''',
+                    (tok['chat_id'], tok['user_id'], tok['msg_type'], tok['role'], tok['content'],
+                     tok['timestamp'], br['branch_id'], tok['metadata'], br['branch_turn_id'], tok['id']),
+                )
+        await branch_cursor.close()
+
     async def migrate_conversations(self):
         await self._migrate_conversations_v1()
         async with self._transaction() as conn:
@@ -151,6 +190,7 @@ class ConversationStore(QueueStore):
             if version > SCHEMA_VERSION:
                 raise ConversationError('数据库版本较新，请升级程序。')
             if version == SCHEMA_VERSION:
+                await self._repair_turn_and_branch_tokens(conn)
                 return
             if version < 2:
                 for column, definition in (
@@ -190,6 +230,113 @@ class ConversationStore(QueueStore):
                         await conn.execute(f'ALTER TABLE chat_sessions ADD COLUMN {column} {definition}')
                 await conn.execute('CREATE INDEX IF NOT EXISTS idx_conversation_group ON chat_sessions(group_id,archived,pinned)')
                 await _set_config(conn, 'conversation_schema_version', 5)
+            if version < 6:
+                cursor = await conn.execute('PRAGMA table_info(chat_sessions)')
+                session_columns = {row['name'] for row in await cursor.fetchall()}
+                for column, definition in (
+                    ('parent_conversation_id', 'TEXT'),
+                    ('parent_turn_id', 'TEXT'),
+                    ('workspace_path', 'TEXT'),
+                    ('branch_mode', 'TEXT'),
+                    ('branch_base_snapshot_id', 'TEXT'),
+                    ('branch_created_at', 'REAL'),
+                ):
+                    if column not in session_columns:
+                        await conn.execute(f'ALTER TABLE chat_sessions ADD COLUMN {column} {definition}')
+                cursor = await conn.execute('PRAGMA table_info(global_messages)')
+                message_columns = {row['name'] for row in await cursor.fetchall()}
+                for column, definition in (
+                    ('turn_id', 'TEXT'),
+                    ('withdrawn', 'INTEGER NOT NULL DEFAULT 0'),
+                    ('source_record_id', 'INTEGER'),
+                ):
+                    if column not in message_columns:
+                        await conn.execute(f'ALTER TABLE global_messages ADD COLUMN {column} {definition}')
+                cursor = await conn.execute('PRAGMA table_info(ui_messages)')
+                ui_columns = {row['name'] for row in await cursor.fetchall()}
+                for column, definition in (
+                    ('turn_id', 'TEXT'),
+                    ('withdrawn', 'INTEGER NOT NULL DEFAULT 0'),
+                ):
+                    if column not in ui_columns:
+                        await conn.execute(f'ALTER TABLE ui_messages ADD COLUMN {column} {definition}')
+                await conn.execute('''CREATE TABLE IF NOT EXISTS artifact_objects (
+                    sha256 TEXT PRIMARY KEY,size INTEGER NOT NULL,path TEXT NOT NULL,
+                    kind TEXT NOT NULL,created_at REAL NOT NULL)''')
+                await conn.execute('''CREATE TABLE IF NOT EXISTS conversation_snapshots (
+                    id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,turn_id TEXT,
+                    phase TEXT NOT NULL,root_digest TEXT NOT NULL,file_count INTEGER NOT NULL,
+                    total_size INTEGER NOT NULL,created_at REAL NOT NULL)''')
+                await conn.execute('''CREATE TABLE IF NOT EXISTS snapshot_entries (
+                    snapshot_id TEXT NOT NULL,path TEXT NOT NULL,object_sha256 TEXT NOT NULL,
+                    mode INTEGER NOT NULL,size INTEGER NOT NULL,
+                    PRIMARY KEY(snapshot_id,path))''')
+                await conn.execute('''CREATE TABLE IF NOT EXISTS conversation_turns (
+                    id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,run_id TEXT UNIQUE,
+                    status TEXT NOT NULL,started_at REAL NOT NULL,finished_at REAL,
+                    before_snapshot_id TEXT,after_snapshot_id TEXT,user_record_id INTEGER,
+                    final_record_id INTEGER,snapshot_complete INTEGER NOT NULL DEFAULT 0,
+                    error TEXT)''')
+                await conn.execute('''CREATE TABLE IF NOT EXISTS turn_operations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,turn_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,kind TEXT NOT NULL,effect TEXT NOT NULL,
+                    details TEXT,created_at REAL NOT NULL,UNIQUE(turn_id,sequence))''')
+                await conn.execute('''CREATE TABLE IF NOT EXISTS conversation_branch_drafts (
+                    conversation_id TEXT PRIMARY KEY,source_record_id INTEGER NOT NULL,
+                    text TEXT NOT NULL,metadata TEXT,created_at REAL NOT NULL)''')
+                await conn.execute('''CREATE TABLE IF NOT EXISTS conversation_mutation_requests (
+                    request_id TEXT PRIMARY KEY,operation TEXT NOT NULL,conversation_id TEXT NOT NULL,
+                    response TEXT NOT NULL,created_at REAL NOT NULL)''')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_turns_conversation ON conversation_turns(conversation_id,started_at,id)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_messages_turn ON global_messages(turn_id,id)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_snapshots_conversation ON conversation_snapshots(conversation_id,created_at,id)')
+                cursor = await conn.execute('SELECT id FROM chat_sessions ORDER BY created_at,id')
+                for session in await cursor.fetchall():
+                    rows_cursor = await conn.execute('SELECT id,role,msg_type,timestamp FROM global_messages '
+                                                     'WHERE session_id=? AND turn_id IS NULL ORDER BY id',
+                                                     (session['id'],))
+                    pending = []
+                    user_row = final_row = None
+                    started_at = finished_at = None
+
+                    async def flush_legacy_turn():
+                        nonlocal pending, user_row, final_row, started_at, finished_at
+                        if not pending or user_row is None:
+                            pending, user_row, final_row = [], None, None
+                            started_at = finished_at = None
+                            return
+                        turn_id = 'legacy_' + hashlib.sha256(
+                            f"{session['id']}:{user_row}".encode()).hexdigest()[:32]
+                        await conn.execute('''INSERT OR IGNORE INTO conversation_turns
+                            (id,conversation_id,status,started_at,finished_at,user_record_id,
+                             final_record_id,snapshot_complete,error)
+                            VALUES(?,?,'legacy',?,?,?,?,0,'')''',
+                            (turn_id, session['id'], started_at, finished_at, user_row, final_row))
+                        await conn.executemany('UPDATE global_messages SET turn_id=? WHERE id=? AND turn_id IS NULL',
+                                               [(turn_id, row_id) for row_id in pending])
+                        pending, user_row, final_row = [], None, None
+                        started_at = finished_at = None
+
+                    for row in await rows_cursor.fetchall():
+                        if row['msg_type'] == 'command':
+                            await flush_legacy_turn()
+                            continue
+                        starts_turn = row['role'] == 'user' and row['msg_type'] in {
+                            'user_text', 'user_file', 'user_photo', 'user_sticker',
+                        }
+                        if starts_turn:
+                            await flush_legacy_turn()
+                            user_row = row['id']
+                            started_at = row['timestamp']
+                        if user_row is None:
+                            continue
+                        pending.append(row['id'])
+                        finished_at = row['timestamp']
+                        if row['role'] == 'assistant' and row['msg_type'] == 'ai_reply':
+                            final_row = row['id']
+                    await flush_legacy_turn()
+                await self._repair_turn_and_branch_tokens(conn)
+                await _set_config(conn, 'conversation_schema_version', 6)
         self._config_cache.clear()
 
     async def get_conversation_groups(self):
@@ -257,7 +404,7 @@ class ConversationStore(QueueStore):
     async def _select_fallback(self, conn):
         cursor = await conn.execute('SELECT s.id FROM chat_sessions s WHERE s.archived=0 AND s.deleting=0 '
                                    'ORDER BY COALESCE((SELECT MAX(timestamp) FROM global_messages m '
-                                   'WHERE m.session_id=s.id AND m.msg_type IN '
+                                   'WHERE m.session_id=s.id AND m.withdrawn=0 AND m.msg_type IN '
                                    "('user_text','user_file','user_photo','ai_reply','media_reply')),s.created_at) DESC,s.id LIMIT 1")
         row = await cursor.fetchone()
         active = row['id'] if row else await self._new_conversation(conn)
@@ -323,6 +470,10 @@ class ConversationStore(QueueStore):
             await conn.execute('DELETE FROM message_queue WHERE conversation_id=?', (cid,))
             await conn.execute('DELETE FROM message_queue_controls WHERE conversation_id=?', (cid,))
             await conn.execute('DELETE FROM message_queue_requests WHERE conversation_id=?', (cid,))
+            await conn.execute('DELETE FROM turn_operations WHERE turn_id IN (SELECT id FROM conversation_turns WHERE conversation_id=?)', (cid,))
+            await conn.execute('DELETE FROM conversation_turns WHERE conversation_id=?', (cid,))
+            await conn.execute('DELETE FROM conversation_branch_drafts WHERE conversation_id=?', (cid,))
+            await conn.execute('DELETE FROM conversation_mutation_requests WHERE conversation_id=?', (cid,))
             for table, key in (('cli_relay_ops','conversation_context'),('channel_outbox','_conversation_context'),('channel_deadletter','_conversation_context')):
                 cursor = await conn.execute(f'SELECT id,payload FROM {table}')
                 ids = []

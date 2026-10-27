@@ -248,10 +248,28 @@ class QueueStore:
                     return []
             batch = await rows(conn, "SELECT * FROM message_queue WHERE conversation_id=? AND generation=? AND status='pending' ORDER BY seq", (cid, scope.generation))
             now = time.time()
-            for item in batch:
+            draft = await one(conn, 'SELECT * FROM conversation_branch_drafts WHERE conversation_id=?', (cid,)) if batch else None
+            for index, item in enumerate(batch):
                 metadata = {'queue_id': item['id'], 'queue_origin': item['origin'], 'queue_created_at': item['created_at'],
                             'queue_run_id': scope.run_id, 'src': 'message-queue'}
-                record = await self._insert_global_record(conn, item['chat_id'], item['chat_id'], 'user_text', 'user', item['text'], now, cid, metadata)
+                if item['origin'] == 'telegram':
+                    parts = str(item.get('request_key') or '').split(':')
+                    if len(parts) == 3 and parts[0] == 'telegram' and parts[1].isdigit() and parts[2].isdigit():
+                        metadata['source_message_id'] = int(parts[2])
+                msg_type = 'user_text'
+                if index == 0 and draft is not None:
+                    try:
+                        branch_metadata = json.loads(draft['metadata'] or '{}')
+                    except (TypeError, ValueError):
+                        branch_metadata = {}
+                    if isinstance(branch_metadata, dict):
+                        metadata.update(branch_metadata)
+                    metadata.update(branch_draft_source_record_id=draft['source_record_id'],
+                                    web_file_message={'version': 1, 'text': item['text']})
+                    if metadata.get('attachments'):
+                        msg_type = 'user_file'
+                    await conn.execute('DELETE FROM conversation_branch_drafts WHERE conversation_id=?', (cid,))
+                record = await self._insert_global_record(conn, item['chat_id'], item['chat_id'], msg_type, 'user', item['text'], now, cid, metadata)
                 await conn.execute('INSERT INTO chat_messages(session_id,role,content,timestamp) VALUES(?,?,?,?)', (cid, 'user', item['text'], now))
                 await conn.execute("UPDATE message_queue SET status='claimed',reason='',run_id=?,record_id=?,revision=revision+1,updated_at=? WHERE id=?", (scope.run_id, record, now, item['id']))
                 item.update(record_id=record, run_id=scope.run_id, status='claimed', revision=item['revision'] + 1)

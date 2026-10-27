@@ -352,7 +352,7 @@ class AgentShellSession:
 
     def __init__(self, session_id: str, command: str):
         self.session_id = session_id
-        self.command = command
+        self.command = AgentExecutor.map_command_paths(command)
         self.started_at = time.time()
         self.started_monotonic = time.monotonic()
         self.last_output_at = self.started_at
@@ -373,7 +373,9 @@ class AgentShellSession:
 
     def start(self):
         from xgent_app.conversations import conversation_secret_environment
-        env = {**os.environ, **conversation_secret_environment(), 'LANG': 'en_US.UTF-8', 'TERM': os.environ.get('TERM') or 'xterm-256color'}
+        env = {**os.environ, **conversation_secret_environment(), 'LANG': 'en_US.UTF-8',
+               'TERM': os.environ.get('TERM') or 'xterm-256color',
+               'XGENT_WORK_DIR': AgentExecutor.current_work_dir()}
         if self.pty_enabled:
             import pty
 
@@ -386,7 +388,7 @@ class AgentShellSession:
                 stdin=terminal_fd,
                 stdout=terminal_fd,
                 stderr=terminal_fd,
-                cwd=AgentExecutor.WORK_DIR,
+                cwd=AgentExecutor.current_work_dir(),
                 env=env,
                 close_fds=True,
                 start_new_session=True,
@@ -400,7 +402,7 @@ class AgentShellSession:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                cwd=AgentExecutor.WORK_DIR,
+                cwd=AgentExecutor.current_work_dir(),
                 env=env,
             )
             self.reader_thread = threading.Thread(target=self._read_pipe_loop, daemon=True)
@@ -2457,6 +2459,7 @@ class SelfTriggerManager:
                 'output_path': None,
                 'error': BLACKLIST_BLOCKED_NOTICE,
             }
+        command = AgentExecutor.map_command_paths(command)
 
         condition = TriggerConditionExpression(task['condition_expr']) if task.get('condition_expr') else None
         now = datetime.now()
@@ -2479,9 +2482,10 @@ class SelfTriggerManager:
 
         process = await asyncio.create_subprocess_shell(
             command,
-            cwd=AgentExecutor.WORK_DIR,
+            cwd=AgentExecutor.current_work_dir(),
             env={**os.environ, **SECRET_STORE.environment(task['conversation_id']), 'LANG': 'en_US.UTF-8',
-                 'XGENT_CHAT_ID': str(task['chat_id']), 'XGENT_CONVERSATION_ID': str(task['conversation_id'])},
+                 'XGENT_CHAT_ID': str(task['chat_id']), 'XGENT_CONVERSATION_ID': str(task['conversation_id']),
+                 'XGENT_WORK_DIR': AgentExecutor.current_work_dir()},
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -2589,6 +2593,8 @@ class SelfTriggerManager:
     @classmethod
     async def _deliver_run_inner(cls, run_id: str):
         db = await BotMemoryDB.get_instance()
+        from xgent_app.conversation_branching import record_operation
+        await record_operation(db, 'trigger', 'unknown', {'run_id': run_id})
         run = await db.get_trigger_run(run_id)
         if run is None or run.get('delivered_at') is not None or run.get('finished_at') is None:
             return

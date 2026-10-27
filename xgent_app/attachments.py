@@ -576,7 +576,7 @@ def prepare_attachment_context(records: list[dict], upload_root: str | Path,
             for reference in references:
                 ordered_references.append(
                     (upload_order, group, message_order, reference["order"],
-                     record.get("id", "?"), reference, mutable)
+                     record.get("id", "?"), reference, mutable and not reference.get('immutable_object'))
                 )
         except AttachmentContextError as exc:
             errors.append(f"Attachment record #{record.get('id', '?')}: {exc}")

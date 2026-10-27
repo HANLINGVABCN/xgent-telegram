@@ -1073,8 +1073,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if data is None:
             return
         # 不沿用 workspace 的宽白名单；只认配置中 xgent_storage 下的 command_outputs。
-        roots = [os.path.join(root, "command_outputs") for root in self.config.media_allowed_roots
-                 if os.path.basename(os.path.normpath(root)) == "xgent_storage"]
+        roots = [os.path.join(root, child) for root in self.config.media_allowed_roots
+                 if os.path.basename(os.path.normpath(root)) == "xgent_storage"
+                 for child in ("command_outputs", "conversation_objects")]
         try:
             page = read_output_page(str(data.get("path") or ""), data.get("offset", 0), roots=roots)
         except OutputArchiveError as exc:

@@ -1,6 +1,8 @@
 # This file is executed by xgent_server.py in the shared application namespace.
 # Keep cross-section names available through the loader until the next decoupling phase.
 
+from pathlib import Path
+
 from xgent_app.agent_context import (
     build_read_attachment_context_message,
     build_read_ranged_context_message,
@@ -24,6 +26,38 @@ class AgentExecutor:
     # 在跑，所以类属性暂存是安全的；将来若要支持真·多对话并发，须改为显式传参。
     _current_chat_id: Optional[int] = None
     _current_conversation_id: Optional[str] = None
+
+    @classmethod
+    def current_work_dir(cls) -> str:
+        from xgent_app.conversations import current_scope
+        scope = current_scope(required=False)
+        return str(Path(scope.workspace_path).resolve()) if scope and scope.workspace_path else cls.WORK_DIR
+
+    @classmethod
+    def _map_conversation_path(cls, value: str) -> str:
+        from xgent_app.conversations import current_scope
+        target = Path(resolve_stored_path(value)).resolve()
+        scope = current_scope(required=False)
+        if not scope or not scope.workspace_path:
+            return str(target)
+        code = Path(cls.WORK_DIR).resolve()
+        if target != code and target.is_relative_to(code):
+            relative = target.relative_to(code)
+            # Runtime storage remains shared and checksum-addressed. Project,
+            # workspace, memory and private-skill paths are branch-local.
+            if relative.parts and relative.parts[0] != 'xgent_storage':
+                return str((Path(scope.workspace_path).resolve() / relative).resolve())
+        return str(target)
+
+    @classmethod
+    def map_command_paths(cls, command: str) -> str:
+        from xgent_app.conversations import current_scope
+        scope = current_scope(required=False)
+        if not scope or not scope.workspace_path:
+            return command
+        source, target = str(Path(cls.WORK_DIR).resolve()), str(Path(scope.workspace_path).resolve())
+        return re.sub(re.escape(source), lambda _match: target, command,
+                      flags=re.IGNORECASE if os.name == 'nt' else 0)
     MEDIA_INLINE_MAX_BYTES = 8 * 1024 * 1024
     TEXT_INLINE_MAX_BYTES = 512 * 1024
     # [edit] 原地替换的备份后缀（后随时间戳）
@@ -871,30 +905,35 @@ class AgentExecutor:
         return ProtocolParser.has_unclosed_block(ai_response)
     @classmethod
     def resolve_file_path(cls, requested_path: str) -> str:
-        """将文件路径解析为服务器上的实际路径。仅接受绝对路径。"""
+        """Resolve absolute paths or conversation-local relative paths."""
         cleaned = requested_path.strip()
         if not cleaned:
             raise ValueError("文件路径为空")
         if not os.path.isabs(cleaned):
-            raise ValueError(f"路径必须是绝对路径（以 / 开头），收到: {cleaned}。请使用项目根目录等绝对路径。")
-        return os.path.abspath(resolve_stored_path(cleaned))
+            root = Path(cls.current_work_dir()).resolve()
+            target = (root / cleaned).resolve()
+            if target != root and not target.is_relative_to(root):
+                raise ValueError(f"相对路径越过当前对话工作区: {cleaned}")
+            return str(target)
+        return cls._map_conversation_path(cleaned)
 
     @classmethod
     def resolve_write_path(cls, requested_path: str) -> str:
-        """写文件用的路径解析。file 协议必须明确提供绝对路径。"""
+        """写文件用的路径解析；相对路径以当前对话工作区为基准。"""
         cleaned = requested_path.strip()
-        default_workspace = to_display_path(os.path.join(cls.WORK_DIR, 'workspace'))
+        default_workspace = to_display_path(os.path.join(cls.current_work_dir(), 'workspace'))
         if not cleaned:
             raise ValueError(
-                "file 协议必须指定目标文件的绝对路径；"
+                "file 协议必须指定目标文件路径；"
                 f"未指定保存位置时，请使用 {default_workspace}/文件名"
             )
         if not os.path.isabs(cleaned):
-            raise ValueError(
-                f"file 协议路径必须是绝对路径，收到: {cleaned}；"
-                f"未指定保存位置时，请使用 {default_workspace}/文件名"
-            )
-        return os.path.abspath(resolve_stored_path(cleaned))
+            root = Path(cls.current_work_dir()).resolve()
+            target = (root / cleaned).resolve()
+            if target != root and not target.is_relative_to(root):
+                raise ValueError(f"相对路径越过当前对话工作区: {cleaned}")
+            return str(target)
+        return cls._map_conversation_path(cleaned)
 
     @classmethod
     async def write_file(cls, requested_path: str, content: str) -> Dict[str, Any]:
@@ -1613,6 +1652,8 @@ class AgentExecutor:
             logger.warning(f"run 命令被黑名单拦截，命中规则: {pattern} | 命令: {command[:200]}")
             return {'success': False, 'output': BLACKLIST_BLOCKED_NOTICE, 'return_code': -1}
 
+        command = cls.map_command_paths(command)
+
         timeout = cls.get_timeout()
         process = None
         tasks = []
@@ -1642,6 +1683,7 @@ class AgentExecutor:
 
             from xgent_app.conversations import conversation_secret_environment
             run_env = {**os.environ, **conversation_secret_environment(), 'LANG': 'en_US.UTF-8'}
+            run_env['XGENT_WORK_DIR'] = cls.current_work_dir()
             if cls._current_chat_id is not None:
                 run_env['XGENT_CHAT_ID'] = str(cls._current_chat_id)
             if cls._current_conversation_id is not None:
@@ -1649,7 +1691,7 @@ class AgentExecutor:
 
             # 创建进程途中也可能收到取消，先取回句柄再让 finally 回收它。
             spawn_task = asyncio.create_task(asyncio.create_subprocess_shell(
-                command, cwd=cls.WORK_DIR, env=run_env,
+                command, cwd=cls.current_work_dir(), env=run_env,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **kwargs,
             ))
             cancelled_during_spawn = False

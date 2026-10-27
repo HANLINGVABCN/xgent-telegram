@@ -40,6 +40,8 @@
     <g id="i-zoom-in"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5M11 8v6M8 11h6"/></g>
     <g id="i-rotate"><path d="M21.5 2v6h-6M21.34 15.57a9 9 0 1 1-.57-8.38l6.67-5.19"/></g>
     <g id="i-external"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14 21 3"/></g>
+    <g id="i-branch"><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M6 3v12M18 9a9 9 0 0 1-9 9"/></g>
+    <g id="i-undo"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></g>
   </defs>
 </svg>
 
@@ -174,7 +176,7 @@
         <button id="btn-stop" class="stop-btn hidden" title="停止生成" aria-label="停止"><svg class="icon" viewBox="0 0 24 24"><use href="#i-stop"/></svg></button>
       </div>
     </div>
-    <div id="composer-options-popover" aria-label="输入选项" hidden></div>
+    <div id="composer-options-popover" aria-label="输入选项" hidden><div id="conversation-lineage" class="conversation-lineage" hidden></div></div>
     <p id="composer-option-error" role="status" hidden></p>
     <section id="composer-commands" aria-label="命令列表" hidden></section>
     <div id="cmd-suggest" class="cmd-suggest hidden"></div>

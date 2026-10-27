@@ -2096,7 +2096,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                       if isinstance(content, list) else str(content) + '\n\n' + notice)
                     return out
 
-                for block in protocol_blocks:
+                for protocol_index, block in enumerate(protocol_blocks):
                     if is_stop_requested():
                         round_state.should_continue = False
                         break
@@ -2104,6 +2104,11 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     smart_notice = _smart_match_notice(block)
                     block_type = block['type']
                     round_state.note_over_eligibility(block_type)
+
+                    if block_type in {'read', 'edit', 'grep', 'run', 'search', 'fetch', 'intel'}:
+                        from xgent_app.conversation_branching import record_operation, operation_effect
+                        await record_operation(db, block_type, operation_effect(block_type),
+                                               {'protocol_index': protocol_index})
 
                     # 智能匹配时，先把"系统提示"发到聊天，放在执行结果前面，让用户也能看到
                     if smart_notice:
@@ -2175,6 +2180,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         continue
 
                     if block_type == 'sendfile':
+                        from xgent_app.conversation_branching import record_operation
+                        await record_operation(db, 'sendfile', 'external')
                         sendfile_notice = await execute_sendfile_protocol(
                             block['body'],
                             executor=AgentExecutor,
@@ -2205,6 +2212,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         continue
 
                     if block_type == 'file':
+                        from xgent_app.conversation_branching import record_operation
+                        await record_operation(db, 'file', 'local_reversible', {'path': block.get('path', '')})
                         filename = block['path']
                         file_notice = ""
                         try:
@@ -2245,6 +2254,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         continue
 
                     if block_type == 'file_base64':
+                        from xgent_app.conversation_branching import record_operation
+                        await record_operation(db, 'file_base64', 'local_reversible', {'path': block.get('path', '')})
                         filename = block['path']
                         file_notice = ""
                         try:
@@ -2285,6 +2296,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         continue
 
                     if block_type == 'ask':
+                        from xgent_app.conversation_branching import record_operation
+                        await record_operation(db, 'ask', 'read_only')
                         ask_form, ask_err = parse_ask_form(block.get('body') or '')
                         if ask_err:
                             # 格式错误：回灌给模型让它改正，不阻断、不抛异常。
@@ -2346,6 +2359,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         break  # 一条消息只处理第一个 ask 表单，其余忽略
 
                     if block_type in {'shell', 'stdin', 'shellkill'}:
+                        from xgent_app.conversation_branching import record_operation
+                        await record_operation(db, block_type, 'unknown')
                         shell_execution = await execute_shell_protocol(
                             block,
                             shell_manager=AgentShellSessionManager,
@@ -2419,6 +2434,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         continue
 
                     if block_type == 'media':
+                        from xgent_app.conversation_branching import record_operation
+                        await record_operation(db, 'media', 'external')
                         media_prompt = block['body']
                         await GlobalRecorder.record(
                             msg_type=MessageType.AGENT_CMD,

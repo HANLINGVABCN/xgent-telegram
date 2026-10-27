@@ -898,6 +898,7 @@
     entry.aiMeta = head && head._aiMeta;
     applyAiGeneration(entry, timestamp, aiGeneration);
     if (messageId != null) byMessageId[messageId] = entry;
+    else if (!renderTarget && role === "user") row._optimisticEntry = entry;
     if (!renderTarget && (role === "ai" || role === "cmd" || role === "sys")) lastStreamEntry = entry;
     return entry;
   }
@@ -1319,6 +1320,16 @@
       existing=aliases.map(mid=>byMessageId[mid]).find(Boolean);
       if(existing)byMessageId[id]=existing;
     }
+    if(!existing&&role==='user'){
+      var unbound=Array.from(log.querySelectorAll('.msg-row.user:not([data-record-id])')).find(
+        r=>r._optimisticEntry&&r._optimisticEntry.rawText===(message.content??message.text)
+      );
+      if(unbound){
+        existing=unbound._optimisticEntry;
+        delete unbound._optimisticEntry;
+        byMessageId[id]=existing;
+      }
+    }
     var frame={...message,type:'message',text:message.content??message.text,
       record_id:message.record_id??message.id,replace_message_ids:aliases};
     var entry=putTextFrame(role,frame);
@@ -1327,8 +1338,154 @@
     aliases.forEach(function(mid){byMessageId[mid]=entry;});
     entry.row.dataset.historyCursor=message.history_cursor||entry.row.dataset.historyCursor||'';
     entry.row._historyOrder=[Number(message.timestamp)||0,message.ui_message_id?1:0,String(message.ui_message_id||message.record_id||message.id||'').padStart(20,'0')];
-    if(frame.record_id!=null&&!message.ui_message_id)entry.row.dataset.recordId=String(frame.record_id);
+    if(frame.record_id!=null&&!message.ui_message_id){entry.row.dataset.recordId=String(frame.record_id);delete entry.row._optimisticEntry;}
+    if(message.turn_id)entry.row.dataset.turnId=String(message.turn_id);
+    setConversationActions(entry,message);
     return entry;
+  }
+
+  function conversationActionButton(iconName,title,handler){
+    var button=document.createElement('button');button.type='button';button.className='act-btn conversation-action';
+    button.innerHTML=svgIcon(iconName);button.title=title;button.setAttribute('aria-label',title);
+    button.addEventListener('click',function(event){event.stopPropagation();handler().catch(error=>toast(error.message,true));});
+    return button;
+  }
+
+  function setConversationActions(entry,message){
+    if(!entry?.bubble||!message?.conversation_actions||!Number.isSafeInteger(message.id))return;
+    var bar=entry.bubble.querySelector('.msg-actions');if(!bar)return;
+    var actions=message.conversation_actions;
+    if(actions.branch_mode==='user'&&message.turn_id){
+      var firstUser=log.querySelector(`.msg-row.user[data-turn-id="${CSS.escape(String(message.turn_id))}"]`);
+      if(firstUser&&firstUser!==entry.row)return;
+    }
+    if(actions.branch_mode==='assistant'&&message.turn_id){
+      log.querySelectorAll(`.msg-row.ai[data-turn-id="${CSS.escape(String(message.turn_id))}"]`).forEach(row=>{
+        if(row!==entry.row)row.querySelectorAll('.conversation-action').forEach(btn=>btn.remove());
+      });
+    }
+    bar.querySelectorAll('.conversation-action').forEach(button=>button.remove());
+    if(actions.branch_mode){
+      var title=actions.branch_mode==='user'?'编辑并创建分支':'从此回答创建分支';
+      bar.appendChild(conversationActionButton('branch',title,()=>openBranchDialog(message,actions.branch_mode)));
+    }
+    if(actions.withdraw)bar.appendChild(conversationActionButton('undo','撤回此消息及之后',()=>openWithdrawDialog(message)));
+  }
+
+  function reconcileUnboundUserMessages(){
+    if(loggedOut||!selectedConversationId||!log.querySelector('.msg-row.user:not([data-record-id])'))return;
+    var cid=selectedConversationId;
+    api('/api/workbench/history?conversation_id='+encodeURIComponent(cid)+'&limit=8').then(function(data){
+      if(cid!==selectedConversationId||!Array.isArray(data?.messages))return;
+      data.messages.forEach(function(m){
+        if(m.role==='user'||byMessageId['history:'+(m.record_id??m.id)])putHistoryFrame(m,streamEpoch);
+      });
+    }).catch(function(){});
+  }
+
+  function dialogSummary(title,lines){
+    var box=actionNode('div');box.append(actionNode('p',title));
+    lines.filter(Boolean).forEach(line=>box.append(actionNode('p',line,'wb-note')));return box;
+  }
+
+  async function openBranchDialog(message,mode){
+    var cid=message.conversation_id||selectedConversationId;
+    var box=dialogSummary('正在检查分支点…',[]);showAction('创建对话分支',box);
+    try{
+      var preview=await api('/api/workbench/conversations/branch/preview',{method:'POST',body:JSON.stringify({conversation_id:cid,record_id:message.id,mode})});
+      box.replaceChildren();
+      box.append(actionNode('p',mode==='user'?'新分支会停在这条消息之前，并把原文字放回输入框。':'新分支会保留到这次完整回答结束。'));
+      box.append(actionNode('p',preview.exact_files?'将准确恢复该回合的文件现场。':preview.warning,preview.exact_files?'wb-note':'wb-error'));
+      if(preview.has_attachments)box.append(actionNode('p','原附件会作为不可变引用进入新分支草稿，不会覆盖来源附件。','wb-note'));
+      var controls=actionNode('div',null,'wb-actions'),cancel=actionButton('取消',closeAction),confirm=actionButton('创建分支',async()=>{
+        confirm.disabled=true;confirm.textContent='正在创建独立工作区…';
+        try{
+          var result=await api('/api/workbench/conversations/branch',{method:'POST',body:JSON.stringify({conversation_id:cid,record_id:message.id,mode,request_id:queueRequestId()})});
+          closeAction();await window.XGentConversations?.refresh();await window.XGentConversations?.select(result.conversation_id);
+          if(result.draft?.text&&!input.value){input.value=result.draft.text;syncSendState();input.focus();}
+          await loadConversationLineage();toast(result.branch_mode==='exact'?'已创建精确文件分支':'已创建仅上下文分支');
+        }finally{confirm.disabled=false;confirm.textContent='创建分支';}
+      },'primary');controls.append(cancel,confirm);box.append(controls);
+    }catch(error){box.replaceChildren(actionMessage(error.message,true),actionButton('关闭',closeAction));}
+  }
+
+  async function openWithdrawDialog(message){
+    var cid=message.conversation_id||selectedConversationId;
+    var box=dialogSummary('正在检查回合副作用…',[]);showAction('撤回此消息及之后',box);
+    try{
+      var preview=await api('/api/workbench/conversations/withdraw/preview',{method:'POST',body:JSON.stringify({conversation_id:cid,record_id:message.id})});
+      box.replaceChildren();
+      if(!preview.can_withdraw){
+        box.append(actionMessage(preview.reason,true));
+        var safe=actionButton('改为从此前创建分支',()=>openBranchDialog(message,'user'),'primary');
+        var fallback=actionNode('div',null,'wb-actions');fallback.append(actionButton('关闭',closeAction),safe);box.append(fallback);return;
+      }
+      if(preview.restore_snapshot_id){
+        box.append(actionNode('p',`将撤回 ${preview.message_count} 条消息、${preview.turn_ids.length} 个回合，并恢复到该消息发送前的文件现场。`));
+      }else{
+        box.append(actionNode('p',`将从对话中撤回 ${preview.message_count} 条消息，不修改任何本地文件。`));
+      }
+      var effects=Object.entries(preview.effects||{}).map(([key,value])=>key+' × '+value).join(' · ');
+      if(effects)box.append(actionNode('p','操作记录：'+effects,'wb-note'));
+      var controls=actionNode('div',null,'wb-actions'),confirm=actionButton('确认撤回',async()=>{
+        confirm.disabled=true;
+        try{
+          await api('/api/workbench/conversations/withdraw',{method:'POST',body:JSON.stringify({conversation_id:cid,record_id:message.id,turn_id:preview.turn_id,current_digest:preview.current_digest,confirm:true,request_id:queueRequestId()})});
+          closeAction();await resync(true);toast('消息和本地文件现场已安全撤回');
+        }finally{confirm.disabled=false;}
+      },'danger');controls.append(actionButton('取消',closeAction),confirm);box.append(controls);
+    }catch(error){box.replaceChildren(actionMessage(error.message,true),actionButton('关闭',closeAction));}
+  }
+
+  async function openApplyBranchDialog(){
+    var cid=selectedConversationId,box=dialogSummary('正在比较来源与分支文件…',[]);showAction('应用分支文件改动',box);
+    try{
+      var preview=await api('/api/workbench/conversations/branch/apply-preview',{method:'POST',body:JSON.stringify({conversation_id:cid})});
+      box.replaceChildren();
+      if(preview.conflicts.length){
+        box.append(actionMessage(`发现 ${preview.conflicts.length} 个冲突，未修改任何文件。`,true));
+        preview.conflicts.slice(0,12).forEach(item=>box.append(actionNode('code',item.path)));
+        box.append(actionButton('关闭',closeAction));return;
+      }
+      box.append(actionNode('p',preview.changes.length?`可安全应用 ${preview.changes.length} 项文件改动。`:'来源工作区已经与分支一致。'));
+      preview.changes.slice(0,20).forEach(item=>box.append(actionNode('code',`${item.action}  ${item.path}`)));
+      var apply=actionButton('应用到来源工作区',async()=>{apply.disabled=true;try{
+        await api('/api/workbench/conversations/branch/apply',{method:'POST',body:JSON.stringify({conversation_id:cid,confirm:true,base_snapshot_id:preview.base_snapshot_id,source_digest:preview.source_digest,branch_digest:preview.branch_digest,request_id:queueRequestId()})});
+        closeAction();toast('分支文件改动已原子应用到来源工作区');
+      }finally{apply.disabled=false;}},'primary');apply.disabled=!preview.changes.length;
+      var applyControls=actionNode('div',null,'wb-actions');applyControls.append(actionButton('取消',closeAction),apply);box.append(applyControls);
+    }catch(error){box.replaceChildren(actionMessage(error.message,true),actionButton('关闭',closeAction));}
+  }
+
+  async function loadConversationLineage(){
+    var bar=document.getElementById('conversation-lineage'),optBtn=document.getElementById('composer-generation-options'),cid=selectedConversationId;
+    if(!bar||!cid){if(bar)bar.hidden=true;if(optBtn)optBtn.classList.remove('has-lineage');return;}
+    try{
+      var data=await api('/api/workbench/conversations/lineage?conversation_id='+encodeURIComponent(cid));
+      if(cid!==selectedConversationId)return;
+      bar.replaceChildren();
+      if(data.parent){
+        var head=actionNode('div',null,'lineage-head');
+        head.append(actionNode('strong','分支'),actionNode('span',`来源：${data.parent.name} · ${data.branch_mode==='exact'?'精确文件现场':'仅上下文'}`,data.branch_mode==='exact'?'':'lineage-warning'));
+        var acts=actionNode('div',null,'lineage-actions');
+        acts.append(actionButton('打开来源',async()=>{if(optBtn?.getAttribute('aria-expanded')==='true')optBtn.click();await window.XGentConversations?.select(data.parent.id);}),actionButton('查看并应用文件改动',()=>{if(optBtn?.getAttribute('aria-expanded')==='true')optBtn.click();openApplyBranchDialog();}));
+        bar.append(head,acts);
+      }
+      if(data.draft){
+        if(!input.value){input.value=data.draft.text||'';syncSendState();}
+        var refs=[...(data.draft.metadata?.attachments||[]),...(data.draft.metadata?.server_uploads||[])];
+        if(refs.length){var files=actionNode('div',null,'branch-draft-files');refs.forEach(ref=>files.append(actionNode('span','引用附件 · '+(ref.name||'文件'),'branch-draft-file')));bar.append(files);}
+      }
+      var hasLineage=Boolean(bar.childNodes.length);
+      if(optBtn)optBtn.classList.toggle('has-lineage',hasLineage);
+      bar.hidden=!(hasLineage&&optBtn?.getAttribute('aria-expanded')==='true');
+    }catch(error){
+      if(cid===selectedConversationId){
+        bar.replaceChildren(actionNode('span','分支信息暂时无法读取：'+error.message,'lineage-warning'));
+        if(optBtn)optBtn.classList.add('has-lineage');
+        bar.hidden=optBtn?.getAttribute('aria-expanded')!=='true';
+      }
+    }
   }
 
   function bindUiMessage(entry, frame) {
@@ -1495,6 +1652,7 @@
       setBusy(false);hideTyping();
     } else if (frame.type === "turn_end" || frame.type === "turn_error") {
       setBusy(false);
+      reconcileUnboundUserMessages();
       var error = frame.type === "turn_error" ? (frame.text || "处理失败") : null;
       var queuedTurn = uploadQueue;
       if (queuedTurn && queuedTurn.finish) {
@@ -3230,7 +3388,7 @@
     Array.from(new Set(Object.values(byMessageId))).forEach(removeEntry);
     byMessageId={};log.replaceChildren();msgCount=0;lastStreamEntry=null;
     updateEmptyState();syncSendState();
-    if(!loggedOut)resync(true).catch(function(){});
+    if(!loggedOut){resync(true).catch(function(){});loadConversationLineage().catch(function(){});}
   });
   window.addEventListener('xgent-conversation-state',function(event){setBusy(!!event.detail.running);});
   window.addEventListener('xgent-conversation-deleted',function(event){

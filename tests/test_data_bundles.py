@@ -36,6 +36,9 @@ class DataBundlesTests(unittest.TestCase):
             "skill-private/script/a.py": b"print(1)",
             "xgent_storage/uploads/original.bin": b"\0\xff\x01",
             "xgent_storage/attachment_versions/test/index.json": b"{}",
+            "xgent_storage/conversation_objects/aa/object": b"branch object",
+            "xgent_storage/conversation_workspaces/branch/workspace.txt": b"branch workspace",
+            "xgent_storage/conversation_workspaces/branch/.git": b"must not archive worktree metadata",
             "xgent_storage/command_outputs/old.txt": b"full raw output",
             "workspace/result.txt": b"user generated file",
             "server_assets/vps-manager/servers.json": b'{"servers":[]}',
@@ -54,6 +57,9 @@ class DataBundlesTests(unittest.TestCase):
             self.assertIn(".env", names)
             self.assertIn("workspace/result.txt", names)
             self.assertIn("xgent_storage/attachment_versions/test/index.json", names)
+            self.assertIn("xgent_storage/conversation_objects/aa/object", names)
+            self.assertIn("xgent_storage/conversation_workspaces/branch/workspace.txt", names)
+            self.assertNotIn("xgent_storage/conversation_workspaces/branch/.git", names)
             self.assertNotIn("xgent_storage/command_outputs/old.txt", names)
             self.assertFalse(
                 any(".log" in name or "__pycache__" in name for name in names)

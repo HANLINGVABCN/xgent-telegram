@@ -142,7 +142,10 @@ body.dark #composer .send-btn.ready,body.dark #composer .stop-btn { background:#
 #composer #wb-chat-controls #composer-agent[aria-pressed=true] { background:var(--wb-soft); color:var(--wb-text); }
 #composer #wb-chat-controls #composer-thinking { flex:0 1 auto; max-width:132px; }
 #composer #wb-chat-controls #composer-model { flex:0 1 250px; margin-left:auto; justify-content:flex-start; }
-#composer #wb-chat-controls #composer-generation-options { display:none; }
+#composer #wb-chat-controls #composer-generation-options { display:inline-flex; flex:0 0 34px; width:34px; height:34px; padding:8px; position:relative; }
+#composer #wb-chat-controls #composer-generation-options .icon { width:16px; height:16px; }
+#composer #wb-chat-controls #composer-generation-options.has-lineage { color:var(--wb-accent); background:var(--wb-tint); }
+#composer #wb-chat-controls #composer-generation-options.has-lineage::before { content:''; position:absolute; top:5px; left:5px; width:5px; height:5px; border-radius:50%; background:var(--wb-accent); }
 #composer #pending-files { padding:5px 8px; margin:0 0 4px; background:transparent; max-height:116px; overflow:auto; }
 #composer .pending-file { max-width:100%; overflow-wrap:anywhere; }
 #composer-options-popover { position:absolute; bottom:calc(100% + 8px); display:flex; flex-direction:column; min-height:0; overflow:hidden; border:1px solid var(--wb-border); border-radius:14px; background:var(--wb-panel); color:var(--wb-text); padding:5px; box-shadow:0 6px 24px #0002; z-index:32; font-size:var(--web-ui-font-size); }

@@ -126,7 +126,10 @@ class BotMemoryDB(ConversationStore):
                 content TEXT NOT NULL,
                 timestamp REAL NOT NULL,
                 session_id TEXT,
-                metadata TEXT
+                metadata TEXT,
+                turn_id TEXT,
+                withdrawn INTEGER NOT NULL DEFAULT 0,
+                source_record_id INTEGER
             )
         ''')
         
@@ -149,6 +152,8 @@ class BotMemoryDB(ConversationStore):
                 revision INTEGER NOT NULL,
                 timestamp REAL NOT NULL,
                 payload TEXT NOT NULL,
+                turn_id TEXT,
+                withdrawn INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(source, chat_id, message_id, generation)
             )
         ''')
@@ -449,6 +454,8 @@ class BotMemoryDB(ConversationStore):
             logger.warning(f"token 用量统计历史迁移失败（下次启动重试）: {e}")
 
         await self.migrate_conversations()
+        from xgent_app.conversation_branching import repair_restored_workspaces
+        await repair_restored_workspaces(self, os.path.dirname(os.path.abspath(self.db_path)))
         default_session = await self.get_session('global_memory')
         if default_session and not default_session.get('deleting'):
             with bind_conversation(ConversationScope('global_memory', default_session['generation'])):
@@ -522,11 +529,12 @@ class BotMemoryDB(ConversationStore):
 
     @staticmethod
     async def _insert_global_record(conn, chat_id, user_id, msg_type, role, content, timestamp, session_id, metadata):
+        from xgent_app.conversation_branching import active_turn_id
         cursor = await conn.execute('''
-            INSERT INTO global_messages (chat_id, user_id, msg_type, role, content, timestamp, session_id, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO global_messages (chat_id, user_id, msg_type, role, content, timestamp, session_id, metadata, turn_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (chat_id, user_id, msg_type, role, content, timestamp, session_id,
-              json.dumps(metadata, ensure_ascii=False) if metadata else None))
+              json.dumps(metadata, ensure_ascii=False) if metadata else None, active_turn_id()))
         return cursor.lastrowid
 
     # --- token 用量统计（独立表，/stats 数据源）---
@@ -583,14 +591,14 @@ class BotMemoryDB(ConversationStore):
             query = f'''
                 SELECT msg_type, role, content, timestamp, session_id, metadata 
                 FROM global_messages
-                WHERE session_id = ? AND id>=? AND msg_type IN ({placeholders})
+                WHERE session_id = ? AND id>=? AND withdrawn=0 AND msg_type IN ({placeholders})
                 ORDER BY timestamp DESC LIMIT ?
             '''
             cursor = await conn.execute(query, (self._conversation_id(), start, *include_types, limit))
         else:
             cursor = await conn.execute('''
                 SELECT msg_type, role, content, timestamp, session_id, metadata 
-                FROM global_messages WHERE session_id = ? AND id>=?
+                FROM global_messages WHERE session_id = ? AND id>=? AND withdrawn=0
                 ORDER BY timestamp DESC LIMIT ?
             ''', (self._conversation_id(), start, limit,))
         
@@ -606,7 +614,7 @@ class BotMemoryDB(ConversationStore):
         # Filter before applying the model-message limit: UI rows do not consume it.
         conn = await self._get_conn()
         cursor = await conn.execute("SELECT id, role, content, timestamp, msg_type, metadata "
-                                    "FROM global_messages WHERE session_id = ? AND id >= "
+                                    "FROM global_messages WHERE session_id = ? AND withdrawn=0 AND id >= "
                                     "(SELECT context_start_record_id FROM chat_sessions WHERE id=global_messages.session_id) "
                                     "AND (? IS NULL OR id<?) "
                                     "ORDER BY timestamp DESC, id DESC",
@@ -708,7 +716,7 @@ class BotMemoryDB(ConversationStore):
         conn = await self._get_conn()
         cursor = await conn.execute('''
             SELECT id, chat_id, msg_type, role, content, timestamp, metadata FROM global_messages
-            WHERE session_id = ? AND id >= (SELECT context_start_record_id FROM chat_sessions WHERE id=global_messages.session_id) AND ((role = 'user' AND msg_type IN (?, ?))
+            WHERE session_id = ? AND withdrawn=0 AND id >= (SELECT context_start_record_id FROM chat_sessions WHERE id=global_messages.session_id) AND ((role = 'user' AND msg_type IN (?, ?))
                OR (role = 'assistant' AND msg_type = ?)
                OR (role = 'media_module' AND msg_type = ?))
             ORDER BY id
@@ -719,7 +727,7 @@ class BotMemoryDB(ConversationStore):
 
     async def get_tool_context_records(self) -> List[Dict]:
         conn = await self._get_conn()
-        cursor = await conn.execute("SELECT * FROM global_messages WHERE session_id = ? AND id >= "
+        cursor = await conn.execute("SELECT * FROM global_messages WHERE session_id = ? AND withdrawn=0 AND id >= "
                                     "(SELECT context_start_record_id FROM chat_sessions WHERE id=global_messages.session_id) AND metadata LIKE '%model_context%' "
                                     "ORDER BY timestamp, id", (self._conversation_id(),))
         return [dict(row) for row in await cursor.fetchall()]
@@ -760,7 +768,7 @@ class BotMemoryDB(ConversationStore):
     async def _compression_snapshot(self, conn, *, full_history=False) -> Dict[str, Any]:
         from xgent_app.compression import metadata_of
         start = 0 if full_history else await self._context_start(conn)
-        cursor = await conn.execute('SELECT * FROM global_messages WHERE session_id = ? AND id>=? ORDER BY timestamp, id', (self._conversation_id(),start))
+        cursor = await conn.execute('SELECT * FROM global_messages WHERE session_id = ? AND withdrawn=0 AND id>=? ORDER BY timestamp, id', (self._conversation_id(),start))
         records = [dict(row) for row in await cursor.fetchall()]
         if not full_history:
             records = [r for r in records if not (metadata_of(r).get('ui_audit') or metadata_of(r).get('ui_only')
@@ -993,10 +1001,10 @@ class BotMemoryDB(ConversationStore):
         async with self._transaction() as conn:
             cursor = await conn.execute('''
                 SELECT id, role, content, timestamp, msg_type, metadata FROM global_messages
-                WHERE session_id = ? ORDER BY timestamp ASC, id ASC
+                WHERE session_id = ? AND withdrawn=0 ORDER BY timestamp ASC, id ASC
             ''', (self._conversation_id(),))
             rows = await cursor.fetchall()
-            cursor = await conn.execute('SELECT * FROM ui_messages WHERE conversation_id=? ORDER BY timestamp, ui_message_id', (self._conversation_id(),))
+            cursor = await conn.execute('SELECT * FROM ui_messages WHERE conversation_id=? AND withdrawn=0 ORDER BY timestamp, ui_message_id', (self._conversation_id(),))
             ui_rows = [dict(row) for row in await cursor.fetchall()]
             generation = await self._conversation_generation(conn)
 
@@ -1070,6 +1078,8 @@ class BotMemoryDB(ConversationStore):
                 }
                 payload = {}
             row['conversation_id'] = self._conversation_id()
+            from xgent_app.conversation_branching import active_turn_id
+            row['turn_id'] = active_turn_id()
             if frame['type'] in {'message', 'edit'}:
                 payload.update(content=str(frame.get('text') or ''), parse_mode=frame.get('parse_mode'))
             if frame['type'] in {'message', 'edit', 'edit_markup'}:
@@ -1080,11 +1090,12 @@ class BotMemoryDB(ConversationStore):
             row['payload'] = json.dumps(payload, ensure_ascii=False)
             await conn.execute('''
                 INSERT INTO ui_messages
-                    (ui_message_id, source, chat_id, message_id, generation, revision, timestamp, payload, conversation_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(ui_message_id) DO UPDATE SET revision = excluded.revision, payload = excluded.payload
+                    (ui_message_id, source, chat_id, message_id, generation, revision, timestamp, payload, conversation_id, turn_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ui_message_id) DO UPDATE SET revision = excluded.revision, payload = excluded.payload,
+                    turn_id=COALESCE(ui_messages.turn_id,excluded.turn_id)
             ''', tuple(row[key] for key in (
-                'ui_message_id', 'source', 'chat_id', 'message_id', 'generation', 'revision', 'timestamp', 'payload', 'conversation_id',
+                'ui_message_id', 'source', 'chat_id', 'message_id', 'generation', 'revision', 'timestamp', 'payload', 'conversation_id', 'turn_id',
             )))
             return row
 
@@ -1093,7 +1104,7 @@ class BotMemoryDB(ConversationStore):
         conn = await self._get_conn()
         cursor = await conn.execute('''
             SELECT id, role, content, timestamp, msg_type, metadata, session_id FROM global_messages
-            WHERE id = ? AND session_id = ?
+            WHERE id = ? AND session_id = ? AND withdrawn=0
         ''', (row_id, self._conversation_id()))
         try:
             row = await cursor.fetchone()
@@ -1308,7 +1319,7 @@ class BotMemoryDB(ConversationStore):
         cursor = await conn.execute('''
             SELECT rowid AS rowid, msg_type, role, content, timestamp, metadata
             FROM global_messages
-            WHERE rowid > ?
+            WHERE rowid > ? AND withdrawn=0
             ORDER BY rowid ASC LIMIT ?
         ''', (int(after_rowid), int(limit)))
         rows = await cursor.fetchall()
@@ -1337,7 +1348,7 @@ class BotMemoryDB(ConversationStore):
         conn = await self._get_conn()
         cursor = await conn.execute('''
             SELECT MAX(timestamp) as last_time FROM global_messages
-            WHERE role = 'user' AND session_id = ?
+            WHERE role = 'user' AND session_id = ? AND withdrawn=0
         ''', (self._conversation_id(),))
         row = await cursor.fetchone()
         return row['last_time'] if row and row['last_time'] else None
@@ -1381,13 +1392,13 @@ class BotMemoryDB(ConversationStore):
         cursor = await conn.execute('''
             SELECT s.*,
                 (SELECT substr(m.content, 1, 160) FROM global_messages m
-                 WHERE m.session_id=s.id AND m.role='user' AND m.msg_type='user_text'
+                 WHERE m.session_id=s.id AND m.withdrawn=0 AND m.role='user' AND m.msg_type='user_text'
                    AND m.content NOT LIKE '[后台任务结果]%'
                    AND m.content NOT LIKE '[用户已取消表单]%'
                    AND m.content NOT LIKE '/%'
                  ORDER BY m.timestamp, m.id LIMIT 1) AS first_user_text,
                 COALESCE((SELECT m.timestamp FROM global_messages m
-                          WHERE m.session_id=s.id AND m.msg_type IN
+                          WHERE m.session_id=s.id AND m.withdrawn=0 AND m.msg_type IN
                             ('user_text','user_file','user_photo','ai_reply','media_reply')
                           ORDER BY m.timestamp DESC, m.id DESC LIMIT 1),
                          s.created_at, s.last_active, 0) AS activity_at

@@ -19,7 +19,7 @@ from typing import Any
 
 DEFAULT_CONVERSATION_ID = 'global_memory'
 DEFAULT_CONVERSATION_NAME = '默认会话'
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class ConversationError(ValueError):
@@ -43,6 +43,7 @@ class ConversationScope:
     origin: str = 'legacy'
     purpose: str = 'chat'
     telegram_delivery: bool | None = None
+    workspace_path: str | None = None
 
 
 _scope = contextvars.ContextVar('xgent_conversation', default=None)
@@ -200,7 +201,7 @@ class ExecutionFileLock:
 
 
 class ConversationManager:
-    def __init__(self, factory, database_path, notify=None):
+    def __init__(self, factory, database_path, notify=None, code_root=None):
         self.factory = factory
         self.lock = ExecutionFileLock(database_path)
         self.notify = notify
@@ -218,6 +219,9 @@ class ConversationManager:
         self.terminal_enabled = False
         self._terminal_id = None
         self._terminal_revision = 0
+        self.code_root = Path(code_root).resolve() if code_root else None
+        data_root = Path(database_path).resolve().parent if database_path != ':memory:' else None
+        self.object_root = data_root / 'xgent_storage' / 'conversation_objects' if data_root else None
 
     async def enable_terminal(self):
         """One selection per CLI process; never persisted as a shared global pointer."""
@@ -285,7 +289,8 @@ class ConversationManager:
         origin, purpose = identity()
         deliver = (purpose == 'chat' and cid == state.get('telegram_conversation_id')) if origin in {'web','cli'} else True
         return ConversationScope(cid, int(session['generation']), name=session.get('name') or '新对话',
-                                 origin=origin, purpose=purpose, telegram_delivery=deliver if origin != 'legacy' else None)
+                                 origin=origin, purpose=purpose, telegram_delivery=deliver if origin != 'legacy' else None,
+                                 workspace_path=session.get('workspace_path'))
 
     @contextlib.asynccontextmanager
     async def operation(self, conversation_id=None, *, execution=False, wait=False,
@@ -340,8 +345,15 @@ class ConversationManager:
                 self.lock.release()
                 raise
         final_scope = None
+        turn_id = None
+        turn_guard = contextlib.nullcontext(None)
         try:
-            with bind_conversation(scope):
+            if acquired and self.code_root is not None and self.object_root is not None:
+                from .conversation_branching import begin_turn, bind_turn
+                db = await self.factory()
+                turn_id = await begin_turn(db, scope, self.code_root, self.object_root)
+                turn_guard = bind_turn(turn_id)
+            with bind_conversation(scope), turn_guard:
                 try:
                     yield scope
                 except BaseException as exc:
@@ -362,6 +374,9 @@ class ConversationManager:
                 try:
                     db = await self.factory()
                     outcome = 'stopped' if self._stop_event and self._stop_event.is_set() else self._run_outcome
+                    if turn_id is not None:
+                        from .conversation_branching import finish_turn
+                        await finish_turn(db, scope, turn_id, self.code_root, self.object_root, outcome)
                     await db.queue_finish_run(scope.run_id, outcome)
                     await db.finish_conversation_run(scope.run_id)
                 finally:
@@ -492,9 +507,9 @@ class ConversationManager:
             await self.text_queue.close()
 
 
-def configure_conversations(factory, database_path, notify=None):
+def configure_conversations(factory, database_path, notify=None, code_root=None):
     global _manager
-    _manager = ConversationManager(factory, database_path, notify)
+    _manager = ConversationManager(factory, database_path, notify, code_root=code_root)
     return _manager
 
 
