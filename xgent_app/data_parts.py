@@ -10,8 +10,6 @@ import sqlite3
 from contextlib import closing, nullcontext
 from pathlib import Path
 
-from dotenv.parser import parse_stream
-
 from .data_contents import PART_CATEGORIES
 
 MAX_RECORD = 64 * 1024 * 1024
@@ -63,6 +61,10 @@ def env_part(key):
 
 
 def env_values(text):
+    # Full-file legacy maintenance must remain stdlib-only. The normal runtime
+    # installs python-dotenv; load its parser only for independent env parts.
+    from dotenv.parser import parse_stream
+
     values = {}
     for binding in parse_stream(io.StringIO(text)):
         if binding.error:
@@ -76,6 +78,8 @@ def env_values(text):
 
 def replace_env(text, categories, incoming):
     """Preserve comments and all unselected assignments, including multiline ones."""
+    from dotenv.parser import parse_stream
+
     env_values(text)
     kept = [binding.original.string for binding in parse_stream(io.StringIO(text))
             if binding.key is None or env_part(binding.key) not in categories]

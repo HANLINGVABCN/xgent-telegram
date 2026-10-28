@@ -284,11 +284,12 @@ class DataBundles:
                 signatures.append((name, signature.st_size, signature.st_mtime_ns))
             except FileNotFoundError:
                 signatures.append((name, None))
-        if signatures != self._parts_signature:
+        measure_parts = compare_formats or any(key in PART_CATEGORIES for key in selected)
+        if measure_parts and (signatures != self._parts_signature or self._parts_inventory is None):
             self._parts_inventory = {key: DataParts(self.paths.root, self.paths.database).measure(key) for key in PART_CATEGORIES}
             self._parts_signature = signatures
         for row in rows:
-            if row["id"] in PART_CATEGORIES:
+            if measure_parts and row["id"] in PART_CATEGORIES:
                 part = self._parts_inventory[row["id"]]
                 row["size"] += part["size"]
                 row["file_count"] += part["file_count"]
@@ -538,15 +539,6 @@ class DataBundles:
                 part = staging / "backup_parts" / (key + ".jsonl")
                 if part.is_file():
                     part_summary(part, key)
-            # Old full-file archives can also expose independent import choices.
-            derived = []
-            if (staging / "xgent_memory.db").is_file():
-                derived = list(PART_CATEGORIES)
-            elif (staging / ".env").is_file():
-                derived = ["secrets", "ai_config", "app_settings"]
-            missing = [key for key in derived if not (staging / "backup_parts" / (key + ".jsonl")).exists()]
-            if missing:
-                DataParts(staging).capture(staging / "backup_parts", missing)
             write_json(staging / "restore-manifest.json", manifest)
             if manifest["version"] == 2:
                 write_json(staging / "restore-plan.json", {"categories": manifest_categories(manifest)})
@@ -666,6 +658,16 @@ class DataBundles:
     def import_preview(self, staging, manifest):
         """Enumerate every available component, including parts derived from old DBs."""
         staging = Path(staging)
+        # Derive independent choices only for the Web/selection flow. Offline
+        # full-archive migration can verify and restore with Python stdlib alone.
+        derived = []
+        if (staging / "xgent_memory.db").is_file():
+            derived = list(PART_CATEGORIES)
+        elif (staging / ".env").is_file():
+            derived = ["secrets", "ai_config", "app_settings"]
+        missing = [key for key in derived if not (staging / "backup_parts" / (key + ".jsonl")).exists()]
+        if missing:
+            DataParts(staging).capture(staging / "backup_parts", missing)
         declared = manifest_categories(manifest)
         base = self.preview(manifest)
         original = {row["id"]: row for row in base["categories"]}

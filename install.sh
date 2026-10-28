@@ -3502,6 +3502,13 @@ data_migration_python() {
 
 manage_data_migration() {
     local migration_python helpers_dir result
+    # One manifest for download and cleanup: every transitive maintenance module
+    # must travel with the isolated helper package, not only the entry point.
+    local -a migration_helpers=(
+        __init__.py backup_storage.py data_migration.py data_service.py
+        data_discovery.py data_bundles.py data_paths.py data_lock.py
+        conversations.py data_archives.py data_contents.py data_parts.py
+    )
     migration_python="$(data_migration_python)" || return 1
     # Stdlib-only maintenance entry: no AI, no Telegram requests and no schema
     # creation while merely viewing the menu or choosing a destination.
@@ -3514,10 +3521,10 @@ manage_data_migration() {
     # are downloaded; do not upgrade/overwrite the old application behind users.
     info "[数据迁移] 正在自动准备兼容工具；不会改动原程序或数据，无需选择版本。"
     helpers_dir="$(mktemp -d "${TMPDIR:-/tmp}/xgent-data-tools.XXXXXXXX")" || return 1
-    if ! "$migration_python" - "$helpers_dir" <<'PY'
+    if ! "$migration_python" - "$helpers_dir" "${migration_helpers[@]}" <<'PY'
 import io,os,stat,sys,urllib.request,zipfile
 from pathlib import Path
-target=Path(sys.argv[1]);required={'__init__.py','backup_storage.py','data_migration.py','data_service.py','data_discovery.py','data_bundles.py','data_paths.py','data_lock.py','conversations.py'}
+target=Path(sys.argv[1]);required=set(sys.argv[2:])
 try:
     request=urllib.request.Request('https://github.com/HANLINGVABCN/xgent-telegram/archive/refs/heads/main.zip',headers={'User-Agent':'XGent-data-migration'})
     with urllib.request.urlopen(request,timeout=60) as response:
@@ -3545,13 +3552,13 @@ PY
         "$migration_python" -c 'import runpy,sys; sys.path.insert(0,sys.argv[1]); runpy.run_module("xgent_app.data_migration",run_name="__main__")' "$helpers_dir" || result=$?
     # Delete only the exact temporary helper files created above, never an
     # instance directory or paths enumerated from user input.
-    "$migration_python" - "$helpers_dir" <<'PY'
+    "$migration_python" - "$helpers_dir" "${migration_helpers[@]}" <<'PY'
 import sys
 from pathlib import Path
 root=Path(sys.argv[1]).resolve()
 if root.name.startswith('xgent-data-tools.'):
     package=root/'xgent_app'
-    for name in ('__init__.py','backup_storage.py','data_migration.py','data_service.py','data_discovery.py','data_bundles.py','data_paths.py','data_lock.py','conversations.py'):
+    for name in sys.argv[2:]:
         (package/name).unlink(missing_ok=True)
     # Bytecode is confined to this private temp directory.
     import shutil

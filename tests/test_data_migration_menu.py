@@ -2,6 +2,8 @@
 
 import json
 import os
+import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -31,6 +33,21 @@ from xgent_app.data_service import (
     ServiceState,
     process_alive,
 )
+
+
+def migration_helper_modules(workspace):
+    """Build fixtures from the installer's real download/cleanup manifest."""
+    script = (workspace / "install.sh").read_text(encoding="utf-8")
+    manifest = re.search(r"local -a migration_helpers=\((.*?)\)", script, re.DOTALL)
+    if manifest is None:
+        raise AssertionError("Installer migration helper manifest is missing")
+    names = shlex.split(manifest[1])
+    if not names or len(names) != len(set(names)):
+        raise AssertionError("Installer migration helper manifest is invalid")
+    for name in names:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\.py", name):
+            raise AssertionError("Unsafe migration helper name: " + name)
+    return names
 
 
 def instance(root, *, old=False, text="original"):
@@ -407,6 +424,56 @@ class DataMigrationTests(unittest.TestCase):
         self.assertIn("2) 导出", result.stdout)
         self.assertNotIn("请选择版本", result.stdout)
 
+    def test_isolated_migration_helpers_export_and_restore_without_site_packages(self):
+        workspace = Path(__file__).resolve().parents[1]
+        helpers = self.base / "isolated-helpers"
+        package = helpers / "xgent_app"
+        package.mkdir(parents=True)
+        names = migration_helper_modules(workspace)
+        self.assertTrue({"data_archives.py", "data_contents.py", "data_parts.py"}.issubset(names))
+        for name in names:
+            shutil.copy2(workspace / "xgent_app" / name, package / name)
+        source = self.base / "legacy-source"
+        target = self.base / "restore-target"
+        instance(source, old=True)
+        instance(target, text="receiver data")
+        program = textwrap.dedent("""\
+            import importlib.abc,json,sys
+            from pathlib import Path
+            sys.path.insert(0,sys.argv[1])
+            class RejectApplicationDependencies(importlib.abc.MetaPathFinder):
+                def find_spec(self,fullname,path=None,target=None):
+                    if fullname.split('.')[0] in {'dotenv','telegram','openai','aiosqlite','httpx','yaml','PIL'}:
+                        raise AssertionError('Maintenance imported application dependency: '+fullname)
+            sys.meta_path.insert(0,RejectApplicationDependencies())
+            from xgent_app.data_discovery import DiscoveredBundles,DiscoveredPaths
+            from xgent_app.data_bundles import DataBundles
+            from xgent_app.data_paths import DataPaths
+            from xgent_app.data_migration import MigrationMenu
+            source,target=Path(sys.argv[2]),Path(sys.argv[3])
+            exporter=DiscoveredBundles(DiscoveredPaths(source,source,True))
+            estimate=exporter.estimate()
+            result=exporter.export(source.parent/'isolated.zip',outputs=True)
+            restorer=DataBundles(DataPaths(target,target))
+            staging,manifest=restorer.prepare_import(result['path'])
+            restored=restorer.activate(staging)
+            print(json.dumps({'count':estimate['file_count'],'version':manifest['version'],
+                              'restored':restored['in_project']}))
+        """)
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", program, str(helpers), str(source), str(target)],
+            cwd=source, capture_output=True, text=True, encoding="utf-8", timeout=45, check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertGreater(summary["count"], 0)
+        self.assertEqual(1, summary["version"])
+        self.assertTrue(summary["restored"])
+        self.assertTrue((source / "bot_memory.db").is_file())
+        self.assertFalse((source / "xgent_app").exists())
+        with closing(sqlite3.connect(target / "xgent_memory.db")) as connection:
+            self.assertEqual("original", connection.execute("SELECT content FROM global_messages").fetchone()[0])
+
     @unittest.skipUnless(os.name == "posix", "installer bootstrap runs through Bash")
     def test_new_installer_can_export_old_checkout_without_installed_helpers(self):
         workspace = Path(__file__).resolve().parents[1]
@@ -414,17 +481,7 @@ class DataMigrationTests(unittest.TestCase):
         instance(old, old=True)
         shutil.copy2(workspace / "install.sh", old / "install.sh")
         archive = self.base / "helpers.zip"
-        names = (
-            "__init__.py",
-            "backup_storage.py",
-            "data_migration.py",
-            "data_service.py",
-            "data_discovery.py",
-            "data_bundles.py",
-            "data_paths.py",
-            "data_lock.py",
-            "conversations.py",
-        )
+        names = migration_helper_modules(workspace)
         with zipfile.ZipFile(archive, "w") as package:
             for name in names:
                 package.write(
@@ -456,6 +513,7 @@ class DataMigrationTests(unittest.TestCase):
             "XGENT_PYTHON": str(interpreter),
             "FIXTURE_HELPER_ZIP": str(archive),
             "XGENT_INSTALL_SH_LIB": "1",
+            "TMPDIR": str(self.base),
         }
         environment.pop("XGENT_DATA_DIR", None)
         result = subprocess.run(
@@ -473,6 +531,7 @@ class DataMigrationTests(unittest.TestCase):
         self.assertIn("导出完成", result.stdout)
         self.assertTrue((old / "bot_memory.db").is_file())
         self.assertFalse((old / "xgent_app").exists())
+        self.assertFalse(list(self.base.glob("xgent-data-tools.*")))
         backups = list((self.base / "xgent-backups").glob("*.zip"))
         self.assertEqual(1, len(backups))
         with zipfile.ZipFile(backups[0]) as saved:
