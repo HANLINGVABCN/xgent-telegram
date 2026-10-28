@@ -37,6 +37,7 @@ _EXCLUDED_NAMES = frozenset({
     '.env', 'xgent_memory.db', 'bot_memory.db', 'backup-schedule.json',
     'data-location.json', 'path-map.json', '.xgent-version',
 })
+_NODEQUALITY_RUNTIME = re.compile(r'^\.nodequality\d')
 
 
 class BranchingError(ConversationError):
@@ -80,6 +81,11 @@ def _safe_relative(value: str) -> str:
 def _excluded(relative: str) -> bool:
     path = PurePosixPath(relative)
     if any(part in _EXCLUDED_PARTS for part in path.parts):
+        return True
+    # NodeQuality extracts an entire guest filesystem below a timestamped
+    # runtime directory and mounts proc inside it.  It is command output, not
+    # editable project state; snapshotting it can take minutes or hit EINVAL.
+    if any(_NODEQUALITY_RUNTIME.match(part) for part in path.parts):
         return True
     name = path.name
     return (name in _EXCLUDED_NAMES or name.endswith(('.db-wal', '.db-shm', '.pid', '.lock', '.tmp'))
@@ -140,6 +146,7 @@ def _git_paths(root: Path, mounts: set[str]) -> set[str] | None:
         )
         untracked = subprocess.run(
             ['git', '-C', str(root), 'ls-files', '-o', '--exclude-standard',
+             '--exclude=/.nodequality[0-9]*/',
              *(f'--exclude={_git_exclude(mount)}' for mount in sorted(mounts)), '-z'],
             check=True, capture_output=True, timeout=30,
         )
@@ -524,6 +531,24 @@ async def begin_turn(db, scope, code_root: str | Path, objects: str | Path) -> s
 
 async def finish_turn(db, scope, turn_id: str, code_root: str | Path, objects: str | Path,
                       status: str = 'completed', error: str | None = None) -> None:
+    conn = await db._get_conn()
+    cursor = await conn.execute(
+        '''SELECT
+            EXISTS(SELECT 1 FROM global_messages WHERE turn_id=?) AS has_messages,
+            EXISTS(SELECT 1 FROM turn_operations WHERE turn_id=?) AS has_operations''',
+        (turn_id, turn_id),
+    )
+    activity = await cursor.fetchone()
+    await cursor.close()
+    if not activity or not (activity['has_messages'] or activity['has_operations']):
+        # A queued message may be cancelled while its pre-turn snapshot is in
+        # progress.  Do not hold the global execution slot for a second full
+        # snapshot when nothing was ever handed to the model.
+        async with db._transaction() as write:
+            await write.execute('''UPDATE conversation_turns SET status='empty',finished_at=?,
+                snapshot_complete=0,error=COALESCE(error,?) WHERE id=?''',
+                (time.time(), '待发消息在接入前已取消或失效', turn_id))
+        return
     root = conversation_root(scope, code_root)
     snapshot_id = None
     snapshot_error = None

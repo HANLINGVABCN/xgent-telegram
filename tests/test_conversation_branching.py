@@ -86,6 +86,18 @@ class ConversationBranchingTests(unittest.IsolatedAsyncioTestCase):
         if link is not None:
             self.assertNotIn('outside-link.txt', paths)
 
+    def test_installed_tree_excludes_nodequality_runtime_without_git_metadata(self):
+        installed = Path(self.temp.name) / 'installed'
+        installed.mkdir()
+        (installed / 'app.py').write_text('print("kept")\n', encoding='utf-8')
+        runtime = installed / '.nodequality2026_10_28_01_31_43' / 'BenchOs'
+        runtime.mkdir(parents=True)
+        (runtime / 'guest-image.bin').write_bytes(b'x' * 4096)
+        manifest = capture_manifest(installed, Path(self.temp.name) / 'installed-objects')
+        paths = {item['path'] for item in manifest['entries']}
+        self.assertIn('app.py', paths)
+        self.assertFalse(any(path.startswith('.nodequality') for path in paths))
+
     async def test_before_snapshot_failure_never_blocks_chat_or_fakes_complete_snapshot(self):
         after = {'root_digest': 'a' * 64, 'entries': [], 'file_count': 0, 'total_size': 0}
         scope = await self.manager.resolve()
@@ -121,6 +133,21 @@ class ConversationBranchingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(turn['after_snapshot_id'])
         self.assertFalse(turn['snapshot_complete'])
         self.assertIn('fixture changed file', turn['error'])
+
+    async def test_empty_cancelled_admission_skips_the_second_snapshot(self):
+        before = {'root_digest': 'c' * 64, 'entries': [], 'file_count': 0, 'total_size': 0}
+        scope = await self.manager.resolve()
+        with patch('xgent_app.conversation_branching.capture_manifest', return_value=before) as capture:
+            async with self.manager.operation(scope, execution=True):
+                pass
+        self.assertEqual(1, capture.call_count)
+        conn = await self.db._get_conn()
+        cursor = await conn.execute('SELECT * FROM conversation_turns ORDER BY started_at DESC LIMIT 1')
+        turn = dict(await cursor.fetchone())
+        await cursor.close()
+        self.assertEqual('empty', turn['status'])
+        self.assertIsNone(turn['after_snapshot_id'])
+        self.assertFalse(turn['snapshot_complete'])
 
     async def test_exact_branch_isolated_apply_and_safe_withdraw(self):
         user, answer = await self.make_edit_turn()
