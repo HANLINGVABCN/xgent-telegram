@@ -653,32 +653,26 @@ async def repair_restored_workspaces(db, code_root: str | Path) -> None:
                                     (str(expected), session['id']))
 
 
-async def begin_turn(db, scope, code_root: str | Path, objects: str | Path,
-                     *, should_cancel: Any = None) -> str:
-    root = conversation_root(scope, code_root)
+async def begin_turn(db, scope, code_root: str | Path | None = None,
+                     objects: str | Path | None = None) -> str:
+    """Record a turn boundary only.
+
+    Turns no longer capture file snapshots: withdrawal and branching operate on
+    conversation history, never on disk files, so a chat turn performs zero
+    filesystem scanning before or after the model runs.
+    """
     turn_id = uuid.uuid4().hex
-    snapshot_id = None
-    error = None
-    kwargs: dict[str, Any] = {'timeout': TURN_SNAPSHOT_TIMEOUT}
-    if should_cancel is not None:
-        kwargs['should_cancel'] = should_cancel
-    try:
-        manifest = await asyncio.to_thread(capture_manifest, root, objects, **kwargs)
-    except Exception as exc:  # noqa: BLE001 - chat must survive an optional file snapshot
-        error = f'回合前文件快照失败：{exc}'
-    else:
-        snapshot_id = await save_snapshot(db, scope.conversation_id, turn_id, 'before', manifest)
     async with db._transaction() as conn:
         await conn.execute('''INSERT INTO conversation_turns
             (id,conversation_id,run_id,status,started_at,before_snapshot_id,snapshot_complete,error)
-            VALUES(?,?,?,'running',?,?,0,?)''',
-            (turn_id, scope.conversation_id, scope.run_id, time.time(), snapshot_id, error))
+            VALUES(?,?,?,'running',?,NULL,0,NULL)''',
+            (turn_id, scope.conversation_id, scope.run_id, time.time()))
     return turn_id
 
 
-async def finish_turn(db, scope, turn_id: str, code_root: str | Path, objects: str | Path,
-                      status: str = 'completed', error: str | None = None,
-                      *, should_cancel: Any = None) -> None:
+async def finish_turn(db, scope, turn_id: str, code_root: str | Path | None = None,
+                      objects: str | Path | None = None,
+                      status: str = 'completed', error: str | None = None) -> None:
     conn = await db._get_conn()
     cursor = await conn.execute(
         '''SELECT
@@ -689,58 +683,23 @@ async def finish_turn(db, scope, turn_id: str, code_root: str | Path, objects: s
     activity = await cursor.fetchone()
     await cursor.close()
     if not activity or not (activity['has_messages'] or activity['has_operations']):
-        # A queued message may be cancelled while its pre-turn snapshot is in
-        # progress.  Do not hold the global execution slot for a second full
-        # snapshot when nothing was ever handed to the model.
+        # A queued message may be cancelled before anything is handed to the
+        # model; record the empty turn and release the slot immediately.
         async with db._transaction() as write:
             await write.execute('''UPDATE conversation_turns SET status='empty',finished_at=?,
                 snapshot_complete=0,error=COALESCE(error,?) WHERE id=?''',
                 (time.time(), '待发消息在接入前已取消或失效', turn_id))
         return
-    cursor = await conn.execute(
-        'SELECT before_snapshot_id,error FROM conversation_turns WHERE id=?', (turn_id,))
-    existing = await cursor.fetchone()
-    await cursor.close()
-    if not existing or not existing['before_snapshot_id']:
-        # An after snapshot cannot restore or branch anything without its
-        # matching before snapshot.  Avoid paying the timeout twice when the
-        # admission snapshot already degraded.
-        async with db._transaction() as write:
-            cursor = await write.execute(
-                "SELECT MIN(id) first_id,MAX(CASE WHEN msg_type='ai_reply' THEN id END) final_id "
-                "FROM global_messages WHERE turn_id=?", (turn_id,))
-            row = await cursor.fetchone()
-            await cursor.close()
-            errors = [value for value in ((existing['error'] if existing else None), error) if value]
-            await write.execute('''UPDATE conversation_turns SET status=?,finished_at=?,
-                user_record_id=?,final_record_id=?,snapshot_complete=0,error=? WHERE id=?''', (
-                status, time.time(), row['first_id'], row['final_id'],
-                '\n'.join(errors) or None, turn_id,
-            ))
-        return
-    root = conversation_root(scope, code_root)
-    snapshot_id = None
-    snapshot_error = None
-    kwargs: dict[str, Any] = {'timeout': TURN_SNAPSHOT_TIMEOUT}
-    if should_cancel is not None:
-        kwargs['should_cancel'] = should_cancel
-    try:
-        manifest = await asyncio.to_thread(capture_manifest, root, objects, **kwargs)
-        snapshot_id = await save_snapshot(db, scope.conversation_id, turn_id, 'after', manifest)
-    except Exception as exc:  # noqa: BLE001 - persist a failed snapshot as turn state
-        snapshot_error = f'回合后文件快照失败：{exc}'
-    async with db._transaction() as conn:
-        cursor = await conn.execute("SELECT MIN(id) first_id,MAX(CASE WHEN msg_type='ai_reply' THEN id END) final_id "
-                                    "FROM global_messages WHERE turn_id=?", (turn_id,))
+    async with db._transaction() as write:
+        cursor = await write.execute(
+            "SELECT MIN(id) first_id,MAX(CASE WHEN msg_type='ai_reply' THEN id END) final_id "
+            "FROM global_messages WHERE turn_id=?", (turn_id,))
         row = await cursor.fetchone()
         await cursor.close()
-        errors = [value for value in ((existing['error'] if existing else None), error, snapshot_error)
-                  if value]
-        complete = bool(snapshot_id)
-        await conn.execute('''UPDATE conversation_turns SET status=?,finished_at=?,after_snapshot_id=?,
-            user_record_id=?,final_record_id=?,snapshot_complete=?,error=? WHERE id=?''', (
-            status, time.time(), snapshot_id, row['first_id'], row['final_id'], int(complete),
-            '\n'.join(errors) or None, turn_id,
+        await write.execute('''UPDATE conversation_turns SET status=?,finished_at=?,
+            user_record_id=?,final_record_id=?,snapshot_complete=0,
+            error=COALESCE(?,error) WHERE id=?''', (
+            status, time.time(), row['first_id'], row['final_id'], error, turn_id,
         ))
 
 
@@ -1017,9 +976,9 @@ class ConversationBranchService:
         return {
             'conversation_id': conversation_id, 'conversation_name': session.get('name') or '新对话',
             'record_id': record_id, 'mode': mode, 'boundary_record_id': boundary,
-            'turn_id': turn.get('id') if turn else None, 'exact_files': bool(snapshot_id),
-            'snapshot_id': snapshot_id,
-            'warning': '' if snapshot_id else '此历史没有文件快照；将使用当前文件创建仅上下文分支。',
+            'turn_id': turn.get('id') if turn else None, 'exact_files': False,
+            'snapshot_id': None,
+            'warning': '',
             'draft_text': record['content'] if mode == 'user' else '',
             'has_attachments': bool(_metadata(record.get('metadata')).get('attachments')),
         }
@@ -1054,140 +1013,125 @@ class ConversationBranchService:
         if previous:
             return {**previous, 'duplicate': True}
         source = await self._session(conversation_id)
-        record, turn, snapshot_id, boundary = await self._anchor(conversation_id, record_id, mode)
-        exact = bool(snapshot_id)
-        if not snapshot_id:
-            manifest = await asyncio.to_thread(capture_manifest, self._root(source), self.objects)
-            snapshot_id = await save_snapshot(self.db, conversation_id, None, 'legacy_branch_base', manifest)
-        manifest = await snapshot_manifest(self.db, snapshot_id)
+        record, turn, _snapshot_id, boundary = await self._anchor(conversation_id, record_id, mode)
+        # Branches copy conversation history only.  No file snapshot, no Git
+        # worktree and no workspace copy: the branch keeps working on the same
+        # project directory as normal chats.
         branch_id = uuid.uuid4().hex
-        workspace = self.workspaces / branch_id
-        await asyncio.to_thread(create_git_worktree, self.code_root, workspace)
-        try:
-            await asyncio.to_thread(materialize_snapshot, manifest, workspace)
-            now = time.time()
-            base_raw = (source.get('name') or '新对话').strip() or '新对话'
-            name = f'{base_raw[:75]} · 分支'
-            generation = None
-            read_conn = await self.db._get_conn()
-            cursor = await read_conn.execute(
-                'SELECT * FROM global_messages WHERE session_id=? AND id<=? AND withdrawn=0 ORDER BY id',
-                (conversation_id, boundary),
+        now = time.time()
+        base_raw = (source.get('name') or '新对话').strip() or '新对话'
+        name = f'{base_raw[:75]} · 分支'
+        generation = None
+        read_conn = await self.db._get_conn()
+        cursor = await read_conn.execute(
+            'SELECT * FROM global_messages WHERE session_id=? AND id<=? AND withdrawn=0 ORDER BY id',
+            (conversation_id, boundary),
+        )
+        source_rows = [dict(row) for row in await cursor.fetchall()]
+        await cursor.close()
+        for row in source_rows:
+            row['_branch_metadata'] = await freeze_attachment_metadata(
+                self.db, _metadata(row.get('metadata')), self.uploads, self.objects,
             )
-            source_rows = [dict(row) for row in await cursor.fetchall()]
-            await cursor.close()
-            for row in source_rows:
-                row['_branch_metadata'] = await freeze_attachment_metadata(
-                    self.db, _metadata(row.get('metadata')), self.uploads, self.objects,
-                )
-                row['_branch_metadata'] = await localize_branch_metadata(
-                    row['_branch_metadata'], branch_id, self.uploads, self.objects,
-                )
-                row['_branch_content'] = row['content']
-                for old_path, object_path in row['_branch_metadata'].pop('_branch_path_map', {}).items():
-                    row['_branch_content'] = row['_branch_content'].replace(old_path, object_path)
-                row['_branch_content'] = await freeze_output_paths(
-                    self.db, row['_branch_content'], self.storage, self.objects,
-                )
-            draft_metadata = (await freeze_attachment_metadata(
-                self.db, _metadata(record.get('metadata')), self.uploads, self.objects,
-            ) if mode == 'user' else None)
-            if draft_metadata:
-                draft_metadata = await localize_branch_metadata(
-                    draft_metadata, branch_id, self.uploads, self.objects,
-                )
-                draft_metadata.pop('_branch_path_map', None)
-            async with self.db._transaction() as conn:
-                name_cursor = await conn.execute('SELECT name FROM chat_sessions WHERE deleting=0 AND name IS NOT NULL')
-                existing_names = {row['name'] for row in await name_cursor.fetchall()}
-                await name_cursor.close()
-                suffix = ' · 分支'
+            row['_branch_metadata'] = await localize_branch_metadata(
+                row['_branch_metadata'], branch_id, self.uploads, self.objects,
+            )
+            row['_branch_content'] = row['content']
+            for old_path, object_path in row['_branch_metadata'].pop('_branch_path_map', {}).items():
+                row['_branch_content'] = row['_branch_content'].replace(old_path, object_path)
+            row['_branch_content'] = await freeze_output_paths(
+                self.db, row['_branch_content'], self.storage, self.objects,
+            )
+        draft_metadata = (await freeze_attachment_metadata(
+            self.db, _metadata(record.get('metadata')), self.uploads, self.objects,
+        ) if mode == 'user' else None)
+        if draft_metadata:
+            draft_metadata = await localize_branch_metadata(
+                draft_metadata, branch_id, self.uploads, self.objects,
+            )
+            draft_metadata.pop('_branch_path_map', None)
+        async with self.db._transaction() as conn:
+            name_cursor = await conn.execute('SELECT name FROM chat_sessions WHERE deleting=0 AND name IS NOT NULL')
+            existing_names = {row['name'] for row in await name_cursor.fetchall()}
+            await name_cursor.close()
+            suffix = ' · 分支'
+            name = f'{base_raw[:80 - len(suffix)]}{suffix}'
+            branch_index = 2
+            while name in existing_names:
+                suffix = f' · 分支 {branch_index}'
                 name = f'{base_raw[:80 - len(suffix)]}{suffix}'
-                branch_index = 2
-                while name in existing_names:
-                    suffix = f' · 分支 {branch_index}'
-                    name = f'{base_raw[:80 - len(suffix)]}{suffix}'
-                    branch_index += 1
-                generation = await self.db._allocate_conversation_generation(conn)
-                await conn.execute('''INSERT INTO chat_sessions
-                    (id,name,model,created_at,last_active,archived,generation,agent_iteration,
-                     context_start_record_id,context_epoch,deleting,title_auto_pending,group_id,pinned,
-                     parent_conversation_id,parent_turn_id,workspace_path,branch_mode,
-                     branch_base_snapshot_id,branch_created_at)
-                    VALUES(?,?,?,?,?,0,?,0,0,0,0,0,?,0,?,?,?,?,?,?)''', (
-                    branch_id, name, source.get('model'), now, now, generation,
-                    source.get('group_id') or 'ungrouped', conversation_id,
-                    turn.get('id') if turn else None, str(workspace),
-                    'exact' if exact else 'context_only', snapshot_id, now,
+                branch_index += 1
+            generation = await self.db._allocate_conversation_generation(conn)
+            await conn.execute('''INSERT INTO chat_sessions
+                (id,name,model,created_at,last_active,archived,generation,agent_iteration,
+                 context_start_record_id,context_epoch,deleting,title_auto_pending,group_id,pinned,
+                 parent_conversation_id,parent_turn_id,workspace_path,branch_mode,
+                 branch_base_snapshot_id,branch_created_at)
+                VALUES(?,?,?,?,?,0,?,0,0,0,0,0,?,0,?,?,?,?,?,?)''', (
+                branch_id, name, source.get('model'), now, now, generation,
+                source.get('group_id') or 'ungrouped', conversation_id,
+                turn.get('id') if turn else None, None,
+                'context', None, now,
+            ))
+            cursor = await conn.execute('SELECT * FROM conversation_turns WHERE conversation_id=? AND '
+                'EXISTS(SELECT 1 FROM global_messages m WHERE m.turn_id=conversation_turns.id AND m.id<=?) '
+                'ORDER BY started_at,id', (conversation_id, boundary))
+            copied_turns = [dict(row) for row in await cursor.fetchall()]
+            turn_map: dict[str, str] = {}
+            for old in copied_turns:
+                new_turn = uuid.uuid4().hex
+                turn_map[old['id']] = new_turn
+                await conn.execute('''INSERT INTO conversation_turns
+                    (id,conversation_id,status,started_at,finished_at,before_snapshot_id,
+                     after_snapshot_id,user_record_id,final_record_id,snapshot_complete,error)
+                    VALUES(?,?,'copied',?,?,?,?,NULL,NULL,?,?)''', (
+                    new_turn, branch_id, old['started_at'], old['finished_at'],
+                    old['before_snapshot_id'], old['after_snapshot_id'],
+                    old['snapshot_complete'], old['error'],
                 ))
-                cursor = await conn.execute('SELECT * FROM conversation_turns WHERE conversation_id=? AND '
-                    'EXISTS(SELECT 1 FROM global_messages m WHERE m.turn_id=conversation_turns.id AND m.id<=?) '
-                    'ORDER BY started_at,id', (conversation_id, boundary))
-                copied_turns = [dict(row) for row in await cursor.fetchall()]
-                turn_map: dict[str, str] = {}
-                for old in copied_turns:
-                    new_turn = uuid.uuid4().hex
-                    turn_map[old['id']] = new_turn
-                    await conn.execute('''INSERT INTO conversation_turns
-                        (id,conversation_id,status,started_at,finished_at,before_snapshot_id,
-                         after_snapshot_id,user_record_id,final_record_id,snapshot_complete,error)
-                        VALUES(?,?,'copied',?,?,?,?,NULL,NULL,?,?)''', (
-                        new_turn, branch_id, old['started_at'], old['finished_at'],
-                        old['before_snapshot_id'], old['after_snapshot_id'],
-                        old['snapshot_complete'], old['error'],
-                    ))
-                    op_cursor = await conn.execute('SELECT * FROM turn_operations WHERE turn_id=? ORDER BY sequence', (old['id'],))
-                    for op in await op_cursor.fetchall():
-                        await conn.execute('INSERT INTO turn_operations(turn_id,sequence,kind,effect,details,created_at) VALUES(?,?,?,?,?,?)',
-                            (new_turn, op['sequence'], op['kind'], op['effect'], op['details'], op['created_at']))
-                record_map: dict[int, int] = {}
-                for row in source_rows:
-                    metadata = row['_branch_metadata']
-                    cursor = await conn.execute('''INSERT INTO global_messages
-                        (chat_id,user_id,msg_type,role,content,timestamp,session_id,metadata,turn_id,withdrawn,source_record_id)
-                        VALUES(?,?,?,?,?,?,?,?,?,0,?)''', (
-                        row['chat_id'], row['user_id'], row['msg_type'], row['role'], row['_branch_content'],
-                        row['timestamp'], branch_id,
-                        json.dumps(metadata, ensure_ascii=False) if metadata else None,
-                        turn_map.get(row.get('turn_id')), row['id'],
-                    ))
-                    record_map[row['id']] = cursor.lastrowid
-                for old in copied_turns:
-                    new_turn = turn_map[old['id']]
-                    await conn.execute('UPDATE conversation_turns SET user_record_id=?,final_record_id=? WHERE id=?', (
-                        record_map.get(old.get('user_record_id')), record_map.get(old.get('final_record_id')), new_turn,
-                    ))
-                if mode == 'user':
-                    await conn.execute('INSERT INTO conversation_branch_drafts VALUES(?,?,?,?,?)', (
-                        branch_id, record_id, record['content'],
-                        json.dumps(draft_metadata, ensure_ascii=False) if draft_metadata else None, now,
-                    ))
-                await conn.execute("INSERT INTO config(key,value) VALUES('current_chat_id',?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(branch_id),))
-                cursor = await conn.execute("SELECT value FROM config WHERE key='conversation_revision'")
-                revision_row = await cursor.fetchone()
-                revision = int(json.loads(revision_row['value'])) if revision_row else 0
-                await conn.execute("INSERT INTO config(key,value) VALUES('conversation_revision',?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(revision + 1),))
-            self.db._config_cache.pop('current_chat_id', None)
-            self.db._config_cache.pop('conversation_revision', None)
-            response = {'ok': True, 'conversation_id': branch_id, 'name': name,
-                        'branch_mode': 'exact' if exact else 'context_only',
-                        'parent_conversation_id': conversation_id,
-                        'parent_turn_id': turn.get('id') if turn else None,
-                        'draft': {'text': record['content'], 'has_attachments': bool(_metadata(record.get('metadata')).get('attachments'))}
-                        if mode == 'user' else None}
-            await self._save_request(request_id, 'branch', conversation_id, response)
-            return response
-        except BaseException:
-            with contextlib.suppress(Exception):
-                await asyncio.to_thread(
-                    subprocess.run,
-                    ['git', '-C', str(self.code_root), 'worktree', 'remove', '--force', str(workspace)],
-                    check=False, capture_output=True, timeout=60,
-                )
-            shutil.rmtree(workspace, ignore_errors=True)
-            raise
+                op_cursor = await conn.execute('SELECT * FROM turn_operations WHERE turn_id=? ORDER BY sequence', (old['id'],))
+                for op in await op_cursor.fetchall():
+                    await conn.execute('INSERT INTO turn_operations(turn_id,sequence,kind,effect,details,created_at) VALUES(?,?,?,?,?,?)',
+                        (new_turn, op['sequence'], op['kind'], op['effect'], op['details'], op['created_at']))
+            record_map: dict[int, int] = {}
+            for row in source_rows:
+                metadata = row['_branch_metadata']
+                cursor = await conn.execute('''INSERT INTO global_messages
+                    (chat_id,user_id,msg_type,role,content,timestamp,session_id,metadata,turn_id,withdrawn,source_record_id)
+                    VALUES(?,?,?,?,?,?,?,?,?,0,?)''', (
+                    row['chat_id'], row['user_id'], row['msg_type'], row['role'], row['_branch_content'],
+                    row['timestamp'], branch_id,
+                    json.dumps(metadata, ensure_ascii=False) if metadata else None,
+                    turn_map.get(row.get('turn_id')), row['id'],
+                ))
+                record_map[row['id']] = cursor.lastrowid
+            for old in copied_turns:
+                new_turn = turn_map[old['id']]
+                await conn.execute('UPDATE conversation_turns SET user_record_id=?,final_record_id=? WHERE id=?', (
+                    record_map.get(old.get('user_record_id')), record_map.get(old.get('final_record_id')), new_turn,
+                ))
+            if mode == 'user':
+                await conn.execute('INSERT INTO conversation_branch_drafts VALUES(?,?,?,?,?)', (
+                    branch_id, record_id, record['content'],
+                    json.dumps(draft_metadata, ensure_ascii=False) if draft_metadata else None, now,
+                ))
+            await conn.execute("INSERT INTO config(key,value) VALUES('current_chat_id',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(branch_id),))
+            cursor = await conn.execute("SELECT value FROM config WHERE key='conversation_revision'")
+            revision_row = await cursor.fetchone()
+            revision = int(json.loads(revision_row['value'])) if revision_row else 0
+            await conn.execute("INSERT INTO config(key,value) VALUES('conversation_revision',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(revision + 1),))
+        self.db._config_cache.pop('current_chat_id', None)
+        self.db._config_cache.pop('conversation_revision', None)
+        response = {'ok': True, 'conversation_id': branch_id, 'name': name,
+                    'branch_mode': 'context',
+                    'parent_conversation_id': conversation_id,
+                    'parent_turn_id': turn.get('id') if turn else None,
+                    'draft': {'text': record['content'], 'has_attachments': bool(_metadata(record.get('metadata')).get('attachments'))}
+                    if mode == 'user' else None}
+        await self._save_request(request_id, 'branch', conversation_id, response)
+        return response
 
     async def lineage(self, conversation_id: str) -> dict:
         session = await self._session(conversation_id)
@@ -1272,6 +1216,14 @@ class ConversationBranchService:
         return response
 
     async def withdraw_preview(self, conversation_id: str, record_id: int) -> dict:
+        """Preview withdrawing a user message and everything after it.
+
+        Withdrawal only removes conversation history and model context; it never
+        scans or restores disk files.  Recorded side effects (commands, file
+        writes, outbound files) are reported as warnings for the confirmation
+        dialog but never block the withdrawal.  Only queued input, an open ask
+        form or a turn that is still running prevent it.
+        """
         record = await self._record(conversation_id, record_id)
         if record['role'] != 'user' or record['msg_type'] not in {'user_text', 'user_file', 'user_photo', 'command'}:
             raise BranchingError('撤回只能从用户消息开始')
@@ -1287,78 +1239,57 @@ class ConversationBranchService:
         control = await cursor.fetchone()
         await cursor.close()
         waiting = bool(queued or control and control['state'] == 'ask')
-        session = await self._session(conversation_id)
-        if not turn:
-            cursor = await conn.execute(
-                "SELECT * FROM conversation_turns WHERE conversation_id=? AND status<>'withdrawn' "
-                "AND (COALESCE(user_record_id,final_record_id,0)>=? OR EXISTS("
-                "SELECT 1 FROM global_messages m WHERE m.turn_id=conversation_turns.id AND m.id>=?)) "
-                "ORDER BY started_at,id",
-                (conversation_id, record_id, record_id),
-            )
-            later_turns = [dict(row) for row in await cursor.fetchall()]
-            await cursor.close()
-            if record['msg_type'] == 'command' and not later_turns:
-                cursor = await conn.execute(
-                    "SELECT COUNT(*) n FROM global_messages WHERE session_id=? AND withdrawn=0 AND id>=? "
-                    "AND msg_type NOT IN ('command','sys_reply')",
-                    (conversation_id, record_id),
-                )
-                non_cmd = int((await cursor.fetchone())['n'])
-                await cursor.close()
-                if non_cmd == 0:
-                    cursor = await conn.execute(
-                        'SELECT COUNT(*) n FROM global_messages WHERE session_id=? AND withdrawn=0 AND id>=?',
-                        (conversation_id, record_id),
-                    )
-                    count = int((await cursor.fetchone())['n'])
-                    await cursor.close()
-                    current = await asyncio.to_thread(capture_manifest, self._root(session), self.objects)
-                    return {
-                        'record_id': record_id, 'turn_id': f'command:{record_id}', 'turn_ids': [],
-                        'message_count': count, 'effects': {}, 'can_withdraw': not waiting,
-                        'reason': '仍有待发消息或表单等待处理，请先完成、取回或取消后再撤回。' if waiting else '',
-                        'queued': queued, 'restore_snapshot_id': None,
-                        'current_digest': current['root_digest'], 'latest_snapshot_id': None,
-                    }
-            if record['msg_type'] == 'command' and later_turns:
-                turn = later_turns[0]
-        if not turn or not turn.get('snapshot_complete') or turn.get('status') not in {'completed', 'copied', 'failed', 'stopped', 'ask'}:
-            return {'can_withdraw': False, 'reason': '旧历史或不完整回合没有可靠文件现场，请改为创建分支。',
-                    'record_id': record_id}
-        cursor = await conn.execute('SELECT * FROM conversation_turns WHERE conversation_id=? AND started_at>=? '
-                                    "AND status<>'withdrawn' ORDER BY started_at,id", (conversation_id, turn['started_at']))
-        turns = [dict(row) for row in await cursor.fetchall()]
+        cursor = await conn.execute(
+            "SELECT id FROM conversation_turns WHERE conversation_id=? AND status<>'withdrawn' "
+            "AND (id=? OR EXISTS(SELECT 1 FROM global_messages m WHERE m.turn_id=conversation_turns.id "
+            "AND m.session_id=? AND m.withdrawn=0 AND m.id>=?)) ORDER BY started_at,id",
+            (conversation_id, turn['id'] if turn else '', conversation_id, record_id),
+        )
+        ids = [row['id'] for row in await cursor.fetchall()]
         await cursor.close()
-        ids = [item['id'] for item in turns]
+        cursor = await conn.execute(
+            "SELECT COUNT(*) n FROM conversation_turns WHERE conversation_id=? AND status='running'",
+            (conversation_id,))
+        running = bool(int((await cursor.fetchone())['n']))
+        await cursor.close()
         effects: dict[str, int] = {}
-        if ids:
-            placeholders = ','.join('?' for _ in ids)
-            cursor = await conn.execute(f'SELECT effect,COUNT(*) n FROM turn_operations WHERE turn_id IN ({placeholders}) GROUP BY effect', ids)
-            effects = {row['effect']: int(row['n']) for row in await cursor.fetchall()}
-            await cursor.close()
-        unsafe = bool(effects.get('external') or effects.get('unknown'))
+        kinds: dict[str, set[str]] = {}
         if ids:
             placeholders = ','.join('?' for _ in ids)
             cursor = await conn.execute(
-                f'SELECT COUNT(*) n FROM global_messages WHERE session_id=? AND withdrawn=0 AND (id>=? OR turn_id IN ({placeholders}))',
-                (conversation_id, record_id, *ids),
-            )
-            count = int((await cursor.fetchone())['n'])
+                f'SELECT kind,effect,COUNT(*) n FROM turn_operations WHERE turn_id IN ({placeholders}) GROUP BY kind,effect',
+                ids)
+            for row in await cursor.fetchall():
+                effects[row['effect']] = effects.get(row['effect'], 0) + int(row['n'])
+                kinds.setdefault(row['effect'], set()).add(row['kind'])
             await cursor.close()
-        else:
-            count = 0
-        current = await asyncio.to_thread(capture_manifest, self._root(session), self.objects)
-        latest_snapshot = await snapshot_manifest(self.db, turns[-1]['after_snapshot_id'])
-        changed = current['root_digest'] != latest_snapshot['root_digest']
-        can = not unsafe and not changed and not waiting
+        warnings = withdraw_warnings(effects, kinds)
+        placeholders = ','.join('?' for _ in ids)
+        cursor = await conn.execute(
+            'SELECT COUNT(*) n FROM global_messages WHERE session_id=? AND withdrawn=0 AND (id>=?'
+            + (f' OR turn_id IN ({placeholders}))' if ids else ')'),
+            (conversation_id, record_id, *ids),
+        )
+        count = int((await cursor.fetchone())['n'])
+        await cursor.close()
+        cursor = await conn.execute(
+            'SELECT COALESCE(MAX(id),0) last_id,COUNT(*) n FROM global_messages WHERE session_id=? AND withdrawn=0',
+            (conversation_id,))
+        state = await cursor.fetchone()
+        await cursor.close()
+        # Optimistic concurrency token: the confirmed withdrawal must match the
+        # conversation the user previewed (no new messages in between).
+        current_digest = hashlib.sha256(
+            f"{state['last_id']}:{state['n']}:{record_id}:{','.join(ids)}".encode()).hexdigest()
         reason = ('仍有待发消息或表单等待处理，请先完成、取回或取消后再撤回。' if waiting else
-                  '包含外部或未知副作用，不能假装撤销；请从此消息之前创建安全分支。' if unsafe else
-                  '当前文件已在回合结束后变化，为避免覆盖人工修改，不能原地撤回。' if changed else '')
-        return {'record_id': record_id, 'turn_id': turn['id'], 'turn_ids': ids,
-                'message_count': count, 'effects': effects, 'can_withdraw': can,
-                'reason': reason, 'queued': queued, 'restore_snapshot_id': turn['before_snapshot_id'],
-                'current_digest': current['root_digest'], 'latest_snapshot_id': latest_snapshot['id']}
+                  '当前对话仍在执行，请等待回答结束或停止后再撤回。' if running else '')
+        return {'record_id': record_id, 'turn_id': turn['id'] if turn else f'record:{record_id}',
+                'turn_ids': ids, 'message_count': count, 'effects': effects,
+                'operation_kinds': {key: sorted(value) for key, value in kinds.items()},
+                'warnings': warnings, 'warning': '\n'.join(warnings),
+                'can_withdraw': not waiting and not running, 'reason': reason, 'queued': queued,
+                'restore_snapshot_id': None, 'current_digest': current_digest,
+                'latest_snapshot_id': None}
 
     async def withdraw(self, conversation_id: str, record_id: int, data: dict) -> dict:
         previous = await self._request(data.get('request_id'), 'withdraw', conversation_id)
@@ -1369,9 +1300,8 @@ class ConversationBranchService:
             raise BranchingError(preview['reason'])
         if (data.get('confirm') is not True or data.get('turn_id') != preview['turn_id']
                 or data.get('current_digest') != preview['current_digest']):
-            raise BranchingError('对话或文件状态已变化，请重新预览后确认')
+            raise BranchingError('对话已变化，请重新预览后确认')
         record = await self._record(conversation_id, record_id)
-        session = await self._session(conversation_id)
         conn = await self.db._get_conn()
         ids = preview['turn_ids']
         if ids:
@@ -1394,47 +1324,53 @@ class ConversationBranchService:
             if isinstance(live, dict):
                 logical_ids.update(mid for mid in live.get('message_ids', []) if type(mid) is int)
         await cursor.close()
-        current = None
-        changes = []
-        if preview['restore_snapshot_id']:
-            restore = await snapshot_manifest(self.db, preview['restore_snapshot_id'])
-            current = await asyncio.to_thread(capture_manifest, self._root(session), self.objects)
-            changes = changes_to(current, restore)
-            await asyncio.to_thread(apply_changes, self._root(session), changes)
-        try:
-            async with self.db._transaction() as conn:
-                await conn.execute('UPDATE global_messages SET withdrawn=1 WHERE session_id=? AND id>=?',
-                                   (conversation_id, record_id))
-                await conn.execute('UPDATE ui_messages SET withdrawn=1 WHERE conversation_id=? AND turn_id IS NULL AND timestamp>=?',
-                                   (conversation_id, record['timestamp']))
-                if ids:
-                    placeholders = ','.join('?' for _ in ids)
-                    await conn.execute(f'UPDATE global_messages SET withdrawn=1 WHERE session_id=? AND turn_id IN ({placeholders})',
-                                       (conversation_id, *ids))
-                    await conn.execute(f'UPDATE ui_messages SET withdrawn=1 WHERE conversation_id=? AND turn_id IN ({placeholders})',
-                                       (conversation_id, *ids))
-                    await conn.execute(f"UPDATE conversation_turns SET status='withdrawn' WHERE id IN ({placeholders})", ids)
-                await conn.execute('DELETE FROM chat_messages WHERE session_id=?', (conversation_id,))
-                cursor = await conn.execute('SELECT * FROM global_messages WHERE session_id=? AND withdrawn=0 ORDER BY id', (conversation_id,))
-                model_rows = self.db.conversation_records_to_messages(await cursor.fetchall())
-                now = time.time()
-                for message in model_rows:
-                    if isinstance(message.get('content'), str):
-                        await conn.execute('INSERT INTO chat_messages(session_id,role,content,timestamp) VALUES(?,?,?,?)',
-                                           (conversation_id, message['role'], message['content'], now))
-                await conn.execute('UPDATE chat_sessions SET last_active=? WHERE id=?', (now, conversation_id))
-        except BaseException:
-            if current is not None:
-                with contextlib.suppress(Exception):
-                    restored_current = await asyncio.to_thread(capture_manifest, self._root(session), self.objects)
-                    await asyncio.to_thread(apply_changes, self._root(session), changes_to(restored_current, current))
-            raise
+        async with self.db._transaction() as conn:
+            await conn.execute('UPDATE global_messages SET withdrawn=1 WHERE session_id=? AND id>=?',
+                               (conversation_id, record_id))
+            await conn.execute('UPDATE ui_messages SET withdrawn=1 WHERE conversation_id=? AND turn_id IS NULL AND timestamp>=?',
+                               (conversation_id, record['timestamp']))
+            if ids:
+                placeholders = ','.join('?' for _ in ids)
+                await conn.execute(f'UPDATE global_messages SET withdrawn=1 WHERE session_id=? AND turn_id IN ({placeholders})',
+                                   (conversation_id, *ids))
+                await conn.execute(f'UPDATE ui_messages SET withdrawn=1 WHERE conversation_id=? AND turn_id IN ({placeholders})',
+                                   (conversation_id, *ids))
+                await conn.execute(f"UPDATE conversation_turns SET status='withdrawn' WHERE id IN ({placeholders})", ids)
+            await conn.execute('DELETE FROM chat_messages WHERE session_id=?', (conversation_id,))
+            cursor = await conn.execute('SELECT * FROM global_messages WHERE session_id=? AND withdrawn=0 ORDER BY id', (conversation_id,))
+            model_rows = self.db.conversation_records_to_messages(await cursor.fetchall())
+            now = time.time()
+            for message in model_rows:
+                if isinstance(message.get('content'), str):
+                    await conn.execute('INSERT INTO chat_messages(session_id,role,content,timestamp) VALUES(?,?,?,?)',
+                                       (conversation_id, message['role'], message['content'], now))
+            await conn.execute('UPDATE chat_sessions SET last_active=? WHERE id=?', (now, conversation_id))
         response = {'ok': True, 'withdrawn_turns': len(ids), 'withdrawn_messages': preview['message_count'],
-                    'restored_files': len(changes), 'conversation_id': conversation_id,
+                    'restored_files': 0, 'conversation_id': conversation_id,
+                    'warnings': preview['warnings'],
                     'telegram_native_message_ids': sorted(native_ids),
                     'telegram_logical_message_ids': sorted(logical_ids)}
         await self._save_request(data.get('request_id'), 'withdraw', conversation_id, response)
         return response
+
+
+_EFFECT_WARNINGS = {
+    'unknown': ('包含命令执行', '已经执行的命令及其对系统、文件或进程造成的影响不会撤销，撤回只删除对话记录和 AI 上下文。'),
+    'local_reversible': ('包含文件写入', '磁盘上已经写入或修改的文件不会回滚，撤回只删除对话记录和 AI 上下文。'),
+    'external': ('包含外部发送', '已经发送出去的文件或媒体不会收回（Telegram 端会尽力删除对应消息）。'),
+}
+
+
+def withdraw_warnings(effects: dict[str, int], kinds: dict[str, set[str]]) -> list[str]:
+    """Human-readable side-effect notes for the withdrawal confirmation."""
+    notes = []
+    for effect in ('unknown', 'local_reversible', 'external'):
+        if not effects.get(effect):
+            continue
+        title, detail = _EFFECT_WARNINGS[effect]
+        names = '、'.join(sorted(kinds.get(effect, ()))) or effect
+        notes.append(f'{title}（{names} × {effects[effect]}）：{detail}')
+    return notes
 
 
 async def consume_branch_draft(db, conversation_id: str) -> dict | None:

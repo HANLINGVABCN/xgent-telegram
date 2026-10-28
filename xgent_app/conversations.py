@@ -215,8 +215,6 @@ class ConversationManager:
         self.text_queue = None
         self._run_outcome = 'completed'
         self._admission_lock = asyncio.Lock()
-        self._admission_cid: str | None = None
-        self._admission_cancelled = False
         self.maintenance = None
         self.terminal_enabled = False
         self._terminal_id = None
@@ -353,17 +351,7 @@ class ConversationManager:
             if acquired and self.code_root is not None and self.object_root is not None:
                 from .conversation_branching import begin_turn, bind_turn
                 db = await self.factory()
-                self._admission_cid = scope.conversation_id
-                self._admission_cancelled = False
-                should_cancel = lambda: bool(
-                    (self._stop_event is not None and self._stop_event.is_set())
-                    or self._admission_cancelled
-                )
-                try:
-                    turn_id = await begin_turn(
-                        db, scope, self.code_root, self.object_root, should_cancel=should_cancel)
-                finally:
-                    self._admission_cid = None
+                turn_id = await begin_turn(db, scope)
                 turn_guard = bind_turn(turn_id)
             with bind_conversation(scope), turn_guard:
                 try:
@@ -398,7 +386,7 @@ class ConversationManager:
                     outcome = 'stopped' if self._stop_event and self._stop_event.is_set() else self._run_outcome
                     if turn_id is not None:
                         from .conversation_branching import finish_turn
-                        await finish_turn(db, scope, turn_id, self.code_root, self.object_root, outcome)
+                        await finish_turn(db, scope, turn_id, status=outcome)
                     await db.queue_finish_run(scope.run_id, outcome)
                     await db.finish_conversation_run(scope.run_id)
                 finally:

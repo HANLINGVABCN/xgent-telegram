@@ -1395,15 +1395,15 @@
       var preview=await api('/api/workbench/conversations/branch/preview',{method:'POST',body:JSON.stringify({conversation_id:cid,record_id:message.id,mode})});
       box.replaceChildren();
       box.append(actionNode('p',mode==='user'?'新分支会停在这条消息之前，并把原文字放回输入框。':'新分支会保留到这次完整回答结束。'));
-      box.append(actionNode('p',preview.exact_files?'将准确恢复该回合的文件现场。':preview.warning,preview.exact_files?'wb-note':'wb-error'));
+      box.append(actionNode('p','分支只复制对话记录，不复制或回滚任何本地文件。','wb-note'));
       if(preview.has_attachments)box.append(actionNode('p','原附件会作为不可变引用进入新分支草稿，不会覆盖来源附件。','wb-note'));
       var controls=actionNode('div',null,'wb-actions'),cancel=actionButton('取消',closeAction),confirm=actionButton('创建分支',async()=>{
-        confirm.disabled=true;confirm.textContent='正在创建独立工作区…';
+        confirm.disabled=true;confirm.textContent='正在创建分支…';
         try{
           var result=await api('/api/workbench/conversations/branch',{method:'POST',body:JSON.stringify({conversation_id:cid,record_id:message.id,mode,request_id:queueRequestId()})});
           closeAction();await window.XGentConversations?.refresh();await window.XGentConversations?.select(result.conversation_id);
           if(result.draft?.text&&!input.value){input.value=result.draft.text;syncSendState();input.focus();}
-          await loadConversationLineage();toast(result.branch_mode==='exact'?'已创建精确文件分支':'已创建仅上下文分支');
+          await loadConversationLineage();toast('已创建对话分支');
         }finally{confirm.disabled=false;confirm.textContent='创建分支';}
       },'primary');controls.append(cancel,confirm);box.append(controls);
     }catch(error){box.replaceChildren(actionMessage(error.message,true),actionButton('关闭',closeAction));}
@@ -1411,27 +1411,22 @@
 
   async function openWithdrawDialog(message){
     var cid=message.conversation_id||selectedConversationId;
-    var box=dialogSummary('正在检查回合副作用…',[]);showAction('撤回此消息及之后',box);
+    var box=dialogSummary('正在检查撤回范围…',[]);showAction('撤回此消息及之后',box);
     try{
       var preview=await api('/api/workbench/conversations/withdraw/preview',{method:'POST',body:JSON.stringify({conversation_id:cid,record_id:message.id})});
       box.replaceChildren();
       if(!preview.can_withdraw){
         box.append(actionMessage(preview.reason,true));
-        var safe=actionButton('改为从此前创建分支',()=>openBranchDialog(message,'user'),'primary');
-        var fallback=actionNode('div',null,'wb-actions');fallback.append(actionButton('关闭',closeAction),safe);box.append(fallback);return;
+        box.append(actionButton('关闭',closeAction));return;
       }
-      if(preview.restore_snapshot_id){
-        box.append(actionNode('p',`将撤回 ${preview.message_count} 条消息、${preview.turn_ids.length} 个回合，并恢复到该消息发送前的文件现场。`));
-      }else{
-        box.append(actionNode('p',`将从对话中撤回 ${preview.message_count} 条消息，不修改任何本地文件。`));
-      }
-      var effects=Object.entries(preview.effects||{}).map(([key,value])=>key+' × '+value).join(' · ');
-      if(effects)box.append(actionNode('p','操作记录：'+effects,'wb-note'));
+      box.append(actionNode('p',`将从对话中撤回 ${preview.message_count} 条消息，仅删除对话记录和 AI 上下文，不修改任何本地文件。`));
+      (preview.warnings||[]).forEach(text=>box.append(actionNode('p','⚠️ '+text,'wb-error')));
+      if((preview.warnings||[]).length)box.append(actionNode('p','以上只是提醒，确认后仍会撤回。','wb-note'));
       var controls=actionNode('div',null,'wb-actions'),confirm=actionButton('确认撤回',async()=>{
         confirm.disabled=true;
         try{
           await api('/api/workbench/conversations/withdraw',{method:'POST',body:JSON.stringify({conversation_id:cid,record_id:message.id,turn_id:preview.turn_id,current_digest:preview.current_digest,confirm:true,request_id:queueRequestId()})});
-          closeAction();await resync(true);toast('消息和本地文件现场已安全撤回');
+          closeAction();await resync(true);toast('消息已撤回');
         }finally{confirm.disabled=false;}
       },'danger');controls.append(actionButton('取消',closeAction),confirm);box.append(controls);
     }catch(error){box.replaceChildren(actionMessage(error.message,true),actionButton('关闭',closeAction));}
@@ -1466,9 +1461,11 @@
       bar.replaceChildren();
       if(data.parent){
         var head=actionNode('div',null,'lineage-head');
-        head.append(actionNode('strong','分支'),actionNode('span',`来源：${data.parent.name} · ${data.branch_mode==='exact'?'精确文件现场':'仅上下文'}`,data.branch_mode==='exact'?'':'lineage-warning'));
+        var exact=data.branch_mode==='exact';
+        head.append(actionNode('strong','分支'),actionNode('span',`来源：${data.parent.name}${exact?' · 旧版文件分支':''}`));
         var acts=actionNode('div',null,'lineage-actions');
-        acts.append(actionButton('打开来源',async()=>{if(optBtn?.getAttribute('aria-expanded')==='true')optBtn.click();await window.XGentConversations?.select(data.parent.id);}),actionButton('查看并应用文件改动',()=>{if(optBtn?.getAttribute('aria-expanded')==='true')optBtn.click();openApplyBranchDialog();}));
+        acts.append(actionButton('打开来源',async()=>{if(optBtn?.getAttribute('aria-expanded')==='true')optBtn.click();await window.XGentConversations?.select(data.parent.id);}));
+        if(exact)acts.append(actionButton('查看并应用文件改动',()=>{if(optBtn?.getAttribute('aria-expanded')==='true')optBtn.click();openApplyBranchDialog();}));
         bar.append(head,acts);
       }
       if(data.draft){

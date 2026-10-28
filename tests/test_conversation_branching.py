@@ -115,14 +115,14 @@ class ConversationBranchingTests(unittest.IsolatedAsyncioTestCase):
                 capture_manifest(
                     installed, Path(self.temp.name) / 'timed-objects', timeout=.001)
 
-    async def test_before_snapshot_failure_never_blocks_chat_or_fakes_complete_snapshot(self):
+    async def test_chat_turn_never_scans_files(self):
         scope = await self.manager.resolve()
         with patch('xgent_app.conversation_branching.capture_manifest',
-                   side_effect=BranchingError('fixture virtual filesystem')) as capture:
+                   side_effect=AssertionError('turns must not scan files')) as capture:
             async with self.manager.operation(scope, execution=True):
-                await self.db.record_global_message(1, 1, 'user_text', 'user', '仍要正常处理')
+                await self.db.record_global_message(1, 1, 'user_text', 'user', '正常聊天')
                 await self.db.record_global_message(1, 0, 'ai_reply', 'assistant', '已完成')
-        self.assertEqual(1, capture.call_count)
+        self.assertEqual(0, capture.call_count)
         conn = await self.db._get_conn()
         cursor = await conn.execute('SELECT * FROM conversation_turns ORDER BY started_at DESC LIMIT 1')
         turn = dict(await cursor.fetchone())
@@ -130,109 +130,117 @@ class ConversationBranchingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual('completed', turn['status'])
         self.assertIsNone(turn['before_snapshot_id'])
         self.assertIsNone(turn['after_snapshot_id'])
-        self.assertFalse(turn['snapshot_complete'])
-        self.assertIn('fixture virtual filesystem', turn['error'])
-
-    async def test_after_snapshot_failure_preserves_completed_run_but_disables_exact_restore(self):
-        before = {'root_digest': 'b' * 64, 'entries': [], 'file_count': 0, 'total_size': 0}
-        scope = await self.manager.resolve()
-        with patch('xgent_app.conversation_branching.capture_manifest',
-                   side_effect=[before, BranchingError('fixture changed file')]):
-            async with self.manager.operation(scope, execution=True):
-                await self.db.record_global_message(1, 1, 'user_text', 'user', '正常回答')
-                await self.db.record_global_message(1, 0, 'ai_reply', 'assistant', '完成')
-        conn = await self.db._get_conn()
-        cursor = await conn.execute('SELECT * FROM conversation_turns ORDER BY started_at DESC LIMIT 1')
-        turn = dict(await cursor.fetchone())
+        self.assertIsNotNone(turn['user_record_id'])
+        self.assertIsNotNone(turn['final_record_id'])
+        cursor = await conn.execute('SELECT COUNT(*) n FROM conversation_snapshots')
+        self.assertEqual(0, (await cursor.fetchone())['n'])
         await cursor.close()
-        self.assertEqual('completed', turn['status'])
-        self.assertIsNotNone(turn['before_snapshot_id'])
-        self.assertIsNone(turn['after_snapshot_id'])
-        self.assertFalse(turn['snapshot_complete'])
-        self.assertIn('fixture changed file', turn['error'])
 
-    async def test_empty_cancelled_admission_skips_the_second_snapshot(self):
-        before = {'root_digest': 'c' * 64, 'entries': [], 'file_count': 0, 'total_size': 0}
+    async def test_empty_cancelled_admission_records_empty_turn(self):
         scope = await self.manager.resolve()
-        with patch('xgent_app.conversation_branching.capture_manifest', return_value=before) as capture:
-            async with self.manager.operation(scope, execution=True):
-                pass
-        self.assertEqual(1, capture.call_count)
+        async with self.manager.operation(scope, execution=True):
+            pass
         conn = await self.db._get_conn()
         cursor = await conn.execute('SELECT * FROM conversation_turns ORDER BY started_at DESC LIMIT 1')
         turn = dict(await cursor.fetchone())
         await cursor.close()
         self.assertEqual('empty', turn['status'])
-        self.assertIsNone(turn['after_snapshot_id'])
-        self.assertFalse(turn['snapshot_complete'])
 
-    async def test_exact_branch_isolated_apply_and_safe_withdraw(self):
-        user, answer = await self.make_edit_turn()
-        preview = await self.service.branch_preview('global_memory', answer, 'assistant')
-        self.assertTrue(preview['exact_files'])
-        branch = await self.service.create_branch(
-            'global_memory', answer, 'assistant', request_id='branch-request-0001')
-        workspace = Path((await self.db.get_session(branch['conversation_id']))['workspace_path'])
-        self.assertEqual('after\n', (workspace / 'note.txt').read_text(encoding='utf-8'))
-        (workspace / 'note.txt').write_text('branch\n', encoding='utf-8')
+    async def _withdraw(self, record_id, request_id):
+        preview = await self.service.withdraw_preview('global_memory', record_id)
+        self.assertTrue(preview['can_withdraw'], preview)
+        result = await self.service.withdraw('global_memory', record_id, {
+            'confirm': True, 'turn_id': preview['turn_id'], 'current_digest': preview['current_digest'],
+            'request_id': request_id,
+        })
+        return preview, result
+
+    async def test_edit_turn_withdraws_with_warning_and_keeps_disk_files(self):
+        user, _answer = await self.make_edit_turn()
+        preview, result = await self._withdraw(user, 'withdraw-edit-0001')
+        self.assertTrue(any('文件写入' in item for item in preview['warnings']))
+        self.assertEqual(0, result['restored_files'])
+        # Withdrawal only removes history; the file written by the turn stays.
         self.assertEqual('after\n', (self.root / 'note.txt').read_text(encoding='utf-8'))
-        apply_preview = await self.service.apply_preview(branch['conversation_id'])
-        self.assertTrue(apply_preview['can_apply'])
-        applied = await self.service.apply(branch['conversation_id'], {
-            'confirm': True, 'base_snapshot_id': apply_preview['base_snapshot_id'],
-            'source_digest': apply_preview['source_digest'], 'branch_digest': apply_preview['branch_digest'],
-            'request_id': 'apply-request-0001',
-        })
-        self.assertEqual(1, applied['applied'])
-        self.assertEqual('branch\n', (self.root / 'note.txt').read_text(encoding='utf-8'))
-        self.assertEqual('branch\n', (workspace / 'note.txt').read_text(encoding='utf-8'))
-        (workspace / 'note.txt').write_text('branch second\n', encoding='utf-8')
-        again = await self.service.apply_preview(branch['conversation_id'])
-        self.assertTrue(again['can_apply'])
-        await self.service.apply(branch['conversation_id'], {
-            'confirm': True, 'base_snapshot_id': again['base_snapshot_id'],
-            'source_digest': again['source_digest'], 'branch_digest': again['branch_digest'],
-            'request_id': 'apply-request-0002',
-        })
-        self.assertEqual('branch second\n', (self.root / 'note.txt').read_text(encoding='utf-8'))
-        # Applying a branch is an external change after the source turn and is
-        # detected by the digest guard instead of being silently overwritten.
-        blocked = await self.service.withdraw_preview('global_memory', user)
-        self.assertFalse(blocked['can_withdraw'])
+        conn = await self.db._get_conn()
+        row = await (await conn.execute('SELECT COUNT(*) n FROM global_messages WHERE withdrawn=0')).fetchone()
+        self.assertEqual(0, row['n'])
 
-    async def test_read_only_turn_withdraws_and_legacy_branch_warns(self):
+    async def test_command_and_external_side_effects_warn_but_never_block(self):
+        scope = await self.manager.resolve()
+        async with self.manager.operation(scope, execution=True):
+            user = await self.db.record_global_message(1, 1, 'user_text', 'user', '运行命令')
+            await record_operation(self.db, 'run', 'unknown')
+            await record_operation(self.db, 'sendfile', 'external')
+            await self.db.record_global_message(1, 0, 'ai_reply', 'assistant', '完成')
+        # Files changed after the turn no longer matter either.
+        (self.root / 'note.txt').write_text('changed later\n', encoding='utf-8')
+        preview, result = await self._withdraw(user, 'withdraw-run-00001')
+        self.assertEqual('', preview['reason'])
+        self.assertTrue(any('命令执行' in item and 'run' in item for item in preview['warnings']))
+        self.assertTrue(any('外部发送' in item for item in preview['warnings']))
+        self.assertEqual(1, result['withdrawn_turns'])
+        self.assertEqual('changed later\n', (self.root / 'note.txt').read_text(encoding='utf-8'))
+
+    async def test_read_only_turn_has_no_warning_and_legacy_history_withdraws(self):
         scope = await self.manager.resolve()
         async with self.manager.operation(scope, execution=True):
             user = await self.db.record_global_message(1, 1, 'user_text', 'user', '只读取')
             await record_operation(self.db, 'read', 'read_only')
             await self.db.record_global_message(1, 0, 'ai_reply', 'assistant', '读取完成')
         preview = await self.service.withdraw_preview('global_memory', user)
-        self.assertTrue(preview['can_withdraw'])
-        result = await self.service.withdraw('global_memory', user, {
-            'confirm': True, 'turn_id': preview['turn_id'], 'current_digest': preview['current_digest'],
-            'request_id': 'withdraw-request-0001',
-        })
-        self.assertEqual(1, result['withdrawn_turns'])
-        conn = await self.db._get_conn()
-        row = await (await conn.execute('SELECT COUNT(*) n FROM global_messages WHERE withdrawn=0')).fetchone()
-        self.assertEqual(0, row['n'])
+        self.assertEqual([], preview['warnings'])
 
         async with self.db._transaction() as tx:
             cursor = await tx.execute("INSERT INTO global_messages(chat_id,user_id,msg_type,role,content,timestamp,session_id) VALUES(1,1,'user_text','user','旧消息',1,'global_memory')")
             legacy_id = cursor.lastrowid
         legacy = await self.service.branch_preview('global_memory', legacy_id, 'user')
-        self.assertFalse(legacy['exact_files'])
-        self.assertIn('仅上下文', legacy['warning'])
+        self.assertEqual('', legacy['warning'])
+        _preview, result = await self._withdraw(legacy_id, 'withdraw-legacy-01')
+        self.assertGreaterEqual(result['withdrawn_messages'], 1)
 
-    async def test_unknown_operation_blocks_withdrawal(self):
+    async def test_pending_queue_still_prevents_withdrawal(self):
         scope = await self.manager.resolve()
         async with self.manager.operation(scope, execution=True):
-            user = await self.db.record_global_message(1, 1, 'user_text', 'user', '运行命令')
-            await record_operation(self.db, 'run', 'unknown')
-            await self.db.record_global_message(1, 0, 'ai_reply', 'assistant', '完成')
+            user = await self.db.record_global_message(1, 1, 'user_text', 'user', '问题')
+            await self.db.record_global_message(1, 0, 'ai_reply', 'assistant', '回答')
+        async with self.db._transaction() as tx:
+            await tx.execute("INSERT INTO message_queue_controls(conversation_id,generation,state,reason) "
+                             "VALUES('global_memory',?,'ask','ask')", (scope.generation,))
         preview = await self.service.withdraw_preview('global_memory', user)
         self.assertFalse(preview['can_withdraw'])
-        self.assertIn('外部或未知', preview['reason'])
+        self.assertIn('待发消息', preview['reason'])
+
+    async def test_stale_preview_is_rejected(self):
+        scope = await self.manager.resolve()
+        async with self.manager.operation(scope, execution=True):
+            user = await self.db.record_global_message(1, 1, 'user_text', 'user', '问题')
+            await self.db.record_global_message(1, 0, 'ai_reply', 'assistant', '回答')
+        preview = await self.service.withdraw_preview('global_memory', user)
+        async with self.manager.operation(scope, execution=True):
+            await self.db.record_global_message(1, 1, 'user_text', 'user', '新消息')
+        with self.assertRaisesRegex(BranchingError, '重新预览'):
+            await self.service.withdraw('global_memory', user, {
+                'confirm': True, 'turn_id': preview['turn_id'],
+                'current_digest': preview['current_digest'], 'request_id': 'withdraw-stale-01',
+            })
+
+    async def test_branch_copies_history_without_workspace(self):
+        _user, answer = await self.make_edit_turn()
+        preview = await self.service.branch_preview('global_memory', answer, 'assistant')
+        self.assertFalse(preview['exact_files'])
+        with patch('xgent_app.conversation_branching.create_git_worktree',
+                   side_effect=AssertionError('branches must not copy workspaces')):
+            branch = await self.service.create_branch(
+                'global_memory', answer, 'assistant', request_id='branch-request-0001')
+        self.assertEqual('context', branch['branch_mode'])
+        session = await self.db.get_session(branch['conversation_id'])
+        self.assertIsNone(session['workspace_path'])
+        conn = await self.db._get_conn()
+        cursor = await conn.execute('SELECT content FROM global_messages WHERE session_id=? ORDER BY id',
+                                    (branch['conversation_id'],))
+        self.assertEqual(['修改文件', '完成'], [row['content'] for row in await cursor.fetchall()])
+        await cursor.close()
 
     async def test_branches_share_immutable_original_attachment_object(self):
         uploads = self.root / 'xgent_storage' / 'uploads'; uploads.mkdir(parents=True, exist_ok=True)
@@ -274,23 +282,6 @@ class ConversationBranchingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output_paths[0], output_paths[1])
         cursor = await conn.execute("SELECT COUNT(*) n FROM artifact_objects WHERE kind='attachment' AND sha256=?", (digest,))
         self.assertEqual(1, (await cursor.fetchone())['n']); await cursor.close()
-
-    async def test_apply_conflict_never_partially_overwrites_source(self):
-        _user, answer = await self.make_edit_turn()
-        branch = await self.service.create_branch('global_memory', answer, 'assistant', request_id='conflict-branch-01')
-        workspace = Path((await self.db.get_session(branch['conversation_id']))['workspace_path'])
-        (workspace / 'note.txt').write_text('branch change\n', encoding='utf-8')
-        (self.root / 'note.txt').write_text('source change\n', encoding='utf-8')
-        preview = await self.service.apply_preview(branch['conversation_id'])
-        self.assertFalse(preview['can_apply'])
-        self.assertEqual(['note.txt'], [item['path'] for item in preview['conflicts']])
-        with self.assertRaisesRegex(Exception, '冲突'):
-            await self.service.apply(branch['conversation_id'], {
-                'confirm': True, 'base_snapshot_id': preview['base_snapshot_id'],
-                'source_digest': preview['source_digest'], 'branch_digest': preview['branch_digest'],
-                'request_id': 'conflict-apply-01',
-            })
-        self.assertEqual('source change\n', (self.root / 'note.txt').read_text(encoding='utf-8'))
 
     async def test_v5_history_is_grouped_into_legacy_turns(self):
         async with self.db._transaction() as conn:
@@ -403,24 +394,6 @@ class ConversationBranchingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(first['root_digest'], third['root_digest'])
         self.assertIn('mutable.py', digested_paths)
         self.assertNotIn('stable.py', digested_paths)
-
-    async def test_unchanged_turn_reuses_snapshot_without_duplicating_entries(self):
-        scope = await self.manager.resolve()
-        async with self.manager.operation(scope, execution=True):
-            user = await self.db.record_global_message(1, 1, 'user_text', 'user', '纯聊天不改文件')
-            await self.db.record_global_message(1, 0, 'ai_reply', 'assistant', '收到')
-        conn = await self.db._get_conn()
-        cursor = await conn.execute('SELECT * FROM conversation_turns ORDER BY started_at DESC LIMIT 1')
-        turn = dict(await cursor.fetchone())
-        await cursor.close()
-        self.assertTrue(turn['snapshot_complete'])
-        self.assertEqual(turn['before_snapshot_id'], turn['after_snapshot_id'])
-        cursor = await conn.execute('SELECT COUNT(*) n FROM conversation_snapshots WHERE conversation_id=?',
-                                    (scope.conversation_id,))
-        self.assertEqual(1, (await cursor.fetchone())['n'])
-        await cursor.close()
-        preview = await self.service.withdraw_preview('global_memory', user)
-        self.assertTrue(preview['can_withdraw'])
 
     def test_snapshot_aborts_immediately_when_cancelled(self):
         project = Path(self.temp.name) / 'cancel-project'
