@@ -38,6 +38,7 @@ _EXCLUDED_NAMES = frozenset({
     'data-location.json', 'path-map.json', '.xgent-version',
 })
 _NODEQUALITY_RUNTIME = re.compile(r'^\.nodequality\d')
+TURN_SNAPSHOT_TIMEOUT = 10.0
 
 
 class BranchingError(ConversationError):
@@ -138,27 +139,45 @@ def _git_exclude(relative: str) -> str:
     return f'/{escaped}/'
 
 
-def _git_paths(root: Path, mounts: set[str]) -> set[str] | None:
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise BranchingError(
+            f'文件快照超过 {TURN_SNAPSHOT_TIMEOUT:g} 秒安全上限，已跳过精确文件快照')
+
+
+def _command_timeout(deadline: float | None, maximum: float = 30.0) -> float:
+    if deadline is None:
+        return maximum
+    _check_deadline(deadline)
+    return max(0.1, min(maximum, deadline - time.monotonic()))
+
+
+def _git_paths(root: Path, mounts: set[str], deadline: float | None = None) -> set[str] | None:
     try:
         tracked = subprocess.run(
             ['git', '-C', str(root), 'ls-files', '-c', '-z'], check=True,
-            capture_output=True, timeout=30,
+            capture_output=True, timeout=_command_timeout(deadline),
         )
         untracked = subprocess.run(
             ['git', '-C', str(root), 'ls-files', '-o', '--exclude-standard',
              '--exclude=/.nodequality[0-9]*/',
              *(f'--exclude={_git_exclude(mount)}' for mount in sorted(mounts)), '-z'],
-            check=True, capture_output=True, timeout=30,
+            check=True, capture_output=True, timeout=_command_timeout(deadline),
         )
-    except (OSError, subprocess.SubprocessError):
+    except subprocess.TimeoutExpired as exc:
+        raise BranchingError(
+            f'文件快照超过 {TURN_SNAPSHOT_TIMEOUT:g} 秒安全上限，已跳过精确文件快照') from exc
+    except (OSError, subprocess.CalledProcessError):
         return None
+    _check_deadline(deadline)
     return {
         _safe_relative(raw.decode('utf-8', errors='surrogateescape'))
         for raw in (tracked.stdout + untracked.stdout).split(b'\0') if raw
     }
 
 
-def _walk_tree(root: Path, relative_root: str = '', mounts: set[str] | None = None) -> set[str]:
+def _walk_tree(root: Path, relative_root: str = '', mounts: set[str] | None = None,
+               deadline: float | None = None) -> set[str]:
     mounts = mounts or set()
     if relative_root and _inside_mount(relative_root, mounts):
         return set()
@@ -167,6 +186,7 @@ def _walk_tree(root: Path, relative_root: str = '', mounts: set[str] | None = No
         return set()
     found: set[str] = set()
     for parent, directories, filenames in os.walk(base, followlinks=False):
+        _check_deadline(deadline)
         parent_path = Path(parent)
         kept = []
         for name in directories:
@@ -178,6 +198,7 @@ def _walk_tree(root: Path, relative_root: str = '', mounts: set[str] | None = No
             kept.append(name)
         directories[:] = kept
         for name in filenames:
+            _check_deadline(deadline)
             path = parent_path / name
             relative = path.relative_to(root).as_posix()
             if not path.is_symlink() and not _excluded(relative):
@@ -185,16 +206,18 @@ def _walk_tree(root: Path, relative_root: str = '', mounts: set[str] | None = No
     return found
 
 
-def managed_paths(root: str | Path) -> list[str]:
+def managed_paths(root: str | Path, deadline: float | None = None) -> list[str]:
     root = Path(root).resolve()
     mounts = _nested_mounts(root)
-    paths = _git_paths(root, mounts)
+    _check_deadline(deadline)
+    paths = _git_paths(root, mounts, deadline)
     if paths is None:
-        paths = _walk_tree(root, mounts=mounts)
+        paths = _walk_tree(root, mounts=mounts, deadline=deadline)
     for tree in _STATE_TREES:
-        paths.update(_walk_tree(root, tree, mounts))
+        paths.update(_walk_tree(root, tree, mounts, deadline))
 
     def regular(relative: str) -> bool:
+        _check_deadline(deadline)
         try:
             return stat.S_ISREG((root / relative).lstat().st_mode)
         except OSError:
@@ -229,11 +252,12 @@ def _open_regular(path: Path):
         handle.close()
 
 
-def _digest_file(path: Path) -> tuple[int, str, int]:
+def _digest_file(path: Path, deadline: float | None = None) -> tuple[int, str, int]:
     digest = hashlib.sha256()
     size = 0
     with _open_regular(path) as (handle, before):
         for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            _check_deadline(deadline)
             size += len(chunk)
             digest.update(chunk)
         after = os.fstat(handle.fileno())
@@ -243,10 +267,11 @@ def _digest_file(path: Path) -> tuple[int, str, int]:
     return size, digest.hexdigest(), stat.S_IMODE(after.st_mode)
 
 
-def _store_object(source: Path, sha256: str, objects: Path) -> Path:
+def _store_object(source: Path, sha256: str, objects: Path,
+                  deadline: float | None = None) -> Path:
     target = objects / sha256[:2] / sha256[2:]
     if target.is_file():
-        _size, digest, _ = _digest_file(target)
+        _size, digest, _ = _digest_file(target, deadline)
         if digest != sha256:
             raise BranchingError('内容对象校验失败，拒绝覆盖')
         return target
@@ -256,10 +281,12 @@ def _store_object(source: Path, sha256: str, objects: Path) -> Path:
         with tempfile.NamedTemporaryFile(dir=target.parent, prefix='.object-', delete=False) as handle:
             temporary = Path(handle.name)
             with _open_regular(source) as (incoming, _opened):
-                shutil.copyfileobj(incoming, handle, 1024 * 1024)
+                for chunk in iter(lambda: incoming.read(1024 * 1024), b''):
+                    _check_deadline(deadline)
+                    handle.write(chunk)
             handle.flush()
             os.fsync(handle.fileno())
-        _size, digest, _mode = _digest_file(temporary)
+        _size, digest, _mode = _digest_file(temporary, deadline)
         if digest != sha256:
             raise BranchingError(f'文件在对象存储期间变化：{source}')
         os.chmod(temporary, 0o400)
@@ -274,16 +301,19 @@ def _store_object(source: Path, sha256: str, objects: Path) -> Path:
             temporary.unlink(missing_ok=True)
 
 
-def capture_manifest(root: str | Path, objects: str | Path) -> dict[str, Any]:
+def capture_manifest(root: str | Path, objects: str | Path, *,
+                     timeout: float | None = None) -> dict[str, Any]:
     root, objects = Path(root).resolve(), Path(objects).resolve()
     if not root.is_dir():
         raise BranchingError(f'工作区不存在：{root}')
+    deadline = time.monotonic() + timeout if timeout is not None else None
     entries, total = [], 0
     digest = hashlib.sha256()
-    for relative in managed_paths(root):
+    for relative in managed_paths(root, deadline):
+        _check_deadline(deadline)
         path = root / relative
-        size, sha256, mode = _digest_file(path)
-        object_path = _store_object(path, sha256, objects)
+        size, sha256, mode = _digest_file(path, deadline)
+        object_path = _store_object(path, sha256, objects, deadline)
         entry = {'path': relative, 'sha256': sha256, 'size': size, 'mode': mode,
                  'object_path': str(object_path)}
         entries.append(entry)
@@ -516,7 +546,8 @@ async def begin_turn(db, scope, code_root: str | Path, objects: str | Path) -> s
     snapshot_id = None
     error = None
     try:
-        manifest = await asyncio.to_thread(capture_manifest, root, objects)
+        manifest = await asyncio.to_thread(
+            capture_manifest, root, objects, timeout=TURN_SNAPSHOT_TIMEOUT)
     except Exception as exc:  # noqa: BLE001 - chat must survive an optional file snapshot
         error = f'回合前文件快照失败：{exc}'
     else:
@@ -549,26 +580,44 @@ async def finish_turn(db, scope, turn_id: str, code_root: str | Path, objects: s
                 snapshot_complete=0,error=COALESCE(error,?) WHERE id=?''',
                 (time.time(), '待发消息在接入前已取消或失效', turn_id))
         return
+    cursor = await conn.execute(
+        'SELECT before_snapshot_id,error FROM conversation_turns WHERE id=?', (turn_id,))
+    existing = await cursor.fetchone()
+    await cursor.close()
+    if not existing or not existing['before_snapshot_id']:
+        # An after snapshot cannot restore or branch anything without its
+        # matching before snapshot.  Avoid paying the timeout twice when the
+        # admission snapshot already degraded.
+        async with db._transaction() as write:
+            cursor = await write.execute(
+                "SELECT MIN(id) first_id,MAX(CASE WHEN msg_type='ai_reply' THEN id END) final_id "
+                "FROM global_messages WHERE turn_id=?", (turn_id,))
+            row = await cursor.fetchone()
+            await cursor.close()
+            errors = [value for value in ((existing['error'] if existing else None), error) if value]
+            await write.execute('''UPDATE conversation_turns SET status=?,finished_at=?,
+                user_record_id=?,final_record_id=?,snapshot_complete=0,error=? WHERE id=?''', (
+                status, time.time(), row['first_id'], row['final_id'],
+                '\n'.join(errors) or None, turn_id,
+            ))
+        return
     root = conversation_root(scope, code_root)
     snapshot_id = None
     snapshot_error = None
     try:
-        manifest = await asyncio.to_thread(capture_manifest, root, objects)
+        manifest = await asyncio.to_thread(
+            capture_manifest, root, objects, timeout=TURN_SNAPSHOT_TIMEOUT)
         snapshot_id = await save_snapshot(db, scope.conversation_id, turn_id, 'after', manifest)
     except Exception as exc:  # noqa: BLE001 - persist a failed snapshot as turn state
         snapshot_error = f'回合后文件快照失败：{exc}'
     async with db._transaction() as conn:
-        cursor = await conn.execute(
-            'SELECT before_snapshot_id,error FROM conversation_turns WHERE id=?', (turn_id,))
-        existing = await cursor.fetchone()
-        await cursor.close()
         cursor = await conn.execute("SELECT MIN(id) first_id,MAX(CASE WHEN msg_type='ai_reply' THEN id END) final_id "
                                     "FROM global_messages WHERE turn_id=?", (turn_id,))
         row = await cursor.fetchone()
         await cursor.close()
         errors = [value for value in ((existing['error'] if existing else None), error, snapshot_error)
                   if value]
-        complete = bool(existing and existing['before_snapshot_id'] and snapshot_id)
+        complete = bool(snapshot_id)
         await conn.execute('''UPDATE conversation_turns SET status=?,finished_at=?,after_snapshot_id=?,
             user_record_id=?,final_record_id=?,snapshot_complete=?,error=? WHERE id=?''', (
             status, time.time(), snapshot_id, row['first_id'], row['final_id'], int(complete),

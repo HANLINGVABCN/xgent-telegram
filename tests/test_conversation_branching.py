@@ -4,6 +4,7 @@ import json
 import re
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -98,21 +99,37 @@ class ConversationBranchingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('app.py', paths)
         self.assertFalse(any(path.startswith('.nodequality') for path in paths))
 
+    def test_turn_snapshot_timeout_is_bounded_without_disabling_manual_snapshots(self):
+        installed = Path(self.temp.name) / 'timeout-project'
+        installed.mkdir()
+        (installed / 'app.py').write_text('content\n', encoding='utf-8')
+        original = capture_manifest(installed, Path(self.temp.name) / 'manual-objects')
+        self.assertEqual(['app.py'], [item['path'] for item in original['entries']])
+
+        def slow_paths(*_args, **_kwargs):
+            time.sleep(.03)
+            return ['app.py']
+
+        with patch('xgent_app.conversation_branching.managed_paths', side_effect=slow_paths):
+            with self.assertRaisesRegex(BranchingError, '安全上限'):
+                capture_manifest(
+                    installed, Path(self.temp.name) / 'timed-objects', timeout=.001)
+
     async def test_before_snapshot_failure_never_blocks_chat_or_fakes_complete_snapshot(self):
-        after = {'root_digest': 'a' * 64, 'entries': [], 'file_count': 0, 'total_size': 0}
         scope = await self.manager.resolve()
         with patch('xgent_app.conversation_branching.capture_manifest',
-                   side_effect=[BranchingError('fixture virtual filesystem'), after]):
+                   side_effect=BranchingError('fixture virtual filesystem')) as capture:
             async with self.manager.operation(scope, execution=True):
                 await self.db.record_global_message(1, 1, 'user_text', 'user', '仍要正常处理')
                 await self.db.record_global_message(1, 0, 'ai_reply', 'assistant', '已完成')
+        self.assertEqual(1, capture.call_count)
         conn = await self.db._get_conn()
         cursor = await conn.execute('SELECT * FROM conversation_turns ORDER BY started_at DESC LIMIT 1')
         turn = dict(await cursor.fetchone())
         await cursor.close()
         self.assertEqual('completed', turn['status'])
         self.assertIsNone(turn['before_snapshot_id'])
-        self.assertIsNotNone(turn['after_snapshot_id'])
+        self.assertIsNone(turn['after_snapshot_id'])
         self.assertFalse(turn['snapshot_complete'])
         self.assertIn('fixture virtual filesystem', turn['error'])
 
