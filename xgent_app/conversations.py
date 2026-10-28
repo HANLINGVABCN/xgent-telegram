@@ -364,6 +364,16 @@ class ConversationManager:
                     raise
                 finally:
                     final_scope = current_scope(required=False)
+        except BaseException as exc:
+            # Failures before ``yield`` (for example admission/snapshot setup)
+            # used to leave the durable message pending, so every poll retried
+            # forever and the UI remained on “排队中”.  Give them the same
+            # terminal queue semantics as failures during model execution.
+            if acquired:
+                self._run_outcome = 'stopped' if isinstance(exc, asyncio.CancelledError) else 'failed'
+            if not hasattr(exc, 'conversation_context'):
+                exc.conversation_context = dataclasses.asdict(scope)
+            raise
         finally:
             if inherited and not inherited.run_id and final_scope and inherited.conversation_id == final_scope.conversation_id and inherited.generation != final_scope.generation:
                 _scope.set(dataclasses.replace(inherited, generation=final_scope.generation))

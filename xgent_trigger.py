@@ -30,14 +30,16 @@ import contextlib
 import io
 import os
 import sys
+from pathlib import Path
 
 from xgent_app.bootstrap import (
     load_sections as _load_sections,
     migrate_legacy_runtime_paths as _migrate_legacy_runtime_paths,
 )
 
-_migrate_legacy_runtime_paths()
-_ns: dict = {"__file__": __file__}
+_ENTRY_FILE = Path(__file__).resolve()
+_migrate_legacy_runtime_paths(_ENTRY_FILE.parent)
+_ns: dict = {"__file__": str(_ENTRY_FILE)}
 
 
 def _load_sections_quietly(namespace: dict):

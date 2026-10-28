@@ -86,30 +86,90 @@ def _excluded(relative: str) -> bool:
             or re.search(r'\.log(?:$|\.)', name, re.IGNORECASE) is not None)
 
 
-def _git_paths(root: Path) -> set[str]:
+def _mountinfo_path(value: str) -> str:
+    """Decode the octal escapes used by Linux ``/proc/*/mountinfo``."""
+    return re.sub(r'\\([0-7]{3})', lambda match: chr(int(match.group(1), 8)), value)
+
+
+def _nested_mounts(root: Path) -> set[str]:
+    """Return lexical paths of mounts nested below ``root``.
+
+    Project tools sometimes mount ``proc`` or another filesystem inside a
+    temporary working directory.  Those trees are runtime inputs, not project
+    state, and reading their pseudo-files can fail with EINVAL or block.
+    """
+    if os.name != 'posix':
+        return set()
+    mounts: set[str] = set()
     try:
-        completed = subprocess.run(
-            ['git', '-C', str(root), 'ls-files', '-co', '--exclude-standard', '-z'],
+        lines = Path('/proc/self/mountinfo').read_text(
+            encoding='utf-8', errors='surrogateescape').splitlines()
+    except OSError:
+        return mounts
+    root = Path(os.path.abspath(root))
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 5:
+            continue
+        mounted = Path(os.path.abspath(_mountinfo_path(fields[4])))
+        try:
+            relative = mounted.relative_to(root)
+        except ValueError:
+            continue
+        if relative.parts:
+            mounts.add(relative.as_posix())
+    return mounts
+
+
+def _inside_mount(relative: str, mounts: set[str]) -> bool:
+    path = PurePosixPath(relative)
+    return any(path == PurePosixPath(mount) or PurePosixPath(mount) in path.parents
+               for mount in mounts)
+
+
+def _git_exclude(relative: str) -> str:
+    escaped = re.sub(r'([\\*?\[\]])', r'\\\1', relative)
+    return f'/{escaped}/'
+
+
+def _git_paths(root: Path, mounts: set[str]) -> set[str] | None:
+    try:
+        tracked = subprocess.run(
+            ['git', '-C', str(root), 'ls-files', '-c', '-z'], check=True,
+            capture_output=True, timeout=30,
+        )
+        untracked = subprocess.run(
+            ['git', '-C', str(root), 'ls-files', '-o', '--exclude-standard',
+             *(f'--exclude={_git_exclude(mount)}' for mount in sorted(mounts)), '-z'],
             check=True, capture_output=True, timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
-        return set()
+        return None
     return {
         _safe_relative(raw.decode('utf-8', errors='surrogateescape'))
-        for raw in completed.stdout.split(b'\0') if raw
+        for raw in (tracked.stdout + untracked.stdout).split(b'\0') if raw
     }
 
 
-def _walk_tree(root: Path, relative_root: str = '') -> set[str]:
+def _walk_tree(root: Path, relative_root: str = '', mounts: set[str] | None = None) -> set[str]:
+    mounts = mounts or set()
+    if relative_root and _inside_mount(relative_root, mounts):
+        return set()
     base = root / relative_root if relative_root else root
     if not base.exists():
         return set()
     found: set[str] = set()
     for parent, directories, filenames in os.walk(base, followlinks=False):
         parent_path = Path(parent)
-        directories[:] = [name for name in directories
-                           if not (parent_path / name).is_symlink()
-                           and not _excluded((parent_path / name).relative_to(root).as_posix())]
+        kept = []
+        for name in directories:
+            path = parent_path / name
+            relative = path.relative_to(root).as_posix()
+            if (path.is_symlink() or _excluded(relative)
+                    or _inside_mount(relative, mounts) or os.path.ismount(path)):
+                continue
+            kept.append(name)
+        directories[:] = kept
         for name in filenames:
             path = parent_path / name
             relative = path.relative_to(root).as_posix()
@@ -120,28 +180,59 @@ def _walk_tree(root: Path, relative_root: str = '') -> set[str]:
 
 def managed_paths(root: str | Path) -> list[str]:
     root = Path(root).resolve()
-    paths = _git_paths(root)
-    if not paths:
-        paths = _walk_tree(root)
+    mounts = _nested_mounts(root)
+    paths = _git_paths(root, mounts)
+    if paths is None:
+        paths = _walk_tree(root, mounts=mounts)
     for tree in _STATE_TREES:
-        paths.update(_walk_tree(root, tree))
-    return sorted(path for path in paths if not _excluded(path) and (root / path).is_file())
+        paths.update(_walk_tree(root, tree, mounts))
+
+    def regular(relative: str) -> bool:
+        try:
+            return stat.S_ISREG((root / relative).lstat().st_mode)
+        except OSError:
+            return False
+
+    return sorted(path for path in paths
+                  if not _excluded(path) and not _inside_mount(path, mounts) and regular(path))
+
+
+@contextlib.contextmanager
+def _open_regular(path: Path):
+    """Open one stable regular file without following a final symlink."""
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise BranchingError(f'无法读取快照文件：{path}') from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise BranchingError(f'快照只接受普通文件：{path}')
+    flags = os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise BranchingError(f'无法读取快照文件：{path}') from exc
+    handle = os.fdopen(descriptor, 'rb')
+    try:
+        opened = os.fstat(handle.fileno())
+        if (before.st_dev, before.st_ino, before.st_mode) != (
+                opened.st_dev, opened.st_ino, opened.st_mode):
+            raise BranchingError(f'文件在生成快照前被替换：{path}')
+        yield handle, opened
+    finally:
+        handle.close()
 
 
 def _digest_file(path: Path) -> tuple[int, str, int]:
-    before = path.stat()
-    if not stat.S_ISREG(before.st_mode):
-        raise BranchingError(f'快照只接受普通文件：{path}')
     digest = hashlib.sha256()
     size = 0
-    with path.open('rb') as handle:
+    with _open_regular(path) as (handle, before):
         for chunk in iter(lambda: handle.read(1024 * 1024), b''):
             size += len(chunk)
             digest.update(chunk)
-    after = path.stat()
-    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
-        raise BranchingError(f'文件在生成快照时变化：{path}')
+        after = os.fstat(handle.fileno())
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise BranchingError(f'文件在生成快照时变化：{path}')
     return size, digest.hexdigest(), stat.S_IMODE(after.st_mode)
 
 
@@ -157,7 +248,7 @@ def _store_object(source: Path, sha256: str, objects: Path) -> Path:
     try:
         with tempfile.NamedTemporaryFile(dir=target.parent, prefix='.object-', delete=False) as handle:
             temporary = Path(handle.name)
-            with source.open('rb') as incoming:
+            with _open_regular(source) as (incoming, _opened):
                 shutil.copyfileobj(incoming, handle, 1024 * 1024)
             handle.flush()
             os.fsync(handle.fileno())
@@ -414,14 +505,20 @@ async def repair_restored_workspaces(db, code_root: str | Path) -> None:
 
 async def begin_turn(db, scope, code_root: str | Path, objects: str | Path) -> str:
     root = conversation_root(scope, code_root)
-    manifest = await asyncio.to_thread(capture_manifest, root, objects)
     turn_id = uuid.uuid4().hex
-    snapshot_id = await save_snapshot(db, scope.conversation_id, turn_id, 'before', manifest)
+    snapshot_id = None
+    error = None
+    try:
+        manifest = await asyncio.to_thread(capture_manifest, root, objects)
+    except Exception as exc:  # noqa: BLE001 - chat must survive an optional file snapshot
+        error = f'回合前文件快照失败：{exc}'
+    else:
+        snapshot_id = await save_snapshot(db, scope.conversation_id, turn_id, 'before', manifest)
     async with db._transaction() as conn:
         await conn.execute('''INSERT INTO conversation_turns
-            (id,conversation_id,run_id,status,started_at,before_snapshot_id,snapshot_complete)
-            VALUES(?,?,?,'running',?,?,0)''',
-            (turn_id, scope.conversation_id, scope.run_id, time.time(), snapshot_id))
+            (id,conversation_id,run_id,status,started_at,before_snapshot_id,snapshot_complete,error)
+            VALUES(?,?,?,'running',?,?,0,?)''',
+            (turn_id, scope.conversation_id, scope.run_id, time.time(), snapshot_id, error))
     return turn_id
 
 
@@ -429,20 +526,28 @@ async def finish_turn(db, scope, turn_id: str, code_root: str | Path, objects: s
                       status: str = 'completed', error: str | None = None) -> None:
     root = conversation_root(scope, code_root)
     snapshot_id = None
+    snapshot_error = None
     try:
         manifest = await asyncio.to_thread(capture_manifest, root, objects)
         snapshot_id = await save_snapshot(db, scope.conversation_id, turn_id, 'after', manifest)
     except Exception as exc:  # noqa: BLE001 - persist a failed snapshot as turn state
-        status, error = 'failed', str(exc)
+        snapshot_error = f'回合后文件快照失败：{exc}'
     async with db._transaction() as conn:
+        cursor = await conn.execute(
+            'SELECT before_snapshot_id,error FROM conversation_turns WHERE id=?', (turn_id,))
+        existing = await cursor.fetchone()
+        await cursor.close()
         cursor = await conn.execute("SELECT MIN(id) first_id,MAX(CASE WHEN msg_type='ai_reply' THEN id END) final_id "
                                     "FROM global_messages WHERE turn_id=?", (turn_id,))
         row = await cursor.fetchone()
         await cursor.close()
+        errors = [value for value in ((existing['error'] if existing else None), error, snapshot_error)
+                  if value]
+        complete = bool(existing and existing['before_snapshot_id'] and snapshot_id)
         await conn.execute('''UPDATE conversation_turns SET status=?,finished_at=?,after_snapshot_id=?,
             user_record_id=?,final_record_id=?,snapshot_complete=?,error=? WHERE id=?''', (
-            status, time.time(), snapshot_id, row['first_id'], row['final_id'], int(snapshot_id is not None),
-            error, turn_id,
+            status, time.time(), snapshot_id, row['first_id'], row['final_id'], int(complete),
+            '\n'.join(errors) or None, turn_id,
         ))
 
 

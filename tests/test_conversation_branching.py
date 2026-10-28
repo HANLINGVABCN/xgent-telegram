@@ -6,9 +6,15 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tests.test_database_write_lock import _load_db_class
-from xgent_app.conversation_branching import ConversationBranchService, record_operation
+from xgent_app.conversation_branching import (
+    BranchingError,
+    ConversationBranchService,
+    capture_manifest,
+    record_operation,
+)
 from xgent_app.conversations import ConversationManager
 
 
@@ -59,6 +65,62 @@ class ConversationBranchingTests(unittest.IsolatedAsyncioTestCase):
             await record_operation(self.db, 'edit', 'local_reversible', {'path': 'note.txt'})
             answer = await self.db.record_global_message(1, 0, 'ai_reply', 'assistant', '完成')
         return user, answer
+
+    def test_snapshot_excludes_nested_mounts_and_symlinks(self):
+        mounted = self.root / 'nodequality-runtime' / 'proc'
+        mounted.mkdir(parents=True)
+        (mounted / 'virtual-status').write_text('must not be read', encoding='utf-8')
+        outside = Path(self.temp.name) / 'outside-secret.txt'
+        outside.write_text('outside', encoding='utf-8')
+        link = self.root / 'outside-link.txt'
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            link = None
+        objects = Path(self.temp.name) / 'objects'
+        with patch('xgent_app.conversation_branching._nested_mounts',
+                   return_value={'nodequality-runtime/proc'}):
+            manifest = capture_manifest(self.root, objects)
+        paths = {item['path'] for item in manifest['entries']}
+        self.assertNotIn('nodequality-runtime/proc/virtual-status', paths)
+        if link is not None:
+            self.assertNotIn('outside-link.txt', paths)
+
+    async def test_before_snapshot_failure_never_blocks_chat_or_fakes_complete_snapshot(self):
+        after = {'root_digest': 'a' * 64, 'entries': [], 'file_count': 0, 'total_size': 0}
+        scope = await self.manager.resolve()
+        with patch('xgent_app.conversation_branching.capture_manifest',
+                   side_effect=[BranchingError('fixture virtual filesystem'), after]):
+            async with self.manager.operation(scope, execution=True):
+                await self.db.record_global_message(1, 1, 'user_text', 'user', '仍要正常处理')
+                await self.db.record_global_message(1, 0, 'ai_reply', 'assistant', '已完成')
+        conn = await self.db._get_conn()
+        cursor = await conn.execute('SELECT * FROM conversation_turns ORDER BY started_at DESC LIMIT 1')
+        turn = dict(await cursor.fetchone())
+        await cursor.close()
+        self.assertEqual('completed', turn['status'])
+        self.assertIsNone(turn['before_snapshot_id'])
+        self.assertIsNotNone(turn['after_snapshot_id'])
+        self.assertFalse(turn['snapshot_complete'])
+        self.assertIn('fixture virtual filesystem', turn['error'])
+
+    async def test_after_snapshot_failure_preserves_completed_run_but_disables_exact_restore(self):
+        before = {'root_digest': 'b' * 64, 'entries': [], 'file_count': 0, 'total_size': 0}
+        scope = await self.manager.resolve()
+        with patch('xgent_app.conversation_branching.capture_manifest',
+                   side_effect=[before, BranchingError('fixture changed file')]):
+            async with self.manager.operation(scope, execution=True):
+                await self.db.record_global_message(1, 1, 'user_text', 'user', '正常回答')
+                await self.db.record_global_message(1, 0, 'ai_reply', 'assistant', '完成')
+        conn = await self.db._get_conn()
+        cursor = await conn.execute('SELECT * FROM conversation_turns ORDER BY started_at DESC LIMIT 1')
+        turn = dict(await cursor.fetchone())
+        await cursor.close()
+        self.assertEqual('completed', turn['status'])
+        self.assertIsNotNone(turn['before_snapshot_id'])
+        self.assertIsNone(turn['after_snapshot_id'])
+        self.assertFalse(turn['snapshot_complete'])
+        self.assertIn('fixture changed file', turn['error'])
 
     async def test_exact_branch_isolated_apply_and_safe_withdraw(self):
         user, answer = await self.make_edit_turn()

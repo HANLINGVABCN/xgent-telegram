@@ -84,8 +84,9 @@ from xgent_app.cli_palette import (
 )
 from xgent_app import cli_tui
 
-_MIGRATED_RUNTIME_PATHS = _migrate_legacy_runtime_paths()
-_ns: dict = {"__file__": __file__}
+_ENTRY_FILE = Path(__file__).resolve()
+_MIGRATED_RUNTIME_PATHS = _migrate_legacy_runtime_paths(_ENTRY_FILE.parent)
+_ns: dict = {"__file__": str(_ENTRY_FILE)}
 
 
 def _load_sections_quietly(namespace: dict):
@@ -433,7 +434,7 @@ def _code_version() -> str:
     类问题时，先看版本号再查逻辑。部署目录不是 git 检出（zip 解压部署）
     时 git 取不到，install.sh 会把哈希写进 .xgent-version 兜底。
     """
-    here = os.path.dirname(os.path.abspath(__file__))
+    here = str(_ENTRY_FILE.parent)
     try:
         import subprocess
 

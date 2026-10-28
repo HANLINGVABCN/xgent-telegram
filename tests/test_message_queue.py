@@ -2,6 +2,7 @@
 import asyncio
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
 from tests import test_conversations as support
@@ -118,6 +119,21 @@ class MessageQueueTests(unittest.IsolatedAsyncioTestCase):
             await self.submit()
             mark_outcome('failed')
         self.assertTrue((await self.queue.snapshot(self.scope.conversation_id))['paused'])
+
+    async def test_failure_before_dispatch_pauses_instead_of_retrying_forever(self):
+        item = await self.submit('must remain recoverable')
+        self.manager.code_root = Path(self.temp.name)
+        self.manager.object_root = Path(self.temp.name) / 'objects'
+        with patch('xgent_app.conversation_branching.begin_turn',
+                   side_effect=OSError('fixture admission failure')):
+            await self.queue.poll()
+            self.assertIsNotNone(self.queue._task)
+            await self.queue._task
+        saved = await self.db.queue_item(item['id'])
+        self.assertEqual('paused', saved['status'])
+        self.assertEqual('failed', saved['reason'])
+        self.assertIsNone(await self.db.queue_head())
+        self.assertFalse(self.manager.lock.busy())
 
     async def test_ask_wait_submit_cancel_and_stop_precedence(self):
         with bind_conversation(self.scope):

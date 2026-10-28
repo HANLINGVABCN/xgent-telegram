@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -19,7 +20,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 
 
-def _run_cli(args, *, workdir, chat_id="42", conversation_id="global_memory", extra_env=None):
+def _run_cli(args, *, workdir, chat_id="42", conversation_id="global_memory",
+             extra_env=None, entry=None):
     env = {
         **os.environ,
         "AUTHORIZED_USER_ID": "1",
@@ -38,7 +40,7 @@ def _run_cli(args, *, workdir, chat_id="42", conversation_id="global_memory", ex
     if extra_env:
         env.update(extra_env)
     proc = subprocess.run(
-        [sys.executable, "-u", str(REPO / "xgent_trigger.py"), *args],
+        [sys.executable, "-u", str(entry or Path(workdir) / "xgent_trigger.py"), *args],
         cwd=workdir,
         env=env,
         capture_output=True,
@@ -103,6 +105,27 @@ class TriggerCliTests(unittest.TestCase):
     def test_missing_cmd_argparse_error(self):
         proc = _run_cli(["add", "--after", "30s"], workdir=self.workdir)
         self.assertEqual(proc.returncode, 2)  # argparse 缺必填参数
+
+    @unittest.skipIf(os.name == "nt", "Windows CI does not guarantee symlink permission")
+    def test_symlink_entry_uses_real_project_database(self):
+        root_entry = Path(self.workdir) / "xgent_trigger.py"
+        initialized = _run_cli(["show"], workdir=self.workdir, entry=root_entry)
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        link = Path(self.workdir) / "venv" / "bin" / "trigger"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(root_entry)
+        added = _run_cli(
+            ["add", "--cmd", "echo linked", "--after", "30s", "--task", "软链入口"],
+            workdir=self.workdir,
+            entry=link,
+        )
+        self.assertEqual(added.returncode, 0, added.stderr)
+        self.assertFalse((link.parent / "xgent_memory.db").exists())
+        with sqlite3.connect(Path(self.workdir) / "xgent_memory.db") as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM trigger_tasks WHERE summary='软链入口'"
+            ).fetchone()[0]
+        self.assertEqual(1, count)
 
 
 if __name__ == "__main__":
