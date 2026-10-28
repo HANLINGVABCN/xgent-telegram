@@ -415,7 +415,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     # --- 处理器 ---
 
     def _serve_workbench_asset(self, path: str) -> None:
-        allowed = {"knowledge.js", "knowledge.css", "appearance.js", "composer-controls.js", "reading.css", "chat.js", "chat.css", "conversations.js", "conversations.css", "global-search.js", "global-search.css", "workbench.js", "workbench.css", "components.js", "page-cache.js", "settings.js", "usage.js", "terminal.js", "terminal.css"}
+        allowed = {"knowledge.js", "knowledge.css", "appearance.js", "composer-controls.js", "reading.css", "chat.js", "chat.css", "conversations.js", "conversations.css", "global-search.js", "global-search.css", "workbench.js", "workbench.css", "components.js", "page-cache.js", "settings.js", "data-backups.js", "usage.js", "terminal.js", "terminal.css"}
         name = path.removeprefix("/assets/")
         if name not in allowed:
             self._send_json({"error": "not found"}, status=404)
@@ -848,11 +848,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         handed_off = False
         try:
-            if len(batch['files']) != 1 or batch.get('text') != 'confirm-instance-restore':
-                raise WorkbenchError('请选择一个实例备份并确认含密钥数据。')
+            if len(batch['files']) != 1 or batch.get('text') not in {'confirm-instance-restore', 'scan-instance-backup'}:
+                raise WorkbenchError('请选择一个实例压缩包进行扫描。')
             item = batch['files'][0]
             result = self._run_coro(self.config.workbench('POST','data/import',{
                 '_bundle_path':item['path'],'confirm_secrets':True,
+                '_source_name':item.get('name') or item.get('filename'),
                 'request_id':batch.get('request_id') or batch.get('idempotency_key'),
                 '_temporary':batch['_temporary'],
             }),timeout=45)

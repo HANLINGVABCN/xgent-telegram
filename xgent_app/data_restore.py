@@ -52,6 +52,7 @@ def main(job_file, code_dir, data_dir):
             state(phase="backing_up")
             pre_import = bundles.export(
                 outputs=True,
+                include_prompts=True,
                 name_prefix="pre-import",
                 _maintenance_locked=True,
             )

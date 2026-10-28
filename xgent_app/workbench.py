@@ -127,24 +127,25 @@ class Workbench:
             operations = self._data_operations
             try:
                 if resource == 'data/estimate' and method == 'GET':
-                    include = data.get('include_command_outputs') in (True, 'true', '1')
-                    return await asyncio.to_thread(operations.bundles.estimate, include)
+                    return await asyncio.to_thread(operations.estimate, data)
                 if resource == 'data/export' and method == 'POST':
                     return await operations.export(data)
                 if resource == 'data/backup-settings' and method == 'GET':
                     return operations.backup_settings()
                 if resource == 'data/backup-settings' and method == 'POST':
-                    return operations.save_backup_settings(data)
+                    return await asyncio.to_thread(operations.save_backup_settings, data)
                 if resource == 'data/backups' and method == 'GET':
-                    return operations.list_backups()
+                    return await asyncio.to_thread(operations.list_backups)
                 if resource == 'data/backups/delete' and method == 'POST':
-                    return operations.delete_backups(data)
+                    return await asyncio.to_thread(operations.delete_backups, data)
                 if resource == 'data/import-stored' and method == 'POST':
                     return await operations.import_stored(data)
                 if resource == 'data/import' and method == 'POST' and data.get('_bundle_path'):
                     return await operations.upload_import(data)
+                if resource == 'data/import/cancel' and method == 'POST':
+                    return await operations.cancel_import(data)
                 if resource == 'data/activate' and method == 'POST':
-                    return operations.activate(data)
+                    return await asyncio.to_thread(operations.activate, data)
                 if resource == 'data/status' and method == 'GET':
                     return operations.status(data.get('id'))
                 if resource == 'data/download' and method == 'GET':

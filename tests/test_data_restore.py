@@ -72,6 +72,7 @@ class DataRestoreTests(unittest.TestCase):
                 calls[1][1]["name_prefix"],
             )
             self.assertTrue(calls[1][1]["_maintenance_locked"])
+            self.assertTrue(calls[1][1]["include_prompts"])
             self.assertEqual("activate", calls[2][0])
             self.assertEqual(
                 str(code.parent / "xgent-backups/pre-import.zip"),

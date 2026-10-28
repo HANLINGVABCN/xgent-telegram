@@ -13,6 +13,8 @@ from pathlib import Path
 
 from .backup_storage import default_backup_directory, validate_backup_directory
 from .data_bundles import DataBundles, protect, write_json
+from .data_archives import FORMATS, archive_format as filename_format, normalize_format
+from .data_contents import normalize_categories
 from .data_lock import DataLease
 
 
@@ -48,7 +50,7 @@ def read_settings(code):
     if not path.is_file():
         return {'enabled': False, 'interval_seconds': 86400, 'frequency': '1d',
                 'mode': 'accumulate', 'include_command_outputs': False,
-                'max_backups': 7,
+                'max_backups': 7, 'categories': normalize_categories(), 'archive_format': 'zip',
                 'backup_directory': str(default_backup_directory(code))}
     value = json.loads(path.read_text(encoding='utf-8'))
     if not isinstance(value, dict):
@@ -66,6 +68,10 @@ def read_settings(code):
         or max_backups < 1
     ):
         raise ValueError("定时备份配置无效，请在安装脚本重新设置")
+    value["categories"] = normalize_categories(value.get("categories"), value.get("include_command_outputs", False))
+    value["archive_format"] = normalize_format(value.get("archive_format", "zip"))
+    if value.get("include_command_outputs", False) != ("command_outputs" in value["categories"]):
+        raise ValueError("定时备份类型与命令输出标记不一致")
     value["max_backups"] = max_backups
     value["backup_directory"] = str(
         validate_backup_directory(code, value.get("backup_directory"))
@@ -82,12 +88,24 @@ def configure(
     outputs=False,
     max_backups=7,
     backup_directory=None,
+    categories=None,
+    archive_format=None,
 ):
     if mode not in {'overwrite', 'accumulate'}:
         raise ValueError('请选择覆盖或累计备份')
     if type(max_backups) is not int or max_backups < 1:
         raise ValueError("累计备份数量必须是正整数")
     code = Path(code).resolve()
+    try:
+        current = read_settings(code)
+    except (ValueError, TypeError, OSError):
+        current = {}
+    if categories is None and current.get("categories"):
+        categories = [item for item in current["categories"] if item != "command_outputs"]
+        if outputs:
+            categories.append("command_outputs")
+    selected = normalize_categories(categories, outputs)
+    archive_format = normalize_format(archive_format or current.get("archive_format", "zip"))
     directory = validate_backup_directory(code, backup_directory)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     protect(directory, True)
@@ -97,7 +115,9 @@ def configure(
         "frequency": frequency.strip(),
         "interval_seconds": parse_interval(frequency),
         "mode": mode,
-        "include_command_outputs": bool(outputs),
+        "include_command_outputs": "command_outputs" in selected,
+        "categories": selected,
+        "archive_format": archive_format,
         "max_backups": max_backups,
         # Null follows the installation when the checkout moves. Custom paths
         # stay explicit and are shared by installer, Web and scheduled jobs.
@@ -139,7 +159,7 @@ def menu(code, ask=input, report=print):
         "备份保存目录 [默认 " + current["backup_directory"] + "]："
     ).strip() or current["backup_directory"]
     directory = str(validate_backup_directory(code, directory))
-    report('  1) 覆盖上一份：成功生成新包后替换 scheduled-latest.zip')
+    report('  1) 覆盖上一份：成功生成新包后替换 scheduled-latest' + FORMATS[current.get('archive_format', 'zip')]['extension'])
     report('  2) 累计保留：每次保存独立备份，使用时间和随机编号命名')
     choice = ask('请选择备份保存方式 [默认 2]：').strip() or '2'
     if choice not in {'1', '2'}:
@@ -198,18 +218,19 @@ class ScheduledBackups:
         self.status_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         write_json(self.status_file, self.status)
 
-    def accumulated_target(self):
+    def accumulated_target(self, archive_format="zip"):
         stamp = datetime.fromtimestamp(self.clock()).astimezone().strftime(
             "%Y%m%d-%H%M%S"
         )
         return self.paths.backups / (
-            "scheduled-" + stamp + "-" + uuid.uuid4().hex[:8] + ".zip"
+            "scheduled-" + stamp + "-" + uuid.uuid4().hex[:8] + FORMATS[archive_format]["extension"]
         )
 
     def prune_accumulated(self, limit):
         archives = []
-        for path in self.paths.backups.glob("scheduled-*.zip"):
-            if path.name == "scheduled-latest.zip" or path.is_symlink():
+        for path in self.paths.backups.iterdir():
+            if (not path.name.startswith("scheduled-") or not filename_format(path.name)
+                    or path.name.startswith("scheduled-latest.") or path.is_symlink()):
                 continue
             try:
                 if path.is_file():
@@ -252,15 +273,17 @@ class ScheduledBackups:
         if not lease.acquire():
             return
         try:
-            target = (self.paths.backups / "scheduled-latest.zip"
-                      if settings["mode"] == "overwrite"
-                      else self.accumulated_target())
+            format = settings.get("archive_format", "zip")
+            target = (self.paths.backups / ("scheduled-latest" + FORMATS[format]["extension"])
+                      if settings["mode"] == "overwrite" else self.accumulated_target(format))
             operation = asyncio.create_task(
                 asyncio.to_thread(
                     self.bundles.export,
                     target,
                     outputs=settings.get("include_command_outputs", False),
                     overwrite=settings["mode"] == "overwrite",
+                    categories=settings.get("categories"),
+                    archive_format=format,
                 )
             )
             try:

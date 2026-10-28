@@ -30,6 +30,7 @@ from .data_bundles import (
     write_json,
 )
 from .data_paths import DataPaths
+from .data_contents import category_for, normalize_categories
 
 DATABASE_NAMES = ("xgent_memory.db", "bot_memory.db")
 STATE_NAMES = {
@@ -119,14 +120,17 @@ class DiscoveredBundles(DataBundles):
         super().__init__(paths)
         self.include_host_config = include_host_config
 
-    def files(self, outputs=False, *, migration=False):
+    def files(self, outputs=False, *, migration=False, categories=None):
         if migration:
             yield from super().files(outputs, migration=True)
             return
+        selected = normalize_categories(categories, outputs)
         root = self.paths.root
         chosen = {}
 
         def add(name, path):
+            if category_for(name) not in selected:
+                return
             if path.is_symlink() or not path.is_file():
                 raise BundleError("数据包含链接或特殊文件：" + str(path))
             previous = chosen.get(name)
@@ -171,7 +175,7 @@ class DiscoveredBundles(DataBundles):
                 for name in sorted(files):
                     path = Path(parent) / name
                     portable = canonical_asset(path.relative_to(root).as_posix())
-                    if portable_name(portable, outputs):
+                    if portable_name(portable, "command_outputs" in selected):
                         add(portable, path)
         # The VPS tool used this user-level location before external data roots.
         legacy_asset = Path.home() / ".config/vps-manager/servers.json"
