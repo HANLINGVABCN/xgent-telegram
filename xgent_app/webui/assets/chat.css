@@ -374,6 +374,8 @@
   .act-btn:hover { background: var(--surface-2); color: var(--accent); }
   .act-btn.done { color: var(--ok) !important; }
   .act-btn .icon { width: 13px; height: 13px; }
+  .act-btn.branch-chat-button { width:auto; height:32px; padding:5px 10px; gap:7px; border:1px solid var(--line); background:var(--surface); color:var(--text-2); font:inherit; white-space:nowrap; }
+  .act-btn.branch-chat-button .icon { width:18px; height:18px; flex-shrink:0; }
 
   .conversation-lineage {
     margin: 2px 4px 6px; padding: 8px 10px;

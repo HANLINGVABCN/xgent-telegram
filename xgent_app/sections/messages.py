@@ -1738,7 +1738,6 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
                                resume_state: Optional[Dict[str, Any]] = None,
                                queued_messages=None):
     """处理对话（全局模式 + Agent 协议执行：命令 / 读文件 / 发文件 / 写文件 / 媒体）"""
-    global _is_processing, _stop_generation_event
 
     # Native Telegram used to await every notification while holding the turn
     # lock. A timed-out result card then discarded an already executed command's
@@ -1754,9 +1753,9 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
     async with _conversation_processing_lock:
         if lock_acquired_event is not None:
             lock_acquired_event.set()
-        _is_processing = True
-        _stop_generation_event = get_conversations().stop_event() or asyncio.Event()
-        get_conversations().attach_stop_event(_stop_generation_event)
+        stop_event = get_conversations().stop_event() or get_or_create_stop_event()
+        get_conversations().attach_stop_event(stop_event)
+        execution_token = AgentExecutor._execution_context.set({'chat_id': update.effective_chat.id})
 
         from xgent_app.error_reporting import runtime_error_scope
         try:
@@ -1773,8 +1772,7 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
                     await GlobalRecorder.record_error(exc, update.effective_chat.id, source='conversation')
                     raise
         finally:
-            _stop_generation_event = None
-            _is_processing = False
+            AgentExecutor._execution_context.reset(execution_token)
             publish_conversation_event(context, {'type': 'generation_end'})
 
 
@@ -1791,10 +1789,6 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     stream_mode = normalize_bool(UserDataManager.get('stream_mode', True), True)
     db = await BotMemoryDB.get_instance()
     cid, cdata = await get_or_create_chat_session()
-    # 暂存当前对话上下文，供 run-x 子进程（如 xgent_trigger.py）登记任务时透传，
-    # 使后台任务结果能投递回正确对话。单对话串行，类属性暂存安全。
-    AgentExecutor._current_chat_id = update.effective_chat.id
-    AgentExecutor._current_conversation_id = cid
     attachment_generation = await db.get_attachment_generation()
     max_agent_iterations = normalize_agent_max_iterations(
         UserDataManager.get('agent_max_iterations', DEFAULT_AGENT_MAX_ITERATIONS)

@@ -217,7 +217,7 @@ async def failures(bot, root):
             if mode in {'stop', 'cancel'}:
                 async def interrupted(*a):
                     if mode == 'cancel': raise asyncio.CancelledError()
-                    bot._stop_generation_event.set()
+                    bot.get_or_create_stop_event().set()
                     return 'PARTIAL-NOT-TO-PERSIST'
                 h.stack.enter_context(patch.object(bot, 'generate_compression_summary', interrupted))
             try:
@@ -253,7 +253,7 @@ async def races(bot, root):
                 clear = h.db._clear_conversation_memory
                 async def stopped(*a, **k):
                     value = await clear(*a, **k)
-                    bot._stop_generation_event.set()
+                    bot.get_or_create_stop_event().set()
                     return value
                 h.stack.enter_context(patch.object(h.db, '_clear_conversation_memory', stopped))
             if mode == 'delivery': h.stack.enter_context(patch.object(bot, 'safe_send_message', AsyncMock(side_effect=OSError('telegram'))))
@@ -391,7 +391,7 @@ async def live_stop(bot, root):
             async def stream(*a, **k):
                 try:
                     yield 'PARTIAL-NEVER-SHOWN'
-                    if mode == 'stop': bot._stop_generation_event.set()
+                    if mode == 'stop': bot.get_or_create_stop_event().set()
                     await asyncio.Event().wait()
                 finally:
                     closed.set()

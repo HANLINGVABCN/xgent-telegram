@@ -88,6 +88,7 @@ def test_busy_submit_cancel_edit_batch_preview_and_no_log_jump(queue_browser, tm
     assert page.locator('.queue-item').count() == 4
     page.locator('.queue-item').first.get_by_role('button', name='❌ 取消', exact=True).click()
     page.wait_for_function('document.querySelectorAll(".queue-item").length===3')
+    assert page.locator('#input').input_value() == '排队内容 0'
     page.locator('#input').fill('已有草稿')
     page.locator('.queue-item').first.get_by_role('button', name='编辑', exact=True).click()
     page.wait_for_function('document.querySelector("#input").value==="排队内容 1\\n\\n已有草稿"')
@@ -99,14 +100,15 @@ def test_busy_submit_cancel_edit_batch_preview_and_no_log_jump(queue_browser, tm
         page.screenshot(path=str(tmp_path / f'queue-{width}-{theme}.png'))
 
 
-def test_edit_after_switch_restores_original_draft_not_current_view(queue_browser):
+@pytest.mark.parametrize('action,label', [('edit','编辑'),('cancel','❌ 取消')])
+def test_recovery_after_switch_restores_original_draft_not_current_view(queue_browser, action, label):
     _, page, _, base, state = queue_browser
     held = []
     ready(page, base)
     enqueue(page, '待取回的 A 消息')
     page.locator('#input').fill('A 草稿')
-    page.route('**/api/queue/edit', lambda route: held.append(route))
-    page.locator('.queue-item').first.get_by_role('button', name='编辑', exact=True).click()
+    page.route('**/api/queue/'+action, lambda route: held.append(route))
+    page.locator('.queue-item').first.get_by_role('button', name=label, exact=True).click()
     page.wait_for_timeout(40)
     assert held
     page.evaluate('window.dispatchEvent(new CustomEvent("xgent-conversation-changed",{detail:{conversation_id:"B"}}))')
@@ -159,7 +161,8 @@ def test_queue_api_auth_origin_validation_and_refresh(queue_browser):
     assert context.request.get(base + '/api/queue?conversation_id=A').status == 401
 
 
-def test_lost_edit_response_remains_recoverable_after_refresh_without_duplicate_draft(queue_browser):
+@pytest.mark.parametrize('action,label', [('edit','编辑'),('cancel','❌ 取消')])
+def test_lost_recovery_response_remains_recoverable_after_refresh_without_duplicate_draft(queue_browser, action, label):
     server, page, _, base, state = queue_browser
     requests = []
     def edit(route):
@@ -169,11 +172,11 @@ def test_lost_edit_response_remains_recoverable_after_refresh_without_duplicate_
             route.abort()
         else:
             route.continue_()
-    page.route('**/api/queue/edit', edit)
+    page.route('**/api/queue/'+action, edit)
     ready(page, base)
     enqueue(page, 'must recover exact text')
     page.locator('#input').fill('keep draft')
-    page.locator('.queue-item').get_by_role('button', name='编辑', exact=True).click()
+    page.locator('.queue-item').get_by_role('button', name=label, exact=True).click()
     page.wait_for_timeout(100)
     server.outbox.put({'type': 'queue_state', 'revision': state['revision']})
     page.get_by_role('button', name='重试取回', exact=True).wait_for()

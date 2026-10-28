@@ -93,8 +93,20 @@ telegram.ext.Application.initialize = _unreachable
 async def main():
     await prepare_web()
     task = asyncio.get_running_loop().create_task(ns["run_app"]())
-    # 给足时间：Web 组件要 bind、trigger 要恢复、TG 要失败并进入退避重试
-    await asyncio.sleep(4.0)
+    # Wait for component readiness, rather than sampling midway through SQLite
+    # startup on a busy Windows runner. Telegram remains permanently unreachable.
+    async def ready():
+        while True:
+            if task.done():
+                raise AssertionError('Application exited before components became ready')
+            state = ns['component_health']()
+            if (state.get('web', {}).get('state') == 'up'
+                    and state.get('telegram', {}).get('state') == 'degraded'
+                    and state.get('triggers', {}).get('state') == 'up'
+                    and state.get('cli_relay', {}).get('state') == 'up'):
+                return
+            await asyncio.sleep(.05)
+    await asyncio.wait_for(ready(), 20)
     health = ns["component_health"]()
     watcher = ns["_web_external_watch_task"]
     payload = {

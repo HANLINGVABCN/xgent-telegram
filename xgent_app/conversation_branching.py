@@ -1347,6 +1347,7 @@ class ConversationBranchService:
             await conn.execute('UPDATE chat_sessions SET last_active=? WHERE id=?', (now, conversation_id))
         response = {'ok': True, 'withdrawn_turns': len(ids), 'withdrawn_messages': preview['message_count'],
                     'restored_files': 0, 'conversation_id': conversation_id,
+                    'draft': {'text': record['content']},
                     'warnings': preview['warnings'],
                     'telegram_native_message_ids': sorted(native_ids),
                     'telegram_logical_message_ids': sorted(logical_ids)}

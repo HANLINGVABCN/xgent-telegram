@@ -704,6 +704,7 @@ class TuiHooks:
     allow_busy_input: Callable[[str], bool] = lambda _text: False
     load_older: Optional[Callable[[], Any]] = None
     running: Callable[[], dict] = lambda: {}
+    runs: Callable[[], dict] = lambda: {}
     completed: Callable[[], dict] = lambda: {}
     queue_snapshot: Callable[[], dict] = lambda: {'items': []}
     queue_action: Optional[Callable[..., Any]] = None

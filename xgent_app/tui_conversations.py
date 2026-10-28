@@ -114,13 +114,14 @@ class ConversationPanel:
                 return [('class:hint', '暂无匹配的对话')]
             selected = self.hooks.conversation().get('conversation_id')
             running = self.hooks.running() or {}
+            runs = self.hooks.runs() or ({running['conversation_id']: running} if running else {})
             done = self.hooks.completed()
             out = []
             from .cli_tui import fit_title
             width = max(12, min(70, self.app().output.get_size().columns - 12))
             for i, row in enumerate(rows):
                 cid = row['id']
-                suffix = ' · 运行中' if running.get('conversation_id') == cid else ' · 已结束' if cid in done else ''
+                suffix = ' · 运行中' if cid in runs else ' · 已结束' if cid in done else ''
                 name = ('✓ ' if cid == selected else '  ') + str(row.get('name') or '新对话') + suffix
                 out.append(('reverse' if i == self.index else '', fit_title(name, width), click(i)))
                 if i < len(rows) - 1:

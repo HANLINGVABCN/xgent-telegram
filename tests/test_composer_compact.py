@@ -24,7 +24,7 @@ def test_single_card_never_has_external_control_rows(browser_context,workspace_u
         assert page.evaluate('document.documentElement.scrollWidth<=innerWidth+1')
         assert page.locator('#wb-shell > footer').bounding_box()['height']<=140
         if size[0]<768:
-            assert page.locator('#composer-agent').is_hidden() and page.locator('#composer-thinking').is_hidden()
+            assert page.locator('#composer-agent').is_hidden() and page.locator('#composer-thinking').is_visible()
             assert page.locator('#composer-generation-options').is_visible()
         else:
             assert page.locator('#composer-agent').is_visible() and page.locator('#composer-thinking').is_visible()
@@ -72,7 +72,12 @@ def test_mobile_generation_panel_switch_and_resize(browser_context,workspace_url
     switch=page.get_by_role('switch',name='Agent 自动执行',exact=True);switch.click()
     page.wait_for_function('(old)=>document.getElementById("composer-agent").getAttribute("aria-pressed")===String(!old)',arg=original)
     assert page.locator('#composer-options-popover').is_hidden()
-    trigger.click();page.locator('.composer-option[data-value=auto]').click()
+    trigger.click()
+    assert page.locator('#composer-options-popover .composer-option').count()==0
+    assert page.get_by_role('switch',name='流式输出',exact=True).is_visible()
+    assert page.get_by_role('switch',name='默认折叠工具块',exact=True).is_visible()
+    page.keyboard.press('Escape')
+    page.locator('#composer-thinking').click();page.locator('.composer-option[data-value=auto]').click()
     page.wait_for_function('document.getElementById("composer-thinking").dataset.value==="auto"')
     trigger.click();page.set_viewport_size({'width':1024,'height':768})
     assert page.locator('#composer-options-popover').is_hidden()

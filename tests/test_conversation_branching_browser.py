@@ -28,7 +28,7 @@ def test_legacy_history_can_branch_with_draft_and_lineage_warning(browser_contex
     cmd_row = page.get_by_text('/update', exact=True).locator('xpath=ancestor::div[contains(@class,"msg-row")]')
     assert cmd_row.get_by_role('button', name='撤回此消息及之后').is_visible()
     row = page.get_by_text('需要修改的旧消息', exact=True).locator('xpath=ancestor::div[contains(@class,"msg-row")]')
-    row.get_by_role('button', name='编辑并创建分支').click()
+    row.get_by_role('button', name='分支到新聊天', exact=True).click()
     dialog = page.locator('#wb-dialog')
     dialog.get_by_text('分支只复制对话记录', exact=False).wait_for()
     dialog.get_by_role('button', name='创建分支', exact=True).click()
@@ -89,6 +89,7 @@ def test_command_side_effect_shows_warning_and_still_withdraws(browser_context, 
     page = browser_context.new_page()
     ready(page, base)
     page.get_by_text('包含命令的输入', exact=True).wait_for()
+    page.locator('#input').fill('已有草稿')
     row = page.get_by_text('包含命令的输入', exact=True).locator('xpath=ancestor::div[contains(@class,"msg-row")]')
     row.get_by_role('button', name='撤回此消息及之后').click()
     dialog = page.locator('#wb-dialog')
@@ -98,5 +99,6 @@ def test_command_side_effect_shows_warning_and_still_withdraws(browser_context, 
     assert confirm_btn.is_enabled()
     confirm_btn.click()
     page.wait_for_function('()=>!Array.from(document.querySelectorAll("#log .bubble")).some(n=>n.textContent.includes("包含命令的输入"))')
+    assert page.locator('#input').input_value() == '包含命令的输入\n\n已有草稿'
     page.close()
 

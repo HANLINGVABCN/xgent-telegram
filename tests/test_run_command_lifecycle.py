@@ -3,6 +3,7 @@ import ast
 import asyncio
 import codecs
 import contextlib
+import contextvars
 from datetime import datetime
 import logging
 import os
@@ -49,8 +50,8 @@ def load_run_namespace(directory):
     agent = type('Agent', (), dict(run_command=ns['run_command'], WORK_DIR=directory,
                  map_command_paths=staticmethod(lambda cmd: cmd),
                  current_work_dir=staticmethod(lambda: directory),
-                 get_timeout=staticmethod(lambda: 10), _current_chat_id=42,
-                 _current_conversation_id='test-conversation'))
+                 get_timeout=staticmethod(lambda: 10),
+                 _execution_context=contextvars.ContextVar('run-test-route', default={'chat_id':42})))
     ns['Agent'] = agent
     return ns
 
@@ -81,7 +82,9 @@ class RunCommandTests(unittest.IsolatedAsyncioTestCase):
             self.spawned.set()
             return process
         with patch.object(asyncio, 'create_subprocess_shell', create):
-            return await self.agent.run_command('safe-python-probe', stop)
+            from xgent_app.conversations import bind_conversation, ConversationScope
+            with bind_conversation(ConversationScope('test-conversation', 0)):
+                return await self.agent.run_command('safe-python-probe', stop)
 
     async def assert_no_new_tasks(self, before):
         await asyncio.sleep(0)

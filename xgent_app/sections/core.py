@@ -94,13 +94,15 @@ from xgent_app.conversations import (
     bind_conversation, current_scope, conversation_snapshot, replay_conversation,
     stamp_frame, conversation_operation, conversation_entry, get_conversations,
     configure_conversations, configure_callback_encoder, decode_conversation_callback, conversation_secret_environment,
+    ConversationProcessingLock,
 )
 
 # --- ☆ 全局控制状态 ☆ ---
 _stop_generation_event: Optional[asyncio.Event] = None   # 停止生成事件
 _is_processing = False                                    # 处理中锁
 _compression_running = False
-_conversation_processing_lock = asyncio.Lock()
+_conversation_processing_lock = ConversationProcessingLock()
+_scoped_stop_events = {}
 _startup_commands_synced = False
 _startup_menu_sent = False
 _startup_menu_lock = asyncio.Lock()                        # 启动菜单发送锁，防止并发双发
@@ -108,12 +110,22 @@ _startup_menu_lock = asyncio.Lock()                        # 启动菜单发送�
 
 def get_or_create_stop_event() -> asyncio.Event:
     global _stop_generation_event
+    scope = current_scope(required=False)
+    if scope is not None:
+        event = get_conversations().stop_event()
+        if event is not None:
+            return event
+        return _scoped_stop_events.setdefault((scope.conversation_id, scope.generation), asyncio.Event())
     if _stop_generation_event is None:
         _stop_generation_event = asyncio.Event()
     return _stop_generation_event
 
 
 def is_stop_requested() -> bool:
+    scope = current_scope(required=False)
+    if scope is not None:
+        event = get_conversations().stop_event() or _scoped_stop_events.get((scope.conversation_id, scope.generation))
+        return bool(event and event.is_set())
     return bool(_stop_generation_event and _stop_generation_event.is_set())
 
 

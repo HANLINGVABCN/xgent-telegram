@@ -126,9 +126,10 @@ class QueueStore:
             control = await one(conn, 'SELECT * FROM message_queue_controls WHERE conversation_id=? AND generation=?',
                                 (scope.conversation_id, scope.generation))
             paused = control and control['state'] != 'ready'
-            run = await one(conn, "SELECT value FROM config WHERE key='conversation_running'")
-            earlier = await one(conn, "SELECT id FROM message_queue WHERE status IN ('pending','paused') LIMIT 1")
-            receipt = bool(scope.origin == 'telegram' and (paused or earlier or run and json.loads(run['value'])))
+            run = await one(conn, "SELECT value FROM config WHERE key='conversation_runs'")
+            running = json.loads(run['value']).get(scope.conversation_id) if run else None
+            earlier = await one(conn, "SELECT id FROM message_queue WHERE conversation_id=? AND status IN ('pending','paused') LIMIT 1", (scope.conversation_id,))
+            receipt = bool(scope.origin == 'telegram' and (paused or earlier or running))
             now, identifier = time.time(), uuid.uuid4().hex
             await conn.execute('INSERT INTO message_queue(id,request_key,conversation_id,generation,text,origin,'
                 'source_instance,dispatch_instance,chat_id,status,reason,created_at,updated_at,receipt_requested) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
@@ -152,10 +153,16 @@ class QueueStore:
                     'reason': control['reason'] if control else ''}
 
     async def queue_head(self):
+        heads = await self.queue_heads()
+        return heads[0] if heads else None
+
+    async def queue_heads(self):
         async with self._transaction() as conn:
             await self._queue_sync(conn)
-            return await one(conn, "SELECT q.* FROM message_queue q JOIN chat_sessions s ON s.id=q.conversation_id "
-                "WHERE q.status='pending' AND q.generation=s.generation AND s.archived=0 AND s.deleting=0 ORDER BY q.seq LIMIT 1")
+            return await rows(conn, "SELECT q.* FROM message_queue q JOIN chat_sessions s ON s.id=q.conversation_id "
+                "WHERE q.status='pending' AND q.generation=s.generation AND s.archived=0 AND s.deleting=0 "
+                "AND q.seq=(SELECT MIN(h.seq) FROM message_queue h WHERE h.conversation_id=q.conversation_id "
+                "AND h.generation=q.generation AND h.status='pending') ORDER BY q.seq")
 
     async def queue_change(self, cid, generation, identifier, revision, action, request_id=None):
         if action not in {'cancel', 'edit'}:
@@ -185,6 +192,18 @@ class QueueStore:
             "ON CONFLICT(conversation_id) DO UPDATE SET generation=excluded.generation,state='paused',reason=excluded.reason,owner=NULL", (reason,))
         changed = await conn.execute("UPDATE message_queue SET status='paused',reason=?,revision=revision+1,updated_at=? "
                                      "WHERE status IN ('pending','paused') AND (status<>'paused' OR reason<>?)", (reason, time.time(), reason))
+        if changed.rowcount:
+            await bump(conn)
+
+    async def _queue_pause_conversation(self, conn, cid, reason):
+        await conn.execute("INSERT INTO message_queue_controls(conversation_id,generation,state,reason) "
+            "SELECT DISTINCT q.conversation_id,q.generation,'paused',? FROM message_queue q JOIN chat_sessions s "
+            "ON s.id=q.conversation_id AND s.generation=q.generation WHERE q.conversation_id=? "
+            "AND q.status IN ('pending','paused') ON CONFLICT(conversation_id) DO UPDATE SET "
+            "generation=excluded.generation,state='paused',reason=excluded.reason,owner=NULL", (reason, cid))
+        changed = await conn.execute("UPDATE message_queue SET status='paused',reason=?,revision=revision+1,updated_at=? "
+            "WHERE conversation_id=? AND status IN ('pending','paused') AND (status<>'paused' OR reason<>?)",
+            (reason, time.time(), cid, reason))
         if changed.rowcount:
             await bump(conn)
 
@@ -238,12 +257,12 @@ class QueueStore:
         async with self._transaction() as conn:
             await self._queue_sync(conn)
             cid = await self._validate_conversation_write(conn, scope.conversation_id)
-            running = await one(conn, "SELECT value FROM config WHERE key='conversation_running'")
-            run = json.loads(running['value']) if running else None
+            running = await one(conn, "SELECT value FROM config WHERE key='conversation_runs'")
+            run = json.loads(running['value']).get(cid) if running else None
             if not run or run['run_id'] != scope.run_id or run.get('stop_requested'):
                 return []
             if first_id:
-                head = await one(conn, "SELECT id,dispatch_instance FROM message_queue WHERE status='pending' ORDER BY seq LIMIT 1")
+                head = await one(conn, "SELECT id,dispatch_instance FROM message_queue WHERE conversation_id=? AND status='pending' ORDER BY seq LIMIT 1", (cid,))
                 if not head or head['id'] != first_id or head['dispatch_instance'] != owner:
                     return []
             batch = await rows(conn, "SELECT * FROM message_queue WHERE conversation_id=? AND generation=? AND status='pending' ORDER BY seq", (cid, scope.generation))
@@ -284,7 +303,12 @@ class QueueStore:
     async def queue_finish_run(self, run_id, outcome):
         async with self._transaction() as conn:
             if outcome in {'failed', 'stopped', 'interrupted'}:
-                await self._queue_pause_all(conn, 'stopped' if outcome == 'stopped' else 'failed')
+                saved = await one(conn, "SELECT value FROM config WHERE key='conversation_runs'")
+                runs = json.loads(saved['value']) if saved else {}
+                cids = {cid for cid, run in runs.items() if run.get('run_id') == run_id}
+                cids.update(row['conversation_id'] for row in await rows(conn, 'SELECT DISTINCT conversation_id FROM message_queue WHERE run_id=?', (run_id,)))
+                for cid in cids:
+                    await self._queue_pause_conversation(conn, cid, 'stopped' if outcome == 'stopped' else 'failed')
             changed = await conn.execute("UPDATE message_queue SET status=?,reason=?,revision=revision+1,updated_at=? WHERE run_id=? AND status='claimed'",
                 ('completed' if outcome in {'completed', 'ask'} else 'interrupted', '' if outcome in {'completed', 'ask'} else 'interrupted', time.time(), run_id))
             if changed.rowcount:

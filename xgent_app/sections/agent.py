@@ -12,6 +12,9 @@ from xgent_app.protocols import ProtocolParser
 from xgent_app.error_reporting import error_text
 from xgent_app import memory_maintenance
 from xgent_app.media_inputs import MediaInputError, native_binary_kind
+import contextvars
+
+
 class AgentExecutor:
     """安全地执行 AI 请求的 shell 命令"""
     
@@ -20,12 +23,8 @@ class AgentExecutor:
     # User-created files and shell working state live in the project workspace,
     # never inside the code checkout.
     WORK_DIR = str(DATA_PATHS.root)
-    # 当前对话上下文：run-x 子进程需要它来登记 trigger 任务（xgent_trigger.py 读
-    # XGENT_CHAT_ID/XGENT_CONVERSATION_ID）。由 _process_conversation_inner 在每轮
-    # 处理开始时暂存。单用户 + _conversation_processing_lock 保证同时只有一个对话
-    # 在跑，所以类属性暂存是安全的；将来若要支持真·多对话并发，须改为显式传参。
-    _current_chat_id: Optional[int] = None
-    _current_conversation_id: Optional[str] = None
+    # A task-local route prevents concurrent run-x processes inheriting another chat.
+    _execution_context = contextvars.ContextVar('xgent_agent_execution', default=None)
 
     @classmethod
     def current_work_dir(cls) -> str:
@@ -1681,13 +1680,15 @@ class AgentExecutor:
             else:
                 kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
 
-            from xgent_app.conversations import conversation_secret_environment
+            from xgent_app.conversations import conversation_secret_environment, current_scope
             run_env = {**os.environ, **conversation_secret_environment(), 'LANG': 'en_US.UTF-8'}
             run_env['XGENT_WORK_DIR'] = cls.current_work_dir()
-            if cls._current_chat_id is not None:
-                run_env['XGENT_CHAT_ID'] = str(cls._current_chat_id)
-            if cls._current_conversation_id is not None:
-                run_env['XGENT_CONVERSATION_ID'] = str(cls._current_conversation_id)
+            route = cls._execution_context.get() or {}
+            scope = current_scope(required=False)
+            if route.get('chat_id') is not None:
+                run_env['XGENT_CHAT_ID'] = str(route['chat_id'])
+            if scope is not None:
+                run_env['XGENT_CONVERSATION_ID'] = scope.conversation_id
 
             # 创建进程途中也可能收到取消，先取回句柄再让 finally 回收它。
             spawn_task = asyncio.create_task(asyncio.create_subprocess_shell(

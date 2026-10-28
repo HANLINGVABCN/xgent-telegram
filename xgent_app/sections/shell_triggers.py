@@ -352,6 +352,17 @@ class AgentShellSession:
 
     def __init__(self, session_id: str, command: str):
         self.session_id = session_id
+        scope = current_scope(required=False)
+        self.conversation_id = scope.conversation_id if scope else None
+        self.generation = scope.generation if scope else None
+        self.work_dir = AgentExecutor.current_work_dir()
+        self.environment = {**os.environ, **conversation_secret_environment(), 'LANG': 'en_US.UTF-8',
+                            'TERM': os.environ.get('TERM') or 'xterm-256color', 'XGENT_WORK_DIR': self.work_dir}
+        route = AgentExecutor._execution_context.get() or {}
+        if route.get('chat_id') is not None:
+            self.environment['XGENT_CHAT_ID'] = str(route['chat_id'])
+        if scope:
+            self.environment['XGENT_CONVERSATION_ID'] = scope.conversation_id
         self.command = AgentExecutor.map_command_paths(command)
         self.started_at = time.time()
         self.started_monotonic = time.monotonic()
@@ -372,10 +383,7 @@ class AgentShellSession:
         self.pty_enabled = os.name != 'nt'
 
     def start(self):
-        from xgent_app.conversations import conversation_secret_environment
-        env = {**os.environ, **conversation_secret_environment(), 'LANG': 'en_US.UTF-8',
-               'TERM': os.environ.get('TERM') or 'xterm-256color',
-               'XGENT_WORK_DIR': AgentExecutor.current_work_dir()}
+        env = self.environment
         if self.pty_enabled:
             import pty
 
@@ -388,7 +396,7 @@ class AgentShellSession:
                 stdin=terminal_fd,
                 stdout=terminal_fd,
                 stderr=terminal_fd,
-                cwd=AgentExecutor.current_work_dir(),
+                cwd=self.work_dir,
                 env=env,
                 close_fds=True,
                 start_new_session=True,
@@ -402,7 +410,7 @@ class AgentShellSession:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                cwd=AgentExecutor.current_work_dir(),
+                cwd=self.work_dir,
                 env=env,
             )
             self.reader_thread = threading.Thread(target=self._read_pipe_loop, daemon=True)
@@ -836,6 +844,10 @@ class AgentShellSessionManager:
             session = cls._sessions.get(session_id)
         if not session:
             raise KeyError(f"shell 会话不存在: {session_id}")
+        scope = current_scope(required=False)
+        if session.conversation_id is not None and (
+                scope is None or scope.conversation_id != session.conversation_id or scope.generation != session.generation):
+            raise KeyError(f"shell 会话不属于当前对话: {session_id}")
         return session
 
     @classmethod
@@ -999,7 +1011,9 @@ class AgentShellSessionManager:
 
         cls._cleanup_exited()
         with cls._lock:
-            running_count = sum(1 for s in cls._sessions.values() if s.is_running())
+            scope = current_scope(required=False)
+            cid = scope.conversation_id if scope else None
+            running_count = sum(1 for s in cls._sessions.values() if s.is_running() and s.conversation_id == cid)
             if running_count >= cls.MAX_SESSIONS:
                 return {
                     'success': False,

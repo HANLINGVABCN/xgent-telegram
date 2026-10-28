@@ -1366,8 +1366,10 @@
     }
     bar.querySelectorAll('.conversation-action').forEach(button=>button.remove());
     if(actions.branch_mode){
-      var title=actions.branch_mode==='user'?'编辑并创建分支':'从此回答创建分支';
-      bar.appendChild(conversationActionButton('branch',title,()=>openBranchDialog(message,actions.branch_mode)));
+      var fork=conversationActionButton('fork-chat','分支到新聊天',()=>openBranchDialog(message,actions.branch_mode));
+      fork.classList.add('branch-chat-button');
+      fork.appendChild(actionNode('span','分支到新聊天'));
+      bar.appendChild(fork);
     }
     if(actions.withdraw)bar.appendChild(conversationActionButton('undo','撤回此消息及之后',()=>openWithdrawDialog(message)));
   }
@@ -1425,8 +1427,10 @@
       var controls=actionNode('div',null,'wb-actions'),confirm=actionButton('确认撤回',async()=>{
         confirm.disabled=true;
         try{
-          await api('/api/workbench/conversations/withdraw',{method:'POST',body:JSON.stringify({conversation_id:cid,record_id:message.id,turn_id:preview.turn_id,current_digest:preview.current_digest,confirm:true,request_id:queueRequestId()})});
-          closeAction();await resync(true);toast('消息已撤回');
+          var requestId=confirm.dataset.requestId||(confirm.dataset.requestId=queueRequestId());
+          var result=await api('/api/workbench/conversations/withdraw',{method:'POST',body:JSON.stringify({conversation_id:cid,record_id:message.id,turn_id:preview.turn_id,current_digest:preview.current_digest,confirm:true,request_id:requestId})});
+          restoreQueuedDraft(cid,result.draft?.text??message.content??message.text??'','withdraw:'+requestId);
+          closeAction();if(cid===selectedConversationId)await resync(true);toast('消息已撤回，原文已放回输入框');
         }finally{confirm.disabled=false;}
       },'danger');controls.append(actionButton('取消',closeAction),confirm);box.append(controls);
     }catch(error){box.replaceChildren(actionMessage(error.message,true),actionButton('关闭',closeAction));}
@@ -1556,7 +1560,7 @@
     if(frame.interaction_id&&['callback_done','turn_error'].includes(frame.type))finishCardRequest(frame.interaction_id);
     if(frame.type === 'conversation_state') {
       window.XGentConversations?.accept(frame);
-      setBusy(!!frame.running);
+      setBusy(!!(frame.runs ? frame.runs[selectedConversationId] : frame.running?.conversation_id===selectedConversationId&&frame.running));
       return;
     }
     if(frame.type === 'turn_rejected') {
@@ -2177,7 +2181,7 @@
   function drawQueue(error){
     var panel=document.getElementById('message-queue');if(!panel)return;
     var items=queueState?.conversation_id===selectedConversationId?queueState.items:[];
-    var recovering=Array.from(queueActions.values()).filter(p=>p.action==='edit'&&p.item?.conversation_id===selectedConversationId&&!items?.some(i=>i.id===p.item.id));
+    var recovering=Array.from(queueActions.values()).filter(p=>['cancel','edit'].includes(p.action)&&p.item?.conversation_id===selectedConversationId&&!items?.some(i=>i.id===p.item.id));
     var anchor=scrollAnchor();
     panel.replaceChildren();panel.hidden=!items?.length&&!error&&!queueState?.paused&&!recovering.length;
     if(panel.hidden)return;
@@ -2201,7 +2205,7 @@
     recovering.forEach(p=>{
       var row=document.createElement('div');row.className='queue-actions';
       var text=document.createElement('span');text.textContent=p.busy?'正在取回消息…':'取回结果待确认，原文仍安全保留。';row.appendChild(text);
-      var retry=button('重试取回',()=>changeQueue(p.item,'edit'));retry.disabled=p.busy;row.appendChild(retry);panel.appendChild(row);
+      var retry=button('重试取回',()=>changeQueue(p.item,p.action));retry.disabled=p.busy;row.appendChild(retry);panel.appendChild(row);
     });
     if(error){var note=document.createElement('p');note.className='queue-error';note.textContent=error;panel.append(note,button('刷新队列',()=>refreshQueue(true)));}
     restoreScrollAnchor(anchor);
@@ -2240,13 +2244,13 @@
     try{
       var data=await api('/api/queue/'+action,{method:'POST',body:JSON.stringify({conversation_id:cid,id:item?.id,
         generation:item?.generation??queueState.generation,revision:item?.revision??queueState.revision,request_id:pending.request_id})});
-      if(action==='edit')restoreQueuedDraft(cid,data.text,pending.request_id);
+      if(action==='edit'||action==='cancel')restoreQueuedDraft(cid,data.text,pending.request_id);
       queueActions.delete(key);persistQueueEdits();await refreshQueue(true);drawQueue();
     }catch(e){pending.busy=false;pending.error=e.message;if(e.status===409&&action==='resume'){queueActions.delete(key);refreshQueue(true);}if(cid===selectedConversationId)drawQueue(e.message);else toast(e.message,true);}
   }
 
   function persistQueueEdits(){
-    try{sessionStorage.setItem('xgent_queue_edits',JSON.stringify(Array.from(queueActions.values()).filter(p=>p.action==='edit').map(p=>({action:p.action,request_id:p.request_id,item:{id:p.item.id,conversation_id:p.item.conversation_id,generation:p.item.generation,revision:p.item.revision}}))));}catch(e){}
+    try{sessionStorage.setItem('xgent_queue_edits',JSON.stringify(Array.from(queueActions.values()).filter(p=>['cancel','edit'].includes(p.action)).map(p=>({action:p.action,request_id:p.request_id,item:{id:p.item.id,conversation_id:p.item.conversation_id,generation:p.item.generation,revision:p.item.revision}}))));}catch(e){}
   }
 
   async function sendQueuedText(text){
@@ -3376,6 +3380,7 @@
     }
     if(uploadQueue)uploadQueue.cancelled=true;
     selectedConversationId=next;
+    setBusy(!!window.XGentConversations?.running);
     queueController?.abort();queueController=null;queueVersion++;queueState=null;queueExpanded=false;drawQueue();
     input.value=conversationDrafts[next]||'';
     try{input.value=input.value||sessionStorage.getItem(draftKey(next))||'';}catch(e){}
@@ -3387,7 +3392,7 @@
     updateEmptyState();syncSendState();
     if(!loggedOut){resync(true).catch(function(){});loadConversationLineage().catch(function(){});}
   });
-  window.addEventListener('xgent-conversation-state',function(event){setBusy(!!event.detail.running);});
+  window.addEventListener('xgent-conversation-state',function(event){const state=event.detail;setBusy(!!(state.runs ? state.runs[selectedConversationId] : state.running?.conversation_id===selectedConversationId&&state.running));});
   window.addEventListener('xgent-conversation-deleted',function(event){
     const cid=event.detail.conversation_id;delete conversationDrafts[cid];try{sessionStorage.removeItem(draftKey(cid));}catch{}
     if(cardScrollIntent?.cid===cid)cancelCardFollow();

@@ -215,10 +215,10 @@ async def upload_acknowledgement(bot, root):
                 assert not h.requests, 'receipt must not wait for a completed model response'
                 release.set()
                 for _ in range(200):
-                    if not bot.get_conversations().lock.busy():
+                    if not bot.get_conversations().busy():
                         break
                     await asyncio.sleep(.02)
-                assert not bot.get_conversations().lock.busy()
+                assert not bot.get_conversations().busy()
             with patch.object(AttachmentVersions, '_write', side_effect=OSError('fixture backup failure')):
                 failed = bot._web_submit_upload('fail.txt', b'not accepted', '', h.outbox, conversation_id=cid)
                 assert not (await asyncio.wait_for(asyncio.wrap_future(failed), 5))['ok']
@@ -260,7 +260,7 @@ async def restore_cancellation_and_delete_race(bot, root):
             else: raise AssertionError('cancellation not propagated')
         assert path.read_bytes() == b'original UTF8\n'
         assert json.loads((await h.db.get_display_message(row))['metadata'])['attachments'][0]['sha256'] == ref['sha256']
-        assert not bot.get_conversations().lock.busy()
+        assert not bot.get_conversations().busy()
         original_read = AttachmentVersions.read_version
         def deleting_read(store, version):
             result = original_read(store, version)

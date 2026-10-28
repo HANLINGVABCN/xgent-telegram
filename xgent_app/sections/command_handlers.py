@@ -149,7 +149,6 @@ async def generate_compression_summary(provider, data, model, history, stop_even
 @conversation_entry(execution=True)
 async def run_context_compression(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                    retry_job_id: Optional[str] = None):
-    global _is_processing, _stop_generation_event, _compression_running
     if not await check_authorized_user_middleware(update, context):
         return
     message = update.message or update.callback_query.message
@@ -158,8 +157,7 @@ async def run_context_compression(update: Update, context: ContextTypes.DEFAULT_
         await message.reply_text('系统仍在处理上一个请求，请结束或停止后再压缩。')
         return
     async with _conversation_processing_lock:
-        _is_processing = _compression_running = True
-        stop_event = _stop_generation_event = get_conversations().stop_event() or asyncio.Event()
+        stop_event = get_conversations().stop_event() or get_or_create_stop_event()
         get_conversations().attach_stop_event(stop_event)
         status = db = entry = snapshot = None
         warning = None
@@ -281,8 +279,6 @@ async def run_context_compression(update: Update, context: ContextTypes.DEFAULT_
                             await send_token_usage_message(
                                 context, update.effective_chat.id, usage, elapsed)
             finally:
-                _stop_generation_event = None
-                _is_processing = _compression_running = False
                 try:
                     publish_conversation_event(context, {'type': 'compression_state', 'busy': False, 'committed': changed})
                 finally:

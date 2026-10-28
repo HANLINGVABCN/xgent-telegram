@@ -1084,8 +1084,8 @@ async def show_conversation_menu(update, context, *, archived=False, page=1, mes
         rows.append([InlineKeyboardButton('➕ 新建会话', callback_data='conv_create'),
                      InlineKeyboardButton('🗃 已归档', callback_data='conv_archived')])
     rows.append([InlineKeyboardButton('🔙 返回', callback_data='conv_list' if archived else ('act_main_menu' if scope else 'conv_home'))])
-    running = state.get('running')
-    note = f"\n⏳ {running.get('name') or running['conversation_id']} 正在执行；切换不会中断。" if running else ''
+    runs = list(state.get('runs', {}).values())
+    note = ''.join(f"\n⏳ {running.get('name') or running['conversation_id']} 正在执行；切换不会中断。" for running in runs)
     with bind_conversation(scope):
         if scope is not None:
             await advance_ui_generation()

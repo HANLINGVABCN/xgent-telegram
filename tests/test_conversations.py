@@ -119,6 +119,80 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         with bind_conversation(await self.manager.resolve(b)):
             self.assertIn('persistent B', str(await self.db.get_conversation_messages()))
 
+    async def test_independent_conversations_share_database_but_not_execution_or_stop(self):
+        first = await self.manager.resolve()
+        second = (await self.manager.manage('create', name='B'))['conversation_id']
+        peer = ConversationManager(self.manager.factory, self.path)
+        async with self.manager.operation(first, execution=True) as a:
+            async with peer.operation(second, execution=True, fresh=True) as b:
+                state = await peer.state()
+                self.assertEqual({first.conversation_id, second}, set(state['runs']))
+                with self.assertRaises(ConversationBusy):
+                    async with peer.operation(first.conversation_id, execution=True, fresh=True):
+                        self.fail('the same conversation was admitted twice')
+                self.assertTrue(await self.manager.request_stop(a.run_id, first.conversation_id))
+                self.assertTrue(self.manager.runtime(a.run_id).stop.is_set())
+                self.assertFalse(peer.stop_event().is_set())
+                with bind_conversation(first):
+                    self.assertIs(self.manager.runtime(a.run_id).stop, self.manager.stop_event())
+                with bind_conversation(await peer.resolve(second)):
+                    self.assertIs(peer.runtime(b.run_id).stop, peer.stop_event())
+                with self.assertRaises(ConversationBusy):
+                    async with peer.file_maintenance_slot():
+                        self.fail('file restore overlapped a live conversation')
+            self.assertIn(first.conversation_id, (await self.manager.state())['runs'])
+        self.assertEqual({}, (await self.manager.state())['runs'])
+
+    async def test_cancelling_during_begin_waits_for_rollback_before_next_writer(self):
+        from unittest.mock import patch
+        conn = await self.db._get_conn()
+        execute, rollback = conn.execute, conn.rollback
+        begun, rolling_back, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        async def begin(sql, *args, **kwargs):
+            result = await execute(sql, *args, **kwargs)
+            if sql == 'BEGIN IMMEDIATE':
+                begun.set()
+                await asyncio.Event().wait()
+            return result
+        async def delayed_rollback():
+            rolling_back.set()
+            await release.wait()
+            await rollback()
+        async def importing():
+            async with self.db._transaction():
+                self.fail('cancelled BEGIN reached transaction body')
+        with patch.object(conn, 'execute', begin), patch.object(conn, 'rollback', delayed_rollback):
+            task = asyncio.create_task(importing())
+            await begun.wait()
+            task.cancel()
+            await rolling_back.wait()
+            task.cancel()
+            writer = asyncio.create_task(self.db.set_config('after_cancel', 'saved'))
+            await asyncio.sleep(0)
+            self.assertFalse(writer.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            await writer
+        self.assertEqual('saved', await self.db.get_config_fresh('after_cancel'))
+
+    async def test_v6_upgrade_preserves_live_owner_then_recovers_only_that_run(self):
+        scope = await self.manager.resolve()
+        legacy = {'conversation_id':scope.conversation_id,'run_id':'legacy-running','pid':123,'stop_requested':False}
+        await self.db.set_config('conversation_schema_version', 6)
+        await self.db.set_config('conversation_running', legacy)
+        owner = ExecutionFileLock(self.path)
+        self.assertTrue(owner.acquire())
+        try:
+            await self.db.migrate_conversations()
+            state = await self.manager.state()
+            self.assertEqual('legacy-running', state['runs'][scope.conversation_id]['run_id'])
+            self.assertTrue(state['runs'][scope.conversation_id]['legacy_lock'])
+        finally:
+            owner.release()
+        self.assertEqual({}, (await self.manager.state())['runs'])
+        self.assertEqual(7, await self.db.get_config_fresh('conversation_schema_version'))
+
     async def test_cross_process_lock_released_after_crash(self):
         source = ('from xgent_app.conversations import ExecutionFileLock; import sys,time; '
                   'lock=ExecutionFileLock(sys.argv[1]); print(lock.acquire(),flush=True); time.sleep(60)')
@@ -221,9 +295,9 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         with outbox.subscribe() as sub, patch('xgent_app.conversations._manager', self.manager):
             async with self.manager.operation(execution=True):
                 outbox.put({'type': 'turn_end'})
-                self.assertTrue(self.manager.lock.busy())
+                self.assertTrue(self.manager.busy('global_memory'))
                 self.assertIsNone(sub.get(timeout=.01))
-            self.assertFalse(self.manager.lock.busy())
+            self.assertFalse(self.manager.busy('global_memory'))
             frame = sub.get(timeout=.1)
             self.assertEqual('turn_end', frame['type'])
             self.assertEqual('global_memory', frame['conversation_id'])

@@ -754,7 +754,7 @@ async def seed_pending_albums(bot, root):
             running = (await manager.state())['running']
             await manager.request_stop(running['run_id'])
             async def stopped():
-                while manager.lock.busy():
+                while manager.busy():
                     await asyncio.sleep(0.01)
             await asyncio.wait_for(stopped(), 5)
             assert len(await h.db.get_attachment_records()) == 3

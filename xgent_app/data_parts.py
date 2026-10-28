@@ -45,7 +45,7 @@ def config_part(key):
         return "prompts"
     if key in AI_KEYS or key.startswith(("model_", "discovered_model_", "ai_")):
         return "ai_config"
-    if key == "conversation_running" or key.startswith(("restart_", "last_idle_", "last_startup_", "runtime_")):
+    if key in {"conversation_running", "conversation_runs"} or key.startswith(("restart_", "last_idle_", "last_startup_", "runtime_")):
         return "runtime_state"
     if key in HISTORY_KEYS or key.startswith("conversation_"):
         return "conversation_history"

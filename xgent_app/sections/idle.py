@@ -4,7 +4,7 @@
 from xgent_app.web_bridge import _without_reverse_mirror
 
 async def check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
-    if get_conversations().lock.busy():
+    if get_conversations().busy():
         return
     try:
         from xgent_app.interaction import interaction
@@ -1820,7 +1820,7 @@ async def _web_request_stop(run_id=None, conversation_id=None):
 
 
 def _web_is_busy() -> bool:
-    return _conversation_processing_lock.locked() or get_conversations().lock.busy()
+    return _conversation_processing_lock.locked() or get_conversations().busy()
 
 
 async def start_web_chat_if_enabled(app: Optional[Any] = None, *,

@@ -1,4 +1,4 @@
-"""Logical conversation scopes and the single cross-process execution slot.
+"""Logical conversation scopes and independent cross-process execution slots.
 
 No Telegram imports at module load. Context is captured at admission and serialized before queues;
 changing the selected conversation never rebinds an admitted operation.
@@ -10,6 +10,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
+import hashlib
 import json
 import os
 import time
@@ -19,7 +20,7 @@ from typing import Any
 
 DEFAULT_CONVERSATION_ID = 'global_memory'
 DEFAULT_CONVERSATION_NAME = '默认会话'
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class ConversationError(ValueError):
@@ -200,6 +201,39 @@ class ExecutionFileLock:
         return False
 
 
+@dataclasses.dataclass
+class ConversationRun:
+    scope: ConversationScope
+    lock: ExecutionFileLock
+    stop: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+    outcome: str = 'completed'
+    delivery: Any = None
+    completions: list = dataclasses.field(default_factory=list)
+
+
+class ConversationProcessingLock:
+    """Serialize one conversation while letting unrelated tasks progress."""
+    def __init__(self):
+        self._locks = {}
+
+    def _current(self):
+        scope = current_scope(required=False)
+        key = scope.conversation_id if scope else None
+        return self._locks.setdefault(key, asyncio.Lock())
+
+    def locked(self):
+        if current_scope(required=False) is None:
+            return any(lock.locked() for lock in tuple(self._locks.values()))
+        return self._current().locked()
+
+    async def __aenter__(self):
+        await self._current().acquire()
+        return self
+
+    async def __aexit__(self, *args):
+        self._current().release()
+
+
 class ConversationManager:
     def __init__(self, factory, database_path, notify=None, code_root=None):
         self.factory = factory
@@ -207,13 +241,11 @@ class ConversationManager:
         self.notify = notify
         self._poll_task = None
         self._background = set()
-        self._completions = []
         self._last_state = None
-        self._stop_event = None
-        self._run_id = None
-        self._reply_delivery = None
+        self._runs = {}
+        self._execution_locks = {}
+        self._observed_runs = {}
         self.text_queue = None
-        self._run_outcome = 'completed'
         self._admission_lock = asyncio.Lock()
         self.maintenance = None
         self.terminal_enabled = False
@@ -222,6 +254,49 @@ class ConversationManager:
         self.code_root = Path(code_root).resolve() if code_root else None
         data_root = Path(database_path).resolve().parent if database_path != ':memory:' else None
         self.object_root = data_root / 'xgent_storage' / 'conversation_objects' if data_root else None
+
+    def execution_lock(self, cid):
+        if cid not in self._execution_locks:
+            key = hashlib.sha256(str(cid).encode('utf-8')).hexdigest()
+            self._execution_locks[cid] = ExecutionFileLock(self.lock.path + '.conversation-' + key)
+        return self._execution_locks[cid]
+
+    def runtime(self, run_id=None):
+        if run_id is None:
+            scope = current_scope(required=False)
+            run_id = scope.run_id if scope else None
+        return self._runs.get(run_id)
+
+    @property
+    def _run_id(self):
+        run = self.runtime()
+        return run.scope.run_id if run else None
+
+    @property
+    def _reply_delivery(self):
+        run = self.runtime()
+        return run.delivery if run else None
+
+    @property
+    def _run_outcome(self):
+        run = self.runtime()
+        return run.outcome if run else 'completed'
+
+    @_run_outcome.setter
+    def _run_outcome(self, outcome):
+        run = self.runtime()
+        if run:
+            run.outcome = outcome
+
+    def busy(self, conversation_id=None):
+        scope = current_scope(required=False)
+        cid = conversation_id or (scope.conversation_id if scope else None)
+        if self.lock.busy():
+            return True
+        if cid is not None:
+            return self.execution_lock(cid).busy()
+        return any(lock.busy() for lock in tuple(self._execution_locks.values())) or any(
+            self.execution_lock(cid).busy() for cid in tuple(self._observed_runs))
 
     async def enable_terminal(self):
         """One selection per CLI process; never persisted as a shared global pointer."""
@@ -242,27 +317,38 @@ class ConversationManager:
                 if checked_id == self._terminal_id and (session is None or session.get('archived') or session.get('deleting')):
                     self._terminal_id = None
                     self._terminal_revision += 1
-            state = {**state, 'terminal_conversation_id': self._terminal_id,
+            state = {**state, 'running': state.get('runs', {}).get(self._terminal_id), 'terminal_conversation_id': self._terminal_id,
                      'terminal_revision': self._terminal_revision}
         return state
 
     async def state(self):
         db = await self.factory()
         state = await db.get_conversation_state()
-        # A dead owner leaves metadata, not a live lock. Never resurrect that run.
-        if state.get('running') and self._run_id is None:
-            probe = ExecutionFileLock(self.lock.path.removesuffix('.turn.lock'))
-            if probe.acquire():
-                try:
-                    # Hold the OS slot across the database awaits. Another process
-                    # cannot start a new run between "not busy" and recovery.
-                    state = await db.get_conversation_state()
-                    if state.get('running'):
-                        await db.queue_finish_run(state['running']['run_id'], 'interrupted')
-                        await db.finish_conversation_run(state['running']['run_id'])
-                        state['running'] = None
-                finally:
+        recovered = False
+        # Probe each owner separately; a live B never hides a crashed A.
+        for cid, saved in list(state.get('runs', {}).items()):
+            if saved['run_id'] in self._runs:
+                continue
+            guard = ExecutionFileLock(self.lock.path.removesuffix('.turn.lock'))
+            if not guard.acquire():
+                continue
+            probe = ExecutionFileLock(self.execution_lock(cid).path.removesuffix('.turn.lock'))
+            acquired = False
+            try:
+                acquired = bool(saved.get('legacy_lock') or probe.acquire())
+                if acquired:
+                    fresh = (await db.get_conversation_state()).get('runs', {}).get(cid)
+                    if fresh and fresh['run_id'] == saved['run_id']:
+                        await db.queue_finish_run(saved['run_id'], 'interrupted')
+                        await db.finish_conversation_run(saved['run_id'])
+                        recovered = True
+            finally:
+                if acquired and not saved.get('legacy_lock'):
                     probe.release()
+                guard.release()
+        if recovered:
+            state = await db.get_conversation_state()
+        self._observed_runs = state.get('runs', {})
         return await self._terminal_state(state)
 
     async def resolve(self, conversation_id=None, *, expected=False, allow_archived=False, selector=None):
@@ -305,15 +391,31 @@ class ConversationManager:
         else:
             scope = await self.resolve(conversation_id, expected=expected, allow_archived=allow_archived, selector=selector)
         acquired = False
-        if execution and not (scope.run_id and scope.run_id == self._run_id):
+        run = None
+        slot = None
+        if execution and not (scope.run_id and self.runtime(scope.run_id)):
+            await self.state()
+            slot = self.execution_lock(scope.conversation_id)
+            admission_deadline = time.monotonic() + 1.0
             while True:
-                async with self._admission_lock:
-                    if self.lock.acquire():
-                        acquired = True
-                        break
-                if not wait:
-                    raise ConversationBusy('另一个会话正在执行，请等待完成或停止该回合后重试。')
-                await asyncio.sleep(0.1)
+                await self._admission_lock.acquire()
+                guarded = False
+                try:
+                    guarded = self.lock.acquire()
+                    if guarded:
+                        if slot.acquire():
+                            acquired = True
+                            break
+                finally:
+                    if not acquired:
+                        if guarded:
+                            self.lock.release()
+                        self._admission_lock.release()
+                if guarded and not wait:
+                    raise ConversationBusy('当前对话正在执行，请等待完成或停止该回合后重试。')
+                if not guarded and not wait and time.monotonic() >= admission_deadline:
+                    raise ConversationBusy('正在维护会话文件，请稍后重试。')
+                await asyncio.sleep(0.1 if guarded else 0.01)
             try:
                 # Check again after acquisition, before any message is persisted.
                 fresh_scope = await self.resolve(scope.conversation_id, expected=expected,
@@ -321,13 +423,11 @@ class ConversationManager:
                 if fresh_scope.generation != scope.generation:
                     raise ConversationChanged('对话已清空或压缩，旧操作未提交。')
                 scope = dataclasses.replace(scope, run_id=uuid.uuid4().hex)
-                self._run_id = scope.run_id
-                self._run_outcome = 'completed'
+                run = ConversationRun(scope, slot)
+                self._runs[scope.run_id] = run
                 if scope.origin == 'web' and scope.purpose == 'chat':
                     from .reply_delivery import WebRunDelivery
-                    self._reply_delivery = WebRunDelivery(scope)
-                self._completions = []
-                self._stop_event = asyncio.Event()
+                    run.delivery = WebRunDelivery(scope)
                 db = await self.factory()
                 await db.begin_conversation_run({
                     'run_id': scope.run_id, 'conversation_id': scope.conversation_id,
@@ -335,19 +435,23 @@ class ConversationManager:
                     'stop_requested': False,
                     'queue_instance': self.text_queue.instance if self.text_queue else None,
                 })
-                await self.poll_once()
             except BaseException:
-                if self._reply_delivery is not None:
-                    self._reply_delivery.close()
-                    self._reply_delivery = None
-                self._run_id = None
-                self._stop_event = None
-                self.lock.release()
+                if run and run.delivery:
+                    run.delivery.close()
+                self._runs.pop(scope.run_id, None)
+                slot.release()
                 raise
+            finally:
+                # Admission and file restoration share this brief global guard;
+                # model and command execution only hold this conversation's lock.
+                self.lock.release()
+                self._admission_lock.release()
         final_scope = None
         turn_id = None
         turn_guard = contextlib.nullcontext(None)
         try:
+            if acquired:
+                await self.poll_once()
             if acquired and self.code_root is not None and self.object_root is not None:
                 from .conversation_branching import begin_turn, bind_turn
                 db = await self.factory()
@@ -358,7 +462,7 @@ class ConversationManager:
                     yield scope
                 except BaseException as exc:
                     if acquired:
-                        self._run_outcome = 'stopped' if isinstance(exc, asyncio.CancelledError) else 'failed'
+                        run.outcome = 'stopped' if isinstance(exc, asyncio.CancelledError) else 'failed'
                     if not hasattr(exc, 'conversation_context'):
                         exc.conversation_context = dataclasses.asdict(current_scope())
                     raise
@@ -370,7 +474,7 @@ class ConversationManager:
             # forever and the UI remained on “排队中”.  Give them the same
             # terminal queue semantics as failures during model execution.
             if acquired:
-                self._run_outcome = 'stopped' if isinstance(exc, asyncio.CancelledError) else 'failed'
+                run.outcome = 'stopped' if isinstance(exc, asyncio.CancelledError) else 'failed'
             if not hasattr(exc, 'conversation_context'):
                 exc.conversation_context = dataclasses.asdict(scope)
             raise
@@ -378,53 +482,70 @@ class ConversationManager:
             if inherited and not inherited.run_id and final_scope and inherited.conversation_id == final_scope.conversation_id and inherited.generation != final_scope.generation:
                 _scope.set(dataclasses.replace(inherited, generation=final_scope.generation))
             if acquired:
-                if self._reply_delivery is not None:
-                    self._reply_delivery.close()
-                    self._reply_delivery = None
+                if run.delivery is not None:
+                    run.delivery.close()
                 try:
                     db = await self.factory()
-                    outcome = 'stopped' if self._stop_event and self._stop_event.is_set() else self._run_outcome
+                    outcome = 'stopped' if run.stop.is_set() else run.outcome
                     if turn_id is not None:
                         from .conversation_branching import finish_turn
                         await finish_turn(db, scope, turn_id, status=outcome)
                     await db.queue_finish_run(scope.run_id, outcome)
                     await db.finish_conversation_run(scope.run_id)
                 finally:
-                    self._run_id = None
-                    self._stop_event = None
-                    self.lock.release()
-                    completions, self._completions = self._completions, []
+                    self._runs.pop(scope.run_id, None)
+                    slot.release()
+                    completions, run.completions = run.completions, []
                     for callback in completions:
                         with contextlib.suppress(Exception):
                             callback()
                 await self.poll_once()
 
     def stop_event(self):
-        return self._stop_event
+        run = self.runtime()
+        scope = current_scope(required=False)
+        if run is None and scope is not None and scope.run_id is None:
+            run = next((active for active in self._runs.values()
+                        if active.scope.conversation_id == scope.conversation_id
+                        and active.scope.generation == scope.generation), None)
+        return run.stop if run else None
 
     @contextlib.asynccontextmanager
-    async def file_maintenance_slot(self):
+    async def file_maintenance_slot(self, conversation_id=None):
         """Brief file restore exclusion, not a model run or a queue transition."""
+        await self.state()
+        slot = self.execution_lock(conversation_id) if conversation_id is not None else None
         async with self._admission_lock:
             if not self.lock.acquire():
                 raise ConversationBusy('正在执行任务，请等待完成后再恢复附件；未停止任务或修改文件。')
+            if slot is not None:
+                try:
+                    if not slot.acquire():
+                        raise ConversationBusy('当前对话正在执行，请等待结束后再撤回。')
+                finally:
+                    self.lock.release()
         try:
+            if slot is None and (await (await self.factory()).get_conversation_state()).get('runs'):
+                raise ConversationBusy('正在执行任务，请等待完成后再恢复附件；未停止任务或修改文件。')
             yield
         finally:
-            self.lock.release()
+            (slot or self.lock).release()
 
     def attach_stop_event(self, event):
-        if self._stop_event is not None and self._stop_event.is_set():
-            event.set()
-        self._stop_event = event
+        run = self.runtime()
+        if run is not None:
+            if run.stop.is_set():
+                event.set()
+            run.stop = event
 
     async def request_stop(self, run_id, conversation_id=None):
         if not run_id:
             raise ConversationChanged('停止按钮已失效，请使用当前回合的停止按钮。')
         db = await self.factory()
         accepted = await db.request_conversation_stop(str(run_id), conversation_id)
-        if accepted and run_id == self._run_id and self._stop_event is not None:
-            self._stop_event.set()
+        run = self.runtime(run_id)
+        if accepted and run is not None:
+            run.stop.set()
         return accepted
 
     async def manage(self, action, conversation_id=None, name=None, *, selector=None):
@@ -455,19 +576,20 @@ class ConversationManager:
         if self.maintenance is not None:
             await self.maintenance()
         state = await self.state()
-        running = state.get('running') or {}
-        delivery = self._reply_delivery
-        if delivery is not None and delivery.active and not delivery.subscribed and (
-                running.get('run_id') == delivery.scope.run_id and
-                state.get('telegram_conversation_id') == delivery.scope.conversation_id):
-            db = await self.factory()
-            session = await db.get_session(delivery.scope.conversation_id)
-            if session and not session.get('deleting') and session['generation'] == delivery.scope.generation:
-                delivery.subscribe()
-            else:
-                delivery.close()
-        if running.get('run_id') == self._run_id and running.get('stop_requested') and self._stop_event:
-            self._stop_event.set()
+        for run in list(self._runs.values()):
+            running = state.get('runs', {}).get(run.scope.conversation_id) or {}
+            delivery = run.delivery
+            if delivery is not None and delivery.active and not delivery.subscribed and (
+                    running.get('run_id') == delivery.scope.run_id and
+                    state.get('telegram_conversation_id') == delivery.scope.conversation_id):
+                db = await self.factory()
+                session = await db.get_session(delivery.scope.conversation_id)
+                if session and not session.get('deleting') and session['generation'] == delivery.scope.generation:
+                    delivery.subscribe()
+                else:
+                    delivery.close()
+            if running.get('run_id') == run.scope.run_id and running.get('stop_requested'):
+                run.stop.set()
         encoded = json.dumps(state, sort_keys=True, ensure_ascii=False)
         if encoded != self._last_state:
             self._last_state = encoded
@@ -649,8 +771,9 @@ def defer_completion(frame, callback):
     kind = frame.get('type')
     completion = kind in {'turn_end', 'turn_error', 'generation_end'} or (
         kind == 'compression_state' and frame.get('busy') is False)
-    if completion and _manager is not None and frame.get('run_id') and frame['run_id'] == _manager._run_id:
-        _manager._completions.append(callback)
+    run = _manager.runtime(frame.get('run_id')) if _manager is not None and frame.get('run_id') else None
+    if completion and run is not None:
+        run.completions.append(callback)
         return True
     return False
 

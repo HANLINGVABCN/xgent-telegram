@@ -57,6 +57,8 @@ function button(text, fn, attributes = {}) {
 function title(item) { return item?.display_title || item?.name || '新对话'; }
 function timestamp(item) { return Number(item.activity_at ?? item.last_active ?? item.created_at) || 0; }
 function itemById(id) { return itemIndex.get(id); }
+function activeRuns() { return state.runs ? Object.values(state.runs) : state.running ? [state.running] : []; }
+function runningFor(id) { return state.runs ? state.runs[id] || null : state.running?.conversation_id === id ? state.running : null; }
 function groups() { return Array.isArray(state.groups) ? state.groups : [{id:'ungrouped',name:'未分组'}]; }
 function groupName(id) { return groups().find(group => group.id === id)?.name || '未分组'; }
 function isArchived(item) { return item.archived === true || Number(item.archived) === 1; }
@@ -111,7 +113,7 @@ function accept(next) {
   const previous = state.current_chat_id;
   const combined = {...state, ...next};
   if (JSON.stringify(combined) === JSON.stringify(state)) return;
-  state = combined;
+  state = {...combined, running: combined.runs ? combined.runs[combined.current_chat_id] || null : combined.running};
   itemIndex = new Map(state.items.map(item => [item.id, item]));
   render();
   window.dispatchEvent(new CustomEvent('xgent-conversation-state', {detail: state}));
@@ -257,7 +259,7 @@ function renderList() {
       const pinned = !query && groupView !== 'all' ? Number(b.pinned || 0) - Number(a.pinned || 0) : 0;
       return pinned || timestamp(b) - timestamp(a) || a.id.localeCompare(b.id);
     });
-  const signature = JSON.stringify([view, groupView, query, state.current_chat_id, state.telegram_conversation_id, state.running?.conversation_id, mutation,
+  const signature = JSON.stringify([view, groupView, query, state.current_chat_id, state.telegram_conversation_id, activeRuns(), mutation,
     visible.map(item => [item.id, title(item), groupFor(item), item.group_id, item.pinned, item.parent_conversation_id, item.branch_mode])]);
   if (signature === listSignature) return;
   listSignature = signature;
@@ -289,7 +291,7 @@ function renderList() {
     entry.open.title = title(item);
     entry.open.setAttribute('aria-label', (isArchived(item) ? '已归档：' : '打开对话：') + title(item));
     if (current) entry.open.setAttribute('aria-current', 'true'); else entry.open.removeAttribute('aria-current');
-    entry.dot.hidden = state.running?.conversation_id !== item.id;
+    entry.dot.hidden = !runningFor(item.id);
     entry.open.disabled = !!mutation || isArchived(item);
     entry.restore.hidden = !isArchived(item);
     entry.restore.disabled = !!mutation;
@@ -315,10 +317,12 @@ function renderList() {
   if (menuTarget) { if (!itemById(menuTarget)) closeMenu(false); else positionMenu(); }
 }
 function renderRunning() {
-  const running = state.running, banner = $('conversation-running');
-  $('conversation-current-status').hidden = !running || running.conversation_id !== state.current_chat_id;
-  banner.hidden = !running || running.conversation_id === state.current_chat_id;
+  const others = activeRuns().filter(run=>run.conversation_id!==state.current_chat_id), banner = $('conversation-running');
+  $('conversation-current-status').hidden = !runningFor(state.current_chat_id);
+  banner.hidden = !others.length;
   if (banner.hidden) { banner.replaceChildren(); return; }
+  const entries=[];
+  for(const running of others){
   const item = itemById(running.conversation_id);
   const text = node('span', {}, '「' + (item ? title(item) : running.name || '另一段对话') + '」' + (running.stop_requested ? '正在停止…' : '正在生成'));
   const visit = button('查看', () => {
@@ -333,7 +337,9 @@ function renderRunning() {
     catch (error) { if (error.name !== 'AbortError') notify(error.message, {error: true}); }
     finally { if (trigger.isConnected) trigger.disabled = false; }
   });
-  banner.replaceChildren(node('span', {class: 'conv-running-dot', 'aria-hidden': 'true'}), text, visit, stop);
+  entries.push(node('div',{class:'conv-running-entry'},node('span', {class: 'conv-running-dot', 'aria-hidden': 'true'}), text, visit, stop));
+  }
+  banner.replaceChildren(...entries);
 }
 function render() {
   const selected = itemById(state.current_chat_id);
@@ -558,7 +564,7 @@ document.addEventListener('keydown', event => {
 window.XGentConversations = {
   accept, refresh, get items(){return state.items;},
   async select(id){if(mutation)throw new Error('正在切换对话，请稍后重试');if(id!==state.current_chat_id)await mutate('switch',{id});closeMenu(false);setDrawer(false);return state.current_chat_id===id;},
-  get current() { return state.current_chat_id; }, get running() { return state.running; },
+  get current() { return state.current_chat_id; }, get running() { return runningFor(state.current_chat_id); }, get runs() { return activeRuns(); },
 };
 const groupSelect = $('conversation-group-select');
 groupSelect?.addEventListener('change', () => { groupView = groupSelect.value || 'all'; render(); scroll.scrollTop = 0; });

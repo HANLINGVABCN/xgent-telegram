@@ -175,7 +175,8 @@ body.dark #composer .send-btn.ready,body.dark #composer .stop-btn { background:#
  #composer .composer-row { gap:2px; }
  #composer #btn-composer-menu,#composer #btn-attach { flex-basis:40px; width:40px; height:40px; min-height:40px; }
  #composer #wb-chat-controls { gap:2px; }
- #composer #wb-chat-controls #composer-agent,#composer #wb-chat-controls #composer-thinking { display:none; }
+ #composer #wb-chat-controls #composer-agent { display:none; }
+ #composer #wb-chat-controls #composer-thinking { display:inline-flex; flex:0 1 auto; max-width:80px; padding:7px 5px; min-height:40px; }
  #composer #wb-chat-controls #composer-model { flex:1 1 0; max-width:none; margin:0; padding:7px 6px; min-height:40px; }
  #composer #wb-chat-controls #composer-generation-options { display:inline-flex; flex:0 0 38px; width:38px; height:40px; padding:9px; position:relative; }
  #composer #wb-chat-controls #composer-generation-options .icon { width:18px; height:18px; }

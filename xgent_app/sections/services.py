@@ -2331,7 +2331,7 @@ async def _clear_current_conversation_inner():
     manager = get_conversations()
     scope = current_scope()
     state = await manager.state()
-    running = state.get('running')
+    running = state.get('runs', {}).get(scope.conversation_id)
     if running and running['conversation_id'] == scope.conversation_id:
         # Stop is requested before the atomic generation change. Do not wait on
         # a blocked upload/network read (or on our own task): stale writes are
@@ -2371,7 +2371,7 @@ async def _finish_conversation_deletion(cid):
         if task['conversation_id'] == cid:
             await SelfTriggerManager.cancel(task['id'])
     while True:
-        running = (await manager.state()).get('running')
+        running = (await manager.state()).get('runs', {}).get(cid)
         if not running or running['conversation_id'] != cid:
             break
         await manager.request_stop(running['run_id'], cid)

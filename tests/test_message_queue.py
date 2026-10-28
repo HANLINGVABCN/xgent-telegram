@@ -97,7 +97,7 @@ class MessageQueueTests(unittest.IsolatedAsyncioTestCase):
             await self.queue._task
         self.assertEqual(['B'], [i['text'] for group in self.delivered for i in group])
 
-    async def test_stop_pauses_all_and_resume_only_one(self):
+    async def test_stop_only_pauses_its_conversation_and_other_queue_keeps_running(self):
         b = (await self.manager.manage('create', name='B'))['conversation_id']
         with interaction('web', 'chat'):
             other = await self.manager.resolve(b)
@@ -106,19 +106,58 @@ class MessageQueueTests(unittest.IsolatedAsyncioTestCase):
             await self.submit('B', other)
             await self.manager.request_stop(current_scope().run_id)
             self.assertEqual([], await self.queue.claim_continuation())
-        for cid in (b, self.scope.conversation_id):
-            self.assertTrue((await self.queue.snapshot(cid))['paused'])
+        if self.queue._task:
+            await self.queue._task
+        self.assertTrue((await self.queue.snapshot(self.scope.conversation_id))['paused'])
+        self.assertFalse((await self.queue.snapshot(b))['paused'])
+        self.assertEqual(['B'], [item['text'] for batch in self.delivered for item in batch])
         await self.submit('A new')
         self.assertIsNone(await self.db.queue_head())
-        with bind_conversation(other):
-            await self.db.queue_resume(other, self.queue.instance)
-        self.assertEqual('B', (await self.db.queue_head())['text'])
+        with bind_conversation(self.scope):
+            await self.db.queue_resume(self.scope, self.queue.instance)
+        self.assertEqual('A', (await self.db.queue_head())['text'])
 
     async def test_failure_pauses_but_tool_nonzero_is_not_run_failure(self):
         async with self.manager.operation(self.scope, execution=True):
             await self.submit()
             mark_outcome('failed')
         self.assertTrue((await self.queue.snapshot(self.scope.conversation_id))['paused'])
+
+    async def test_scheduler_runs_b_while_a_is_waiting_and_a_failure_does_not_pause_b(self):
+        b = (await self.manager.manage('create', name='B'))['conversation_id']
+        with interaction('web', 'chat'):
+            other = await self.manager.resolve(b)
+        started = {self.scope.conversation_id: asyncio.Event(), b: asyncio.Event()}
+        release = {cid: asyncio.Event() for cid in started}
+        async def dispatch(batch):
+            cid = current_scope().conversation_id
+            started[cid].set()
+            await release[cid].wait()
+            if cid == self.scope.conversation_id:
+                raise RuntimeError('simulated A failure')
+        self.queue.dispatch = dispatch
+        await self.submit('A')
+        try:
+            await self.queue.poll()
+            # Exercise the reported workload: B arrives after A begins waiting.
+            # SQLite startup under asyncio debug is outside the concurrency assertion.
+            await asyncio.wait_for(started[self.scope.conversation_id].wait(), 20)
+            await self.submit('B', other)
+            await self.queue.poll()
+            await asyncio.wait_for(started[b].wait(), 20)
+            self.assertFalse(release[self.scope.conversation_id].is_set())
+            self.assertEqual(set(started), set((await self.manager.state())['runs']))
+            await self.submit('A waiting')
+            await self.submit('B waiting', other)
+            release[self.scope.conversation_id].set()
+            await self.queue._tasks[self.scope.conversation_id]
+            self.assertTrue((await self.queue.snapshot(self.scope.conversation_id))['paused'])
+            self.assertFalse((await self.queue.snapshot(b))['paused'])
+            self.assertIn(b, (await self.manager.state())['runs'])
+        finally:
+            for event in release.values():
+                event.set()
+            await asyncio.gather(*self.queue._tasks.values(), return_exceptions=True)
 
     async def test_failure_before_dispatch_pauses_instead_of_retrying_forever(self):
         item = await self.submit('must remain recoverable')

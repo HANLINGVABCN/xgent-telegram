@@ -19,8 +19,7 @@ async def settled(bot):
         queue = bot.get_text_queue()
         for _ in range(1000):
             await queue.poll()
-            task = queue._task
-            if (not task or task.done()) and not bot.get_conversations().lock.busy():
+            if not any(not task.done() for task in queue._tasks.values()) and not bot.get_conversations().busy():
                 head = await (await bot.BotMemoryDB.get_instance()).queue_head()
                 if not head or head['dispatch_instance'] != queue.instance:
                     return
@@ -118,7 +117,7 @@ async def native_telegram_delivery_failure(bot, root):
                 # The immutable full result also survives beyond the live round.
                 history = await h.db.get_conversation_messages(1000)
                 assert any(marker in str(m['content']) for m in history)
-                assert not bot.get_conversations().lock.busy()
+                assert not bot.get_conversations().busy()
                 return {'command_exactly_once': True, 'result_saved_before_network': True,
                         'model_and_queue_continue_while_tg_blocked': True,
                         'later_messages_not_paused': True, 'ordered_replay': True}

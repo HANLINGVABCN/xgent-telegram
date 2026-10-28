@@ -108,7 +108,7 @@ def runtime_health() -> Dict[str, Any]:
         "components": component_health(),
         "channels": get_channel_registry().stats(),
         "conversation": {
-            # 三端共用一个对话（这是逐条同步能成立的前提），所以"忙"是全局的。
+            # Health summarizes whether any local conversation is processing.
             "busy": _conversation_processing_lock.locked(),
         },
         "surfaces": {

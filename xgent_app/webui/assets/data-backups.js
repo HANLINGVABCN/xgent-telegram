@@ -25,9 +25,10 @@ export async function dataBackupCards({page,card,state={},dirtyForm=()=>{}}){
   let estimate=initialEstimate,rules=initialRules,catalog=initialCatalog;
   const categories=estimate.categories||[];
   const chosen=new Set(rules.categories||estimate.recommended_categories||estimate.selected_categories||categories.filter(item=>item.selected).map(item=>item.id));
-  let format=rules.archive_format||'zip',exportBusy=false,activating=false;
+  let format=rules.archive_format||'zip',exportBusy=false,activating=false,deleting=false;
   let estimateSerial=0,estimateTimer=null,estimateAbort=null,selectionSerial=0;
   let exportTimer=null,importTimer=null,importId=null,selectedName=null,currentSource='';
+  const deleteNames=new Set();
   const form=el('form',{class:'wb-backup-config-form'}),formFields=el('fieldset',{class:'wb-backup-config-fields'});
   const feedback=el('div',{class:'wb-backup-rule-feedback'}),exportProgress=el('div',{class:'wb-data-progress',role:'status','aria-live':'polite'});
   const totalText=el('strong',{class:'wb-backup-total'}),forecast=el('span',{class:'wb-backup-forecast'});
@@ -137,15 +138,24 @@ export async function dataBackupCards({page,card,state={},dirtyForm=()=>{}}){
   }
   function renderCatalog(next){
     catalog=next;const entries=el('div',{class:'wb-backup-entries'});
+    const available=new Set((catalog.items||[]).map(item=>item.name));
+    for(const name of deleteNames)if(!available.has(name))deleteNames.delete(name);
+    const selectionCount=el('span',{class:'wb-backup-delete-summary','aria-live':'polite'});
     for(const item of catalog.items||[]){
-      const box=el('input',{type:'checkbox','data-backup-name':item.name,'aria-label':'删除选择 '+item.name});
+      const box=el('input',{type:'checkbox',checked:deleteNames.has(item.name),'data-backup-name':item.name,'aria-label':'删除选择 '+item.name});
+      box.onchange=()=>{if(box.checked)deleteNames.add(item.name);else deleteNames.delete(item.name);syncDeleteSelection();};
       const choose=button('',()=>selectStored(item.name));choose.classList.add('wb-backup-entry-select');
       choose.append(el('strong',{},item.name),el('small',{},item.label+' · '+bytes(item.size)+' · '+new Date(item.created_at*1000).toLocaleString('zh-CN',{hour12:false})),el('small',{},(item.file_count==null?'文件数未知':item.file_count+' 个文件')+' · '+(item.archive_format||'ZIP').toUpperCase()),el('span',{class:'wb-backup-entry-types'},(item.categories||[]).slice(0,4).map(category=>el('span',{class:'wb-tag'},category.label)),(item.categories||[]).length>4?el('span',{class:'wb-tag'},'+'+(item.categories.length-4)+' 类'):null));
       choose.setAttribute('aria-pressed',String(selectedName===item.name));
       entries.append(el('div',{class:'wb-backup-entry'+(selectedName===item.name?' is-selected':''),'data-archive-name':item.name},box,choose,el('a',{class:'wb-btn',href:'/api/workbench/data/backup-download?name='+encodeURIComponent(item.name),download:''},'下载')));
     }
-    const remove=button('删除选中压缩包',async()=>{const names=[...listBox.querySelectorAll('[data-backup-name]:checked')].map(input=>input.dataset.backupName);if(!names.length){listFeedback.replaceChildren(message('请先勾选需要删除的压缩包。'));return;}if(!confirm('永久删除 '+names.length+' 个压缩包？此操作不可撤销。'))return;remove.disabled=true;try{if(names.includes(selectedName))await beginSelection('');renderCatalog(await wb('data/backups/delete',{data:{names,confirm:true}}));listFeedback.replaceChildren(message('压缩包已删除。','success'));}catch(error){listFeedback.replaceChildren(message(error.message));}finally{remove.disabled=false;}},'danger');
-    listBox.replaceChildren(el('p',{class:'wb-file-path'},'目录：',el('code',{},catalog.directory)),entries.childElementCount?entries:el('div',{class:'wb-empty'},el('h4',{},'还没有压缩包'),el('p',{},'立即压缩、自动压缩及导入前自动备份会显示在这里。')),el('div',{class:'wb-actions'},remove));
+    const remove=button('删除选中压缩包',async()=>{if(activating||deleting)return;const names=[...deleteNames];if(!names.length)return;if(!confirm('永久删除 '+names.length+' 个压缩包？此操作不可撤销。'))return;deleting=true;syncDeleteSelection();try{if(names.includes(selectedName))await beginSelection('');renderCatalog(await wb('data/backups/delete',{data:{names,confirm:true}}));listFeedback.replaceChildren(message('压缩包已删除。','success'));}catch(error){listFeedback.replaceChildren(message(error.message));}finally{deleting=false;renderCatalog(catalog);}},'danger');
+    function syncDeleteSelection(){selectionCount.textContent='已选 '+deleteNames.size+' / '+available.size+' 个';remove.disabled=activating||deleting||!deleteNames.size;selectAll.disabled=selectNone.disabled=activating||deleting||!available.size;for(const box of entries.querySelectorAll('[data-backup-name]'))box.disabled=activating||deleting;}
+    const selectAll=button('全选压缩包',()=>{for(const name of available)deleteNames.add(name);for(const box of entries.querySelectorAll('[data-backup-name]'))box.checked=true;syncDeleteSelection();});
+    const selectNone=button('全不选压缩包',()=>{deleteNames.clear();for(const box of entries.querySelectorAll('[data-backup-name]'))box.checked=false;syncDeleteSelection();});
+    selectAll.disabled=selectNone.disabled=!available.size;
+    listBox.replaceChildren(el('p',{class:'wb-file-path'},'目录：',el('code',{},catalog.directory)),el('div',{class:'wb-actions'},selectAll,selectNone,selectionCount),entries.childElementCount?entries:el('div',{class:'wb-empty'},el('h4',{},'还没有压缩包'),el('p',{},'立即压缩、自动压缩及导入前自动备份会显示在这里。')),el('div',{class:'wb-actions'},remove));
+    syncDeleteSelection();
   }
   async function refreshCatalog(){renderCatalog(await wb('data/backups'));}
   async function cancelScan(id){if(!id)return;try{await wb('data/import/cancel',{data:{id}});}catch{}}
@@ -181,21 +191,24 @@ export async function dataBackupCards({page,card,state={},dirtyForm=()=>{}}){
       const input=el('input',{type:'checkbox',checked:selected.has(item.id),'data-import-category':item.id,'aria-label':'导入 '+item.label});choiceInputs.set(item.id,input);
       input.onchange=()=>{if(input.checked){selected.add(item.id);for(const other of rows){if(other.id!==item.id&&((item.conflicts||[]).includes(other.id)||(other.conflicts||[]).includes(item.id))){selected.delete(other.id);choiceInputs.get(other.id).checked=false;}}}else selected.delete(item.id);syncImport();};
       const details=el('details',{class:'wb-import-content-group'},el('summary',{},el('strong',{},item.label),el('span',{},item.file_count+' 个文件 · '+bytes(item.size)+(item.item_count!=null?' · '+item.item_count+' 条记录':''))),item.description?el('p',{class:'wb-note'},item.description):null,el('p',{class:'wb-import-replacement'},'当前 '+(item.current_item_count!=null?item.current_item_count+' 条记录':item.current_file_count+' 个文件')+' / '+bytes(item.current_size)+' → 导入 '+item.file_count+' 个文件 / '+bytes(item.size)),el('p',{class:'wb-file-path'},'覆盖范围：'+(item.replace_paths||item.paths||[]).join(' · ')),item.entry_names?.length?el('p',{class:'wb-note'},'条目名称（不显示密钥值）：'+item.entry_names.join('、')):null,fileDetails(item));
-      groups.append(el('div',{class:'wb-import-select-row','data-import-row':item.id},input,details));
+      groups.append(el('div',{class:'wb-import-select-row','data-import-row':item.id},input,el('div',{},details,el('p',{class:'wb-note wb-import-covered',hidden:true}))));
     }
     const activate=button('确认覆盖并导入',async()=>{
       if(activating||importId!==job.id)return;
       if(!selected.size)return;
-      const labels=rows.filter(item=>selected.has(item.id)).map(item=>item.label).join('、');
+      const effective=effectiveSelection();
+      const labels=rows.filter(item=>effective.includes(item.id)).map(item=>item.label).join('、');
       if(!confirm('将停止服务，并覆盖 '+labels+'。这些类型中的旧内容会删除，不会合并。切换前会自动备份旧数据，随后重启服务。确认导入？'))return;
       activating=true;activate.disabled=true;file.disabled=true;for(const input of choiceInputs.values())input.disabled=true;
-      try{await wb('data/activate',{data:{id:job.id,categories:[...selected],confirm_replace:true}});previewBox.replaceChildren();pollImport(job.id,selectionSerial);}
+      try{await wb('data/activate',{data:{id:job.id,categories:effective,confirm_replace:true}});previewBox.replaceChildren();pollImport(job.id,selectionSerial);}
       catch(error){activating=false;file.disabled=false;for(const input of choiceInputs.values())input.disabled=false;importProgress.replaceChildren(message(error.message));syncImport();}
     },'danger');
-    function syncImport(){const included=rows.filter(item=>selected.has(item.id));selectionSummary.textContent='已选导入 '+included.length+' 部分 · '+bytes(included.reduce((sum,item)=>sum+(item.size||0),0));warningText.textContent=included.length?'将覆盖：'+included.map(item=>item.label).join('、'):'尚未选择导入部分；当前数据不会修改。';activate.disabled=!selected.size;for(const row of groups.querySelectorAll('[data-import-row]'))row.classList.toggle('is-selected',selected.has(row.dataset.importRow));}
-    const chooseAll=()=>{selected.clear();rows.filter(item=>!item.advanced).forEach(item=>selected.add(item.id));for(const [key,input] of choiceInputs)input.checked=selected.has(key);syncImport();};
-    const chooseNone=()=>{selected.clear();for(const input of choiceInputs.values())input.checked=false;syncImport();};
-    previewBox.replaceChildren(el('div',{class:'wb-import-summary'},el('strong',{},'可导入 '+rows.length+' 部分 · 压缩包 '+bytes(preview.size)),el('span',{class:'wb-tag'},(preview.archive_format||'ZIP').toUpperCase())),warning,el('div',{class:'wb-backup-section-head'},el('h4',{},'选择需要导入的部分'),el('div',{class:'wb-actions'},button('全选可导入部分',chooseAll),button('全不选导入部分',chooseNone))),groups,selectionSummary,el('p',{class:'wb-note'},'只有勾选部分会覆盖；完整数据库与独立数据库分类互斥。导入同时更新路径映射与恢复记录。'),activate);syncImport();
+    function covering(item){return rows.find(other=>selected.has(other.id)&&other.id!==item.id&&(other.id==='database'||other.id==='env')&&(other.conflicts||[]).includes(item.id));}
+    function effectiveSelection(){return rows.filter(item=>selected.has(item.id)&&!covering(item)).map(item=>item.id);}
+    function syncImport(){const effective=effectiveSelection(),included=rows.filter(item=>effective.includes(item.id));let count=0;for(const item of rows){const covered=covering(item),input=choiceInputs.get(item.id),row=groups.querySelector('[data-import-row="'+item.id+'"]'),note=row.querySelector('.wb-import-covered');input.checked=selected.has(item.id)||!!covered;input.disabled=activating||!!covered;row.classList.toggle('is-selected',input.checked);note.hidden=!covered;note.textContent=covered?'已包含在「'+covered.label+'」中，导入时不会重复覆盖。':'';if(input.checked)count++;}selectionSummary.textContent='已选导入 '+count+' 部分 / 共 '+rows.length+' 部分 · '+bytes(included.reduce((sum,item)=>sum+(item.size||0),0));warningText.textContent=included.length?'将覆盖：'+included.map(item=>item.label).join('、'):'尚未选择导入部分；当前数据不会修改。';activate.disabled=activating||!effective.length;}
+    const chooseAll=()=>{if(activating)return;selected.clear();rows.forEach(item=>selected.add(item.id));syncImport();};
+    const chooseNone=()=>{if(activating)return;selected.clear();for(const input of choiceInputs.values())input.checked=false;syncImport();};
+    previewBox.replaceChildren(el('div',{class:'wb-import-summary'},el('strong',{},'可导入 '+rows.length+' 部分 · 压缩包 '+bytes(preview.size)),el('span',{class:'wb-tag'},(preview.archive_format||'ZIP').toUpperCase())),warning,el('div',{class:'wb-backup-section-head'},el('h4',{},'选择需要导入的部分'),el('div',{class:'wb-actions'},button('全选可导入部分',chooseAll),button('全不选导入部分',chooseNone))),groups,selectionSummary,el('p',{class:'wb-note'},'全选包含高级恢复项。完整数据库或环境文件已包含的分项会一起勾选，提交时自动去重；取消完整文件后可单独选择分项。'),activate);syncImport();
   }
   async function pollImport(id,serial){
     clearTimeout(importTimer);if(serial!==selectionSerial)return;

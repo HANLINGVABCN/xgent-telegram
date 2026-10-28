@@ -167,6 +167,7 @@ body.dark .wb-source-link { color:#78caff; }.wb-source-cell small { display:bloc
 .wb-backup-content-table td:last-child small{display:block;color:var(--wb-muted);font-size:.8em;margin-top:4px;white-space:normal}
 .wb-import-select-row{display:flex;align-items:flex-start;gap:10px;border:1px solid var(--wb-border);border-radius:8px;padding:11px;min-width:0}
 .wb-import-select-row>input{flex-shrink:0;accent-color:var(--wb-accent);width:17px;height:17px;margin-top:3px}
+.wb-import-select-row>div{flex:1;min-width:0}
 .wb-import-select-row.is-selected{border-color:var(--wb-accent);background:color-mix(in srgb,var(--wb-accent) 4%,var(--wb-panel))}
 .wb-import-select-row .wb-import-content-group{border:0;padding:0;flex:1;min-width:0}
 .wb-import-selected-summary{display:block;line-height:1.6;margin-top:16px;font-size:.93em}

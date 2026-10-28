@@ -90,10 +90,11 @@ async def actual_tui(cli, scenario='routing'):
                         await work.manage('switch', b)
                         assert buf.text == 'B 草稿'
                         await keys('\r')
-                        assert len(calls) == 1 and buf.text == ''
+                        await wait_for(lambda: len(calls) == 2)
+                        assert {cid for cid, _ in calls} == {a,b} and buf.text == ''
                         pending = await cli._ns['get_text_queue']().snapshot(b)
-                        assert len(pending['items']) == 1 and pending['items'][0]['text'] == 'B 草稿'
-                        assert '本机流式开始' not in str(screen.model.render_rows())
+                        assert not pending['items']
+                        assert '本机流式开始' in str(screen.model.render_rows())
                         # F4 and Enter are real modal navigation, allowed while generating.
                         await keys('\x1bOS', .4)  # F4
                         assert app.current_buffer is not buf
@@ -101,10 +102,10 @@ async def actual_tui(cli, scenario='routing'):
                         assert app.current_buffer is buf
                         await keys('\x01\x0b/new 执行中新建\r', .5)
                         assert work.selected not in {a,b}
-                        assert buf.text == '' and len(calls) == 1
+                        assert buf.text == '' and len(calls) == 2
                         assert (await db.get_conversation_state())['current_chat_id'] == b
                         finish.set()
-                        await wait_for(lambda: len(calls) == 2 and not manager.lock.busy())
+                        await wait_for(lambda: len(calls) == 2 and not manager.busy(a) and not manager.busy(b))
                         await work.refresh_history(force=True)
                         assert '本机完整回复' not in str(screen.model.render_rows())
                         await work.manage('switch', a)
@@ -126,7 +127,7 @@ async def actual_tui(cli, scenario='routing'):
                             await keys('one submitted text\r\r', .3)
                             assert len(writes) == 1 and buf.text == 'one submitted text'
                             release_write.set()
-                            await wait_for(lambda: len(calls) == 1 and not manager.lock.busy())
+                            await wait_for(lambda: len(calls) == 1 and not manager.busy(a))
                         assert buf.text == ''
                     elif scenario == 'queue':
                         from prompt_toolkit.formatted_text import to_formatted_text
@@ -157,13 +158,13 @@ async def actual_tui(cli, scenario='routing'):
                         assert not (await cli._ns['get_text_queue']().snapshot(a))['items']
                         buf.reset()
                         await keys('paused input\r')
-                        await manager.request_stop(manager._run_id)
+                        await manager.request_stop((await manager.state())['runs'][a]['run_id'], a)
                         finish.set()
-                        await wait_for(lambda: not manager.lock.busy())
+                        await wait_for(lambda: not manager.busy(a))
                         assert (await cli._ns['get_text_queue']().snapshot(a))['paused']
                         await work.refresh_state()
                         await queue_click('[继续发送]')
-                        await wait_for(lambda: len(calls)==2 and not manager.lock.busy())
+                        await wait_for(lambda: len(calls)==2 and not manager.busy(a))
                     elif scenario == 'stale':
                         await keys('旧上下文草稿')
                         with bind_conversation(await manager.resolve(a, selector='terminal')):

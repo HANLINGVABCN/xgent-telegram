@@ -1912,6 +1912,7 @@ def _build_tui_hooks():
         conversation=_terminal_snapshot,
         conversation_items=lambda: _terminal_workspace.items if _terminal_workspace is not None else [],
         running=lambda: _terminal_frame.get('running') or {},
+        runs=lambda: _terminal_frame.get('runs') or {},
         completed=lambda: _terminal_workspace.finished if _terminal_workspace is not None else {},
         dispatch_scoped=_dispatch_tui,
         allow_busy_input=_allow_queued_input,

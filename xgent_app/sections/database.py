@@ -34,13 +34,21 @@ class BotMemoryDB(ConversationStore):
         """持写锁的显式事务：整段串行化，保证不会混入其他协程的写。"""
         async with self._write_lock:
             conn = await self._get_conn()
-            await conn.execute('BEGIN IMMEDIATE')
             try:
+                # Cancellation can arrive after SQLite starts BEGIN but before
+                # aiosqlite delivers its result; that path must also roll back.
+                await conn.execute('BEGIN IMMEDIATE')
                 yield conn
                 await conn.commit()
             except BaseException:
                 try:
-                    await conn.rollback()
+                    rollback = asyncio.create_task(conn.rollback())
+                    while not rollback.done():
+                        try:
+                            await asyncio.shield(rollback)
+                        except asyncio.CancelledError:
+                            continue
+                    rollback.result()
                 except Exception as rollback_err:
                     logger.error(f"事务回滚失败: {rollback_err}")
                 raise

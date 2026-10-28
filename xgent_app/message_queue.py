@@ -29,6 +29,7 @@ class MessageQueue:
         self._start_lock = asyncio.Lock()
         self._poll_lock = asyncio.Lock()
         self._task = None
+        self._tasks = {}
         self._closed = False
         self._revision = -1
 
@@ -91,7 +92,7 @@ class MessageQueue:
             await self.recover_sources(db)
             # Sync invalidations before notifying. A single monotonic revision is
             # shared across processes; the UI fetches only its selected queue.
-            head = await db.queue_head()
+            heads = await db.queue_heads()
             revision = await db.get_config_fresh('message_queue_revision', 0)
             if revision != self._revision:
                 if self.notify:
@@ -99,10 +100,14 @@ class MessageQueue:
                 self._revision = revision
             if self.receipts:
                 await self.receipts(db)
-            if (head and head['dispatch_instance'] == self.instance and not self.manager.lock.busy()
-                    and (self._task is None or self._task.done())):
-                self._task = asyncio.create_task(self._drain(head), name='queued-text-turn')
-                self.manager.track_background(self._task)
+            self._tasks = {cid: task for cid, task in self._tasks.items() if not task.done()}
+            for head in heads:
+                cid = head['conversation_id']
+                if (head['dispatch_instance'] == self.instance and cid not in self._tasks
+                        and not self.manager.busy(cid)):
+                    task = asyncio.create_task(self._drain(head), name='queued-text-turn:' + cid)
+                    self._tasks[cid] = self._task = task
+                    self.manager.track_background(task)
 
     async def _drain(self, head):
         if self._closed:
@@ -129,7 +134,8 @@ class MessageQueue:
             logging.getLogger(__name__).exception('排队消息执行失败；未领取消息保留暂停')
 
     async def claim_continuation(self):
-        if (self.manager.lock.fd is None or not current_scope().run_id
+        run = self.manager.runtime()
+        if (run is None or run.lock.fd is None or not current_scope().run_id
                 or self.manager._run_outcome in {'failed', 'stopped', 'interrupted'}):
             return []
         db = await self.manager.factory()

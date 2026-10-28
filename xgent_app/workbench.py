@@ -242,7 +242,7 @@ class Workbench:
                     return await service.withdraw_preview(cid, record_id)
                 if resource == 'conversations/withdraw':
                     async with self._mutation_lock:
-                        async with get_conversations().file_maintenance_slot():
+                        async with get_conversations().file_maintenance_slot(cid):
                             result = await service.withdraw(cid, record_id, data)
                     deleter = self.ns.get('_delete_withdrawn_telegram')
                     if callable(deleter):
@@ -450,7 +450,7 @@ class Workbench:
                 'last_cursor': found[-1]['history_cursor'] if found else None,
                 'conversation_id': current_scope().conversation_id,
                 'ui_generation': generation, 'ui_tombstones': tombstones, 'busy': self.ns['_web_is_busy'](),
-                'running': (await get_conversations().state()).get('running')}
+                'running': (await get_conversations().state()).get('runs', {}).get(current_scope().conversation_id)}
 
     async def search(self, data):
         if not str(data.get('q') or '').strip(): return {'messages': [], 'next_cursor': None}

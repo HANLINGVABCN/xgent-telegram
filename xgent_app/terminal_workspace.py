@@ -74,7 +74,10 @@ class TerminalWorkspace:
                 'revision': self.frame.get('terminal_revision', 0)}
 
     def on_state(self, frame):
-        old_run = self.frame.get('running') or {}
+        old_runs = self.frame.get('runs')
+        if old_runs is None:
+            old_run = self.frame.get('running')
+            old_runs = {old_run['conversation_id']: old_run} if old_run else {}
         self.frame = dict(frame)
         self.items = list(frame.get('items', self.items))
         snapshot = self.snapshot()
@@ -84,11 +87,17 @@ class TerminalWorkspace:
         self.screen.drop_conversations(existing)
         self.screen.select_conversation(snapshot['conversation_id'], snapshot['generation'])
         self.finished.pop(self.selected, None)
-        new_run = frame.get('running') or {}
-        if new_run.get('pid') == os.getpid():
-            self._local_runs[new_run['conversation_id']] = new_run['run_id']
-        if old_run and old_run.get('run_id') != new_run.get('run_id'):
+        new_runs = frame.get('runs')
+        if new_runs is None:
+            new_run = frame.get('running')
+            new_runs = {new_run['conversation_id']: new_run} if new_run else {}
+        for new_run in new_runs.values():
+            if new_run.get('pid') == os.getpid():
+                self._local_runs[new_run['conversation_id']] = new_run['run_id']
+        for old_run in old_runs.values():
             cid = old_run['conversation_id']
+            if new_runs.get(cid, {}).get('run_id') == old_run.get('run_id'):
+                continue
             if old_run.get('pid') == os.getpid() and not self._closed:
                 from types import SimpleNamespace
                 task = asyncio.create_task(self.end_run(SimpleNamespace(conversation_id=cid, run_id=old_run['run_id'])))

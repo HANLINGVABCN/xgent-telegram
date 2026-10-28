@@ -16,7 +16,7 @@ from pathlib import Path
 
 from xgent_app.conversations import (
     DEFAULT_CONVERSATION_ID, DEFAULT_CONVERSATION_NAME, SCHEMA_VERSION,
-    ConversationError, ExecutionFileLock, current_scope, require_conversation_id,
+    ConversationError, ConversationBusy, ExecutionFileLock, current_scope, require_conversation_id,
 )
 from xgent_app.queue_store import QueueStore, migrate_queue
 
@@ -337,6 +337,13 @@ class ConversationStore(QueueStore):
                     await flush_legacy_turn()
                 await self._repair_turn_and_branch_tokens(conn)
                 await _set_config(conn, 'conversation_schema_version', 6)
+            if version < 7:
+                legacy = await _config(conn, 'conversation_running')
+                runs = ({legacy['conversation_id']: {**legacy, 'legacy_lock': True}}
+                        if isinstance(legacy, dict) and legacy.get('conversation_id') else {})
+                await _set_config(conn, 'conversation_runs', runs)
+                await _set_config(conn, 'conversation_running', None)
+                await _set_config(conn, 'conversation_schema_version', 7)
         self._config_cache.clear()
 
     async def get_conversation_groups(self):
@@ -434,10 +441,11 @@ class ConversationStore(QueueStore):
             await conn.execute("UPDATE trigger_tasks SET status='cancelled',next_run_at=NULL,updated_at=? WHERE conversation_id=?", (now,cid))
             await conn.execute('UPDATE trigger_runs SET delivered_at=COALESCE(delivered_at,?) '
                                'WHERE task_id IN (SELECT id FROM trigger_tasks WHERE conversation_id=?)', (now,cid))
-            running = await _config(conn, 'conversation_running')
-            if running and running['conversation_id'] == cid:
+            runs = await _config(conn, 'conversation_runs', {})
+            running = runs.get(cid)
+            if running:
                 running['stop_requested'] = True
-                await _set_config(conn, 'conversation_running', running)
+                await _set_config(conn, 'conversation_runs', runs)
             if await _config(conn, 'current_chat_id') == cid:
                 await self._select_fallback(conn)
             if await _config(conn, 'telegram_conversation_id') == cid:
@@ -459,8 +467,8 @@ class ConversationStore(QueueStore):
                 return
             if not row['deleting']:
                 raise ConversationError('删除操作尚未确认。')
-            running = await _config(conn, 'conversation_running')
-            if running and running['conversation_id'] == cid:
+            runs = await _config(conn, 'conversation_runs', {})
+            if cid in runs:
                 raise ConversationError('正在停止该会话的回合，请稍候。')
             await conn.execute('DELETE FROM trigger_runs WHERE task_id IN (SELECT id FROM trigger_tasks WHERE conversation_id=?)', (cid,))
             await conn.execute('DELETE FROM trigger_tasks WHERE conversation_id=?', (cid,))
@@ -526,13 +534,14 @@ class ConversationStore(QueueStore):
         # One statement gives an atomic selection/revision/run snapshot.
         conn = await self._get_conn()
         cursor = await conn.execute("SELECT key,value FROM config WHERE key IN "
-                                    "('current_chat_id','telegram_conversation_id','conversation_revision','conversation_running')")
+                                    "('current_chat_id','telegram_conversation_id','conversation_revision','conversation_runs')")
         config = {row['key']: json.loads(row['value']) for row in await cursor.fetchall()}
         await cursor.close()
         return {'current_chat_id': config.get('current_chat_id', DEFAULT_CONVERSATION_ID),
                 'telegram_conversation_id': config.get('telegram_conversation_id'),
                 'revision': int(config.get('conversation_revision', 0)),
-                'running': config.get('conversation_running')}
+                'runs': config.get('conversation_runs', {}),
+                'running': config.get('conversation_runs', {}).get(config.get('current_chat_id', DEFAULT_CONVERSATION_ID))}
 
     async def manage_conversation(self, action, conversation_id=None, name=None, *, selector='shared', select=True):
         from xgent_app.interaction import selection_key
@@ -603,24 +612,27 @@ class ConversationStore(QueueStore):
 
     async def request_conversation_stop(self, run_id, conversation_id=None):
         async with self._transaction() as conn:
-            running = await _config(conn, 'conversation_running')
-            if not running or running.get('run_id') != run_id:
+            runs = await _config(conn, 'conversation_runs', {})
+            running = next((run for run in runs.values() if run.get('run_id') == run_id), None)
+            if not running:
                 return False
             if conversation_id and running.get('conversation_id') != conversation_id:
                 return False
             if running.get('stop_requested'):
                 return True
             running['stop_requested'] = True
-            await self._queue_pause_all(conn, 'stopped')
-            await _set_config(conn, 'conversation_running', running)
+            await self._queue_pause_conversation(conn, running['conversation_id'], 'stopped')
+            await _set_config(conn, 'conversation_runs', runs)
             await _set_config(conn, 'conversation_revision', int(await _config(conn, 'conversation_revision', 0)) + 1)
             return True
 
     async def finish_conversation_run(self, run_id):
         async with self._transaction() as conn:
-            running = await _config(conn, 'conversation_running')
-            if running and running.get('run_id') == run_id:
-                await _set_config(conn, 'conversation_running', None)
+            runs = await _config(conn, 'conversation_runs', {})
+            cid = next((cid for cid, run in runs.items() if run.get('run_id') == run_id), None)
+            if cid is not None:
+                del runs[cid]
+                await _set_config(conn, 'conversation_runs', runs)
                 await _set_config(conn, 'conversation_revision', int(await _config(conn, 'conversation_revision', 0)) + 1)
 
     async def reset_agent_iteration(self):
@@ -639,5 +651,10 @@ class ConversationStore(QueueStore):
 
     async def begin_conversation_run(self, running):
         async with self._transaction() as conn:
-            await _set_config(conn, 'conversation_running', running)
+            runs = await _config(conn, 'conversation_runs', {})
+            cid = running['conversation_id']
+            if cid in runs:
+                raise ConversationBusy('当前对话正在执行，请等待完成或停止该回合。')
+            runs[cid] = running
+            await _set_config(conn, 'conversation_runs', runs)
             await _set_config(conn, 'conversation_revision', int(await _config(conn, 'conversation_revision', 0)) + 1)

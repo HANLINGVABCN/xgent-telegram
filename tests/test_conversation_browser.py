@@ -163,6 +163,43 @@ def test_double_new_only_creates_one_chat(conversation_page, browser_context, wo
     assert after == before + 1
 
 
+def test_each_running_conversation_has_its_own_busy_state_and_stop_target(conversation_page, browser_context, workspace_url):
+    page = conversation_page
+    b = create(browser_context, workspace_url['url'], '独立运行 B')
+    page.evaluate('window.XGentConversations.refresh()')
+    page.wait_for_function('(id)=>window.XGentConversations.current===id', arg=b)
+    state = browser_context.request.get(workspace_url['url']+'/api/workbench/conversations').json()
+    a = 'global_memory'
+    state['revision'] += 100
+    state['runs'] = {a:{'conversation_id':a,'run_id':'run-a','name':'运行 A'},
+                     b:{'conversation_id':b,'run_id':'run-b','name':'运行 B'}}
+    state['running'] = state['runs'][b]
+    requests = []
+    page.route('**/api/workbench/conversations', lambda route: route.fulfill(json=state))
+    page.route('**/api/stop', lambda route: (requests.append(route.request.post_data_json), route.fulfill(json={'ok':True})))
+    page.locator('#input').fill('B 草稿')
+    page.evaluate('(state)=>window.XGentConversations.accept(state)', state)
+    assert row(page,a).locator('.conv-running-dot').is_visible()
+    assert row(page,b).locator('.conv-running-dot').is_visible()
+    assert page.locator('#btn-stop').is_visible()
+    state['revision'] += 1
+    del state['runs'][a]
+    page.evaluate('(state)=>window.XGentConversations.accept(state)', state)
+    assert page.locator('#btn-stop').is_visible()
+    assert page.locator('#input').input_value() == 'B 草稿'
+    with page.expect_request('**/api/stop') as stopped:
+        page.locator('#btn-stop').click()
+    payload = stopped.value.post_data_json
+    assert payload['conversation_id']==b and payload['run_id']=='run-b'
+    state['revision'] += 1
+    state['runs'] = {a:{'conversation_id':a,'run_id':'run-a2','name':'运行 A'}}
+    state['running'] = None
+    page.evaluate('(state)=>window.XGentConversations.accept(state)', state)
+    assert page.locator('#btn-stop').is_hidden()
+    assert page.locator('#btn-send').is_enabled()
+    assert page.locator('#input').input_value() == 'B 草稿'
+
+
 def test_mobile_drawer_keyboard_backdrop_and_resize(conversation_page, tmp_path):
     page = conversation_page
     page.set_viewport_size({'width': 390, 'height': 844})
@@ -266,6 +303,7 @@ def test_background_generation_is_marked_and_stop_uses_original_run(conversation
     b = create(browser_context, workspace_url['url'], '当前查看的对话')
     payload = browser_context.request.get(workspace_url['url'] + '/api/workbench/conversations').json()
     payload['running'] = {'run_id': 'original-run', 'conversation_id': a, 'name': '后台继续执行的任务'}
+    payload['runs'] = {a:payload['running']}
     page.evaluate('(state)=>window.XGentConversations.accept(state)', payload)
     assert current(page) == b
     assert row(page, a).locator('.conv-running-dot').is_visible()

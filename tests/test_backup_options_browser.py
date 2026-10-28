@@ -8,7 +8,7 @@ from tests.test_workbench_browser import browser_context, workspace_url, ready  
 from xgent_app.data_contents import CATEGORIES, RECOMMENDED_CATEGORIES
 
 
-def backup_api(page):
+def backup_api(page, import_keys=None):
     records = []
     categories = [{**item, "size": 0, "file_count": 0, "files": []} for item in CATEGORIES]
     by_id = {item["id"]: item for item in categories}
@@ -69,7 +69,7 @@ def backup_api(page):
             result = catalog()
         elif resource == "import-stored":
             output = data["name"].endswith("xz")
-            result = import_job(("b" if output else "a") * 32, data["name"], ["command_outputs"] if output else ["secrets", "ai_config", "memory"])
+            result = import_job(("b" if output else "a") * 32, data["name"], import_keys or (["command_outputs"] if output else ["secrets", "ai_config", "memory"]))
         elif resource == "import":result = import_job("c" * 32, "uploaded.zip", ["memory"])
         elif resource == "import/cancel":
             if data["id"] in jobs:jobs[data["id"]]["state"] = "cancelled"
@@ -226,6 +226,51 @@ def test_advanced_export_deselects_conflicting_independent_parts(browser_context
     assert not page.get_by_label("导出 密钥与登录凭据", exact=True).is_checked()
     page.get_by_label("导出 AI 与模型配置", exact=True).check()
     assert not page.get_by_label("导出 完整数据库（高级）", exact=True).is_checked()
+    page.close()
+
+
+@pytest.mark.parametrize('keys', [
+    ['secrets', 'runtime_state', 'memory'],
+    ['secrets', 'ai_config', 'app_settings', 'conversation_history', 'runtime_state', 'env', 'database', 'memory'],
+])
+def test_import_all_checks_advanced_and_covered_parts_without_duplicate_restore(browser_context, workspace_url, keys):
+    page = browser_context.new_page(); records = backup_api(page, keys)
+    page.on('dialog', lambda dialog: dialog.accept())
+    open_backups(page, workspace_url['url'])
+    page.locator('[data-archive-name="manual-fixture.zip"] .wb-backup-entry-select').click()
+    page.get_by_role('button', name='确认覆盖并导入', exact=True).wait_for()
+    page.get_by_role('button', name='全不选导入部分', exact=True).click()
+    assert page.locator('[data-import-category]:checked').count() == 0
+    page.get_by_role('button', name='全选可导入部分', exact=True).click()
+    assert page.locator('[data-import-category]:checked').count() == len(keys)
+    assert '已选导入 '+str(len(keys))+' 部分' in page.locator('.wb-import-selected-summary').inner_text()
+    if 'database' in keys:
+        assert page.locator('.wb-import-covered:not([hidden])').count() == 5
+        assert page.get_by_label('导入 待发送队列与运行状态', exact=True).is_checked()
+    page.get_by_role('button', name='确认覆盖并导入', exact=True).click()
+    page.get_by_text('导入完成，所覆盖的旧内容已清理。', exact=True).wait_for()
+    submitted = next(data['categories'] for resource, data in records if resource == 'activate')
+    assert set(submitted) == ({'env','database','memory'} if 'database' in keys else set(keys))
+    page.close()
+
+
+def test_catalog_select_all_none_and_refresh_do_not_scan_archives(browser_context, workspace_url):
+    page = browser_context.new_page(); records = backup_api(page)
+    page.on('dialog', lambda dialog: dialog.accept())
+    open_backups(page, workspace_url['url'])
+    page.get_by_role('button', name='全选压缩包', exact=True).click()
+    assert page.locator('[data-backup-name]:checked').count() == 2
+    page.get_by_role('button', name='刷新列表', exact=True).click()
+    assert page.locator('[data-backup-name]:checked').count() == 2
+    assert not any(resource == 'import-stored' for resource, _ in records)
+    page.get_by_role('button', name='全不选压缩包', exact=True).click()
+    assert page.locator('[data-backup-name]:checked').count() == 0
+    assert page.get_by_role('button', name='删除选中压缩包', exact=True).is_disabled()
+    page.get_by_role('button', name='全选压缩包', exact=True).click()
+    page.get_by_role('button', name='删除选中压缩包', exact=True).click()
+    page.get_by_text('还没有压缩包', exact=True).wait_for()
+    assert page.get_by_role('button', name='全选压缩包', exact=True).is_disabled()
+    assert set(next(data['names'] for resource, data in records if resource=='backups/delete')) == {'manual-fixture.zip','manual-output.tar.xz'}
     page.close()
 
 

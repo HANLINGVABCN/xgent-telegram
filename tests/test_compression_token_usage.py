@@ -121,7 +121,7 @@ async def compression_usage_probe(bot, directory, surface='telegram', outcome='s
                 'model_has_tokens': '↑ 1200 tokens' in str(model_history),
                 'after_summary': bool(summaries and token_positions and max(summaries) < min(token_positions)),
                 'completed': bool(entry and entry['status'] == 'completed'),
-                'busy': bot._is_processing or bot._compression_running or bot.get_conversations().lock.busy(),
+                'busy': bot._is_processing or bot._compression_running or bot.get_conversations().busy(),
                 'state_events': [frame for frame in frames if frame['type'] == 'compression_state'],
                 'original': original, 'selected': (await bot.get_conversations().state())['current_chat_id'],
                 'switched_to': target,
