@@ -22,9 +22,9 @@ def test_touch_menu_and_logout_do_not_depend_on_workbench(touch_context,workspac
     expect=pytest.importorskip('playwright.sync_api').expect
     page=touch_context.new_page();sent=[]
     page.route('**/api/command',lambda r:(sent.append(r.request.post_data_json),r.fulfill(json={'ok':True})))
-    if failure=='workbench_404':page.route('**/assets/workbench.js',lambda r:r.fulfill(status=404,body='not found'))
-    elif failure=='dependency_404':page.route('**/assets/page-cache.js',lambda r:r.fulfill(status=404,body='not found'))
-    elif failure=='syntax_error':page.route('**/assets/workbench.js',lambda r:r.fulfill(content_type='text/javascript',body='export const broken = ;'))
+    if failure=='workbench_404':page.route('**/assets/workbench.js*',lambda r:r.fulfill(status=404,body='not found'))
+    elif failure=='dependency_404':page.route('**/assets/page-cache.js*',lambda r:r.fulfill(status=404,body='not found'))
+    elif failure=='syntax_error':page.route('**/assets/workbench.js*',lambda r:r.fulfill(content_type='text/javascript',body='export const broken = ;'))
     else:page.add_init_script("Storage.prototype.getItem=function(){throw new DOMException('storage blocked','SecurityError')};Storage.prototype.removeItem=function(){throw new DOMException('storage blocked','SecurityError')};Storage.prototype.setItem=function(){throw new DOMException('storage blocked','SecurityError')};")
     page.goto(workspace_url['url']);page.wait_for_function('!!window.XGentChat && !document.getElementById("btn-send").disabled')
     assert not page.evaluate('!!window.XGentWorkbench')
@@ -52,7 +52,7 @@ def test_optional_page_import_failure_is_local_to_that_page(touch_context,worksp
     expect=pytest.importorskip('playwright.sync_api').expect
     page=touch_context.new_page();reads=[]
     page.on('request',lambda r:reads.append(r.url))
-    page.route('**/assets/'+module+'.js',lambda r:r.fulfill(status=404,body='not found'))
+    page.route('**/assets/'+module+'.js*',lambda r:r.fulfill(status=404,body='not found'))
     page.goto(workspace_url['url']);page.wait_for_function('document.getElementById("composer-model")?.disabled===false')
     assert not any('/assets/'+module+'.js' in url for url in reads)
     page.locator('#btn-composer-menu').tap();expect(page.locator('#composer-commands')).to_be_visible();page.keyboard.press('Escape')
@@ -66,7 +66,7 @@ def test_optional_page_import_failure_is_local_to_that_page(touch_context,worksp
 def test_failure_fallback_retry_and_no_duplicate_logout(touch_context,workspace_url):
     expect=pytest.importorskip('playwright.sync_api').expect
     page=touch_context.new_page();requests=[]
-    page.route('**/assets/workbench.js',lambda r:r.abort())
+    page.route('**/assets/workbench.js*',lambda r:r.abort())
     page.route('**/api/workbench/bootstrap',lambda r:r.fulfill(status=503,json={'error':'fixture offline'}))
     page.goto(workspace_url['url']);page.wait_for_function('!!window.XGentChat')
     page.locator('#btn-composer-menu').tap()
@@ -88,7 +88,7 @@ def test_fallback_request_timeout_is_visible(touch_context,workspace_url):
     expect=pytest.importorskip('playwright.sync_api').expect
     page=touch_context.new_page()
     page.add_init_script("const timer=window.setTimeout;window.setTimeout=(fn,ms,...args)=>timer(fn,ms===12000?100:ms,...args);")
-    page.route('**/assets/workbench.js',lambda r:r.abort())
+    page.route('**/assets/workbench.js*',lambda r:r.abort())
     page.route('**/api/workbench/bootstrap',lambda r:None)
     page.goto(workspace_url['url']);page.wait_for_function('!!window.XGentChat')
     page.locator('#btn-composer-menu').tap()
@@ -138,7 +138,7 @@ def test_composer_menu_is_anchored_nonmodal_toggle_and_outside_dismiss(touch_con
 
 def test_menu_dismissed_request_cannot_reopen_and_dangerous_command_confirms(touch_context,workspace_url):
     expect=pytest.importorskip('playwright.sync_api').expect
-    page=touch_context.new_page();page.route('**/assets/workbench.js',lambda r:r.abort())
+    page=touch_context.new_page();page.route('**/assets/workbench.js*',lambda r:r.abort())
     reads=[];page.route('**/api/workbench/bootstrap',lambda r:reads.append(r))
     page.goto(workspace_url['url']);page.wait_for_function('!!window.XGentChat && !document.getElementById("btn-send").disabled')
     page.locator('#btn-composer-menu').tap();expect(page.locator('#composer-commands')).to_contain_text('正在读取')

@@ -60,16 +60,15 @@ def test_backup_ui_is_explicit_separate_from_chat(browser_context, workspace_url
     page = browser_context.new_page()
     ready(page, workspace_url["url"], "settings")
     page.get_by_role("tab", name="数据与备份", exact=True).click()
-    page.get_by_role("button", name="创建核心数据备份").wait_for()
-    checkbox = page.get_by_role(
-        "checkbox", name="包含历史命令完整回执 command_outputs/（默认不选）"
-    )
+    page.get_by_role("button", name="立即压缩", exact=True).wait_for()
+    checkbox = page.get_by_role("checkbox", name="导出 命令完整输出", exact=True)
     assert not checkbox.is_checked()
     text = page.locator("#wb-page").inner_text()
-    assert "不含命令回执不会影响聊天" in text
-    assert "服务器备份文件" in text
-    assert page.get_by_role("button", name="上传并校验本地备份").count() == 1
-    assert page.get_by_role("button", name="校验所选服务器备份").count() == 1
+    assert "后台压缩，不停服、不重启" in text
+    assert "点击名称，右侧立即扫描内容" in text
+    assert "选择后立即上传并扫描，不会直接导入" in text
+    assert page.get_by_role("button", name="上传压缩包", exact=True).count() == 1
+    assert page.get_by_label("上传压缩包以扫描内容", exact=True).count() == 1
     page.close()
 
 
