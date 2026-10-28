@@ -375,6 +375,61 @@ class ConversationBranchingTests(unittest.IsolatedAsyncioTestCase):
         for item in (first, second, third):
             self.assertLessEqual(len(item['name']), 80)
 
+    def test_incremental_snapshot_reuses_unchanged_file_digests_without_rereading(self):
+        project = Path(self.temp.name) / 'incremental-project'
+        project.mkdir()
+        (project / 'stable.py').write_text('print("stable")\n', encoding='utf-8')
+        (project / 'mutable.py').write_text('v1\n', encoding='utf-8')
+        objects = Path(self.temp.name) / 'incremental-objects'
+        first = capture_manifest(project, objects)
+        self.assertEqual(2, first['file_count'])
+
+        with patch('xgent_app.conversation_branching._digest_file') as mocked_digest:
+            second = capture_manifest(project, objects)
+            self.assertEqual(0, mocked_digest.call_count)
+        self.assertEqual(first['root_digest'], second['root_digest'])
+
+        # Modifying only mutable.py hashes only the changed file and updates root_digest.
+        (project / 'mutable.py').write_text('v2-modified\n', encoding='utf-8')
+        from xgent_app.conversation_branching import _digest_file as real_digest
+        digested_paths = []
+
+        def spy_digest(path, *args, **kwargs):
+            digested_paths.append(Path(path).name)
+            return real_digest(path, *args, **kwargs)
+
+        with patch('xgent_app.conversation_branching._digest_file', side_effect=spy_digest):
+            third = capture_manifest(project, objects)
+        self.assertNotEqual(first['root_digest'], third['root_digest'])
+        self.assertIn('mutable.py', digested_paths)
+        self.assertNotIn('stable.py', digested_paths)
+
+    async def test_unchanged_turn_reuses_snapshot_without_duplicating_entries(self):
+        scope = await self.manager.resolve()
+        async with self.manager.operation(scope, execution=True):
+            user = await self.db.record_global_message(1, 1, 'user_text', 'user', '纯聊天不改文件')
+            await self.db.record_global_message(1, 0, 'ai_reply', 'assistant', '收到')
+        conn = await self.db._get_conn()
+        cursor = await conn.execute('SELECT * FROM conversation_turns ORDER BY started_at DESC LIMIT 1')
+        turn = dict(await cursor.fetchone())
+        await cursor.close()
+        self.assertTrue(turn['snapshot_complete'])
+        self.assertEqual(turn['before_snapshot_id'], turn['after_snapshot_id'])
+        cursor = await conn.execute('SELECT COUNT(*) n FROM conversation_snapshots WHERE conversation_id=?',
+                                    (scope.conversation_id,))
+        self.assertEqual(1, (await cursor.fetchone())['n'])
+        await cursor.close()
+        preview = await self.service.withdraw_preview('global_memory', user)
+        self.assertTrue(preview['can_withdraw'])
+
+    def test_snapshot_aborts_immediately_when_cancelled(self):
+        project = Path(self.temp.name) / 'cancel-project'
+        project.mkdir()
+        (project / 'a.txt').write_text('hello\n', encoding='utf-8')
+        objects = Path(self.temp.name) / 'cancel-objects'
+        with self.assertRaisesRegex(BranchingError, '取消或停止'):
+            capture_manifest(project, objects, should_cancel=lambda: True)
+
 
 if __name__ == '__main__':
     unittest.main()

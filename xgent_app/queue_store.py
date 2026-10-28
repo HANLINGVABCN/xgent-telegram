@@ -175,6 +175,11 @@ class QueueStore:
                 raise ConversationChanged('队列已更新，请在当前消息上重试。')
             await conn.execute('UPDATE message_queue SET status=?,reason=?,revision=revision+1,updated_at=?,edit_request_id=? WHERE id=?',
                                ('edited' if action == 'edit' else 'cancelled', '', time.time(), request_id, identifier))
+            if not await one(conn, "SELECT 1 FROM message_queue WHERE conversation_id=? AND status='pending' LIMIT 1", (cid,)):
+                from . import conversations
+                mgr = getattr(conversations, '_manager', None)
+                if mgr is not None and getattr(mgr, '_admission_cid', None) == cid:
+                    mgr._admission_cancelled = True
             await bump(conn)
             return await one(conn, 'SELECT * FROM message_queue WHERE id=?', (identifier,))
 

@@ -39,6 +39,8 @@ _EXCLUDED_NAMES = frozenset({
 })
 _NODEQUALITY_RUNTIME = re.compile(r'^\.nodequality\d')
 TURN_SNAPSHOT_TIMEOUT = 10.0
+_STAT_CACHE: dict[str, dict[str, dict[str, Any]]] = {}
+_STAT_INDEX_FILE = '.stat-index.tmp'
 
 
 class BranchingError(ConversationError):
@@ -139,37 +141,41 @@ def _git_exclude(relative: str) -> str:
     return f'/{escaped}/'
 
 
-def _check_deadline(deadline: float | None) -> None:
+def _check_deadline(deadline: float | None, should_cancel: Any = None) -> None:
+    if callable(should_cancel) and should_cancel():
+        raise BranchingError('文件快照已因任务取消或停止而中断')
     if deadline is not None and time.monotonic() >= deadline:
         raise BranchingError(
             f'文件快照超过 {TURN_SNAPSHOT_TIMEOUT:g} 秒安全上限，已跳过精确文件快照')
 
 
-def _command_timeout(deadline: float | None, maximum: float = 30.0) -> float:
+def _command_timeout(deadline: float | None, maximum: float = 30.0,
+                     should_cancel: Any = None) -> float:
+    _check_deadline(deadline, should_cancel)
     if deadline is None:
         return maximum
-    _check_deadline(deadline)
     return max(0.1, min(maximum, deadline - time.monotonic()))
 
 
-def _git_paths(root: Path, mounts: set[str], deadline: float | None = None) -> set[str] | None:
+def _git_paths(root: Path, mounts: set[str], deadline: float | None = None,
+               should_cancel: Any = None) -> set[str] | None:
     try:
         tracked = subprocess.run(
             ['git', '-C', str(root), 'ls-files', '-c', '-z'], check=True,
-            capture_output=True, timeout=_command_timeout(deadline),
+            capture_output=True, timeout=_command_timeout(deadline, should_cancel=should_cancel),
         )
         untracked = subprocess.run(
             ['git', '-C', str(root), 'ls-files', '-o', '--exclude-standard',
              '--exclude=/.nodequality[0-9]*/',
              *(f'--exclude={_git_exclude(mount)}' for mount in sorted(mounts)), '-z'],
-            check=True, capture_output=True, timeout=_command_timeout(deadline),
+            check=True, capture_output=True, timeout=_command_timeout(deadline, should_cancel=should_cancel),
         )
     except subprocess.TimeoutExpired as exc:
         raise BranchingError(
             f'文件快照超过 {TURN_SNAPSHOT_TIMEOUT:g} 秒安全上限，已跳过精确文件快照') from exc
     except (OSError, subprocess.CalledProcessError):
         return None
-    _check_deadline(deadline)
+    _check_deadline(deadline, should_cancel)
     return {
         _safe_relative(raw.decode('utf-8', errors='surrogateescape'))
         for raw in (tracked.stdout + untracked.stdout).split(b'\0') if raw
@@ -177,7 +183,7 @@ def _git_paths(root: Path, mounts: set[str], deadline: float | None = None) -> s
 
 
 def _walk_tree(root: Path, relative_root: str = '', mounts: set[str] | None = None,
-               deadline: float | None = None) -> set[str]:
+               deadline: float | None = None, should_cancel: Any = None) -> set[str]:
     mounts = mounts or set()
     if relative_root and _inside_mount(relative_root, mounts):
         return set()
@@ -186,7 +192,7 @@ def _walk_tree(root: Path, relative_root: str = '', mounts: set[str] | None = No
         return set()
     found: set[str] = set()
     for parent, directories, filenames in os.walk(base, followlinks=False):
-        _check_deadline(deadline)
+        _check_deadline(deadline, should_cancel)
         parent_path = Path(parent)
         kept = []
         for name in directories:
@@ -198,7 +204,7 @@ def _walk_tree(root: Path, relative_root: str = '', mounts: set[str] | None = No
             kept.append(name)
         directories[:] = kept
         for name in filenames:
-            _check_deadline(deadline)
+            _check_deadline(deadline, should_cancel)
             path = parent_path / name
             relative = path.relative_to(root).as_posix()
             if not path.is_symlink() and not _excluded(relative):
@@ -206,18 +212,19 @@ def _walk_tree(root: Path, relative_root: str = '', mounts: set[str] | None = No
     return found
 
 
-def managed_paths(root: str | Path, deadline: float | None = None) -> list[str]:
+def managed_paths(root: str | Path, deadline: float | None = None,
+                  should_cancel: Any = None) -> list[str]:
     root = Path(root).resolve()
     mounts = _nested_mounts(root)
-    _check_deadline(deadline)
-    paths = _git_paths(root, mounts, deadline)
+    _check_deadline(deadline, should_cancel)
+    paths = _git_paths(root, mounts, deadline, should_cancel)
     if paths is None:
-        paths = _walk_tree(root, mounts=mounts, deadline=deadline)
+        paths = _walk_tree(root, mounts=mounts, deadline=deadline, should_cancel=should_cancel)
     for tree in _STATE_TREES:
-        paths.update(_walk_tree(root, tree, mounts, deadline))
+        paths.update(_walk_tree(root, tree, mounts, deadline, should_cancel))
 
     def regular(relative: str) -> bool:
-        _check_deadline(deadline)
+        _check_deadline(deadline, should_cancel)
         try:
             return stat.S_ISREG((root / relative).lstat().st_mode)
         except OSError:
@@ -252,12 +259,13 @@ def _open_regular(path: Path):
         handle.close()
 
 
-def _digest_file(path: Path, deadline: float | None = None) -> tuple[int, str, int]:
+def _digest_file(path: Path, deadline: float | None = None,
+                 should_cancel: Any = None) -> tuple[int, str, int]:
     digest = hashlib.sha256()
     size = 0
     with _open_regular(path) as (handle, before):
         for chunk in iter(lambda: handle.read(1024 * 1024), b''):
-            _check_deadline(deadline)
+            _check_deadline(deadline, should_cancel)
             size += len(chunk)
             digest.update(chunk)
         after = os.fstat(handle.fileno())
@@ -267,11 +275,68 @@ def _digest_file(path: Path, deadline: float | None = None) -> tuple[int, str, i
     return size, digest.hexdigest(), stat.S_IMODE(after.st_mode)
 
 
+def _stat_signature(st: os.stat_result) -> list[int]:
+    return [
+        int(st.st_dev),
+        int(st.st_ino),
+        int(st.st_size),
+        int(getattr(st, 'st_mtime_ns', int(st.st_mtime * 1e9))),
+        int(getattr(st, 'st_ctime_ns', int(st.st_ctime * 1e9))),
+        stat.S_IMODE(st.st_mode),
+    ]
+
+
+def _load_stat_index(objects: Path, root_key: str) -> dict[str, dict[str, Any]]:
+    cache_key = f'{objects}::{root_key}'
+    if cache_key in _STAT_CACHE:
+        return _STAT_CACHE[cache_key]
+    index_path = objects / _STAT_INDEX_FILE
+    data: dict[str, dict[str, Any]] = {}
+    if index_path.is_file():
+        with contextlib.suppress(Exception):
+            raw = json.loads(index_path.read_text(encoding='utf-8'))
+            if isinstance(raw, dict) and isinstance(raw.get(root_key), dict):
+                data = raw[root_key]
+    _STAT_CACHE[cache_key] = data
+    return data
+
+
+def _save_stat_index(objects: Path, root_key: str, entries: dict[str, dict[str, Any]]) -> None:
+    cache_key = f'{objects}::{root_key}'
+    _STAT_CACHE[cache_key] = entries
+    if not objects.is_dir():
+        return
+    index_path = objects / _STAT_INDEX_FILE
+    all_roots: dict[str, Any] = {}
+    if index_path.is_file():
+        with contextlib.suppress(Exception):
+            loaded = json.loads(index_path.read_text(encoding='utf-8'))
+            if isinstance(loaded, dict):
+                all_roots = loaded
+    all_roots[root_key] = entries
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='w', encoding='utf-8', dir=objects,
+            prefix='.stat-index-', suffix='.tmp', delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(all_roots, handle, ensure_ascii=False)
+            handle.flush()
+        os.replace(temporary, index_path)
+        temporary = None
+    except OSError:
+        pass
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def _store_object(source: Path, sha256: str, objects: Path,
-                  deadline: float | None = None) -> Path:
+                  deadline: float | None = None, should_cancel: Any = None) -> Path:
     target = objects / sha256[:2] / sha256[2:]
     if target.is_file():
-        _size, digest, _ = _digest_file(target, deadline)
+        _size, digest, _ = _digest_file(target, deadline, should_cancel)
         if digest != sha256:
             raise BranchingError('内容对象校验失败，拒绝覆盖')
         return target
@@ -282,11 +347,11 @@ def _store_object(source: Path, sha256: str, objects: Path,
             temporary = Path(handle.name)
             with _open_regular(source) as (incoming, _opened):
                 for chunk in iter(lambda: incoming.read(1024 * 1024), b''):
-                    _check_deadline(deadline)
+                    _check_deadline(deadline, should_cancel)
                     handle.write(chunk)
             handle.flush()
             os.fsync(handle.fileno())
-        _size, digest, _mode = _digest_file(temporary, deadline)
+        _size, digest, _mode = _digest_file(temporary, deadline, should_cancel)
         if digest != sha256:
             raise BranchingError(f'文件在对象存储期间变化：{source}')
         os.chmod(temporary, 0o400)
@@ -302,30 +367,78 @@ def _store_object(source: Path, sha256: str, objects: Path,
 
 
 def capture_manifest(root: str | Path, objects: str | Path, *,
-                     timeout: float | None = None) -> dict[str, Any]:
+                     timeout: float | None = None, should_cancel: Any = None) -> dict[str, Any]:
     root, objects = Path(root).resolve(), Path(objects).resolve()
     if not root.is_dir():
         raise BranchingError(f'工作区不存在：{root}')
     deadline = time.monotonic() + timeout if timeout is not None else None
+    root_key = str(root)
+    previous_index = _load_stat_index(objects, root_key)
+    next_index: dict[str, dict[str, Any]] = {}
+    index_dirty = False
     entries, total = [], 0
     digest = hashlib.sha256()
-    for relative in managed_paths(root, deadline):
-        _check_deadline(deadline)
+    paths = (managed_paths(root, deadline) if should_cancel is None
+             else managed_paths(root, deadline, should_cancel))
+    for relative in paths:
+        _check_deadline(deadline, should_cancel)
         path = root / relative
-        size, sha256, mode = _digest_file(path, deadline)
-        object_path = _store_object(path, sha256, objects, deadline)
+        cached = previous_index.get(relative)
+        reused = False
+        if isinstance(cached, dict):
+            try:
+                src_st = path.lstat()
+                if stat.S_ISREG(src_st.st_mode) and cached.get('src_sig') == _stat_signature(src_st):
+                    sha256 = str(cached['sha256'])
+                    target = objects / sha256[:2] / sha256[2:]
+                    obj_st = target.lstat()
+                    if stat.S_ISREG(obj_st.st_mode) and cached.get('obj_sig') == _stat_signature(obj_st):
+                        size = int(src_st.st_size)
+                        mode = stat.S_IMODE(src_st.st_mode)
+                        object_path = target
+                        next_index[relative] = cached
+                        reused = True
+            except (OSError, KeyError, TypeError, ValueError):
+                reused = False
+        if not reused:
+            size, sha256, mode = _digest_file(path, deadline, should_cancel)
+            object_path = _store_object(path, sha256, objects, deadline, should_cancel)
+            try:
+                next_index[relative] = {
+                    'src_sig': _stat_signature(path.lstat()),
+                    'obj_sig': _stat_signature(Path(object_path).lstat()),
+                    'sha256': sha256,
+                }
+                index_dirty = True
+            except OSError:
+                pass
         entry = {'path': relative, 'sha256': sha256, 'size': size, 'mode': mode,
                  'object_path': str(object_path)}
         entries.append(entry)
         total += size
         digest.update(relative.encode('utf-8', errors='surrogateescape'))
         digest.update(b'\0' + sha256.encode() + b'\0' + str(mode).encode() + b'\n')
+    if index_dirty or set(next_index) != set(previous_index):
+        _save_stat_index(objects, root_key, next_index)
     return {'root_digest': digest.hexdigest(), 'entries': entries,
             'file_count': len(entries), 'total_size': total}
 
 
 async def save_snapshot(db, conversation_id: str, turn_id: str | None, phase: str,
                         manifest: dict[str, Any]) -> str:
+    conn = await db._get_conn()
+    cursor = await conn.execute(
+        '''SELECT s.id FROM conversation_snapshots s
+           WHERE s.conversation_id=? AND s.root_digest=? AND s.file_count=? AND s.total_size=?
+           AND (SELECT COUNT(*) FROM snapshot_entries e WHERE e.snapshot_id=s.id)=?
+           ORDER BY s.created_at DESC LIMIT 1''',
+        (conversation_id, manifest['root_digest'], manifest['file_count'],
+         manifest['total_size'], manifest['file_count']),
+    )
+    existing = await cursor.fetchone()
+    await cursor.close()
+    if existing is not None:
+        return existing['id']
     snapshot_id = uuid.uuid4().hex
     now = time.time()
     async with db._transaction() as conn:
@@ -540,14 +653,17 @@ async def repair_restored_workspaces(db, code_root: str | Path) -> None:
                                     (str(expected), session['id']))
 
 
-async def begin_turn(db, scope, code_root: str | Path, objects: str | Path) -> str:
+async def begin_turn(db, scope, code_root: str | Path, objects: str | Path,
+                     *, should_cancel: Any = None) -> str:
     root = conversation_root(scope, code_root)
     turn_id = uuid.uuid4().hex
     snapshot_id = None
     error = None
+    kwargs: dict[str, Any] = {'timeout': TURN_SNAPSHOT_TIMEOUT}
+    if should_cancel is not None:
+        kwargs['should_cancel'] = should_cancel
     try:
-        manifest = await asyncio.to_thread(
-            capture_manifest, root, objects, timeout=TURN_SNAPSHOT_TIMEOUT)
+        manifest = await asyncio.to_thread(capture_manifest, root, objects, **kwargs)
     except Exception as exc:  # noqa: BLE001 - chat must survive an optional file snapshot
         error = f'回合前文件快照失败：{exc}'
     else:
@@ -561,7 +677,8 @@ async def begin_turn(db, scope, code_root: str | Path, objects: str | Path) -> s
 
 
 async def finish_turn(db, scope, turn_id: str, code_root: str | Path, objects: str | Path,
-                      status: str = 'completed', error: str | None = None) -> None:
+                      status: str = 'completed', error: str | None = None,
+                      *, should_cancel: Any = None) -> None:
     conn = await db._get_conn()
     cursor = await conn.execute(
         '''SELECT
@@ -604,9 +721,11 @@ async def finish_turn(db, scope, turn_id: str, code_root: str | Path, objects: s
     root = conversation_root(scope, code_root)
     snapshot_id = None
     snapshot_error = None
+    kwargs: dict[str, Any] = {'timeout': TURN_SNAPSHOT_TIMEOUT}
+    if should_cancel is not None:
+        kwargs['should_cancel'] = should_cancel
     try:
-        manifest = await asyncio.to_thread(
-            capture_manifest, root, objects, timeout=TURN_SNAPSHOT_TIMEOUT)
+        manifest = await asyncio.to_thread(capture_manifest, root, objects, **kwargs)
         snapshot_id = await save_snapshot(db, scope.conversation_id, turn_id, 'after', manifest)
     except Exception as exc:  # noqa: BLE001 - persist a failed snapshot as turn state
         snapshot_error = f'回合后文件快照失败：{exc}'
