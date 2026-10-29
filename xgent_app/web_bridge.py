@@ -559,8 +559,9 @@ def _present_media_frame(frame: Dict[str, Any]) -> Dict[str, Any]:
 
 async def emit_ui_frame(outbox: WebOutbox, chat_id: int, frame_type: str,
                         *, source: Optional[str] = None, **fields: Any) -> None:
-    from xgent_app.ask_presentation import local_ask_notice
-    if local_ask_notice() and frame_type in {'message', 'edit'}:
+    from xgent_app.message_policy import current_policy
+    policy = current_policy()
+    if policy is not None and not policy.allows('web') and frame_type in {'message', 'edit'}:
         return
     from xgent_app.interaction import identity
     from xgent_app.conversations import current_scope
@@ -769,6 +770,9 @@ async def deliver_op_to_bot(bot: Any, op: Op, native_id: Optional[int], *,
     _markup_to_frame 的逆运算）——"带停止按钮的占位消息"补发过去还带不带按钮，
     全看这一步。
     """
+    from .message_policy import read_policy
+    if '_message_policy' in op.payload and not read_policy(op.payload['_message_policy']).allows('telegram'):
+        return None
     if bot is None:
         raise OpNotDeliverable("通道没有可用的 bot")
     payload = op.payload or {}
@@ -1051,6 +1055,9 @@ class MirrorBot:
 
     def _enqueue_telegram(self, op):
         """Admission shared by live sends and a single current-reply subscription."""
+        from .message_policy import read_policy
+        if '_message_policy' in op.payload and not read_policy(op.payload['_message_policy']).allows('telegram'):
+            return
         # A CLI/Web mirroring preference must not disable replies to native
         # Telegram inputs. The shared worker only checks transport readiness.
         if os.environ.get('XGENT_CLI_NO_TG_MIRROR') and not getattr(self, '_is_xgent_telegram_bot', False):

@@ -538,6 +538,8 @@ class BotMemoryDB(ConversationStore):
     @staticmethod
     async def _insert_global_record(conn, chat_id, user_id, msg_type, role, content, timestamp, session_id, metadata):
         from xgent_app.conversation_branching import active_turn_id
+        from xgent_app.message_policy import stamp_record_metadata
+        metadata = stamp_record_metadata(msg_type, role, metadata)
         cursor = await conn.execute('''
             INSERT INTO global_messages (chat_id, user_id, msg_type, role, content, timestamp, session_id, metadata, turn_id)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -643,12 +645,15 @@ class BotMemoryDB(ConversationStore):
     @staticmethod
     def conversation_records_to_messages(rows, *, include_all: bool = False) -> List[Dict]:
         from xgent_app.compression import metadata_of
+        from xgent_app.message_policy import record_policy
 
         # 转换格式，系统操作转为 user 角色以便 AI 理解
         result = []
         for row in rows:
             msg = dict(row)
             metadata = metadata_of(msg)
+            if not include_all and not record_policy(msg).model_context:
+                continue
             if not include_all and (metadata.get('ui_audit') or metadata.get('ui_only') or msg.get('msg_type') in {'button_click', 'command', 'management_input'}):
                 continue
             if not include_all and (metadata.get('model_context_superseded') or msg.get('msg_type') == 'presentation_note'):
@@ -736,7 +741,8 @@ class BotMemoryDB(ConversationStore):
     async def get_tool_context_records(self) -> List[Dict]:
         conn = await self._get_conn()
         cursor = await conn.execute("SELECT * FROM global_messages WHERE session_id = ? AND withdrawn=0 AND id >= "
-                                    "(SELECT context_start_record_id FROM chat_sessions WHERE id=global_messages.session_id) AND metadata LIKE '%model_context%' "
+                                    "(SELECT context_start_record_id FROM chat_sessions WHERE id=global_messages.session_id) AND "
+                                    "CASE WHEN json_valid(metadata) THEN json_extract(metadata,'$.model_context') END IS NOT NULL "
                                     "ORDER BY timestamp, id", (self._conversation_id(),))
         return [dict(row) for row in await cursor.fetchall()]
 
@@ -779,8 +785,10 @@ class BotMemoryDB(ConversationStore):
         cursor = await conn.execute('SELECT * FROM global_messages WHERE session_id = ? AND withdrawn=0 AND id>=? ORDER BY timestamp, id', (self._conversation_id(),start))
         records = [dict(row) for row in await cursor.fetchall()]
         if not full_history:
+            from xgent_app.message_policy import record_policy
             records = [r for r in records if not (metadata_of(r).get('ui_audit') or metadata_of(r).get('ui_only')
-                       or r['msg_type'] in {'button_click','command','management_input','token_usage','agent_status'})]
+                       or r['msg_type'] in {'button_click','command','management_input','token_usage','agent_status'}
+                       or not record_policy(r).model_context)]
         cursor = await conn.execute('SELECT * FROM chat_messages WHERE session_id = ? ORDER BY id', (self._conversation_id(),))
         mirror = [dict(row) for row in await cursor.fetchall()]
         cursor = await conn.execute('SELECT * FROM chat_sessions WHERE id = ?', (self._conversation_id(),))
@@ -923,7 +931,8 @@ class BotMemoryDB(ConversationStore):
             'compression_task': {'id': entry['job_id'], 'status': entry['status'], 'sequence': entry['sequence']},
             'display_media': [display_media_reference(entry['archive_path'], '系统记忆.zip')],
         }
-        return text, metadata
+        from xgent_app.message_policy import stamp_record_metadata
+        return text, stamp_record_metadata('system_op', 'system', metadata)
 
     async def _update_compression_notice(self, conn, entry):
         text, metadata = self._compression_notice(entry)
@@ -1041,8 +1050,6 @@ class BotMemoryDB(ConversationStore):
             else:
                 result.append(item)
         result.sort(key=lambda item: (item['timestamp'], item.get('id') or 0, item.get('ui_message_id', '')))
-        from xgent_app.ask_presentation import mark_legacy_ask_inputs
-        mark_legacy_ask_inputs(result)
         from xgent_app.presentation import link_usage_records
         link_usage_records(result)
         return UiHistorySnapshot(result[-limit:] if limit > 0 else result,
@@ -1098,6 +1105,10 @@ class BotMemoryDB(ConversationStore):
                 payload.update(reply_markup=markup, guard=guard)
             if frame['type'] == 'delete':
                 payload.update(deleted=True, reply_markup=[])
+            from xgent_app.message_policy import new_policy
+            if 'message_policy' not in payload:
+                payload['message_policy'] = new_policy('ui_message', metadata={
+                    'message_policy': frame['message_policy']} if 'message_policy' in frame else None).to_dict()
             row['revision'] += 1
             row['payload'] = json.dumps(payload, ensure_ascii=False)
             await conn.execute('''
@@ -1122,11 +1133,7 @@ class BotMemoryDB(ConversationStore):
             row = await cursor.fetchone()
         finally:
             await cursor.close()
-        result = dict(row) if row else None
-        if result is not None:
-            from xgent_app.ask_presentation import mark_legacy_ask_inputs_from_database
-            await mark_legacy_ask_inputs_from_database(conn, [result])
-        return result
+        return dict(row) if row else None
 
     async def get_max_relay_op_id(self) -> int:
         """cli_relay_ops 的最大 id。"""

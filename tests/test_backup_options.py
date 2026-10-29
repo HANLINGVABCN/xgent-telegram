@@ -17,6 +17,7 @@ import pytest
 from xgent_app.backup_schedule import ScheduledBackups, configure, read_settings
 from xgent_app.data_archives import FORMATS
 from xgent_app.data_bundles import BundleError, DataBundles
+from xgent_app.data_discovery import DiscoveredBundles
 from xgent_app.data_operations import DataOperations
 from xgent_app.data_paths import DataPaths
 
@@ -126,6 +127,38 @@ def test_inventory_and_sample_estimates_follow_selection(bundles):
     for invalid in ([], ["unknown"], ["env", "env"]):
         with pytest.raises(BundleError):
             service.export(categories=invalid)
+
+
+@pytest.mark.parametrize('bundle_class', [DataBundles, DiscoveredBundles])
+@pytest.mark.parametrize('pre_import', [False, True])
+def test_server_assets_are_excluded_from_new_backups_and_left_in_place(bundles, bundle_class, pre_import):
+    paths, _ = bundles
+    asset = paths.root / 'server_assets/vps-manager/servers.json'
+    asset.parent.mkdir(parents=True)
+    asset.write_text('private-server-config', encoding='utf-8')
+    service = bundle_class(paths)
+    exported = service.export(outputs=True, include_prompts=pre_import,
+                              name_prefix='pre-import' if pre_import else 'manual')
+    manifest = service.verify(exported['path'])
+    assert not any(name.startswith('server_assets/') for name in manifest['files'])
+    assert all(row['id'] != 'server_assets' for row in service.estimate()['categories'])
+    with pytest.raises(BundleError):
+        service.export(categories=['server_assets'])
+    staging, _ = service.prepare_import(exported['path'])
+    asset.write_text('keep-current-config', encoding='utf-8')
+    service.activate(staging)
+    assert asset.read_text() == 'keep-current-config'
+
+
+def test_scheduled_backup_removes_retired_server_assets_from_saved_choices(bundles):
+    paths, service = bundles
+    saved = configure(paths.code, enabled=True, frequency='1m', categories=['memory'])
+    saved['categories'].append('server_assets')
+    (paths.code / 'backup-schedule.json').write_text(json.dumps(saved), encoding='utf-8')
+    selected = read_settings(paths.code)['categories']
+    assert selected == ['memory']
+    exported = service.export(categories=selected, name_prefix='scheduled')
+    assert not any(name.startswith('server_assets/') for name in service.verify(exported['path'])['files'])
 
 
 def test_manifest_cannot_smuggle_unselected_content(bundles, tmp_path):

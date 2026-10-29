@@ -395,6 +395,9 @@ rows = [
     {"role": "assistant", "content": "AI 的 *加粗* 回复", "msg_type": "ai_reply"},
     {"role": "system", "content": "系统操作记录", "msg_type": "system_op"},
 ]
+from xgent_app.message_policy import stamp_record_metadata
+for row in rows:
+    row['metadata'] = stamp_record_metadata(row['msg_type'], row['role'])
 xgent_cli._render_history_rows(rows)
 out = stream.getvalue()
 print(json.dumps({

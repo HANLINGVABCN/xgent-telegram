@@ -191,7 +191,8 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             owner.release()
         self.assertEqual({}, (await self.manager.state())['runs'])
-        self.assertEqual(7, await self.db.get_config_fresh('conversation_schema_version'))
+        from xgent_app.conversations import SCHEMA_VERSION
+        self.assertEqual(SCHEMA_VERSION, await self.db.get_config_fresh('conversation_schema_version'))
 
     async def test_cross_process_lock_released_after_crash(self):
         source = ('from xgent_app.conversations import ExecutionFileLock; import sys,time; '

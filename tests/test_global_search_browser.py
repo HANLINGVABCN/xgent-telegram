@@ -7,6 +7,7 @@ from contextlib import suppress
 import pytest
 
 from tests import test_workbench_browser as fixture_helpers
+from tests.message_fixtures import typed_record
 
 workspace_url = fixture_helpers.workspace_url
 browser_context = fixture_helpers.browser_context
@@ -25,7 +26,7 @@ def search_seed(browser_context, workspace_url):
     with sqlite3.connect(workspace_url['database_path']) as conn:
         def add(cid, text, kind='user_text', role='user', meta=None):
             cursor = conn.execute('INSERT INTO global_messages(chat_id,user_id,msg_type,role,content,timestamp,session_id,metadata) VALUES(1,1,?,?,?,?,?,?)',
-                (kind, role, text, time.time(), cid, json.dumps(meta) if meta else None))
+                (kind, role, text, time.time(), cid, json.dumps(typed_record({'msg_type':kind,'role':role,'metadata':meta})['metadata'])))
             return 'history:' + str(cursor.lastrowid)
         anchor = add(active, '仅在正文命中的独有词 · 用户说明')
         add(archived, '仅在正文命中的独有词 · 归档 AI 回复', 'ai_reply', 'assistant')

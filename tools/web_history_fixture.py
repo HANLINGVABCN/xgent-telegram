@@ -57,6 +57,7 @@ class Fixture:
         self.populate()
 
     def add(self, kind, content, media=None, metadata=None):
+        from xgent_app.message_policy import stamp_record_metadata
         self.serial += 1
         row = {
             "id": self.serial, "timestamp": 1700000000 + self.serial,
@@ -67,6 +68,7 @@ class Fixture:
             row["metadata"]["display_media"] = [
                 display_media_reference(str(path), name) for path, name in media
             ]
+        row['metadata'] = stamp_record_metadata(kind, row['role'], row['metadata'])
         self.records[self.serial] = row
         return row
 

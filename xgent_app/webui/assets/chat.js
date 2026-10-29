@@ -892,23 +892,15 @@ import {syncAskForm} from './ask-form.js';
     return entry.rawText&&entry.parseMode!=='HTML'?entry.rawText:entry.body.textContent;
   }
 
-  var AGENT_STATUS_RE = /Agent\s*第\s*\d+\s*轮/;
-  var AGENT_RESULT_RE = /<b>\s*Agent\s+\w+\s*<\/b>/i;
-
-  function classifyMessageText(role, text, messageType) {
+  function classifyMessageText(role, text, messageType, policy) {
+    if(policy){
+      if(policy.version!==1)return 'sys';
+      if(policy.purpose==='usage')return 'token';
+      return {user:'user',assistant:'ai',system:'sys',tool:'cmd'}[policy.speaker]||'sys';
+    }
     if (messageType === "token_usage") return "token";
     if (messageType === "agent_status" || messageType === "system_op" || messageType === "runtime_error" || messageType === 'ui_message') return "sys";
     if (messageType === "agent_result") return "cmd";
-    if (messageType || role === "user") return role;
-    if (typeof text !== "string") return role;
-    if (/^⚠️(?:\s|$)/.test(text)) return 'sys';
-    if (isTokenUsageText(text)) {
-      return "token";
-    }
-    if (role === "ai" || role === "sys" || role === "cmd") {
-      if (AGENT_RESULT_RE.test(text)) return "cmd";
-      if (AGENT_STATUS_RE.test(text)) return "sys";
-    }
     return role;
   }
 
@@ -930,12 +922,12 @@ import {syncAskForm} from './ask-form.js';
   }
 
   var lastStreamEntry = null;
-  function makeBubble(role, text, messageId, parseMode, markup, messageType, timestamp, webDisplay, aiGeneration, renderTarget) {
+  function makeBubble(role, text, messageId, parseMode, markup, messageType, timestamp, webDisplay, aiGeneration, renderTarget, policy) {
     var targetLog=renderTarget||log;
     var stick = !renderTarget && isNearBottom();
     if(!renderTarget){msgCount++;updateEmptyState();}
 
-    role = classifyMessageText(role, text, messageType);
+    role = classifyMessageText(role, text, messageType, policy);
 
     var row = document.createElement("div");
     row.className = "msg-row " + role;
@@ -1048,7 +1040,7 @@ import {syncAskForm} from './ask-form.js';
     targetLog.appendChild(row);
     if (stick) scrollDown();
 
-    var entry = { row: row, body: body, bubble: bubble, head: head, btns: btns, rawText: text, parseMode: parseMode, role: role, messageType:messageType, webDisplay:webDisplay, aiGeneration: aiGeneration || null };
+    var entry = { row: row, body: body, bubble: bubble, head: head, btns: btns, rawText: text, parseMode: parseMode, role: role, messageType:messageType, messagePolicy:policy, webDisplay:webDisplay, aiGeneration: aiGeneration || null };
     entry.aiMeta = head && head._aiMeta;
     if(role==='ai'){entry.replyTime=document.createElement('span');entry.replyTime.className='reply-timestamp';}
     applyAiGeneration(entry, timestamp, aiGeneration);
@@ -1365,7 +1357,8 @@ import {syncAskForm} from './ask-form.js';
         var b = document.createElement("button");
         b.className = "ik-btn";
         const stopAction=/^act_stop_generation(?::(.+))?$/.exec(String(btn.callback_action||btn.callback_data||''));
-        b.textContent = stopAction ? '打断' : btn.text;
+        const stopLabel='❌ 停止回答';
+        b.textContent = stopAction ? stopLabel : btn.text;
         b.disabled = !!btn.unavailable;
         if (btn.unavailable) b.title = "菜单已失效，请重新打开";
         b.addEventListener("click", function () {
@@ -1375,7 +1368,7 @@ import {syncAskForm} from './ask-form.js';
           if(stopAction){
             api('/api/stop',{method:'POST',body:JSON.stringify({conversation_id:owner,
               run_id:stopAction[1]||currentRun()?.run_id})})
-              .catch(err=>{b.disabled=false;b.classList.remove('loading');toast('打断失败：'+err.message,true);});
+              .catch(err=>{b.disabled=false;b.classList.remove('loading');toast(stopLabel+'失败：'+err.message,true);});
             return;
           }
           var payload = ui ? {ui_message_id: ui.id, revision: ui.revision, button_id: btn.button_id} :
@@ -1442,6 +1435,12 @@ import {syncAskForm} from './ask-form.js';
       (frame.media_group_id || (frame.record_id != null ? "history:" + frame.record_id :
         (frame.web_display?.reply_message_id ?? frame.message_id)));
     var entry = id != null ? byMessageId[id] : null;
+    if(!entry&&frame.record_id!=null&&frame.message_id!=null&&!frame.ui_message_id){
+      const live=byMessageId[frame.message_id];
+      if(live&&(!live.durable||live.row.dataset.recordId===String(frame.record_id))){
+        entry=live;byMessageId[id]=entry;
+      }
+    }
     if(!entry){
       entry=(frame.replace_message_ids||[]).map(previousId=>byMessageId[previousId]).find(Boolean);
       if(entry&&id!=null)byMessageId[id]=entry;
@@ -1452,7 +1451,7 @@ import {syncAskForm} from './ask-form.js';
       if (byMessageId[previousId] !== entry) removeEntry(byMessageId[previousId]);
     });
     if (!entry && frame.type === "edit" && id == null) entry = lastStreamEntry;
-    var newRole = classifyMessageText(role, frame.text, frame.msg_type??entry?.messageType);
+    var newRole = classifyMessageText(role, frame.text, frame.msg_type??entry?.messageType, frame.message_policy??entry?.messagePolicy);
     var displayKey=JSON.stringify(frame.web_display||null);
     if(entry)entry.webDisplay=frame.web_display;
     if (entry && entry.rawText !== undefined && entry.role === newRole) {
@@ -1463,11 +1462,12 @@ import {syncAskForm} from './ask-form.js';
     } else {
       var next = entry && entry.row.nextSibling;
       removeEntry(entry);
-      entry = makeBubble(role, frame.text, id, frame.parse_mode, null, frame.msg_type, frame.timestamp || frame.ts, frame.web_display, frame.ai_generation);
+      entry = makeBubble(role, frame.text, id, frame.parse_mode, null, frame.msg_type, frame.timestamp || frame.ts, frame.web_display, frame.ai_generation, null, frame.message_policy);
       if (next && next.parentNode === log) log.insertBefore(entry.row, next);
     }
     entry.rawText=frame.text;entry.parseMode=frame.parse_mode;entry.displayKey=displayKey;
     entry.messageType=frame.msg_type??entry.messageType;
+    entry.messagePolicy=frame.message_policy??entry.messagePolicy;
     entry.webDisplay=frame.web_display;
     if(frame.turn_id)entry.row.dataset.turnId=String(frame.turn_id);
     if(frame.run_id)entry.row.dataset.runId=String(frame.run_id);
@@ -1475,7 +1475,9 @@ import {syncAskForm} from './ask-form.js';
     if(frame.record_id!=null&&!frame.ui_message_id){entry.durable=true;entry.row.dataset.recordId=String(frame.record_id);}
     applyAiGeneration(entry, frame.timestamp??frame.ts, frame.ai_generation);
     syncMessageChrome(entry);
-    if(typeof frame.hidden==='boolean'){entry.row.classList.toggle('presentation-hidden',frame.hidden);entry.row.classList.toggle('msg-row',!frame.hidden);}
+    const hidden=!!frame.hidden||!!entry.messagePolicy&&
+      (entry.messagePolicy.version!==1||!entry.messagePolicy.audience?.includes('web'));
+    entry.row.classList.toggle('presentation-hidden',hidden);entry.row.classList.toggle('msg-row',!hidden);
     if(frame.timestamp!=null){
       var ts=entry.row.querySelector('.ts');
       if(ts){ts.textContent=nowTime(frame.timestamp);ts.title=new Date(Number(frame.timestamp)*1000).toLocaleString();}
@@ -1521,8 +1523,10 @@ import {syncAskForm} from './ask-form.js';
     var frame={...message,type:'message',text:message.content??message.text,
       record_id:message.record_id??message.id,replace_message_ids:aliases};
     var entry=putTextFrame(role,frame);
-    entry.row.classList.toggle('presentation-hidden',!!message.hidden);
-    if(message.hidden)entry.row.classList.remove('msg-row');else entry.row.classList.add('msg-row');
+    const hidden=!!message.hidden||!!entry.messagePolicy&&
+      (entry.messagePolicy.version!==1||!entry.messagePolicy.audience?.includes('web'));
+    entry.row.classList.toggle('presentation-hidden',hidden);
+    if(hidden)entry.row.classList.remove('msg-row');else entry.row.classList.add('msg-row');
     if(message.file_message&&entry.uploadProgress){entry.uploadProgress.remove();entry.uploadProgress=null;}
     entry.durable=!message.ui_message_id;
     aliases.forEach(function(mid){byMessageId[mid]=entry;});
@@ -3684,7 +3688,7 @@ import {syncAskForm} from './ask-form.js';
     },
     renderRecord: function(message,target){
       const role=message.role==='user'?'user':message.role==='assistant'?'ai':'sys';
-      const entry=makeBubble(role,message.content,null,message.parse_mode,null,message.msg_type,message.timestamp,message.web_display,message.ai_generation,target);
+      const entry=makeBubble(role,message.content,null,message.parse_mode,null,message.msg_type,message.timestamp,message.web_display,message.ai_generation,target,message.message_policy);
       if(message.turn_id)entry.row.dataset.turnId=String(message.turn_id);
       if(message.run_id)entry.row.dataset.runId=String(message.run_id);
       if(message.conversation_id)entry.row.dataset.presentationConversationId=message.conversation_id;

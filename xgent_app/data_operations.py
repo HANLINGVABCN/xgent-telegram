@@ -21,7 +21,7 @@ from .backup_storage import default_backup_directory
 from .data_bundles import BundleError, DataBundles, protect, write_json
 from .data_lock import DataLease
 from .data_archives import ArchiveReader, archive_format as filename_format, normalize_format
-from .data_contents import CATEGORY_MAP, RECOMMENDED_CATEGORIES, manifest_categories, normalize_categories, validate_independent_selection
+from .data_contents import BACKUP_GROUPS, CATEGORY_MAP, RECOMMENDED_CATEGORIES, manifest_categories, normalize_categories, selected_groups, validate_independent_selection
 
 
 @dataclass(frozen=True)
@@ -138,6 +138,7 @@ class DataOperations:
         return {
             "ok": True,
             **settings,
+            "selected_groups": selected_groups(settings["categories"]),
             "default_backup_directory": str(
                 default_backup_directory(self.paths.code).resolve()
             ),
@@ -218,7 +219,8 @@ class DataOperations:
                                "include_command_outputs": bool(manifest.get("include_command_outputs")),
                                "file_count": len(manifest.get("files") or {}),
                                "manifest_created_at": manifest.get("created_at"),
-                               "categories": [{"id": key, "label": CATEGORY_MAP[key]["label"]} for key in selected],
+                               "categories": [{"id": group["id"], "label": group["label"]} for group in BACKUP_GROUPS
+                                              if group["id"] in selected_groups(selected)],
                                "restore_mode": "categories" if manifest.get("version") == 2 else "full"}
                     self.catalog_cache[cache_key] = summary
                 item.update(summary)

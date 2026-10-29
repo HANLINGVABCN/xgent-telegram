@@ -2,6 +2,7 @@ import sqlite3
 import time
 
 from tests import test_workbench_browser as fixture_helpers
+from tests.message_fixtures import stamp_fixture_messages
 
 workspace_url = fixture_helpers.workspace_url
 browser_context = fixture_helpers.browser_context
@@ -21,6 +22,7 @@ def test_legacy_history_can_branch_with_draft_and_lineage_warning(browser_contex
                      "VALUES(1,0,'ai_reply','assistant','旧回答',?,?)", (now + 1, source))
         conn.execute("INSERT INTO global_messages(chat_id,user_id,msg_type,role,content,timestamp,session_id) "
                      "VALUES(1,1,'command','user','/update',?,?)", (now + 2, source))
+        stamp_fixture_messages(conn, source)
         conn.commit()
     page = browser_context.new_page()
     ready(page, base)
@@ -88,6 +90,7 @@ def test_command_side_effect_shows_warning_and_still_withdraws(browser_context, 
         conn.execute(
             "INSERT INTO turn_operations(turn_id,sequence,kind,effect,details,created_at) "
             "VALUES(?,1,'run','unknown','{}',?)", (turn_id, now))
+        stamp_fixture_messages(conn, cid)
         conn.commit()
     page = browser_context.new_page()
     ready(page, base)

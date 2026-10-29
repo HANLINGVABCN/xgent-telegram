@@ -193,6 +193,10 @@ class Op:
         self.conversation_context = self.payload.pop('_conversation_context', conversation_snapshot())
         from xgent_app.telegram_presentation import presentation_snapshot
         self.presentation_context = self.payload.pop('_telegram_presentation', presentation_snapshot())
+        from .message_policy import current_policy, new_policy
+        policy = current_policy() or new_policy('ui_message')
+        if '_message_policy' not in self.payload:
+            self.payload['_message_policy'] = policy.to_dict()
         self.transient = transient or {}
         self.durable = bool(durable)
         self.seq = seq
@@ -217,12 +221,8 @@ class Op:
         context = self.conversation_context or {}
         if context.get('telegram_delivery') is False:
             return True
-        # Exact legacy control signature, not a heuristic over user/model text.
-        text = self.payload.get('text', '')
-        return (self.kind == OP_SEND and not context.get('run_id') and
-                self.presentation_context == {'label': False} and isinstance(text, str) and
-                text.startswith('🗂 ') and
-                text.endswith('\n已切换会话，三端同步；未提交的设置输入已取消。'))
+        from .message_policy import read_policy
+        return not read_policy(self.payload.get('_message_policy')).allows('telegram')
 
     def to_row(self) -> Dict[str, Any]:
         return {
@@ -249,6 +249,8 @@ class Op:
             attempts = 0
         if isinstance(payload, dict):
             payload.setdefault('_conversation_context', None)
+            from .message_policy import read_policy
+            payload['_message_policy'] = read_policy(payload.get('_message_policy')).to_dict()
         return cls(
             str(row.get("kind") or ""),
             logical_id=row.get("logical_id"),

@@ -16,9 +16,17 @@ import urllib.request
 from xgent_app import web_auth
 from xgent_app.web_bridge import MediaTokenRegistry
 from xgent_app.web_history import (
-    build_history_message, delivered_file_reference, display_media_reference,
+    build_history_message as render_history_message, delivered_file_reference, display_media_reference,
 )
 from xgent_app.web_server import WebChatConfig, WebChatServer
+from xgent_app.message_policy import new_policy, object_dict
+
+
+def build_history_message(record, *args, **kwargs):
+    """These hand-built descriptor fixtures represent current, typed producers."""
+    record={**record, 'message_policy':new_policy(record.get('msg_type') or 'ui_message',
+            record.get('role'),metadata=object_dict(record.get('metadata'))).to_dict()}
+    return render_history_message(record,*args,**kwargs)
 
 
 class HistoryDescriptorTests(unittest.TestCase):

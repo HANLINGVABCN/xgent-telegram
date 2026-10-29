@@ -5,7 +5,7 @@ from xgent_app.telegram_presentation import telegram_label, label_enabled, strea
 from xgent_app.protocols import ProtocolParser
 from xgent_app.reply_presentation import track_reply_presentation, bind_reply_message_ids, remember_reply_messages
 from xgent_app.web_display import web_text_response, web_stream_display
-from xgent_app.presentation import current_turn, normalize_mode, ai_html
+from xgent_app.presentation import current_turn, normalize_mode, ai_html, message_presentation
 
 
 def _presentation_mode() -> str:
@@ -1548,7 +1548,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
     try:
         generated_reply = await _ensure_generated_reply(generated_reply, chat_id, prov_name, model)
         stop_kb = build_stop_keyboard()
-        with telegram_label(False):
+        with telegram_label(False), message_presentation({'kind':'ai_reply','purpose':'generation','transient':True}):
             msg = await context.bot.send_message(
                 chat_id=chat_id,
                 text="前台流式输出中...",
@@ -1920,7 +1920,7 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
     try:
         generated_reply = await _ensure_generated_reply(generated_reply, chat_id, prov_name, model)
         stop_kb = build_stop_keyboard()
-        with telegram_label(False):
+        with telegram_label(False), message_presentation({'kind':'ai_reply','purpose':'generation','transient':True}):
             msg = await context.bot.send_message(
                 chat_id=chat_id,
                 text="后台流式输出中...",
@@ -2250,7 +2250,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
     try:
         generated_reply = await _ensure_generated_reply(generated_reply, chat_id, prov_name, model)
         stop_kb = build_stop_keyboard()
-        with telegram_label(False):
+        with telegram_label(False), message_presentation({'kind':'ai_reply','purpose':'generation','transient':True}):
             msg = await context.bot.send_message(
                 chat_id=chat_id,
                 text="非流式输出中...",

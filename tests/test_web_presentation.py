@@ -159,7 +159,9 @@ def test_generated_media_uses_history_prose_renderer(tmp_path):
         with patch.dict('sys.modules',{'xgent_server':module}):
             with media_presentation_scope(build_media_presentation(raw,[{'path':str(path)}])):
                 live=_present_media_frame({'type':'photo','message_id':1})
-            saved=build_history_message({'id':5,'role':'assistant','msg_type':'ai_reply','content':raw},tmp_path,tmp_path)
+            from xgent_app.message_policy import stamp_record_metadata
+            saved=build_history_message({'id':5,'role':'assistant','msg_type':'ai_reply','content':raw,
+                'metadata':stamp_record_metadata('ai_reply','assistant')},tmp_path,tmp_path)
         assert (live['text'],live['parse_mode'])==(saved['content'],saved['parse_mode'])
 
 

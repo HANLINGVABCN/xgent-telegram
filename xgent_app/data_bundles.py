@@ -24,9 +24,10 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from .data_archives import ArchiveReader, ArchiveWriter, FORMATS, estimate_formats, normalize_format
-from .data_contents import (CATEGORY_MAP, CATEGORIES, category_for, inventory,
+from .data_contents import (ARCHIVE_CATEGORY_MAP, CATEGORY_MAP, CATEGORIES, category_for, inventory,
                             manifest_categories, normalize_categories, replacement_paths,
-                            PART_CATEGORIES, RECOMMENDED_CATEGORIES, validate_independent_selection)
+                            PART_CATEGORIES, RECOMMENDED_CATEGORIES, validate_independent_selection,
+                            grouped_inventory, selected_groups)
 from .data_parts import DataParts, apply_database, part_summary, read_part, replace_env
 from .data_lock import DataLease
 from .data_paths import DataPaths
@@ -35,7 +36,6 @@ CHUNK = 1024 * 1024
 TREES = (
     "memory",
     "skill-private",
-    "server_assets",
     "workspace",
     "xgent_storage/uploads",
     "xgent_storage/generated_media",
@@ -187,7 +187,7 @@ def safe_name(name):
         "backup_parts/" + category + ".jsonl" for category in PART_CATEGORIES
     } or any(
         name.startswith(root + "/")
-        for root in (*TREES, "xgent_storage/command_outputs")
+        for root in (*TREES, "server_assets", "xgent_storage/command_outputs")
     )
     if not allowed:
         raise BundleError("备份包含白名单以外的文件：" + name)
@@ -303,8 +303,9 @@ class DataBundles:
             "command_outputs_size": next(row["size"] for row in rows if row["id"] == "command_outputs"),
             "includes_secrets": any(CATEGORY_MAP[key].get("sensitive") for key in selected),
             "include_outputs": "command_outputs" in selected,
-            "data_dir": str(self.paths.root), "categories": rows,
+            "data_dir": str(self.paths.root), "categories": rows, "groups": grouped_inventory(rows, selected),
             "selected_categories": selected, "recommended_categories": list(RECOMMENDED_CATEGORIES),
+            "recommended_groups": selected_groups(RECOMMENDED_CATEGORIES),
             "formats": estimate_formats(chosen, total, count,
                 samples=[self._parts_inventory[key]["sample"] for key in selected if key in PART_CATEGORIES]) if compare_formats else [],
             "estimate_note": "基于最多 1 MiB 的实际抽样压缩，时间包含打包、快照与校验估算；结果受数据分布、磁盘和 CPU 影响。",
@@ -619,10 +620,10 @@ class DataBundles:
     def preview(self, manifest):
         selected = manifest_categories(manifest)
         scoped = manifest["version"] == 2
-        affected = selected if scoped else [item["id"] for item in CATEGORIES]
+        affected = selected if scoped else list(ARCHIVE_CATEGORY_MAP)
         rows = []
         for key in affected:
-            spec = CATEGORY_MAP[key]
+            spec = ARCHIVE_CATEGORY_MAP[key]
             files = [{"name": name, "size": info["size"]}
                      for name, info in sorted(manifest["files"].items()) if category_for(name) == key]
             current_size, current_count = 0, 0
@@ -651,7 +652,7 @@ class DataBundles:
                 "archive_format": manifest.get("archive_format", "zip"), "categories": rows,
                 "file_count": len(manifest["files"]),
                 "size": sum(file["size"] for file in manifest["files"].values()),
-                "includes_secrets": any(CATEGORY_MAP[key].get("sensitive") for key in selected),
+                "includes_secrets": any(ARCHIVE_CATEGORY_MAP[key].get("sensitive") for key in selected),
                 "replace_paths": replacement_paths(selected) if scoped else list(self.PROJECT_STATE),
                 "metadata_paths": ["path-map.json", "restore-info.json"]}
 
@@ -672,7 +673,7 @@ class DataBundles:
         base = self.preview(manifest)
         original = {row["id"]: row for row in base["categories"]}
         rows = []
-        for spec in CATEGORIES:
+        for spec in ARCHIVE_CATEGORY_MAP.values():
             key = spec["id"]
             part = staging / "backup_parts" / (key + ".jsonl")
             files = [{"name": name, "size": info["size"]} for name, info in manifest["files"].items()
@@ -710,6 +711,8 @@ class DataBundles:
             recommended.append("command_outputs")
         return {**base, "categories": rows, "selectable": True,
                 "recommended_categories": recommended, "original_restore_mode": base["restore_mode"],
+                "groups": grouped_inventory(rows, recommended, importing=True),
+                "recommended_groups": selected_groups(recommended),
                 "restore_mode": "selection"}
 
     def select_import(self, staging, categories):
@@ -718,7 +721,7 @@ class DataBundles:
                 or not staging.name.startswith(".xgent-restore-")):
             raise BundleError("恢复临时目录无效")
         try:
-            selected = validate_independent_selection(categories)
+            selected = validate_independent_selection(categories, for_restore=True)
             manifest = json.loads((staging / "restore-manifest.json").read_text(encoding="utf-8"))
             preview = self.import_preview(staging, manifest)
         except (ValueError, KeyError, TypeError) as exc:
@@ -750,7 +753,7 @@ class DataBundles:
             raise BundleError("恢复计划不能是符号链接")
         try:
             saved_plan = json.loads(plan.read_text(encoding="utf-8")) if plan.is_file() else None
-            selected = validate_independent_selection(saved_plan["categories"]) if saved_plan else None
+            selected = validate_independent_selection(saved_plan["categories"], for_restore=True) if saved_plan else None
         except (ValueError, KeyError, TypeError) as exc:
             raise BundleError("恢复类型清单无效") from exc
         physical_paths = saved_plan.get("physical_paths", replacement_paths(selected)) if selected else []
@@ -760,8 +763,12 @@ class DataBundles:
         names = list(dict.fromkeys(physical_paths + ["path-map.json", "restore-info.json"])) if selected else list(self.PROJECT_STATE)
         if selected is None:
             manifest_path = staging / "restore-manifest.json"
-            if manifest_path.is_file() and json.loads(manifest_path.read_text(encoding="utf-8")).get("include_prompts") is True:
-                names.append("prompts")
+            if manifest_path.is_file():
+                full_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if full_manifest.get("include_prompts") is True:
+                    names.append("prompts")
+                if "server_assets" not in manifest_categories(full_manifest):
+                    names.remove("server_assets")
         partial_files = {key: staging / "backup_parts" / (key + ".jsonl")
                          for key in (selected or []) if key in PART_CATEGORIES}
         if partial_files:

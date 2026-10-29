@@ -595,6 +595,10 @@ async def _replay_relay_op_with_presentation(mirror: Any, op: str, payload: Dict
     token 用量行全都在。唯一的例外是 user_echo（用户自己的那句话），它是全
     流程里唯一带来源标识的地方。
     """
+    from xgent_app.message_policy import current_policy
+    policy = current_policy()
+    if policy is not None and policy.purpose=='form_input':
+        return
     message_id = payload.get('message_id')
 
     if op == 'user_echo':

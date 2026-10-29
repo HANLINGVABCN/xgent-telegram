@@ -13,6 +13,7 @@ from xgent_app.cli_tui import PtScreen, block_text
 from xgent_app.cli_render import Palette
 from xgent_app.output_archive import read_output_page, OutputArchiveError, OUTPUT_PAGE_BYTES
 from xgent_app.web_history import build_history_message
+from xgent_app.message_migrations import migrate_record_metadata
 
 
 def protocol(body, tag='run-x'):
@@ -63,6 +64,7 @@ class FullPresentationTests(unittest.TestCase):
             '<blockquote expandable><b>run-x</b> · 1 行\n<pre>old summary</pre></blockquote>')
         record = {"id": 1, "msg_type": "agent_result", "content": "context", "metadata": {
             "display": {"content": old, "parse_mode": "HTML"}}}
+        record['metadata'] = migrate_record_metadata(record['msg_type'], 'assistant', record['content'], record['metadata'])
         display = build_history_message(record, "/tmp/xgent_storage", "/tmp/workspace")["content"]
         self.assertIn('data-output-path="/tmp/xgent_storage/command_outputs/a.txt"', display)
         self.assertEqual("old summary", body_of(display))
@@ -98,6 +100,7 @@ class FullPresentationTests(unittest.TestCase):
         self.assertEqual(body, body_of(restored))
         record = {'id': 1, 'msg_type': 'agent_result', 'content': 'model context',
                   'metadata': {'display': {'content': old, 'parse_mode': 'HTML'}}}
+        record['metadata'] = migrate_record_metadata(record['msg_type'], 'assistant', record['content'], record['metadata'])
         message = build_history_message(record, '/tmp/storage', '/tmp/workspace')
         self.assertEqual(body, body_of(message['content']))
         no_raw = ProtocolParser.render_folded_html(protocol(body), max_lines=50)

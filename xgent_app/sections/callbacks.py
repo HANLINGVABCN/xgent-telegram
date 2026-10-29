@@ -140,6 +140,7 @@ async def _dispatch_ask_callback_inner(update: Any, context: Any, data: str) -> 
             from xgent_app.ask_presentation import send_ask_input_notice
             await send_ask_input_notice(query.message,
                 f"请填写：{question.prompt}{hint}\n（直接发一条消息即可；发 cancel 取消录入）",
+                form_id=ask_id, field_id=qid,
             )
         return  # 不重画键盘，等用户把内容发进来再重画
 

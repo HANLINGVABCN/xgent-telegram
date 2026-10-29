@@ -51,10 +51,17 @@ async def main():
                         calls=[]
                         def answer(kwargs):
                             calls.append(True)
-                            kwargs['usage_sink'].append({'input_tokens':100,'output_tokens':20,'cached_tokens':50})
+                            kwargs['usage_sink'].append({'input_tokens':100,'output_tokens':20})
                             return response if len(calls)==1 else '命令已结束，结果保留。'
-                        async def complete(*args,**kwargs):return answer(kwargs),None
-                        async def chunks(*args,**kwargs):yield answer(kwargs)
+                        generation_entered=asyncio.Event();release_generation=asyncio.Event()
+                        async def wait_generation():
+                            if not calls:
+                                generation_entered.set()
+                                await release_generation.wait()
+                        async def complete(*args,**kwargs):
+                            await wait_generation();return answer(kwargs),None
+                        async def chunks(*args,**kwargs):
+                            await wait_generation();yield answer(kwargs)
                         spawned=[]
                         original_spawn=asyncio.create_subprocess_shell
                         async def spawn(*args,**kwargs):
@@ -78,13 +85,20 @@ async def main():
                             await page.wait_for_function('document.getElementById("composer-model")?.disabled===false')
                             with patch.object(bot.ModelClient,'think_and_reply',complete),patch.object(bot.ModelClient,'think_and_reply_stream',chunks),patch('asyncio.create_subprocess_shell',spawn):
                                 task=asyncio.create_task(h.turn('运行长命令'))
+                                await asyncio.wait_for(generation_entered.wait(),5)
+                                ai_stop=page.locator('.bubble.ai').get_by_role('button',name='❌ 停止回答',exact=True)
+                                await ai_stop.wait_for()
+                                assert await ai_stop.is_visible()
+                                assert await page.locator('.bubble.ai').get_by_role('button',name='打断',exact=True).count()==0
+                                release_generation.set()
                                 async def process_started():
                                     while not started.is_file():await asyncio.sleep(.01)
                                 await asyncio.wait_for(process_started(),5)
                                 command_output=page.locator('.bubble.cmd')
                                 await command_output.get_by_text('执行中',exact=True).wait_for()
-                                interrupt=command_output.get_by_role('button',name='打断',exact=True)
+                                interrupt=command_output.get_by_role('button',name='❌ 停止回答',exact=True)
                                 assert await interrupt.is_visible()
+                                assert 'cache 0' in await page.locator('.bubble.ai').inner_text()
                                 assert not task.done() and not done.exists()
                                 assert len(spawned)==1 and spawned[0].returncode is None
                                 snapshot=h.outbox.snapshot()
@@ -93,11 +107,11 @@ async def main():
                                 await page.reload()
                                 await page.locator('.bubble.cmd').get_by_text('执行中',exact=True).wait_for()
                                 assert await page.locator('.bubble.cmd').count()==1
-                                assert await page.locator('.bubble.cmd').get_by_role('button',name='打断',exact=True).is_visible()
+                                assert await page.locator('.bubble.cmd').get_by_role('button',name='❌ 停止回答',exact=True).is_visible()
                                 await page.locator('.bubble.cmd').evaluate('(node)=>window.commandRow=node.closest(".msg-row")')
                                 await page.screenshot(path=str(Path(os.environ['COMMAND_TEST_SCREENSHOTS'])/f'command-running-{width}-{interrupt_command}.png'))
                                 if interrupt_command:
-                                    await page.locator('.bubble.cmd').get_by_role('button',name='打断',exact=True).click()
+                                    await page.locator('.bubble.cmd').get_by_role('button',name='❌ 停止回答',exact=True).click()
                                 else:
                                     release.write_text('finish')
                                 await asyncio.wait_for(task,8)
@@ -107,7 +121,7 @@ async def main():
                                 assert await page.locator('.bubble.cmd .execution-label').inner_text()==('输出 · 已停止' if interrupt_command else '输出')
                                 assert await page.locator('.bubble.cmd').count()==1
                                 assert await page.evaluate('window.commandRow.isConnected && window.commandRow===document.querySelector(".msg-row.cmd")')
-                                assert await page.locator('.bubble.cmd').get_by_role('button',name='打断',exact=True).count()==0
+                                assert await page.locator('.bubble.cmd').get_by_role('button',name='❌ 停止回答',exact=True).count()==0
                                 rows=await h.db.get_display_history(0)
                                 output=next(row for row in rows if row['msg_type']=='agent_result')
                                 metadata=json.loads(output['metadata']) if isinstance(output['metadata'],str) else output['metadata']
@@ -116,10 +130,20 @@ async def main():
                                 assert len(calls)==(1 if interrupt_command else 2)
                                 if interrupt_command:
                                     assert not any('已完成' in row['content'] for row in rows if row['msg_type']=='agent_status')
+                                    terminal=page.locator('.msg-row.sys').filter(has_text='已有结果保留')
+                                    await page.wait_for_function('Array.from(document.querySelectorAll(".msg-row.sys")).some(n=>n.textContent.includes("总耗时"))')
+                                    assert await terminal.count()==1,await page.locator('#log').inner_text()
+                                    assert (await terminal.locator('.body').inner_text()).count('已有结果保留')==1
+                                    assert (await terminal.inner_text()).count('总耗时')==1
+                                    terminal_text=await terminal.inner_text()
                                 await page.reload()
                                 await page.locator('.bubble.cmd .execution-dot.state-'+state).wait_for()
                                 assert await page.locator('.bubble.cmd').count()==1
-                                assert await page.locator('.bubble.cmd').get_by_role('button',name='打断',exact=True).count()==0
+                                assert await page.locator('.bubble.cmd').get_by_role('button',name='❌ 停止回答',exact=True).count()==0
+                                if interrupt_command:
+                                    terminal=page.locator('.msg-row.sys').filter(has_text='已有结果保留')
+                                    assert await terminal.count()==1
+                                    assert await terminal.inner_text()==terminal_text
                                 assert not errors,errors
                                 cases.append({'style':style,'width':width,'outcome':state,'process_finished':True,'one_output':True})
                         finally:

@@ -10,6 +10,7 @@ from PIL import Image
 
 from tests import test_workbench_browser as browser_fixture
 from xgent_app.artifact_covers import video_encoder
+from tests.message_fixtures import stamp_fixture_messages
 
 workspace_url = browser_fixture.workspace_url
 browser_context = browser_fixture.browser_context
@@ -82,6 +83,7 @@ def test_library_uses_lightweight_covers_filename_first_and_full_media_only_afte
     with sqlite3.connect(workspace_url['database_path']) as conn:
         row_id = conn.execute("INSERT INTO global_messages(chat_id,user_id,msg_type,role,content,timestamp,session_id,metadata) VALUES(1,1,'user_file','user',?,?,?,?)",
                               ('混合批次图片与服务器视频', time.time(), cid, json.dumps(metadata))).lastrowid
+        stamp_fixture_messages(conn, cid)
     page = browser_context.new_page()
     original_requests = []
     page.on('request', lambda request: original_requests.append(request.url) if f'/api/history/media/{row_id}/' in request.url else None)

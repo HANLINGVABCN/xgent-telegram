@@ -150,7 +150,8 @@ class GlobalRecorder:
 
         普通记录失败只记日志；附件关联是完整上下文的必要条件，必须写入成功。
         """
-        stamped_metadata = dict(metadata or {})
+        from xgent_app.message_policy import stamp_record_metadata
+        stamped_metadata = stamp_record_metadata(msg_type, role, metadata)
         from xgent_app.presentation import record_presentation, current_turn
         presentation = record_presentation(msg_type, content)
         if presentation is not None:
@@ -204,7 +205,10 @@ class GlobalRecorder:
         if turn is not None and rowid is not None:
             if not hasattr(turn, 'record_ids'):
                 turn.record_ids = {}
+            if not hasattr(turn, 'record_contents'):
+                turn.record_contents = {}
             turn.record_ids[msg_type] = rowid
+            turn.record_contents[msg_type] = str(content)
         if turn is not None and msg_type in {MessageType.AI_REPLY, MessageType.AGENT_RESULT, 'presentation_note', MessageType.RUNTIME_ERROR}:
             turn.last_record_id = rowid
         if msg_type == MessageType.AI_REPLY:
@@ -354,7 +358,8 @@ class GlobalRecorder:
     @staticmethod
     async def record_token_usage(content: str, chat_id: Optional[int] = None,
                                  usage: Optional[Dict[str, Any]] = None,
-                                 model: Optional[str] = None):
+                                 model: Optional[str] = None, *, parent_record_id: Optional[int] = None,
+                                 associate_reply: bool = True, elapsed_seconds: Optional[float] = None):
         """记录 token 用量提示。须在 record_ai_reply 之后调用，保证 timestamp 晚于正文，
         刷新后顺序为「输出 + tokens」而非反序。usage/model 存进 metadata 供 token 统计。"""
         metadata = None
@@ -371,6 +376,18 @@ class GlobalRecorder:
                         meta_usage[_k] = _v
                 if meta_usage:
                     metadata['usage'] = meta_usage
+        from xgent_app.presentation import current_turn
+        parent = None
+        if associate_reply and (current_turn() is None or current_turn().active_reply is None):
+            db = await BotMemoryDB.get_instance()
+            cursor=await (await db._get_conn()).execute(
+                "SELECT * FROM global_messages WHERE session_id=? AND msg_type='ai_reply' AND withdrawn=0 "
+                + ('AND id=?' if parent_record_id is not None else 'ORDER BY id DESC LIMIT 1'),
+                (current_scope().conversation_id,parent_record_id) if parent_record_id is not None else (current_scope().conversation_id,))
+            parent=await cursor.fetchone();await cursor.close()
+            if parent:
+                metadata=dict(metadata or {})
+                metadata['presentation']={'version':1,'kind':'token_usage','reply_record_id':parent['id']}
         rowid = await GlobalRecorder.record(
             msg_type=MessageType.TOKEN_USAGE,
             role='assistant',
@@ -378,6 +395,15 @@ class GlobalRecorder:
             chat_id=chat_id,
             metadata=metadata
         )
+        if rowid is not None and parent is not None and metadata.get('usage'):
+            from xgent_app.presentation import metadata_dict
+            saved = dict(parent)
+            parent_meta = metadata_dict(saved.get('metadata'))
+            facts = parent_meta.setdefault('presentation', {'version':1,'kind':'ai_reply','mode':'folded'})
+            facts.update(usage=metadata['usage'],model=metadata.get('model') or '')
+            if elapsed_seconds is not None:
+                facts['elapsed_seconds'] = elapsed_seconds
+            await db.backfill_attachment_metadata(saved['id'],saved.get('metadata'),parent_meta)
         # 双写：global_messages 行只作聊天历史显示；统计以独立表为准，
         # 清空对话记忆不会再丢用量数据。旁路失败只记日志，不中断对话。
         if metadata and (metadata.get('model') or metadata.get('usage')):

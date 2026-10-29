@@ -29,6 +29,8 @@ class GlobalSearchTests(unittest.TestCase):
         ''')
 
     def add(self, text, cid='a', kind='user_text', role='user', meta=None, timestamp=100):
+        from xgent_app.message_policy import stamp_record_metadata
+        meta=stamp_record_metadata(kind,role,meta)
         return self.conn.execute('INSERT INTO global_messages(session_id,msg_type,role,content,metadata,timestamp) VALUES(?,?,?,?,?,?)',
             (cid, kind, role, text, json.dumps(meta) if meta is not None else None, timestamp)).lastrowid
 
@@ -114,13 +116,16 @@ class GlobalSearchTests(unittest.TestCase):
         self.assertTrue(item['snippet'].startswith('…') and item['snippet'].endswith('…'))
 
     def test_user_html_remains_literal_and_ai_markup_is_plain_text(self):
-        self.assertEqual(visible_text('user_text', 'user', '<script>这是用户原文</script>', None), '<script>这是用户原文</script>')
-        self.assertEqual(visible_text('ai_reply', 'assistant', '<b>可搜索</b> &amp; <code>命令</code>', None), '可搜索 & 命令')
+        from xgent_app.message_policy import stamp_record_metadata
+        self.assertEqual(visible_text('user_text', 'user', '<script>这是用户原文</script>', stamp_record_metadata('user_text','user')), '<script>这是用户原文</script>')
+        self.assertEqual(visible_text('ai_reply', 'assistant', '<b>可搜索</b> &amp; <code>命令</code>', stamp_record_metadata('ai_reply','assistant')), '可搜索 & 命令')
 
     def test_ten_thousand_messages_no_schema_change_or_sqlite_fts_requirement(self):
+        from xgent_app.message_policy import stamp_record_metadata
+        metadata=json.dumps(stamp_record_metadata('user_text','user'))
         self.conn.execute('BEGIN')
-        self.conn.executemany("INSERT INTO global_messages(session_id,msg_type,role,content,timestamp) VALUES('a','user_text','user',?,?)",
-            ((f'历史消息 {i}：查找位置', i) for i in range(10000)))
+        self.conn.executemany("INSERT INTO global_messages(session_id,msg_type,role,content,timestamp,metadata) VALUES('a','user_text','user',?,?,?)",
+            ((f'历史消息 {i}：查找位置', i,metadata) for i in range(10000)))
         self.conn.commit()
         schema = list(self.conn.execute('SELECT name FROM sqlite_master'))
         start = time.monotonic()

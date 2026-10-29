@@ -14,6 +14,9 @@ from xgent_app.compression import (
 
 
 def record(text, kind='user_text', metadata=None, row_id=1):
+    from xgent_app.message_policy import new_policy, object_dict
+    metadata = object_dict(metadata)
+    metadata['message_policy'] = new_policy(kind, metadata=metadata).to_dict()
     return {'id': row_id, 'role': 'assistant' if kind == 'ai_reply' else 'user',
             'msg_type': kind, 'content': text, 'timestamp': row_id, 'metadata': metadata}
 

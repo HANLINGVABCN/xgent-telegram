@@ -40,12 +40,17 @@ class ConversationStore(QueueStore):
         cursor = await conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = {row['name'] for row in await cursor.fetchall()}
         version = await _config(conn, 'conversation_schema_version', 0) if 'config' in tables else 0
+        imported = await _config(conn, 'message_policy_import_pending') if 'config' in tables else None
+        if imported is not None and (not isinstance(imported, str) or len(imported) != 32
+                                     or any(char not in '0123456789abcdef' for char in imported)):
+            raise ConversationError('导入消息迁移标记无效，原数据已保留。')
         if version > SCHEMA_VERSION:
             raise ConversationError('数据库版本较新，请升级程序，不能降级混跑。')
-        if 'global_messages' not in tables or self.db_path == ':memory:' or version >= SCHEMA_VERSION:
+        if 'global_messages' not in tables or self.db_path == ':memory:' or version >= SCHEMA_VERSION and not imported:
             return
         database = Path(self.db_path).resolve()
-        backup = database.with_name(database.name + f'.pre-conversations-v{1 if not version else SCHEMA_VERSION}.sqlite3')
+        suffix = f'.pre-message-policy-{imported}.sqlite3' if imported else f'.pre-conversations-v{1 if not version else SCHEMA_VERSION}.sqlite3'
+        backup = database.with_name(database.name + suffix)
         guard = ExecutionFileLock(str(database) + '.migration')
         while not guard.acquire():
             await asyncio.sleep(0.05)
@@ -191,7 +196,8 @@ class ConversationStore(QueueStore):
                 raise ConversationError('数据库版本较新，请升级程序。')
             if version == SCHEMA_VERSION:
                 await self._repair_turn_and_branch_tokens(conn)
-                return
+                if not await _config(conn, 'message_policy_import_pending'):
+                    return
             if version < 2:
                 for column, definition in (
                     ('context_start_record_id', 'INTEGER NOT NULL DEFAULT 0'),
@@ -344,6 +350,11 @@ class ConversationStore(QueueStore):
                 await _set_config(conn, 'conversation_runs', runs)
                 await _set_config(conn, 'conversation_running', None)
                 await _set_config(conn, 'conversation_schema_version', 7)
+            if version < 8 or await _config(conn, 'message_policy_import_pending'):
+                from .message_migrations import migrate_message_policies
+                await migrate_message_policies(conn)
+                await _set_config(conn, 'conversation_schema_version', 8)
+                await conn.execute("DELETE FROM config WHERE key='message_policy_import_pending'")
         self._config_cache.clear()
 
     async def get_conversation_groups(self):

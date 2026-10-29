@@ -101,20 +101,6 @@ def conversation_visible():
     scope = current_scope(required=False)
     return not scope or not _visible_conversation_id or scope.conversation_id == _visible_conversation_id
 
-# token 用量行："↑ X tokens … · ⚡ R tokens/s"（build_token_usage_message）。
-_TOKEN_LINE_RE = re.compile(r"tokens\s*/\s*s\b")
-
-# Agent 轮次状态行（agent_status.py）："Agent 第 3 轮 · 1 个操作进行中"、
-# "✅ Agent 第 3 轮 · 已完成"。纯 UI 状态，核心侧连上下文都不喂给 AI
-# （core.py 的 MessageType.AGENT_STATUS 注释）——它是系统旁白，不是回复。
-_AGENT_STATUS_RE = re.compile(r"Agent\s*第\s*\d+\s*轮")
-
-# Agent 操作结果（agent_presenter.py 的 build_*_presentation）：
-# "⌨️ <b>Agent Run</b>"、"🔎 <b>Agent Grep</b> 命中 3 处" …
-# 这些是工具的输出——命令返回，不是 AI 说的话。
-_AGENT_RESULT_RE = re.compile(r"<b>\s*Agent\s+\w+\s*</b>", re.I)
-
-
 def set_turn_kind(kind: str) -> None:
     """登记当前轮的显示分类：chat=对话 / cmd=命令返回 / system=系统提示。"""
     _turn_kind.set(kind if kind in ("chat", "cmd", "system") else "chat")
@@ -125,23 +111,13 @@ def current_turn_kind() -> str:
 
 
 def _render_kind_for(text: str) -> str:
-    """这条 send_message 该用哪种呈现样式。
-
-    内容特征优先于轮次类型：轮次只知道"用户敲的是命令还是对话"，认不出
-    一次对话轮内部的状态行和工具输出。
-    """
+    """Producer intent chooses the style; reply wording never changes its type."""
     from .presentation import current_message_presentation
     hint = current_message_presentation()
     if hint is not None:
         if hint['kind'] == 'ask_input_notice':
             return 'system'
         return {'ai_reply': 'chat', 'agent_result': 'cmd', 'agent_status': 'system', 'runtime_error': 'system', 'token_usage': 'token'}.get(hint['kind'], 'chat')
-    if _TOKEN_LINE_RE.search(text):
-        return "token"
-    if _AGENT_RESULT_RE.search(text):
-        return "cmd"
-    if _AGENT_STATUS_RE.search(text):
-        return "system"
     return _turn_kind.get()
 
 
@@ -235,8 +211,11 @@ class _CliRelay:
     # -- 生产端 --
 
     def emit(self, op: str, **payload: Any) -> None:
-        from .ask_presentation import local_ask_notice
-        if local_ask_notice() and op in {'send_message', 'edit_message_text', 'user_echo'}:
+        from .message_policy import current_policy
+        policy = current_policy()
+        if policy is not None and not (policy.allows('web') or policy.allows('telegram')) and op in {'send_message', 'edit_message_text', 'user_echo'}:
+            return
+        if policy is not None and policy.purpose == 'form_input' and op in {'send_message', 'edit_message_text', 'user_echo'}:
             return
         from xgent_app.conversations import conversation_snapshot
         snapshot = conversation_snapshot()
@@ -245,14 +224,23 @@ class _CliRelay:
         payload['telegram_presentation'] = presentation_snapshot()
         from xgent_app.web_display import current_web_display
         from xgent_app.presentation import current_message_presentation
-        if current_message_presentation() is not None:
-            payload['message_presentation'] = current_message_presentation()
+        hint = current_message_presentation()
         if op in {'send_message', 'edit_message_text'} and current_web_display() is not None:
             payload['web_display'] = current_web_display()
         from xgent_app.ui_history import relay_ui_context
         ui_context = relay_ui_context()
         if ui_context is not None:
             payload['ui_context'] = ui_context
+        if op == 'user_echo' and (hint or {}).get('kind') != 'user_text':
+            hint = {'kind': 'user_text'}
+        if hint is None:
+            kind = ('ui_message' if ui_context is not None else
+                    'media_reply' if op in {'send_photo', 'send_document'} else
+                    {'chat': 'ai_reply', 'cmd': 'agent_result', 'system': 'system_op'}[_turn_kind.get()])
+            hint = {'kind': kind}
+        from .message_policy import new_policy
+        hint['message_policy'] = new_policy(hint['kind'], hint=hint, origin='cli').to_dict()
+        payload['message_presentation'] = hint
         presentation = current_media_presentation()
         if presentation and op in {'send_message', 'edit_message_text', 'send_photo', 'send_document'}:
             payload['media_presentation'] = presentation

@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 import html
+import copy
 import json
 import re
 import time
@@ -52,7 +53,11 @@ def presentation_turn(turn):
 
 @contextmanager
 def message_presentation(value):
-    token = _message.set(value)
+    from .message_policy import new_policy
+    frozen = copy.deepcopy(value)
+    if frozen is not None:
+        frozen['message_policy'] = new_policy(frozen['kind'], hint=frozen).to_dict()
+    token = _message.set(frozen)
     try:
         yield
     finally:
@@ -60,7 +65,7 @@ def message_presentation(value):
 
 
 def current_message_presentation():
-    return _message.get()
+    return copy.deepcopy(_message.get())
 
 
 def metadata_dict(value):
@@ -96,7 +101,7 @@ def usage_line(reply):
     if not usage and reply.get('elapsed_seconds') is None:
         return ''
     return (f"↑ {_number(usage.get('input_tokens'))} · "
-            f"↓ {_number(usage.get('output_tokens'))} · cache {_number(usage.get('cached_tokens'))} · "
+            f"↓ {_number(usage.get('output_tokens'))} · cache {_number(usage.get('cached_tokens') or 0)} · "
             f"{approximate_seconds(reply['elapsed_seconds']) if reply.get('elapsed_seconds') is not None else '耗时未记录'}")
 
 
@@ -282,31 +287,30 @@ def record_presentation(msg_type, content):
         result.update({k: v for k, v in turn.active_reply.items() if k not in {'record_id', 'message_ids'}})
     elif msg_type == 'token_usage' and turn.active_reply:
         result['reply_record_id'] = turn.active_reply.get('record_id')
-    elif msg_type == 'agent_result' and turn.active_operation and not technical_notice(content):
+    elif (msg_type == 'agent_result' and turn.active_operation
+          and (current_message_presentation() or {}).get('purpose') != 'status'):
         result['operation'] = {k: v for k, v in turn.active_operation.items() if k != 'started_at'}
         result['operation'].setdefault('notice', str(content))
-    if msg_type == 'agent_status' or technical_notice(content):
+    if msg_type == 'agent_status' or (current_message_presentation() or {}).get('purpose') == 'status':
         result['technical'] = True
         result['anchor_record_id'] = turn.last_record_id
     return result
 
 
 def link_usage_records(rows):
-    """Join old and new usage rows without altering their durable content or order."""
+    """Project usage by its saved reply identity; startup migration links old rows."""
     replies = {}
-    previous = None
     for row in rows:
         metadata = metadata_dict(row.get('metadata'))
         if row.get('msg_type') == 'ai_reply':
-            previous = row
             replies[row.get('id')] = row
         elif row.get('msg_type') == 'token_usage':
             link = (metadata.get('presentation') or {}).get('reply_record_id')
-            parent = replies.get(link) if link is not None else previous
+            parent = replies.get(link)
             if parent is not None and isinstance(metadata.get('usage'), dict):
                 parent_meta = metadata_dict(parent.get('metadata'))
                 presentation = parent_meta.setdefault('presentation', {'version': 1, 'kind': 'ai_reply'})
-                presentation.setdefault('round', '?')  # Legacy records have no reliable task boundary.
+                presentation.setdefault('round', '?')
                 presentation.setdefault('model', metadata.get('model') or '')
                 presentation.setdefault('usage', metadata['usage'])
                 parent['metadata'] = parent_meta

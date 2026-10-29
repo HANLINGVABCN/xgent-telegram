@@ -67,14 +67,15 @@ class AgentStatusTests(unittest.TestCase):
 
 def test_background_progress_is_ai_status_even_after_an_operation():
     from types import SimpleNamespace
-    from xgent_app.presentation import PresentationTurn
+    from xgent_app.presentation import PresentationTurn, message_presentation
     from xgent_app.presentation_delivery import PresentationBot
     turn=PresentationTurn('folded')
     turn.active_operation={'kind':'run','output':'previous result'}
     bot=PresentationBot(SimpleNamespace(),turn)
     text='后台流式输出中... 已生成 120 字'
-    assert bot._kind(text)=='ai_reply'
-    assert bot._prepare(text,bot._kind(text),None)==text
+    with message_presentation({'kind':'ai_reply','purpose':'generation','transient':True}):
+        assert bot._kind(text)=='ai_reply'
+        assert bot._prepare(text,bot._kind(text),None)==text
 
 
 if __name__ == "__main__":

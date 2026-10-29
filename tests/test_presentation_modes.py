@@ -133,7 +133,7 @@ def test_short_tool_blocks_are_really_foldable_in_tui_and_plain_cli_stays_compac
 
 def test_missing_usage_is_unknown_and_failures_remain_visible():
     line=usage_line({'round':1,'usage':{'input_tokens':100},'elapsed_seconds':1})
-    assert '↓ 未提供' in line and 'cache 未提供' in line
+    assert '↓ 未提供' in line and 'cache 0' in line
     assert '耗时未记录' in usage_line({'usage':{'input_tokens':100}})
     assert '思考 Token：未提供' in usage_details({'round':1,'usage':{}})
     failure=operation_html({'kind':'run','success':False,'return_code':1,'output':'permission denied'})
@@ -164,6 +164,8 @@ def test_independent_cli_namespace_reprojects_history_without_server_module(monk
     raw='好的。\n```run-x\n<<BEGIN_CLIMODE123456\nuptime\n<<END_CLIMODE123456\n```'
     record={'id':1,'role':'assistant','msg_type':'ai_reply','content':raw,
             'metadata':{'display':{'content':'legacy frozen snapshot','parse_mode':'HTML'}}}
+    from xgent_app.message_policy import stamp_record_metadata
+    record['metadata']=stamp_record_metadata('ai_reply','assistant',record['metadata'])
     folded=web_history.build_history_message(record,tmp_path,tmp_path,presentation_namespace=namespace,presentation_mode='folded')
     detailed=web_history.build_history_message(record,tmp_path,tmp_path,presentation_namespace=namespace,presentation_mode='detailed')
     assert 'data-compact="1"' in folded['content']

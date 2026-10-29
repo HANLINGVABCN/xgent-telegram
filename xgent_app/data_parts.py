@@ -7,6 +7,7 @@ import json
 import math
 import re
 import sqlite3
+import uuid
 from contextlib import closing, nullcontext
 from pathlib import Path
 
@@ -28,7 +29,7 @@ AI_KEYS = {"active_provider", "default_model", "default_media_provider", "defaul
            "model_request_limits", "discovered_model_limits", "model_fetch_status", "thinking_level",
            "ai_request_timeout", "smart_match_threshold", "global_depth", "stream_timeout"}
 HISTORY_KEYS = {"current_chat_id", "telegram_conversation_id", "attachment_generation"}
-INTERNAL_KEYS = {"conversation_schema_version"}
+INTERNAL_KEYS = {"conversation_schema_version", "message_policy_migration", "message_policy_import_pending"}
 SECRET_KEY = re.compile(r"(?:^|_)(?:api_?key|key|secret|password|passwd|token|credential)(?:$|_)", re.I)
 IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -364,3 +365,11 @@ def apply_database(conn, files):
                 columns = headers[category]["tables"][table]
                 sql = "INSERT INTO " + quote(table) + "(" + ",".join(quote(column) for column in columns) + ") VALUES(" + ",".join("?" for _ in columns) + ")"
                 conn.execute(sql, [decode(value) for value in record["values"]])
+    if "config" in existing and any(table in {"global_messages", "ui_messages", "cli_relay_ops", "channel_outbox", "channel_deadletter"}
+                                    for header in headers.values() for table in header["tables"]):
+        # Imported partitions may predate the message contract while the target
+        # schema is already current. Migrate once at the next startup, before any
+        # history reader or delivery worker starts.
+        conn.execute("DELETE FROM config WHERE key='message_policy_import_pending'")
+        conn.execute("INSERT INTO config(key,value) VALUES(?,?)",
+                     ('message_policy_import_pending', json.dumps(uuid.uuid4().hex)))

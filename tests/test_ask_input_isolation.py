@@ -32,6 +32,15 @@ async def main():
             await ui(104,'🔒 已录入变量 $TEST_KEY，内容只进了环境变量，没有发给 AI。回到表单继续。')
             ordinary=await bot.GlobalRecorder.record_user_message('测试',chat_id=1)
             await bot.GlobalRecorder.record_ai_reply('正常回复',chat_id=1,provider='p',model='m')
+            # Seed a v7 database, then exercise the startup conversion. Readers
+            # no longer scan prompt/ack text on every history request.
+            async with h.db._transaction() as conn:
+                await conn.execute("UPDATE global_messages SET metadata=json_remove(metadata,'$.message_policy')")
+                await conn.execute("UPDATE ui_messages SET payload=json_remove(payload,'$.message_policy')")
+                await conn.execute("UPDATE config SET value='7' WHERE key='conversation_schema_version'")
+            h.db._config_cache.clear()
+            await h.db.backup_legacy_conversations()
+            await h.db.migrate_conversations()
             history=await h.db.get_display_history(0)
             messages=[build_history_message(row,bot.ArtifactManager.ROOT_DIR,root) for row in history]
             hidden=[message for message in messages if message.get('hidden')]

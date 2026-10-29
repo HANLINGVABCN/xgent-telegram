@@ -216,7 +216,9 @@ async def run_context_compression(update: Update, context: ContextTypes.DEFAULT_
             publish_conversation_event(context, {'type': 'context_reset'})
             # Delivery is after commit; a Telegram outage cannot undo the summary.
             with contextlib.suppress(Exception):
-                await safe_send_message(context, update.effective_chat.id, summary)
+                from xgent_app.presentation import message_presentation
+                with message_presentation({'kind':'ai_reply','record_id':entry['response_row_id']}):
+                    await safe_send_message(context, update.effective_chat.id, summary)
                 notice, _ = db._compression_notice(entry)
                 await message.reply_text(notice)
         except asyncio.CancelledError:
@@ -272,7 +274,11 @@ async def run_context_compression(update: Update, context: ContextTypes.DEFAULT_
                         with contextlib.suppress(Exception):
                             await GlobalRecorder.record_token_usage(
                                 build_token_usage_message(usage, elapsed) or '',
-                                update.effective_chat.id, usage=usage, model=model)
+                                update.effective_chat.id, usage=usage, model=model,
+                                parent_record_id=entry.get('response_row_id'), associate_reply=bool(entry.get('response_row_id')),
+                                elapsed_seconds=elapsed)
+                            if entry.get('response_row_id'):
+                                await publish_saved_reply(context, entry['response_row_id'])
                         # Recording makes usage visible in refreshed history; Telegram
                         # also needs an actual send through the active channel/mirror.
                         with contextlib.suppress(Exception):

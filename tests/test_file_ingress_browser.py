@@ -10,6 +10,7 @@ import pytest
 
 from tests.test_workbench_browser import browser_context, workspace_url, ready  # noqa: F401
 from xgent_app.file_ingress import read_multipart
+from tests.message_fixtures import current_history_message
 
 
 @pytest.mark.parametrize('width', [1440, 390])
@@ -69,7 +70,6 @@ def test_server_upload_button_uses_path_only_endpoint(browser_context, workspace
 @pytest.mark.parametrize('width,count', [(1440, 1), (390, 2)])
 def test_images_and_caption_stay_in_one_bubble_before_and_after_refresh(browser_context, workspace_url, tmp_path, width, count):
     from tests.test_attachments import image_bytes
-    from xgent_app.web_history import build_history_message
     expect = pytest.importorskip('playwright.sync_api').expect
     page = browser_context.new_page()
     page.set_viewport_size({'width': width, 'height': 900})
@@ -131,7 +131,7 @@ def test_images_and_caption_stay_in_one_bubble_before_and_after_refresh(browser_
         request_key = parsed['idempotency_key']
     finally:
         parsed['_temporary'].cleanup()
-    message = build_history_message({'id': 900001, 'role': 'user', 'msg_type': 'user_file', 'timestamp': 1792840000,
+    message = current_history_message({'id': 900001, 'role': 'user', 'msg_type': 'user_file', 'timestamp': 1792840000,
         'content': caption + '\n\n[文件] image-0.png，已保存到 ' + str(storage/'uploads'/refs[0]['path']),
         'metadata': {'attachments': refs, 'file_ingress_mode': 'attachment', 'upload_request_key': request_key,
                      'web_file_message': {'version': 1, 'text': caption}}}, storage, tmp_path)
@@ -181,7 +181,6 @@ def test_images_and_caption_stay_in_one_bubble_before_and_after_refresh(browser_
 @pytest.mark.parametrize('viewport', [1440, 390])
 def test_slow_history_images_keep_placeholder_size_and_reuse_nodes(browser_context, workspace_url, tmp_path, viewport):
     from tests.test_attachments import image_bytes
-    from xgent_app.web_history import build_history_message
     expect=pytest.importorskip('playwright.sync_api').expect
     page=browser_context.new_page();page.set_viewport_size({'width':viewport,'height':900})
     storage=tmp_path/'storage';refs=[];images=[]
@@ -190,7 +189,7 @@ def test_slow_history_images_keep_placeholder_size_and_reuse_nodes(browser_conte
         path=storage/'uploads'/f'day/photo-{index}.png';path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data)
         refs.append({'path':f'day/photo-{index}.png','name':f'photo-{index}.png','mime_type':'image/png',
                      'width':size[0],'height':size[1],'order':index,'sha256':str(index)*64})
-    message=build_history_message({'id':910001,'role':'user','msg_type':'user_file','timestamp':1792840000,'content':'index',
+    message=current_history_message({'id':910001,'role':'user','msg_type':'user_file','timestamp':1792840000,'content':'index',
         'metadata':{'file_ingress_mode':'attachment','attachments':refs,'web_file_message':{'version':1,'text':'慢速网络下文字和图片位置都不能跳'}}},storage,tmp_path)
     message['conversation_id']='global_memory';pending=[];received=[];events=[]
     def history(route):
@@ -285,7 +284,6 @@ def test_history_image_failure_keeps_placeholder_and_can_retry(browser_context,w
 @pytest.mark.parametrize('width,kind', [(1440, 'user_photo'), (390, 'user_file')])
 def test_telegram_image_live_and_refresh_match_web_image_style(browser_context,workspace_url,tmp_path,width,kind):
     from tests.test_attachments import image_bytes
-    from xgent_app.web_history import build_history_message
     expect=pytest.importorskip('playwright.sync_api').expect
     page=browser_context.new_page();page.set_viewport_size({'width':width,'height':900})
     page.add_init_script("localStorage.setItem('xgent-theme','dark')")
@@ -294,7 +292,7 @@ def test_telegram_image_live_and_refresh_match_web_image_style(browser_context,w
     storage=tmp_path/'storage';path=storage/'uploads'/'day'/'photo_telegram.png'
     path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data)
     source=f'[文件] photo_telegram.png，已保存到 {path.as_posix()}。说明：{caption}'
-    message=build_history_message({'id':930001,'timestamp':1792840000,'role':'user','msg_type':kind,'content':source,
+    message=current_history_message({'id':930001,'timestamp':1792840000,'role':'user','msg_type':kind,'content':source,
         'metadata':{'attachments':[{'path':'day/photo_telegram.png','name':'photo_telegram.png','mime_type':'image/png',
             'width':800,'height':600,'caption':caption,'source_message_id':333}]}},storage,tmp_path)
     message['conversation_id']='global_memory';stored=[];events=[];errors=[]

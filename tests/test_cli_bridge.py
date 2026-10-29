@@ -660,7 +660,9 @@ class MessagePresentationTests(unittest.TestCase):
         run(self.bot.send_message(chat_id=1, text="回复正文"))
         self.stream.truncate(0)
         self.stream.seek(0)
-        run(self.bot.send_message(chat_id=1, text="↑ 100 tokens · ⚡ 43 tokens/s"))
+        from xgent_app.presentation import message_presentation
+        with message_presentation({'kind': 'token_usage'}):
+            run(self.bot.send_message(chat_id=1, text="↑ 100 tokens · ⚡ 43 tokens/s"))
         output = self.stream.getvalue()
         self.assertFalse(output.startswith("\n"), "token 行前面不该再空一行")
         self.assertTrue(output.endswith("\n\n"), "行距要放到 token 行下面")
@@ -708,10 +710,12 @@ class MessageKindClassificationTests(unittest.TestCase):
         cli_bridge.set_screen(None)
         cli_bridge.reset_menu_state()
 
-    def send(self, text, parse_mode=None):
+    def send(self, text, parse_mode=None, kind='ai_reply'):
         self.stream.truncate(0)
         self.stream.seek(0)
-        run(self.bot.send_message(chat_id=1, text=text, parse_mode=parse_mode))
+        from xgent_app.presentation import message_presentation
+        with message_presentation({'kind': kind}):
+            run(self.bot.send_message(chat_id=1, text=text, parse_mode=parse_mode))
         return self.stream.getvalue()
 
     def test_agent_status_line_is_system_not_a_boxed_reply(self):
@@ -719,7 +723,7 @@ class MessageKindClassificationTests(unittest.TestCase):
                      "✅ Agent 第 3 轮 · 1 个操作已完成",
                      "⏹️ Agent 第 2 轮 · 已停止"):
             with self.subTest(text=text):
-                out = self.send(text)
+                out = self.send(text, kind='agent_status')
                 self.assertIn("◇", out)
                 self.assertIn("系统", out)
                 self.assertNotIn("XGent", out)
@@ -730,7 +734,7 @@ class MessageKindClassificationTests(unittest.TestCase):
                      "🔎 <b>Agent Grep</b> 命中 3 处",
                      "🌐 <b>Agent Search</b> 命中 2 条"):
             with self.subTest(text=text):
-                out = self.send(text, "HTML")
+                out = self.send(text, "HTML", kind='agent_result')
                 self.assertIn("◇", out)
                 self.assertIn("命令", out)
                 self.assertNotIn("XGent", out)
@@ -742,20 +746,27 @@ class MessageKindClassificationTests(unittest.TestCase):
         self.assertIn("XGent", out)
         self.assertIn("─", out)
 
+    def test_reply_with_status_words_is_still_an_assistant_reply(self):
+        out = self.send('✅ Agent 第 3 轮 · 已完成')
+        self.assertIn('XGent', out)
+        self.assertNotIn('◇ 系统', out)
+
     def test_only_one_kind_of_block_in_a_whole_turn(self):
         # 走一遍真实对话轮：状态 → 工具输出 → 状态 → 正文 → token。
         # 整轮下来横线块只该出现一次（那段正文）。
         turn = [
-            ("Agent 第 1 轮 · 1 个操作进行中", None),
-            ("⌨️ <b>Agent Run</b>\n✅ 返回码: <code>0</code>", "HTML"),
-            ("✅ Agent 第 1 轮 · 1 个操作已完成", None),
-            ("测试正常，随时可以开始。", "HTML"),
-            ("↑ 5459 tokens · ↓ 117 tokens · ⚡ 30 tokens/s", None),
+            ("Agent 第 1 轮 · 1 个操作进行中", None, 'agent_status'),
+            ("⌨️ <b>Agent Run</b>\n✅ 返回码: <code>0</code>", "HTML", 'agent_result'),
+            ("✅ Agent 第 1 轮 · 1 个操作已完成", None, 'agent_status'),
+            ("测试正常，随时可以开始。", "HTML", 'ai_reply'),
+            ("↑ 5459 tokens · ↓ 117 tokens · ⚡ 30 tokens/s", None, 'token_usage'),
         ]
         self.stream.truncate(0)
         self.stream.seek(0)
-        for text, parse_mode in turn:
-            run(self.bot.send_message(chat_id=1, text=text, parse_mode=parse_mode))
+        from xgent_app.presentation import message_presentation
+        for text, parse_mode, kind in turn:
+            with message_presentation({'kind': kind}):
+                run(self.bot.send_message(chat_id=1, text=text, parse_mode=parse_mode))
         output = self.stream.getvalue()
         self.assertEqual(1, output.count("◆ XGent"),
                          f"一轮里横线块只该有一个（AI 正文）：\n{output}")

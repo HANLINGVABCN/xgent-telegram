@@ -23,8 +23,9 @@ function showProgress(container,job){
 export async function dataBackupCards({page,card,state={},dirtyForm=()=>{}}){
   const [initialEstimate,initialRules,initialCatalog]=await Promise.all([wb('data/estimate'),wb('data/backup-settings'),wb('data/backups')]);
   let estimate=initialEstimate,rules=initialRules,catalog=initialCatalog;
-  const categories=estimate.categories||[];
-  const chosen=new Set(rules.categories||estimate.recommended_categories||estimate.selected_categories||categories.filter(item=>item.selected).map(item=>item.id));
+  const categories=estimate.groups||[];
+  const chosen=new Set(rules.selected_groups||estimate.recommended_groups||categories.filter(item=>item.selected).map(item=>item.id));
+  const selectedParts=()=>[...new Set(categories.filter(item=>chosen.has(item.id)).flatMap(item=>item.categories))];
   let format=rules.archive_format||'zip',exportBusy=false,activating=false,deleting=false;
   let estimateSerial=0,estimateTimer=null,estimateAbort=null,selectionSerial=0;
   let exportTimer=null,importTimer=null,importId=null,selectedName=null,currentSource='';
@@ -36,13 +37,13 @@ export async function dataBackupCards({page,card,state={},dirtyForm=()=>{}}){
   const allSize=categories.reduce((total,item)=>total+(item.size||0),0);
   for(const item of categories){
     const input=el('input',{type:'checkbox',name:'category_'+item.id,checked:chosen.has(item.id),'data-category':item.id,'aria-label':'导出 '+item.label});inputs.set(item.id,input);
-    input.onchange=()=>{if(input.checked){chosen.add(item.id);resolveConflicts(item.id);}else chosen.delete(item.id);changedSelection();};
-    const info=el('details',{class:'wb-backup-category'},el('summary',{},el('span',{},item.label),item.sensitive?el('span',{class:'wb-backup-sensitive'},'含敏感信息'):null),item.description?el('p',{class:'wb-note'},item.description):null,el('small',{class:'wb-file-path'},(item.paths||[]).join(' · ')||(item.part?'独立分类记录 · 数据库 / 环境变量':'无文件')),fileDetails(item));
+    input.onchange=()=>{if(input.checked)chosen.add(item.id);else chosen.delete(item.id);changedSelection();};
+    const info=el('details',{class:'wb-backup-category'},el('summary',{},el('span',{},item.label),item.sensitive?el('span',{class:'wb-backup-sensitive'},'含敏感信息'):null),item.description?el('p',{class:'wb-note'},item.description):null,item.paths?.length?el('small',{class:'wb-file-path'},item.paths.join(' · ')):null,fileDetails(item));
     const meter=el('span',{class:'wb-backup-size-fill'});meter.style.width=(allSize?Math.min(100,(item.size||0)/allSize*100):0)+'%';
     body.append(el('tr',{'data-export-category':item.id},el('td',{},input),el('td',{},info),el('td',{},el('strong',{},(item.size_is_estimate?'约 ':'')+bytes(item.size)),el('span',{class:'wb-backup-size-meter','aria-hidden':'true'},meter)),el('td',{},String(item.file_count||0),item.item_count!=null?el('small',{},item.item_count+' 条记录'):null)));
   }
   const setChoices=ids=>{chosen.clear();ids.forEach(id=>chosen.add(id));for(const [id,input] of inputs)input.checked=chosen.has(id);form.dispatchEvent(new Event('input',{bubbles:true}));changedSelection();};
-  const contents=el('section',{class:'wb-backup-contents'},el('div',{class:'wb-backup-section-head'},el('h4',{},'全部导出类型 · '+categories.length+' 类'),el('div',{class:'wb-actions'},button('全选',()=>setChoices(categories.filter(item=>!item.advanced).map(item=>item.id))),button('全不选',()=>setChoices([])),button('默认选择',()=>setChoices(estimate.recommended_categories||categories.filter(item=>!item.advanced&&item.id!=='command_outputs').map(item=>item.id))))),el('p',{class:'wb-note'},'全部类型均列出，空类型也显示。密钥、AI 配置、对话记忆可独立导出；全选使用独立分类，不重复勾选完整文件。源码、公共技能和缓存不导出。'),el('div',{class:'wb-table-wrap wb-backup-content-table'},el('table',{class:'wb-table'},el('thead',{},el('tr',{},el('th',{},'选择'),el('th',{},'数据类型 / 文件'),el('th',{},'空间占用'),el('th',{},'文件数'))),body)));
+  const contents=el('section',{class:'wb-backup-contents'},el('div',{class:'wb-backup-section-head'},el('h4',{},'备份内容 · '+categories.length+' 组'),el('div',{class:'wb-actions'},button('全选',()=>setChoices(categories.map(item=>item.id))),button('全不选',()=>setChoices([])),button('默认选择',()=>setChoices(estimate.recommended_groups||categories.filter(item=>!item.advanced&&item.id!=='command_outputs').map(item=>item.id))))),el('p',{class:'wb-note'},'各组独立，可同时勾选。展开查看包含的文件与记录。源码、公共技能和缓存不导出。'),el('div',{class:'wb-table-wrap wb-backup-content-table'},el('table',{class:'wb-table'},el('thead',{},el('tr',{},el('th',{},'选择'),el('th',{},'备份内容'),el('th',{},'空间占用'),el('th',{},'文件数'))),body)));
 
   const enabled=check('开启自动压缩','enabled',rules.enabled);
   const presets=[{value:'30m',label:'每 30 分钟'},{value:'1h',label:'每小时'},{value:'6h',label:'每 6 小时'},{value:'12h',label:'每 12 小时'},{value:'1d',label:'每天'},{value:'7d',label:'每周'},{value:'custom',label:'自定义间隔'}];
@@ -93,28 +94,25 @@ export async function dataBackupCards({page,card,state={},dirtyForm=()=>{}}){
   previewBox.replaceChildren(el('div',{class:'wb-empty'},el('h4',{},'选择一个压缩包'),el('p',{},'点击左侧名称或上传文件，扫描通过后显示包含内容与覆盖范围。')));
 
   function updateSummary(){
-    const selected=categories.filter(item=>chosen.has(item.id));
-    totalText.textContent='已选 '+selected.length+' 类 · '+selected.reduce((sum,item)=>sum+(item.file_count||0),0)+' 个文件 · 原始 '+bytes(selected.reduce((sum,item)=>sum+(item.size||0),0));
+    const selected=(estimate.groups||categories).filter(item=>chosen.has(item.id));
+    totalText.textContent='已选 '+selected.length+' 组 · '+selected.reduce((sum,item)=>sum+(item.file_count||0),0)+' 个文件 · 原始 '+bytes(selected.reduce((sum,item)=>sum+(item.size||0),0));
     const prediction=(estimate.formats||[]).find(item=>item.id===format);
     forecast.textContent=chosen.size?(prediction?'预计 '+seconds(prediction.estimated_seconds)+' · 压缩后约 '+bytes(prediction.estimated_size):'正在更新估算…'):'请选择至少一种数据类型';
     saveButton.disabled=exportBusy||!chosen.size;exportButton.disabled=exportBusy||!chosen.size;
     for(const spec of FORMAT_DEFAULTS){const value=(estimate.formats||[]).find(item=>item.id===spec.id);formatLabels.get(spec.id).prediction.textContent=!chosen.size?'请选择内容':value?'预计 '+seconds(value.estimated_seconds)+' · 约 '+bytes(value.estimated_size):'正在估算…';}
-  }
-  function resolveConflicts(key){
-    for(const item of categories){if(item.id!==key&&((item.conflicts||[]).includes(key)||(categories.find(value=>value.id===key)?.conflicts||[]).includes(item.id))){chosen.delete(item.id);inputs.get(item.id).checked=false;}}
   }
   function changedSelection(){estimate={...estimate,formats:[]};updateSummary();clearTimeout(estimateTimer);estimateTimer=setTimeout(refreshEstimate,180);}
   async function refreshEstimate(){
     const serial=++estimateSerial;estimateAbort?.abort();
     if(!chosen.size)return;
     estimateAbort=new AbortController();
-    try{const value=await wb('data/estimate?categories='+encodeURIComponent([...chosen].join(',')),{signal:estimateAbort.signal});if(serial!==estimateSerial)return;estimate=value;updateSummary();}
+    try{const value=await wb('data/estimate?categories='+encodeURIComponent(selectedParts().join(',')),{signal:estimateAbort.signal});if(serial!==estimateSerial)return;estimate=value;updateSummary();}
     catch(error){if(error.name!=='AbortError'&&serial===estimateSerial){feedback.replaceChildren(message('估算未完成：'+error.message));for(const value of formatLabels.values())value.prediction.textContent='估算不可用';forecast.textContent='估算不可用，仍可压缩';}}
   }
   function settingsData(){
     return {backup_directory:directoryInput.value.trim(),enabled:enabled.querySelector('input').checked,
       frequency:frequency.querySelector('select').value==='custom'?customFrequency.querySelector('input').value.trim():frequency.querySelector('select').value,
-      mode:mode.querySelector('select').value,max_backups:Number(limit.querySelector('input').value),categories:[...chosen],archive_format:format,include_command_outputs:chosen.has('command_outputs')};
+      mode:mode.querySelector('select').value,max_backups:Number(limit.querySelector('input').value),categories:selectedParts(),archive_format:format,include_command_outputs:chosen.has('command_outputs')};
   }
   async function saveRules(){
     if(!chosen.size)throw new Error('请至少选择一种数据类型。');
@@ -125,7 +123,7 @@ export async function dataBackupCards({page,card,state={},dirtyForm=()=>{}}){
     if(exportBusy||!chosen.size)return;
     if(categories.some(item=>chosen.has(item.id)&&item.sensitive)&&!confirm('所选内容可能包含 .env 原文、Bot/API 密钥或私有配置。确认压缩并妥善保管？'))return;
     setExportBusy(true);feedback.replaceChildren();exportProgress.replaceChildren(message('正在保存配置并开始压缩…','loading'));
-    try{await saveRules();const job=await wb('data/export',{data:{request_id:requestId(),categories:[...chosen],archive_format:format,include_command_outputs:chosen.has('command_outputs'),confirm_secrets:true}});store('xgent-data-export-job',job.id);pollExport(job.id);}
+    try{await saveRules();const job=await wb('data/export',{data:{request_id:requestId(),categories:selectedParts(),archive_format:format,include_command_outputs:chosen.has('command_outputs'),confirm_secrets:true}});store('xgent-data-export-job',job.id);pollExport(job.id);}
     catch(error){exportProgress.replaceChildren(message(error.message));setExportBusy(false);}
   }
   async function pollExport(id){
@@ -182,33 +180,32 @@ export async function dataBackupCards({page,card,state={},dirtyForm=()=>{}}){
   function renderPreview(job){
     const preview=job.preview;if(!preview){previewBox.replaceChildren(message('此任务没有内容预览，请重新选择压缩包。'));return;}
     currentSource=currentSource||job.source_name;sourceText.textContent='当前压缩包：'+currentSource;
-    const rows=(preview.categories||[]).filter(item=>item.available!==false&&item.included!==false);
-    const selected=new Set(preview.recommended_categories||rows.filter(item=>!item.advanced).map(item=>item.id));
+    const rows=preview.groups||[];
+    const selected=new Set(preview.recommended_groups||rows.filter(item=>item.selected).map(item=>item.id));
     const choiceInputs=new Map(),selectionSummary=el('strong',{class:'wb-import-selected-summary'}),warningText=el('p');
-    const warning=el('div',{class:'wb-backup-overwrite-warning',role:'note'},el('strong',{},'只覆盖勾选的部分；这些部分中的旧内容会删除。未勾选的全部保留。'),warningText,el('p',{},'密钥、AI 配置、应用设置、对话记忆分别恢复，不会连带覆盖其他数据库内容。切换前自动备份；失败会尝试回滚。'));
+    const warning=el('div',{class:'wb-backup-overwrite-warning',role:'note'},el('strong',{},'只覆盖勾选的组；组内被导入的旧内容会删除。其余内容保留。'),warningText,el('p',{},'每组仅恢复压缩包中已有的部分。切换前自动备份；失败会尝试回滚。'));
     const groups=el('div',{class:'wb-import-content-groups'});
     for(const item of rows){
       const input=el('input',{type:'checkbox',checked:selected.has(item.id),'data-import-category':item.id,'aria-label':'导入 '+item.label});choiceInputs.set(item.id,input);
-      input.onchange=()=>{if(input.checked){selected.add(item.id);for(const other of rows){if(other.id!==item.id&&((item.conflicts||[]).includes(other.id)||(other.conflicts||[]).includes(item.id))){selected.delete(other.id);choiceInputs.get(other.id).checked=false;}}}else selected.delete(item.id);syncImport();};
+      input.onchange=()=>{if(input.checked)selected.add(item.id);else selected.delete(item.id);syncImport();};
       const details=el('details',{class:'wb-import-content-group'},el('summary',{},el('strong',{},item.label),el('span',{},item.file_count+' 个文件 · '+bytes(item.size)+(item.item_count!=null?' · '+item.item_count+' 条记录':''))),item.description?el('p',{class:'wb-note'},item.description):null,el('p',{class:'wb-import-replacement'},'当前 '+(item.current_item_count!=null?item.current_item_count+' 条记录':item.current_file_count+' 个文件')+' / '+bytes(item.current_size)+' → 导入 '+item.file_count+' 个文件 / '+bytes(item.size)),el('p',{class:'wb-file-path'},'覆盖范围：'+(item.replace_paths||item.paths||[]).join(' · ')),item.entry_names?.length?el('p',{class:'wb-note'},'条目名称（不显示密钥值）：'+item.entry_names.join('、')):null,fileDetails(item));
-      groups.append(el('div',{class:'wb-import-select-row','data-import-row':item.id},input,el('div',{},details,el('p',{class:'wb-note wb-import-covered',hidden:true}))));
+      groups.append(el('div',{class:'wb-import-select-row','data-import-row':item.id},input,details));
     }
     const activate=button('确认覆盖并导入',async()=>{
       if(activating||importId!==job.id)return;
       if(!selected.size)return;
       const effective=effectiveSelection();
-      const labels=rows.filter(item=>effective.includes(item.id)).map(item=>item.label).join('、');
+      const labels=rows.filter(item=>selected.has(item.id)).map(item=>item.label).join('、');
       if(!confirm('将停止服务，并覆盖 '+labels+'。这些类型中的旧内容会删除，不会合并。切换前会自动备份旧数据，随后重启服务。确认导入？'))return;
       activating=true;activate.disabled=true;file.disabled=true;for(const input of choiceInputs.values())input.disabled=true;
       try{await wb('data/activate',{data:{id:job.id,categories:effective,confirm_replace:true}});previewBox.replaceChildren();pollImport(job.id,selectionSerial);}
       catch(error){activating=false;file.disabled=false;for(const input of choiceInputs.values())input.disabled=false;importProgress.replaceChildren(message(error.message));syncImport();}
     },'danger');
-    function covering(item){return rows.find(other=>selected.has(other.id)&&other.id!==item.id&&(other.id==='database'||other.id==='env')&&(other.conflicts||[]).includes(item.id));}
-    function effectiveSelection(){return rows.filter(item=>selected.has(item.id)&&!covering(item)).map(item=>item.id);}
-    function syncImport(){const effective=effectiveSelection(),included=rows.filter(item=>effective.includes(item.id));let count=0;for(const item of rows){const covered=covering(item),input=choiceInputs.get(item.id),row=groups.querySelector('[data-import-row="'+item.id+'"]'),note=row.querySelector('.wb-import-covered');input.checked=selected.has(item.id)||!!covered;input.disabled=activating||!!covered;row.classList.toggle('is-selected',input.checked);note.hidden=!covered;note.textContent=covered?'已包含在「'+covered.label+'」中，导入时不会重复覆盖。':'';if(input.checked)count++;}selectionSummary.textContent='已选导入 '+count+' 部分 / 共 '+rows.length+' 部分 · '+bytes(included.reduce((sum,item)=>sum+(item.size||0),0));warningText.textContent=included.length?'将覆盖：'+included.map(item=>item.label).join('、'):'尚未选择导入部分；当前数据不会修改。';activate.disabled=activating||!effective.length;}
+    function effectiveSelection(){return [...new Set(rows.filter(item=>selected.has(item.id)).flatMap(item=>item.categories))];}
+    function syncImport(){const effective=effectiveSelection(),included=rows.filter(item=>selected.has(item.id));for(const item of rows){const input=choiceInputs.get(item.id),row=groups.querySelector('[data-import-row="'+item.id+'"]');input.checked=selected.has(item.id);input.disabled=activating;row.classList.toggle('is-selected',input.checked);}selectionSummary.textContent='已选导入 '+included.length+' 组 / 共 '+rows.length+' 组 · '+bytes(included.reduce((sum,item)=>sum+(item.size||0),0));warningText.textContent=included.length?'将覆盖：'+included.map(item=>item.label).join('、'):'尚未选择导入部分；当前数据不会修改。';activate.disabled=activating||!effective.length;}
     const chooseAll=()=>{if(activating)return;selected.clear();rows.forEach(item=>selected.add(item.id));syncImport();};
     const chooseNone=()=>{if(activating)return;selected.clear();for(const input of choiceInputs.values())input.checked=false;syncImport();};
-    previewBox.replaceChildren(el('div',{class:'wb-import-summary'},el('strong',{},'可导入 '+rows.length+' 部分 · 压缩包 '+bytes(preview.size)),el('span',{class:'wb-tag'},(preview.archive_format||'ZIP').toUpperCase())),warning,el('div',{class:'wb-backup-section-head'},el('h4',{},'选择需要导入的部分'),el('div',{class:'wb-actions'},button('全选可导入部分',chooseAll),button('全不选导入部分',chooseNone))),groups,selectionSummary,el('p',{class:'wb-note'},'全选包含高级恢复项。完整数据库或环境文件已包含的分项会一起勾选，提交时自动去重；取消完整文件后可单独选择分项。'),activate);syncImport();
+    previewBox.replaceChildren(el('div',{class:'wb-import-summary'},el('strong',{},'可导入 '+rows.length+' 组 · 压缩包 '+bytes(preview.size)),el('span',{class:'wb-tag'},(preview.archive_format||'ZIP').toUpperCase())),warning,el('div',{class:'wb-backup-section-head'},el('h4',{},'选择需要导入的内容'),el('div',{class:'wb-actions'},button('全选可导入部分',chooseAll),button('全不选导入部分',chooseNone))),groups,selectionSummary,activate);syncImport();
   }
   async function pollImport(id,serial){
     clearTimeout(importTimer);if(serial!==selectionSerial)return;
@@ -221,7 +218,7 @@ export async function dataBackupCards({page,card,state={},dirtyForm=()=>{}}){
     }catch(error){importProgress.replaceChildren(message('状态读取失败：'+error.message),button('重试读取状态',()=>pollImport(id,serial)));if(activating)importTimer=setTimeout(()=>pollImport(id,serial),3000);}
   }
   renderCatalog(catalog);updateSummary();
-  if(JSON.stringify([...chosen].sort())!==JSON.stringify((initialEstimate.selected_categories||[]).slice().sort()))changedSelection();
+  if(JSON.stringify(selectedParts().sort())!==JSON.stringify((initialEstimate.selected_categories||[]).slice().sort()))changedSelection();
   const pendingExport=stored('xgent-data-export-job');if(pendingExport){setExportBusy(true);setTimeout(()=>pollExport(pendingExport),0);}
   const pendingImport=stored('xgent-data-import-job');if(pendingImport){importId=pendingImport;setTimeout(()=>pollImport(pendingImport,selectionSerial),0);}
   const legacy=stored('xgent-data-job');if(legacy){store('xgent-data-job',null);wb('data/status?id='+encodeURIComponent(legacy)).then(job=>{if(job.kind==='export'){store('xgent-data-export-job',legacy);setExportBusy(true);pollExport(legacy);}else{importId=legacy;store('xgent-data-import-job',legacy);pollImport(legacy,selectionSerial);}}).catch(()=>{});}

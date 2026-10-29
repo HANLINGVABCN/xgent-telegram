@@ -25,8 +25,8 @@ def full_output_server(tmp_path):
     body = '\n'.join(f'line{i:03d}: <tag> & 中文' for i in range(120)) + '\n<script>window.hacked=1</script>'
     raw = '```run-x\n<<BEGIN_WEB123456\n' + body + '\n<<END_WEB123456\n```'
     canonical = ProtocolParser.render_folded_html(raw, raw_copy=True)
-    records = [{'id': 1, 'role': 'assistant', 'content': canonical, 'parse_mode': 'HTML', 'timestamp': 1},
-               {'id': 2, 'role': 'assistant', 'content': build_run_presentation({
+    records = [{'id': 1, 'role': 'assistant', 'msg_type':'ai_reply', 'content': canonical, 'parse_mode': 'HTML', 'timestamp': 1},
+               {'id': 2, 'role': 'assistant', 'msg_type':'agent_result', 'content': build_run_presentation({
                    'success': True, 'return_code': 0, 'output': 'bounded summary', 'output_path': str(archive)}),
                 'parse_mode': 'HTML', 'timestamp': 2}]
     loop = asyncio.new_event_loop()

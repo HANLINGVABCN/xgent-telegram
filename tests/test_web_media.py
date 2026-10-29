@@ -38,10 +38,11 @@ class WebMediaTests(unittest.IsolatedAsyncioTestCase):
         self.presentation = build_media_presentation(self.text, self.artifacts, replace_message_ids=[42, 43])
 
     def history(self, kind='ai_reply'):
+        from xgent_app.message_policy import stamp_record_metadata
         return build_history_message({
             'id': 8, 'timestamp': 123, 'role': 'assistant', 'msg_type': kind,
             'content': self.text,
-            'metadata': {'display_media': [display_media_reference(item['path']) for item in self.artifacts]},
+            'metadata': stamp_record_metadata(kind,'assistant',{'display_media': [display_media_reference(item['path']) for item in self.artifacts]}),
         }, self.root, self.root)
 
     def assert_frame(self, frame):

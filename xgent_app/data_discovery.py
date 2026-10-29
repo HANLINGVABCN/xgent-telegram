@@ -129,6 +129,8 @@ class DiscoveredBundles(DataBundles):
         chosen = {}
 
         def add(name, path):
+            if category_for(name) == "server_assets":
+                return
             if category_for(name) not in selected:
                 return
             if path.is_symlink() or not path.is_file():
@@ -159,7 +161,7 @@ class DiscoveredBundles(DataBundles):
             and (self.paths.code / ".env").is_file()
         ):
             add(".env", self.paths.code / ".env")
-        for tree in sorted(STATE_NAMES - {".env"}):
+        for tree in sorted(STATE_NAMES - {".env", "server_assets"}):
             folder = root / tree
             if folder.is_symlink():
                 raise BundleError("数据目录是符号链接：" + str(folder))

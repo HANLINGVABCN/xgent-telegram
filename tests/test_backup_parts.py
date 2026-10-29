@@ -6,7 +6,7 @@ import sqlite3
 import pytest
 
 from xgent_app.data_bundles import BundleError, DataBundles
-from xgent_app.data_contents import CATEGORIES, RECOMMENDED_CATEGORIES
+from xgent_app.data_contents import BACKUP_GROUPS, CATEGORIES, RECOMMENDED_CATEGORIES
 from xgent_app.data_parts import DataParts, env_values, read_part
 from xgent_app.data_paths import DataPaths
 
@@ -177,14 +177,60 @@ def test_unavailable_and_conflicting_import_selection_is_rejected(instances):
     target.discard_staging(staging)
 
 
-def test_every_export_category_is_visible_even_when_empty(instances):
+def test_export_groups_include_empty_content_without_overlapping_choices(instances):
     source, _ = instances
     estimate = source.estimate(categories=list(RECOMMENDED_CATEGORIES), compare_formats=True)
-    assert len(estimate["categories"]) == len(CATEGORIES) > 20
+    assert len(estimate["categories"]) == len(CATEGORIES)
     assert {row["id"] for row in estimate["categories"]} == {spec["id"] for spec in CATEGORIES}
     assert {"secrets", "ai_config", "conversation_history", "prompts", "tasks"} <= set(estimate["recommended_categories"])
     assert all(item["sample_bytes"] <= 1024 * 1024 for item in estimate["formats"])
     assert "source-api-key" not in json.dumps(estimate)
+    groups = estimate['groups']
+    assert len(groups) == 7
+    members = [key for group in groups for key in group['categories']]
+    assert len(members) == len(set(members))
+    assert not {'env', 'database', 'server_assets'} & set(members)
+    assert sum(group['size'] for group in groups if group['selected']) == estimate['size']
+    assert not next(group for group in groups if group['id'] == 'runtime_state')['selected']
+
+
+def test_merged_configuration_restore_restores_all_config_and_keeps_conversations(instances):
+    source, target = instances
+    selected = [key for group in BACKUP_GROUPS if group['id'] in {'configuration', 'conversations'}
+                for key in group['categories']]
+    exported = source.export(categories=selected)
+    staging, manifest = target.prepare_import(exported['path'])
+    preview = target.import_preview(staging, manifest)
+    assert {group['id'] for group in preview['groups']} == {'configuration', 'conversations'}
+    group = next(group for group in preview['groups'] if group['id'] == 'configuration')
+    before = state(target)
+    result = target.activate(staging, categories=group['categories'])
+    after, incoming = state(target), state(source)
+    assert after['env'] == incoming['env']
+    assert after['providers'] == incoming['providers']
+    assert after['config']['default_model'] == incoming['config']['default_model']
+    assert after['config']['web_password_hash'] == incoming['config']['web_password_hash']
+    for table in ('global_messages', 'chat_sessions', 'trigger_tasks', 'channel_outbox'):
+        assert after[table] == before[table]
+    target.rollback_activation(result)
+    assert state(target) == before
+
+
+def test_partial_and_old_full_archives_use_the_same_nonoverlapping_import_groups(instances):
+    source, target = instances
+    output = source.paths.storage / 'command_outputs/result.txt'
+    output.parent.mkdir(parents=True)
+    output.write_text('completed command', encoding='utf-8')
+    exported = source.export(outputs=True)
+    staging, manifest = target.prepare_import(exported['path'])
+    preview = target.import_preview(staging, manifest)
+    assert len(preview['groups']) == len(BACKUP_GROUPS)
+    members = [key for group in preview['groups'] for key in group['categories']]
+    assert len(members) == len(set(members))
+    assert not {'env', 'database', 'server_assets'} & set(members)
+    assert {'secrets','ai_config','app_settings','conversation_history','runtime_state'} <= set(members)
+    target.select_import(staging, members)
+    target.discard_staging(staging)
 
 
 def test_new_full_independent_backup_round_trips_all_parts(instances):

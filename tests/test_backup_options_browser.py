@@ -5,7 +5,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from tests.test_workbench_browser import browser_context, workspace_url, ready  # noqa: F401
-from xgent_app.data_contents import CATEGORIES, RECOMMENDED_CATEGORIES
+from xgent_app.data_contents import BACKUP_GROUPS, CATEGORIES, RECOMMENDED_CATEGORIES, grouped_inventory, selected_groups
 
 
 def backup_api(page, import_keys=None):
@@ -38,7 +38,8 @@ def backup_api(page, import_keys=None):
                 for item in categories if item["id"] in keys]
         jobs[identifier] = {"id": identifier, "kind": "import", "state": "ready", "phase": "verified",
                             "source_name": source, "preview": {"restore_mode": "selection", "selectable": True,
-                            "recommended_categories": keys,
+                            "recommended_categories": keys, "recommended_groups": [group['id'] for group in grouped_inventory(rows, keys, importing=True)],
+                            "groups": grouped_inventory(rows, keys, importing=True),
                             "archive_format": "tar.xz" if source.endswith("xz") else "zip", "categories": rows,
                             "file_count": sum(item["file_count"] for item in rows),
                             "size": sum(item["size"] for item in rows)}}
@@ -56,13 +57,14 @@ def backup_api(page, import_keys=None):
         if resource == "estimate":
             selected = query.get("categories", [",".join(RECOMMENDED_CATEGORIES)])[0].split(",")
             rows = [{**item, "selected": item["id"] in selected} for item in categories]
-            result = {"categories": rows, "selected_categories": selected, "recommended_categories": list(RECOMMENDED_CATEGORIES), "formats": formats,
+            result = {"categories": rows, "groups": grouped_inventory(rows, selected), "selected_categories": selected,
+                      "recommended_categories": list(RECOMMENDED_CATEGORIES), "recommended_groups": selected_groups(RECOMMENDED_CATEGORIES), "formats": formats,
                       "size": sum(item["size"] for item in rows if item["selected"]),
                       "file_count": sum(item["file_count"] for item in rows if item["selected"]),
                       "estimate_note": "实际抽样估算；时间和大小不是保证值。"}
         elif resource == "backup-settings":
             if request.method == "POST":rules.update(data)
-            result = rules
+            result = {**rules, "selected_groups": selected_groups(rules["categories"])}
         elif resource == "backups":result = catalog()
         elif resource == "backups/delete":
             names[:] = [name for name in names if name not in data["names"]]
@@ -114,20 +116,20 @@ def test_backup_layout_estimates_and_accessible_selection(browser_context, works
     page.evaluate("theme=>document.body.classList.toggle('dark',theme==='dark')", theme)
     assert page.locator(".wb-backup-format").count() == 3
     assert "1.2 秒" in page.locator(".wb-backup-format").first.inner_text()
-    assert page.get_by_label("导出 密钥与登录凭据", exact=True).is_checked()
-    assert page.get_by_label("导出 AI 与模型配置", exact=True).is_checked()
-    assert page.locator("[data-export-category]").count() == len(CATEGORIES) > 20
-    assert page.locator('[data-export-category="uploads"]').count() == 1
-    assert "0 B" in page.locator('[data-export-category="uploads"]').inner_text()
+    assert page.get_by_label("导出 连接与应用配置", exact=True).is_checked()
+    assert page.locator("[data-export-category]").count() == len(BACKUP_GROUPS) == 7
+    assert page.locator('[data-export-category="files"]').count() == 1
+    assert "0 B" in page.locator('[data-export-category="files"]').inner_text()
+    assert page.get_by_text("服务器资产配置", exact=True).count() == 0
     assert not page.get_by_label("导出 命令完整输出", exact=True).is_checked()
     assert page.get_by_label("压缩频率", exact=True).input_value() == "6h"
     assert page.evaluate("document.documentElement.scrollWidth<=innerWidth+1")
     page.screenshot(path=str(tmp_path / (theme + "-" + str(width) + "-config.png")))
     page.get_by_role("button", name="全不选", exact=True).click()
     assert page.get_by_role("button", name="立即压缩", exact=True).is_disabled()
-    page.get_by_label("导出 记忆文件", exact=True).check()
+    page.get_by_label("导出 对话与记忆", exact=True).check()
     assert page.get_by_role("button", name="立即压缩", exact=True).is_enabled()
-    assert "已选 1 类" in page.locator(".wb-backup-total").inner_text()
+    assert "已选 1 组" in page.locator(".wb-backup-total").inner_text()
     left = page.locator(".wb-backup-catalog-card");right = page.locator(".wb-backup-import-card")
     left.scroll_into_view_if_needed()
     if width == 1440:
@@ -146,22 +148,21 @@ def test_click_and_upload_scan_without_import_until_confirmation(browser_context
     page.locator('[data-archive-name="manual-fixture.zip"] .wb-backup-entry-select').click()
     page.get_by_role("button", name="确认覆盖并导入", exact=True).wait_for()
     assert not dialogs
-    assert "密钥与登录凭据" in page.locator(".wb-import-content-groups").inner_text()
-    assert "AI 与模型配置" in page.locator(".wb-import-content-groups").inner_text()
-    assert "记忆文件" in page.locator(".wb-import-content-groups").inner_text()
+    assert "连接与应用配置" in page.locator(".wb-import-content-groups").inner_text()
+    assert "对话与记忆" in page.locator(".wb-import-content-groups").inner_text()
     assert "删除" in page.locator(".wb-backup-overwrite-warning").inner_text()
     assert not any(resource == "activate" for resource, _ in records)
     page.get_by_role("button", name="全不选导入部分", exact=True).click()
     assert page.get_by_role("button", name="确认覆盖并导入", exact=True).is_disabled()
-    page.get_by_label("导入 AI 与模型配置", exact=True).check()
-    assert "已选导入 1 部分" in page.locator(".wb-import-selected-summary").inner_text()
-    assert not page.get_by_label("导入 密钥与登录凭据", exact=True).is_checked()
+    page.get_by_label("导入 连接与应用配置", exact=True).check()
+    assert "已选导入 1 组" in page.locator(".wb-import-selected-summary").inner_text()
+    assert not page.get_by_label("导入 对话与记忆", exact=True).is_checked()
     page.get_by_label("上传压缩包以扫描内容", exact=True).set_input_files(
         {"name": "uploaded.zip", "mimeType": "application/zip", "buffer": b"isolated mock archive"})
     page.wait_for_function("document.querySelector('.wb-import-source')?.textContent.includes('uploaded.zip')")
     page.get_by_role("button", name="确认覆盖并导入", exact=True).wait_for()
     assert page.locator(".wb-import-content-group").count() == 1
-    assert "记忆文件" in page.locator(".wb-import-content-groups").inner_text()
+    assert "对话与记忆" in page.locator(".wb-import-content-groups").inner_text()
     assert not any(resource == "activate" for resource, _ in records)
     page.get_by_role("button", name="确认覆盖并导入", exact=True).click()
     page.get_by_text("导入完成，所覆盖的旧内容已清理。", exact=True).wait_for()
@@ -210,22 +211,31 @@ def test_import_posts_only_checked_parts(browser_context, workspace_url):
     page.locator('[data-archive-name="manual-fixture.zip"] .wb-backup-entry-select').click()
     page.get_by_role("button", name="确认覆盖并导入", exact=True).wait_for()
     page.get_by_role("button", name="全不选导入部分", exact=True).click()
-    page.get_by_label("导入 AI 与模型配置", exact=True).check()
+    page.get_by_label("导入 连接与应用配置", exact=True).check()
     page.get_by_role("button", name="确认覆盖并导入", exact=True).click()
     page.get_by_text("导入完成，所覆盖的旧内容已清理。", exact=True).wait_for()
     exported = next(data for resource, data in records if resource == "activate")
-    assert exported["categories"] == ["ai_config"]
+    assert exported["categories"] == ["secrets", "ai_config"]
     page.close()
 
 
-def test_advanced_export_deselects_conflicting_independent_parts(browser_context, workspace_url):
-    page = browser_context.new_page();backup_api(page)
+def test_export_groups_are_independent_and_all_selects_every_group(browser_context, workspace_url):
+    page = browser_context.new_page();records = backup_api(page)
+    page.on('dialog', lambda dialog: dialog.accept())
     open_backups(page, workspace_url["url"])
-    page.get_by_label("导出 完整数据库（高级）", exact=True).check()
-    assert not page.get_by_label("导出 AI 与模型配置", exact=True).is_checked()
-    assert not page.get_by_label("导出 密钥与登录凭据", exact=True).is_checked()
-    page.get_by_label("导出 AI 与模型配置", exact=True).check()
-    assert not page.get_by_label("导出 完整数据库（高级）", exact=True).is_checked()
+    page.get_by_role('button', name='全不选', exact=True).click()
+    page.get_by_role('button', name='全选', exact=True).click()
+    assert page.locator('[data-category]:checked').count() == len(BACKUP_GROUPS)
+    assert page.locator('[data-category]:disabled').count() == 0
+    page.get_by_label('导出 对话与记忆', exact=True).uncheck()
+    assert page.get_by_label('导出 连接与应用配置', exact=True).is_checked()
+    page.get_by_role('button', name='全选', exact=True).click()
+    page.get_by_role('button', name='立即压缩', exact=True).click()
+    page.get_by_role('link', name='下载压缩包', exact=True).wait_for()
+    exported = next(data['categories'] for resource, data in records if resource == 'export')
+    assert len(exported) == len(set(exported))
+    assert not {'env','database','server_assets'} & set(exported)
+    assert set(exported) == {key for group in BACKUP_GROUPS for key in group['categories']}
     page.close()
 
 
@@ -233,7 +243,7 @@ def test_advanced_export_deselects_conflicting_independent_parts(browser_context
     ['secrets', 'runtime_state', 'memory'],
     ['secrets', 'ai_config', 'app_settings', 'conversation_history', 'runtime_state', 'env', 'database', 'memory'],
 ])
-def test_import_all_checks_advanced_and_covered_parts_without_duplicate_restore(browser_context, workspace_url, keys):
+def test_import_all_checks_every_group_without_duplicate_restore(browser_context, workspace_url, keys):
     page = browser_context.new_page(); records = backup_api(page, keys)
     page.on('dialog', lambda dialog: dialog.accept())
     open_backups(page, workspace_url['url'])
@@ -242,15 +252,16 @@ def test_import_all_checks_advanced_and_covered_parts_without_duplicate_restore(
     page.get_by_role('button', name='全不选导入部分', exact=True).click()
     assert page.locator('[data-import-category]:checked').count() == 0
     page.get_by_role('button', name='全选可导入部分', exact=True).click()
-    assert page.locator('[data-import-category]:checked').count() == len(keys)
-    assert '已选导入 '+str(len(keys))+' 部分' in page.locator('.wb-import-selected-summary').inner_text()
-    if 'database' in keys:
-        assert page.locator('.wb-import-covered:not([hidden])').count() == 5
-        assert page.get_by_label('导入 待发送队列与运行状态', exact=True).is_checked()
+    count = len(grouped_inventory([item for item in CATEGORIES if item['id'] in keys], keys, importing=True))
+    assert page.locator('[data-import-category]:checked').count() == count
+    assert page.locator('[data-import-category]:disabled').count() == 0
+    assert '已选导入 '+str(count)+' 组' in page.locator('.wb-import-selected-summary').inner_text()
+    assert page.get_by_label('导入 待发送队列与运行状态', exact=True).is_checked()
     page.get_by_role('button', name='确认覆盖并导入', exact=True).click()
     page.get_by_text('导入完成，所覆盖的旧内容已清理。', exact=True).wait_for()
     submitted = next(data['categories'] for resource, data in records if resource == 'activate')
-    assert set(submitted) == ({'env','database','memory'} if 'database' in keys else set(keys))
+    assert set(submitted) == set(keys) - {'env','database'}
+    assert len(submitted) == len(set(submitted))
     page.close()
 
 
@@ -278,7 +289,7 @@ def test_real_api_all_categories_export_scan_and_upload(browser_context, workspa
     """No mocked data endpoints: exercise the actual DB snapshot and part scanner."""
     url = workspace_url["url"]
     estimate = browser_context.request.get(url + "/api/workbench/data/estimate").json()
-    assert len(estimate["categories"]) == len(CATEGORIES) > 20
+    assert len(estimate["groups"]) == len(BACKUP_GROUPS) == 7
     selected = ["secrets", "ai_config", "memory", "prompts", "command_outputs"]
     response = browser_context.request.post(url + "/api/workbench/data/export", data={
         "request_id": "real-browser-export-" + str(time.time_ns()), "categories": selected,
@@ -296,16 +307,15 @@ def test_real_api_all_categories_export_scan_and_upload(browser_context, workspa
     name = next(item["name"] for item in catalog["items"] if item["path"] == job["result"]["path"])
     page = browser_context.new_page()
     open_backups(page, url)
-    assert page.locator("[data-export-category]").count() == len(CATEGORIES)
+    assert page.locator("[data-export-category]").count() == len(BACKUP_GROUPS)
     page.locator('[data-archive-name="' + name + '"] .wb-backup-entry-select').click()
     page.get_by_role("button", name="确认覆盖并导入", exact=True).wait_for(timeout=45000)
-    assert page.get_by_label("导入 密钥与登录凭据", exact=True).is_checked()
-    assert page.get_by_label("导入 AI 与模型配置", exact=True).is_checked()
+    assert page.get_by_label("导入 连接与应用配置", exact=True).is_checked()
     page.get_by_role("button", name="全不选导入部分", exact=True).click()
-    page.get_by_label("导入 AI 与模型配置", exact=True).check()
-    page.locator('[data-import-row="ai_config"] summary').click()
+    page.get_by_label("导入 连接与应用配置", exact=True).check()
+    page.locator('[data-import-row="configuration"] summary').click()
     assert "fixture-not-a-real-key" not in page.locator(".wb-import-preview").inner_text()
-    assert "已选导入 1 部分" in page.locator(".wb-import-selected-summary").inner_text()
+    assert "已选导入 1 组" in page.locator(".wb-import-selected-summary").inner_text()
     page.locator(".wb-backup-import-card").scroll_into_view_if_needed()
     page.screenshot(path=str(tmp_path / "real-selective-import.png"))
     archive = browser_context.request.get(url + job["download_url"])
@@ -314,8 +324,7 @@ def test_real_api_all_categories_export_scan_and_upload(browser_context, workspa
         "name": "uploaded-real.tar.gz", "mimeType": "application/gzip", "buffer": archive.body()})
     page.wait_for_function("document.querySelector('.wb-import-source')?.textContent.includes('uploaded-real.tar.gz')")
     page.get_by_role("button", name="确认覆盖并导入", exact=True).wait_for(timeout=45000)
-    assert page.get_by_label("导入 AI 与模型配置", exact=True).is_checked()
-    assert page.get_by_label("导入 密钥与登录凭据", exact=True).is_checked()
+    assert page.get_by_label("导入 连接与应用配置", exact=True).is_checked()
     scan_id = page.evaluate("sessionStorage.getItem('xgent-data-import-job')")
     assert browser_context.request.post(url + "/api/workbench/data/import/cancel", data={"id": scan_id}).ok
     assert browser_context.request.post(url + "/api/workbench/data/backups/delete", data={"names": [name], "confirm": True}).ok

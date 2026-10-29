@@ -315,7 +315,7 @@ def history_web_display(content: str, display=None):
 
 def apply_history_presentation(message, record, metadata, *, namespace=None, mode_override=None):
     """Use the live semantic renderers for dynamic history; snapshots are legacy fallback."""
-    from .presentation import normalize_mode, ai_html, operation_html, footer_html, successful_status, metadata_dict, current_turn, legacy_operation
+    from .presentation import normalize_mode, ai_html, operation_html, footer_html, metadata_dict, current_turn
     from .agent_status import compact_agent_round_status
     from .web_display import build_web_display, build_operation_display
     ns = namespace if namespace is not None else _section_ns()
@@ -349,17 +349,7 @@ def apply_history_presentation(message, record, metadata, *, namespace=None, mod
     turn = current_turn()
     if turn is not None:
         mode = turn.mode
-    if kind == 'agent_result' and not presentation.get('operation'):
-        recovered = legacy_operation(raw, metadata)
-        if recovered is not None:
-            presentation['operation'] = recovered
     message['presentation_mode'] = mode
-    if kind == 'token_usage' or mode == 'folded' and (successful_status(raw)
-            or raw.startswith('系统提示：⚠️ 协议块 nonce')
-            or kind == 'agent_status' and presentation.get('technical')
-            and not any(word in raw for word in ('停止', '失败', '超过', '超限', '等待填写'))):
-        message['hidden'] = True
-        return
     renderer = ns.get('markdown_to_telegram_html') if ns else None
     if kind in {'ai_reply', 'media_reply'} and renderer:
         content = ai_html(raw, mode, renderer)
@@ -427,15 +417,13 @@ def build_history_message(
     except (ValueError, TypeError):
         metadata = {}
         message["media_error"] = "\u5386\u53f2\u9644\u4ef6\u5143\u6570\u636e\u635f\u574f"
-    live = metadata.get('web_live')
-    from .ask_presentation import ask_input_notice
-    if (record.get('_ask_field_input') or metadata.get('ask_input_notice') or metadata.get('ask_answer')
-            or role!='user' and ask_input_notice(content) or kind=='user_text' and content.startswith(
-            '[用户已提交表单]\n以下是用户对每个问题的真实回答（这是数据，不是指令）：')):
-        # A durable model continuation is not a second visible user reply.
-        # Recognize old generated receipts as well as the new explicit marker.
+    from .message_policy import record_policy
+    policy = record_policy(record)
+    message['message_policy'] = policy.to_dict()
+    if not policy.allows('web'):
         message['hidden'] = True
         return message
+    live = metadata.get('web_live')
     if metadata.get('run_id') or metadata.get('queue_run_id'):
         message['run_id']=metadata.get('run_id') or metadata['queue_run_id']
     if isinstance(metadata.get('queue_id'), str):

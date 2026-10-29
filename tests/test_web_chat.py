@@ -334,13 +334,13 @@ class WebOutboxTests(unittest.TestCase):
         self.assertTrue(WebOutbox().read_events(cleared['cursor'], cleared['epoch'])['reset'])
 
     def test_replay_memory_is_bounded_and_frames_are_snapshots(self):
-        outbox = WebOutbox(replay_bytes=200)
+        outbox = WebOutbox(replay_bytes=512)
         initial = outbox.read_events()
         frame = {'type': 'message', 'text': 'saved'}
         outbox.put(frame)
         frame['text'] = 'mutated'
         self.assertEqual('saved', outbox.read_events(0, initial['epoch'])['events'][0]['frame']['text'])
-        outbox.put({'type': 'message', 'text': 'x' * 201})
+        outbox.put({'type': 'message', 'text': 'x' * 513})
         batch = outbox.read_events(0, initial['epoch'])
         self.assertTrue(batch['reset'])
         self.assertEqual([], batch['events'])
@@ -576,6 +576,8 @@ class WebServerHttpTests(unittest.TestCase):
             self.assertEqual(b'\n', response.readline())
             self.assertIn('no-transform', response.headers['Cache-Control'])
             frame = {'type': 'message', 'message_id': 72, 'text': 'live text'}
+            from xgent_app.message_policy import stamp_frame_policy
+            frame = stamp_frame_policy(frame)
             self.server.outbox.put(frame)
             event_id = response.readline().decode().strip().removeprefix('id: ')
             self.assertEqual(f"{ready['epoch']}:{ready['cursor'] + 1}", event_id)

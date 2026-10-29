@@ -20,7 +20,7 @@ from typing import Any
 
 DEFAULT_CONVERSATION_ID = 'global_memory'
 DEFAULT_CONVERSATION_NAME = '默认会话'
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class ConversationError(ValueError):
@@ -129,6 +129,8 @@ def set_reply_generation(provider, model):
 
 
 def stamp_frame(frame: dict) -> dict:
+    from .message_policy import stamp_frame_policy
+    frame = stamp_frame_policy(frame)
     scope = current_scope(required=False)
     if scope is None or frame.get('type') in {'conversation_state', 'settings_state', 'knowledge_state', 'queue_state'}:
         return dict(frame)

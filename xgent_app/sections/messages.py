@@ -163,6 +163,15 @@ async def _finish_presentation(context, turn):
     presentation = metadata.setdefault('presentation', {'version': 1, 'mode': turn.mode, 'kind': row['msg_type']})
     presentation['revision'] = int(presentation.get('revision', 0)) + 1
     presentation['summary'] = summary
+    # A terminal status is sent before its record is saved. Bind that live slot
+    # before editing the summary, so the durable snapshot updates the same row.
+    if message.kind == row['msg_type'] and message.message_id is not None:
+        message.record_id = row_id
+        message.presentation_message_ids = [message.message_id]
+        outbox = getattr(context.bot, 'outbox', None) or get_web_outbox()
+        if outbox is not None:
+            metadata['web_live'] = {'epoch': outbox.snapshot()['epoch'],
+                                    'message_ids': message.presentation_message_ids}
     if turn.reason and row['msg_type'] == MessageType.AGENT_STATUS:
         presentation['summary'] = {**summary, 'reason': ''}
     if turn.folded:
@@ -173,7 +182,7 @@ async def _finish_presentation(context, turn):
                                  reply_markup=message.reply_markup)
         metadata['display'] = {'content': display, 'parse_mode': 'HTML'}
     await db.backfill_attachment_metadata(row_id, row.get('metadata'), metadata)
-    await publish_saved_reply(context, row_id)
+    await publish_saved_reply(context, row_id, message)
 
 
 def _is_presentation_stop(button):
@@ -1815,12 +1824,13 @@ async def _move_status_message_to_bottom(msg, context, chat_id: int, text: str) 
     with contextlib.suppress(Exception):
         await msg.delete()
         deleted = True
-    if deleted:
+    with message_presentation({'kind': 'agent_status', 'mode': 'folded'}):
+        if deleted:
+            with contextlib.suppress(Exception):
+                await safe_send_message(context, chat_id, text)
+                return
         with contextlib.suppress(Exception):
-            await safe_send_message(context, chat_id, text)
-            return
-    with contextlib.suppress(Exception):
-        await safe_edit_text(msg, text, reply_markup=None)
+            await safe_edit_text(msg, text, reply_markup=None)
 
 
 def _build_agent_trigger_round_notice(
@@ -1856,7 +1866,8 @@ async def _send_agent_trigger_round_notice(
         origin=origin,
     )
     # 只发 Telegram 界面，不写入 AI 历史；轮数状态仍由同一个 DB 配置键跟踪。
-    sent = await safe_send_message(context, chat_id, message)
+    with message_presentation({'kind': 'agent_status', 'mode': 'folded', 'transient': True}):
+        sent = await safe_send_message(context, chat_id, message)
     return sent[0] if sent else None
 
 
@@ -1874,7 +1885,8 @@ async def _send_agent_iteration_limit_notice(
         max_iterations=max_iterations,
     )
     # 只发 Telegram 界面，不写入 AI 历史。
-    await safe_send_message(context, chat_id, message)
+    with message_presentation({'kind': 'agent_status', 'mode': 'folded'}):
+        await safe_send_message(context, chat_id, message)
 
 
 async def _record_user_stopped_reply(db, cid, chat_id, partial_text: str, *, provider=None, model=None) -> str:
@@ -2210,16 +2222,17 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             round_state = AgentRoundState()
             form_shown = False  # ask 协议：本轮弹了表单则结束循环、等用户提交后再恢复
             provider_api_format = str(prov_data.get('api_format', 'openai'))
-            agent_stop_msg = await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=build_agent_round_status(
-                    operation_iteration,
-                    "running",
-                    origin=agent_origin,
-                    operation_count=len(protocol_blocks),
-                ),
-                reply_markup=build_stop_keyboard()
-            )
+            with message_presentation({'kind': 'agent_status', 'mode': 'folded', 'transient': True}):
+                agent_stop_msg = await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=build_agent_round_status(
+                        operation_iteration,
+                        "running",
+                        origin=agent_origin,
+                        operation_count=len(protocol_blocks),
+                    ),
+                    reply_markup=build_stop_keyboard()
+                )
 
             # 命令执行期间保持聊天顶栏 typing 状态；max_duration 仅作异常防泄漏兜底，
             # 正常路径在操作循环结束后立即停止。
@@ -2294,19 +2307,20 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     # 智能匹配时，先把"系统提示"发到聊天，放在执行结果前面，让用户也能看到
                     if smart_notice:
                         sys_notice = f"系统提示：{smart_notice}"
-                        await safe_send_message(
-                            context,
-                            update.effective_chat.id,
-                            sys_notice,
-                        )
-                        await persist_agent_result(
-                            recorder=GlobalRecorder,
-                            message_type=MessageType.AGENT_RESULT,
-                            database=db,
-                            conversation_id=cid,
-                            chat_id=update.effective_chat.id,
-                            notice=sys_notice,
-                        )
+                        with message_presentation({'kind': 'agent_result', 'purpose': 'status', 'audience': []}):
+                            await safe_send_message(
+                                context,
+                                update.effective_chat.id,
+                                sys_notice,
+                            )
+                            await persist_agent_result(
+                                recorder=GlobalRecorder,
+                                message_type=MessageType.AGENT_RESULT,
+                                database=db,
+                                conversation_id=cid,
+                                chat_id=update.effective_chat.id,
+                                notice=sys_notice,
+                            )
 
                     # over 协议：模型声明"这一轮不必把结果回灌给我"，并把收尾语预先写在
                     # 块里。这里只发出去，不执行、不进回灌载荷。拦不拦得住由循环末尾的
@@ -3061,13 +3075,13 @@ async def _handle_ask_text_input(update: Update, context: ContextTypes.DEFAULT_T
     if pending is None:
         UserDataManager.set('state', BotState.IDLE)
         UserDataManager.set('ask_input_target', None)
-        await send_ask_input_notice(update.message, "这个表单已失效，请让 AI 重新发起提问。")
+        await send_ask_input_notice(update.message, "这个表单已失效，请让 AI 重新发起提问。", form_id=ask_id, field_id=qid)
         return
 
     if pending.conversation_id!=current_scope().conversation_id or pending.status!='pending':
         UserDataManager.set('state', BotState.IDLE)
         UserDataManager.set('ask_input_target', None)
-        await send_ask_input_notice(update.message, '表单已提交或不属于当前会话，请回到表单所属会话。')
+        await send_ask_input_notice(update.message, '表单已提交或不属于当前会话，请回到表单所属会话。', form_id=ask_id, field_id=qid)
         return
 
     question = pending.form.question(qid)
@@ -3075,7 +3089,7 @@ async def _handle_ask_text_input(update: Update, context: ContextTypes.DEFAULT_T
         UserDataManager.set('state', BotState.IDLE)
         UserDataManager.set('ask_input_target', None)
         if is_cancel:
-            await send_ask_input_notice(update.message, "已取消这一项的录入，其它选项不受影响。")
+            await send_ask_input_notice(update.message, "已取消这一项的录入，其它选项不受影响。", form_id=ask_id, field_id=qid)
         return
 
     if state == BotState.ASK_SECRET_INPUT:
@@ -3086,7 +3100,7 @@ async def _handle_ask_text_input(update: Update, context: ContextTypes.DEFAULT_T
         pending.ensure_entry(qid)['filled'] = True
         # 录库占位符已在上游 masking 段记过；这里给用户一句可见回执（不含明文）。
         await send_ask_input_notice(update.message,
-            f"🔒 已录入变量 ${question.var}，内容只进了环境变量，没有发给 AI。回到表单继续。"
+            f"🔒 已录入变量 ${question.var}，内容只进了环境变量，没有发给 AI。回到表单继续。", form_id=ask_id, field_id=qid,
         )
     else:
         entry = pending.ensure_entry(qid)
@@ -3094,7 +3108,7 @@ async def _handle_ask_text_input(update: Update, context: ContextTypes.DEFAULT_T
         # 选择题填了自定义 → 视为改选自定义，清掉预设勾选，避免二义。
         if question.qtype in ('single', 'multi'):
             entry['selected'] = []
-        await send_ask_input_notice(update.message, "✅ 已填入，回到表单继续。")
+        await send_ask_input_notice(update.message, "✅ 已填入，回到表单继续。", form_id=ask_id, field_id=qid)
 
     UserDataManager.set('state', BotState.IDLE)
     UserDataManager.set('ask_input_target', None)

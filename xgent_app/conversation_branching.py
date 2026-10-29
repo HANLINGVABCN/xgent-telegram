@@ -1191,12 +1191,13 @@ class ConversationBranchService:
             synced_branch = True
             async with self.db._transaction() as conn:
                 content = f"分支「{branch.get('name') or conversation_id}」的 {len(preview['changes'])} 项文件改动已应用。"
+                from .message_policy import stamp_record_metadata
+                metadata=stamp_record_metadata('system_op','system',{'ui_audit': False, 'branch_apply': {
+                    'branch_id': conversation_id, 'before_snapshot_id': before_id, 'after_snapshot_id': after_id}})
                 await conn.execute('''INSERT INTO global_messages
                     (chat_id,user_id,msg_type,role,content,timestamp,session_id,metadata,withdrawn)
                     VALUES(0,0,'system_op','system',?,?,?,?,0)''', (
-                    content, time.time(), parent['id'], json.dumps({'ui_audit': False, 'branch_apply': {
-                        'branch_id': conversation_id, 'before_snapshot_id': before_id,
-                        'after_snapshot_id': after_id}}, ensure_ascii=False),
+                    content, time.time(), parent['id'], json.dumps(metadata, ensure_ascii=False),
                 ))
                 await conn.execute('UPDATE chat_sessions SET branch_base_snapshot_id=? WHERE id=?',
                                    (after_id, conversation_id))

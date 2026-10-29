@@ -14,7 +14,7 @@ from pathlib import Path
 from .backup_storage import default_backup_directory, validate_backup_directory
 from .data_bundles import DataBundles, protect, write_json
 from .data_archives import FORMATS, archive_format as filename_format, normalize_format
-from .data_contents import normalize_categories
+from .data_contents import RECOMMENDED_CATEGORIES, normalize_categories
 from .data_lock import DataLease
 
 
@@ -68,7 +68,13 @@ def read_settings(code):
         or max_backups < 1
     ):
         raise ValueError("定时备份配置无效，请在安装脚本重新设置")
-    value["categories"] = normalize_categories(value.get("categories"), value.get("include_command_outputs", False))
+    categories = value.get("categories")
+    if isinstance(categories, list) and "server_assets" in categories:
+        categories = [key for key in categories if key != "server_assets"]
+        if not categories:
+            value["enabled"] = False
+            categories = list(RECOMMENDED_CATEGORIES)
+    value["categories"] = normalize_categories(categories, value.get("include_command_outputs", False))
     value["archive_format"] = normalize_format(value.get("archive_format", "zip"))
     if value.get("include_command_outputs", False) != ("command_outputs" in value["categories"]):
         raise ValueError("定时备份类型与命令输出标记不一致")

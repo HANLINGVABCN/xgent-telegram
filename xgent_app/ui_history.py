@@ -178,10 +178,11 @@ def durable_markup(rows: list) -> bool:
 
 
 def ui_record(row: dict, *, active_generation=None) -> dict:
-    from .ask_presentation import ask_input_notice
+    from .message_policy import read_policy
     payload = json.loads(row['payload']) if isinstance(row.get('payload'), str) else row['payload']
     readonly = active_generation is not None and row['generation'] != active_generation
     markup = payload.get('reply_markup', [])
+    policy = read_policy(payload.get('message_policy'))
     if readonly:
         markup = [[{**b, 'callback_data': None, 'unavailable': True} if b.get('callback_data') else b for b in buttons] for buttons in markup]
     return {
@@ -191,11 +192,16 @@ def ui_record(row: dict, *, active_generation=None) -> dict:
         'msg_type': 'ui_message', 'role': 'assistant', 'content': payload.get('content', ''),
         'parse_mode': payload.get('parse_mode'), 'reply_markup': markup,
         'deleted': bool(payload.get('deleted')), 'media': [],
-        **({'hidden': True} if not markup and ask_input_notice(payload.get('content')) else {}),
+        'message_policy': policy.to_dict(),
+        **({'hidden': True} if not policy.allows('web') else {}),
     }
 
 
 async def capture_ui_frame(frame: dict, chat_id: int, *, source=None) -> dict:
+    from .message_policy import current_policy
+    policy = current_policy()
+    if policy is not None and (policy.purpose in {'form_input', 'form', 'model_context', 'generation'} or policy.transient):
+        return frame
     from xgent_app.conversations import current_scope
     scope = _scope.get()
     if current_scope(required=False) is None:
@@ -239,6 +245,7 @@ async def capture_ui_frame(frame: dict, chat_id: int, *, source=None) -> dict:
         'ui_generation': display['ui_generation'], 'timestamp': display['timestamp'],
         'text': display['content'], 'parse_mode': display['parse_mode'],
         'reply_markup': display['reply_markup'], 'msg_type': 'ui_message',
+        **({'message_policy': display['message_policy']} if 'message_policy' in display else {}),
     }
 
 

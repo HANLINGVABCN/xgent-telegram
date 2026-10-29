@@ -58,6 +58,9 @@ def visible_text(kind, role, content, raw_metadata):
         meta = {}
     if not isinstance(meta, dict):
         meta = {}
+    from .message_policy import record_policy
+    if not record_policy({'msg_type': kind, 'role': role, 'metadata': meta}).allows('web'):
+        return ''
     if (hide_audit_record({'msg_type': kind, 'content': content, 'metadata': meta})
             or meta.get('attachment_purpose') == 'configuration'):
         return ''

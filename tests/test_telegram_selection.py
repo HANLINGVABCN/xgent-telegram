@@ -96,12 +96,15 @@ class TelegramSelectionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(current_scope().telegram_delivery)
                     self.assertTrue((await render_telegram_text('task done')).startswith('🗂 B'))
 
-    async def test_only_exact_legacy_switch_notice_is_suppressed(self):
+    async def test_legacy_switch_notice_is_typed_once_before_replay(self):
+        from xgent_app.message_migrations import migrate_envelope
         payload = {'text': '🗂 A · abcdef\n已切换会话，三端同步；未提交的设置输入已取消。',
                    '_conversation_context': {'conversation_id': 'a', 'generation': 1, 'run_id': None},
                    '_telegram_presentation': {'label': False}}
-        self.assertTrue(Op(OP_SEND, payload=payload).muted)
+        _, policy = migrate_envelope(payload, OP_SEND, 'telegram')
+        self.assertTrue(Op(OP_SEND, payload={**payload, '_message_policy': policy.to_dict()}).muted)
         payload['_conversation_context']['run_id'] = 'real-reply'
+        # Identical words in a current reply do not determine delivery.
         self.assertFalse(Op(OP_SEND, payload=payload).muted)
 
     async def test_foreign_html_measures_native_display_not_raw_protocol_data(self):

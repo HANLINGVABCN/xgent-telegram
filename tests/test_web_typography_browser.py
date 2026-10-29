@@ -6,6 +6,7 @@ import pytest
 from tests.test_full_output_web import full_output_server  # noqa: F401
 from tests.test_web_presentation import browser_session
 from xgent_app.web_display import build_web_display
+from tests.message_fixtures import typed_record
 
 
 CODE = 'if ready:\n    print("two  spaces")\n\tprint("tab preserved")\n'
@@ -23,14 +24,14 @@ def test_semantics_weights_spacing_safe_rendering_and_screenshots(full_output_se
     server = full_output_server[0]
     display = build_web_display(RAW)
     async def history(limit):
-        return [
+        return [typed_record(row) for row in [
             {'id': 101, 'role': 'user', 'msg_type': 'user_text', 'content': '检查部署状态，不改变功能设计。', 'timestamp': 1},
             {'id': 102, 'role': 'assistant', 'msg_type': 'ai_reply', 'content': 'Telegram reduced HTML',
              'parse_mode': 'HTML', 'web_display': display, 'timestamp': 2},
             {'id': 103, 'role': 'assistant', 'msg_type': 'agent_result', 'content': '<b>验证完成</b>\n18 checks passed',
              'parse_mode': 'HTML', 'timestamp': 3},
             {'id': 104, 'role': 'system', 'msg_type': 'token_usage', 'content': '↑ 128 tokens · ↓ 64 tokens · 20 tokens/s', 'timestamp': 4},
-        ]
+        ]]
     server.config.read_history = history
     with playwright.sync_playwright() as p:
         if not Path(p.chromium.executable_path).exists():
@@ -61,7 +62,8 @@ def test_semantics_weights_spacing_safe_rendering_and_screenshots(full_output_se
                 assert metrics[0] == message_size and metrics[1] == '500'
                 assert abs(metrics[2] - message_size * 1.6) < .1
                 assert metrics[3] > message_size and metrics[4] == '700' and metrics[5] == 'normal'
-                assert page.locator('[data-record-id="102"]').evaluate('(e)=>getComputedStyle(e).marginBottom') == '12px'
+                assert page.locator('[data-record-id="102"]').evaluate('(e)=>e.classList.contains("followed-by-output")')
+                assert page.locator('[data-record-id="102"]').evaluate('(e)=>getComputedStyle(e).marginBottom') == '0px'
                 assert page.locator('[data-record-id="103"]').evaluate('(e)=>getComputedStyle(e).marginBottom') == '8px'
                 assert page.evaluate('document.documentElement.scrollWidth<=innerWidth+1')
                 assert page.locator('#log').evaluate('(e)=>e.scrollWidth<=e.clientWidth+1')
