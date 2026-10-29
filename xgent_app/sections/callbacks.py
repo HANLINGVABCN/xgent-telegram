@@ -84,9 +84,6 @@ async def _dispatch_ask_callback_inner(update: Any, context: Any, data: str) -> 
         msg = await (resume_from_ask(ask_id) if action == "askd" else cancel_ask(ask_id))
         with contextlib.suppress(Exception):
             await query.answer(msg)
-        if PENDING_ASKS.get(ask_id) is None:
-            with contextlib.suppress(Exception):
-                await query.edit_message_reply_markup(reply_markup=None)
         return
 
     ask_id = parts[1] if len(parts) > 1 else ""
@@ -149,10 +146,6 @@ async def _dispatch_ask_callback_inner(update: Any, context: Any, data: str) -> 
     pending.revision += 1
     from xgent_app.web_ask import sync_ask
     await sync_ask(globals(), pending)
-    with contextlib.suppress(Exception):
-        await query.edit_message_reply_markup(
-            reply_markup=pending.form.build_keyboard(ask_id, pending.draft)
-        )
 
 
 async def handle_conversation_action(update, context, data):

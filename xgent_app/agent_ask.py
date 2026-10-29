@@ -266,6 +266,7 @@ class PendingAsk:
     conversation_context: Optional[Dict[str, Any]] = None
     draft: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     form_message_id: Optional[int] = None  # 表单消息 id，供录入自定义/密钥后原地重画键盘
+    form_bot: Any = field(default=None, repr=False)
     form_record_id: Optional[int] = None
     revision: int = 0
     status: str = 'pending'

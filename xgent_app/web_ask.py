@@ -3,8 +3,10 @@ from __future__ import annotations
 
 from .agent_ask import PENDING_ASKS, SECRET_STORE
 from .conversations import current_scope
+from .ui_history import without_ui_history
 
 
+@without_ui_history
 async def sync_ask(namespace, pending, *, status='pending'):
     """Save only safe form state; the model-history snapshot remains in memory."""
     db = await namespace['BotMemoryDB'].get_instance()
@@ -15,12 +17,16 @@ async def sync_ask(namespace, pending, *, status='pending'):
             metadata = metadata_dict(row.get('metadata'))
             metadata['ask_form'] = pending.web_snapshot(status)
             await db.backfill_attachment_metadata(pending.form_record_id, row.get('metadata'), metadata)
-    bot = namespace['build_trigger_delivery_bot'](int(pending.chat_id))
+    # The creator owns the logical/native message mapping (or the CLI screen).
+    # A fresh bot can interpret the logical ID as a native Telegram ID instead.
+    bot = pending.form_bot or namespace['build_trigger_delivery_bot'](int(pending.chat_id))
     if pending.form_message_id is not None:
-        import contextlib
-        with contextlib.suppress(Exception):
+        try:
             await bot.edit_message_reply_markup(chat_id=pending.chat_id, message_id=pending.form_message_id,
                 reply_markup=pending.form.build_keyboard(pending.ask_id, pending.draft) if status=='pending' else None)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning('原表单按钮更新失败，草稿已保留；不重发表单', exc_info=True)
     context = namespace['_SelfTriggerContext'](bot)
     if pending.form_record_id is not None:
         await namespace['publish_saved_reply'](context, pending.form_record_id)

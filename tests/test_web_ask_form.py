@@ -124,9 +124,13 @@ async def main():
                                 assert '预发布环境' in json.dumps(calls,ensure_ascii=False)
                                 assert '原地填写  <tag>  保留两个空格' in json.dumps(calls,ensure_ascii=False)
                                 assert '$TEST_FORM_KEY' in json.dumps(calls,ensure_ascii=False)
+                                assert '[用户已提交表单]' not in await page.locator('#log').inner_text()
                                 await page.reload();await form.wait_for()
                                 assert not await form.get_by_role('button',name='提交',exact=True).is_visible()
                                 assert '已提交' in await form.inner_text()
+                                assert '[用户已提交表单]' not in await page.locator('#log').inner_text()
+                                assert '以下是用户对每个问题的真实回答' not in await page.locator('#log').inner_text()
+                                assert await form.count()==1
                                 assert not errors,errors
                                 cases.append(width)
                         finally:

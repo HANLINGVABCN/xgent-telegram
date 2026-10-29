@@ -2517,6 +2517,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             agent_iteration=agent_iteration,
                             chat_id=update.effective_chat.id,
                             origin=AgentTurnOrigin.ask(),
+                            form_bot=context.bot.original,
                         )
                         form_header = (
                             "📝 需要你的输入：请在下面选择/填写后点「✅ 提交」。\n"
@@ -2936,7 +2937,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
 
 async def persist_ask_answer(text, chat_id, generation):
     answer = build_ask_context_message(text)
-    metadata = {'attachment_generation': generation}
+    metadata = {'attachment_generation': generation, 'ask_answer': True}
     if normalize_bool(UserDataManager.get('readx_persist_context', False), False):
         from xgent_app.tool_context import freeze_tool_message
         metadata['model_context'] = freeze_tool_message(answer, ArtifactManager.save_binary_upload)
@@ -2972,7 +2973,7 @@ async def resume_from_ask(ask_id: str) -> str:
     restore_reply_route(pending.conversation_context)
     answer_text = pending.form.assemble_answer(pending.draft)
 
-    # 记录一条用户消息（表单回答，不含明文密钥）到全局记忆，供三端展示与后续历史。
+    # Preserve the model's form context without another visible answer dump.
     answer_message = await persist_ask_answer(answer_text, pending.chat_id, pending.generation)
     queue = get_text_queue()
     await queue.start()
@@ -3046,7 +3047,7 @@ async def _handle_ask_text_input(update: Update, context: ContextTypes.DEFAULT_T
     - 密钥（ASK_SECRET_INPUT）：明文只写 SecretStore（os.environ + 脱敏名单），
       draft 只标记「已录入」，落库是占位符——明文绝不进 draft/模型/库。
     - 自定义（ASK_FIELD_INPUT）：普通文本，进 draft 也可入模型，落原文。
-    录完清状态、原地重画表单键盘（拿不到表单消息 id 时退化为新发一条）。
+    录完清状态，只更新原表单键盘，不重发另一张表单。
     """
     target = UserDataManager.get('ask_input_target') or {}
     ask_id = target.get('ask_id', '')
@@ -3099,26 +3100,8 @@ async def _handle_ask_text_input(update: Update, context: ContextTypes.DEFAULT_T
     UserDataManager.set('ask_input_target', None)
 
     # 原地重画表单键盘反映「已填/已录入」。
-    new_markup = pending.form.build_keyboard(ask_id, pending.draft)
     pending.revision += 1
     from xgent_app.web_ask import sync_ask
     await sync_ask(globals(), pending)
-    redrawn = False
-    if pending.form_message_id is not None:
-        with contextlib.suppress(Exception):
-            await context.bot.edit_message_reply_markup(
-                chat_id=pending.chat_id,
-                message_id=pending.form_message_id,
-                reply_markup=new_markup,
-            )
-            redrawn = True
-    if not redrawn:
-        with contextlib.suppress(Exception):
-            sent = await context.bot.send_message(
-                chat_id=pending.chat_id,
-                text="📝 表单已更新，请继续选择/填写后点「✅ 提交」。",
-                reply_markup=new_markup,
-            )
-            pending.form_message_id = sent.message_id
 
 # --- ☆ 命令函数 ☆ ---
