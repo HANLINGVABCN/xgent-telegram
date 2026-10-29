@@ -1041,6 +1041,8 @@ class BotMemoryDB(ConversationStore):
             else:
                 result.append(item)
         result.sort(key=lambda item: (item['timestamp'], item.get('id') or 0, item.get('ui_message_id', '')))
+        from xgent_app.ask_presentation import mark_legacy_ask_inputs
+        mark_legacy_ask_inputs(result)
         from xgent_app.presentation import link_usage_records
         link_usage_records(result)
         return UiHistorySnapshot(result[-limit:] if limit > 0 else result,
@@ -1120,7 +1122,11 @@ class BotMemoryDB(ConversationStore):
             row = await cursor.fetchone()
         finally:
             await cursor.close()
-        return dict(row) if row else None
+        result = dict(row) if row else None
+        if result is not None:
+            from xgent_app.ask_presentation import mark_legacy_ask_inputs_from_database
+            await mark_legacy_ask_inputs_from_database(conn, [result])
+        return result
 
     async def get_max_relay_op_id(self) -> int:
         """cli_relay_ops 的最大 id。"""

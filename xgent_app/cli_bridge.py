@@ -133,6 +133,8 @@ def _render_kind_for(text: str) -> str:
     from .presentation import current_message_presentation
     hint = current_message_presentation()
     if hint is not None:
+        if hint['kind'] == 'ask_input_notice':
+            return 'system'
         return {'ai_reply': 'chat', 'agent_result': 'cmd', 'agent_status': 'system', 'runtime_error': 'system', 'token_usage': 'token'}.get(hint['kind'], 'chat')
     if _TOKEN_LINE_RE.search(text):
         return "token"
@@ -233,6 +235,9 @@ class _CliRelay:
     # -- 生产端 --
 
     def emit(self, op: str, **payload: Any) -> None:
+        from .ask_presentation import local_ask_notice
+        if local_ask_notice() and op in {'send_message', 'edit_message_text', 'user_echo'}:
+            return
         from xgent_app.conversations import conversation_snapshot
         snapshot = conversation_snapshot()
         payload['conversation_context'] = snapshot

@@ -14,6 +14,8 @@ def test_unsubmitted_web_form_survives_reload_custom_input_and_checked_choices(t
     pytest.importorskip('playwright.async_api')
     result=Probe().run_probe(r'''
 import asyncio,json,tempfile,os
+from dataclasses import replace
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 from playwright.async_api import async_playwright
@@ -23,6 +25,9 @@ from xgent_app.web_auth import hash_password
 from xgent_app.web_server import WebChatConfig,WebChatServer
 from xgent_app.workbench import Workbench
 from xgent_app.agent_ask import PENDING_ASKS,SECRET_STORE
+from xgent_app.conversations import bind_conversation,current_scope
+from xgent_app.interaction import interaction
+from xgent_app.web_bridge import install_tg_to_web_mirror
 
 FORM='Q1|single|选择环境\n- 测试\n- 生产\n+other\nQ2|multi|选择项目\n- 日志\n- 备份\n+other\nQ3|text|补充说明\nQ4|secret:TEST_FORM_KEY|测试密钥'
 async def main():
@@ -90,6 +95,38 @@ async def main():
                                     'id':pending.ask_id,'conversation_id':pending.conversation_id,'action':'submit',
                                     'revision':pending.revision,'draft':{qid:answer for qid,answer in pending.draft.items() if qid!='3'}})
                                 assert not incomplete.ok and PENDING_ASKS.get(pending.ask_id) is pending and len(calls)==1
+                                class LocalInputBot:
+                                    def __init__(self):self.notices=[]
+                                    async def send_message(self,**kwargs):
+                                        self.notices.append(kwargs['text']);return SimpleNamespace(message_id=500+len(self.notices),chat_id=1)
+                                native=LocalInputBot()
+                                restore=install_tg_to_web_mirror(native,h.outbox)
+                                try:
+                                    tg_scope=replace(current_scope(),origin='telegram',purpose='management',run_id=None)
+                                    with interaction('telegram','management'),bind_conversation(tg_scope):
+                                        query=SimpleNamespace(message=bot._SelfTriggerMessage(native,1),answer=lambda *a,**k:asyncio.sleep(0))
+                                        for action,qid,text in [('asko','2','测试'),('askk','3','PRIVATE_BOT_FIELD_SECRET')]:
+                                            await bot._dispatch_ask_callback(SimpleNamespace(callback_query=query),bot._SelfTriggerContext(native),
+                                                f'{action}:{pending.ask_id}:{qid}')
+                                            update=bot._SelfTriggerUpdate(native,1);update.effective_user=SimpleNamespace(id=1)
+                                            update.message.text=text;update.message.message_id=700
+                                            await bot.handle_text_message(update,bot._SelfTriggerContext(native))
+                                finally:restore()
+                                assert pending.draft['2'].get('custom')=='测试',pending.web_snapshot()
+                                await page.wait_for_function('document.querySelector("textarea[aria-label=补充说明]")?.value==="测试"')
+                                assert len(native.notices)==4
+                                assert any('请填写：' in text for text in native.notices)
+                                assert any('已填入' in text for text in native.notices)
+                                text_before=await page.locator('#log').inner_text()
+                                assert '请填写：' not in text_before and '回到表单继续' not in text_before
+                                assert await page.locator('.msg-row.user').filter(has_text='测试').count()==0
+                                await page.reload();await form.wait_for()
+                                assert await form.get_by_role('textbox',name='补充说明',exact=True).input_value()=='测试'
+                                assert '请填写：' not in await page.locator('#log').inner_text()
+                                assert '回到表单继续' not in await page.locator('#log').inner_text()
+                                assert await page.locator('.msg-row.user').filter(has_text='测试').count()==0
+                                records=await h.db.get_global_messages(100)
+                                assert not any(row['content']=='测试' for row in records)
                                 # Cross-conversation and forged password status are rejected.
                                 other=(await bot.get_conversations().manage('create',name='other'))['conversation_id']
                                 bad=await context.request.get(base+'/api/workbench/ask?id='+pending.ask_id+'&conversation_id='+other)
@@ -122,7 +159,8 @@ async def main():
                                 assert 'NEVER_PERSIST_FORM_SECRET' not in json.dumps(calls)
                                 assert SECRET_STORE.has(pending.conversation_id,'TEST_FORM_KEY')
                                 assert '预发布环境' in json.dumps(calls,ensure_ascii=False)
-                                assert '原地填写  <tag>  保留两个空格' in json.dumps(calls,ensure_ascii=False)
+                                assert '测试' in json.dumps(calls,ensure_ascii=False)
+                                assert 'PRIVATE_BOT_FIELD_SECRET' not in raw and 'PRIVATE_BOT_FIELD_SECRET' not in json.dumps(calls)
                                 assert '$TEST_FORM_KEY' in json.dumps(calls,ensure_ascii=False)
                                 assert '[用户已提交表单]' not in await page.locator('#log').inner_text()
                                 await page.reload();await form.wait_for()

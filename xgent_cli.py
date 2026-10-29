@@ -977,6 +977,8 @@ def _echo_submitted(text: str, *, conversation: bool) -> None:
 
     input() 回退路径系统已回显（last_read_native_echo），不重复打印。
     """
+    if UserDataManager.get('state') in (BotState.ASK_FIELD_INPUT, BotState.ASK_SECRET_INPUT):
+        return
     if isinstance(SCREEN, cli_tui.PtScreen) or getattr(_READER, "last_read_native_echo", False):
         return
     _print_user_block(text)

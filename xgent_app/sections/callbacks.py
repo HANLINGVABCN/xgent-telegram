@@ -137,7 +137,8 @@ async def _dispatch_ask_callback_inner(update: Any, context: Any, data: str) -> 
             # ASK_FIELD_INPUT/ASK_SECRET_INPUT 分支），无需强制回复。ForceReply 会在
             # 客户端把「回复某条消息」的草稿粘在输入框上——用户若没回而是点了别的按钮，
             # 这条草稿就一直挂着，每次进聊天都弹，故去掉。
-            await query.message.reply_text(
+            from xgent_app.ask_presentation import send_ask_input_notice
+            await send_ask_input_notice(query.message,
                 f"请填写：{question.prompt}{hint}\n（直接发一条消息即可；发 cancel 取消录入）",
             )
         return  # 不重画键盘，等用户把内容发进来再重画

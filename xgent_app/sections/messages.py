@@ -3046,10 +3046,11 @@ async def _handle_ask_text_input(update: Update, context: ContextTypes.DEFAULT_T
 
     - 密钥（ASK_SECRET_INPUT）：明文只写 SecretStore（os.environ + 脱敏名单），
       draft 只标记「已录入」，落库是占位符——明文绝不进 draft/模型/库。
-    - 自定义（ASK_FIELD_INPUT）：普通文本，进 draft 也可入模型，落原文。
+    - 自定义（ASK_FIELD_INPUT）：仅更新 draft，提交时再进入模型上下文。
     录完清状态，只更新原表单键盘，不重发另一张表单。
     """
     target = UserDataManager.get('ask_input_target') or {}
+    from xgent_app.ask_presentation import send_ask_input_notice
     ask_id = target.get('ask_id', '')
     qid = target.get('qid', '')
     pending = PENDING_ASKS.get(ask_id)
@@ -3060,13 +3061,13 @@ async def _handle_ask_text_input(update: Update, context: ContextTypes.DEFAULT_T
     if pending is None:
         UserDataManager.set('state', BotState.IDLE)
         UserDataManager.set('ask_input_target', None)
-        await update.message.reply_text("这个表单已失效，请让 AI 重新发起提问。")
+        await send_ask_input_notice(update.message, "这个表单已失效，请让 AI 重新发起提问。")
         return
 
     if pending.conversation_id!=current_scope().conversation_id or pending.status!='pending':
         UserDataManager.set('state', BotState.IDLE)
         UserDataManager.set('ask_input_target', None)
-        await update.message.reply_text('表单已提交或不属于当前会话，请回到表单所属会话。')
+        await send_ask_input_notice(update.message, '表单已提交或不属于当前会话，请回到表单所属会话。')
         return
 
     question = pending.form.question(qid)
@@ -3074,7 +3075,7 @@ async def _handle_ask_text_input(update: Update, context: ContextTypes.DEFAULT_T
         UserDataManager.set('state', BotState.IDLE)
         UserDataManager.set('ask_input_target', None)
         if is_cancel:
-            await update.message.reply_text("已取消这一项的录入，其它选项不受影响。")
+            await send_ask_input_notice(update.message, "已取消这一项的录入，其它选项不受影响。")
         return
 
     if state == BotState.ASK_SECRET_INPUT:
@@ -3084,7 +3085,7 @@ async def _handle_ask_text_input(update: Update, context: ContextTypes.DEFAULT_T
         SECRET_STORE.set(current_scope().conversation_id, question.var, text)
         pending.ensure_entry(qid)['filled'] = True
         # 录库占位符已在上游 masking 段记过；这里给用户一句可见回执（不含明文）。
-        await update.message.reply_text(
+        await send_ask_input_notice(update.message,
             f"🔒 已录入变量 ${question.var}，内容只进了环境变量，没有发给 AI。回到表单继续。"
         )
     else:
@@ -3093,8 +3094,7 @@ async def _handle_ask_text_input(update: Update, context: ContextTypes.DEFAULT_T
         # 选择题填了自定义 → 视为改选自定义，清掉预设勾选，避免二义。
         if question.qtype in ('single', 'multi'):
             entry['selected'] = []
-        await GlobalRecorder.record_user_message(text, MessageType.USER_TEXT, update.effective_chat.id)
-        await update.message.reply_text("✅ 已填入，回到表单继续。")
+        await send_ask_input_notice(update.message, "✅ 已填入，回到表单继续。")
 
     UserDataManager.set('state', BotState.IDLE)
     UserDataManager.set('ask_input_target', None)

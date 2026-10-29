@@ -559,6 +559,9 @@ def _present_media_frame(frame: Dict[str, Any]) -> Dict[str, Any]:
 
 async def emit_ui_frame(outbox: WebOutbox, chat_id: int, frame_type: str,
                         *, source: Optional[str] = None, **fields: Any) -> None:
+    from xgent_app.ask_presentation import local_ask_notice
+    if local_ask_notice() and frame_type in {'message', 'edit'}:
+        return
     from xgent_app.interaction import identity
     from xgent_app.conversations import current_scope
     if source == 'telegram' and _outbound_telegram.get():

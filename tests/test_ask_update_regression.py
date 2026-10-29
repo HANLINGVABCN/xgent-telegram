@@ -23,6 +23,8 @@ from xgent_app.web_history import build_history_message
 from xgent_app.fanout import get_channel_registry
 from xgent_app.agent_ask import PENDING_ASKS
 from xgent_app.web_ask import sync_ask
+from xgent_app.web_bridge import install_tg_to_web_mirror
+from xgent_app.ui_history import ui_operation
 
 class NativeBot:
     def __init__(self):self.messages={};self.edits=[];self.replies=[];self.bad_edits=0
@@ -65,16 +67,29 @@ async def main():
                         initial_forms=sum(record.get('reply_markup') is not None and any('提交' in b.text for row in record['reply_markup'].inline_keyboard for b in row) for record in native.messages.values())
                         assert initial_forms==1
                         native.edits.clear()
+                        h.drain_frames()
+                        ui_before=(await h.db._get_conn())
+                        ui_before=await (await ui_before.execute('SELECT COUNT(*) n FROM ui_messages')).fetchone()
+                        restore=install_tg_to_web_mirror(native,h.outbox)
                         query=SimpleNamespace(message=bot._SelfTriggerMessage(native,1),answer=AsyncMock())
                         callback=SimpleNamespace(callback_query=query)
                         for text in ('不保证','保证'):
                             await bot._dispatch_ask_callback(callback,bot._SelfTriggerContext(native),f'asko:{pending.ask_id}:0')
-                            await bot._handle_ask_text_input(bot._SelfTriggerUpdate(native,1),bot._SelfTriggerContext(native),bot.BotState.ASK_FIELD_INPUT,text)
+                            update=bot._SelfTriggerUpdate(native,1)
+                            update.effective_user=SimpleNamespace(id=1)
+                            update.message.text=text
+                            update.message.message_id=100+len(native.edits)
+                            await bot.handle_text_message(update,bot._SelfTriggerContext(native))
                             assert pending.form_message_id==logical
                             assert await pending.form_bot.flush_telegram(timeout=3)
                             assert pending.draft['0']['custom']==text
                         await bot._dispatch_ask_callback(callback,bot._SelfTriggerContext(native),f'askk:{pending.ask_id}:1')
-                        await bot._handle_ask_text_input(bot._SelfTriggerUpdate(native,1),bot._SelfTriggerContext(native),bot.BotState.ASK_SECRET_INPUT,'PRIVATE_REPEAT_SECRET')
+                        update=bot._SelfTriggerUpdate(native,1)
+                        update.effective_user=SimpleNamespace(id=1)
+                        update.message.text='PRIVATE_REPEAT_SECRET'
+                        update.message.message_id=200
+                        await bot.handle_text_message(update,bot._SelfTriggerContext(native))
+                        restore()
                         assert await pending.form_bot.flush_telegram(timeout=3)
                         forms=[record for record in native.messages.values() if record.get('reply_markup') is not None and any('提交' in b.text for row in record['reply_markup'].inline_keyboard for b in row)]
                         assert len(forms)==1 and native.bad_edits==0
@@ -85,6 +100,13 @@ async def main():
                         snapshots=[frame for frame in frames if frame.get('ask_form')]
                         assert {frame.get('record_id') for frame in snapshots if frame.get('record_id')}=={pending.form_record_id}
                         assert not any('表单已更新，请继续' in str(frame.get('text')) for frame in frames)
+                        assert not any(str(frame.get('text','')).startswith(('请填写：','✅ 已填入','🔒 已录入变量')) for frame in frames)
+                        rows_before=await h.db.get_global_messages(100)
+                        assert not any(row['content'] in ('不保证','保证') for row in rows_before)
+                        ui_after=await (await (await h.db._get_conn()).execute('SELECT COUNT(*) n FROM ui_messages')).fetchone()
+                        assert ui_after['n']==ui_before['n']
+                        assert any(str(record['text']).startswith('请填写：') for record in native.messages.values())
+                        assert any(record['text']=='✅ 已填入，回到表单继续。' for record in native.messages.values())
                         await bot.resume_from_ask(pending.ask_id)
                         assert await pending.form_bot.flush_telegram(timeout=3)
                         assert native.messages[form_mid]['reply_markup'] is None

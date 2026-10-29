@@ -178,6 +178,7 @@ def durable_markup(rows: list) -> bool:
 
 
 def ui_record(row: dict, *, active_generation=None) -> dict:
+    from .ask_presentation import ask_input_notice
     payload = json.loads(row['payload']) if isinstance(row.get('payload'), str) else row['payload']
     readonly = active_generation is not None and row['generation'] != active_generation
     markup = payload.get('reply_markup', [])
@@ -190,6 +191,7 @@ def ui_record(row: dict, *, active_generation=None) -> dict:
         'msg_type': 'ui_message', 'role': 'assistant', 'content': payload.get('content', ''),
         'parse_mode': payload.get('parse_mode'), 'reply_markup': markup,
         'deleted': bool(payload.get('deleted')), 'media': [],
+        **({'hidden': True} if not markup and ask_input_notice(payload.get('content')) else {}),
     }
 
 

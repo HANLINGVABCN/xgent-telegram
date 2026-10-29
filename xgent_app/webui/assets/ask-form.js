@@ -14,8 +14,12 @@ export function syncAskForm(entry,snapshot){
   const key='xgent-ask-draft:'+snapshot.conversation_id+':'+snapshot.id;
   const state={snapshot,draft:structuredClone(snapshot.draft||{}),dirty:false,busy:false,serial:0,timer:null,writes:Promise.resolve(),fields:[]};
   entry.askState=state;entry.askNode=node;
-  try{const local=JSON.parse(sessionStorage.getItem(key)||'null');if(local){state.draft=local;state.dirty=true;}}catch{}
-  const saveLocal=()=>{const safe={};for(const q of snapshot.questions)if(q.type!=='secret')safe[q.id]=state.draft[q.id]||{};try{sessionStorage.setItem(key,JSON.stringify(safe));}catch{}};
+  try{
+    const local=JSON.parse(sessionStorage.getItem(key)||'null');
+    if(local?.revision===snapshot.revision&&local.draft){state.draft=local.draft;state.dirty=true;}
+    else if(local)sessionStorage.removeItem(key);
+  }catch{}
+  const saveLocal=()=>{const safe={};for(const q of snapshot.questions)if(q.type!=='secret')safe[q.id]=state.draft[q.id]||{};try{sessionStorage.setItem(key,JSON.stringify({revision:state.snapshot.revision,draft:safe}));}catch{}};
   const notice=document.createElement('p');notice.className='web-ask-notice';notice.setAttribute('role','status');
   async function request(action){
     clearTimeout(state.timer);
@@ -30,7 +34,8 @@ export function syncAskForm(entry,snapshot){
           body:JSON.stringify({id:state.snapshot.id,conversation_id:state.snapshot.conversation_id,revision:state.snapshot.revision,action,draft,secrets})});
         const data=await response.json();if(!response.ok)throw new Error(data.error||'表单保存失败');
         state.snapshot=data;
-        if(serial===state.serial){state.dirty=false;state.draft=structuredClone(data.draft||{});}
+        if(serial===state.serial){state.dirty=false;state.draft=structuredClone(data.draft||{});sessionStorage.removeItem(key);}
+        else saveLocal();
         if(data.status!=='pending'){sessionStorage.removeItem(key);for(const field of state.fields)if(field.q.type==='secret')field.input.value='';}
         notice.textContent=data.status==='submitted'?'已提交':data.status==='cancelled'?'已取消':'已保存';
       }catch(error){
@@ -40,7 +45,7 @@ export function syncAskForm(entry,snapshot){
     });
     return state.writes;
   }
-  function changed(){state.dirty=true;state.serial++;saveLocal();state.paint();clearTimeout(state.timer);state.timer=setTimeout(()=>request('save'),400);}
+  function changed(){state.dirty=true;state.serial++;notice.textContent='正在保存…';saveLocal();state.paint();clearTimeout(state.timer);state.timer=setTimeout(()=>request('save'),400);}
   for(const q of snapshot.questions){
     const group=document.createElement('fieldset');group.className='web-ask-question';
     const legend=document.createElement('legend');legend.textContent=(q.label?q.label+' · ':'')+q.prompt;group.append(legend);
