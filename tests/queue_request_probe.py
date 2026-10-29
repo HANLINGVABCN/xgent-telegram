@@ -44,7 +44,7 @@ async def native_telegram_delivery_failure(bot, root):
         class NativeBot:
             failed = False
 
-            async def send_message(self, **kwargs):
+            async def deliver(self, kwargs):
                 text = kwargs.get('text', '')
                 attempts.append(text)
                 if marker in text and not self.failed:
@@ -56,10 +56,15 @@ async def native_telegram_delivery_failure(bot, root):
                     self.failed = True
                     raise TimedOut('fixture: result card timed out')
                 sent.append(kwargs)
+
+            async def send_message(self, **kwargs):
+                await self.deliver(kwargs)
                 return SimpleNamespace(message_id=len(attempts))
 
             async def edit_message_text(self, **kwargs):
-                sent.append(kwargs)
+                # Results now replace the running-command slot. A timeout on
+                # that edit must exercise the same ordered notification retry.
+                await self.deliver(kwargs)
                 return True
 
             async def edit_message_reply_markup(self, **kwargs):
