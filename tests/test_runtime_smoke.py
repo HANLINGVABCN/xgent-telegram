@@ -238,6 +238,8 @@ async def main():
     class FakeMsg:
         async def delete(self):
             return True
+        async def edit_text(self, text, **kwargs):
+            return True
     await bot.rich_finalize_text_response(
         NS(bot=NS(_is_xgent_web_bot=False)), 7, FakeMsg(), "tg回复", limit=4000)
 
@@ -253,7 +255,7 @@ asyncio.run(main())
         data = json.loads(output.strip().splitlines()[-1])
         self.assertFalse(data["web_rich_called"], "网页会话不应直连 Telegram rich API")
         self.assertTrue(data["web_has_reply_text"], "网页 outbox 必须收到含回复正文的帧")
-        self.assertTrue(data["tg_rich_called"], "原生 Telegram 仍应走 rich API")
+        self.assertFalse(data["tg_rich_called"], "两种呈现模式均使用 HTML 卡片，不恢复旧裸协议通道")
 
     def test_provider_import_syncs_chat_session_model(self):
         """导入配置/Web 设置换默认模型后，会话绑定必须跟着换。
@@ -585,9 +587,9 @@ async def main():
     r2 = bot.TelegramStreamRenderer(NS(bot=NS(_is_xgent_web_bot=True)), 7, FakeMsg(), None, limit=4000)
     off_html = r2._display_html(RAW, hide_unclosed=False)
     off_text = r2._display_text(RAW, hide_unclosed=True)
-    off_flag = r2._hide_blocks is False
-    off_force_html = r2._force_html is False
-    should_fn_off = bot._should_hide_protocol_blocks() is False
+    off_flag = r2._hide_blocks is True
+    off_force_html = r2._force_html is True
+    should_fn_off = bot._should_hide_protocol_blocks() is True
     md_raw = bot.markdown_to_telegram_html(RAW)
 
     print(json.dumps({
@@ -607,8 +609,8 @@ async def main():
         "rich_draft_off": rich_draft_off,
         "hide_flag_on": hide_flag_on,
         "should_fn_on": should_fn_on,
-        "off_html_is_markdown": (off_html == md_raw) and ("<blockquote expandable" not in off_html),
-        "off_text_raw": off_text == RAW,
+        "detailed_html_classic": ("<blockquote expandable" in off_html) and ('data-compact="1"' not in off_html),
+        "detailed_text_safe": ("<<BEGIN_" not in off_text) and ("diskchk_7f3a2b1c" not in off_text),
         "off_flag": off_flag,
         "off_force_html": off_force_html,
         "should_fn_off": should_fn_off,
@@ -632,11 +634,11 @@ asyncio.run(main())
         self.assertTrue(data["rich_draft_off"], "hide=on 时必须关闭 rich draft（走 HTML edit）")
         self.assertTrue(data["hide_flag_on"], "hide=on 时渲染器 _hide_blocks 必须为真")
         self.assertTrue(data["should_fn_on"], "_should_hide_protocol_blocks 必须反映开关开")
-        self.assertTrue(data["off_html_is_markdown"], "hide=off：_display_html 必须与 markdown_to_telegram_html 逐字节一致、无 expandable")
-        self.assertTrue(data["off_text_raw"], "hide=off：_display_text 原样透传")
-        self.assertTrue(data["off_flag"], "hide=off 时渲染器 _hide_blocks 必须为假")
-        self.assertTrue(data["off_force_html"], "hide=off 时 _force_html 必须为假（不强制 HTML 通道）")
-        self.assertTrue(data["should_fn_off"], "_should_hide_protocol_blocks 必须反映开关关")
+        self.assertTrue(data["detailed_html_classic"], "非折叠保留经典工具卡片，不恢复裸协议显示")
+        self.assertTrue(data["detailed_text_safe"], "非折叠的显示去重文本也不得暴露协议标记")
+        self.assertTrue(data["off_flag"], "非折叠仍采用协议卡片")
+        self.assertTrue(data["off_force_html"], "非折叠同样采用 HTML 卡片通道")
+        self.assertTrue(data["should_fn_off"], "两个模式均已退出旧协议裸显示路径")
 
 
 if __name__ == "__main__":

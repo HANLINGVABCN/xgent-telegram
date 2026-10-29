@@ -890,7 +890,8 @@ def _fold_ai_reply_for_cli(content: str) -> str:
 def _history_row_lines(row):
     """Read-only display: no historical keyboard can mutate a new context."""
     from xgent_app.web_history import build_history_message
-    item = build_history_message(row, _ns['ArtifactManager'].ROOT_DIR, _ns['PROJECT_ROOT'])
+    item = build_history_message(row, _ns['ArtifactManager'].ROOT_DIR, _ns['PROJECT_ROOT'],
+        presentation_namespace=_ns, presentation_mode=row.get('presentation_mode'))
     if item.get('hidden'):
         return []
     renderer = SCREEN.renderer()
@@ -904,10 +905,13 @@ def _history_row_lines(row):
     mode = item.get('parse_mode')
     if kind == 'ai_reply' and not mode:
         content, mode = _fold_ai_reply_for_cli(content), 'HTML'
-    style = 'token' if kind == 'token_usage' else 'user' if role == 'user' else 'system' if role == 'system' else 'ai'
+    style = ('token' if kind == 'token_usage' else 'cmd' if kind == 'agent_result' else
+             'system' if kind in {'agent_status','runtime_error','system_op'} or role == 'system' else
+             'user' if role == 'user' else 'ai')
     if kind == 'ui_message':
         style = 'system'
-    result = renderer.render_message(content, (), mode, title='User' if role == 'user' else 'XGent',
+    title = 'User' if style == 'user' else '命令' if style == 'cmd' else '系统' if style == 'system' else 'XGent'
+    result = renderer.render_message(content, (), mode, title=title,
                                      marker='❯' if role == 'user' else '◆', style=style) if content else []
     for medium in item.get('media', []):
         result += renderer.render_text('📎 ' + str(medium.get('filename') or '附件'), None)
@@ -925,30 +929,10 @@ async def _dispatch_tui(text, snapshot, on_admitted):
 
 def _render_history_rows(rows: Sequence[dict]) -> None:
     """把 get_display_history 的行渲染到终端。独立成函数方便单测。"""
-    renderer = SCREEN.renderer()
-    pal = PALETTE
     for row in rows:
-        role = str(row.get("role") or "")
-        content = str(row.get("content") or "")
-        msg_type = row.get("msg_type")
-        if not content.strip():
-            continue
-        if role == "user":
-            lines = renderer.render_message(
-                content, (), None, title="User", marker="❯", style="user",
-            )
+        lines = _history_row_lines(row)
+        if lines:
             SCREEN.print_block(lines, message_id=None)
-        elif role == "assistant":
-            if msg_type == MessageType.AI_REPLY:
-                content = _fold_ai_reply_for_cli(content)
-                lines = renderer.render_message(content, (), "HTML")
-            else:
-                # AGENT_RESULT/媒体回执存库时已是 Telegram HTML
-                lines = renderer.render_message(content, (), "HTML")
-            SCREEN.print_block(lines, message_id=None)
-        else:
-            compact = content if len(content) <= 160 else content[:157] + "…"
-            SCREEN.notice(compact, "info")
 
 
 async def _pull_cross_client_history(limit: int) -> None:
@@ -958,6 +942,7 @@ async def _pull_cross_client_history(limit: int) -> None:
         SCREEN.flash('当前对话历史已同步；新消息会自动刷新，F5 加载更早记录')
         return
     db = await BotMemoryDB.get_instance()
+    UserDataManager.set('presentation_mode', await db.get_config_fresh('presentation_mode', 'folded'))
     rows = await db.get_display_history(limit)
     SCREEN.print_plain("")
     if not rows:

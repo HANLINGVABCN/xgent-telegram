@@ -424,6 +424,8 @@ class Workbench:
                 await cur.close()
             batch.sort(key=lambda r: (r['timestamp'], r['_source'], r['_key']), reverse=not forward)
             batch = batch[:128]  # Do not advance past unread rows from either individually bounded source.
+            from .presentation import link_usage_records
+            link_usage_records(sorted((row for row in batch if not row['_source']), key=lambda row: (row['timestamp'], row['id'])))
             if not batch: break
             for row in batch:
                 scanned += 1

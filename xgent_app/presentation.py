@@ -95,8 +95,8 @@ def usage_line(reply):
     usage = reply.get('usage') or {}
     if not usage and reply.get('elapsed_seconds') is None:
         return ''
-    return (f"R{reply['round']} · 入 {_number(usage.get('input_tokens'))} · "
-            f"出 {_number(usage.get('output_tokens'))} · 缓存 {_number(usage.get('cached_tokens'))} · "
+    return (f"↑ {_number(usage.get('input_tokens'))} · "
+            f"↓ {_number(usage.get('output_tokens'))} · 缓存 {_number(usage.get('cached_tokens'))} · "
             f"{approximate_seconds(reply.get('elapsed_seconds'))}")
 
 
@@ -236,7 +236,7 @@ class PresentationTurn:
         self.active_operation = None
         self.active_reply = {'version': 1, 'mode': self.mode, 'kind': 'ai_reply',
             'round': len(self.replies) + 1, 'model': getattr(reply, 'presentation_model', ''),
-            'message_ids': ids, 'record_id': None}
+            'message_ids': ids, 'record_id': None, 'execution_schema': 1}
 
     def saved_reply(self, record_id):
         if self.active_reply is not None and self.active_reply.get('record_id') is None and record_id is not None:
@@ -250,18 +250,24 @@ class PresentationTurn:
             self.active_operation = None
             return
         self.active_operation = {'kind': block['type'], 'sequence': len(self.operations) + 1,
-                                 'started_at': time.monotonic(), 'command': str(block.get('body') or '')}
+                                 'started_at': time.monotonic(), 'command': str(block.get('body') or ''),
+                                 'path': block.get('path'), 'state': 'running',
+                                 'reply_record_id': self.replies[-1].get('record_id') if self.replies else None}
         self.operations.append(self.active_operation)
 
     def observe_operation(self, result, detailed_html=None):
         if self.active_operation is not None:
             for key in ('kind', 'success', 'output', 'notice', 'return_code', 'output_path',
-                        'archive_truncated', 'running', 'status', 'session_id', 'waited_seconds'):
+                        'archive_truncated', 'running', 'status', 'session_id', 'waited_seconds', 'stopped'):
                 if result.get(key) is not None:
                     self.active_operation[key] = result[key]
             self.active_operation['elapsed_seconds'] = time.monotonic() - self.active_operation['started_at']
             if detailed_html is not None:
                 self.active_operation['detailed_html'] = detailed_html
+            from .web_display import operation_state
+            if result.get('stopped'):
+                self.active_operation['state'] = 'stopped'
+            self.active_operation['state'] = operation_state(self.active_operation)
 
     def summary(self):
         return {'rounds': len(self.replies), 'operations': len(self.operations),

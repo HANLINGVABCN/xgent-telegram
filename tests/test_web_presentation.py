@@ -23,7 +23,7 @@ async def main():
         async with Harness(bot,folder) as h:
             for hide in (True,False):
                 for stream,style in ((False,'foreground'),(True,'foreground'),(True,'background')):
-                    bot.UserDataManager.set('hide_protocol_blocks',hide)
+                    await bot.UserDataManager.save_config('hide_protocol_blocks',hide)
                     bot.UserDataManager.set('stream_mode',stream);bot.UserDataManager.set('stream_style',style)
                     raw='# 标题\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n- [x] 检查完成\n\n'
                     raw+='```python\nprint("<safe> & 中文")\n```\n\n'

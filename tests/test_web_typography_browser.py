@@ -61,7 +61,7 @@ def test_semantics_weights_spacing_safe_rendering_and_screenshots(full_output_se
                 assert metrics[0] == message_size and metrics[1] == '500'
                 assert abs(metrics[2] - message_size * 1.6) < .1
                 assert metrics[3] > message_size and metrics[4] == '700' and metrics[5] == 'normal'
-                assert page.locator('[data-record-id="102"]').evaluate('(e)=>getComputedStyle(e).marginBottom') == '16px'
+                assert page.locator('[data-record-id="102"]').evaluate('(e)=>getComputedStyle(e).marginBottom') == '12px'
                 assert page.locator('[data-record-id="103"]').evaluate('(e)=>getComputedStyle(e).marginBottom') == '8px'
                 assert page.evaluate('document.documentElement.scrollWidth<=innerWidth+1')
                 assert page.locator('#log').evaluate('(e)=>e.scrollWidth<=e.clientWidth+1')

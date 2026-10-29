@@ -172,7 +172,7 @@ async def pure_telegram_and_chooser(bot, root):
             assert native.sent[0]['text'] == '同会话简洁正文'
             foreign = [item['text'] for item in native.sent if '跨会话长回复' in item['text']]
             assert len(foreign) >= 2 and all(text.startswith('🗂 ') for text in foreign)
-            for hint in ('流式输出中...', '↑ 12 tokens'):
+            for hint in ('流式输出中...', '↑ 12 · ↓ 3'):
                 text = next(item['text'] for item in native.sent if hint in item['text'])
                 assert text.startswith('🗂 ') and '\n' not in text
             assert any(('说明全文。'*204) in item['text'] for item in native.sent)

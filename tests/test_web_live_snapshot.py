@@ -187,13 +187,15 @@ async def main():
                     started.set();await release.wait();yield 'final body'
                 with patch.object(bot.ModelClient,'think_and_reply',complete),patch.object(bot.ModelClient,'think_and_reply_stream',chunks):
                     task=asyncio.create_task(h.turn('check refresh'))
-                    await asyncio.wait_for(started.wait(),2)
-                    snapshot=h.outbox.snapshot()
-                    assert len(snapshot['frames'])==1,snapshot
-                    assert '输出中' in snapshot['frames'][0]['text']
-                    mid=snapshot['frames'][0]['message_id']
-                    assert h.outbox.snapshot()['frames'][0]['message_id']==mid
-                    release.set();await task
+                    try:
+                        await asyncio.wait_for(started.wait(),2)
+                        snapshot=h.outbox.snapshot()
+                        assert len(snapshot['frames'])==1,snapshot
+                        assert snapshot['frames'][0]['text'] in ('思考中…', '流式输出中...', '非流式输出中...'), snapshot
+                        mid=snapshot['frames'][0]['message_id']
+                        assert h.outbox.snapshot()['frames'][0]['message_id']==mid
+                    finally:
+                        release.set();await task
                 rows=await h.db.get_global_messages(100)
                 saved=next(r for r in reversed(rows) if r['msg_type']=='ai_reply')
                 metadata=json.loads(saved['metadata'])

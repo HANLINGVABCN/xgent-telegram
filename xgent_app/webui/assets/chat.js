@@ -328,7 +328,7 @@
           if (c.tagName === "A" && a.name === "href") {
             if (!/^(https?:|mailto:)/i.test(a.value)) c.removeAttribute(a.name);
           } else if (c.tagName === "A" && (a.name === "target" || a.name === "rel")) {
-          } else if (c.tagName === "BLOCKQUOTE" && (a.name === "expandable" || a.name === "data-raw" || a.name === "data-output-path" || (a.name === "data-compact" && a.value === "1"))) {
+          } else if (c.tagName === "BLOCKQUOTE" && (a.name === "expandable" || a.name === "data-raw" || a.name === "data-output-path" || ['data-protocol','data-state','data-preview','data-operation-details'].includes(a.name) || (a.name === "data-web-fold" && a.value === "1") || (a.name === "data-compact" && a.value === "1"))) {
             // 保留：服务端 render_folded_html 用 <blockquote expandable> 标记
             // 「可展开折叠的协议代码块」（与电报原生 expandable 同源），网页据此做
             // 折叠交互（CSS blockquote[expandable] + bindContentClicks 里的点击切换）。
@@ -412,30 +412,33 @@
     // Reported errors are literal diagnostics both live and in durable history.
     // Do not turn upstream Markdown, HTML or stack traces into different layouts.
     if(role==='sys'&&!parseMode&&/^⚠️(?:\s|$)/.test(String(text||''))){
-      return '<pre>'+escapeHtml(String(text||''))+'</pre>';
+      return '<pre class="literal-diagnostic">'+escapeHtml(String(text||''))+'</pre>';
     }
     if(webDisplay?.version===1 && Array.isArray(webDisplay.segments) &&
        webDisplay.segments.every(s=>s && ['markdown','html'].includes(s.kind) && typeof s.text==='string')){
       // Every segment uses the same allowlist. Never trust even stored/tool HTML.
       let rendered=webDisplay.segments.map(s=>s.footer?'<div class="token-hud">'+renderText(s.text,'HTML')+'</div>':renderText(s.text,s.kind==='html'?'HTML':null)).join('\n');
-      for(const [key,label] of [['operation_details','执行详情'],['usage_details','用量详情'],['task_details','本次任务详情']]){
-        if(typeof webDisplay[key]==='string'&&webDisplay[key]&&webDisplay.presentation_mode==='folded')
-          rendered+='<details class="presentation-details"><summary>'+label+'</summary><pre>'+escapeHtml(webDisplay[key])+'</pre></details>';
-      }
       return rendered;
     }
-    return renderText(text, parseMode);
+    const rendered=renderText(text,parseMode);
+    return role==='sys'?rendered.replace(/<pre(?:\s[^>]*)?>/g,'<pre class="literal-diagnostic">'):rendered;
   }
 
   function repaintBubble(entry, html) {
     var next=document.createElement('div');next.innerHTML=html;
+    const keepFoldState=!entry.row.dataset.presentationMode||entry.row.dataset.presentationMode===entry.webDisplay?.presentation_mode;
     var oldBlocks=Array.from(entry.body.querySelectorAll('blockquote[expandable]'));
     next.querySelectorAll('blockquote[expandable]').forEach(function(block){
       var key=block.getAttribute('data-raw'),path=block.getAttribute('data-output-path');
       var text=block.querySelector('pre')?.textContent||'';
       var index=oldBlocks.findIndex(old=>old.getAttribute('data-compact')===block.getAttribute('data-compact') &&
         (key ? old.getAttribute('data-raw')===key : old.getAttribute('data-output-path')===path && old._pbText===text));
-      if(index>=0)block.replaceWith(oldBlocks.splice(index,1)[0]);
+      if(index>=0){
+        const old=oldBlocks.splice(index,1)[0];
+        if(!keepFoldState){clearTimeout(old._ft);old._outputRequest?.abort();return;}
+        const same=['data-state','data-operation-details','data-protocol'].every(key=>old.getAttribute(key)===block.getAttribute(key));
+        if(same)block.replaceWith(old);else block.classList.toggle('expanded',old.classList.contains('expanded'));
+      }
     });
     oldBlocks.forEach(block=>{clearTimeout(block._ft);block._outputRequest?.abort();});
     var oldCode=Array.from(entry.body.querySelectorAll('.code-block-wrap'));
@@ -447,14 +450,16 @@
       if(index>=0)pre.replaceWith(oldCode.splice(index,1)[0]);
     });
     enhanceBubbleContent(next);
+    entry.footerMeta?.querySelectorAll('.token-hud').forEach(node=>node.remove());
     entry.body.replaceChildren(...next.childNodes);
+    syncMessageChrome(entry);
   }
 
   function foldStateKey(block){
     const row=block.closest('[data-record-id]');
     if(!row)return null;
     const blocks=Array.from(row.querySelectorAll('blockquote[expandable]'));
-    return (row.dataset.presentationConversationId||String(selectedConversationId))+':'+row.dataset.recordId+':'+(block.getAttribute('data-compact')==='1'?'folded':'detailed')+':'+blocks.indexOf(block);
+    return (row.dataset.presentationConversationId||String(selectedConversationId))+':'+row.dataset.recordId+':'+(row.dataset.presentationMode||presentationViewMode||'folded')+':'+blocks.indexOf(block);
   }
   function saveFoldState(block){
     const key=foldStateKey(block);if(!key)return;
@@ -524,6 +529,7 @@
 
   function flashCopied(btn, label) {
     var old = btn.innerHTML;
+    if(btn.closest('.execution-code'))label=false;
     btn.innerHTML = svgIcon("check") + (label ? "<span>已复制</span>" : "");
     btn.classList.add("done");
     triggerHaptic("success");
@@ -537,6 +543,11 @@
     var expanded = bq.classList.contains("expanded") || bq.classList.contains("pb-short");
     bq.querySelector(".pb-toggle")?.setAttribute("aria-expanded",String(expanded));
     var text = bq._pbText;
+    if(bq.dataset.webFold==='1'){
+      if(text.length>20000)pre.textContent=text;
+      else pre.innerHTML='<code>'+highlightCode(text,bq._pbLang||'shell')+'</code>';
+      return;
+    }
     if (!expanded) {
       // 收起时只构建三行 DOM；这不是内容删除，复制和展开都使用完整 _pbText。
       var end = 0;
@@ -552,7 +563,7 @@
     bq._outputVersion=(bq._outputVersion||0)+1;
     bq._outputRequest?.abort();bq._outputRequest=null;bq._outputLoading=false;
     bq.querySelector('.output-pages')?.remove();bq.classList.remove('output-open');
-    var trigger=bq.querySelector('.btn-output');if(trigger){trigger.textContent='查看完整输出';trigger.setAttribute('aria-expanded','false');}
+    var trigger=bq.querySelector('.btn-output');if(trigger){trigger.innerHTML=svgIcon('external');trigger.title='查看完整输出';trigger.setAttribute('aria-expanded','false');}
   }
   function showOutputPage(bq, offset, previous) {
     if(bq._outputLoading)return;
@@ -562,7 +573,7 @@
     var area=bq.querySelector('.output-pages');
     if(!area){area=document.createElement('div');area.className='output-pages';bq.appendChild(area);}
     bq.classList.add('output-open');
-    var trigger=bq.querySelector('.btn-output');if(trigger){trigger.textContent='收起完整输出';trigger.setAttribute('aria-expanded','true');}
+    var trigger=bq.querySelector('.btn-output');if(trigger){trigger.innerHTML=svgIcon('external');trigger.title='收起完整输出';trigger.setAttribute('aria-expanded','true');}
     var loading=document.createElement('p');loading.className='output-page-label';loading.textContent='正在读取完整日志…';area.appendChild(loading);
     api('/api/output/page',{method:'POST',signal:controller.signal,body:JSON.stringify({path:bq.getAttribute('data-output-path'),offset:offset})}).then(function(page){
       if(version!==bq._outputVersion||!area.isConnected)return;
@@ -574,6 +585,31 @@
       var pre=document.createElement('pre');pre.className='output-page-text';pre.dataset.enhanced='1';pre.textContent=page.text;
       area.appendChild(controls);area.appendChild(pre);
     }).catch(function(err){if(err.name!=='AbortError'&&version===bq._outputVersion){closeOutputPage(bq);toast('读取输出失败：'+err.message,true);}}).finally(function(){if(version===bq._outputVersion){bq._outputLoading=false;bq._outputRequest=null;}});
+  }
+
+  function enhanceExecutionBlock(bq,pre,text,title,lang){
+    bq.dataset.webFold='1';bq.classList.add('pb','execution-block');bq.classList.remove('pb-short');
+    const raw=bq.getAttribute('data-raw')||'';
+    const protocol=bq.getAttribute('data-protocol')||/^```([^\s:]+)/.exec(raw)?.[1]||null;
+    const state=bq.getAttribute('data-state')||'unknown';
+    const states={pending:'待执行',generating:'生成中',running:'运行中',success:'已运行',failed:'运行失败',stopped:'已停止',unknown:'执行记录'};
+    const caption=protocol?protocol+' '+(states[state]||states.unknown):'输出'+(state==='stopped'?' · 已停止':state==='running'?' · 运行中':'');
+    const row=document.createElement('button');row.type='button';row.className='pb-head pb-toggle execution-row';
+    row.setAttribute('aria-label','展开或收起 '+caption);row.setAttribute('aria-expanded',String(bq.classList.contains('expanded')));
+    row.innerHTML=(protocol?svgIcon(protocol.startsWith('file')?'file':'terminal'):'<span class="execution-dot state-'+escapeHtml(state)+'" aria-label="'+escapeHtml(states[state]||states.unknown)+'"></span>')+
+      '<span class="execution-label pb-title">'+escapeHtml(caption)+'</span><span class="execution-preview">'+escapeHtml(bq.getAttribute('data-preview')||text.split('\n').find(line=>line.trim())||title||'(无输出)')+'</span>'+svgIcon('chev','execution-caret');
+    const panel=document.createElement('div');panel.className='execution-code';
+    const head=document.createElement('div');head.className='code-header';
+    head.innerHTML='<span class="code-lang">'+(protocol?.startsWith('file')?'File':protocol?'Shell':'Output')+'</span><div class="code-actions">'+
+      '<button class="code-btn btn-wrap" type="button" aria-label="切换代码换行" title="切换代码换行">'+svgIcon('wrap')+'</button>'+
+      '<button class="code-btn btn-copy" type="button" aria-label="复制代码正文" title="复制代码正文">'+svgIcon('copy')+'</button>'+
+      (raw?'<button class="code-btn btn-copy-all" type="button" aria-label="复制完整协议" title="复制完整协议">'+svgIcon('copy')+'</button>':'')+
+      (bq.getAttribute('data-operation-details')?'<button class="code-btn btn-operation-details" type="button" aria-label="查看执行信息" title="查看执行信息">'+svgIcon('info')+'</button>':'')+
+      (bq.getAttribute('data-output-path')?'<button class="code-btn btn-output" type="button" aria-label="查看完整输出" title="查看完整输出" aria-expanded="false">'+svgIcon('external')+'</button>':'')+'</div>';
+    bq._pbText=text;bq._pbLang=lang;bq.replaceChildren(row,panel);panel.append(head);
+    if(pre){pre.dataset.enhanced='1';pre.classList.add('execution-pre');panel.append(pre);}
+    const detail=document.createElement('div');detail.className='execution-details';detail.hidden=true;detail.textContent=bq.getAttribute('data-operation-details')||'';panel.append(detail);
+    paintProtocolBody(bq);
   }
 
   function enhanceProtocolBlocks(container) {
@@ -598,41 +634,8 @@
         var pbLm = /language-([a-zA-Z0-9_+#.-]+)/.exec(pbCode.className);
         if (pbLm) pbLang = pbLm[1];
       }
-      var compact = bq.getAttribute("data-compact") === "1";
-      var short = !compact && !label && text.split("\n").length <= 3;
-
-      var head = document.createElement("div");
-      head.className = "pb-head";
-      head.innerHTML = (short ? "" : '<span class="pb-caret">▶</span>') +
-        '<span class="pb-title">' + (function () {
-          var cut = title.lastIndexOf(" · ");
-          return cut < 0 ? '<b>' + escapeHtml(title) + '</b>'
-            : '<b>' + escapeHtml(title.slice(0, cut)) + '</b><span class="pb-count">' + escapeHtml(title.slice(cut)) + '</span>';
-        })() + '</span>' +
-        (pre ? '<button class="code-btn btn-wrap" type="button" title="切换自动换行">' + svgIcon("wrap") + '<span>换行</span></button>' +
-               '<button class="code-btn btn-copy" type="button" title="复制显示的代码">' + svgIcon("copy") + '<span>复制</span></button>' : '') +
-        (bq.getAttribute("data-raw") ? '<button class="code-btn btn-copy-all" type="button" title="复制整个协议块（BEGIN 到 END 原文）">' + svgIcon("copy") + '<span>复制全部</span></button>' : '');
-
-      head.title = title;
-      if(!short){var toggle=document.createElement("button");toggle.type="button";toggle.className="pb-toggle";toggle.setAttribute("aria-label","展开或收起 "+title);toggle.setAttribute("aria-expanded",String(bq.classList.contains("expanded")));var caret=head.querySelector(".pb-caret"),caption=head.querySelector(".pb-title");if(caret)toggle.appendChild(caret);toggle.appendChild(caption);head.prepend(toggle);}
-      if (bq.getAttribute('data-output-path')) {
-        var archive = document.createElement('button'); archive.type = 'button';
-        archive.className = 'code-btn btn-output'; archive.textContent = '查看完整输出';archive.setAttribute('aria-expanded','false');
-        head.appendChild(archive);
-      }
-      bq._pbText = text; bq._pbLang = pbLang;
-      while (bq.firstChild) bq.removeChild(bq.firstChild);
-      bq.appendChild(head);
-      if (pre) {
-        pre.dataset.enhanced = "1";
-        pre.textContent = '';
-        bq.appendChild(pre);
-      }
-      if (label) { label.className = "pb-folded"; bq.appendChild(label); }
-      bq.classList.add("pb");
-      if (compact) bq.classList.add("pb-compact");
-      if (short) bq.classList.add("pb-short");
-      paintProtocolBody(bq);
+      enhanceExecutionBlock(bq,pre,text,title,pbLang);
+      return;
     });
   }
 
@@ -641,6 +644,7 @@
     var pres = container.querySelectorAll("pre");
     Array.prototype.forEach.call(pres, function (pre) {
       if (pre.dataset.enhanced === "1") return;
+      if(pre.classList.contains('literal-diagnostic'))return;
       pre.dataset.enhanced = "1";
 
       var wrap = pre.closest(".code-block-wrap");
@@ -687,6 +691,7 @@
         var wrap = btn.closest(".code-block-wrap, blockquote.pb");
         var pre = wrap && wrap.querySelector("pre");
         e.stopPropagation();
+        if(btn.classList.contains('btn-operation-details')){const detail=wrap.querySelector('.execution-details');if(detail)detail.hidden=!detail.hidden;return;}
         if (btn.classList.contains('btn-output')) {
           if(wrap.classList.contains('output-open'))closeOutputPage(wrap);else showOutputPage(wrap,0,[]);return;
         }
@@ -734,6 +739,7 @@
         if (foldBq.classList.contains("pb-short") || e.target.closest(".pb-folded, .output-pages")) return;
         clearTimeout(foldBq._ft);
         if (e.detail > 1) return;
+        if(e.detail===0){foldBq.classList.toggle('expanded');paintProtocolBody(foldBq);saveFoldState(foldBq);return;}
         foldBq._ft = setTimeout(function () {
           if (String(window.getSelection() || "").length) return;
           if(foldBq.classList.contains("output-open")){closeOutputPage(foldBq);foldBq.classList.remove("expanded");}else foldBq.classList.toggle("expanded");
@@ -766,6 +772,66 @@
   function isTokenUsageText(text) {
     return typeof text === "string" && /tokens\/s/.test(text) &&
       text.indexOf("↑") >= 0 && text.indexOf("↓") >= 0;
+  }
+
+  var messageActionMenu=null,messageActionTrigger=null;
+  function closeMessageActions(){if(messageActionMenu)messageActionMenu.remove();messageActionMenu=null;if(messageActionTrigger)messageActionTrigger.setAttribute('aria-expanded','false');messageActionTrigger=null;}
+  function showMessageActions(entry,trigger){
+    if(messageActionTrigger===trigger){closeMessageActions();return;}closeMessageActions();
+    messageActionTrigger=trigger;trigger.setAttribute('aria-expanded','true');
+    const menu=document.createElement('div');menu.className='message-action-menu';menu.setAttribute('role','menu');
+    for(const original of entry.actions.querySelectorAll('.secondary-action')){
+      const item=document.createElement('button');item.type='button';item.setAttribute('role','menuitem');item.disabled=original.disabled;
+      item.innerHTML=original.innerHTML;item.append(document.createTextNode(original.getAttribute('aria-label')||original.title));
+      item.onclick=()=>{closeMessageActions();original.click();};menu.append(item);
+    }
+    document.body.append(menu);messageActionMenu=menu;
+    const box=trigger.getBoundingClientRect(),bounds=menu.getBoundingClientRect();
+    menu.style.left=Math.max(8,Math.min(innerWidth-bounds.width-8,box.right-bounds.width))+'px';
+    menu.style.top=Math.max(8,box.top-bounds.height-5)+'px';menu.querySelector('button')?.focus();
+  }
+  document.addEventListener('click',event=>{if(messageActionMenu&&!messageActionMenu.contains(event.target)&&!messageActionTrigger?.contains(event.target))closeMessageActions();});
+  document.addEventListener('keydown',event=>{if(event.key==='Escape'&&messageActionMenu){const trigger=messageActionTrigger;closeMessageActions();trigger?.focus();}});
+  window.addEventListener('resize',closeMessageActions);window.addEventListener('xgent-conversation-changed',closeMessageActions);
+  log.addEventListener('scroll',closeMessageActions,{passive:true});
+
+  function syncMessageChrome(entry){
+    if(!entry?.body||entry.role==='token')return;
+    if(!entry.footer){
+      entry.footer=document.createElement('div');entry.footer.className='message-footer';
+      entry.footerMeta=document.createElement('div');entry.footerMeta.className='footer-meta';entry.footer.append(entry.footerMeta);
+      entry.actions=entry.bubble.querySelector('.msg-actions');
+      if(entry.actions)entry.footer.append(entry.actions);
+      entry.bubble.insertBefore(entry.footer,entry.btns||null);
+    }
+    const huds=entry.body.querySelectorAll('.token-hud');
+    if(huds.length){entry.footerMeta.querySelectorAll('.token-hud').forEach(node=>node.remove());huds.forEach(node=>entry.footerMeta.append(node));}
+    const ts=entry.bubble.querySelector('.ts');if(ts&&!entry.footerMeta.contains(ts))entry.footerMeta.prepend(ts);
+    const display=entry.webDisplay;
+    if(entry.actions){
+      let info=entry.actions.querySelector('.usage-action');
+      if(display&&(display.usage_details||display.task_details)&&['ai','user'].includes(entry.role)){
+        if(!info){info=document.createElement('button');info.type='button';info.className='act-btn usage-action secondary-action';info.innerHTML=svgIcon('info');info.title='用量与汇总';info.setAttribute('aria-label','用量与汇总');info.onclick=()=>{const content=actionNode('pre',[entry.webDisplay?.usage_details,entry.webDisplay?.task_details].filter(Boolean).join('\n\n'),'plain-details');showAction('用量与汇总',content);};entry.actions.append(info);}
+      }else info?.remove();
+      let more=entry.actions.querySelector('.more-message-actions');
+      if(!more&&entry.actions.querySelector('.secondary-action')){more=document.createElement('button');more.type='button';more.className='act-btn more-message-actions';more.innerHTML=svgIcon('more');more.title='更多消息操作';more.setAttribute('aria-label','更多消息操作');more.setAttribute('aria-haspopup','menu');more.setAttribute('aria-expanded','false');more.onclick=event=>{event.stopPropagation();showMessageActions(entry,more);};entry.actions.append(more);}
+      if(more)entry.actions.append(more);
+      entry.footer.hidden=!entry.footerMeta.textContent.trim()&&!entry.actions.childElementCount;
+    }else entry.footer.hidden=!entry.footerMeta.textContent.trim();
+    entry.row.dataset.presentationMode=display?.presentation_mode||entry.row.dataset.presentationMode||presentationViewMode||'folded';
+  }
+
+  function messageCopyText(entry){
+    if(entry.role==='user')return entry.body.innerText;
+    if(entry.webDisplay?.version===1){
+      return entry.webDisplay.segments.filter(part=>!part.footer).map(part=>{
+        if(part.kind==='markdown')return part.text;
+        const content=document.createElement('template');content.innerHTML=sanitizeHtml(part.text);
+        const block=content.content.querySelector('blockquote[expandable]');
+        return block?(block.getAttribute('data-raw')||block.querySelector('pre')?.textContent||block.textContent):content.content.textContent;
+      }).join('\n');
+    }
+    return entry.rawText&&entry.parseMode!=='HTML'?entry.rawText:entry.body.textContent;
   }
 
   var AGENT_STATUS_RE = /Agent\s*第\s*\d+\s*轮/;
@@ -874,14 +940,16 @@
     btnCp.innerHTML = svgIcon("copy");
     btnCp.addEventListener("click", function (e) {
       e.stopPropagation();
-      copyText(body.innerText).then(function () { flashCopied(btnCp, false); })
+    copyText(messageCopyText(entry)).then(function () { flashCopied(btnCp, false); })
                               .catch(function () { toast("复制失败"); });
     });
-    actBar.appendChild(btnCp);
+    btnCp.classList.add('copy-message-action');
+    if(role==='ai'||role==='user')actBar.appendChild(btnCp);
 
-    if (role === "ai" || role === "cmd" || role === "sys") {
+    if (role === "ai") {
       var btnQt = document.createElement("button");
       btnQt.className = "act-btn";
+      btnQt.classList.add('secondary-action');
       btnQt.type = "button";
       btnQt.title = "引用回复";
       btnQt.setAttribute('aria-label','引用'+authorName+'回复');
@@ -896,6 +964,7 @@
 
       var btnSpk = document.createElement("button");
       btnSpk.className = "act-btn";
+      btnSpk.classList.add('secondary-action');
       btnSpk.type = "button";
       btnSpk.title = "朗读消息";
       btnSpk.setAttribute('aria-label','朗读'+authorName+'消息');
@@ -908,7 +977,7 @@
       actBar.appendChild(btnQt);
       actBar.appendChild(btnSpk);
     }
-    bubble.appendChild(actBar);
+    if(role==='ai'||role==='user')bubble.appendChild(actBar);
 
     var btns = null;
     markup=platformPresentationButtons(markup);
@@ -921,9 +990,10 @@
     targetLog.appendChild(row);
     if (stick) scrollDown();
 
-    var entry = { row: row, body: body, bubble: bubble, head: head, btns: btns, rawText: text, parseMode: parseMode, role: role, aiGeneration: aiGeneration || null };
+    var entry = { row: row, body: body, bubble: bubble, head: head, btns: btns, rawText: text, parseMode: parseMode, role: role, webDisplay:webDisplay, aiGeneration: aiGeneration || null };
     entry.aiMeta = head && head._aiMeta;
     applyAiGeneration(entry, timestamp, aiGeneration);
+    syncMessageChrome(entry);
     if (messageId != null) byMessageId[messageId] = entry;
     else if (!renderTarget && role === "user") row._optimisticEntry = entry;
     if (!renderTarget && (role === "ai" || role === "cmd" || role === "sys")) lastStreamEntry = entry;
@@ -1311,7 +1381,8 @@
     });
     if (!entry && frame.type === "edit" && id == null) entry = lastStreamEntry;
     var newRole = classifyMessageText(role, frame.text, frame.msg_type);
-    var displayKey=JSON.stringify(frame.web_display?.segments||null);
+    var displayKey=JSON.stringify(frame.web_display||null);
+    if(entry)entry.webDisplay=frame.web_display;
     if (entry && entry.rawText !== undefined && entry.role === newRole) {
       if(entry.displayKey!==displayKey || (!frame.web_display &&
           (entry.rawText!==frame.text || entry.parseMode!==frame.parse_mode))){
@@ -1324,6 +1395,9 @@
       if (next && next.parentNode === log) log.insertBefore(entry.row, next);
     }
     entry.rawText=frame.text;entry.parseMode=frame.parse_mode;entry.displayKey=displayKey;
+    entry.webDisplay=frame.web_display;
+    syncMessageChrome(entry);
+    if(typeof frame.hidden==='boolean'){entry.row.classList.toggle('presentation-hidden',frame.hidden);entry.row.classList.toggle('msg-row',!frame.hidden);}
     if(frame.timestamp!=null){
       var ts=entry.row.querySelector('.ts');
       if(ts){ts.textContent=nowTime(frame.timestamp);ts.title=new Date(Number(frame.timestamp)*1000).toLocaleString();}
@@ -1409,7 +1483,8 @@
       var fork=conversationActionButton('fork-chat','分支到新聊天',()=>openBranchDialog(message,actions.branch_mode));
       bar.appendChild(fork);
     }
-    if(actions.withdraw)bar.appendChild(conversationActionButton('undo','撤回此消息及之后',()=>openWithdrawDialog(message)));
+    if(actions.withdraw){const withdraw=conversationActionButton('undo','撤回此消息及之后',()=>openWithdrawDialog(message));withdraw.classList.add('secondary-action');bar.appendChild(withdraw);}
+    syncMessageChrome(entry);
   }
 
   function reconcileUnboundUserMessages(){
@@ -2470,7 +2545,7 @@
         if(batch.conversation_id)fd.append("conversation_id",batch.conversation_id);
         try {
           var progress=document.createElement('small');progress.className='upload-progress';progress.textContent='正在上传…';
-          entry.uploadProgress=progress;entry.bubble.insertBefore(progress,entry.bubble.querySelector('.ts'));
+          entry.uploadProgress=progress;entry.bubble.insertBefore(progress,entry.footer||null);
           var body;
           if(batch.files.reduce((sum,file)=>sum+file.size,0)>8*1024*1024){
             body=await uploadFileChunks(batch,mode,modes,caption,requestKey,progress);

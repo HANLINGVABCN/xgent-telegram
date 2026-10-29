@@ -842,20 +842,8 @@ def build_token_usage_message(usage: Optional[Dict[str, int]], elapsed_seconds: 
     if input_tokens is None and output_tokens is None:
         return None
 
-    cached_tokens = usage.get('cached_tokens', 0)
-    input_display = input_tokens if input_tokens is not None else 0
-    output_display = output_tokens if output_tokens is not None else 0
-    rate_display = format_token_rate(output_display, elapsed_seconds)
-    visible_output_tokens = usage.get('visible_output_tokens')
-    reasoning_tokens = usage.get('reasoning_tokens')
-    output_detail = ""
-    if visible_output_tokens is not None and reasoning_tokens is not None:
-        output_detail = f" ({visible_output_tokens} text + {reasoning_tokens} thoughts)"
-    body = (
-        f"↑ {input_display} tokens ({cached_tokens} cached) · "
-        f"↓ {output_display} tokens{output_detail} · "
-        f"⚡ {rate_display} tokens/s"
-    )
+    from xgent_app.presentation import usage_line
+    body = usage_line({'usage': usage, 'elapsed_seconds': elapsed_seconds})
     return f"<i>{html.escape(body)}</i>"
 
 

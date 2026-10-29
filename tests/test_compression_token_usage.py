@@ -29,7 +29,7 @@ class TelegramProbe:
         return WebMessage(self, self.serial, 1, text)
 
     async def send_message(self, chat_id, text, **kwargs):
-        if '↑ 1200 tokens' in text:
+        if '↑ 1,200' in text:
             self.token_attempts += 1
             records = await self.database.get_global_messages(1000)
             self.persisted_before_tokens = any(row['msg_type'] == 'token_usage' for row in records)
@@ -104,10 +104,10 @@ async def compression_usage_probe(bot, directory, surface='telegram', outcome='s
             rows = await h.db.get_global_messages(1000)
             tokens = [row for row in rows if row['msg_type'] == 'token_usage']
             frames = h.drain_frames()
-            live = [frame for frame in frames if '↑ 1200 tokens' in str(frame.get('text', ''))]
-            sent = [item for item in telegram.sent if '↑ 1200 tokens' in item['text']]
+            live = [frame for frame in frames if '↑ 1,200' in str(frame.get('text', ''))]
+            sent = [item for item in telegram.sent if '↑ 1,200' in item['text']]
             summaries = [index for index, item in enumerate(telegram.sent) if SUMMARY in item['text']]
-            token_positions = [index for index, item in enumerate(telegram.sent) if '↑ 1200 tokens' in item['text']]
+            token_positions = [index for index, item in enumerate(telegram.sent) if '↑ 1,200' in item['text']]
             all_history = await h.db.get_display_history(1000)
             model_history = await h.db.get_conversation_messages(1000)
             stats = await h.db.get_token_stats()
@@ -117,8 +117,8 @@ async def compression_usage_probe(bot, directory, surface='telegram', outcome='s
                 'recorded': tokens, 'stat_count': len(stats), 'stats': stats,
                 'persisted_before_send': telegram.persisted_before_tokens,
                 'live': live,
-                'display_count': sum('↑ 1200 tokens' in str(row.get('content', '')) for row in all_history),
-                'model_has_tokens': '↑ 1200 tokens' in str(model_history),
+                'display_count': sum('↑ 1,200' in str(row.get('content', '')) for row in all_history),
+                'model_has_tokens': '↑ 1,200' in str(model_history),
                 'after_summary': bool(summaries and token_positions and max(summaries) < min(token_positions)),
                 'completed': bool(entry and entry['status'] == 'completed'),
                 'busy': bot._is_processing or bot._compression_running or bot.get_conversations().busy(),
@@ -150,9 +150,9 @@ class CompressionTokenUsageTests(unittest.TestCase):
         sent = result['sent'][0]
         self.assertTrue(sent['disable_notification'])
         self.assertEqual('HTML', sent['parse_mode'])
-        self.assertIn('↑ 1200 tokens (300 cached)', sent['text'])
-        self.assertIn('↓ 90 tokens (80 text + 10 thoughts)', sent['text'])
-        self.assertIn('tokens/s', sent['text'])
+        self.assertIn('↑ 1,200 · ↓ 90 · 缓存 300', sent['text'])
+        self.assertIn('约 ', sent['text'])
+        self.assertNotIn('tokens/s', sent['text'])
         self.assertIn(result['recorded'][0]['content'], sent['text'])
         self.assertTrue(result['persisted_before_send'])
 

@@ -8,11 +8,78 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
+import html
 
 from .protocols import ProtocolParser
-from .presentation import LABELS, ai_segments, current_turn, current_message_presentation, normalize_mode, footer_html, usage_details
+from .presentation import LABELS, current_turn, current_message_presentation, normalize_mode, footer_html, usage_details
 
 _current = ContextVar('web_display', default=None)
+
+PROTOCOL_NAMES = {kind: kind + '-x' for kind in LABELS}
+PROTOCOL_NAMES['file_base64'] = 'file-x'
+
+
+def operation_state(operation):
+    if operation.get('status') in {'stopped', 'cancelled', 'interrupted'} or operation.get('state') == 'stopped':
+        return 'stopped'
+    if operation.get('running'):
+        return 'running'
+    if operation.get('success') is False:
+        return 'failed'
+    if operation.get('success') is True:
+        return 'success'
+    return operation.get('state') or 'unknown'
+
+
+def web_block_html(body, *, protocol=None, state='unknown', raw=None, path=None, output_path=None, details=None):
+    attrs = {'data-web-fold': '1', 'data-state': state}
+    if protocol:
+        attrs['data-protocol'] = protocol
+    if path:
+        attrs['data-preview'] = path
+    if raw:
+        attrs['data-raw'] = raw
+    if output_path:
+        attrs['data-output-path'] = output_path
+    if details:
+        attrs['data-operation-details'] = details
+    encoded = ''.join(' ' + key + '="' + html.escape(str(value), quote=True).replace('\n', '&#10;') + '"'
+                      for key, value in attrs.items())
+    label = protocol or '输出'
+    return '<blockquote expandable' + encoded + '><b>' + label + '</b><pre>' + html.escape(str(body), quote=False) + '</pre></blockquote>'
+
+
+def web_ai_segments(text, *, hide_unclosed=False, presentation=None):
+    operations = list((presentation or {}).get('operations') or [])
+    segments = []
+    for part in ProtocolParser.scan_folded_segments(text, hide_unclosed=hide_unclosed):
+        if part['kind'] == 'prose':
+            segments.append({'kind': 'markdown', 'text': part['text']})
+            continue
+        if part.get('type') == 'over':
+            continue
+        matched = next((op for op in operations if op.get('kind') == part.get('type')
+                        and op.get('command') == part.get('body') and (op.get('path') or '') == (part.get('path') or '')), None)
+        if matched:
+            operations.remove(matched)
+        state = operation_state(matched) if matched else 'generating' if part.get('generating') else (presentation or {}).get('default_protocol_state', 'pending')
+        segments.append({'kind': 'html', 'text': web_block_html(
+            part.get('body') or '', protocol=PROTOCOL_NAMES.get(part['type'], part['type'] + '-x'),
+            state=state, raw=part.get('raw'), path=part.get('path'))})
+    return segments
+
+
+def build_operation_display(operation, mode, presentation=None):
+    details = '\n'.join(f'{label}：{operation[key]}' for key, label in (
+        ('return_code', '返回码'), ('elapsed_seconds', '耗时（秒）'),
+        ('session_id', '终端会话'), ('output_path', '输出存档')) if operation.get(key) is not None)
+    body = operation.get('output') or operation.get('notice') or '(无输出)'
+    segments = [{'kind': 'html', 'text': web_block_html(body, state=operation_state(operation),
+                 output_path=operation.get('output_path'), details=details)}]
+    footer = footer_html(presentation or {})
+    if footer:
+        segments.append({'kind': 'html', 'text': footer, 'footer': True})
+    return {'version': 1, 'segments': segments, 'presentation_mode': mode, 'operation_details': details}
 
 
 def build_web_display(text: str, *, fold: bool = True, hide_unclosed: bool = False,
@@ -20,10 +87,10 @@ def build_web_display(text: str, *, fold: bool = True, hide_unclosed: bool = Fal
     turn = current_turn()
     mode = normalize_mode(mode or (turn.mode if turn is not None else 'detailed'))
     if fold:
-        segments = ai_segments(text, mode, hide_unclosed=hide_unclosed)
+        segments = web_ai_segments(text, hide_unclosed=hide_unclosed, presentation=presentation)
     else:
         segments = [{'kind': 'markdown', 'text': text}]
-    if presentation and mode == 'folded':
+    if presentation:
         footer = footer_html(presentation)
         if footer:
             segments.append({'kind': 'html', 'text': footer, 'footer': True})
@@ -33,7 +100,7 @@ def build_web_display(text: str, *, fold: bool = True, hide_unclosed: bool = Fal
     if presentation and presentation.get('summary'):
         result['task_details'] = '\n\n'.join(
             f"{item.get('sequence', '?')}. {LABELS.get(item.get('kind'), ('', item.get('kind', '操作')))[1]}\n"
-            f"{item.get('command', '')}\n状态：{'失败' if item.get('success') is False else '已执行'}"
+            f"{item.get('command', '')}\n状态：{ {'success': '已运行', 'failed': '失败', 'stopped': '已停止', 'running': '运行中', 'pending': '待执行'}.get(operation_state(item), '未确认') }"
             for item in presentation['summary'].get('items', []))
     # Telegram may split a single reply into many transport messages. Web renders
     # the complete Markdown once, so a split cannot break a list/table/code fence.
@@ -65,6 +132,11 @@ def present_web_frame(frame):
         result = {**result, 'msg_type': hint['kind'], 'presentation_mode': hint.get('mode')}
         if hint.get('record_id') is not None:
             result['record_id'] = hint['record_id']
+        if hint['kind'] == 'token_usage':
+            result['hidden'] = True
+        turn = current_turn()
+        if hint['kind'] == 'agent_result' and turn and turn.active_operation and turn.active_operation['kind'] != 'ask':
+            result['web_display'] = build_operation_display(turn.active_operation, turn.mode)
     return result
 
 
@@ -81,7 +153,8 @@ def web_text_response(function):
             ns = _section_ns()
             fold = ns['_should_hide_protocol_blocks']() if ns else True
             ids = reply_message_ids() or [getattr(msg, 'message_id', None)]
-            mode = ns['_presentation_mode']() if ns and '_presentation_mode' in ns else 'folded'
+            turn = current_turn()
+            mode = ns['_presentation_mode']() if ns and '_presentation_mode' in ns else (turn.mode if turn is not None else 'folded')
             display = build_web_display(response, fold=fold, reply_message_id=ids[0], mode=mode)
         with web_display_scope(display):
             return await function(context, chat_id, msg, response, *args, **kwargs)

@@ -110,7 +110,28 @@ async def _sync_presentation_footer(context, row_id, reply):
     await db.backfill_attachment_metadata(row_id, row.get('metadata'), metadata)
 
 
+async def _sync_protocol_states(context, *, terminal=False):
+    turn = current_turn()
+    if turn is None:
+        return
+    for operation in turn.operations:
+        if terminal and operation.get('state') == 'running' and not operation.get('running'):
+            operation['state'] = 'stopped' if is_stop_requested() else 'unknown'
+        if operation.get('success') is not None:
+            from xgent_app.web_display import operation_state
+            operation['state'] = operation_state(operation)
+    for reply in turn.replies:
+        states = [{key: operation.get(key) for key in ('kind', 'sequence', 'command', 'path', 'state')}
+                  for operation in turn.operations if operation.get('reply_record_id') == reply.get('record_id')]
+        if not states or reply.get('operations') == states:
+            continue
+        reply['operations'] = states
+        await _sync_presentation_footer(context, reply['record_id'], None)
+        await publish_saved_reply(context, reply['record_id'])
+
+
 async def _finish_presentation(context, turn):
+    await _sync_protocol_states(context, terminal=True)
     if not turn.operations:
         return
     summary = turn.summary()
@@ -142,9 +163,11 @@ async def _finish_presentation(context, turn):
     presentation = metadata.setdefault('presentation', {'version': 1, 'mode': turn.mode, 'kind': row['msg_type']})
     presentation['revision'] = int(presentation.get('revision', 0)) + 1
     presentation['summary'] = summary
+    if turn.reason and row['msg_type'] == MessageType.AGENT_STATUS:
+        presentation['summary'] = {**summary, 'reason': ''}
     if turn.folded:
         base = message.base_text if 'html' in str(message.parse_mode).lower() else html.escape(message.base_text)
-        display = base + '\n\n<i>' + html.escape(summary_line(summary)) + '</i>'
+        display = base + '\n\n<i>' + html.escape(summary_line(presentation['summary'])) + '</i>'
         with message_presentation({'kind': message.kind, 'mode': turn.mode}):
             await safe_edit_text(message, display, parse_mode=constants.ParseMode.HTML,
                                  reply_markup=message.reply_markup)
@@ -1901,7 +1924,9 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
             db = await BotMemoryDB.get_instance()
             generation = await db.get_attachment_generation()
             with runtime_error_scope(update.effective_chat.id, generation):
-                turn = PresentationTurn(normalize_mode(UserDataManager.get('presentation_mode', 'folded')))
+                mode = normalize_mode(await db.get_config_fresh('presentation_mode', 'folded'))
+                UserDataManager.set('presentation_mode', mode)
+                turn = PresentationTurn(mode)
                 context = PresentationContext(context, turn)
                 with presentation_turn(turn):
                     try:
@@ -2258,6 +2283,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     block_type = block['type']
                     if current_turn() is not None:
                         current_turn().start_operation(block)
+                        await _sync_protocol_states(context)
                     round_state.note_over_eligibility(block_type)
 
                     if block_type in {'read', 'edit', 'grep', 'run', 'search', 'fetch', 'intel'}:
@@ -2332,6 +2358,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                 parse_mode=constants.ParseMode.HTML,
                             )
                         round_state.should_continue = True
+                        await _sync_protocol_states(context)
                         continue
 
                     if block_type == 'sendfile':
@@ -2375,6 +2402,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             written_file = await write_text_protocol_file(
                                 block, executor=AgentExecutor
                             )
+                            current_turn().observe_operation({'success': True})
                             file_notice = await send_written_agent_file(
                                 written_file,
                                 protocol="file",
@@ -2387,6 +2415,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             )
                         except Exception as e:
                             logger.error(f"Agent写入文件失败: {e}")
+                            current_turn().observe_operation({'success': False})
                             round_state.over_blocked = True
                             from xgent_app.error_reporting import error_text
                             file_notice = error_text(f"[file结果] 写入失败: {filename}。错误: {redact_sensitive_text(str(e))}")
@@ -2417,6 +2446,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             written_file = await write_base64_protocol_file(
                                 block, executor=AgentExecutor
                             )
+                            current_turn().observe_operation({'success': True})
                             file_notice = await send_written_agent_file(
                                 written_file,
                                 protocol="file:base64",
@@ -2429,6 +2459,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             )
                         except Exception as e:
                             logger.error(f"Agent base64 写入文件失败: {e}")
+                            current_turn().observe_operation({'success': False})
                             round_state.over_blocked = True
                             from xgent_app.error_reporting import error_text
                             file_notice = error_text(f"[file:base64结果] 写入失败: {filename}。错误: {redact_sensitive_text(str(e))}")
@@ -2678,6 +2709,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 # typing 状态会空转到 max_duration 才停。
                 typing_stop.set()
                 await cancel_task_quietly(typing_task)
+                await _sync_protocol_states(context, terminal=True)
 
             # ask 表单已弹出：本轮到此结束，释放锁，等用户在任一端提交后由
             # resume_from_ask 重新进入。把"进行中"状态改成"等待填写"，不再叫模型。
@@ -2714,15 +2746,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 stop_requested=is_stop_requested(),
                 agent_turn_history=agent_turn_history,
             )
-            if round_decision['send_stop_notice']:
-                await safe_send_message(
-                    context,
-                    update.effective_chat.id,
-                    (
-                        "⏹️ 已停止当前回合，后续 Agent 操作不会继续。\n"
-                        "已经产生的工具结果会保留在全局记忆里。"
-                    )
-                )
+            if is_stop_requested():
+                round_decision['status_text'] = '⏹ 已停止，已有结果保留。'
 
             if round_decision['status_text'] is not None:
                 with contextlib.suppress(Exception):
@@ -2734,11 +2759,13 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 if not round_decision['continue_loop']:
                     # 终态状态（停止/超限/失败）是这条消息最终呈现的文字，落库一份
                     with contextlib.suppress(Exception):
-                        await GlobalRecorder.record(
+                        status_row_id = await GlobalRecorder.record(
                             MessageType.AGENT_STATUS, 'assistant',
                             round_decision['status_text'],
                             chat_id=update.effective_chat.id,
                         )
+                        if is_stop_requested() and current_turn() is not None:
+                            current_turn().last_record_id = status_row_id
 
             round_status_text = build_agent_round_status(
                 operation_iteration,
@@ -2748,11 +2775,12 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             )
             # 每轮的 ✅ 状态行是用户在 Telegram/网页上真实看到的内容，落库一份：
             # 刷新后的历史显示与实时流逐字一致（AGENT_STATUS 只进显示，不进 AI 上下文）。
-            with contextlib.suppress(Exception):
-                await GlobalRecorder.record(
-                    MessageType.AGENT_STATUS, 'assistant', round_status_text,
-                    chat_id=update.effective_chat.id,
-                )
+            if round_decision['show_completion_status'] and not is_stop_requested():
+                with contextlib.suppress(Exception):
+                    await GlobalRecorder.record(
+                        MessageType.AGENT_STATUS, 'assistant', round_status_text,
+                        chat_id=update.effective_chat.id,
+                    )
 
             if not round_decision['continue_loop']:
                 if round_decision['show_completion_status'] and round_decision['status_text'] is None:

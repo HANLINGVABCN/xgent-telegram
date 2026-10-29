@@ -105,7 +105,8 @@ def test_browser_full_expand_copy_live_restore_and_archive_paging(full_output_se
             page.goto(base)
             block = page.locator('blockquote.pb').first
             block.wait_for()
-            assert 'line119' not in block.locator('pre').inner_text()
+            assert block.locator('pre').is_hidden()
+            assert 'line119' not in block.locator('.execution-preview').inner_text()
             block.locator('.pb-title').click()
             page.wait_for_function("document.querySelector('blockquote.pb').classList.contains('expanded')")
             assert block.locator('pre').text_content() == body
@@ -116,9 +117,13 @@ def test_browser_full_expand_copy_live_restore_and_archive_paging(full_output_se
             # Collapse again keeps full source for copy without retaining a giant highlighted DOM.
             block.locator('.pb-title').click()
             page.wait_for_function("!document.querySelector('blockquote.pb').classList.contains('expanded')")
-            assert 'line119' not in block.locator('pre').inner_text()
+            assert block.locator('pre').is_hidden()
+            block.locator('.pb-title').click()
+            page.wait_for_function("document.querySelector('blockquote.pb').classList.contains('expanded')")
             block.locator('.btn-copy').click()
             assert page.evaluate('navigator.clipboard.readText()').replace('\r\n', '\n') == body
+            block.locator('.pb-title').click()
+            page.wait_for_function("!document.querySelector('blockquote.pb').classList.contains('expanded')")
             page.reload()
             block = page.locator('blockquote.pb').first
             block.locator('.pb-title').click()
@@ -132,6 +137,9 @@ def test_browser_full_expand_copy_live_restore_and_archive_paging(full_output_se
             page.wait_for_function("document.querySelectorAll('blockquote.pb')[2].classList.contains('expanded')")
             assert live.locator('pre').text_content() == body
             result = page.locator('blockquote.pb[data-output-path]').first
+            if 'expanded' not in result.get_attribute('class').split():
+                result.locator('.pb-title').click()
+                page.wait_for_timeout(300)
             result.locator('.btn-output').click()
             viewer = result.locator('.output-page-text')
             viewer.wait_for()

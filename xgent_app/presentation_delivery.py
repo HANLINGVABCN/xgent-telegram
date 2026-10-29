@@ -89,7 +89,7 @@ class PresentationBot:
         if technical_notice(text) and current_web_display() is None:
             self.remember_notice(text)
             return None
-        if text in {'流式输出中...', '非流式输出中...'} or text.startswith('后台流式生成中'):
+        if text in {'流式输出中...', '非流式输出中...'} or text.startswith(('后台流式生成中', '后台流式输出中')):
             return '思考中…'
         op = self.turn.active_operation
         # A form is actionable UI, not an output preview.

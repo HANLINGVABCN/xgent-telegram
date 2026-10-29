@@ -23,7 +23,7 @@ async def main():
       for stream,style in ((False,'foreground'),(True,'foreground'),(True,'background')):
         with tempfile.TemporaryDirectory() as folder:
           async with Harness(bot,folder) as h:
-            bot.UserDataManager.set('presentation_mode',mode)
+            await bot.UserDataManager.save_config('presentation_mode',mode)
             bot.UserDataManager.set('agent_mode',True)
             bot.UserDataManager.set('stream_mode',stream)
             bot.UserDataManager.set('stream_style',style)
@@ -104,7 +104,7 @@ def test_completed_turn_removes_every_stop_button_and_preserves_token_kind(turns
                 keyboards[frame['message_id']]=frame['reply_markup'] or []
         assert all('停止回答' not in button['text'] for rows in keyboards.values() for row in rows for button in row),case['name']
         if case['mode']=='detailed':
-            token_frames=[frame for frame in case['frames'] if frame['type']=='message' and 'tokens/s' in frame.get('text','')]
+            token_frames=[frame for frame in case['frames'] if frame['type']=='message' and frame.get('msg_type')=='token_usage']
             assert len(token_frames)==2 and all(frame['msg_type']=='token_usage' for frame in token_frames),case['name']
 
 
@@ -121,10 +121,27 @@ def test_short_tool_blocks_are_really_foldable_in_tui_and_plain_cli_stays_compac
 
 def test_missing_usage_is_unknown_and_failures_remain_visible():
     line=usage_line({'round':1,'usage':{'input_tokens':100},'elapsed_seconds':1})
-    assert '出 未提供' in line and '缓存 未提供' in line
+    assert '↓ 未提供' in line and '缓存 未提供' in line
     assert '思考 Token：未提供' in usage_details({'round':1,'usage':{}})
     failure=operation_html({'kind':'run','success':False,'return_code':1,'output':'permission denied'})
     assert failure.startswith('⚠️') and '返回码 1' in failure and 'permission denied' in failure
+
+
+def test_independent_cli_namespace_reprojects_history_without_server_module(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from xgent_app import web_history
+    monkeypatch.setattr(web_history,'_section_ns',lambda:None)
+    namespace={'UserDataManager':SimpleNamespace(get=lambda key,default=None:'folded'),
+               'markdown_to_telegram_html':lambda text:text}
+    raw='好的。\n```run-x\n<<BEGIN_CLIMODE123456\nuptime\n<<END_CLIMODE123456\n```'
+    record={'id':1,'role':'assistant','msg_type':'ai_reply','content':raw,
+            'metadata':{'display':{'content':'legacy frozen snapshot','parse_mode':'HTML'}}}
+    folded=web_history.build_history_message(record,tmp_path,tmp_path,presentation_namespace=namespace,presentation_mode='folded')
+    detailed=web_history.build_history_message(record,tmp_path,tmp_path,presentation_namespace=namespace,presentation_mode='detailed')
+    assert 'data-compact="1"' in folded['content']
+    assert 'data-compact="1"' not in detailed['content'] and 'run-x' in detailed['content']
+    assert 'legacy frozen snapshot' not in folded['content']+detailed['content']
+    assert record['content']==raw
 
 
 def test_browser_dynamic_mode_refresh_short_folds_and_late_snapshot(full_output_server, turns, tmp_path):
@@ -152,23 +169,26 @@ def test_browser_dynamic_mode_refresh_short_folds_and_late_snapshot(full_output_
             page.goto(base)
             page.locator('.token-hud').first.wait_for()
             assert page.locator('.msg-row').count()==4
-            command=page.locator('blockquote.pb-compact').first
+            command=page.locator('blockquote.execution-block').first
             assert not command.locator('pre').is_visible()
             command.locator('.pb-toggle').click()
-            page.wait_for_function("document.querySelector('blockquote.pb-compact').classList.contains('expanded')")
+            page.wait_for_function("document.querySelector('blockquote.execution-block').classList.contains('expanded')")
             assert 'uptime' in command.locator('pre').inner_text()
             page.reload();page.locator('.token-hud').first.wait_for()
-            assert page.locator('blockquote.pb-compact').first.locator('pre').is_visible()
+            assert page.locator('blockquote.execution-block').first.locator('pre').is_visible()
             mode[0]='detailed'
             server.outbox.put({'type':'presentation_changed','presentation_mode':'detailed'})
-            page.wait_for_function("document.querySelectorAll('blockquote.pb-compact').length===0")
+            page.wait_for_function("document.querySelector('[data-presentation-mode=detailed]')!==null")
             assert page.locator('.msg-row').count()>4
-            assert '返回码' in page.locator('#log').inner_text()
+            output=page.locator('.msg-row.cmd .execution-block').first
+            output.locator('.execution-row').click()
+            output.get_by_role('button',name='查看执行信息').click()
+            assert '返回码' in output.locator('.execution-details').inner_text()
             mode[0]='folded'
             server.outbox.put({'type':'presentation_changed','presentation_mode':'folded'})
             page.locator('.token-hud').first.wait_for()
             assert page.locator('.msg-row').count()==4
-            assert not page.locator('blockquote.pb-compact').first.locator('pre').is_visible(), page.evaluate("({state:sessionStorage.getItem('xgent-fold-state'), blocks:Array.from(document.querySelectorAll('blockquote.pb')).map(n=>({class:n.className,id:n.closest('[data-record-id]')?.dataset.recordId}))})")
+            assert not page.locator('blockquote.execution-block').first.locator('pre').is_visible()
             stale={**case['final'],'presentation_mode':'detailed','text':'stale snapshot'}
             server.outbox.put(stale)
             page.wait_for_timeout(400)

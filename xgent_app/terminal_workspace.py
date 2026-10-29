@@ -177,6 +177,7 @@ class TerminalWorkspace:
                     rows = await db.get_display_history(limit)
                     rendered = []
                     for row in rows:
+                        row['presentation_mode'] = mode
                         if row.get('msg_type') == 'ui_message':
                             continue  # Other clients' menu navigation is not a new chat message.
                         key = ('h:' + str(row['id']) if row.get('id') is not None
