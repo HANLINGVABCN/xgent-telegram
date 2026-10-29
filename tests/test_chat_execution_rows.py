@@ -125,7 +125,8 @@ def test_real_shell_single_rows_inline_actions_and_copying(full_output_server, t
                 assert page.locator('.bubble.cmd .msg-actions,.bubble.sys .msg-actions').count()==0
                 assert page.locator('.bubble.sys .bubble-header:visible,.bubble.cmd .bubble-header:visible').count()==0
                 assert page.locator('.bubble.ai .bubble-header:visible').count()==1
-                assert page.locator('.bubble-header .ai-generation-meta').count()==0
+                assert page.locator('.bubble-header .ai-generation-meta:visible').count()==1
+                assert page.locator('.footer-meta .ai-generation-meta').count()==0
                 page.locator('.bubble.ai .copy-message-action').first.click()
                 assert page.evaluate('navigator.clipboard.readText()').replace('\r\n','\n')==case['expected_raw'][0]
                 for footer in page.locator('.bubble.ai .message-footer').all():
@@ -217,12 +218,15 @@ def test_reply_footer_and_single_author_survive_live_adoption_pruning_and_refres
                 assert page.locator('[data-record-id="5"] .bubble-header').is_hidden()
                 assert page.locator('[data-record-id="9"] .bubble-header').is_hidden()
                 assert page.locator('[data-record-id="13"] .bubble-header').is_hidden()
-                assert page.locator('.bubble-header .ai-generation-meta').count()==0
+                assert page.locator('.bubble-header .ai-generation-meta:visible').count()==3
+                assert page.locator('.footer-meta .ai-generation-meta').count()==0
                 assert page.evaluate('document.documentElement.scrollWidth<=innerWidth+1')
                 for row in page.locator('.msg-row.ai').all():
                     body=row.locator('.body').bounding_box()
-                    meta=row.locator('.footer-meta .ai-generation-meta')
-                    assert '模型：p / m' in meta.inner_text()
+                    model=row.locator('.bubble-header .ai-generation-meta')
+                    assert model.text_content()=='p / m'
+                    meta=row.locator('.footer-meta .reply-timestamp')
+                    assert '模型' not in meta.inner_text()
                     assert meta.bounding_box()['y']>=body['y']+body['height']
                     hud=row.locator('.footer-meta .token-hud')
                     assert '↑ 4,110 · ↓ 86 · cache 3,660 · 约 1.0 秒' in hud.inner_text()
@@ -230,7 +234,7 @@ def test_reply_footer_and_single_author_survive_live_adoption_pruning_and_refres
                     assert hud.evaluate('(n)=>getComputedStyle(n).display')=='inline'
                     if width==1440:
                         positions=row.evaluate('''(n)=>{
-                            const a=n.querySelector('.ai-generation-meta').getClientRects()[0];
+                            const a=n.querySelector('.reply-timestamp').getClientRects()[0];
                             const b=n.querySelector('.token-hud i').getClientRects()[0];
                             return {sameLine:Math.abs(a.y-b.y)<2,gap:b.x-a.right};
                         }''')

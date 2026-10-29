@@ -88,7 +88,10 @@ body,body.dark { --code-bg:#182334; --code-header:#101827; --code-fg:#eef3f9; --
 .msg-row{margin-bottom:12px}.msg-row.cmd,.msg-row.sys{margin-bottom:8px}
 .bubble.ai,.bubble.cmd,.bubble.sys{padding:3px 0}
 .bubble.cmd>.bubble-header,.bubble.sys>.bubble-header{display:none}
-.bubble.ai>.bubble-header{border-bottom:0;margin-bottom:4px;padding-bottom:0}
+.bubble.ai>.bubble-header{border-bottom:0;margin-bottom:4px;padding-bottom:0;display:flex;justify-content:flex-start;gap:8px}
+.bubble.ai>.bubble-header .bubble-author{flex:0 0 auto}
+.bubble.ai>.bubble-header .ai-generation-meta{margin:0;padding:0;text-align:left;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:11px/17px var(--font);color:var(--text-3)}
+.bubble.ai>.bubble-header .ai-generation-meta[hidden]{display:none}
 .msg-row.ai.turn-continuation>.bubble>.bubble-header{display:none}
 .msg-row.followed-by-output,.msg-row.followed-by-round{margin-bottom:0}
 .msg-row.cmd.attached-output>.bubble{padding-top:0;padding-bottom:0}
@@ -104,7 +107,8 @@ body,body.dark { --code-bg:#182334; --code-header:#101827; --code-fg:#eef3f9; --
 .bubble.user .message-footer{margin-top:2px;justify-content:flex-end}
 .bubble .footer-meta{flex:1;min-width:0;font-size:11px;line-height:17px;color:var(--text-3);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 .bubble .footer-meta:empty{display:none}
-.bubble .footer-meta .ai-generation-meta{display:inline;margin:0 12px 0 0;padding:0;text-align:left;font:inherit;color:inherit}
+.bubble .footer-meta .reply-timestamp{display:inline;margin:0 12px 0 0;padding:0;font:inherit;color:inherit}
+.bubble .footer-meta .reply-timestamp[hidden]{display:none}
 .bubble .footer-meta .token-hud{display:inline;margin:0;font-size:11px;line-height:17px;color:inherit}
 .bubble .footer-meta i{font-style:normal}.bubble .footer-meta pre{background:none;margin:0;padding:0;font:inherit}
 .bubble .footer-meta .ts{float:none;margin:0;font-size:11px;line-height:17px}
@@ -217,6 +221,8 @@ body.dark #composer .send-btn.ready,body.dark #composer .stop-btn { background:#
 .composer-options-head button { display:grid; place-items:center; width:30px; height:30px; border:0; background:transparent; border-radius:8px; color:var(--wb-muted); }
 .composer-options-head button .icon { width:16px; height:16px; }
 .composer-choice-list { min-height:0; overflow:auto; overscroll-behavior:contain; }
+.composer-response-modes{flex-shrink:0;border-bottom:1px solid var(--wb-border);padding-bottom:3px;margin-bottom:3px}
+.composer-response-modes .composer-option[aria-checked=true]{background:var(--wb-soft)}
 .composer-option { display:flex; gap:10px; align-items:center; justify-content:space-between; width:100%; min-height:38px; padding:9px 10px; border:0; border-radius:8px; background:transparent; color:var(--wb-text); font:inherit; text-align:left; }
 .composer-option span { min-width:0; overflow-wrap:anywhere; }
 .composer-option .icon { width:15px; height:15px; flex-shrink:0; }

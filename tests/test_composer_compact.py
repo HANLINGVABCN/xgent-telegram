@@ -69,12 +69,14 @@ def test_mobile_generation_panel_switch_and_resize(browser_context,workspace_url
     page.locator('#input').fill('手机草稿')
     original=browser_context.request.get(workspace_url['url']+'/api/workbench/bootstrap').json()['settings']['values']['agent_mode']
     trigger=page.get_by_role('button',name='生成选项',exact=True);trigger.click()
-    switch=page.get_by_role('switch',name='Agent 自动执行',exact=True);switch.click()
+    switch=page.get_by_role('switch',name='Agent 模式',exact=True);switch.click()
     page.wait_for_function('(old)=>document.getElementById("composer-agent").getAttribute("aria-pressed")===String(!old)',arg=original)
     assert page.locator('#composer-options-popover').is_hidden()
     trigger.click()
-    assert page.locator('#composer-options-popover .composer-option').count()==0
-    assert page.get_by_role('switch',name='流式输出',exact=True).is_visible()
+    assert page.locator('#composer-options-popover .composer-option').count()==3
+    assert page.get_by_role('radio',name='前台流式',exact=True).is_visible()
+    assert page.get_by_role('radio',name='后台流式',exact=True).is_visible()
+    assert page.get_by_role('radio',name='非流式',exact=True).is_visible()
     assert page.get_by_role('switch',name='呈现模式',exact=True).count()==0
     page.keyboard.press('Escape')
     page.locator('#composer-thinking').click();page.locator('.composer-option[data-value=auto]').click()
@@ -98,3 +100,28 @@ def test_failed_change_stays_in_composer_and_preserves_value(browser_context,wor
     assert page.locator('#composer-option-error').is_visible()
     assert page.locator('#composer-options-popover').is_visible()
     page.keyboard.press('Escape');page.close()
+
+
+@pytest.mark.parametrize('width',[1440,390,320])
+def test_three_generation_choices_save_enablement_and_style_together(browser_context,workspace_url,width):
+    page=browser_context.new_page();page.set_viewport_size({'width':width,'height':844});ready(page,workspace_url['url'])
+    page.wait_for_function('!document.getElementById("composer-model").disabled')
+    page.locator('#input').fill('保留草稿')
+    for value,label,enabled,style in [('background','后台流式',True,'background'),
+                                      ('nonstream','非流式',False,'foreground'),
+                                      ('foreground','前台流式',True,'foreground')]:
+        page.get_by_role('button',name='生成选项',exact=True).click()
+        assert page.get_by_role('radiogroup',name='回复方式').is_visible()
+        assert page.get_by_role('switch',name='Agent 模式',exact=True).is_visible()
+        assert page.get_by_role('switch',name='Agent 自动执行',exact=True).count()==0
+        page.get_by_role('radio',name=label,exact=True).click()
+        page.locator('#composer-options-popover').wait_for(state='hidden')
+        data=browser_context.request.get(workspace_url['url']+'/api/workbench/bootstrap').json()['settings']['values']
+        assert (data['response_mode'],data['stream_mode'],data['stream_style'])==(value,enabled,style)
+        assert page.locator('#input').input_value()=='保留草稿'
+        page.get_by_role('button',name='生成选项',exact=True).click()
+        assert page.get_by_role('radio',name=label,exact=True).get_attribute('aria-checked')=='true'
+        bounds=page.locator('#composer-options-popover').bounding_box()
+        assert bounds['x']>=0 and bounds['x']+bounds['width']<=width+1
+        page.keyboard.press('Escape')
+    page.close()

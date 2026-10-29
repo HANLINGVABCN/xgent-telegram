@@ -156,6 +156,8 @@ class GlobalRecorder:
         if presentation is not None:
             stamped_metadata.setdefault('presentation', presentation)
         stamped_metadata.setdefault('src', _RECORDER_SOURCE_ID)
+        if current_scope().run_id:
+            stamped_metadata.setdefault('run_id', current_scope().run_id)
         ui_generation = active_ui_generation()
         if ui_generation is not None:
             stamped_metadata.setdefault('ui_generation', ui_generation)

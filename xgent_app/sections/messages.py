@@ -2730,6 +2730,20 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             # over 协议的拦截点，全局就这一处：模型说了不必回灌，且这一轮每个操作都成功，
             # 就把回灌载荷丢掉，让下面的协调器落到"没有新上下文"那条既有分支——正常收尾、
             # 不再叫一次模型。该发的结果已经发了，该落库的也已经落库了。
+            round_status_text = build_agent_round_status(
+                operation_iteration, 'completed', origin=agent_origin,
+                operation_count=len(protocol_blocks))
+            completion_sent = False
+            # Finish this operation round before claiming another user input.
+            # Both durable timestamps and live delivery then place the count
+            # before a queued message, rather than underneath that new message.
+            if round_state.should_continue and not is_stop_requested():
+                with contextlib.suppress(Exception):
+                    await GlobalRecorder.record(MessageType.AGENT_STATUS, 'assistant', round_status_text,
+                        chat_id=update.effective_chat.id)
+                await _move_status_message_to_bottom(agent_stop_msg, context,
+                    update.effective_chat.id, round_status_text)
+                completion_sent = True
             batch = []
             if (round_state.should_continue and round_state.has_context and not is_stop_requested()
                     and agent_iteration + 1 <= max_agent_iterations and get_conversations().text_queue is not None):
@@ -2767,15 +2781,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                         if is_stop_requested() and current_turn() is not None:
                             current_turn().last_record_id = status_row_id
 
-            round_status_text = build_agent_round_status(
-                operation_iteration,
-                "completed",
-                origin=agent_origin,
-                operation_count=len(protocol_blocks),
-            )
             # 每轮的 ✅ 状态行是用户在 Telegram/网页上真实看到的内容，落库一份：
             # 刷新后的历史显示与实时流逐字一致（AGENT_STATUS 只进显示，不进 AI 上下文）。
-            if round_decision['show_completion_status'] and not is_stop_requested():
+            if round_decision['show_completion_status'] and not is_stop_requested() and not completion_sent:
                 with contextlib.suppress(Exception):
                     await GlobalRecorder.record(
                         MessageType.AGENT_STATUS, 'assistant', round_status_text,
@@ -2783,7 +2791,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     )
 
             if not round_decision['continue_loop']:
-                if round_decision['show_completion_status'] and round_decision['status_text'] is None:
+                if round_decision['show_completion_status'] and round_decision['status_text'] is None and not completion_sent:
                     # 完成状态紧跟本轮执行结果，不再原地编辑
                     await _move_status_message_to_bottom(
                         agent_stop_msg,
@@ -2794,12 +2802,9 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                 break
 
             # 轮次继续：立刻把本轮 ✅ 发到执行结果之后
-            await _move_status_message_to_bottom(
-                agent_stop_msg,
-                context,
-                update.effective_chat.id,
-                round_status_text,
-            )
+            if not completion_sent:
+                await _move_status_message_to_bottom(agent_stop_msg, context,
+                    update.effective_chat.id, round_status_text)
 
             # Continue from this turn's in-memory transcript. Re-reading global history here would
             # duplicate just-recorded Agent results and make prompt caching worse.

@@ -414,6 +414,8 @@ def build_history_message(
         metadata = {}
         message["media_error"] = "\u5386\u53f2\u9644\u4ef6\u5143\u6570\u636e\u635f\u574f"
     live = metadata.get('web_live')
+    if metadata.get('run_id') or metadata.get('queue_run_id'):
+        message['run_id']=metadata.get('run_id') or metadata['queue_run_id']
     if isinstance(metadata.get('queue_id'), str):
         message['queue_id'] = metadata['queue_id']
     if (isinstance(live, dict) and isinstance(live.get('epoch'), str)

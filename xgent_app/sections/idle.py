@@ -344,7 +344,7 @@ from xgent_app.web_appearance import FONT_SETTINGS, read_appearance, write_appea
 
 WEB_EDITABLE_SETTINGS = {
     *FONT_SETTINGS,
-    'thinking_level', 'stream_mode', 'agent_mode', 'text_stitch_mode',
+    'thinking_level', 'stream_mode', 'response_mode', 'agent_mode', 'text_stitch_mode',
     'global_depth', 'agent_max_iterations', 'stream_timeout', 'chat_model',
     'disabled_skills', 'hidden_skills', 'skill_state', 'agent_command_timeout', 'idle_message_interval',
     'smart_match_threshold',
@@ -898,6 +898,9 @@ async def _web_read_settings() -> Dict[str, Any]:
             **appearance['values'],
             'thinking_level': normalize_thinking_level(UserDataManager.get('thinking_level')),
             'stream_mode': normalize_bool(UserDataManager.get('stream_mode', True), True),
+            'stream_style': normalize_stream_style(UserDataManager.get('stream_style', DEFAULT_STREAM_STYLE)),
+            'response_mode': (normalize_stream_style(UserDataManager.get('stream_style', DEFAULT_STREAM_STYLE))
+                              if normalize_bool(UserDataManager.get('stream_mode', True), True) else 'nonstream'),
             'presentation_mode': normalize_mode(UserDataManager.get('presentation_mode', 'folded')),
             'hide_protocol_blocks': True,
             'agent_mode': bool(UserDataManager.get('agent_mode', False)),
@@ -923,6 +926,9 @@ async def _web_read_settings() -> Dict[str, Any]:
             'stats_metric': stats_metric,
         },
         'options': {
+            'response_mode': [{'value': 'foreground', 'label': '前台流式'},
+                              {'value': 'background', 'label': '后台流式'},
+                              {'value': 'nonstream', 'label': '非流式'}],
             'thinking_level': [
                 {'value': level, 'label': THINKING_LEVEL_LABELS[level]}
                 for level in THINKING_LEVEL_ORDER
@@ -974,6 +980,10 @@ async def _web_write_setting(key: str, value: Any) -> Dict[str, Any]:
         UserDataManager.set(key, level)
         await UserDataManager.save_config(key, level)
         ModelClient._thinking_unsupported.clear()
+    elif key == 'response_mode':
+        values = await (await BotMemoryDB.get_instance()).set_response_mode(value)
+        for setting, selected in values.items():
+            UserDataManager.set(setting, selected)
     elif key in {'stream_mode', 'agent_mode'}:
         flag = normalize_bool(value, False)
         UserDataManager.set(key, flag)

@@ -1580,6 +1580,20 @@ class BotMemoryDB(ConversationStore):
                                ('presentation_mode', json.dumps('folded')))
         return await self.get_config_fresh('presentation_mode', 'folded')
 
+    async def set_response_mode(self, mode):
+        """Commit stream enablement and style together for the three UI choices."""
+        modes = {'foreground': (True, 'foreground'), 'background': (True, 'background'),
+                 'nonstream': (False, 'foreground')}
+        if mode not in modes:
+            raise ValueError('回复方式只能是前台流式、后台流式或非流式')
+        enabled, style = modes[mode]
+        values = {'stream_mode': enabled, 'stream_style': style}
+        async with self._transaction() as conn:
+            await conn.executemany('INSERT OR REPLACE INTO config(key,value) VALUES (?,?)',
+                [(key, json.dumps(value)) for key, value in values.items()])
+        self._config_cache.update(values)
+        return values
+
     async def set_skill_state(self, path: str, state: str) -> Dict[str, List[str]]:
         if state not in {'enabled', 'disabled', 'hidden'}:
             raise ValueError('无效的技能状态')

@@ -60,6 +60,23 @@
   var uploadQueue = null;
   var queueEnabled=false,queueState=null,queueController=null,queueVersion=0,queueExpanded=false,queueRefreshPending=false;
   var queueActions=new Map(),recoveredEdits=new Set(),textSubmitting=false,textSubmission=null;
+  const observedRuns=new Map(),finishedRuns=new Set();
+  function currentRun(){
+    const cid=selectedConversationId||window.XGentConversations?.current;
+    const run=observedRuns.get(cid)||window.XGentConversations?.running;
+    return run&&run.conversation_id===cid&&!finishedRuns.has(run.run_id)?run:null;
+  }
+  function rememberRun(frame){
+    if(!frame?.run_id||!frame.conversation_id||finishedRuns.has(frame.run_id))return;
+    observedRuns.set(frame.conversation_id,{...observedRuns.get(frame.conversation_id),
+      conversation_id:frame.conversation_id,run_id:frame.run_id});
+  }
+  function finishRun(frame){
+    if(!frame.run_id)return;
+    finishedRuns.add(frame.run_id);
+    if(finishedRuns.size>1000)finishedRuns.delete(finishedRuns.values().next().value);
+    if(observedRuns.get(frame.conversation_id)?.run_id===frame.run_id)observedRuns.delete(frame.conversation_id);
+  }
   try{
     JSON.parse(sessionStorage.getItem('xgent_queue_edits')||'[]').forEach(saved=>queueActions.set(saved.item.id,{...saved,busy:false,error:'取回结果待确认'}));
     recoveredEdits=new Set(JSON.parse(sessionStorage.getItem('xgent_queue_recovered')||'[]'));
@@ -168,7 +185,7 @@
     if (cid && options.method === 'POST' && ['/api/chat','/api/command','/api/callback','/api/stop'].includes(path)) {
       var payload = options.body ? JSON.parse(options.body) : {};
       if(path === '/api/stop') {
-        var running = window.XGentConversations?.running;
+        var running = currentRun();
         payload = {conversation_id:running?.conversation_id || cid, run_id:running?.run_id, ...payload};
       } else payload = {conversation_id:cid, ...payload};
       options.body = JSON.stringify(payload);
@@ -484,9 +501,11 @@
   function applyAiGeneration(entry, timestamp, generation) {
     if (!entry || entry.role !== 'ai' || !entry.aiMeta) return;
     entry.aiGeneration = generation || entry.aiGeneration || null;
+    if(timestamp!=null)entry.timestamp=timestamp;
     var provider = entry.aiGeneration?.provider || '', model = entry.aiGeneration?.model || '';
-    entry.aiMeta.textContent = detailedTime(entry.aiGeneration?.generated_at || timestamp) + ' · 模型：' +
-      (provider || model ? (provider && model ? provider + ' / ' + model : provider || model) : '历史记录未记录模型');
+    entry.aiMeta.textContent = provider&&model?provider+' / '+model:provider||model;
+    entry.aiMeta.hidden=!entry.aiMeta.textContent;
+    entry.aiMeta.title=entry.aiMeta.textContent?'模型：'+entry.aiMeta.textContent:'';
   }
 
   function syncTurnAuthors(root){
@@ -495,7 +514,7 @@
     for(const row of root.children){
       row.classList.remove('followed-by-output','attached-output','followed-by-round','round-followup');
       if(!row.classList.contains('msg-row')||row.classList.contains('presentation-hidden'))continue;
-      const cid=row.dataset.presentationConversationId||null,id=row.dataset.turnId||null;
+      const cid=row.dataset.presentationConversationId||null,id=row.dataset.turnId||row.dataset.runId||null;
       if(cid&&conversationId&&cid!==conversationId){seenReply=false;turnId=null;previous=null;}
       if(id&&turnId&&id!==turnId)previous=null;
       if(cid)conversationId=cid;
@@ -836,10 +855,16 @@
     const huds=entry.body.querySelectorAll('.token-hud');
     if(huds.length){entry.footerMeta.querySelectorAll('.token-hud').forEach(node=>node.remove());huds.forEach(node=>entry.footerMeta.append(node));}
     const ts=entry.bubble.querySelector('.ts');if(ts&&!entry.footerMeta.contains(ts))entry.footerMeta.prepend(ts);
-    if(entry.aiMeta&&!entry.footerMeta.contains(entry.aiMeta))entry.footerMeta.prepend(entry.aiMeta);
+    if(entry.aiMeta&&entry.head&&!entry.head.contains(entry.aiMeta))entry.head.append(entry.aiMeta);
+    if(entry.replyTime){
+      entry.replyTime.textContent=entry.durable&&entry.timestamp!=null?
+        detailedTime(entry.aiGeneration?.generated_at??entry.timestamp):'';
+      entry.replyTime.hidden=!entry.replyTime.textContent;
+      if(!entry.footerMeta.contains(entry.replyTime))entry.footerMeta.prepend(entry.replyTime);
+    }
     const display=entry.webDisplay;
     const hasFooterText=!!entry.footerMeta.querySelector('.token-hud')||
-      entry.role==='ai'&&!!entry.aiMeta?.textContent||entry.role==='user'&&!!ts?.textContent;
+      entry.role==='ai'&&!!entry.replyTime?.textContent||entry.role==='user'&&!!ts?.textContent;
     if(entry.actions){
       let info=entry.actions.querySelector('.usage-action');
       if(display&&(display.usage_details||display.task_details)&&['ai','user'].includes(entry.role)){
@@ -872,7 +897,7 @@
 
   function classifyMessageText(role, text, messageType) {
     if (messageType === "token_usage") return "token";
-    if (messageType === "agent_status" || messageType === "system_op" || messageType === "runtime_error") return "sys";
+    if (messageType === "agent_status" || messageType === "system_op" || messageType === "runtime_error" || messageType === 'ui_message') return "sys";
     if (messageType === "agent_result") return "cmd";
     if (messageType || role === "user") return role;
     if (typeof text !== "string") return role;
@@ -942,6 +967,7 @@
       if (role === "ai") {
         var aiMeta = document.createElement("span");
         aiMeta.className = "ai-generation-meta";
+        head.appendChild(aiMeta);
         head._aiMeta = aiMeta;
       }
       bubble.appendChild(head);
@@ -1024,6 +1050,7 @@
 
     var entry = { row: row, body: body, bubble: bubble, head: head, btns: btns, rawText: text, parseMode: parseMode, role: role, messageType:messageType, webDisplay:webDisplay, aiGeneration: aiGeneration || null };
     entry.aiMeta = head && head._aiMeta;
+    if(role==='ai'){entry.replyTime=document.createElement('span');entry.replyTime.className='reply-timestamp';}
     applyAiGeneration(entry, timestamp, aiGeneration);
     syncMessageChrome(entry);
     if (messageId != null) byMessageId[messageId] = entry;
@@ -1412,7 +1439,7 @@
       if (byMessageId[previousId] !== entry) removeEntry(byMessageId[previousId]);
     });
     if (!entry && frame.type === "edit" && id == null) entry = lastStreamEntry;
-    var newRole = classifyMessageText(role, frame.text, frame.msg_type);
+    var newRole = classifyMessageText(role, frame.text, frame.msg_type??entry?.messageType);
     var displayKey=JSON.stringify(frame.web_display||null);
     if(entry)entry.webDisplay=frame.web_display;
     if (entry && entry.rawText !== undefined && entry.role === newRole) {
@@ -1427,17 +1454,19 @@
       if (next && next.parentNode === log) log.insertBefore(entry.row, next);
     }
     entry.rawText=frame.text;entry.parseMode=frame.parse_mode;entry.displayKey=displayKey;
-    entry.messageType=frame.msg_type;
+    entry.messageType=frame.msg_type??entry.messageType;
     entry.webDisplay=frame.web_display;
     if(frame.turn_id)entry.row.dataset.turnId=String(frame.turn_id);
+    if(frame.run_id)entry.row.dataset.runId=String(frame.run_id);
     if(frame.conversation_id)entry.row.dataset.presentationConversationId=frame.conversation_id;
+    if(frame.record_id!=null&&!frame.ui_message_id)entry.durable=true;
+    applyAiGeneration(entry, frame.timestamp??frame.ts, frame.ai_generation);
     syncMessageChrome(entry);
     if(typeof frame.hidden==='boolean'){entry.row.classList.toggle('presentation-hidden',frame.hidden);entry.row.classList.toggle('msg-row',!frame.hidden);}
     if(frame.timestamp!=null){
       var ts=entry.row.querySelector('.ts');
       if(ts){ts.textContent=nowTime(frame.timestamp);ts.title=new Date(Number(frame.timestamp)*1000).toLocaleString();}
     }
-    applyAiGeneration(entry, frame.timestamp || frame.ts, frame.ai_generation);
     bindUiMessage(entry, frame);
     if (frame.reply_markup !== undefined) {
       setButtons(entry, frame.reply_markup, frame.message_id != null ? frame.message_id : (frame.record_id || 0));
@@ -1708,7 +1737,7 @@
     if(frame.interaction_id&&['callback_done','turn_error'].includes(frame.type))finishCardRequest(frame.interaction_id);
     if(frame.type === 'conversation_state') {
       window.XGentConversations?.accept(frame);
-      setBusy(!!(frame.runs ? frame.runs[selectedConversationId] : frame.running?.conversation_id===selectedConversationId&&frame.running));
+      setBusy(!!currentRun());
       return;
     }
     if(frame.type === 'turn_rejected') {
@@ -1734,11 +1763,15 @@
       return;
     }
     if(frame.generation!=null && uiGeneration!=null && frame.generation<uiGeneration)return;
-    var running=window.XGentConversations?.running;
+    var running=currentRun();
     var completion=['turn_end','turn_error','generation_end'].includes(frame.type)||(frame.type==='compression_state'&&!frame.busy);
     if(completion&&running&&(!frame.run_id||frame.run_id!==running.run_id)){
       if(!frame.run_id&&frame.type==='turn_error'&&frame.text)toast(frame.text,true);
       return;
+    }
+    if(completion)finishRun(frame);
+    else if(frame.run_id&&!frame.ui_message_id&&['message','edit','chat_action','compression_state'].includes(frame.type)){
+      rememberRun(frame);setBusy(!!currentRun());
     }
     if(frame.type==='turn_end'||frame.type==='turn_error')window.dispatchEvent(new Event('xgent-turn-finished'));
     if(viewingPast && ['message','edit','edit_markup','user_message','document','photo','notice','record_snapshot'].includes(frame.type) &&
@@ -2265,6 +2298,7 @@
         snapshotWatermark={epoch:streamEpoch,cursor:streamCursor};
         streamEpoch=live.epoch;streamCursor=live.cursor;
         (live.frames||[]).filter(frame=>!frame.conversation_id||frame.conversation_id===selectedConversationId).forEach(function(frame){
+          rememberRun(frame);
           const entry=putTextFrame('ai',frame);retained.add(entry);log.appendChild(entry.row);
         });
       }
@@ -3284,10 +3318,16 @@
   });
   syncSendState();
 
-  btnStop.addEventListener("click", function () {
+  btnStop.addEventListener("click", async function () {
+    if(btnStop.disabled)return;
+    const run=currentRun();
     triggerHaptic("warning");
     cancelUploads();
-    api("/api/stop", { method: "POST" }).catch(function (err) { toast("停止失败：" + err.message, true); });
+    btnStop.disabled=true;
+    try{await api('/api/stop',{method:'POST',body:JSON.stringify({
+      conversation_id:run?.conversation_id||selectedConversationId,run_id:run?.run_id})});}
+    catch(err){toast('打断失败：'+err.message,true);}
+    finally{btnStop.disabled=false;}
   });
   window.addEventListener("beforeunload", function (event) {
     if (!uploadQueue) return;
@@ -3561,7 +3601,7 @@
     }
     if(uploadQueue)uploadQueue.cancelled=true;
     selectedConversationId=next;
-    setBusy(!!window.XGentConversations?.running);
+    setBusy(!!currentRun());
     queueController?.abort();queueController=null;queueVersion++;queueState=null;queueExpanded=false;drawQueue();
     input.value=conversationDrafts[next]||'';
     try{input.value=input.value||sessionStorage.getItem(draftKey(next))||'';}catch(e){}
@@ -3573,7 +3613,14 @@
     updateEmptyState();syncSendState();
     if(!loggedOut){resync(true).catch(function(){});loadConversationLineage().catch(function(){});}
   });
-  window.addEventListener('xgent-conversation-state',function(event){const state=event.detail;setBusy(!!(state.runs ? state.runs[selectedConversationId] : state.running?.conversation_id===selectedConversationId&&state.running));});
+  window.addEventListener('xgent-conversation-state',function(event){
+    const state=event.detail;
+    if(state.runs){
+      for(const [cid,run] of observedRuns)if(!state.runs[cid]||state.runs[cid].run_id!==run.run_id)observedRuns.delete(cid);
+      Object.values(state.runs).forEach(rememberRun);
+    }else if(state.running)rememberRun(state.running);
+    setBusy(!!currentRun());
+  });
   window.addEventListener('xgent-conversation-deleted',function(event){
     const cid=event.detail.conversation_id;delete conversationDrafts[cid];try{sessionStorage.removeItem(draftKey(cid));}catch{}
     if(cardScrollIntent?.cid===cid)cancelCardFollow();
@@ -3625,6 +3672,7 @@
       const role=message.role==='user'?'user':message.role==='assistant'?'ai':'sys';
       const entry=makeBubble(role,message.content,null,message.parse_mode,null,message.msg_type,message.timestamp,message.web_display,message.ai_generation,target);
       if(message.turn_id)entry.row.dataset.turnId=String(message.turn_id);
+      if(message.run_id)entry.row.dataset.runId=String(message.run_id);
       if(message.conversation_id)entry.row.dataset.presentationConversationId=message.conversation_id;
       if(message.media?.length)setInlineMedia(entry,message.media);
       entry.row.dataset.sourceMessage=message.history_key||'history:'+message.id;
@@ -3650,6 +3698,7 @@
     if(actionDialog.open)closeAction();
     loggedOut=true;stopLiveTransport();cancelHistoryPage();historyLoadController?.abort();historyGen++;historyReady=false;pendingFrames=[];
     queueController?.abort();queueController=null;queueVersion++;queueState=null;queueEnabled=false;queueActions.clear();recoveredEdits.clear();textSubmission=null;drawQueue();
+    observedRuns.clear();finishedRuns.clear();
     try{sessionStorage.removeItem('xgent_queue_edits');sessionStorage.removeItem('xgent_queue_recovered');}catch(e){}
     document.getElementById('media-preview-dialog')?.close();
     cancelUploads('已退出登录');conversationFiles=Object.create(null);clearPendingFiles();pendingPreviews.forEach(value=>URL.revokeObjectURL(value.url));pendingPreviews.clear();input.value='';try { sessionStorage.removeItem(draftKey()); } catch(e) {}

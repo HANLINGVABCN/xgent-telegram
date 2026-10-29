@@ -137,7 +137,8 @@ def stamp_frame(frame: dict) -> dict:
     generated = _reply_generation.get()
     if (scope.run_id and generated and generated['run_id'] == scope.run_id
             and generated['conversation_id'] == scope.conversation_id
-            and frame.get('type') in {'message','edit','document','photo'}):
+            and frame.get('type') in {'message','edit','document','photo'}
+            and frame.get('msg_type') in {'ai_reply','media_reply'}):
         result.setdefault('ai_generation', {key:generated[key] for key in ('provider','model','generated_at')})
     return result
 
