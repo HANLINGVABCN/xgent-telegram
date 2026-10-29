@@ -67,7 +67,7 @@ def visible(messages):
     return [message for message in messages if not message.get('hidden') and message['msg_type']!='ui_message']
 
 
-def test_two_model_replies_one_operation_and_four_visible_blocks(turns):
+def test_two_model_replies_one_operation_and_one_round_line(turns):
     for case in turns:
         assert case['raw']==case['expected_raw'],case['name']
         assert case['stats']==2,case['name']
@@ -75,7 +75,8 @@ def test_two_model_replies_one_operation_and_four_visible_blocks(turns):
         assert (summary['rounds'],summary['operations'])==(2,1),case['name']
         if case['mode']=='folded':
             messages=visible(case['shown'])
-            assert [m['msg_type'] for m in messages]==['user_text','ai_reply','agent_result','ai_reply'],case['name']
+            assert [m['msg_type'] for m in messages]==['user_text','ai_reply','agent_result','agent_status','ai_reply'],case['name']
+            assert messages[3]['content']=='Agent 第 1 轮 · 1 个操作',case['name']
             assert '共执行 2 轮，1 个操作' in messages[-1]['content']
             assert '返回码' not in messages[2]['content']
             assert 'data-compact="1"' in messages[1]['content']
@@ -105,6 +106,18 @@ def test_completed_turn_removes_every_stop_button_and_preserves_token_kind(turns
         assert all('停止回答' not in button['text'] for rows in keyboards.values() for row in rows for button in row),case['name']
         token_frames=[frame for frame in case['frames'] if frame['type']=='message' and frame.get('msg_type')=='token_usage']
         assert not token_frames,case['name']
+
+
+def test_generation_styles_and_round_line_remain_distinct_in_every_iteration(turns):
+    for case in turns:
+        _,stream,style=case['name'].split('/')
+        label='非流式输出中...' if stream=='False' else '后台流式输出中...' if style=='background' else '前台流式输出中...'
+        placeholders=[frame for frame in case['frames'] if frame.get('text')==label and frame['type']=='message']
+        assert len(placeholders)==2,case['name']
+        assert all(frame.get('msg_type')=='ai_reply' for frame in placeholders),case['name']
+        assert not any(frame.get('text')=='思考中…' for frame in case['frames']),case['name']
+        rounds=[frame for frame in case['frames'] if frame['type']=='message' and frame.get('msg_type')=='agent_status']
+        assert [frame['text'] for frame in rounds]==['Agent 第 1 轮 · 1 个操作'],case['name']
 
 
 def test_short_tool_blocks_are_really_foldable_in_tui_and_plain_cli_stays_compact():
@@ -183,7 +196,7 @@ def test_browser_retired_mode_events_preserve_expansion_and_reject_stale_snapsho
         try:
             page.goto(base)
             page.locator('.token-hud').first.wait_for()
-            assert page.locator('.msg-row').count()==4
+            assert page.locator('.msg-row').count()==5
             command=page.locator('blockquote.execution-block').first
             assert not command.locator('pre').is_visible()
             command.locator('.pb-toggle').click()
@@ -195,7 +208,7 @@ def test_browser_retired_mode_events_preserve_expansion_and_reject_stale_snapsho
             server.outbox.put({'type':'presentation_changed','presentation_mode':'detailed'})
             page.wait_for_timeout(300)
             assert page.locator('[data-presentation-mode=detailed]').count()==0
-            assert page.locator('.msg-row').count()==4
+            assert page.locator('.msg-row').count()==5
             assert page.locator('blockquote.execution-block').first.locator('pre').is_visible()
             output=page.locator('.msg-row.cmd .execution-block').first
             output.locator('.execution-row').click()
@@ -204,7 +217,7 @@ def test_browser_retired_mode_events_preserve_expansion_and_reject_stale_snapsho
             mode[0]='folded'
             server.outbox.put({'type':'presentation_changed','presentation_mode':'folded'})
             page.locator('.token-hud').first.wait_for()
-            assert page.locator('.msg-row').count()==4
+            assert page.locator('.msg-row').count()==5
             assert page.locator('blockquote.execution-block').first.locator('pre').is_visible()
             stale={**case['final'],'presentation_mode':'detailed','text':'stale snapshot'}
             server.outbox.put(stale)

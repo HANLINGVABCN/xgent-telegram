@@ -102,7 +102,7 @@ def test_task_source_tokens_rounds_and_dark_code_unchanged(browser_context,works
     token=page.locator('.token-hud').filter(has_text='↑ 2,400');token.first.wait_for()
     before=token.first.inner_text()
     assert '2,400' in before and '800' in before and 'cache' in before
-    assert page.locator('.msg-row[data-record-id="'+str(workspace_url['demo']['round_message'])+'"]').get_by_text('Agent 第 2 轮',exact=False).count()==0
+    assert page.locator('.msg-row[data-record-id="'+str(workspace_url['demo']['round_message'])+'"]').get_by_text('Agent 第 2 轮 · 3 个操作',exact=True).count()==1
     assert page.locator('.bubble-header').count()>0
     for dark in [False,True]:
         page.evaluate('(dark)=>document.body.classList.toggle("dark",dark)',dark)

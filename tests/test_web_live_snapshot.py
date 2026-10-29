@@ -191,7 +191,9 @@ async def main():
                         await asyncio.wait_for(started.wait(),2)
                         snapshot=h.outbox.snapshot()
                         assert len(snapshot['frames'])==1,snapshot
-                        assert snapshot['frames'][0]['text'] in ('思考中…', '流式输出中...', '非流式输出中...'), snapshot
+                        expected = ('非流式输出中...' if not stream else
+                                    '后台流式输出中...' if style == 'background' else '前台流式输出中...')
+                        assert snapshot['frames'][0]['text'] == expected, snapshot
                         mid=snapshot['frames'][0]['message_id']
                         assert h.outbox.snapshot()['frames'][0]['message_id']==mid
                     finally:

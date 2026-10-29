@@ -1,10 +1,16 @@
 """A turn-local bot facade; presentation never changes execution or persistence."""
 from __future__ import annotations
 
+from .agent_status import compact_agent_round_status
 from .presentation import (
     current_message_presentation, message_presentation, operation_html,
     technical_notice, successful_status,
 )
+
+
+def _generation_status(text):
+    return str(text).startswith(('前台流式输出中', '流式输出中', '非流式输出中',
+                                 '后台流式生成中', '后台流式输出中'))
 
 
 class PresentationMessage:
@@ -21,6 +27,9 @@ class PresentationMessage:
     async def edit_text(self, text, **kwargs):
         if self.hidden:
             if technical_notice(text):
+                if compact_agent_round_status(text):
+                    with message_presentation({'kind': 'agent_status', 'mode': self.bot.turn.mode}):
+                        return await self.bot.send_message(chat_id=self.chat_id, text=text, **kwargs)
                 self.bot.remember_notice(text)
                 return self
             # A hidden progress placeholder may later carry an actionable failure.
@@ -65,6 +74,8 @@ class PresentationBot:
                                     '⚠️ 本次处理失败，已有结果已保留。')
 
     def _kind(self, text):
+        if _generation_status(text):
+            return 'ai_reply'
         explicit = current_message_presentation()
         if explicit:
             if explicit.get('kind') == 'runtime_error':
@@ -85,12 +96,15 @@ class PresentationBot:
             return text
         if kind == 'runtime_error':
             return text
+        if _generation_status(text):
+            return text
         from .web_display import current_web_display
         if technical_notice(text) and current_web_display() is None:
+            caption = compact_agent_round_status(text)
+            if caption:
+                return caption
             self.remember_notice(text)
             return None
-        if text in {'流式输出中...', '非流式输出中...'} or text.startswith(('后台流式生成中', '后台流式输出中')):
-            return '思考中…'
         op = self.turn.active_operation
         # A form is actionable UI, not an output preview.
         if (kind == 'agent_result' and op and op['kind'] != 'ask' and not markup

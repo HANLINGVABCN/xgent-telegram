@@ -316,9 +316,16 @@ def history_web_display(content: str, display=None):
 def apply_history_presentation(message, record, metadata, *, namespace=None, mode_override=None):
     """Use the live semantic renderers for dynamic history; snapshots are legacy fallback."""
     from .presentation import normalize_mode, ai_html, operation_html, footer_html, successful_status, metadata_dict, current_turn, legacy_operation
+    from .agent_status import compact_agent_round_status
     from .web_display import build_web_display, build_operation_display
     ns = namespace if namespace is not None else _section_ns()
     presentation = metadata_dict(metadata.get('presentation'))
+    kind, raw = record.get('msg_type'), str(record.get('content') or '')
+    caption = compact_agent_round_status(raw) if kind == 'agent_status' else None
+    if caption:
+        message.update(content=caption, parse_mode=None, presentation_mode='folded')
+        message['web_display'] = build_web_display(caption, mode='folded', presentation=presentation)
+        return
     if ns is None and not presentation:
         return
     mode = (normalize_mode(ns['UserDataManager'].get('presentation_mode', 'folded'))
@@ -328,7 +335,6 @@ def apply_history_presentation(message, record, metadata, *, namespace=None, mod
     turn = current_turn()
     if turn is not None:
         mode = turn.mode
-    kind, raw = record.get('msg_type'), str(record.get('content') or '')
     if kind == 'agent_result' and not presentation.get('operation'):
         recovered = legacy_operation(raw, metadata)
         if recovered is not None:

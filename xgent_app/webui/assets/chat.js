@@ -491,11 +491,13 @@
 
   function syncTurnAuthors(root){
     if(!root)return;
-    let seenReply=false,turnId=null,conversationId=null;
+    let seenReply=false,turnId=null,conversationId=null,previous=null;
     for(const row of root.children){
+      row.classList.remove('followed-by-output','attached-output','followed-by-round','round-followup');
       if(!row.classList.contains('msg-row')||row.classList.contains('presentation-hidden'))continue;
       const cid=row.dataset.presentationConversationId||null,id=row.dataset.turnId||null;
-      if(cid&&conversationId&&cid!==conversationId){seenReply=false;turnId=null;}
+      if(cid&&conversationId&&cid!==conversationId){seenReply=false;turnId=null;previous=null;}
+      if(id&&turnId&&id!==turnId)previous=null;
       if(cid)conversationId=cid;
       if(row.classList.contains('user')){
         // A queued message or form answer can belong to the same logical turn.
@@ -508,6 +510,12 @@
         row.classList.toggle('turn-continuation',seenReply);
         seenReply=true;
       }
+      if(row.classList.contains('cmd')&&previous?.matches('.ai,.cmd')){
+        row.classList.add('attached-output');previous.classList.add('followed-by-output');
+      }
+      if(row.classList.contains('agent-round-message')&&previous?.classList.contains('cmd'))previous.classList.add('followed-by-round');
+      if(row.classList.contains('ai')&&previous?.classList.contains('agent-round-message'))row.classList.add('round-followup');
+      previous=row;
     }
   }
   // Paging, pruning and live-to-durable adoption can change the first visible
@@ -816,6 +824,8 @@
 
   function syncMessageChrome(entry){
     if(!entry?.body||entry.role==='token')return;
+    entry.row.classList.toggle('agent-round-message',entry.role==='sys'&&entry.messageType==='agent_status'&&
+      /^Agent 第 \d+ 轮(?: · \d+ 个操作)?$/.test(String(entry.rawText||'').trim()));
     if(!entry.footer){
       entry.footer=document.createElement('div');entry.footer.className='message-footer';
       entry.footerMeta=document.createElement('div');entry.footerMeta.className='footer-meta';entry.footer.append(entry.footerMeta);
@@ -828,6 +838,8 @@
     const ts=entry.bubble.querySelector('.ts');if(ts&&!entry.footerMeta.contains(ts))entry.footerMeta.prepend(ts);
     if(entry.aiMeta&&!entry.footerMeta.contains(entry.aiMeta))entry.footerMeta.prepend(entry.aiMeta);
     const display=entry.webDisplay;
+    const hasFooterText=!!entry.footerMeta.querySelector('.token-hud')||
+      entry.role==='ai'&&!!entry.aiMeta?.textContent||entry.role==='user'&&!!ts?.textContent;
     if(entry.actions){
       let info=entry.actions.querySelector('.usage-action');
       if(display&&(display.usage_details||display.task_details)&&['ai','user'].includes(entry.role)){
@@ -836,8 +848,8 @@
       let more=entry.actions.querySelector('.more-message-actions');
       if(!more&&entry.actions.querySelector('.secondary-action')){more=document.createElement('button');more.type='button';more.className='act-btn more-message-actions';more.innerHTML=svgIcon('more');more.title='更多消息操作';more.setAttribute('aria-label','更多消息操作');more.setAttribute('aria-haspopup','menu');more.setAttribute('aria-expanded','false');more.onclick=event=>{event.stopPropagation();showMessageActions(entry,more);};entry.actions.append(more);}
       if(more)entry.actions.append(more);
-      entry.footer.hidden=!entry.footerMeta.textContent.trim()&&!entry.actions.childElementCount;
-    }else entry.footer.hidden=!entry.footerMeta.textContent.trim();
+      entry.footer.hidden=!hasFooterText&&!entry.actions.childElementCount;
+    }else entry.footer.hidden=!hasFooterText;
     entry.row.dataset.presentationMode='folded';
     syncTurnAuthors(entry.row.parentNode);
   }
@@ -1010,7 +1022,7 @@
     targetLog.appendChild(row);
     if (stick) scrollDown();
 
-    var entry = { row: row, body: body, bubble: bubble, head: head, btns: btns, rawText: text, parseMode: parseMode, role: role, webDisplay:webDisplay, aiGeneration: aiGeneration || null };
+    var entry = { row: row, body: body, bubble: bubble, head: head, btns: btns, rawText: text, parseMode: parseMode, role: role, messageType:messageType, webDisplay:webDisplay, aiGeneration: aiGeneration || null };
     entry.aiMeta = head && head._aiMeta;
     applyAiGeneration(entry, timestamp, aiGeneration);
     syncMessageChrome(entry);
@@ -1415,6 +1427,7 @@
       if (next && next.parentNode === log) log.insertBefore(entry.row, next);
     }
     entry.rawText=frame.text;entry.parseMode=frame.parse_mode;entry.displayKey=displayKey;
+    entry.messageType=frame.msg_type;
     entry.webDisplay=frame.web_display;
     if(frame.turn_id)entry.row.dataset.turnId=String(frame.turn_id);
     if(frame.conversation_id)entry.row.dataset.presentationConversationId=frame.conversation_id;

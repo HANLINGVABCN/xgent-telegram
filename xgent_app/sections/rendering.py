@@ -1551,7 +1551,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
         with telegram_label(False):
             msg = await context.bot.send_message(
                 chat_id=chat_id,
-                text="流式输出中...",
+                text="前台流式输出中...",
                 reply_markup=stop_kb
             )
         renderer = TelegramStreamRenderer(context, chat_id, msg, stop_kb, TELEGRAM_MSG_LIMIT, stop_event)

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Optional
 
 
@@ -41,6 +42,25 @@ class AgentTurnOrigin:
         if self.kind == "ask":
             return "表单回答"
         return ""
+
+
+def compact_agent_round_status(text: str) -> Optional[str]:
+    """Display one completed round as a small count, without a success banner.
+
+    Progress and unsuccessful terminal states are deliberately not projected
+    into a completed round. Existing durable status text remains unchanged.
+    """
+    text = str(text).strip()
+    compact = re.fullmatch(r'Agent 第 (\d+) 轮(?: · (\d+) 个操作)?', text)
+    if compact:
+        return text
+    completed = re.match(r'^✅\s*Agent\s*第\s*(\d+)\s*轮(.*)$', text)
+    if not completed or not any(word in completed[2] for word in ('已完成', '本轮处理完成')):
+        return None
+    if any(word in completed[2] for word in ('停止', '失败', '超过', '超限')):
+        return None
+    count = re.search(r'(\d+)\s*个操作已完成', completed[2])
+    return f'Agent 第 {int(completed[1])} 轮' + (f' · {int(count[1])} 个操作' if count else '')
 
 
 def build_agent_round_status(
@@ -100,4 +120,4 @@ def build_agent_round_status(
     raise ValueError(f"未知 Agent 状态阶段: {phase}")
 
 
-__all__ = ["AgentTurnOrigin", "build_agent_round_status"]
+__all__ = ["AgentTurnOrigin", "build_agent_round_status", "compact_agent_round_status"]
