@@ -84,13 +84,16 @@ def test_file_filters_precise_source_location_and_return(browser_context,workspa
     assert target['y']<log['y']+log['height'] and target['y']+target['height']>log['y']
     page.get_by_role('link',name='返回文件与输出',exact=True).click()
     page.get_by_role('heading',name='文件与输出',exact=True).wait_for()
+    expect=pytest.importorskip('playwright.sync_api').expect
+    expect(page.get_by_role('searchbox',name='按文件名搜索',exact=True)).to_have_value('来源验证')
     assert page.get_by_label('文件来源对话',exact=True).input_value()==source
     assert page.get_by_role('searchbox',name='按文件名搜索',exact=True).input_value()=='来源验证'
     page.close()
 
 
 def test_task_source_tokens_rounds_and_dark_code_unchanged(browser_context,workspace_url):
-    assert browser_context.request.post(workspace_url['url']+'/api/workbench/settings',data={'key':'presentation_mode','value':'detailed'}).ok
+    retired=browser_context.request.post(workspace_url['url']+'/api/workbench/settings',data={'key':'presentation_mode','value':'detailed'})
+    assert retired.ok and retired.json()['values']['presentation_mode']=='folded'
     page=browser_context.new_page();ready(page,workspace_url['url'],'tasks')
     target=page.locator('.wb-task-table tr').filter(has=page.get_by_role('button',name='每日服务健康检查',exact=True))
     target.locator('.wb-source-link').click()
@@ -98,8 +101,8 @@ def test_task_source_tokens_rounds_and_dark_code_unchanged(browser_context,works
     page.evaluate('window.XGentChat.reload()')
     token=page.locator('.token-hud').filter(has_text='↑ 2,400');token.first.wait_for()
     before=token.first.inner_text()
-    assert '2,400' in before and '800' in before and '缓存' in before
-    assert page.locator('.msg-row[data-record-id="'+str(workspace_url['demo']['round_message'])+'"]').get_by_text('Agent 第 2 轮',exact=False).count()>0
+    assert '2,400' in before and '800' in before and 'cache' in before
+    assert page.locator('.msg-row[data-record-id="'+str(workspace_url['demo']['round_message'])+'"]').get_by_text('Agent 第 2 轮',exact=False).count()==0
     assert page.locator('.bubble-header').count()>0
     for dark in [False,True]:
         page.evaluate('(dark)=>document.body.classList.toggle("dark",dark)',dark)

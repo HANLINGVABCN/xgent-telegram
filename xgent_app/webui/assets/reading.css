@@ -89,6 +89,7 @@ body,body.dark { --code-bg:#182334; --code-header:#101827; --code-fg:#eef3f9; --
 .bubble.ai,.bubble.cmd,.bubble.sys{padding:3px 0}
 .bubble.cmd>.bubble-header,.bubble.sys>.bubble-header{display:none}
 .bubble.ai>.bubble-header{border-bottom:0;margin-bottom:4px;padding-bottom:0}
+.msg-row.ai.turn-continuation>.bubble>.bubble-header{display:none}
 .bubble.cmd>.message-footer,.bubble.sys .ts{display:none}
 .bubble.sys{font-size:12px;font-weight:400;line-height:1.5}
 .bubble.sys p{margin:0}.bubble.sys .literal-diagnostic{margin:0;padding:0;white-space:pre-wrap;overflow-wrap:anywhere;background:none;border:0;font:12px/1.5 var(--font);color:inherit}
@@ -96,7 +97,8 @@ body,body.dark { --code-bg:#182334; --code-header:#101827; --code-fg:#eef3f9; --
 .bubble.user .message-footer{margin-top:2px;justify-content:flex-end}
 .bubble .footer-meta{flex:1;min-width:0;font-size:11px;line-height:17px;color:var(--text-3);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 .bubble .footer-meta:empty{display:none}
-.bubble .footer-meta .token-hud{margin:0;font-size:11px;line-height:17px;color:inherit}
+.bubble .footer-meta .ai-generation-meta{display:inline;margin:0 12px 0 0;padding:0;text-align:left;font:inherit;color:inherit}
+.bubble .footer-meta .token-hud{display:inline;margin:0;font-size:11px;line-height:17px;color:inherit}
 .bubble .footer-meta i{font-style:normal}.bubble .footer-meta pre{background:none;margin:0;padding:0;font:inherit}
 .bubble .footer-meta .ts{float:none;margin:0;font-size:11px;line-height:17px}
 .bubble.ai .footer-meta>.ts,.bubble.cmd .footer-meta>.ts,.bubble.sys .footer-meta>.ts{display:none}

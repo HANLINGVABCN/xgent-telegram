@@ -609,7 +609,7 @@ async def main():
         "rich_draft_off": rich_draft_off,
         "hide_flag_on": hide_flag_on,
         "should_fn_on": should_fn_on,
-        "detailed_html_classic": ("<blockquote expandable" in off_html) and ('data-compact="1"' not in off_html),
+        "legacy_setting_stays_compact": ("<blockquote expandable" in off_html) and ('data-compact="1"' in off_html),
         "detailed_text_safe": ("<<BEGIN_" not in off_text) and ("diskchk_7f3a2b1c" not in off_text),
         "off_flag": off_flag,
         "off_force_html": off_force_html,
@@ -634,11 +634,11 @@ asyncio.run(main())
         self.assertTrue(data["rich_draft_off"], "hide=on 时必须关闭 rich draft（走 HTML edit）")
         self.assertTrue(data["hide_flag_on"], "hide=on 时渲染器 _hide_blocks 必须为真")
         self.assertTrue(data["should_fn_on"], "_should_hide_protocol_blocks 必须反映开关开")
-        self.assertTrue(data["detailed_html_classic"], "非折叠保留经典工具卡片，不恢复裸协议显示")
-        self.assertTrue(data["detailed_text_safe"], "非折叠的显示去重文本也不得暴露协议标记")
-        self.assertTrue(data["off_flag"], "非折叠仍采用协议卡片")
-        self.assertTrue(data["off_force_html"], "非折叠同样采用 HTML 卡片通道")
-        self.assertTrue(data["should_fn_off"], "两个模式均已退出旧协议裸显示路径")
+        self.assertTrue(data["legacy_setting_stays_compact"], "旧开关关闭也必须使用统一紧凑预览")
+        self.assertTrue(data["detailed_text_safe"], "旧开关写入不得暴露协议标记")
+        self.assertTrue(data["off_flag"], "旧开关不能关闭协议卡片")
+        self.assertTrue(data["off_force_html"], "旧开关不能关闭 HTML 卡片通道")
+        self.assertTrue(data["should_fn_off"], "旧开关不能恢复协议裸显示路径")
 
 
 if __name__ == "__main__":

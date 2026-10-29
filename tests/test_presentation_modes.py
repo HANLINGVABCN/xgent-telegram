@@ -55,7 +55,7 @@ async def main():
             ai=[r for r in rows if r['msg_type']=='ai_reply']
             meta=[json.loads(r['metadata']) if isinstance(r['metadata'],str) else r['metadata'] for r in ai]
             final=[f for f in frames if f['type']=='record_snapshot' and f.get('record_id')==ai[-1]['id']][-1]
-            cases.append({'name':f'{mode}/{stream}/{style}','mode':mode,'shown':shown,'refreshed':refreshed,
+            cases.append({'name':f'{mode}/{stream}/{style}','mode':'folded','shown':shown,'refreshed':refreshed,
               'switched':switched,'restored':restored,'raw':[r['content'] for r in ai], 'expected_raw':raw,
               'metadata':meta,'final':final,'frames':frames,'subset':subset['messages'],'stats':len(await h.db.get_token_stats())})
     print(json.dumps(cases,ensure_ascii=False))
@@ -81,11 +81,11 @@ def test_two_model_replies_one_operation_and_four_visible_blocks(turns):
             assert 'data-compact="1"' in messages[1]['content']
 
 
-def test_live_refresh_switch_and_switch_back_preserve_content_and_ids(turns):
+def test_retired_mode_writes_preserve_live_history_content_and_ids(turns):
     for case in turns:
         assert case['shown']==case['refreshed']==case['restored'],case['name']
         assert [m['id'] for m in case['shown']]==[m['id'] for m in case['switched']]
-        assert case['shown']!=case['switched'],case['name']
+        assert case['shown']==case['switched'],case['name']
         final=case['final']
         matching=next(m for m in case['shown'] if m['id']==final['record_id'])
         assert final['text']==matching['content'],case['name']
@@ -103,9 +103,8 @@ def test_completed_turn_removes_every_stop_button_and_preserves_token_kind(turns
             if frame.get('message_id') is not None and 'reply_markup' in frame:
                 keyboards[frame['message_id']]=frame['reply_markup'] or []
         assert all('停止回答' not in button['text'] for rows in keyboards.values() for row in rows for button in row),case['name']
-        if case['mode']=='detailed':
-            token_frames=[frame for frame in case['frames'] if frame['type']=='message' and frame.get('msg_type')=='token_usage']
-            assert len(token_frames)==2 and all(frame['msg_type']=='token_usage' for frame in token_frames),case['name']
+        token_frames=[frame for frame in case['frames'] if frame['type']=='message' and frame.get('msg_type')=='token_usage']
+        assert not token_frames,case['name']
 
 
 def test_short_tool_blocks_are_really_foldable_in_tui_and_plain_cli_stays_compact():
@@ -121,10 +120,26 @@ def test_short_tool_blocks_are_really_foldable_in_tui_and_plain_cli_stays_compac
 
 def test_missing_usage_is_unknown_and_failures_remain_visible():
     line=usage_line({'round':1,'usage':{'input_tokens':100},'elapsed_seconds':1})
-    assert '↓ 未提供' in line and '缓存 未提供' in line
+    assert '↓ 未提供' in line and 'cache 未提供' in line
+    assert '耗时未记录' in usage_line({'usage':{'input_tokens':100}})
     assert '思考 Token：未提供' in usage_details({'round':1,'usage':{}})
     failure=operation_html({'kind':'run','success':False,'return_code':1,'output':'permission denied'})
     assert failure.startswith('⚠️') and '返回码 1' in failure and 'permission denied' in failure
+
+
+def test_new_replies_keep_response_timing_live_and_after_refresh(turns):
+    for case in turns:
+        for metadata in case['metadata']:
+            elapsed=metadata['presentation']['elapsed_seconds']
+            assert isinstance(elapsed,(float,int)) and elapsed>=0,case['name']
+        for message in case['shown']:
+            if message['msg_type']=='ai_reply':
+                footer=next(segment['text'] for segment in message['web_display']['segments'] if segment.get('footer'))
+                assert 'cache 2,130' in footer and '约 ' in footer,case['name']
+                assert '未采集' not in footer and '耗时未记录' not in footer,case['name']
+        final=case['final']
+        footer=next(segment['text'] for segment in final['web_display']['segments'] if segment.get('footer'))
+        assert 'cache 2,130' in footer and '约 ' in footer,case['name']
 
 
 def test_independent_cli_namespace_reprojects_history_without_server_module(monkeypatch, tmp_path):
@@ -139,12 +154,12 @@ def test_independent_cli_namespace_reprojects_history_without_server_module(monk
     folded=web_history.build_history_message(record,tmp_path,tmp_path,presentation_namespace=namespace,presentation_mode='folded')
     detailed=web_history.build_history_message(record,tmp_path,tmp_path,presentation_namespace=namespace,presentation_mode='detailed')
     assert 'data-compact="1"' in folded['content']
-    assert 'data-compact="1"' not in detailed['content'] and 'run-x' in detailed['content']
+    assert detailed==folded
     assert 'legacy frozen snapshot' not in folded['content']+detailed['content']
     assert record['content']==raw
 
 
-def test_browser_dynamic_mode_refresh_short_folds_and_late_snapshot(full_output_server, turns, tmp_path):
+def test_browser_retired_mode_events_preserve_expansion_and_reject_stale_snapshot(full_output_server, turns, tmp_path):
     from pathlib import Path
     playwright=pytest.importorskip('playwright.sync_api')
     case=next(item for item in turns if item['name']=='folded/False/foreground')
@@ -156,7 +171,7 @@ def test_browser_dynamic_mode_refresh_short_folds_and_late_snapshot(full_output_
         browser=p.chromium.launch(headless=True)
         context=browser.new_context(viewport={'width':390,'height':844})
         context.route('**/*',lambda route:route.continue_() if route.request.url.startswith(base) else route.abort())
-        context.route('**/api/config',lambda route:route.fulfill(json={'values':{'presentation_mode':mode[0]},'options':{'presentation_mode':[{'value':'folded','label':'折叠'},{'value':'detailed','label':'非折叠'}]}}))
+        context.route('**/api/config',lambda route:route.fulfill(json={'values':{'presentation_mode':mode[0]},'options':{}}))
         def history(route):
             messages=case['shown'] if mode[0]=='folded' else case['switched']
             live=server.outbox.snapshot()
@@ -178,8 +193,10 @@ def test_browser_dynamic_mode_refresh_short_folds_and_late_snapshot(full_output_
             assert page.locator('blockquote.execution-block').first.locator('pre').is_visible()
             mode[0]='detailed'
             server.outbox.put({'type':'presentation_changed','presentation_mode':'detailed'})
-            page.wait_for_function("document.querySelector('[data-presentation-mode=detailed]')!==null")
-            assert page.locator('.msg-row').count()>4
+            page.wait_for_timeout(300)
+            assert page.locator('[data-presentation-mode=detailed]').count()==0
+            assert page.locator('.msg-row').count()==4
+            assert page.locator('blockquote.execution-block').first.locator('pre').is_visible()
             output=page.locator('.msg-row.cmd .execution-block').first
             output.locator('.execution-row').click()
             output.get_by_role('button',name='查看执行信息').click()
@@ -188,7 +205,7 @@ def test_browser_dynamic_mode_refresh_short_folds_and_late_snapshot(full_output_
             server.outbox.put({'type':'presentation_changed','presentation_mode':'folded'})
             page.locator('.token-hud').first.wait_for()
             assert page.locator('.msg-row').count()==4
-            assert not page.locator('blockquote.execution-block').first.locator('pre').is_visible()
+            assert page.locator('blockquote.execution-block').first.locator('pre').is_visible()
             stale={**case['final'],'presentation_mode':'detailed','text':'stale snapshot'}
             server.outbox.put(stale)
             page.wait_for_timeout(400)

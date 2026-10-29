@@ -1300,16 +1300,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
         elif data in {"toggle_presentation_mode", "toggle_hide_protocol_blocks"}:
-            # 折叠协议代码块（默认开）：开启后 AI 回复正文里的 *-x 协议块在「显示」层折成
-            # 可展开控件（前 50 行 +「已折叠 N 行」）；落库 / 执行 / 镜像用的原始文本不受影响。
-            mode = 'detailed' if UserDataManager.get('presentation_mode', 'folded') == 'folded' else 'folded'
-            on = mode == 'folded'
-            await UserDataManager.save_config('presentation_mode', mode)
-            await GlobalRecorder.record_system_op(
-                f"呈现模式切换为{'折叠' if on else '非折叠'}",
-                {"presentation_mode": mode}
-            )
-            await query.answer(f"已切换为{'折叠' if on else '非折叠'}模式", show_alert=False)
+            await UserDataManager.save_config('presentation_mode', 'folded')
+            await query.answer('已统一为单行预览，点击代码块可展开。', show_alert=False)
             await query.message.edit_text(
                 build_settings_menu_text(),
                 reply_markup=get_more_settings_menu(),

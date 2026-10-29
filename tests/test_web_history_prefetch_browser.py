@@ -270,9 +270,15 @@ def test_bounded_history_forward_page_and_latest_restore_inflight_reply(history_
             r.fulfill(json=page_data(server, 401, 451, baseline=True, next_cursor='401'))
     page.route('**/api/workbench/history?*', route)
     ready(page, base)
-    for first_id in (351, 301, 251, 201):
+    # Compact rows let velocity-based prefetch load several pages per scroll.
+    # Exercise the bounded window without assuming one specific page remains
+    # mounted while later off-screen pages are already arriving.
+    for _ in range(4):
+        first_id=page.locator('#log [data-record-id]').first.get_attribute('data-record-id')
         page.locator('#log').evaluate('(e)=>e.scrollTop=400')
-        page.locator(f'[data-record-id="{first_id}"]').wait_for()
+        page.wait_for_function('(id)=>Number(document.querySelector("#log [data-record-id]").dataset.recordId)<Number(id)',arg=first_id)
+        if not page.locator('[data-record-id="450"]').count():
+            break
     assert page.locator('#log>.msg-row').count() <= 200
     assert page.locator('#wb-chat').evaluate('(e)=>e.classList.contains("history-past")')
     assert page.locator('[data-record-id="450"]').count() == 0

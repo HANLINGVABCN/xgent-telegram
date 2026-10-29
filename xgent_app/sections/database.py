@@ -1572,9 +1572,11 @@ class BotMemoryDB(ConversationStore):
         self._config_cache[key] = value
 
     async def ensure_presentation_mode(self):
-        """One-time, race-safe upgrade; the retired boolean never selects raw output."""
+        """Retire saved detailed mode without modifying any conversation records."""
         async with self._write() as conn:
-            await conn.execute('INSERT OR IGNORE INTO config(key,value) VALUES (?,?)',
+            await conn.execute('INSERT INTO config(key,value) VALUES (?,?) '
+                               'ON CONFLICT(key) DO UPDATE SET value=excluded.value '
+                               'WHERE config.value<>excluded.value',
                                ('presentation_mode', json.dumps('folded')))
         return await self.get_config_fresh('presentation_mode', 'folded')
 
@@ -2206,13 +2208,10 @@ class UserDataManager:
                 cls._telegram_ui_revision += 1
             else:
                 cls._ui_state_revision += 1
-        if key == 'hide_protocol_blocks':
-            from xgent_app.presentation import FOLDED, DETAILED
-            cls._data['presentation_mode'] = FOLDED if normalize_bool(value, True) else DETAILED
-        elif key == 'presentation_mode':
-            from xgent_app.presentation import normalize_mode
-            value = normalize_mode(value)
-            cls._data['hide_protocol_blocks'] = value == 'folded'
+        if key in {'hide_protocol_blocks', 'presentation_mode'}:
+            cls._data['presentation_mode'] = 'folded'
+            cls._data['hide_protocol_blocks'] = True
+            return
         data[key] = value
 
     @classmethod
@@ -2220,7 +2219,7 @@ class UserDataManager:
         """保存配置到数据库"""
         # 先落库再更新内存缓存，写库失败时不留下与 DB 不一致的缓存值。
         if key == 'hide_protocol_blocks':
-            key, value = 'presentation_mode', 'folded' if normalize_bool(value, True) else 'detailed'
+            key, value = 'presentation_mode', 'folded'
         if key == 'presentation_mode':
             from xgent_app.presentation import normalize_mode
             value = normalize_mode(value)

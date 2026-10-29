@@ -426,7 +426,6 @@
 
   function repaintBubble(entry, html) {
     var next=document.createElement('div');next.innerHTML=html;
-    const keepFoldState=!entry.row.dataset.presentationMode||entry.row.dataset.presentationMode===entry.webDisplay?.presentation_mode;
     var oldBlocks=Array.from(entry.body.querySelectorAll('blockquote[expandable]'));
     next.querySelectorAll('blockquote[expandable]').forEach(function(block){
       var key=block.getAttribute('data-raw'),path=block.getAttribute('data-output-path');
@@ -435,7 +434,6 @@
         (key ? old.getAttribute('data-raw')===key : old.getAttribute('data-output-path')===path && old._pbText===text));
       if(index>=0){
         const old=oldBlocks.splice(index,1)[0];
-        if(!keepFoldState){clearTimeout(old._ft);old._outputRequest?.abort();return;}
         const same=['data-state','data-operation-details','data-protocol'].every(key=>old.getAttribute(key)===block.getAttribute(key));
         if(same)block.replaceWith(old);else block.classList.toggle('expanded',old.classList.contains('expanded'));
       }
@@ -459,7 +457,7 @@
     const row=block.closest('[data-record-id]');
     if(!row)return null;
     const blocks=Array.from(row.querySelectorAll('blockquote[expandable]'));
-    return (row.dataset.presentationConversationId||String(selectedConversationId))+':'+row.dataset.recordId+':'+(row.dataset.presentationMode||presentationViewMode||'folded')+':'+blocks.indexOf(block);
+    return (row.dataset.presentationConversationId||String(selectedConversationId))+':'+row.dataset.recordId+':folded:'+blocks.indexOf(block);
   }
   function saveFoldState(block){
     const key=foldStateKey(block);if(!key)return;
@@ -467,10 +465,6 @@
   }
   function restoreFoldStates(entry){
     try{const values=JSON.parse(sessionStorage.getItem('xgent-fold-state')||'{}');entry.body.querySelectorAll('blockquote[expandable]').forEach(block=>{const key=foldStateKey(block);if(key&&key in values&&!block.classList.contains('pb-short')){block.classList.toggle('expanded',values[key]);paintProtocolBody(block);}});}catch(e){}
-  }
-  function clearFoldStates(){
-    // Presentation is an application setting; a mode change resets every mode's initial fold state.
-    try{sessionStorage.removeItem('xgent-fold-state');}catch(e){}
   }
 
   function nowTime(timestamp) {
@@ -494,6 +488,31 @@
     entry.aiMeta.textContent = detailedTime(entry.aiGeneration?.generated_at || timestamp) + ' · 模型：' +
       (provider || model ? (provider && model ? provider + ' / ' + model : provider || model) : '历史记录未记录模型');
   }
+
+  function syncTurnAuthors(root){
+    if(!root)return;
+    let seenReply=false,turnId=null,conversationId=null;
+    for(const row of root.children){
+      if(!row.classList.contains('msg-row')||row.classList.contains('presentation-hidden'))continue;
+      const cid=row.dataset.presentationConversationId||null,id=row.dataset.turnId||null;
+      if(cid&&conversationId&&cid!==conversationId){seenReply=false;turnId=null;}
+      if(cid)conversationId=cid;
+      if(row.classList.contains('user')){
+        // A queued message or form answer can belong to the same logical turn.
+        // Old records without turn IDs fall back to user-message boundaries.
+        if(!id||id!==turnId)seenReply=false;
+        turnId=id;
+      }else if(row.classList.contains('ai')){
+        if(id&&turnId&&id!==turnId)seenReply=false;
+        if(id)turnId=id;
+        row.classList.toggle('turn-continuation',seenReply);
+        seenReply=true;
+      }
+    }
+  }
+  // Paging, pruning and live-to-durable adoption can change the first visible
+  // reply. Recompute after the DOM batch, without rebuilding message content.
+  new MutationObserver(()=>syncTurnAuthors(log)).observe(log,{childList:true});
 
   function toast(msg, alert) {
     if (!msg) return;
@@ -807,6 +826,7 @@
     const huds=entry.body.querySelectorAll('.token-hud');
     if(huds.length){entry.footerMeta.querySelectorAll('.token-hud').forEach(node=>node.remove());huds.forEach(node=>entry.footerMeta.append(node));}
     const ts=entry.bubble.querySelector('.ts');if(ts&&!entry.footerMeta.contains(ts))entry.footerMeta.prepend(ts);
+    if(entry.aiMeta&&!entry.footerMeta.contains(entry.aiMeta))entry.footerMeta.prepend(entry.aiMeta);
     const display=entry.webDisplay;
     if(entry.actions){
       let info=entry.actions.querySelector('.usage-action');
@@ -818,7 +838,8 @@
       if(more)entry.actions.append(more);
       entry.footer.hidden=!entry.footerMeta.textContent.trim()&&!entry.actions.childElementCount;
     }else entry.footer.hidden=!entry.footerMeta.textContent.trim();
-    entry.row.dataset.presentationMode=display?.presentation_mode||entry.row.dataset.presentationMode||presentationViewMode||'folded';
+    entry.row.dataset.presentationMode='folded';
+    syncTurnAuthors(entry.row.parentNode);
   }
 
   function messageCopyText(entry){
@@ -909,7 +930,6 @@
       if (role === "ai") {
         var aiMeta = document.createElement("span");
         aiMeta.className = "ai-generation-meta";
-        head.appendChild(aiMeta);
         head._aiMeta = aiMeta;
       }
       bubble.appendChild(head);
@@ -1396,6 +1416,8 @@
     }
     entry.rawText=frame.text;entry.parseMode=frame.parse_mode;entry.displayKey=displayKey;
     entry.webDisplay=frame.web_display;
+    if(frame.turn_id)entry.row.dataset.turnId=String(frame.turn_id);
+    if(frame.conversation_id)entry.row.dataset.presentationConversationId=frame.conversation_id;
     syncMessageChrome(entry);
     if(typeof frame.hidden==='boolean'){entry.row.classList.toggle('presentation-hidden',frame.hidden);entry.row.classList.toggle('msg-row',!frame.hidden);}
     if(frame.timestamp!=null){
@@ -1689,10 +1711,7 @@
       return;
     }
     if(frame.type==='presentation_changed'){
-      if(presentationViewMode!==frame.presentation_mode)clearFoldStates();
-      presentationViewMode=frame.presentation_mode;
-      refreshPresentation().catch(error=>toast('历史呈现更新失败：'+error.message,true));
-      loadSettings().catch(()=>{});
+      // Ignore obsolete mode-switch notifications from older clients.
       return;
     }
     if(frame.conversation_id && selectedConversationId && frame.conversation_id !== selectedConversationId) {
@@ -1719,7 +1738,7 @@
     if (isNearBottom()) requestAnimationFrame(function(){boundMessages(false);});
     if (!acceptUiFrame(frame)) return;
     if(frame.type==='record_snapshot'){
-      if(presentationViewMode&&frame.presentation_mode&&frame.presentation_mode!==presentationViewMode){
+      if(frame.presentation_mode&&frame.presentation_mode!=='folded'){
         refreshPresentation([frame.record_id]).catch(()=>{});return;
       }
       if(Number.isSafeInteger(frame.ui_generation)&&uiGeneration!==null&&frame.ui_generation!==uiGeneration){
@@ -2050,6 +2069,9 @@
     return row?{row:row,top:row.getBoundingClientRect().top}:null;
   }
   function restoreScrollAnchor(anchor){
+    // Avatar deduplication changes row heights. Finish it before measuring the
+    // restored position, rather than move the anchor in the next animation frame.
+    syncTurnAuthors(log);
     if(anchor?.row.isConnected)log.scrollTop+=anchor.row.getBoundingClientRect().top-anchor.top;
   }
   function cancelHistoryPage(){
@@ -2123,6 +2145,7 @@
     const rows=Array.from(log.children).filter(row=>row._historyOrder);
     rows.sort((a,b)=>a._historyOrder[0]-b._historyOrder[0]||a._historyOrder[1]-b._historyOrder[1]||a._historyOrder[2].localeCompare(b._historyOrder[2]));
     const fragment=document.createDocumentFragment();rows.forEach(row=>fragment.append(row));log.prepend(fragment);
+    syncTurnAuthors(log);
   }
   function updateHistoryState() {
     document.getElementById('wb-chat').classList.toggle('history-past',viewingPast);
@@ -2807,7 +2830,6 @@
   var SETTING_FIELDS = [
     { key: "thinking_level", label: "思考深度 / 推理等级", type: "select" },
     { key: "stream_mode", label: "打字机流式输出", type: "bool" },
-    { key: "presentation_mode", label: "呈现模式", type: "select" },
     { key: "agent_mode", label: "Agent 智能体模式", type: "bool" },
     { key: "text_stitch_mode", label: "文字拼接模式", type: "select" },
     { key: "global_depth", label: "全局记忆轮数", type: "number", min: 1 },
@@ -3042,7 +3064,7 @@
     return box;
   }
 
-  var presentationViewMode=null, presentationRequest=0, settingsRequest=0;
+  var presentationRequest=0, settingsRequest=0;
   async function refreshPresentation(requestedIds){
     const version=++presentationRequest,cid=selectedConversationId;
     const ids=Array.from(new Set([...Object.values(byMessageId).map(e=>Number(e.row.dataset.recordId)).filter(Number.isSafeInteger),...(requestedIds||[]).filter(Number.isSafeInteger)]));
@@ -3066,9 +3088,6 @@
     const version=++settingsRequest;
     return api("/api/config").then(function (data) {
       if(version!==settingsRequest)return data;
-      const nextMode=data.values.presentation_mode;
-      if(presentationViewMode&&nextMode&&nextMode!==presentationViewMode){clearFoldStates();presentationViewMode=nextMode;refreshPresentation().catch(()=>{});}
-      else if(nextMode)presentationViewMode=nextMode;
       settingsRows.innerHTML = "";
       SETTING_FIELDS.forEach(function (field) {
         if (!(field.key in data.values)) return;
@@ -3592,8 +3611,11 @@
     renderRecord: function(message,target){
       const role=message.role==='user'?'user':message.role==='assistant'?'ai':'sys';
       const entry=makeBubble(role,message.content,null,message.parse_mode,null,message.msg_type,message.timestamp,message.web_display,message.ai_generation,target);
+      if(message.turn_id)entry.row.dataset.turnId=String(message.turn_id);
+      if(message.conversation_id)entry.row.dataset.presentationConversationId=message.conversation_id;
       if(message.media?.length)setInlineMedia(entry,message.media);
       entry.row.dataset.sourceMessage=message.history_key||'history:'+message.id;
+      syncTurnAuthors(target);
       return entry.row;
     },
     bindContent: bindContentClicks,

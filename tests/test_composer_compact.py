@@ -75,7 +75,7 @@ def test_mobile_generation_panel_switch_and_resize(browser_context,workspace_url
     trigger.click()
     assert page.locator('#composer-options-popover .composer-option').count()==0
     assert page.get_by_role('switch',name='流式输出',exact=True).is_visible()
-    assert page.get_by_role('switch',name='呈现模式',exact=True).is_visible()
+    assert page.get_by_role('switch',name='呈现模式',exact=True).count()==0
     page.keyboard.press('Escape')
     page.locator('#composer-thinking').click();page.locator('.composer-option[data-value=auto]').click()
     page.wait_for_function('document.getElementById("composer-thinking").dataset.value==="auto"')

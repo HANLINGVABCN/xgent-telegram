@@ -518,14 +518,14 @@ class HistoryReplayFoldTests(unittest.TestCase):
         self.assertNotIn("```", visible)
         self.assertEqual("ai_reply", msg["msg_type"])  # 记录本身不变
 
-    def test_detailed_uses_same_prose_renderer_and_classic_protocol_blocks(self):
+    def test_retired_detailed_mode_uses_compact_protocol_blocks(self):
         content = "先看磁盘：\n" + self._block() + "\n完成。"
         msg = self._build(content, hide=False)
         self.assertEqual("HTML", msg.get("parse_mode"))
         self.assertIn("<p>先看磁盘：</p>", msg["content"])
         self.assertIn("<p>完成。</p>", msg["content"])
         self.assertIn("<blockquote expandable", msg["content"])
-        self.assertNotIn('data-compact="1"', msg["content"])
+        self.assertIn('data-compact="1"', msg["content"])
 
     def test_no_protocol_block_unified_to_html(self):
         # 无协议块的纯 markdown（折叠开关 ON）也统一走 markdown_to_telegram_html：

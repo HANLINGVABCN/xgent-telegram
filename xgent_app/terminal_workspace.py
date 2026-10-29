@@ -164,7 +164,8 @@ class TerminalWorkspace:
                 "(SELECT SUM(CASE WHEN json_valid(metadata) THEN COALESCE(json_extract(metadata,'$.presentation.revision'),0) ELSE 0 END) FROM global_messages WHERE session_id=?)", (cid, cid, cid, cid))
             from .web_history import _section_ns
             ns = _section_ns()
-            mode = await db.get_config_fresh('presentation_mode', 'folded')
+            from .presentation import normalize_mode
+            mode = normalize_mode(await db.get_config_fresh('presentation_mode', 'folded'))
             if ns:
                 ns['UserDataManager'].set('presentation_mode', mode)
             stamp = (tuple(await cursor.fetchone()), session['generation'], limit, mode)

@@ -1,7 +1,7 @@
 """Structured, display-only conversation presentation shared by all clients.
 
-Raw model text and tool continuation messages are never rewritten here. A mode
-is frozen for live delivery; history can project the same facts into either mode.
+Raw model text and tool continuation messages are never rewritten here. Live
+delivery and history share one compact, expandable presentation.
 """
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ from typing import Any
 from .protocols import ProtocolParser
 
 FOLDED = 'folded'
-DETAILED = 'detailed'
 _turn = ContextVar('conversation_presentation', default=None)
 _message = ContextVar('message_presentation', default=None)
 LABELS = {
@@ -34,7 +33,8 @@ _STATUS_RE = re.compile(r'Agent\s*第\s*\d+\s*轮')
 
 
 def normalize_mode(value: Any) -> str:
-    return DETAILED if value == DETAILED else FOLDED
+    """Accept retired client/settings values without restoring another view."""
+    return FOLDED
 
 
 def current_turn():
@@ -96,8 +96,8 @@ def usage_line(reply):
     if not usage and reply.get('elapsed_seconds') is None:
         return ''
     return (f"↑ {_number(usage.get('input_tokens'))} · "
-            f"↓ {_number(usage.get('output_tokens'))} · 缓存 {_number(usage.get('cached_tokens'))} · "
-            f"{approximate_seconds(reply.get('elapsed_seconds'))}")
+            f"↓ {_number(usage.get('output_tokens'))} · cache {_number(usage.get('cached_tokens'))} · "
+            f"{approximate_seconds(reply['elapsed_seconds']) if reply.get('elapsed_seconds') is not None else '耗时未记录'}")
 
 
 def usage_details(reply):
@@ -138,8 +138,6 @@ def footer_html(presentation, *, expanded=False):
 
 
 def protocol_block_html(part, mode):
-    if normalize_mode(mode) == DETAILED:
-        return ProtocolParser._render_block_blockquote(part, raw_copy=True)
     if part.get('type') == 'over':
         return ''  # Its prose is delivered once by the existing over executor.
     icon, label = LABELS.get(part.get('type'), ('🔧', '执行操作'))
@@ -167,8 +165,6 @@ def ai_html(raw, mode, prose_renderer, *, hide_unclosed=False):
 
 
 def operation_html(operation, *, detailed=False):
-    if detailed and operation.get('detailed_html'):
-        return operation['detailed_html']
     kind = operation.get('kind') or 'run'
     icon, label = LABELS.get(kind, ('🔧', '操作'))
     if kind == 'run':
@@ -190,8 +186,6 @@ def operation_html(operation, *, detailed=False):
     attrs = ' expandable data-compact="1"'
     if operation.get('output_path'):
         attrs += ' data-output-path="' + html.escape(str(operation['output_path']), quote=True) + '"'
-    if detailed:
-        attrs = attrs.replace(' data-compact="1"', '')
     return (prefix + f'<blockquote{attrs}><b>{icon} {label}</b> · {body.count(chr(10)) + 1} 行\n'
             '<pre>' + html.escape(body, quote=False) + '</pre></blockquote>')
 
@@ -227,6 +221,9 @@ class PresentationTurn:
     reason: str = ''
     last_message: Any = None
     last_record_id: int | None = None
+
+    def __post_init__(self):
+        self.mode = FOLDED
 
     @property
     def folded(self):

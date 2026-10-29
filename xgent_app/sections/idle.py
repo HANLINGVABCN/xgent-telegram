@@ -347,7 +347,7 @@ WEB_EDITABLE_SETTINGS = {
     'thinking_level', 'stream_mode', 'agent_mode', 'text_stitch_mode',
     'global_depth', 'agent_max_iterations', 'stream_timeout', 'chat_model',
     'disabled_skills', 'hidden_skills', 'skill_state', 'agent_command_timeout', 'idle_message_interval',
-    'smart_match_threshold', 'presentation_mode', 'hide_protocol_blocks',
+    'smart_match_threshold',
     # token 统计相关：价格表 / 手动合并表 / 报表默认选项
     'model_price_table', 'model_merge_map', 'stats_auto_merge', 'stats_metric',
 }
@@ -899,7 +899,7 @@ async def _web_read_settings() -> Dict[str, Any]:
             'thinking_level': normalize_thinking_level(UserDataManager.get('thinking_level')),
             'stream_mode': normalize_bool(UserDataManager.get('stream_mode', True), True),
             'presentation_mode': normalize_mode(UserDataManager.get('presentation_mode', 'folded')),
-            'hide_protocol_blocks': UserDataManager.get('presentation_mode', 'folded') == 'folded',
+            'hide_protocol_blocks': True,
             'agent_mode': bool(UserDataManager.get('agent_mode', False)),
             'text_stitch_mode': normalize_text_stitch_mode(UserDataManager.get('text_stitch_mode')),
             'global_depth': int(UserDataManager.get('global_depth', 30) or 30),
@@ -923,10 +923,6 @@ async def _web_read_settings() -> Dict[str, Any]:
             'stats_metric': stats_metric,
         },
         'options': {
-            'presentation_mode': [
-                {'value': 'folded', 'label': '折叠（减少刷屏）'},
-                {'value': 'detailed', 'label': '非折叠（详细明细）'},
-            ],
             'thinking_level': [
                 {'value': level, 'label': THINKING_LEVEL_LABELS[level]}
                 for level in THINKING_LEVEL_ORDER
@@ -955,6 +951,11 @@ async def _web_write_setting(key: str, value: Any) -> Dict[str, Any]:
         UserDataManager.set(key, appearance['values'][key])
         await _sync_web_appearance(db, force=True)
         return await _web_read_settings()
+    if key in {'presentation_mode', 'hide_protocol_blocks'}:
+        # Older clients may still submit these settings. Keep their request
+        # compatible while persisting the sole supported presentation.
+        await UserDataManager.save_config('presentation_mode', 'folded')
+        return await _web_read_settings()
     if key not in WEB_EDITABLE_SETTINGS:
         raise ValueError(f"不可修改的配置项: {key}")
 
@@ -973,11 +974,7 @@ async def _web_write_setting(key: str, value: Any) -> Dict[str, Any]:
         UserDataManager.set(key, level)
         await UserDataManager.save_config(key, level)
         ModelClient._thinking_unsupported.clear()
-    elif key == 'presentation_mode':
-        if value not in {'folded', 'detailed'}:
-            raise ValueError('呈现模式只能是 folded 或 detailed')
-        await UserDataManager.save_config(key, value)
-    elif key in {'stream_mode', 'agent_mode', 'hide_protocol_blocks'}:
+    elif key in {'stream_mode', 'agent_mode'}:
         flag = normalize_bool(value, False)
         UserDataManager.set(key, flag)
         await UserDataManager.save_config(key, flag)

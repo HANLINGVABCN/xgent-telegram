@@ -150,7 +150,7 @@ class CompressionTokenUsageTests(unittest.TestCase):
         sent = result['sent'][0]
         self.assertTrue(sent['disable_notification'])
         self.assertEqual('HTML', sent['parse_mode'])
-        self.assertIn('↑ 1,200 · ↓ 90 · 缓存 300', sent['text'])
+        self.assertIn('↑ 1,200 · ↓ 90 · cache 300', sent['text'])
         self.assertIn('约 ', sent['text'])
         self.assertNotIn('tokens/s', sent['text'])
         self.assertIn(result['recorded'][0]['content'], sent['text'])

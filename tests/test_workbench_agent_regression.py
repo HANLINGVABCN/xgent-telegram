@@ -116,12 +116,13 @@ async def main():
     await db.close()
 asyncio.run(main())
 ''')
-        for key in ('stream_mode', 'hide_protocol_blocks', 'stats_auto_merge'):
+        for key in ('stream_mode', 'stats_auto_merge'):
             self.assertIs(False, result[key])
+        self.assertIs(True, result['hide_protocol_blocks'])
         self.assertEqual(0, result['smart_match_threshold'])
         self.assertEqual([], result['disabled_skills'])
         self.assertEqual({}, result['model_price_table'])
-        self.assertEqual('detailed', result['presentation_mode'])
+        self.assertEqual('folded', result['presentation_mode'])
 
     def test_presentation_mode_wins_over_retired_boolean_in_both_read_orders(self):
         result = self.run_probe(self.SECTIONS_PREAMBLE + r'''
@@ -153,7 +154,41 @@ async def main():
     await db.close()
 asyncio.run(main())
 ''')
-        self.assertEqual([['folded', True], ['folded', True],
-                          ['detailed', False], ['detailed', False]], result['cases'])
-        self.assertEqual('detailed', result['persisted'])
-        self.assertEqual(['detailed', False], result['reopened'])
+        self.assertEqual([['folded', True]]*4, result['cases'])
+        self.assertEqual('folded', result['persisted'])
+        self.assertEqual(['folded', True], result['reopened'])
+
+    def test_retired_mode_config_and_clients_cannot_restore_detailed_view(self):
+        result = self.run_probe(self.SECTIONS_PREAMBLE + r'''
+import asyncio
+from xgent_app.workbench import Workbench
+async def main():
+    db = await ns['BotMemoryDB'].get_instance()
+    await db.set_config('presentation_mode', 'detailed')
+    await db.set_config('hide_protocol_blocks', False)
+    row_id = await db.record_global_message(chat_id=1, user_id=1,
+        msg_type='ai_reply', role='assistant', content='original reply  \n  exact spaces',
+        session_id='global_memory', metadata={'fixture': 'keep'})
+    original = await db.get_display_message(row_id)
+    service = Workbench(ns)
+    boot = await service.bootstrap({})
+    modes = [await db.get_config_fresh('presentation_mode')]
+    for key, value in (('presentation_mode', 'detailed'), ('hide_protocol_blocks', False)):
+        result = await ns['_web_write_setting'](key, value)
+        modes.append(result['values']['presentation_mode'])
+    ns['UserDataManager'].set('hide_protocol_blocks', False)
+    modes.append(ns['UserDataManager'].get('presentation_mode'))
+    menu = [button.text for row in ns['get_more_settings_menu']().inline_keyboard for button in row]
+    print(json.dumps({'modes': modes,
+        'options': 'presentation_mode' in boot['settings']['options'],
+        'editable': any(key in ns['WEB_EDITABLE_SETTINGS'] for key in ('presentation_mode', 'hide_protocol_blocks')),
+        'menu': any('呈现模式' in text or '非折叠' in text for text in menu),
+        'record_unchanged': original == await db.get_display_message(row_id)}))
+    await db.close()
+asyncio.run(main())
+''')
+        self.assertEqual(['folded']*4, result['modes'])
+        self.assertFalse(result['options'])
+        self.assertFalse(result['editable'])
+        self.assertFalse(result['menu'])
+        self.assertTrue(result['record_unchanged'])

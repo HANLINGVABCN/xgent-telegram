@@ -70,6 +70,7 @@ def web_ai_segments(text, *, hide_unclosed=False, presentation=None):
 
 
 def build_operation_display(operation, mode, presentation=None):
+    mode = normalize_mode(mode)
     details = '\n'.join(f'{label}：{operation[key]}' for key, label in (
         ('return_code', '返回码'), ('elapsed_seconds', '耗时（秒）'),
         ('session_id', '终端会话'), ('output_path', '输出存档')) if operation.get(key) is not None)
@@ -85,7 +86,7 @@ def build_operation_display(operation, mode, presentation=None):
 def build_web_display(text: str, *, fold: bool = True, hide_unclosed: bool = False,
                       reply_message_id=None, mode=None, presentation=None) -> dict:
     turn = current_turn()
-    mode = normalize_mode(mode or (turn.mode if turn is not None else 'detailed'))
+    mode = normalize_mode(mode or (turn.mode if turn is not None else 'folded'))
     if fold:
         segments = web_ai_segments(text, hide_unclosed=hide_unclosed, presentation=presentation)
     else:
@@ -129,7 +130,7 @@ def present_web_frame(frame):
         result = {**frame, 'web_display': display, 'msg_type': frame.get('msg_type') or 'ai_reply'}
     hint = current_message_presentation()
     if hint and frame.get('type') in {'message', 'edit', 'edit_markup'}:
-        result = {**result, 'msg_type': hint['kind'], 'presentation_mode': hint.get('mode')}
+        result = {**result, 'msg_type': hint['kind'], 'presentation_mode': normalize_mode(hint.get('mode'))}
         if hint.get('record_id') is not None:
             result['record_id'] = hint['record_id']
         if hint['kind'] == 'token_usage':
@@ -173,7 +174,7 @@ def web_stream_display(*, final=False, stopped=False):
             display = build_web_display(text, fold=renderer._hide_blocks,
                                         hide_unclosed=not final,
                                         reply_message_id=renderer.message_ids[0],
-                                        mode=getattr(renderer, '_presentation_mode', 'detailed'))
+                                        mode=getattr(renderer, '_presentation_mode', 'folded'))
             with web_display_scope(display):
                 return await function(renderer, *args, **kwargs)
         return wrapped

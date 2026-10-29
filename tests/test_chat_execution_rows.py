@@ -111,7 +111,7 @@ def test_real_shell_single_rows_inline_actions_and_copying(full_output_server, t
         page=context.new_page();errors=[];page.on('pageerror',lambda err:errors.append(str(err)))
         for width,height in [(1440,900),(390,844),(320,640)]:
             page.set_viewport_size({'width':width,'height':height})
-            for current in ('folded','detailed'):
+            for current in ('folded',):
                 mode[0]=current
                 page.goto(base)
                 page.locator('.token-hud').first.wait_for()
@@ -124,6 +124,8 @@ def test_real_shell_single_rows_inline_actions_and_copying(full_output_server, t
                 assert first.locator('.execution-row').bounding_box()['height']<=31
                 assert page.locator('.bubble.cmd .msg-actions,.bubble.sys .msg-actions').count()==0
                 assert page.locator('.bubble.sys .bubble-header:visible,.bubble.cmd .bubble-header:visible').count()==0
+                assert page.locator('.bubble.ai .bubble-header:visible').count()==1
+                assert page.locator('.bubble-header .ai-generation-meta').count()==0
                 page.locator('.bubble.ai .copy-message-action').first.click()
                 assert page.evaluate('navigator.clipboard.readText()').replace('\r\n','\n')==case['expected_raw'][0]
                 for footer in page.locator('.bubble.ai .message-footer').all():
@@ -154,5 +156,107 @@ def test_real_shell_single_rows_inline_actions_and_copying(full_output_server, t
                 output.get_by_role('button',name='查看完整输出').click()
                 page.get_by_text('FULL OUTPUT',exact=True).wait_for()
                 page.screenshot(path=str(tmp_path/f'approved-{width}-{current}.png'))
+        assert not errors,errors
+        browser.close()
+
+
+def test_reply_footer_and_single_author_survive_live_adoption_pruning_and_refresh(full_output_server, tmp_path):
+    playwright=pytest.importorskip('playwright.sync_api')
+    server=full_output_server[0]
+    base=f'http://127.0.0.1:{server.config.port}'
+    mode=['folded']
+    timestamp=1793202844
+
+    def record(mid, role, text, kind, turn=None):
+        value={'id':mid,'role':role,'content':text,'msg_type':kind,'timestamp':timestamp+mid,
+               'conversation_id':'global_memory'}
+        if turn:
+            value['turn_id']=turn
+        if kind=='ai_reply':
+            value['ai_generation']={'provider':'p','model':'m','generated_at':timestamp+mid}
+            facts={'usage':{'input_tokens':4110,'output_tokens':86,'cached_tokens':3660},'elapsed_seconds':1}
+            value['web_display']=build_web_display(text,mode=mode[0],presentation=facts)
+        return value
+
+    def messages():
+        return [record(1,'user','检查运行情况','user_text','A'),
+                record(2,'assistant','第一轮：开始检查。','ai_reply','A'),
+                record(3,'assistant','操作已结束。','agent_status','A'),
+                record(4,'user','补充同一任务的信息','user_text','A'),
+                record(5,'assistant','第二轮：结果已确认。','ai_reply','A'),
+                record(6,'user','开始另一个任务','user_text','B'),
+                record(7,'assistant','新任务第一轮。','ai_reply','B'),
+                record(8,'assistant','必要系统提示。','system_op','B'),
+                record(9,'assistant','新任务第二轮。','ai_reply','B'),
+                record(10,'user','旧历史没有轮次标识','user_text'),
+                record(11,'assistant','旧历史第一轮。','ai_reply'),
+                record(12,'assistant','中间状态。','agent_status'),
+                record(13,'assistant','旧历史第二轮。','ai_reply')]
+
+    with playwright.sync_playwright() as p:
+        if not Path(p.chromium.executable_path).exists():
+            pytest.skip('Chromium unavailable')
+        browser=p.chromium.launch(headless=True)
+        context=browser.new_context(permissions=['clipboard-read','clipboard-write'], reduced_motion='reduce')
+        context.route('**/*',lambda route:route.continue_() if route.request.url.startswith(base) else route.abort())
+        assert context.request.post(base+'/api/login',data={'password':'temporary-test-only'}).ok
+        context.route('**/api/workbench/history?*',lambda route:route.fulfill(json={
+            'messages':messages(),'presentation_mode':mode[0],'busy':False,'next_cursor':None,
+            'live':{**server.outbox.snapshot(),'frames':[]}}))
+        context.route('**/api/config',lambda route:route.fulfill(json={'values':{'presentation_mode':mode[0]},'options':{}}))
+        page=context.new_page();errors=[];page.on('pageerror',lambda error:errors.append(str(error)))
+        for width,height in ((1440,900),(390,844),(320,640)):
+            page.set_viewport_size({'width':width,'height':height})
+            for current in ('folded',):
+                mode[0]=current
+                page.goto(base)
+                page.locator('[data-record-id="13"]').wait_for()
+                page.wait_for_function('document.querySelectorAll(".msg-row.ai.turn-continuation").length===3')
+                assert page.locator('.bubble.ai .bubble-header:visible').count()==3
+                assert page.locator('[data-record-id="2"] .bubble-header').is_visible()
+                assert page.locator('[data-record-id="5"] .bubble-header').is_hidden()
+                assert page.locator('[data-record-id="9"] .bubble-header').is_hidden()
+                assert page.locator('[data-record-id="13"] .bubble-header').is_hidden()
+                assert page.locator('.bubble-header .ai-generation-meta').count()==0
+                assert page.evaluate('document.documentElement.scrollWidth<=innerWidth+1')
+                for row in page.locator('.msg-row.ai').all():
+                    body=row.locator('.body').bounding_box()
+                    meta=row.locator('.footer-meta .ai-generation-meta')
+                    assert '模型：p / m' in meta.inner_text()
+                    assert meta.bounding_box()['y']>=body['y']+body['height']
+                    hud=row.locator('.footer-meta .token-hud')
+                    assert '↑ 4,110 · ↓ 86 · cache 3,660 · 约 1.0 秒' in hud.inner_text()
+                    assert meta.evaluate('(n)=>n.compareDocumentPosition(n.parentElement.querySelector(".token-hud"))&Node.DOCUMENT_POSITION_FOLLOWING')
+                    assert hud.evaluate('(n)=>getComputedStyle(n).display')=='inline'
+                    if width==1440:
+                        positions=row.evaluate('''(n)=>{
+                            const a=n.querySelector('.ai-generation-meta').getClientRects()[0];
+                            const b=n.querySelector('.token-hud i').getClientRects()[0];
+                            return {sameLine:Math.abs(a.y-b.y)<2,gap:b.x-a.right};
+                        }''')
+                        assert positions['sameLine'] and 8<=positions['gap']<=16,positions
+                page.locator('[data-record-id="5"] .copy-message-action').click()
+                assert page.evaluate('navigator.clipboard.readText()')=='第二轮：结果已确认。'
+                page.locator('#log').evaluate('(n)=>n.scrollTop=0')
+                page.screenshot(path=str(tmp_path/f'footer-author-{width}-{current}.png'))
+
+        # A live reply without a known turn ID belongs to the last user turn;
+        # adopting its durable ID must not introduce another avatar/header.
+        server.outbox.put({'type':'message','message_id':901,'text':'追加实时结果。','msg_type':'ai_reply'})
+        page.get_by_text('追加实时结果。',exact=True).wait_for()
+        page.wait_for_function('document.querySelectorAll(".bubble.ai .bubble-header").length===7')
+        assert page.locator('.bubble.ai .bubble-header:visible').count()==3
+        saved=record(14,'assistant','追加实时结果已保存。','ai_reply')
+        server.outbox.put({**saved,'type':'record_snapshot','record_id':14,'text':saved['content'],
+                          'replace_message_ids':[901]})
+        page.locator('[data-record-id="14"]').wait_for()
+        assert page.get_by_text('追加实时结果。',exact=True).count()==0
+        assert page.locator('.bubble.ai .bubble-header:visible').count()==3
+        page.locator('[data-record-id="2"]').evaluate('(n)=>n.remove()')
+        page.locator('[data-record-id="5"] .bubble-header').wait_for(state='visible')
+        assert page.locator('.bubble.ai .bubble-header:visible').count()==3
+        page.reload()
+        page.locator('[data-record-id="2"] .bubble-header').wait_for(state='visible')
+        assert page.locator('[data-record-id="5"] .bubble-header').is_hidden()
         assert not errors,errors
         browser.close()
