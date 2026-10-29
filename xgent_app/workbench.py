@@ -299,6 +299,11 @@ class Workbench:
         db = await self.db()
         missing = object()
         for key in self.ns.get('WEB_EDITABLE_SETTINGS', set()):
+            # The retired boolean is a write-through API alias, not another
+            # stored source of truth. Replaying both rows from an unordered set
+            # made the selected mode depend on PYTHONHASHSEED.
+            if key == 'hide_protocol_blocks':
+                continue
             value = await db.get_config_fresh(key, missing)
             # Missing rows (including virtual settings such as chat_model/skill_state)
             # must not create None entries that suppress runtime getter defaults.

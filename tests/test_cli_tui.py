@@ -631,22 +631,35 @@ class PtMouseTests(unittest.TestCase):
 
     def test_slow_clipboard_does_not_block_scrolling(self):
         import threading
-        started, release = threading.Event(), threading.Event()
+        release, finished = threading.Event(), threading.Event()
         async def scenario(screen, app, win, keys, at):
+            loop = asyncio.get_running_loop()
+            started = asyncio.Event()
             screen.print_block([f"row {i}" for i in range(200)], message_id=902)
             await keys("")
             def slow_copy(text):
-                started.set()
-                release.wait(timeout=3)
-                return True
+                loop.call_soon_threadsafe(started.set)
+                try:
+                    release.wait(timeout=3)
+                    return True
+                finally:
+                    finished.set()
             with mock.patch.object(cli_tui, "copy_to_clipboard", side_effect=slow_copy):
                 try:
-                    await keys("\x1b[<0;3;6M\x1b[<32;6;7M\x1b[<0;6;7m", 0.1)
-                    self.assertTrue(started.is_set())
+                    await keys("\x1b[<0;3;6M\x1b[<32;6;7M\x1b[<0;6;7m", 0)
+                    # Synchronize with the actual clipboard worker instead of
+                    # assuming both thread-pool submissions start within 100ms.
+                    await asyncio.wait_for(started.wait(), timeout=1)
+                    self.assertFalse(finished.is_set())
                     top = win.vertical_scroll
-                    await keys("\x1b[<64;5;10M", 0.1)
+                    await keys("\x1b[<64;5;10M", 0)
+                    async def scrolled():
+                        while win.vertical_scroll >= top:
+                            await asyncio.sleep(0)
+                    await asyncio.wait_for(scrolled(), timeout=1)
                     self.assertLess(win.vertical_scroll, top)
                     self.assertFalse(release.is_set())
+                    self.assertFalse(finished.is_set())
                 finally:
                     release.set()
                     await keys("")

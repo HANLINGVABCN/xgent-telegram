@@ -108,7 +108,7 @@ async def main():
     await ns['UserDataManager'].init()
     db = await ns['BotMemoryDB'].get_instance()
     for key, value in {'smart_match_threshold': 0, 'stream_mode': False,
-                       'hide_protocol_blocks': False, 'stats_auto_merge': False,
+                       'presentation_mode': 'detailed', 'stats_auto_merge': False,
                        'disabled_skills': [], 'model_price_table': {}}.items():
         await db.set_config(key, value)
     result = await Workbench(ns).bootstrap({})
@@ -121,3 +121,39 @@ asyncio.run(main())
         self.assertEqual(0, result['smart_match_threshold'])
         self.assertEqual([], result['disabled_skills'])
         self.assertEqual({}, result['model_price_table'])
+        self.assertEqual('detailed', result['presentation_mode'])
+
+    def test_presentation_mode_wins_over_retired_boolean_in_both_read_orders(self):
+        result = self.run_probe(self.SECTIONS_PREAMBLE + r'''
+import asyncio
+from unittest.mock import patch
+from xgent_app.workbench import Workbench
+async def main():
+    await ns['UserDataManager'].init()
+    db = await ns['BotMemoryDB'].get_instance()
+    service = Workbench(ns)
+    cases = []
+    for mode, legacy in (('folded', False), ('detailed', True)):
+        await db.set_config('presentation_mode', mode)
+        await db.set_config('hide_protocol_blocks', legacy)
+        for order in (('presentation_mode', 'hide_protocol_blocks'),
+                      ('hide_protocol_blocks', 'presentation_mode')):
+            with patch.dict(ns, WEB_EDITABLE_SETTINGS=order):
+                values = (await service.bootstrap({}))['settings']['values']
+                cases.append([values['presentation_mode'], values['hide_protocol_blocks']])
+    # Public writes through the compatibility alias still select and persist
+    # the new mode; reopening the database must keep that choice.
+    await ns['_web_write_setting']('hide_protocol_blocks', False)
+    persisted = await db.get_config_fresh('presentation_mode')
+    await db.close()
+    await ns['UserDataManager']._load_from_db()
+    values = (await service.bootstrap({}))['settings']['values']
+    print(json.dumps({'cases': cases, 'persisted': persisted,
+        'reopened': [values['presentation_mode'], values['hide_protocol_blocks']]}))
+    await db.close()
+asyncio.run(main())
+''')
+        self.assertEqual([['folded', True], ['folded', True],
+                          ['detailed', False], ['detailed', False]], result['cases'])
+        self.assertEqual('detailed', result['persisted'])
+        self.assertEqual(['detailed', False], result['reopened'])
