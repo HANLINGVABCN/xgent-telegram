@@ -66,6 +66,18 @@ class PresentationBot:
     def __getattr__(self, name):
         return getattr(self.original, name)
 
+    async def start_command_display(self, chat_id, reply_markup):
+        """Show the command's result slot before awaiting the actual process."""
+        operation = self.turn.active_operation
+        if not operation or operation.get('kind') != 'run':
+            return
+        with message_presentation({'kind': 'agent_result', 'mode': self.turn.mode, 'transient': True}):
+            message = await self.send_message(chat_id=chat_id,
+                text=operation_html({'kind': 'run', 'running': True, 'notice': '等待命令返回…'}),
+                parse_mode='HTML', reply_markup=reply_markup)
+        message.finalized = False
+        self.turn.operation_messages[operation['sequence']] = message
+
     def remember_notice(self, text):
         if technical_notice(text) and not successful_status(text) and not str(text).startswith('系统提示：'):
             if any(word in str(text) for word in ('停止', '失败', '超过', '超限')):
@@ -133,11 +145,20 @@ class PresentationBot:
             reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton('完整输出',
                 callback_data=f'present_output:{self.turn.last_record_id}')]])
         hint = {'kind': kind, 'mode': self.turn.mode}
+        transient = bool((current_message_presentation() or {}).get('transient'))
         record_ids = getattr(self.turn, 'record_ids', {})
-        if kind in {'agent_result', 'runtime_error', 'presentation_note'} and record_ids.get(kind) == self.turn.last_record_id:
+        if not transient and kind in {'agent_result', 'runtime_error', 'presentation_note'} and record_ids.get(kind) == self.turn.last_record_id:
             hint['record_id'] = self.turn.last_record_id
         elif kind == 'agent_status' and str(text).startswith('✅') and record_ids.get(kind):
             hint['record_id'] = record_ids[kind]
+        progress = self.turn.operation_messages.get(op.get('sequence')) if op else None
+        if (kind == 'agent_result' and progress is not None and not progress.finalized
+                and not transient and not technical_notice(text)):
+            progress.record_id = hint.get('record_id')
+            result = await self.edit_message_text(prepared, chat_id=chat_id,
+                message_id=progress.message_id, reply_markup=reply_markup, parse_mode=parse_mode, **kwargs)
+            progress.finalized = True
+            return result
         with message_presentation(hint):
             original = await self.original.send_message(chat_id=chat_id, text=prepared,
                 reply_markup=reply_markup, parse_mode=parse_mode, **kwargs)

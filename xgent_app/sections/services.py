@@ -155,6 +155,14 @@ class GlobalRecorder:
         presentation = record_presentation(msg_type, content)
         if presentation is not None:
             stamped_metadata.setdefault('presentation', presentation)
+        turn = current_turn()
+        if msg_type == MessageType.AGENT_RESULT and turn and turn.active_operation:
+            progress = turn.operation_messages.get(turn.active_operation.get('sequence'))
+            if progress is not None and not progress.finalized:
+                outbox = getattr(progress.bot, 'outbox', None) or get_web_outbox()
+                if outbox is not None:
+                    stamped_metadata.setdefault('web_live', {'epoch': outbox.snapshot()['epoch'],
+                                                            'message_ids': [progress.message_id]})
         stamped_metadata.setdefault('src', _RECORDER_SOURCE_ID)
         if current_scope().run_id:
             stamped_metadata.setdefault('run_id', current_scope().run_id)

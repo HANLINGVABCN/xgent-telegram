@@ -321,6 +321,20 @@ def apply_history_presentation(message, record, metadata, *, namespace=None, mod
     ns = namespace if namespace is not None else _section_ns()
     presentation = metadata_dict(metadata.get('presentation'))
     kind, raw = record.get('msg_type'), str(record.get('content') or '')
+    if isinstance(metadata.get('ask_form'),dict):
+        from .agent_ask import PENDING_ASKS
+        snapshot = metadata['ask_form']
+        pending = PENDING_ASKS.get(snapshot.get('id'))
+        if (pending and pending.conversation_id==record.get('session_id') and
+                pending.generation==snapshot.get('generation')):
+            snapshot = pending.web_snapshot()
+        elif snapshot.get('status')=='pending':
+            snapshot = {**snapshot, 'status':'expired'}
+        message.update(ask_form=snapshot, content='📝 需要你的输入' if snapshot['status']=='pending' else
+                       {'submitted':'表单已提交。','cancelled':'表单已取消。','expired':'表单已失效，请让 AI 重新发起。'}.get(snapshot['status'],'表单已结束。'),
+                       parse_mode=None, presentation_mode='folded', reply_markup=[])
+        message['web_display'] = build_web_display(message['content'],mode='folded',presentation=presentation)
+        return
     caption = compact_agent_round_status(raw) if kind == 'agent_status' else None
     if caption:
         message.update(content=caption, parse_mode=None, presentation_mode='folded')

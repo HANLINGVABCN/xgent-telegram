@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import os
+import asyncio
+import copy
 import re
 import secrets as _secrets
 from dataclasses import dataclass, field
@@ -106,7 +108,7 @@ class AskForm:
             if q.qtype in ("single", "multi"):
                 for idx, opt in enumerate(q.options):
                     picked = idx in selected
-                    mark = ("✅ " if q.qtype == "multi" else "🔘 ") if picked else "▫️ "
+                    mark = "✅ " if picked else "▫️ "
                     act = "askm" if q.qtype == "multi" else "asks"
                     rows.append([InlineKeyboardButton(
                         f"{mark}{_ellipsis(opt, 48)}",
@@ -264,9 +266,20 @@ class PendingAsk:
     conversation_context: Optional[Dict[str, Any]] = None
     draft: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     form_message_id: Optional[int] = None  # 表单消息 id，供录入自定义/密钥后原地重画键盘
+    form_record_id: Optional[int] = None
+    revision: int = 0
+    status: str = 'pending'
+    lock: Any = field(default_factory=asyncio.Lock, repr=False)
 
     def ensure_entry(self, qid: str) -> Dict[str, Any]:
         return self.draft.setdefault(qid, {})
+
+    def web_snapshot(self, status=None) -> Dict[str, Any]:
+        return {'version': 1, 'id': self.ask_id, 'conversation_id': self.conversation_id,
+                'generation': self.generation, 'revision': self.revision, 'status': status or self.status,
+                'questions': [{'id': q.qid, 'type': q.qtype, 'label': q.label, 'prompt': q.prompt,
+                               'options': list(q.options), 'other': q.other, 'var': q.var}
+                              for q in self.form.questions], 'draft': copy.deepcopy(self.draft)}
 
 
 class PendingAskStore:

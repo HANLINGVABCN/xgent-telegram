@@ -54,7 +54,20 @@ async def _sync_web_switches(query: Any, app: Any = None) -> None:
         await query.answer(note)
 
 
+@without_ui_history
 async def _dispatch_ask_callback(update: Any, context: Any, data: str) -> None:
+    parts=data.split(':')
+    pending=PENDING_ASKS.get(parts[1] if len(parts)>1 else '')
+    if pending is not None and parts[0] not in {'askd','askx'}:
+        async with pending.lock:
+            if pending.status!='pending' or pending.generation!=current_scope().generation:
+                await update.callback_query.answer('表单已提交或失效，请刷新。',show_alert=True)
+                return
+            return await _dispatch_ask_callback_inner(update,context,data)
+    return await _dispatch_ask_callback_inner(update,context,data)
+
+
+async def _dispatch_ask_callback_inner(update: Any, context: Any, data: str) -> None:
     """处理 ask 协议表单的按钮：选项切换 / 自定义或密钥录入 / 提交 / 取消。
 
     三端共用：Telegram 真按钮、网页可点按钮、CLI 数字菜单点进来的 data 一致。
@@ -71,8 +84,9 @@ async def _dispatch_ask_callback(update: Any, context: Any, data: str) -> None:
         msg = await (resume_from_ask(ask_id) if action == "askd" else cancel_ask(ask_id))
         with contextlib.suppress(Exception):
             await query.answer(msg)
-        with contextlib.suppress(Exception):
-            await query.edit_message_reply_markup(reply_markup=None)
+        if PENDING_ASKS.get(ask_id) is None:
+            with contextlib.suppress(Exception):
+                await query.edit_message_reply_markup(reply_markup=None)
         return
 
     ask_id = parts[1] if len(parts) > 1 else ""
@@ -95,6 +109,9 @@ async def _dispatch_ask_callback(update: Any, context: Any, data: str) -> None:
 
     if action == "asks":  # 单选：选中即互斥，清掉旧的自定义
         idx = int(parts[3])
+        if question.qtype!='single' or not 0<=idx<len(question.options):
+            await query.answer('无效的选项。',show_alert=True)
+            return
         entry = pending.ensure_entry(qid)
         entry["selected"] = [idx]
         entry.pop("custom", None)
@@ -102,6 +119,9 @@ async def _dispatch_ask_callback(update: Any, context: Any, data: str) -> None:
             await query.answer("已选择")
     elif action == "askm":  # 多选：切换
         idx = int(parts[3])
+        if question.qtype!='multi' or not 0<=idx<len(question.options):
+            await query.answer('无效的选项。',show_alert=True)
+            return
         entry = pending.ensure_entry(qid)
         sel = set(entry.get("selected") or [])
         sel.discard(idx) if idx in sel else sel.add(idx)
@@ -126,6 +146,9 @@ async def _dispatch_ask_callback(update: Any, context: Any, data: str) -> None:
         return  # 不重画键盘，等用户把内容发进来再重画
 
     # 选项类：原地重画键盘反映最新草稿（Telegram 可靠；其它端草稿已存服务端，提交照样对）。
+    pending.revision += 1
+    from xgent_app.web_ask import sync_ask
+    await sync_ask(globals(), pending)
     with contextlib.suppress(Exception):
         await query.edit_message_reply_markup(
             reply_markup=pending.form.build_keyboard(ask_id, pending.draft)

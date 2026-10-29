@@ -1,4 +1,4 @@
-
+import {syncAskForm} from './ask-form.js';
 (function () {
   "use strict";
 
@@ -639,7 +639,7 @@
     const protocol=bq.getAttribute('data-protocol')||/^```([^\s:]+)/.exec(raw)?.[1]||null;
     const state=bq.getAttribute('data-state')||'unknown';
     const states={pending:'待执行',generating:'生成中',running:'运行中',success:'已运行',failed:'运行失败',stopped:'已停止',unknown:'执行记录'};
-    const caption=protocol?protocol+' '+(states[state]||states.unknown):'输出'+(state==='stopped'?' · 已停止':state==='running'?' · 运行中':'');
+    const caption=protocol?protocol+' '+(states[state]||states.unknown):state==='running'?'执行中':'输出'+(state==='stopped'?' · 已停止':'');
     const row=document.createElement('button');row.type='button';row.className='pb-head pb-toggle execution-row';
     row.setAttribute('aria-label','展开或收起 '+caption);row.setAttribute('aria-expanded',String(bq.classList.contains('expanded')));
     row.innerHTML=(protocol?svgIcon(protocol.startsWith('file')?'file':'terminal'):'<span class="execution-dot state-'+escapeHtml(state)+'" aria-label="'+escapeHtml(states[state]||states.unknown)+'"></span>')+
@@ -1344,6 +1344,7 @@
   }
 
   function renderButtons(rows, messageId, ui) {
+    const owner=selectedConversationId;
     var container = document.createElement("div");
     container.className = "inline-keyboard";
     rows.forEach(function (row) {
@@ -1363,13 +1364,20 @@
         if (!btn.callback_data && !btn.unavailable) return;
         var b = document.createElement("button");
         b.className = "ik-btn";
-        b.textContent = btn.text;
+        const stopAction=/^act_stop_generation(?::(.+))?$/.exec(String(btn.callback_action||btn.callback_data||''));
+        b.textContent = stopAction ? '打断' : btn.text;
         b.disabled = !!btn.unavailable;
         if (btn.unavailable) b.title = "菜单已失效，请重新打开";
         b.addEventListener("click", function () {
           if (b.disabled) return;
           b.disabled = true; b.classList.add("loading");
           triggerHaptic();
+          if(stopAction){
+            api('/api/stop',{method:'POST',body:JSON.stringify({conversation_id:owner,
+              run_id:stopAction[1]||currentRun()?.run_id})})
+              .catch(err=>{b.disabled=false;b.classList.remove('loading');toast('打断失败：'+err.message,true);});
+            return;
+          }
           var payload = ui ? {ui_message_id: ui.id, revision: ui.revision, button_id: btn.button_id} :
             {callback_data: btn.callback_data, message_id: messageId};
           var requestId=crypto.randomUUID?crypto.randomUUID():Date.now().toString(36)+Math.random().toString(36).slice(2);
@@ -1391,6 +1399,7 @@
   }
 
   function setButtons(entry, markup, messageId) {
+    if(entry.askState)return;
     markup=platformPresentationButtons(markup);
     if (entry.btns && entry.btns.parentNode) entry.btns.parentNode.removeChild(entry.btns);
     entry.btns = null;
@@ -1433,6 +1442,10 @@
       (frame.media_group_id || (frame.record_id != null ? "history:" + frame.record_id :
         (frame.web_display?.reply_message_id ?? frame.message_id)));
     var entry = id != null ? byMessageId[id] : null;
+    if(!entry){
+      entry=(frame.replace_message_ids||[]).map(previousId=>byMessageId[previousId]).find(Boolean);
+      if(entry&&id!=null)byMessageId[id]=entry;
+    }
     // An already saved reply must not regress to a delayed transport fragment.
     if(entry?.durable && frame.record_id==null && !frame.ui_message_id)return entry;
     (frame.replace_message_ids || []).forEach(function (previousId) {
@@ -1459,7 +1472,7 @@
     if(frame.turn_id)entry.row.dataset.turnId=String(frame.turn_id);
     if(frame.run_id)entry.row.dataset.runId=String(frame.run_id);
     if(frame.conversation_id)entry.row.dataset.presentationConversationId=frame.conversation_id;
-    if(frame.record_id!=null&&!frame.ui_message_id)entry.durable=true;
+    if(frame.record_id!=null&&!frame.ui_message_id){entry.durable=true;entry.row.dataset.recordId=String(frame.record_id);}
     applyAiGeneration(entry, frame.timestamp??frame.ts, frame.ai_generation);
     syncMessageChrome(entry);
     if(typeof frame.hidden==='boolean'){entry.row.classList.toggle('presentation-hidden',frame.hidden);entry.row.classList.toggle('msg-row',!frame.hidden);}
@@ -1469,8 +1482,9 @@
     }
     bindUiMessage(entry, frame);
     if (frame.reply_markup !== undefined) {
-      setButtons(entry, frame.reply_markup, frame.message_id != null ? frame.message_id : (frame.record_id || 0));
+      if(!frame.ask_form&&!entry.askState)setButtons(entry, frame.reply_markup, frame.message_id != null ? frame.message_id : (frame.record_id || 0));
     }
+    if(frame.ask_form)syncAskForm(entry,frame.ask_form);
     if(frame.record_id!=null){
       entry.durable=true;
       if(frame.message_id!=null)byMessageId[frame.message_id]=entry;
@@ -3675,6 +3689,7 @@
       if(message.run_id)entry.row.dataset.runId=String(message.run_id);
       if(message.conversation_id)entry.row.dataset.presentationConversationId=message.conversation_id;
       if(message.media?.length)setInlineMedia(entry,message.media);
+      if(message.ask_form)syncAskForm(entry,message.ask_form);
       entry.row.dataset.sourceMessage=message.history_key||'history:'+message.id;
       syncTurnAuthors(target);
       return entry.row;

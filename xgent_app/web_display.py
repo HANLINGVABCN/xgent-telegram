@@ -74,7 +74,7 @@ def build_operation_display(operation, mode, presentation=None):
     details = '\n'.join(f'{label}：{operation[key]}' for key, label in (
         ('return_code', '返回码'), ('elapsed_seconds', '耗时（秒）'),
         ('session_id', '终端会话'), ('output_path', '输出存档')) if operation.get(key) is not None)
-    body = operation.get('output') or operation.get('notice') or '(无输出)'
+    body = operation.get('output') or operation.get('notice') or ('等待命令返回…' if operation_state(operation) == 'running' else '(无输出)')
     segments = [{'kind': 'html', 'text': web_block_html(body, state=operation_state(operation),
                  output_path=operation.get('output_path'), details=details)}]
     footer = footer_html(presentation or {})
@@ -133,9 +133,16 @@ def present_web_frame(frame):
         result = {**result, 'msg_type': hint['kind'], 'presentation_mode': normalize_mode(hint.get('mode'))}
         if hint.get('record_id') is not None:
             result['record_id'] = hint['record_id']
+            if hint['kind'] == 'agent_result' and frame.get('message_id') is not None:
+                result['replace_message_ids'] = [frame['message_id']]
         if hint['kind'] == 'token_usage':
             result['hidden'] = True
         turn = current_turn()
+        if hint.get('ask_id'):
+            from .agent_ask import PENDING_ASKS
+            pending = PENDING_ASKS.get(hint['ask_id'])
+            if pending:
+                result['ask_form'] = pending.web_snapshot()
         if hint['kind'] == 'agent_result' and turn and turn.active_operation and turn.active_operation['kind'] != 'ask':
             result['web_display'] = build_operation_display(turn.active_operation, turn.mode)
     return result

@@ -121,6 +121,9 @@ class Workbench:
 
     async def _handle_scoped(self, method, resource, data):
         await self.db()
+        if resource == 'ask':
+            from .web_ask import handle_ask
+            return await handle_ask(self.ns,method,data,self.background)
         if resource.startswith('data/'):
             if self._data_operations is None:
                 self._data_operations = DataOperations(self.ns)

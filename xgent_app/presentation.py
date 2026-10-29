@@ -221,6 +221,7 @@ class PresentationTurn:
     reason: str = ''
     last_message: Any = None
     last_record_id: int | None = None
+    operation_messages: dict = field(default_factory=dict)
 
     def __post_init__(self):
         self.mode = FOLDED

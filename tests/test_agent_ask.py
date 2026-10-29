@@ -95,6 +95,27 @@ class KeyboardAndAnswerTests(unittest.TestCase):
         self.assertIn("askd:aid", cbs)       # 提交
         self.assertIn("askx:aid", cbs)       # 取消
 
+    def test_single_selection_has_checkmark_and_web_snapshot_omits_model_history(self):
+        pending=PendingAsk(ask_id='web',form=self.form,generation=1,
+            turn_history_snapshot=[{'role':'user','content':'PRIVATE_MODEL_HISTORY'}],agent_iteration=1,chat_id=1)
+        pending.draft={'1':{'selected':[1]}}
+        flat=[button.text for row in self.form.build_keyboard('web',pending.draft).inline_keyboard for button in row]
+        self.assertTrue(any(text.startswith('✅ ') and '测试' in text for text in flat))
+        import json
+        self.assertNotIn('PRIVATE_MODEL_HISTORY',json.dumps(pending.web_snapshot()))
+
+    def test_web_draft_checks_selection_and_secret_fields(self):
+        from xgent_app.web_ask import validated_draft
+        pending=PendingAsk(ask_id='web',form=self.form,generation=1,
+            turn_history_snapshot=[],agent_iteration=1,chat_id=1)
+        value={'0':{'selected':[0,2],'custom':'保留自定义'},'1':{'selected':[1]},'2':{'custom':' exact  spaces '}}
+        result=validated_draft(pending,value)
+        self.assertEqual(result['0'],{'selected':[0,2],'custom':'保留自定义'})
+        self.assertEqual(result['2']['custom'],' exact  spaces ')
+        for invalid in ({'3':{'filled':True}},{'1':{'selected':[0,1]}},{'1':{'selected':[99]}},
+                        {'1':{'selected':[1],'custom':'冲突'}},{'2':{'selected':[0]}}):
+            with self.assertRaises(ValueError):validated_draft(pending,invalid)
+
     def test_assemble_answer_secret_only_var_name_never_plaintext(self):
         draft = {
             "0": {"selected": [0, 2]},
