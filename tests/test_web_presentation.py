@@ -49,10 +49,10 @@ asyncio.run(main())
 ''')
 
 
-def test_saved_reply_freezes_display_and_tracks_all_final_fragments(reply_cases):
+def test_history_reprojects_mode_without_changing_raw_reply_or_fragment_identity(reply_cases):
     assert len(reply_cases)==6
     for case in reply_cases:
-        assert case['raw_unchanged'] and case['frozen'],case['name']
+        assert case['raw_unchanged'] and not case['frozen'],case['name']
         assert case['display']['parse_mode']=='HTML'
         finals=[f for f in case['frames'] if f['type']=='record_snapshot']
         assert len(finals)==1,case['name']

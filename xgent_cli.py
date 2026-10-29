@@ -891,9 +891,16 @@ def _history_row_lines(row):
     """Read-only display: no historical keyboard can mutate a new context."""
     from xgent_app.web_history import build_history_message
     item = build_history_message(row, _ns['ArtifactManager'].ROOT_DIR, _ns['PROJECT_ROOT'])
+    if item.get('hidden'):
+        return []
     renderer = SCREEN.renderer()
     kind, role = item.get('msg_type'), item.get('role')
     content = item.get('content') or ''
+    details = (item.get('web_display') or {}).get('usage_details')
+    if details and item.get('presentation_mode') == 'folded':
+        import html
+        content += ('\n<blockquote expandable data-compact="1"><b>📊 用量详情</b> · '
+                    + str(details.count('\n') + 1) + ' 行\n<pre>' + html.escape(details) + '</pre></blockquote>')
     mode = item.get('parse_mode')
     if kind == 'ai_reply' and not mode:
         content, mode = _fold_ai_reply_for_cli(content), 'HTML'

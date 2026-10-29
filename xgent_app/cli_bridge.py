@@ -130,6 +130,10 @@ def _render_kind_for(text: str) -> str:
     内容特征优先于轮次类型：轮次只知道"用户敲的是命令还是对话"，认不出
     一次对话轮内部的状态行和工具输出。
     """
+    from .presentation import current_message_presentation
+    hint = current_message_presentation()
+    if hint is not None:
+        return {'ai_reply': 'chat', 'agent_result': 'cmd', 'agent_status': 'system', 'runtime_error': 'system', 'token_usage': 'token'}.get(hint['kind'], 'chat')
     if _TOKEN_LINE_RE.search(text):
         return "token"
     if _AGENT_RESULT_RE.search(text):
@@ -235,6 +239,9 @@ class _CliRelay:
         from xgent_app.telegram_presentation import presentation_snapshot
         payload['telegram_presentation'] = presentation_snapshot()
         from xgent_app.web_display import current_web_display
+        from xgent_app.presentation import current_message_presentation
+        if current_message_presentation() is not None:
+            payload['message_presentation'] = current_message_presentation()
         if op in {'send_message', 'edit_message_text'} and current_web_display() is not None:
             payload['web_display'] = current_web_display()
         from xgent_app.ui_history import relay_ui_context
@@ -620,6 +627,14 @@ class CliBot:
         编辑那一刻从"◇ 命令 + 灰底"翻成"◆ XGent 双横线块"，中途换皮。
         """
         kind = _render_kind_for(text)
+        from .web_display import current_web_display
+        display = current_web_display() or {}
+        if display.get('usage_details') and display.get('presentation_mode') == 'folded':
+            import html
+            details = display['usage_details']
+            text += ('\n<blockquote expandable data-compact="1"><b>📊 用量详情</b> · '
+                     + str(details.count('\n') + 1) + ' 行\n<pre>' + html.escape(details) + '</pre></blockquote>')
+            buttons = [(label, action) for label, action in buttons if not action.startswith('present_usage:') and label not in {'用量详情', '收起用量详情'}]
         if not conversation_visible() and not getattr(self.screen, 'conversation_routing', False):
             return [], kind
         renderer = self._renderer()
@@ -640,6 +655,7 @@ class CliBot:
         message_id = self._allocate_message_id()
         reply_markup = bind_callback_markup(reply_markup)
         buttons = buttons_from_markup(reply_markup)
+        buttons = [(label, action) for label, action in buttons if label not in {'用量详情', '收起用量详情'}]
         lines, kind = self._render_by_kind(str(text), buttons, parse_mode)
         if not lines:
             # 渲染成��（空消息、只剩一颗被摘掉的停止按钮）：屏幕上什么都不
@@ -682,6 +698,7 @@ class CliBot:
         target_id = int(message_id or 0)
         reply_markup = bind_callback_markup(reply_markup)
         buttons = buttons_from_markup(reply_markup)
+        buttons = [(label, action) for label, action in buttons if label not in {'用量详情', '收起用量详情'}]
         lines, _kind = self._render_by_kind(str(text), buttons, parse_mode)
         if lines and not self.screen.update_block(lines, target_id):
             self.screen.print_block(lines, message_id=target_id)
@@ -702,6 +719,7 @@ class CliBot:
         target_id = int(message_id or 0)
         reply_markup = bind_callback_markup(reply_markup)
         buttons = buttons_from_markup(reply_markup)
+        buttons = [(label, action) for label, action in buttons if label not in {'用量详情', '收起用量详情'}]
         menu_buttons, hints = split_control_buttons(buttons)
         if hasattr(self.screen, 'tag_menu'):
             self.screen.tag_menu(target_id, bool(menu_buttons), menu_buttons)

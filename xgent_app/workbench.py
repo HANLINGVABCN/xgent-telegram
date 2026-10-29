@@ -320,6 +320,31 @@ class Workbench:
                                 'model': self.ns['UserDataManager'].get('default_media_model', '')}}
 
     async def history(self, data):
+        if data.get('presentation_ids') is not None:
+            # Reproject only already-loaded records; cursors and unrelated DOM stay intact.
+            values = str(data['presentation_ids']).split(',')
+            if len(values) > 100 or any(not value.isdigit() for value in values):
+                raise ValueError('无效的历史记录列表')
+            db = await self.db()
+            conn = await db._get_conn()
+            ids = [int(value) for value in values]
+            placeholders = ','.join('?' for _ in ids)
+            cursor = await conn.execute('SELECT * FROM global_messages WHERE session_id=? AND withdrawn=0 AND ('
+                f'id IN ({placeholders}) OR '
+                f"(CASE WHEN json_valid(metadata) THEN json_extract(metadata,'$.presentation.reply_record_id') END) IN ({placeholders}) OR "
+                f"(CASE WHEN json_valid(metadata) THEN json_extract(metadata,'$.presentation.anchor_record_id') END) IN ({placeholders}) OR "
+                "(msg_type IN ('token_usage','agent_status') AND id BETWEEN ? AND ? "
+                "AND (CASE WHEN json_valid(metadata) THEN json_extract(metadata,'$.presentation.version') END) IS NULL)) ORDER BY timestamp,id",
+                [current_scope().conversation_id, *ids, *ids, *ids, min(ids), max(ids)])
+            rows = [dict(row) for row in await cursor.fetchall()]
+            await cursor.close()
+            from .presentation import link_usage_records
+            link_usage_records(rows)
+            messages = [build_history_message(row, self.ns['ArtifactManager'].ROOT_DIR,
+                         str(Path(self.ns['AgentExecutor'].WORK_DIR) / 'workspace')) for row in rows]
+            return {'messages': messages, 'ui_generation': await db.get_attachment_generation(),
+                    'conversation_id': current_scope().conversation_id,
+                    'presentation_mode': self.ns['UserDataManager'].get('presentation_mode', 'folded')}
         if data.get('anchor') and not data.get('_anchor_side'):
             # A location is a window, not a cut-off point. Return both sides
             # with independent cursors while keeping the old fields compatible.

@@ -313,6 +313,60 @@ def history_web_display(content: str, display=None):
     return build_web_display(content, fold=folded)
 
 
+def apply_history_presentation(message, record, metadata):
+    """Use the live semantic renderers for dynamic history; snapshots are legacy fallback."""
+    from .presentation import normalize_mode, ai_html, operation_html, footer_html, successful_status, metadata_dict, current_turn, legacy_operation
+    from .web_display import build_web_display
+    ns = _section_ns()
+    presentation = metadata_dict(metadata.get('presentation'))
+    if ns is None and not presentation:
+        return
+    mode = (normalize_mode(ns['UserDataManager'].get('presentation_mode', 'folded'))
+            if ns and 'UserDataManager' in ns else normalize_mode(presentation.get('mode')))
+    turn = current_turn()
+    if turn is not None:
+        mode = turn.mode
+    kind, raw = record.get('msg_type'), str(record.get('content') or '')
+    if kind == 'agent_result' and not presentation.get('operation'):
+        recovered = legacy_operation(raw, metadata)
+        if recovered is not None:
+            presentation['operation'] = recovered
+    message['presentation_mode'] = mode
+    if mode == 'folded' and (kind == 'token_usage' or successful_status(raw)
+            or raw.startswith('系统提示：⚠️ 协议块 nonce')
+            or kind == 'agent_status' and presentation.get('technical')):
+        message['hidden'] = True
+        return
+    renderer = ns.get('markdown_to_telegram_html') if ns else None
+    if kind in {'ai_reply', 'media_reply'} and renderer:
+        content = ai_html(raw, mode, renderer)
+        footer = footer_html(presentation) if mode == 'folded' else ''
+        message.update(content=content + ('\n\n' + footer if footer else ''), parse_mode='HTML')
+        message['web_display'] = build_web_display(raw, fold=True, mode=mode, presentation=presentation)
+    elif kind == 'agent_result' and isinstance(presentation.get('operation'), dict):
+        operation = presentation['operation']
+        content = operation_html(operation, detailed=mode == 'detailed')
+        footer = footer_html(presentation) if mode == 'folded' else ''
+        message.update(content=content + ('\n\n' + footer if footer else ''), parse_mode='HTML')
+        details = '\n'.join(f'{label}：{operation[key]}' for key, label in (
+            ('return_code', '返回码'), ('elapsed_seconds', '耗时（秒）'),
+            ('session_id', '终端会话'), ('output_path', '输出存档'), ('notice', '执行说明'))
+            if operation.get(key) is not None)
+        message['web_display'] = {'version': 1, 'presentation_mode': mode,
+            'segments': [{'kind': 'html', 'text': message['content']}], 'operation_details': details}
+        if operation.get('output_path') and record.get('id'):
+            message['reply_markup'] = [[{'text': '完整输出', 'callback_data': f'present_output:{record["id"]}'}]]
+    elif kind == 'presentation_note' and renderer:
+        message.update(content=renderer(raw), parse_mode='HTML')
+        footer = footer_html(presentation) if mode == 'folded' else ''
+        if footer:
+            message['content'] += '\n\n' + footer
+        message['web_display'] = build_web_display(raw, fold=True, mode=mode, presentation=presentation)
+    if mode == 'folded' and presentation.get('usage') and record.get('id'):
+        message.setdefault('reply_markup', []).append([{
+            'text': '用量详情', 'callback_data': f'present_usage:{record["id"]}:1'}])
+
+
 def build_history_message(
     record: dict[str, Any], storage_root: str | Path, workspace_root: str | Path,
 ) -> dict[str, Any]:
@@ -387,6 +441,7 @@ def build_history_message(
         message['reply_markup'] = [[{
             'text': '\u91cd\u8bd5\u6062\u590d', 'callback_data': 'retry_compress:' + task['id'],
         }]]
+    apply_history_presentation(message, record, metadata)
     if kind not in _FILE_TYPES and not metadata.get('server_uploads'):
         return message
     if (metadata.get("attachment_purpose") == "configuration"

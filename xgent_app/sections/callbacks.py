@@ -184,6 +184,54 @@ async def handle_conversation_action(update, context, data):
     return
 
 
+async def _handle_presentation_callback(update, context, data):
+    from xgent_app.presentation import metadata_dict, footer_html, usage_details, legacy_operation
+    query = update.callback_query
+    parts = data.split(':')
+    if len(parts) < 2 or not parts[1].isdigit():
+        await query.answer('无效的明细入口。', show_alert=True)
+        return
+    row_id = int(parts[1])
+    db = await BotMemoryDB.get_instance()
+    row = await db.get_display_message(row_id)
+    if row is None:
+        await query.answer('这条记录已删除或不属于当前会话。', show_alert=True)
+        return
+    metadata = metadata_dict(row.get('metadata'))
+    presentation = metadata.get('presentation') or {}
+    if parts[0] == 'present_output':
+        from xgent_app.output_archive import read_output_page, OutputArchiveError
+        path = (presentation.get('operation') or legacy_operation(row['content'], metadata) or {}).get('output_path')
+        try:
+            page = await asyncio.to_thread(read_output_page, path)
+            if page['size'] > AgentExecutor.MAX_FILE_SIZE:
+                await query.answer('输出超过文件发送限制，请在 Web 或 CLI 分页查看。', show_alert=True)
+                return
+            await query.answer()
+            with open(page['path'], 'rb') as document:
+                await context.bot.send_document(chat_id=update.effective_chat.id, document=document, filename=page['filename'])
+        except (OutputArchiveError, TypeError, OSError) as exc:
+            await query.answer('完整输出不存在或无法读取。', show_alert=True)
+        return
+    if not presentation.get('usage'):
+        await query.answer('上游未提供本轮用量数据。', show_alert=True)
+        return
+    expanded = len(parts) > 2 and parts[2] == '1'
+    base = presentation.get('footer_base_html') or _folded_display_html(row['content'])
+    closed = presentation.get('footer_message_html') or base + '\n\n' + footer_html(presentation)
+    text = closed + ('\n<pre>' + html.escape(usage_details(presentation)) + '</pre>' if expanded else '')
+    if _tg_len(text) > 3900:
+        text = '<b>用量详情</b>\n<pre>' + html.escape(usage_details(presentation)) + '</pre>' if expanded else closed
+    markup = _presentation_buttons(row_id, expanded=expanded)
+    old_markup = getattr(query.message, 'reply_markup', None)
+    stop_rows = [buttons for buttons in getattr(old_markup, 'inline_keyboard', ())
+                 if any(_is_presentation_stop(button) for button in buttons)]
+    if stop_rows:
+        markup = InlineKeyboardMarkup([*markup.inline_keyboard, *stop_rows])
+    await query.answer()
+    await safe_edit_text(query.message, text, parse_mode=constants.ParseMode.HTML, reply_markup=markup)
+
+
 @conversation_entry()
 async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -206,6 +254,11 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         run_id = data.partition(':')[2]
         accepted = await get_conversations().request_stop(run_id) if run_id else False
         await query.answer('已收到停止请求' if accepted else '该回合已结束，停止按钮已失效。')
+        return
+
+    if data.startswith(('present_usage:', 'present_output:')):
+        await UserDataManager.init()
+        await _handle_presentation_callback(update, context, data)
         return
 
     if data.startswith('conv_') or data in {'cmd_new_chat', 'cmd_list_chats', 'cmd_rename_chat'}:
@@ -1246,17 +1299,17 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode=constants.ParseMode.HTML
             )
 
-        elif data == "toggle_hide_protocol_blocks":
+        elif data in {"toggle_presentation_mode", "toggle_hide_protocol_blocks"}:
             # 折叠协议代码块（默认开）：开启后 AI 回复正文里的 *-x 协议块在「显示」层折成
             # 可展开控件（前 50 行 +「已折叠 N 行」）；落库 / 执行 / 镜像用的原始文本不受影响。
-            on = not normalize_bool(UserDataManager.get('hide_protocol_blocks', True), True)
-            UserDataManager.set('hide_protocol_blocks', on)
-            await UserDataManager.save_config('hide_protocol_blocks', on)
+            mode = 'detailed' if UserDataManager.get('presentation_mode', 'folded') == 'folded' else 'folded'
+            on = mode == 'folded'
+            await UserDataManager.save_config('presentation_mode', mode)
             await GlobalRecorder.record_system_op(
-                f"折叠代码块{'开启' if on else '关闭'}",
-                {"hide_protocol_blocks": on}
+                f"呈现模式切换为{'折叠' if on else '非折叠'}",
+                {"presentation_mode": mode}
             )
-            await query.answer(f"已{'开启' if on else '关闭'}折叠代码块", show_alert=False)
+            await query.answer(f"已切换为{'折叠' if on else '非折叠'}模式", show_alert=False)
             await query.message.edit_text(
                 build_settings_menu_text(),
                 reply_markup=get_more_settings_menu(),

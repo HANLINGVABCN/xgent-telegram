@@ -651,7 +651,7 @@ class BotMemoryDB(ConversationStore):
             metadata = metadata_of(msg)
             if not include_all and (metadata.get('ui_audit') or metadata.get('ui_only') or msg.get('msg_type') in {'button_click', 'command', 'management_input'}):
                 continue
-            if not include_all and metadata.get('model_context_superseded'):
+            if not include_all and (metadata.get('model_context_superseded') or msg.get('msg_type') == 'presentation_note'):
                 continue
             if not include_all and metadata.get('model_context') is not None:
                 from xgent_app.tool_context import messages_from_metadata
@@ -1008,7 +1008,7 @@ class BotMemoryDB(ConversationStore):
         """
         async with self._transaction() as conn:
             cursor = await conn.execute('''
-                SELECT id, role, content, timestamp, msg_type, metadata FROM global_messages
+                SELECT id, role, content, timestamp, msg_type, metadata, session_id, turn_id FROM global_messages
                 WHERE session_id = ? AND withdrawn=0 ORDER BY timestamp ASC, id ASC
             ''', (self._conversation_id(),))
             rows = await cursor.fetchall()
@@ -1041,6 +1041,8 @@ class BotMemoryDB(ConversationStore):
             else:
                 result.append(item)
         result.sort(key=lambda item: (item['timestamp'], item.get('id') or 0, item.get('ui_message_id', '')))
+        from xgent_app.presentation import link_usage_records
+        link_usage_records(result)
         return UiHistorySnapshot(result[-limit:] if limit > 0 else result,
                                  generation=generation, tombstones=tombstones)
 
@@ -1569,6 +1571,13 @@ class BotMemoryDB(ConversationStore):
                 await bump_knowledge_revision(conn)
         self._config_cache[key] = value
 
+    async def ensure_presentation_mode(self):
+        """One-time, race-safe upgrade; the retired boolean never selects raw output."""
+        async with self._write() as conn:
+            await conn.execute('INSERT OR IGNORE INTO config(key,value) VALUES (?,?)',
+                               ('presentation_mode', json.dumps('folded')))
+        return await self.get_config_fresh('presentation_mode', 'folded')
+
     async def set_skill_state(self, path: str, state: str) -> Dict[str, List[str]]:
         if state not in {'enabled', 'disabled', 'hidden'}:
             raise ValueError('无效的技能状态')
@@ -2051,6 +2060,8 @@ class UserDataManager:
     @classmethod
     async def _load_from_db(cls):
         """从数据库加载数据到内存"""
+        from xgent_app.presentation import normalize_mode
+        mode = normalize_mode(await cls._require_db().ensure_presentation_mode())
         fetch_status_raw = await cls._require_db().get_config('model_fetch_status', {})
         cls._data = {
             'state': BotState.IDLE,
@@ -2093,7 +2104,8 @@ class UserDataManager:
             # 折叠协议代码块（默认开）：开启后 AI 回复正文里的 *-x 协议块在「显示」层折成
             # 可展开控件（收起→块头；展开→块头+前 50 行+「已折叠 N 行」标签，第 51 行起不显示）；
             # 落库 / 执行 / 镜像用的原始文本不受影响。
-            'hide_protocol_blocks': normalize_bool(await cls._require_db().get_config('hide_protocol_blocks', True), True),
+            'presentation_mode': mode,
+            'hide_protocol_blocks': mode == 'folded',  # Deprecated public alias for one release.
             # 只缓存"有没有设密码"这个布尔，哈希本身按需读库，不进内存快照。
             '_web_has_password': bool(
                 await cls._require_db().get_config(WEB_PASSWORD_CONFIG_KEY, '')
@@ -2194,14 +2206,30 @@ class UserDataManager:
                 cls._telegram_ui_revision += 1
             else:
                 cls._ui_state_revision += 1
+        if key == 'hide_protocol_blocks':
+            from xgent_app.presentation import FOLDED, DETAILED
+            cls._data['presentation_mode'] = FOLDED if normalize_bool(value, True) else DETAILED
+        elif key == 'presentation_mode':
+            from xgent_app.presentation import normalize_mode
+            value = normalize_mode(value)
+            cls._data['hide_protocol_blocks'] = value == 'folded'
         data[key] = value
 
     @classmethod
     async def save_config(cls, key: str, value: Any):
         """保存配置到数据库"""
         # 先落库再更新内存缓存，写库失败时不留下与 DB 不一致的缓存值。
+        if key == 'hide_protocol_blocks':
+            key, value = 'presentation_mode', 'folded' if normalize_bool(value, True) else 'detailed'
+        if key == 'presentation_mode':
+            from xgent_app.presentation import normalize_mode
+            value = normalize_mode(value)
         await cls._require_db().set_config(key, value)
-        cls._data[key] = value
+        cls.set(key, value)
+        if key == 'presentation_mode':
+            outbox = get_web_outbox() or globals().get('_web_external_outbox') or getattr(globals().get('_web_chat_server'), 'outbox', None)
+            if outbox is not None:
+                outbox.put({'type': 'presentation_changed', 'presentation_mode': value})
     
     @classmethod
     async def reload_providers(cls):

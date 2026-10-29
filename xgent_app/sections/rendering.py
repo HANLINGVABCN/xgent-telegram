@@ -5,6 +5,12 @@ from xgent_app.telegram_presentation import telegram_label, label_enabled, strea
 from xgent_app.protocols import ProtocolParser
 from xgent_app.reply_presentation import track_reply_presentation, bind_reply_message_ids, remember_reply_messages
 from xgent_app.web_display import web_text_response, web_stream_display
+from xgent_app.presentation import current_turn, normalize_mode, ai_html
+
+
+def _presentation_mode() -> str:
+    turn = current_turn()
+    return turn.mode if turn is not None else normalize_mode(UserDataManager.get('presentation_mode', 'folded'))
 
 
 def _should_hide_protocol_blocks() -> bool:
@@ -14,7 +20,8 @@ def _should_hide_protocol_blocks() -> bool:
     （Web/TUI 展开完整正文；Telegram 出口单独限制预览长度），绝不触碰被落库 /
     执行 / 镜像的原始文本。默认 True（开）。
     """
-    return normalize_bool(UserDataManager.get('hide_protocol_blocks', True), True)
+    # Both new modes use semantic protocol cards. The old raw protocol view is retired.
+    return True
 
 async def keep_typing_while_waiting(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
                                     stop_event: asyncio.Event, interval: float = 4.0,
@@ -842,13 +849,11 @@ def _folded_display_html(response: str, hide_unclosed: bool = False, monospace: 
     render_folded_html 原样返回输入 → 这里退回 markdown→HTML，保证产物始终是 HTML。
     只改显示：绝不触碰落库 / 执行 / 镜像的原始文本。
     """
-    folded = ProtocolParser.render_folded_html(
-        response, hide_unclosed=hide_unclosed, prose_renderer=markdown_to_telegram_html,
-        monospace=monospace, raw_copy=raw_copy,
-    )
-    if folded is response:  # identity：未折叠任何协议块
-        return markdown_to_telegram_html(response)
-    return folded
+    folded = ai_html(response, _presentation_mode(), markdown_to_telegram_html,
+                     hide_unclosed=hide_unclosed)
+    if not raw_copy:
+        folded = re.sub(r' data-raw="[^"]*"', '', folded)
+    return folded if monospace else ProtocolParser.to_telegram_html(folded)
 
 
 def split_html_for_telegram(html_text: str, limit: int = 4000) -> List[str]:
@@ -1060,7 +1065,8 @@ class TelegramStreamRenderer:
         self.current_text = ""
         # 折叠协议代码块：只影响流式「显示」。current_text / response_parts / finish()
         # 恒为原始文本（落库 / 执行 / 镜像取的就是它们），折叠只在 _display_text() 临渲染时发生。
-        self._hide_blocks = normalize_bool(UserDataManager.get('hide_protocol_blocks', True), True)
+        self._hide_blocks = True
+        self._presentation_mode = _presentation_mode()
         # 去重基准：脱敏后文本较上次没变则跳过这次 draft/edit，长代码块流式时消息静止、零 API 抖动。
         self._last_display: Optional[str] = None
         self.pending_text = ""
@@ -1478,6 +1484,9 @@ def _remember_live_reply(reply, context, message_ids):
     bind_reply_message_ids(message_ids)
     if reply is not None:
         reply.presentation_message_ids = message_ids
+    turn = current_turn()
+    if turn is not None:
+        turn.start_reply(reply, message_ids)
     outbox = getattr(context.bot, 'outbox', None) or get_web_outbox()
     if reply is not None and outbox is not None:
         reply.web_live = {'epoch': outbox.snapshot()['epoch'], 'message_ids': message_ids}

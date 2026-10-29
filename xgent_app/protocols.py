@@ -644,6 +644,9 @@ class ProtocolParser:
             segments = cls.scan_folded_segments(raw)
             if len(segments) != 1 or segments[0].get("kind") != "block" or not segments[0].get("closed"):
                 return match.group(0)
+            if 'data-compact="1"' in match.group(0).split('>', 1)[0]:
+                from .presentation import protocol_block_html
+                return protocol_block_html(segments[0], 'folded')
             return cls._render_block_blockquote(segments[0], raw_copy=True)
         return cls._TG_FOLD_RE.sub(one, html_text)
 

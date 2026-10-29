@@ -151,6 +151,10 @@ class GlobalRecorder:
         普通记录失败只记日志；附件关联是完整上下文的必要条件，必须写入成功。
         """
         stamped_metadata = dict(metadata or {})
+        from xgent_app.presentation import record_presentation, current_turn
+        presentation = record_presentation(msg_type, content)
+        if presentation is not None:
+            stamped_metadata.setdefault('presentation', presentation)
         stamped_metadata.setdefault('src', _RECORDER_SOURCE_ID)
         ui_generation = active_ui_generation()
         if ui_generation is not None:
@@ -186,7 +190,16 @@ class GlobalRecorder:
             if rowid is None:
                 raise AttachmentContextError('工具结果留存失败，未调用下一轮模型。')
             tool_scope.row_ids.append(rowid)
+        turn = current_turn()
+        if turn is not None and rowid is not None:
+            if not hasattr(turn, 'record_ids'):
+                turn.record_ids = {}
+            turn.record_ids[msg_type] = rowid
+        if turn is not None and msg_type in {MessageType.AI_REPLY, MessageType.AGENT_RESULT, 'presentation_note', MessageType.RUNTIME_ERROR}:
+            turn.last_record_id = rowid
         if msg_type == MessageType.AI_REPLY:
+            if turn is not None:
+                turn.saved_reply(rowid)
             return rowid
         try:
             write_model_trace("operation", {
@@ -318,7 +331,7 @@ class GlobalRecorder:
             metadata['display'] = {'content': display, 'parse_mode': 'HTML'}
         if 'web_display' not in metadata:
             from xgent_app.web_display import build_web_display
-            metadata['web_display'] = build_web_display(content, fold=_should_hide_protocol_blocks())
+            metadata['web_display'] = build_web_display(content, fold=True, mode=_presentation_mode())
         return await GlobalRecorder.record(
             msg_type=MessageType.AI_REPLY,
             role='assistant',
@@ -368,6 +381,7 @@ class GlobalRecorder:
                 )
             except Exception as e:
                 logger.error(f"token 用量统计写入失败（已忽略，不中断主流程）: {e}")
+        return rowid
 
     @staticmethod
     async def record_media_reply(content: str, chat_id: Optional[int] = None,
@@ -1451,6 +1465,8 @@ async def publish_saved_reply(context, row_id, reply=None):
     """
     if row_id is None:
         return
+    if reply is not None:
+        await _sync_presentation_footer(context, row_id, reply)
     outbox = getattr(context.bot, 'outbox', None) or get_web_outbox()
     cli_relay = getattr(context.bot, '_is_xgent_cli_bot', False)
     if outbox is None and not cli_relay:
@@ -2225,6 +2241,7 @@ def make_generated_reply_persistence(db, conversation_id, chat_id: int,
                 raise AttachmentContextError(f"生成图片回复同步失败：{exc}") from exc
 
     reply = GeneratedMediaReply(extract_inline_generated_media, persist)
+    reply.presentation_model = model_name
     return reply
 
 

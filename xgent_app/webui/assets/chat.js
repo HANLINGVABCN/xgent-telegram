@@ -328,7 +328,7 @@
           if (c.tagName === "A" && a.name === "href") {
             if (!/^(https?:|mailto:)/i.test(a.value)) c.removeAttribute(a.name);
           } else if (c.tagName === "A" && (a.name === "target" || a.name === "rel")) {
-          } else if (c.tagName === "BLOCKQUOTE" && (a.name === "expandable" || a.name === "data-raw" || a.name === "data-output-path")) {
+          } else if (c.tagName === "BLOCKQUOTE" && (a.name === "expandable" || a.name === "data-raw" || a.name === "data-output-path" || (a.name === "data-compact" && a.value === "1"))) {
             // 保留：服务端 render_folded_html 用 <blockquote expandable> 标记
             // 「可展开折叠的协议代码块」（与电报原生 expandable 同源），网页据此做
             // 折叠交互（CSS blockquote[expandable] + bindContentClicks 里的点击切换）。
@@ -417,7 +417,12 @@
     if(webDisplay?.version===1 && Array.isArray(webDisplay.segments) &&
        webDisplay.segments.every(s=>s && ['markdown','html'].includes(s.kind) && typeof s.text==='string')){
       // Every segment uses the same allowlist. Never trust even stored/tool HTML.
-      return webDisplay.segments.map(s=>renderText(s.text,s.kind==='html'?'HTML':null)).join('\n');
+      let rendered=webDisplay.segments.map(s=>s.footer?'<div class="token-hud">'+renderText(s.text,'HTML')+'</div>':renderText(s.text,s.kind==='html'?'HTML':null)).join('\n');
+      for(const [key,label] of [['operation_details','执行详情'],['usage_details','用量详情'],['task_details','本次任务详情']]){
+        if(typeof webDisplay[key]==='string'&&webDisplay[key]&&webDisplay.presentation_mode==='folded')
+          rendered+='<details class="presentation-details"><summary>'+label+'</summary><pre>'+escapeHtml(webDisplay[key])+'</pre></details>';
+      }
+      return rendered;
     }
     return renderText(text, parseMode);
   }
@@ -428,8 +433,8 @@
     next.querySelectorAll('blockquote[expandable]').forEach(function(block){
       var key=block.getAttribute('data-raw'),path=block.getAttribute('data-output-path');
       var text=block.querySelector('pre')?.textContent||'';
-      var index=oldBlocks.findIndex(old=>key ? old.getAttribute('data-raw')===key :
-        old.getAttribute('data-output-path')===path && old._pbText===text);
+      var index=oldBlocks.findIndex(old=>old.getAttribute('data-compact')===block.getAttribute('data-compact') &&
+        (key ? old.getAttribute('data-raw')===key : old.getAttribute('data-output-path')===path && old._pbText===text));
       if(index>=0)block.replaceWith(oldBlocks.splice(index,1)[0]);
     });
     oldBlocks.forEach(block=>{clearTimeout(block._ft);block._outputRequest?.abort();});
@@ -443,6 +448,24 @@
     });
     enhanceBubbleContent(next);
     entry.body.replaceChildren(...next.childNodes);
+  }
+
+  function foldStateKey(block){
+    const row=block.closest('[data-record-id]');
+    if(!row)return null;
+    const blocks=Array.from(row.querySelectorAll('blockquote[expandable]'));
+    return (row.dataset.presentationConversationId||String(selectedConversationId))+':'+row.dataset.recordId+':'+(block.getAttribute('data-compact')==='1'?'folded':'detailed')+':'+blocks.indexOf(block);
+  }
+  function saveFoldState(block){
+    const key=foldStateKey(block);if(!key)return;
+    try{const values=JSON.parse(sessionStorage.getItem('xgent-fold-state')||'{}');values[key]=block.classList.contains('expanded');const keys=Object.keys(values);for(const old of keys.slice(0,Math.max(0,keys.length-1000)))delete values[old];sessionStorage.setItem('xgent-fold-state',JSON.stringify(values));}catch(e){}
+  }
+  function restoreFoldStates(entry){
+    try{const values=JSON.parse(sessionStorage.getItem('xgent-fold-state')||'{}');entry.body.querySelectorAll('blockquote[expandable]').forEach(block=>{const key=foldStateKey(block);if(key&&key in values&&!block.classList.contains('pb-short')){block.classList.toggle('expanded',values[key]);paintProtocolBody(block);}});}catch(e){}
+  }
+  function clearFoldStates(){
+    // Presentation is an application setting; a mode change resets every mode's initial fold state.
+    try{sessionStorage.removeItem('xgent-fold-state');}catch(e){}
   }
 
   function nowTime(timestamp) {
@@ -575,7 +598,8 @@
         var pbLm = /language-([a-zA-Z0-9_+#.-]+)/.exec(pbCode.className);
         if (pbLm) pbLang = pbLm[1];
       }
-      var short = !label && text.split("\n").length <= 3;
+      var compact = bq.getAttribute("data-compact") === "1";
+      var short = !compact && !label && text.split("\n").length <= 3;
 
       var head = document.createElement("div");
       head.className = "pb-head";
@@ -606,6 +630,7 @@
       }
       if (label) { label.className = "pb-folded"; bq.appendChild(label); }
       bq.classList.add("pb");
+      if (compact) bq.classList.add("pb-compact");
       if (short) bq.classList.add("pb-short");
       paintProtocolBody(bq);
     });
@@ -713,6 +738,7 @@
           if (String(window.getSelection() || "").length) return;
           if(foldBq.classList.contains("output-open")){closeOutputPage(foldBq);foldBq.classList.remove("expanded");}else foldBq.classList.toggle("expanded");
           paintProtocolBody(foldBq);
+          saveFoldState(foldBq);
         }, 250);
         return;
       }
@@ -885,6 +911,7 @@
     bubble.appendChild(actBar);
 
     var btns = null;
+    markup=platformPresentationButtons(markup);
     if (markup && markup.length) {
       btns = renderButtons(markup, messageId);
       if (btns) bubble.appendChild(btns);
@@ -1230,7 +1257,12 @@
     return container.childNodes.length ? container : null;
   }
 
+  function platformPresentationButtons(rows){
+    return rows?.map(row=>row.filter(button=>!String(button.callback_action||button.callback_data||'').startsWith('present_')&&!['用量详情','收起用量详情','完整输出'].includes(button.text))).filter(row=>row.length);
+  }
+
   function setButtons(entry, markup, messageId) {
+    markup=platformPresentationButtons(markup);
     if (entry.btns && entry.btns.parentNode) entry.btns.parentNode.removeChild(entry.btns);
     entry.btns = null;
     if (markup && markup.length) {
@@ -1301,6 +1333,10 @@
     if (frame.reply_markup !== undefined) {
       setButtons(entry, frame.reply_markup, frame.message_id != null ? frame.message_id : (frame.record_id || 0));
     }
+    if(frame.record_id!=null){
+      entry.durable=true;
+      if(frame.message_id!=null)byMessageId[frame.message_id]=entry;
+    }
     if (frame.media) appendHistoryMedia(entry, frame, role);
     if (frame.message_id != null && !frame.ui_message_id) byMessageId[frame.message_id] = entry;
     return entry;
@@ -1333,12 +1369,16 @@
     var frame={...message,type:'message',text:message.content??message.text,
       record_id:message.record_id??message.id,replace_message_ids:aliases};
     var entry=putTextFrame(role,frame);
+    entry.row.classList.toggle('presentation-hidden',!!message.hidden);
+    if(message.hidden)entry.row.classList.remove('msg-row');else entry.row.classList.add('msg-row');
     if(message.file_message&&entry.uploadProgress){entry.uploadProgress.remove();entry.uploadProgress=null;}
     entry.durable=!message.ui_message_id;
     aliases.forEach(function(mid){byMessageId[mid]=entry;});
     entry.row.dataset.historyCursor=message.history_cursor||entry.row.dataset.historyCursor||'';
     entry.row._historyOrder=[Number(message.timestamp)||0,message.ui_message_id?1:0,String(message.ui_message_id||message.record_id||message.id||'').padStart(20,'0')];
     if(frame.record_id!=null&&!message.ui_message_id){entry.row.dataset.recordId=String(frame.record_id);delete entry.row._optimisticEntry;}
+    entry.row.dataset.presentationConversationId=message.conversation_id||selectedConversationId||'global_memory';
+    restoreFoldStates(entry);
     if(message.turn_id)entry.row.dataset.turnId=String(message.turn_id);
     setConversationActions(entry,message);
     return entry;
@@ -1367,8 +1407,6 @@
     bar.querySelectorAll('.conversation-action').forEach(button=>button.remove());
     if(actions.branch_mode){
       var fork=conversationActionButton('fork-chat','分支到新聊天',()=>openBranchDialog(message,actions.branch_mode));
-      fork.classList.add('branch-chat-button');
-      fork.appendChild(actionNode('span','分支到新聊天'));
       bar.appendChild(fork);
     }
     if(actions.withdraw)bar.appendChild(conversationActionButton('undo','撤回此消息及之后',()=>openWithdrawDialog(message)));
@@ -1575,6 +1613,13 @@
       setBusy(!!window.XGentConversations?.running);
       return;
     }
+    if(frame.type==='presentation_changed'){
+      if(presentationViewMode!==frame.presentation_mode)clearFoldStates();
+      presentationViewMode=frame.presentation_mode;
+      refreshPresentation().catch(error=>toast('历史呈现更新失败：'+error.message,true));
+      loadSettings().catch(()=>{});
+      return;
+    }
     if(frame.conversation_id && selectedConversationId && frame.conversation_id !== selectedConversationId) {
       if(uploadQueue?.conversation_id===frame.conversation_id && ['turn_end','turn_error'].includes(frame.type) && uploadQueue.finish){
         uploadQueue.awaitingTurn=false;uploadQueue.finish(frame.type==='turn_error'?frame.text:null);
@@ -1599,6 +1644,9 @@
     if (isNearBottom()) requestAnimationFrame(function(){boundMessages(false);});
     if (!acceptUiFrame(frame)) return;
     if(frame.type==='record_snapshot'){
+      if(presentationViewMode&&frame.presentation_mode&&frame.presentation_mode!==presentationViewMode){
+        refreshPresentation([frame.record_id]).catch(()=>{});return;
+      }
       if(Number.isSafeInteger(frame.ui_generation)&&uiGeneration!==null&&frame.ui_generation!==uiGeneration){
         if(frame.ui_generation>uiGeneration)resync(true).catch(function(){});
         return;
@@ -2684,7 +2732,7 @@
   var SETTING_FIELDS = [
     { key: "thinking_level", label: "思考深度 / 推理等级", type: "select" },
     { key: "stream_mode", label: "打字机流式输出", type: "bool" },
-    { key: "hide_protocol_blocks", label: "折叠协议代码块", type: "bool" },
+    { key: "presentation_mode", label: "呈现模式", type: "select" },
     { key: "agent_mode", label: "Agent 智能体模式", type: "bool" },
     { key: "text_stitch_mode", label: "文字拼接模式", type: "select" },
     { key: "global_depth", label: "全局记忆轮数", type: "number", min: 1 },
@@ -2919,8 +2967,33 @@
     return box;
   }
 
+  var presentationViewMode=null, presentationRequest=0, settingsRequest=0;
+  async function refreshPresentation(requestedIds){
+    const version=++presentationRequest,cid=selectedConversationId;
+    const ids=Array.from(new Set([...Object.values(byMessageId).map(e=>Number(e.row.dataset.recordId)).filter(Number.isSafeInteger),...(requestedIds||[]).filter(Number.isSafeInteger)]));
+    if(!ids.length)return;
+    const anchor=Array.from(log.children).find(r=>r.classList.contains('msg-row')&&r.getBoundingClientRect().bottom>log.getBoundingClientRect().top);
+    const top=anchor?.getBoundingClientRect().top,stick=isNearBottom();
+    const results=[];
+    for(let i=0;i<ids.length;i+=100){
+      results.push(await api('/api/workbench/history?presentation_ids='+ids.slice(i,i+100).join(',')+'&conversation_id='+encodeURIComponent(cid)));
+      if(version!==presentationRequest||cid!==selectedConversationId)return;
+    }
+    invalidateHistoryPreloads(false);invalidateHistoryPreloads(true);
+    renderingHistory++;
+    try{for(const data of results){if(data.ui_generation!==uiGeneration)return;for(const m of data.messages)putHistoryFrame(m,streamEpoch);}}
+    finally{renderingHistory--;}
+    sortHistoryRows();updateEmptyState();
+    if(stick)scrollDown();else if(anchor?.isConnected)log.scrollTop+=anchor.getBoundingClientRect().top-top;
+  }
+
   function loadSettings() {
+    const version=++settingsRequest;
     return api("/api/config").then(function (data) {
+      if(version!==settingsRequest)return data;
+      const nextMode=data.values.presentation_mode;
+      if(presentationViewMode&&nextMode&&nextMode!==presentationViewMode){clearFoldStates();presentationViewMode=nextMode;refreshPresentation().catch(()=>{});}
+      else if(nextMode)presentationViewMode=nextMode;
       settingsRows.innerHTML = "";
       SETTING_FIELDS.forEach(function (field) {
         if (!(field.key in data.values)) return;
@@ -3027,6 +3100,7 @@
       });
     });
   }
+  window.addEventListener('xgent-workbench-change',event=>{if(event.detail?.pages?.includes('settings'))loadSettings().catch(()=>{});});
 
   function boot() {
     loggedOut=false;

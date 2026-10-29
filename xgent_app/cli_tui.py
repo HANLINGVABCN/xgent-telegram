@@ -109,6 +109,7 @@ class Block:
     collapsible: bool
     expanded: bool = False
     header: str = ""
+    force_folded: bool = False
 
     _code_lines: List[str] = field(init=False, repr=False)
     _foldable: bool = field(init=False, repr=False)
@@ -120,7 +121,7 @@ class Block:
         self.source_body = next((getattr(line, 'source_body', None) for line in self.lines
                                  if getattr(line, 'source_body', None) is not None), None)
         self._foldable = self.collapsible and (
-            len(self._code_lines) > _PREVIEW_LINES or len(self._code_lines) != len(self.lines))
+            self.force_folded or len(self._code_lines) > _PREVIEW_LINES or len(self._code_lines) != len(self.lines))
         match = re.search(r"·\s*(\d+)\s*行$", _strip_ansi(self.header).strip())
         self.total_lines = int(match.group(1)) if match else len(self._code_lines)
 
@@ -181,7 +182,7 @@ def segment_lines(lines: Sequence[str]) -> List[Block]:
                     body.append(lines[k])
                     j = k + 1
                 _flush()
-                blocks.append(Block(body, collapsible=True, header=line))
+                blocks.append(Block(body, collapsible=True, header=line, force_folded=bool(getattr(line, 'force_folded', False))))
                 i = j
                 continue
             line = lines[i]
@@ -239,7 +240,8 @@ class MessageModel:
             old_folds = [b for b in old.blocks if b.foldable]
             new_folds = [b for b in blocks if b.foldable]
             for ob, nb in zip(old_folds, new_folds):
-                nb.expanded = ob.expanded
+                if ob.force_folded == nb.force_folded:
+                    nb.expanded = ob.expanded
             if attention and not old.attention:
                 for block in new_folds:
                     block.expanded = True
@@ -459,6 +461,7 @@ class _ArchiveLine(str):
 
 class TuiMessageRenderer(MessageRenderer):
     """只供全屏 TUI 使用：无双横线气泡/整行底色，legacy 和其他通道不变。"""
+    interactive_folds = True
 
     def __init__(self, palette: Palette, width: int):
         super().__init__(palette, width, wrap_text=_tui_wrap_text)
@@ -479,7 +482,9 @@ class TuiMessageRenderer(MessageRenderer):
         if lines and parse_mode is not None and "html" in str(parse_mode).lower():
             match = re.search(r'<blockquote\b[^>]*\bdata-output-path="([^"]+)"', str(text))
             if match:
-                lines[0] = _ArchiveLine(lines[0], html.unescape(match[1]))
+                line = _ArchiveLine(lines[0], html.unescape(match[1]))
+                line.force_folded = bool(getattr(lines[0], 'force_folded', False))
+                lines[0] = line
         return lines
 
     def render_message(self, text: str, buttons: Sequence[Tuple[str, str]] = (),

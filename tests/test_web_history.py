@@ -491,6 +491,8 @@ class HistoryReplayFoldTests(unittest.TestCase):
         server = types.ModuleType("xgent_server")
         server.markdown_to_telegram_html = lambda t: "<p>" + t + "</p>"
         server._should_hide_protocol_blocks = lambda: hide
+        server.UserDataManager = types.SimpleNamespace(get=lambda key, default=None:
+            ('folded' if hide else 'detailed') if key == 'presentation_mode' else default)
         return server
 
     def _build(self, content, *, hide=True, metadata=None, server=True):
@@ -516,12 +518,14 @@ class HistoryReplayFoldTests(unittest.TestCase):
         self.assertNotIn("```", visible)
         self.assertEqual("ai_reply", msg["msg_type"])  # 记录本身不变
 
-    def test_switch_off_uses_same_html_prose_renderer_as_live(self):
+    def test_detailed_uses_same_prose_renderer_and_classic_protocol_blocks(self):
         content = "先看磁盘：\n" + self._block() + "\n完成。"
         msg = self._build(content, hide=False)
         self.assertEqual("HTML", msg.get("parse_mode"))
-        self.assertEqual("<p>" + content + "</p>", msg["content"])
-        self.assertNotIn("<blockquote expandable", msg["content"])
+        self.assertIn("<p>先看磁盘：</p>", msg["content"])
+        self.assertIn("<p>完成。</p>", msg["content"])
+        self.assertIn("<blockquote expandable", msg["content"])
+        self.assertNotIn('data-compact="1"', msg["content"])
 
     def test_no_protocol_block_unified_to_html(self):
         # 无协议块的纯 markdown（折叠开关 ON）也统一走 markdown_to_telegram_html：
@@ -531,11 +535,13 @@ class HistoryReplayFoldTests(unittest.TestCase):
         self.assertEqual("HTML", msg["parse_mode"])
         self.assertEqual("<p>" + content + "</p>", msg["content"])   # 假渲染器：<p>…</p>
 
-    def test_display_metadata_takes_precedence(self):
-        # 已有 display（live 落库的镜像）优先，不再二次折叠。
+    def test_current_presentation_overrides_legacy_display_snapshot(self):
+        # 历史按当前模式投影，旧 live 显示快照不能冻结新的呈现选择。
         msg = self._build(self._block(), hide=True,
                           metadata={"display": {"content": "已折好", "parse_mode": "HTML"}})
-        self.assertEqual("已折好", msg["content"])
+        self.assertNotIn("已折好", msg["content"])
+        self.assertIn('data-compact="1"', msg["content"])
+        self.assertIn('df -h', msg["content"])
         self.assertEqual("HTML", msg["parse_mode"])
 
     def test_no_server_namespace_falls_back_to_raw(self):

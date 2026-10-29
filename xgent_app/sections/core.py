@@ -871,22 +871,35 @@ async def send_token_usage_message(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     timestamp 早于正文，刷新后顺序反成「tokens + 输出」。改为把 token 文本写进
     token_text_sink，由调用方在正文落库之后再落库，保证顺序为「输出 + tokens」。
     """
+    from xgent_app.presentation import current_turn
+    turn = current_turn()
+    if turn is not None and turn.active_reply is not None:
+        turn.active_reply['usage'] = {k: v for k, v in (usage or {}).items() if k != 'raw_usage'}
+        turn.active_reply['elapsed_seconds'] = elapsed_seconds
     text = build_token_usage_message(usage, elapsed_seconds)
     if not text:
         return
+    sink_entry = None
     if token_text_sink is not None:
         sink_usage = None
         if usage:
             sink_usage = {k: v for k, v in usage.items()
                          if k != 'raw_usage' and v is not None}
-        token_text_sink.append({'text': text, 'usage': sink_usage})
+        sink_entry = {'text': text, 'usage': sink_usage, 'message_ids': []}
+        token_text_sink.append(sink_entry)
+    if turn is not None and turn.folded:
+        return
     try:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode=constants.ParseMode.HTML,
-            disable_notification=True
-        )
+        from xgent_app.presentation import message_presentation
+        with message_presentation({'kind': 'token_usage', 'mode': turn.mode if turn else 'detailed'}):
+            sent = await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=constants.ParseMode.HTML,
+                disable_notification=True
+            )
+        if sink_entry is not None and type(getattr(sent, 'message_id', None)) is int:
+            sink_entry['message_ids'].append(sent.message_id)
     except Exception as e:
         logger.debug(f"token 使用量消息发送失败: {e}")
         write_model_trace("telegram_token_usage_error", {

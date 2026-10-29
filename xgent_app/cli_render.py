@@ -37,7 +37,11 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 # 协议折叠块头：「{icon} {name}-x[ path] · {N} 行」（protocols._render_block_blockquote）
-_FOLD_HEADER_RE = re.compile(r"^\S+\s+\S+-x\b.*·\s*\d+\s*行$")
+_FOLD_HEADER_RE = re.compile(r"^\S+\s+.+·\s*\d+\s*行$")
+
+
+class CompactFoldHeader(str):
+    force_folded = True
 
 # --------------------------------------------------------------------------
 # 常驻输入框挂载
@@ -635,6 +639,7 @@ class MessageRenderer:
     只负责"算出要打印哪些行"，不碰 stdout——这样可以脱离终端直接单测：
     给定 HTML 进去，断言渲染出的行长什么样。
     """
+    interactive_folds = False
 
     def __init__(self, palette: Optional[Palette] = None, width: int = 80,
                  wrap_text: Optional[Callable[[str, int], Sequence[str]]] = None):
@@ -691,6 +696,13 @@ class MessageRenderer:
         """消息正文 -> 终端行。"""
         raw = str(text)
         is_html = parse_mode is not None and "html" in str(parse_mode).lower()
+        compact_headers = set()
+        if is_html:
+            for match in re.finditer(r'<blockquote[^>]*data-compact="1"[^>]*>(.*?)\n<pre>', raw, re.S):
+                compact_headers.add(_html.unescape(re.sub(r'<[^>]+>', '', match[1])).strip())
+            if not self.interactive_folds:
+                raw = re.sub(r'<blockquote[^>]*data-compact="1"[^>]*>(.*?)\n<pre>.*?</pre></blockquote>',
+                             lambda match: match[1], raw, flags=re.S)
         if is_html and 'data-raw="' in raw:
             from .protocols import ProtocolParser
             raw = ProtocolParser.restore_folded_html(raw)
@@ -709,7 +721,10 @@ class MessageRenderer:
                 if _FOLD_HEADER_RE.search(_ANSI_RE.sub("", paragraph).strip()):
                     # 协议折叠块头（「📄 file-x /长路径 · 70 行」）整行不主动折：交给终端 /
                     # TUI 软换行，保证它永远是一行，TUI 才能稳定识别成可折叠块。
-                    lines.append(indent + paragraph.rstrip())
+                    line = indent + paragraph.rstrip()
+                    if _ANSI_RE.sub('', paragraph).strip() in compact_headers:
+                        line = CompactFoldHeader(line)
+                    lines.append(line)
                     continue
                 for wrapped in self._wrap_text(paragraph.rstrip(), body_width):
                     lines.append(indent + wrapped)

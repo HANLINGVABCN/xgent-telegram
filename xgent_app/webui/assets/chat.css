@@ -374,8 +374,6 @@
   .act-btn:hover { background: var(--surface-2); color: var(--accent); }
   .act-btn.done { color: var(--ok) !important; }
   .act-btn .icon { width: 13px; height: 13px; }
-  .act-btn.branch-chat-button { width:auto; height:32px; padding:5px 10px; gap:7px; border:1px solid var(--line); background:var(--surface); color:var(--text-2); font:inherit; white-space:nowrap; }
-  .act-btn.branch-chat-button .icon { width:18px; height:18px; flex-shrink:0; }
 
   .conversation-lineage {
     margin: 2px 4px 6px; padding: 8px 10px;
@@ -616,6 +614,14 @@
   }
   .token-pill .metric { display: inline-flex; align-items: center; gap: 3px; }
   .token-pill .speed { color: var(--accent); font-weight: 600; }
+  .presentation-hidden { display: none !important; }
+  .bubble blockquote.pb.pb-compact:not(.expanded) pre { display: none; }
+  .token-hud { margin-top: 5px; color: var(--text-3); font-size:max(11px,calc(var(--web-ui-font-size,13px) * .85)); font-variant-numeric:tabular-nums; line-height:1.4; overflow-wrap:anywhere; }
+  .token-hud i { font-style: normal; }
+  .presentation-details { margin:4px 0; color:var(--text-3); font-size:max(11px,calc(var(--web-ui-font-size,13px) * .85)); }
+  .presentation-details summary { cursor:pointer; width:fit-content; padding:3px 0; }
+  .presentation-details pre { max-height:60vh; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; }
+  @media(max-width:600px) { .token-hud,.presentation-details { font-size:max(12px,calc(var(--web-ui-font-size,13px) * .85)); } }
 
   /* ---- 媒体气泡与文件卡片 ---- */
   .message-media { display: grid; grid-template-columns:minmax(0,1fr); gap: 12px; min-width: 0; margin-bottom: 12px; }

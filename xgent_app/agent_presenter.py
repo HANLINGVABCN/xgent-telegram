@@ -100,7 +100,14 @@ def build_standard_operation_presentation(
         "fetch": build_fetch_presentation,
     }
     builder = builders.get(str(result.get("kind") or ""))
-    return builder(result) if builder is not None else None
+    detailed = builder(result) if builder is not None else None
+    from .presentation import current_turn, operation_html
+    turn = current_turn()
+    if turn is not None:
+        turn.observe_operation(result, detailed)
+        if turn.folded:
+            return operation_html(result)
+    return detailed
 
 
 def build_shell_presentation(
@@ -122,10 +129,19 @@ def build_shell_presentation(
     if wait_seconds is not None:
         wait_note = f"\n本次等待/捕获耗时: {escape_html(wait_seconds)} 秒"
     fold = fold_output_block(display_output, kind="shell", icon="🖥️")
-    return (
+    detailed = (
         f"🖥️ <b>Agent Shell {escape_html(action_label)}</b>\n"
         f"会话: <code>{escape_html(session_id)}</code> · {escape_html(running_note)} · {escape_html(pty_note)}\n"
         f"{status_emoji} 状态: <code>{escape_html(shell_result.get('status') or shell_result.get('return_code') or '')}</code>"
         f"{wait_note}{escape_html(pause_note)}\n"
         f"{fold}"
     )
+    from .presentation import current_turn, operation_html
+    turn = current_turn()
+    if turn is not None:
+        result = {**shell_result, 'kind': (turn.active_operation or {}).get('kind', 'shell'),
+                  'session_id': session_id, 'output': display_output}
+        turn.observe_operation(result, detailed)
+        if turn.folded:
+            return operation_html(result)
+    return detailed

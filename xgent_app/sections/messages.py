@@ -31,6 +31,145 @@ from xgent_app.agent_presenter import (
     build_shell_presentation,
     build_standard_operation_presentation,
 )
+from xgent_app.presentation import (
+    PresentationTurn, presentation_turn, current_turn, normalize_mode,
+    footer_html, summary_line, metadata_dict, message_presentation,
+)
+from xgent_app.presentation_delivery import PresentationContext
+from xgent_app.web_display import web_display_scope, build_web_display
+
+
+def _presentation_buttons(row_id, *, expanded=False, stop=False, output=False):
+    rows = []
+    if row_id is not None:
+        rows.append([InlineKeyboardButton('收起用量详情' if expanded else '用量详情',
+            callback_data=f'present_usage:{row_id}:{0 if expanded else 1}')])
+        if output:
+            rows.append([InlineKeyboardButton('完整输出', callback_data=f'present_output:{row_id}')])
+    if stop:
+        rows.extend(build_stop_keyboard().inline_keyboard)
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _sync_presentation_footer(context, row_id, reply):
+    turn = current_turn()
+    if turn is None:
+        return
+    facts = next((item for item in turn.replies if item.get('record_id') == row_id), None)
+    if facts is None:
+        return
+    db = await BotMemoryDB.get_instance()
+    row = await db.get_display_message(row_id)
+    if row is None:
+        return
+    metadata = metadata_dict(row.get('metadata'))
+    presentation = {k: v for k, v in facts.items() if k not in {'record_id', 'message_ids', 'base_fragment'}}
+    presentation['revision'] = int((metadata.get('presentation') or {}).get('revision', 0)) + 1
+    metadata['presentation'] = presentation
+    footer = footer_html(presentation) if turn.folded else ''
+    content = _folded_display_html(row['content'])
+    metadata['display'] = {'content': content + ('\n\n' + footer if footer else ''), 'parse_mode': 'HTML'}
+    metadata['web_display'] = build_web_display(row['content'], fold=True,
+        mode=turn.mode, presentation=presentation)
+    ids = facts.get('message_ids') or []
+    message = next((context.bot.messages.get(mid) for mid in reversed(ids)
+                    if context.bot.messages.get(mid) is not None), None)
+    if turn.folded and footer and message is not None:
+        fixed_id = facts.setdefault('footer_message_id', message.message_id)
+        message = context.bot.messages.get(fixed_id, message)
+        base = facts.setdefault('base_fragment', message.base_text)
+        if 'html' not in str(message.parse_mode).lower():
+            base = facts['base_fragment'] = markdown_to_telegram_html(base)
+        presentation['footer_base_html'] = base
+        # One semantic Web reply, even if the Telegram transport needs another fragment.
+        display = build_web_display(row['content'], fold=True, mode=turn.mode,
+            reply_message_id=ids[0], presentation=presentation)
+        stop = bool(AgentExecutor.extract_protocol_blocks(row['content'])) and getattr(turn, 'agent_enabled', False) and not presentation.get('summary')
+        with web_display_scope(display), message_presentation({'kind': 'ai_reply', 'mode': turn.mode}):
+            chunks = split_html_for_telegram(base + '\n\n' + footer, 3900)
+            presentation['footer_message_html'] = chunks[-1]
+            await safe_edit_text(message, chunks[0], parse_mode=constants.ParseMode.HTML,
+                reply_markup=_presentation_buttons(row_id, stop=stop) if len(chunks)==1 else None)
+            extra_ids = facts.setdefault('footer_fragment_ids', [])
+            for index, chunk in enumerate(chunks[1:]):
+                extra = context.bot.messages.get(extra_ids[index]) if index < len(extra_ids) else None
+                if extra is not None:
+                    await safe_edit_text(extra, chunk, parse_mode=constants.ParseMode.HTML,
+                        reply_markup=_presentation_buttons(row_id, stop=stop) if index==len(chunks)-2 else None)
+                else:
+                    sent = await safe_send_message(context, message.chat_id, chunk, parse_mode=constants.ParseMode.HTML,
+                        reply_markup=_presentation_buttons(row_id, stop=stop) if index==len(chunks)-2 else None)
+                    for item in sent or []:
+                        extra_ids.append(item.message_id)
+                        if item.message_id not in ids:
+                            ids.append(item.message_id)
+        message.record_id = row_id
+    live = metadata.get('web_live')
+    if isinstance(live, dict):
+        live['message_ids'] = list(ids)
+    await db.backfill_attachment_metadata(row_id, row.get('metadata'), metadata)
+
+
+async def _finish_presentation(context, turn):
+    if not turn.operations:
+        return
+    summary = turn.summary()
+    last_reply = turn.replies[-1] if turn.replies else None
+    if last_reply and turn.last_record_id == last_reply['record_id']:
+        last_reply['summary'] = summary
+        await _sync_presentation_footer(context, last_reply['record_id'], None)
+        await publish_saved_reply(context, last_reply['record_id'])
+        return
+    row_id, message = turn.last_record_id, turn.last_message
+    if message is not None and getattr(message, 'media', False) and turn.folded:
+        # A transport without caption editing still needs one readable terminal block.
+        notice = turn.reason or '操作已结束。'
+        note_presentation = {'version': 1, 'mode': turn.mode, 'kind': 'presentation_note', 'summary': {**summary, 'reason': ''}}
+        row_id = await GlobalRecorder.record('presentation_note', 'assistant', notice, chat_id=message.chat_id,
+            metadata={'presentation': note_presentation})
+        with message_presentation({'kind': 'presentation_note', 'mode': turn.mode}), web_display_scope(build_web_display(notice, mode=turn.mode, presentation=note_presentation)):
+            await safe_send_message(context, message.chat_id,
+                html.escape(notice) + '\n<i>' + html.escape(summary_line({**summary, 'reason': ''})) + '</i>', parse_mode=constants.ParseMode.HTML)
+        await publish_saved_reply(context, row_id)
+        return
+    if row_id is None or message is None:
+        return
+    db = await BotMemoryDB.get_instance()
+    row = await db.get_display_message(row_id)
+    if row is None:
+        return
+    metadata = metadata_dict(row.get('metadata'))
+    presentation = metadata.setdefault('presentation', {'version': 1, 'mode': turn.mode, 'kind': row['msg_type']})
+    presentation['revision'] = int(presentation.get('revision', 0)) + 1
+    presentation['summary'] = summary
+    if turn.folded:
+        base = message.base_text if 'html' in str(message.parse_mode).lower() else html.escape(message.base_text)
+        display = base + '\n\n<i>' + html.escape(summary_line(summary)) + '</i>'
+        with message_presentation({'kind': message.kind, 'mode': turn.mode}):
+            await safe_edit_text(message, display, parse_mode=constants.ParseMode.HTML,
+                                 reply_markup=message.reply_markup)
+        metadata['display'] = {'content': display, 'parse_mode': 'HTML'}
+    await db.backfill_attachment_metadata(row_id, row.get('metadata'), metadata)
+    await publish_saved_reply(context, row_id)
+
+
+def _is_presentation_stop(button):
+    action = str(button.callback_data or '')
+    try:
+        action = CallbackDataStore.get(action)
+    except (ConversationError, UiHistoryError):
+        pass
+    return action == 'act_stop_generation' or action.startswith('act_stop_generation:')
+
+
+async def _clear_presentation_stops(context):
+    for message in list(context.bot.messages.values()):
+        rows = getattr(message.reply_markup, 'inline_keyboard', ())
+        kept = [row for row in rows if not any(_is_presentation_stop(button) for button in row)]
+        if len(kept) != len(rows):
+            with contextlib.suppress(Exception):
+                await context.bot.edit_message_reply_markup(chat_id=message.chat_id, message_id=message.message_id,
+                    reply_markup=InlineKeyboardMarkup(kept) if kept else None)
 
 def build_document_attachment_payload(doc_name: str, content_bytes: bytes, caption: str,
                                       context_prefix: str = "", mime_type: Optional[str] = None,
@@ -1762,15 +1901,30 @@ async def process_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
             db = await BotMemoryDB.get_instance()
             generation = await db.get_attachment_generation()
             with runtime_error_scope(update.effective_chat.id, generation):
-                try:
-                    await _process_conversation_inner(
-                        update, context, text, content_override, force_agent_mode,
-                        reset_agent_iterations, agent_origin, resume_state, queued_messages,
-                    )
-                except Exception as exc:
-                    mark_outcome('failed')
-                    await GlobalRecorder.record_error(exc, update.effective_chat.id, source='conversation')
-                    raise
+                turn = PresentationTurn(normalize_mode(UserDataManager.get('presentation_mode', 'folded')))
+                context = PresentationContext(context, turn)
+                with presentation_turn(turn):
+                    try:
+                        await _process_conversation_inner(
+                            update, context, text, content_override, force_agent_mode,
+                            reset_agent_iterations, agent_origin, resume_state, queued_messages,
+                        )
+                    except Exception as exc:
+                        turn.reason = '⚠️ 本次处理失败，已有结果已保留。'
+                        mark_outcome('failed')
+                        await GlobalRecorder.record_error(exc, update.effective_chat.id, source='conversation')
+                        raise
+                    finally:
+                        if is_stop_requested():
+                            turn.reason = '⏹️ 已停止。'
+                        try:
+                            await _finish_presentation(context, turn)
+                        except (ConversationError, asyncio.CancelledError):
+                            raise
+                        except Exception:
+                            logger.warning('任务汇总显示失败，工具执行与原始记录已保留', exc_info=True)
+                        finally:
+                            await _clear_presentation_stops(context)
         finally:
             AgentExecutor._execution_context.reset(execution_token)
             publish_conversation_event(context, {'type': 'generation_end'})
@@ -1785,6 +1939,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                                        queued_messages=None):
     """process_conversation 内部实现"""
     agent_mode = force_agent_mode or UserDataManager.get('agent_mode', False)
+    if current_turn() is not None:
+        current_turn().agent_enabled = agent_mode
     agent_origin = agent_origin or AgentTurnOrigin.user()
     stream_mode = normalize_bool(UserDataManager.get('stream_mode', True), True)
     db = await BotMemoryDB.get_instance()
@@ -1965,12 +2121,15 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
     # token 用量在正文落库之后落库，保证 timestamp 晚于正文，刷新后顺序为「输出 + tokens」。
     if token_text:
         _entry = token_text[0]
-        await GlobalRecorder.record_token_usage(
+        token_row_id = await GlobalRecorder.record_token_usage(
             _entry['text'] if isinstance(_entry, dict) else _entry,
             update.effective_chat.id,
             usage=_entry.get('usage') if isinstance(_entry, dict) else None,
             model=model
         )
+        if isinstance(_entry, dict) and _entry.get('message_ids'):
+            from types import SimpleNamespace
+            await publish_saved_reply(context, token_row_id, SimpleNamespace(presentation_message_ids=_entry['message_ids']))
     agent_turn_history: List[Dict[str, Any]] = list(history)
     agent_turn_history.append({'role': 'assistant', 'content': response})
     
@@ -2097,6 +2256,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     active_tool_result.set(ToolResultScope() if retain_tools else None)
                     smart_notice = _smart_match_notice(block)
                     block_type = block['type']
+                    if current_turn() is not None:
+                        current_turn().start_operation(block)
                     round_state.note_over_eligibility(block_type)
 
                     if block_type in {'read', 'edit', 'grep', 'run', 'search', 'fetch', 'intel'}:
@@ -2125,15 +2286,15 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                     # 块里。这里只发出去，不执行、不进回灌载荷。拦不拦得住由循环末尾的
                     # apply_over 定——白名单外的协议或任何一个失败都会作废它。
                     # 收尾语无条件发出：即便 over 随后作废，模型改口的话会跟在它后面。
-                    # 不单独落库：这段文字本来就在助手回复里，再记一份等于给下一轮添噪音。
+                    # 仅保存显示记录；presentation_note 不参与模型上下文。
                     if block_type == 'over':
                         round_state.over_text = str(block.get('body') or '').strip()
                         if round_state.over_text:
-                            await safe_send_message(
-                                context,
-                                update.effective_chat.id,
-                                round_state.over_text,
-                            )
+                            await GlobalRecorder.record('presentation_note', 'assistant', round_state.over_text,
+                                chat_id=update.effective_chat.id)
+                            with message_presentation({'kind': 'presentation_note', 'mode': current_turn().mode}), web_display_scope(build_web_display(round_state.over_text, mode=current_turn().mode)):
+                                await safe_send_message(context, update.effective_chat.id,
+                                    markdown_to_telegram_html(round_state.over_text), parse_mode=constants.ParseMode.HTML)
                         continue
 
                     standard_operation = await dispatch_standard_protocol(
@@ -2349,6 +2510,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             notice=f"[ask] 已向用户弹出表单（{len(ask_form.questions)} 个问题），等待提交。",
                         )
                         form_shown = True
+                        if current_turn() is not None:
+                            current_turn().reason = '📝 等待填写表单。'
                         round_state.should_continue = False
                         break  # 一条消息只处理第一个 ask 表单，其余忽略
 
@@ -2719,12 +2882,15 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             await publish_saved_reply(context, getattr(generated_reply, 'record_id', None), generated_reply)
             if token_text:
                 _entry = token_text[0]
-                await GlobalRecorder.record_token_usage(
+                token_row_id = await GlobalRecorder.record_token_usage(
                     _entry['text'] if isinstance(_entry, dict) else _entry,
                     update.effective_chat.id,
                     usage=_entry.get('usage') if isinstance(_entry, dict) else None,
                     model=model
                 )
+                if isinstance(_entry, dict) and _entry.get('message_ids'):
+                    from types import SimpleNamespace
+                    await publish_saved_reply(context, token_row_id, SimpleNamespace(presentation_message_ids=_entry['message_ids']))
             agent_turn_history = next_history
             agent_turn_history.append({'role': 'assistant', 'content': response})
 

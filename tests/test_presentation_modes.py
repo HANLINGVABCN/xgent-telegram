@@ -1,0 +1,179 @@
+"""Visible message counts, dynamic history and statistics use the actual turn pipeline."""
+import pytest
+
+from tests.test_external_sync import ProbeMixin
+from tests.test_full_output_web import full_output_server  # noqa: F401
+from xgent_app.presentation import operation_html, usage_line, usage_details
+from xgent_app.cli_render import Palette, MessageRenderer
+from xgent_app.cli_tui import PtScreen
+
+
+@pytest.fixture(scope='module')
+def turns():
+    return ProbeMixin().run_probe(r'''
+import asyncio,json,tempfile
+from pathlib import Path
+from unittest.mock import patch
+import xgent_server as bot
+from tests.attachment_request_probe import Harness
+from xgent_app.web_history import build_history_message
+async def main():
+    cases=[]
+    for mode in ('folded','detailed'):
+      for stream,style in ((False,'foreground'),(True,'foreground'),(True,'background')):
+        with tempfile.TemporaryDirectory() as folder:
+          async with Harness(bot,folder) as h:
+            bot.UserDataManager.set('presentation_mode',mode)
+            bot.UserDataManager.set('agent_mode',True)
+            bot.UserDataManager.set('stream_mode',stream)
+            bot.UserDataManager.set('stream_style',style)
+            replies=['好的，主人，\n```run-x\n<<BEGIN_PRESENT123456\nuptime\n<<END_PRESENT123456\n```\n主人稍等马上。',
+                     '主人，当前负载为 0.15、0.20、0.18。']
+            raw=list(replies)
+            def response(kwargs):
+                kwargs['usage_sink'].append({'input_tokens':2840,'output_tokens':38,'cached_tokens':2130,'total_tokens':2878})
+                return replies.pop(0)
+            async def complete(*args,**kwargs):return response(kwargs),None
+            async def chunks(*args,**kwargs):yield response(kwargs)
+            async def operation(*args,**kwargs):return {'kind':'run','success':True,'return_code':0,
+                'output':'load average: 0.15, 0.20, 0.18','notice':'[run结果] return_code=0 load average: 0.15, 0.20, 0.18',
+                'context_message':{'role':'user','content':'[run结果] load average: 0.15, 0.20, 0.18'}}
+            with patch.object(bot.ModelClient,'think_and_reply',complete),patch.object(bot.ModelClient,'think_and_reply_stream',chunks),patch.object(bot,'dispatch_standard_protocol',operation):
+                await h.turn('去查下负载')
+            frames=h.drain_frames()
+            rows=await h.db.get_display_history(0)
+            shown=[build_history_message(row,bot.ArtifactManager.ROOT_DIR,folder) for row in rows]
+            refreshed=[build_history_message(row,bot.ArtifactManager.ROOT_DIR,folder) for row in rows]
+            other='detailed' if mode=='folded' else 'folded'
+            bot.UserDataManager.set('presentation_mode',other)
+            switched=[build_history_message(row,bot.ArtifactManager.ROOT_DIR,folder) for row in rows]
+            from xgent_app.workbench import Workbench
+            loaded=[str(row['id']) for row,message in zip(rows,shown) if not message.get('hidden')]
+            subset=await Workbench(vars(bot)).history({'presentation_ids':','.join(loaded)})
+            bot.UserDataManager.set('presentation_mode',mode)
+            restored=[build_history_message(row,bot.ArtifactManager.ROOT_DIR,folder) for row in rows]
+            ai=[r for r in rows if r['msg_type']=='ai_reply']
+            meta=[json.loads(r['metadata']) if isinstance(r['metadata'],str) else r['metadata'] for r in ai]
+            final=[f for f in frames if f['type']=='record_snapshot' and f.get('record_id')==ai[-1]['id']][-1]
+            cases.append({'name':f'{mode}/{stream}/{style}','mode':mode,'shown':shown,'refreshed':refreshed,
+              'switched':switched,'restored':restored,'raw':[r['content'] for r in ai], 'expected_raw':raw,
+              'metadata':meta,'final':final,'frames':frames,'subset':subset['messages'],'stats':len(await h.db.get_token_stats())})
+    print(json.dumps(cases,ensure_ascii=False))
+asyncio.run(main())
+''')
+
+
+def visible(messages):
+    return [message for message in messages if not message.get('hidden') and message['msg_type']!='ui_message']
+
+
+def test_two_model_replies_one_operation_and_four_visible_blocks(turns):
+    for case in turns:
+        assert case['raw']==case['expected_raw'],case['name']
+        assert case['stats']==2,case['name']
+        summary=case['metadata'][-1]['presentation']['summary']
+        assert (summary['rounds'],summary['operations'])==(2,1),case['name']
+        if case['mode']=='folded':
+            messages=visible(case['shown'])
+            assert [m['msg_type'] for m in messages]==['user_text','ai_reply','agent_result','ai_reply'],case['name']
+            assert '共执行 2 轮，1 个操作' in messages[-1]['content']
+            assert '返回码' not in messages[2]['content']
+            assert 'data-compact="1"' in messages[1]['content']
+
+
+def test_live_refresh_switch_and_switch_back_preserve_content_and_ids(turns):
+    for case in turns:
+        assert case['shown']==case['refreshed']==case['restored'],case['name']
+        assert [m['id'] for m in case['shown']]==[m['id'] for m in case['switched']]
+        assert case['shown']!=case['switched'],case['name']
+        final=case['final']
+        matching=next(m for m in case['shown'] if m['id']==final['record_id'])
+        assert final['text']==matching['content'],case['name']
+        assert final['web_display']==matching['web_display'],case['name']
+        assert [m['id'] for m in case['subset']]==[m['id'] for m in case['switched']],case['name']
+
+
+def test_completed_turn_removes_every_stop_button_and_preserves_token_kind(turns):
+    for case in turns:
+        keyboards={}
+        for frame in case['frames']:
+            if frame['type']=='delete':
+                keyboards.pop(frame.get('message_id'),None)
+                continue
+            if frame.get('message_id') is not None and 'reply_markup' in frame:
+                keyboards[frame['message_id']]=frame['reply_markup'] or []
+        assert all('停止回答' not in button['text'] for rows in keyboards.values() for row in rows for button in row),case['name']
+        if case['mode']=='detailed':
+            token_frames=[frame for frame in case['frames'] if frame['type']=='message' and 'tokens/s' in frame.get('text','')]
+            assert len(token_frames)==2 and all(frame['msg_type']=='token_usage' for frame in token_frames),case['name']
+
+
+def test_short_tool_blocks_are_really_foldable_in_tui_and_plain_cli_stays_compact():
+    text=operation_html({'kind':'run','success':True,'output':'one line'})
+    screen=PtScreen(Palette(False),width=80)
+    screen.print_block(screen.renderer().render_message(text,parse_mode='HTML'),message_id=1)
+    assert len(screen.model.foldable_targets())==1
+    assert 'one line' not in '\n'.join(line for line, _ in screen.model.render_rows())
+    screen.model.toggle(*screen.model.foldable_targets()[0])
+    assert 'one line' in '\n'.join(line for line, _ in screen.model.render_rows())
+    assert 'one line' not in '\n'.join(MessageRenderer(Palette(False),width=80).render_text(text,'HTML'))
+
+
+def test_missing_usage_is_unknown_and_failures_remain_visible():
+    line=usage_line({'round':1,'usage':{'input_tokens':100},'elapsed_seconds':1})
+    assert '出 未提供' in line and '缓存 未提供' in line
+    assert '思考 Token：未提供' in usage_details({'round':1,'usage':{}})
+    failure=operation_html({'kind':'run','success':False,'return_code':1,'output':'permission denied'})
+    assert failure.startswith('⚠️') and '返回码 1' in failure and 'permission denied' in failure
+
+
+def test_browser_dynamic_mode_refresh_short_folds_and_late_snapshot(full_output_server, turns, tmp_path):
+    from pathlib import Path
+    playwright=pytest.importorskip('playwright.sync_api')
+    case=next(item for item in turns if item['name']=='folded/False/foreground')
+    server=full_output_server[0]
+    base=f'http://127.0.0.1:{server.config.port}'
+    mode=['folded']
+    with playwright.sync_playwright() as p:
+        if not Path(p.chromium.executable_path).exists():pytest.skip('Chromium unavailable')
+        browser=p.chromium.launch(headless=True)
+        context=browser.new_context(viewport={'width':390,'height':844})
+        context.route('**/*',lambda route:route.continue_() if route.request.url.startswith(base) else route.abort())
+        context.route('**/api/config',lambda route:route.fulfill(json={'values':{'presentation_mode':mode[0]},'options':{'presentation_mode':[{'value':'folded','label':'折叠'},{'value':'detailed','label':'非折叠'}]}}))
+        def history(route):
+            messages=case['shown'] if mode[0]=='folded' else case['switched']
+            live=server.outbox.snapshot()
+            route.fulfill(json={'messages':messages,'ui_generation':case['final']['ui_generation'],'busy':False,
+                'presentation_mode':mode[0],'next_cursor':None,'live':{**live,'frames':[]}})
+        context.route('**/api/workbench/history?*',history)
+        assert context.request.post(base+'/api/login',data={'password':'temporary-test-only'}).ok
+        page=context.new_page();errors=[];page.on('pageerror',lambda error:errors.append(str(error)))
+        try:
+            page.goto(base)
+            page.locator('.token-hud').first.wait_for()
+            assert page.locator('.msg-row').count()==4
+            command=page.locator('blockquote.pb-compact').first
+            assert not command.locator('pre').is_visible()
+            command.locator('.pb-toggle').click()
+            page.wait_for_function("document.querySelector('blockquote.pb-compact').classList.contains('expanded')")
+            assert 'uptime' in command.locator('pre').inner_text()
+            page.reload();page.locator('.token-hud').first.wait_for()
+            assert page.locator('blockquote.pb-compact').first.locator('pre').is_visible()
+            mode[0]='detailed'
+            server.outbox.put({'type':'presentation_changed','presentation_mode':'detailed'})
+            page.wait_for_function("document.querySelectorAll('blockquote.pb-compact').length===0")
+            assert page.locator('.msg-row').count()>4
+            assert '返回码' in page.locator('#log').inner_text()
+            mode[0]='folded'
+            server.outbox.put({'type':'presentation_changed','presentation_mode':'folded'})
+            page.locator('.token-hud').first.wait_for()
+            assert page.locator('.msg-row').count()==4
+            assert not page.locator('blockquote.pb-compact').first.locator('pre').is_visible(), page.evaluate("({state:sessionStorage.getItem('xgent-fold-state'), blocks:Array.from(document.querySelectorAll('blockquote.pb')).map(n=>({class:n.className,id:n.closest('[data-record-id]')?.dataset.recordId}))})")
+            stale={**case['final'],'presentation_mode':'detailed','text':'stale snapshot'}
+            server.outbox.put(stale)
+            page.wait_for_timeout(400)
+            assert 'stale snapshot' not in page.locator('#log').inner_text()
+            assert '共执行 2 轮，1 个操作' in page.locator('#log').inner_text()
+            page.screenshot(path=str(tmp_path/'folded-mobile.png'),full_page=True)
+            assert not errors
+        finally:browser.close()
