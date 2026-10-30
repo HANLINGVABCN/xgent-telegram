@@ -71,12 +71,13 @@ def test_local_cli_form_notices_stay_visible_locally_but_are_not_relayed():
     from xgent_app.ask_presentation import send_ask_input_notice
     from xgent_app.cli_bridge import CliBot, _CliRelay, reset_menu_state
     from xgent_app.cli_render import TerminalScreen
+    from xgent_app.interaction import interaction
     stream=io.StringIO()
     relay=_CliRelay()
     relay._enabled=True
     native=CliBot(1,TerminalScreen(stream=stream,color=False,width=80))
     async def main():
-        with patch('xgent_app.cli_bridge._RELAY',relay):
+        with interaction('cli'), patch('xgent_app.cli_bridge._RELAY',relay):
             await send_ask_input_notice(type('Input',(),{'reply_text':lambda _,text:native.send_message(1,text)})(),
                 '请填写：测试备注\n（直接发一条消息即可；发 cancel 取消录入）')
             assert relay._queue.empty()

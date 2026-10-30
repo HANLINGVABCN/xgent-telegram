@@ -149,7 +149,7 @@ class TestBadRequestTranslation(unittest.TestCase):
             wb._TgBadRequest = original_cls
 
     def test_message_not_modified(self):
-        """'Message is not modified' 是永久性错误，应翻译。"""
+        """重复投递已生效的编辑应成功结束，不另发消息。"""
         import xgent_app.web_bridge as wb
         original_cls = wb._TgBadRequest
         try:
@@ -158,8 +158,9 @@ class TestBadRequestTranslation(unittest.TestCase):
             bot.edit_message_text = AsyncMock(
                 side_effect=_FakeBadRequest("Message is not modified"))
             op = self._make_edit_op()
-            with self.assertRaises(OpNotDeliverable):
-                _run(deliver_op_to_bot(bot, op, 42))
+            self.assertIsNone(_run(deliver_op_to_bot(bot, op, 42)))
+            bot.edit_message_text.assert_awaited_once()
+            bot.send_message.assert_not_called()
         finally:
             wb._TgBadRequest = original_cls
 
