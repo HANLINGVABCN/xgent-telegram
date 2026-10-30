@@ -799,6 +799,7 @@ class CliBot:
             "send_document", message_id=message_id, path=local_path,
             filename=display_name, caption=str(caption or "") or None,
             parse_mode=str(parse_mode) if parse_mode else None,
+            native_media=kwargs.get('native_media'),
         )
         return CliMessage(self, message_id, int(chat_id or self.chat_id), str(caption or ""))
 

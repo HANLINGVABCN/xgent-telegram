@@ -120,7 +120,7 @@ def get_main_menu():
     stitch_label = get_text_stitch_mode_label()
     web_on = normalize_bool(UserDataManager.get('web_enabled', False), False)
 
-    return InlineKeyboardMarkup([
+    keyboard = [
         [InlineKeyboardButton("🔌 提供商", callback_data="menu_providers"),
          InlineKeyboardButton("🎯 模型", callback_data="menu_default_models")],
         [InlineKeyboardButton(f"🤖 Agent:{'开' if agent_on else '关'}", callback_data="toggle_agent_mode"),
@@ -130,7 +130,16 @@ def get_main_menu():
         [InlineKeyboardButton(f"🌐 Web:{'开' if web_on else '关'}", callback_data="menu_web"),
          InlineKeyboardButton("📝 提示词", callback_data="menu_prompts")],
         [InlineKeyboardButton("⚙️ 更多", callback_data="menu_more_settings")]
-    ])
+    ]
+    from xgent_app.miniapps import page_url
+    scope=current_scope(required=False)
+    if scope:
+        pages=[]
+        for page,label in (('settings','设置与模型'),('tasks','任务'),('files','文件')):
+            url=page_url(globals(),page,conversation_id=scope.conversation_id)
+            if url:pages.append(InlineKeyboardButton(label,web_app=WebAppInfo(url=url)))
+        if pages:keyboard.append(pages)
+    return InlineKeyboardMarkup(keyboard)
 
 
 def _build_web_open_button():

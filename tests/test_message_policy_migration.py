@@ -55,7 +55,7 @@ class MessagePolicyMigrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(7,json.loads(saved.execute("SELECT value FROM config WHERE key='conversation_schema_version'").fetchone()[0]))
             self.assertFalse('message_policy' in saved.execute('SELECT metadata FROM global_messages ORDER BY id LIMIT 1').fetchone()[0])
         await self.db.migrate_conversations()
-        self.assertEqual(8,await self.db.get_config_fresh('conversation_schema_version'))
+        self.assertEqual(SCHEMA_VERSION,await self.db.get_config_fresh('conversation_schema_version'))
         rows=[dict(row) for row in await (await conn.execute('SELECT * FROM global_messages ORDER BY id')).fetchall()]
         self.assertEqual(original,[(row['id'],row['content'],row['timestamp'],row['session_id']) for row in rows])
         fields=[row for row in rows if row['content']=='测试']
@@ -96,7 +96,7 @@ class MessagePolicyMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(7,await self.db.get_config_fresh('conversation_schema_version'))
         await conn.execute('DROP TRIGGER reject_policy')
         await self.db.migrate_conversations()
-        self.assertEqual(8,await self.db.get_config_fresh('conversation_schema_version'))
+        self.assertEqual(SCHEMA_VERSION,await self.db.get_config_fresh('conversation_schema_version'))
 
     async def test_real_database_reopen_migrates_before_any_history_is_read(self):
         _, scope = await self.seed_old_messages()
@@ -156,7 +156,7 @@ class MessagePolicyMigrationTests(unittest.IsolatedAsyncioTestCase):
             with closing(sqlite3.connect(target_path)) as conn:
                 apply_database(conn, {'conversation_history': part})
                 conn.commit()
-                self.assertEqual(8, json.loads(conn.execute("SELECT value FROM config WHERE key='conversation_schema_version'").fetchone()[0]))
+                self.assertEqual(SCHEMA_VERSION, json.loads(conn.execute("SELECT value FROM config WHERE key='conversation_schema_version'").fetchone()[0]))
                 imported = json.loads(conn.execute("SELECT value FROM config WHERE key='message_policy_import_pending'").fetchone()[0])
             target = type(self.db)(str(target_path))
             await target._init_db()

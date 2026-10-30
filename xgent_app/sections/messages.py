@@ -548,173 +548,23 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 
 
 def _rich_part_to_markdown(part):
-    """Convert a rich text part to markdown. Handles string, dict (formatted), and list."""
-    if isinstance(part, str):
-        return part
-    if isinstance(part, dict):
-        t = part.get('text')
-        if t is None:
-            return ''
-        if isinstance(t, (dict, list)):
-            inner = _rich_part_to_markdown(t)
-        else:
-            inner = str(t)
-        fmt = part.get('type', '')
-        if fmt == 'bold':
-            return '**' + inner + '**'
-        elif fmt == 'italic':
-            return '*' + inner + '*'
-        elif fmt == 'code':
-            return '`' + inner + '`'
-        elif fmt == 'pre':
-            return '```' + chr(10) + inner + chr(10) + '```'
-        elif fmt == 'strikethrough':
-            return '~~' + inner + '~~'
-        elif fmt == 'underline':
-            return '__' + inner + '__'
-        elif fmt == 'spoiler':
-            return '||' + inner + '||'
-        elif fmt in ('link', 'text_link'):
-            url = part.get('url', '')
-            return '[' + inner + '](' + url + ')' if url else inner
-        else:
-            return inner
-    if isinstance(part, list):
-        return ''.join(_rich_part_to_markdown(p) for p in part)
-    return ''
+    from xgent_app.rich_input import text
+    return text(part,markdown=True)
 
 
 def _rich_block_to_text(block):
-    """Convert a rich_message block to text. Handles paragraphs, blockquotes, tables, lists."""
-    if not isinstance(block, dict):
-        return ''
-    btype = block.get('type', '')
-    text = block.get('text')
-    if text is not None:
-        return _rich_part_to_markdown(text)
-    if 'blocks' in block:
-        nested = [_rich_block_to_text(b) for b in block['blocks'] if isinstance(b, dict)]
-        result = chr(10).join(nested)
-        if btype == 'blockquote':
-            result = chr(10).join('> ' + line for line in result.split(chr(10)) if line)
-        return result
-    if 'cells' in block:
-        cells = block['cells']
-        if not isinstance(cells, list):
-            return ''
-        rows = []
-        for row in cells:
-            if not isinstance(row, list):
-                continue
-            cell_texts = []
-            for cell in row:
-                if isinstance(cell, dict):
-                    ct = cell.get('text', '')
-                    cell_texts.append(_rich_part_to_markdown(ct))
-                else:
-                    cell_texts.append(str(cell))
-            rows.append(cell_texts)
-        if not rows:
-            return ''
-        lines = []
-        for i, row in enumerate(rows):
-            lines.append('| ' + ' | '.join(row) + ' |')
-            if i == 0:
-                lines.append('| ' + ' | '.join(['---'] * len(row)) + ' |')
-        return chr(10).join(lines)
-    if 'items' in block:
-        items = block['items']
-        if not isinstance(items, list):
-            return ''
-        lines = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            label = item.get('label', '-')
-            item_blocks = item.get('blocks', [])
-            item_text = chr(10).join(_rich_block_to_text(b) for b in item_blocks if isinstance(b, dict))
-            lines.append(label + ' ' + item_text)
-        return chr(10).join(lines)
-    # Fallback for unknown block types: recursively search all fields for text
-    logger.warning(f"_rich_block_to_text: unknown block type={btype}, keys={list(block.keys())}")
-    parts = []
-    for key, value in block.items():
-        if key == 'type':
-            continue
-        if isinstance(value, str) and value.strip():
-            parts.append(value)
-        elif isinstance(value, dict):
-            t = _rich_part_to_markdown(value)
-            if not t:
-                t = _rich_block_to_text(value)
-            if t:
-                parts.append(t)
-        elif isinstance(value, list):
-            for item in value:
-                if isinstance(item, str) and item.strip():
-                    parts.append(item)
-                elif isinstance(item, dict):
-                    t = _rich_part_to_markdown(item)
-                    if not t:
-                        t = _rich_block_to_text(item)
-                    if t:
-                        parts.append(t)
-    if parts:
-        result = chr(10).join(parts)
-        logger.warning(f"_rich_block_to_text: fallback extracted len={len(result)} from type={btype}")
-        return result
-    return ''
+    from xgent_app.rich_input import block as decode
+    return decode(block,markdown=True)
 
 
 def _rich_part_to_plain_text(part):
-    """提取富文本的原始文字，不添加 Markdown 标记。配置值必须走这个路径。"""
-    if isinstance(part, str):
-        return part
-    if isinstance(part, dict):
-        value = part.get('text')
-        if value is not None:
-            return _rich_part_to_plain_text(value)
-        return ''
-    if isinstance(part, list):
-        return ''.join(_rich_part_to_plain_text(item) for item in part)
-    return ''
+    from xgent_app.rich_input import text
+    return text(part)
 
 
 def _rich_block_to_plain_text(block):
-    if not isinstance(block, dict):
-        return ''
-    if block.get('text') is not None:
-        return _rich_part_to_plain_text(block.get('text'))
-    if isinstance(block.get('blocks'), list):
-        return chr(10).join(
-            _rich_block_to_plain_text(item)
-            for item in block['blocks']
-            if isinstance(item, dict)
-        )
-    if isinstance(block.get('cells'), list):
-        rows = []
-        for row in block['cells']:
-            if not isinstance(row, list):
-                continue
-            rows.append(' | '.join(
-                _rich_part_to_plain_text(cell.get('text', '') if isinstance(cell, dict) else cell)
-                for cell in row
-            ))
-        return chr(10).join(rows)
-    if isinstance(block.get('items'), list):
-        rows = []
-        for item in block['items']:
-            if not isinstance(item, dict):
-                continue
-            label = str(item.get('label', '') or '')
-            content = chr(10).join(
-                _rich_block_to_plain_text(child)
-                for child in item.get('blocks', [])
-                if isinstance(child, dict)
-            )
-            rows.append((label + ' ' + content).strip())
-        return chr(10).join(rows)
-    return ''
+    from xgent_app.rich_input import block as decode
+    return decode(block)
 
 
 def _extract_rich_message_plain_text(msg):
@@ -763,14 +613,8 @@ def _extract_rich_message_text(msg):
             rich = None
     if not rich or not isinstance(rich, dict):
         return ""
-    try:
-        rich_json = json.dumps(rich, ensure_ascii=False, default=str)
-        logger.warning(f"_extract_rich_message_text: source={rich_source}, keys={list(rich.keys())}, full={rich_json[:3000]}")
-    except Exception:
-        logger.warning(f"_extract_rich_message_text: source={rich_source}, keys={list(rich.keys()) if isinstance(rich, dict) else type(rich)}")
     md = rich.get('markdown')
     if md and isinstance(md, str) and md.strip():
-        logger.warning(f"_extract_rich_message_text: extracted via markdown, len={len(md)}: {md[:200]}")
         return md
     blocks = rich.get('blocks')
     if not blocks or not isinstance(blocks, list):

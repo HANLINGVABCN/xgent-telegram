@@ -487,6 +487,11 @@ def _markup_to_frame(reply_markup: Any) -> Optional[List[List[Dict[str, Any]]]]:
                 "text": str(getattr(button, "text", "")),
                 "callback_data": str(getattr(button, "callback_data", "") or ""),
             }
+            native = button.to_dict() if hasattr(button,'to_dict') else {}
+            for key in ('copy_text','style','disabled','icon_custom_emoji_id','login_url','switch_inline_query',
+                        'switch_inline_query_current_chat','switch_inline_query_chosen_chat','pay','callback_game'):
+                if key in native:
+                    item[key] = native[key]
             url = getattr(button, "url", None)
             if url:
                 item["url"] = str(url)
@@ -525,11 +530,15 @@ def markup_from_frame(rows: Any) -> Optional[Any]:
             text = str(btn.get("text") or "")
             callback_data = str(btn.get("callback_data") or "")
             url = str(btn.get("url") or "")
-            if url:
-                buttons.append(InlineKeyboardButton(text, web_app=WebAppInfo(url=url)) if btn.get('web_app')
-                               else InlineKeyboardButton(text, url=url))
-            elif callback_data:
-                buttons.append(InlineKeyboardButton(text, callback_data=callback_data))
+            fields={'text':text}
+            for key in ('copy_text','style','disabled','icon_custom_emoji_id','login_url','switch_inline_query',
+                        'switch_inline_query_current_chat','switch_inline_query_chosen_chat','pay','callback_game'):
+                if key in btn:fields[key]=btn[key]
+            if url:fields['web_app' if btn.get('web_app') else 'url']={'url':url} if btn.get('web_app') else url
+            elif callback_data:fields['callback_data']=callback_data
+            if any(key in fields for key in ('url','web_app','callback_data','copy_text','disabled','login_url',
+                    'switch_inline_query','switch_inline_query_current_chat','switch_inline_query_chosen_chat','pay','callback_game')):
+                buttons.append(InlineKeyboardButton.de_json(fields,None))
         if buttons:
             keyboard.append(buttons)
     return InlineKeyboardMarkup(keyboard) if keyboard else None
@@ -778,6 +787,27 @@ async def deliver_op_to_bot(bot: Any, op: Op, native_id: Optional[int], *,
     payload = op.payload or {}
     extra = dict(payload.get("kwargs") or {})
     kind = op.kind
+    route = op.conversation_context or {}
+    thread_id = route.get('telegram_thread_id')
+    if (route.get('telegram_bot_id') and not thread_id and route.get('origin') in {'web','cli'}
+            and route.get('telegram_chat_id')==op.chat_id):
+        from .conversations import get_conversations, ConversationError
+        try:
+            topics=get_conversations().topics
+            refreshed=await topics.route(route['conversation_id']) if topics and topics.bot_id==route['telegram_bot_id'] else {}
+        except (RuntimeError,ConversationError):
+            refreshed={}
+        if not refreshed.get('telegram_thread_id'):
+            raise OpNotDeliverable('目标电报页面尚未绑定；消息仍保存在原会话，不改投其他页面')
+        route={**route,**refreshed}
+        op.conversation_context=route
+        thread_id=route['telegram_thread_id']
+    if (thread_id and route.get('telegram_chat_id')==op.chat_id
+            and kind in {OP_SEND,OP_DOCUMENT,OP_PHOTO,OP_CHAT_ACTION}):
+        extra['message_thread_id'] = thread_id
+    from .telegram_native import NATIVE_KINDS
+    if thread_id and route.get('telegram_chat_id')==op.chat_id and kind in NATIVE_KINDS:
+        payload['kwargs'] = {**(payload.get('kwargs') or {}),'message_thread_id':thread_id}
 
     def markup() -> Any:
         if "reply_markup" in op.transient:
@@ -869,6 +899,7 @@ async def deliver_op_to_bot(bot: Any, op: Op, native_id: Optional[int], *,
             return None
 
         if kind in (OP_DOCUMENT, OP_PHOTO):
+            media_kind=extra.pop('native_media',None)
             arg_name = "document" if kind == OP_DOCUMENT else "photo"
             handle = op.transient.get(arg_name)
             opened = None
@@ -894,10 +925,14 @@ async def deliver_op_to_bot(bot: Any, op: Op, native_id: Optional[int], *,
                 handle = opened
             try:
                 if kind == OP_DOCUMENT:
-                    result = await method("send_document")(
-                        chat_id=op.chat_id, document=handle,
-                        filename=payload.get("filename"),
-                        caption=payload.get("caption"), **extra)
+                    if media_kind and callable(getattr(bot,'send_'+media_kind,None)):
+                        result=await method('send_'+media_kind)(chat_id=op.chat_id,
+                            **{media_kind:handle},caption=payload.get('caption'),**extra)
+                    else:
+                        result = await method("send_document")(
+                            chat_id=op.chat_id, document=handle,
+                            filename=payload.get("filename"),
+                            caption=payload.get("caption"), **extra)
                 else:
                     result = await method("send_photo")(
                         chat_id=op.chat_id, photo=handle,
@@ -1167,6 +1202,8 @@ class MirrorBot:
         }
         if isinstance(kwargs.get('disable_notification'), bool):
             result['disable_notification'] = kwargs['disable_notification']
+        if kwargs.get('native_media') in {'video','audio','voice','animation'}:
+            result['native_media']=kwargs['native_media']
         return result
 
     async def send_message(self, chat_id: Optional[int] = None, text: str = "",

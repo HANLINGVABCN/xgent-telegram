@@ -20,7 +20,7 @@ from typing import Any
 
 DEFAULT_CONVERSATION_ID = 'global_memory'
 DEFAULT_CONVERSATION_NAME = '默认会话'
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class ConversationError(ValueError):
@@ -45,6 +45,9 @@ class ConversationScope:
     purpose: str = 'chat'
     telegram_delivery: bool | None = None
     workspace_path: str | None = None
+    telegram_bot_id: int | None = None
+    telegram_chat_id: int | None = None
+    telegram_thread_id: int | None = None
 
 
 _scope = contextvars.ContextVar('xgent_conversation', default=None)
@@ -101,7 +104,8 @@ def replay_conversation(snapshot):
     scope = ConversationScope(str(snapshot['conversation_id']), int(snapshot['generation']),
                               snapshot.get('run_id'), str(snapshot.get('name') or ''),
                               str(snapshot.get('origin') or 'legacy'), str(snapshot.get('purpose') or 'chat'),
-                              snapshot.get('telegram_delivery'))
+                              snapshot.get('telegram_delivery'), snapshot.get('workspace_path'),
+                              snapshot.get('telegram_bot_id'),snapshot.get('telegram_chat_id'),snapshot.get('telegram_thread_id'))
     with interaction(scope.origin, scope.purpose), bind_conversation(scope):
         yield scope
 
@@ -115,7 +119,10 @@ def restore_reply_route(snapshot):
         raise ConversationChanged('表单已不属于当前会话或上下文。')
     _scope.set(dataclasses.replace(scope, origin=snapshot.get('origin', 'legacy'),
                                   purpose=snapshot.get('purpose', 'chat'),
-                                  telegram_delivery=snapshot.get('telegram_delivery')))
+                                  telegram_delivery=snapshot.get('telegram_delivery'),
+                                  telegram_bot_id=snapshot.get('telegram_bot_id'),
+                                  telegram_chat_id=snapshot.get('telegram_chat_id'),
+                                  telegram_thread_id=snapshot.get('telegram_thread_id')))
 
 
 _reply_generation = contextvars.ContextVar('reply_generation', default=None)
@@ -251,6 +258,7 @@ class ConversationManager:
         self.text_queue = None
         self._admission_lock = asyncio.Lock()
         self.maintenance = None
+        self.topics = None
         self.terminal_enabled = False
         self._terminal_id = None
         self._terminal_revision = 0
@@ -377,9 +385,14 @@ class ConversationManager:
             raise ConversationChanged('该会话已归档，请先恢复。')
         origin, purpose = identity()
         deliver = (purpose == 'chat' and cid == state.get('telegram_conversation_id')) if origin in {'web','cli'} else True
+        route = await self.topics.route(cid) if self.topics is not None else {}
+        from .telegram_topics import input_route
+        incoming = input_route() if origin=='telegram' else None
+        if incoming is not None:
+            route = incoming
         return ConversationScope(cid, int(session['generation']), name=session.get('name') or '新对话',
                                  origin=origin, purpose=purpose, telegram_delivery=deliver if origin != 'legacy' else None,
-                                 workspace_path=session.get('workspace_path'))
+                                 workspace_path=session.get('workspace_path'),**route)
 
     @contextlib.asynccontextmanager
     async def operation(self, conversation_id=None, *, execution=False, wait=False,
@@ -573,6 +586,8 @@ class ConversationManager:
             result = await db.manage_conversation(action, conversation_id, name,
                 selector='telegram' if key == 'telegram_conversation_id' else 'shared')
         await self.poll_once()
+        if self.topics is not None:
+            await self.topics.reconcile()
         return result
 
     async def poll_once(self):

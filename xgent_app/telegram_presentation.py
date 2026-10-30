@@ -21,6 +21,8 @@ def label_enabled():
 def should_label(scope):
     if not label_enabled():
         return False
+    if getattr(scope,'telegram_thread_id',None):
+        return False
     return presentation_mode() in {'menu', 'footer'} or _receiver.get() is _UNKNOWN or _receiver.get() != scope.conversation_id
 
 

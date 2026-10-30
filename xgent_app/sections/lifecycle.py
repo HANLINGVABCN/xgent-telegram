@@ -10,6 +10,9 @@ TELEGRAM_COMMAND_DESCRIPTIONS = (
     ("chats", "管理与切换会话"),
     ("queue", "查看与管理待发消息"),
     ("new", "新建会话"),
+    ("topics", "查看电报独立会话页面"),
+    ("stop", "停止当前会话的回答或命令"),
+    ("topic_bind", "绑定已有电报页面"),
     ("config", "打开设置面板"),
     ("update", "更新代码并重启"),
     ("providers", "管理提供商与模型列表"),
@@ -147,6 +150,24 @@ async def _telegram_ready(app) -> None:
     from xgent_app.telegram_presentation import render_telegram_text
     from xgent_app.conversations import bind_callback_markup
     global _startup_commands_synced, _startup_menu_sent
+    from xgent_app.miniapps import page_url
+    if page_url(globals(),'settings'):
+        from telegram import MenuButtonWebApp
+        try:
+            await app.bot.set_chat_menu_button(chat_id=BotConfig.AUTHORIZED_USER_ID,
+                menu_button=MenuButtonWebApp('工作台',WebAppInfo(url=str(UserDataManager.get('web_public_url')).rstrip('/'))))
+        except Exception as exc:logger.warning('同步主工作台菜单入口失败：%s',exc)
+    from xgent_app.telegram_native import request_capable
+    if request_capable(app.bot):
+        from xgent_app.telegram_topics import TopicManager
+        try:
+            profile = getattr(app.bot,'_bot_user',None) or await app.bot.get_me()
+            topics = TopicManager(BotMemoryDB.get_instance,app.bot,BotConfig.AUTHORIZED_USER_ID,
+                                  enabled=getattr(profile,'has_topics_enabled',False) is True)
+            get_conversations().topics = topics
+            await topics.reconcile()
+        except Exception as exc:
+            logger.warning('Telegram 会话页面初始化未完成：%s',exc)
 
     if not _startup_commands_synced:
         try:

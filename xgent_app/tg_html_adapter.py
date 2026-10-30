@@ -28,6 +28,13 @@ def _is_html(parse_mode: Any) -> bool:
 
 def adapt_call(kwargs: dict, args: tuple, text_pos: int) -> tuple:
     """把调用参数里的 text 转成 Telegram 形态（仅 HTML）。返回新的 (args, kwargs)。"""
+    if text_pos==1:
+        from .conversations import current_scope
+        scope=current_scope(required=False)
+        if scope and scope.telegram_thread_id and 'message_thread_id' not in kwargs:
+            target=kwargs.get('chat_id',args[0] if args else None)
+            if target==scope.telegram_chat_id:
+                kwargs={**kwargs,'message_thread_id':scope.telegram_thread_id}
     if not _is_html(kwargs.get("parse_mode")):
         return args, kwargs
     if "text" in kwargs:

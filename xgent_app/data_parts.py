@@ -19,7 +19,7 @@ TABLES = {
     "conversation_history": ("chat_sessions", "chat_messages", "global_messages", "ui_messages",
         "context_compressions", "context_compression_jobs", "conversation_groups", "artifact_objects",
         "conversation_snapshots", "snapshot_entries", "conversation_turns", "turn_operations",
-        "conversation_branch_drafts", "conversation_mutation_requests"),
+        "conversation_branch_drafts", "conversation_mutation_requests", "telegram_topics"),
     "tasks": ("trigger_tasks", "trigger_runs"),
     "usage_statistics": ("token_usage_stats",),
     "security_logs": ("unauthorized_access_logs", "channel_deadletter"),

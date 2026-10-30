@@ -1,4 +1,5 @@
 import {syncAskForm} from './ask-form.js';
+import {installTelegramHost} from './telegram-host.js';
 (function () {
   "use strict";
 
@@ -1356,7 +1357,7 @@ import {syncAskForm} from './ask-form.js';
         if (!btn.callback_data && !btn.unavailable) return;
         var b = document.createElement("button");
         b.className = "ik-btn";
-        const stopAction=/^act_stop_generation(?::(.+))?$/.exec(String(btn.callback_action||btn.callback_data||''));
+        const stopAction=/^act_stop_generation(?::([^:]+)(?::([^:]+))?)?$/.exec(String(btn.callback_action||btn.callback_data||''));
         const stopLabel='❌ 停止回答';
         b.textContent = stopAction ? stopLabel : btn.text;
         b.disabled = !!btn.unavailable;
@@ -1367,7 +1368,7 @@ import {syncAskForm} from './ask-form.js';
           triggerHaptic();
           if(stopAction){
             api('/api/stop',{method:'POST',body:JSON.stringify({conversation_id:owner,
-              run_id:stopAction[1]||currentRun()?.run_id})})
+              run_id:stopAction[1]||currentRun()?.run_id,phase_ref:stopAction[2]})})
               .catch(err=>{b.disabled=false;b.classList.remove('loading');toast(stopLabel+'失败：'+err.message,true);});
             return;
           }
@@ -3710,6 +3711,7 @@ import {syncAskForm} from './ask-form.js';
     enhance: enhanceBubbleContent
   };
   try { input.value=sessionStorage.getItem(draftKey())||""; syncSendState(); } catch(e) {}
+  installTelegramHost({input,getConversation:()=>selectedConversationId});
   input.addEventListener("input",function(){try{sessionStorage.setItem(draftKey(),input.value);}catch(e){}});
   window.addEventListener('xgent-auth-expired',function(){
     closeCommands(false);

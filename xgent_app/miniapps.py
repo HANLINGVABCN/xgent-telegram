@@ -40,12 +40,12 @@ def _encode(raw):
     return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
 
 
-def make_session(key, user_id, kind, resource, *, now=None):
+def make_session(key, user_id, kind, resource, *, now=None,ttl=SESSION_SECONDS):
     if kind not in SESSION_KINDS or not isinstance(resource, dict):
         raise ValueError('无效页面')
     stamp = time.time() if now is None else now
     body = {'version':1,'user_id':int(user_id),'kind':kind,'resource':resource,
-            'issued_at':stamp,'expires_at':stamp+SESSION_SECONDS}
+            'issued_at':stamp,'expires_at':stamp+ttl}
     payload = _encode(json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode())
     signature = _encode(hmac.new(key, payload.encode(), hashlib.sha256).digest())
     return payload + '.' + signature

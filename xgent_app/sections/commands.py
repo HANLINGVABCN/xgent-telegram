@@ -39,6 +39,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     await UserDataManager.init()
+    args=list(getattr(context,'args',[]) or [])
+    if args and args[0].startswith('read_') and args[0][5:].isdigit():
+        identifier=int(args[0][5:]);db=await BotMemoryDB.get_instance();conn=await db._get_conn()
+        row=await (await conn.execute('SELECT session_id FROM global_messages WHERE id=? AND withdrawn=0',(identifier,))).fetchone()
+        if row:
+            from xgent_app.miniapps import page_url
+            url=page_url(globals(),'read',id=identifier,conversation_id=row['session_id'])
+            if url:
+                await context.bot.send_message(chat_id=update.effective_chat.id,text='打开此回复',
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('阅读／复制全文',web_app=WebAppInfo(url=url))]]))
+                return
     
     # 记录用户命令
     if update.message and update.message.text:
@@ -49,6 +60,77 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     message = update.message or update.callback_query.message
     await show_start_card(message)
+
+
+async def cmd_topics(update, context):
+    manager=get_conversations()
+    topics=manager.topics
+    if topics is None or not topics.enabled:
+        from xgent_app.telegram_topics import TopicManager
+        try:
+            profile=await context.bot.get_me()
+            topics=TopicManager(BotMemoryDB.get_instance,context.bot,update.effective_chat.id,
+                                enabled=getattr(profile,'has_topics_enabled',False) is True)
+            manager.topics=topics
+        except Exception:
+            topics=None
+    if topics is None or not topics.enabled:
+        await context.bot.send_message(chat_id=update.effective_chat.id,
+            text='请在 BotFather 的 Bot 设置中开启私聊话题，再发送 /topics。旧消息保留，以后的回复进入对应页面。')
+        return
+    await topics.reconcile()
+    rows=await topics.rows()
+    labels={'ready':'已连接','closed':'已归档','creating':'创建待确认','uncertain':'创建待确认',
+            'failed':'创建被拒绝','orphaned':'原会话已删除'}
+    lines=['电报会话页面']
+    for row in rows:
+        lines.append(f"{row['title']} · {labels.get(row['status'],row['status'])}\n"
+                     f"会话：{row['conversation_id']} · 页面：{row['thread_id'] or '待绑定'}")
+    lines.append('恢复绑定：/topic_bind 会话ID 页面ID。不会搬移或补发旧消息。')
+    await safe_send_message(context,update.effective_chat.id,'\n\n'.join(lines))
+
+
+async def cmd_stop_answer(update, context):
+    manager=get_conversations()
+    scope=current_scope(required=False)
+    state=await manager.state()
+    cid=scope.conversation_id if scope else state.get('telegram_conversation_id')
+    run=(state.get('runs') or {}).get(cid) or {}
+    accepted=await manager.request_stop(run['run_id'],cid) if run.get('run_id') else False
+    await context.bot.send_message(chat_id=update.effective_chat.id,
+        text='⏹ 已请求停止当前会话，已有结果保留。' if accepted else '当前会话没有正在执行的回答。')
+
+
+async def handle_personal_inline_query(update,context):
+    query=update.inline_query
+    if update.effective_user.id!=BotConfig.AUTHORIZED_USER_ID:
+        await query.answer([],cache_time=0,is_personal=True);return
+    from telegram import InlineQueryResultArticle,InputTextMessageContent
+    await UserDataManager.init();db=await BotMemoryDB.get_instance();conn=await db._get_conn()
+    text=str(query.query or '').strip()[:200]
+    rows=await (await conn.execute("SELECT id,content FROM global_messages WHERE msg_type='ai_reply' AND withdrawn=0 "
+        "AND instr(lower(content),lower(?))>0 ORDER BY id DESC LIMIT 20",(text,))).fetchall()
+    results=[]
+    for row in rows:
+        body=row['content']
+        if len(body)>3900:continue
+        results.append(InlineQueryResultArticle(id=str(row['id']),title=body.splitlines()[0][:80] or '回复',
+            description=body[:120],input_message_content=InputTextMessageContent(body)))
+    await query.answer(results,cache_time=0,is_personal=True)
+
+
+async def cmd_topic_bind(update, context):
+    topics=get_conversations().topics
+    args=list(getattr(context,'args',[]) or [])
+    if topics is None or not topics.enabled:
+        await cmd_topics(update,context);return
+    if len(args)!=2 or not args[1].isdigit():
+        await context.bot.send_message(chat_id=update.effective_chat.id,text='用法：/topic_bind 会话ID 页面ID；先用 /topics 查看。');return
+    try:
+        await topics.bind(args[0],int(args[1]))
+        await context.bot.send_message(chat_id=update.effective_chat.id,text='已绑定。以后的消息进入该页面，旧记录保留。')
+    except ConversationError as exc:
+        await context.bot.send_message(chat_id=update.effective_chat.id,text=str(exc))
 
 async def cmd_restart_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorized_user_middleware(update, context):

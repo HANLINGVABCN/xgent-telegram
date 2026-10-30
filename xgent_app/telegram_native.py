@@ -104,6 +104,9 @@ async def _stored_parts(bot, op, value=None):
 
 
 async def _post(bot, method, data, extra):
+    if method=='editMessageText':
+        data={key:value for key,value in data.items() if key in {'chat_id','message_id','text','rich_message',
+            'parse_mode','entities','reply_markup','link_preview_options'}}
     return await bot._post(method, deepcopy(data), **{key: value for key, value in extra.items()
         if key in {'read_timeout', 'write_timeout', 'connect_timeout', 'pool_timeout'}})
 

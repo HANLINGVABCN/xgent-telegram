@@ -246,6 +246,15 @@ class PresentationBot:
             owner_id = ids[0] if ids else None
             message = self.messages.get(owner_id)
             if message is not None and not getattr(message, 'media', False):
+                from .miniapps import page_url
+                from .web_history import _section_ns
+                from telegram import InlineKeyboardButton,InlineKeyboardMarkup,CopyTextButton,WebAppInfo
+                rows=[]
+                if 0<len(row['content'])<=256:
+                    rows.append([InlineKeyboardButton('复制',copy_text=CopyTextButton(row['content']))])
+                url=page_url(_section_ns() or {},'read',id=row['id'],conversation_id=row.get('session_id'))
+                if url:rows.append([InlineKeyboardButton('阅读／复制全文',web_app=WebAppInfo(url=url))])
+                buttons=InlineKeyboardMarkup(rows) if rows else None
                 native = {'phase': 'reply', 'owner_id': owner_id, 'record_id': row['id'],
                           'html': render_rich(row['content'], details=''.join(details)),
                           'fallback': []}
@@ -254,7 +263,7 @@ class PresentationBot:
                 # Footer retries edit the same native parts, never append again.
                 await self._telegram_only('edit_message_text', native=native, record_id=row['id'],
                     chat_id=message.chat_id, message_id=owner_id, text=message.telegram_body,
-                    parse_mode='HTML', reply_markup=None)
+                    parse_mode='HTML', reply_markup=buttons)
                 return {'version': 1, 'record_id': row['id'], 'message_ids': [owner_id], 'details': details,
                         'native_format': 'rich'}
         saved = self._telegram_final_replies.get(row['id'])

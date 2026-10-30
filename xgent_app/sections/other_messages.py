@@ -302,6 +302,7 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await UserDataManager.init()
     msg = update.message
+
     media, kind = _extract_native_media(msg)
     if media is None:
         # filter 只会把上述类型路由进来；真落空则回退到通用兜底，绝不静默。
@@ -494,16 +495,23 @@ async def handle_other_message(update: Update, context: ContextTypes.DEFAULT_TYP
     await UserDataManager.init()
     msg = update.message
 
+    from xgent_app.rich_input import media as rich_media,media_update
+    parts=rich_media((getattr(msg,'api_kwargs',None) or {}).get('rich_message',{}))
+    if parts:
+        caption=_extract_rich_message_text(msg)
+        for index,(kind,value) in enumerate(parts):
+            projected=media_update(update,kind,value,caption if index==0 else '')
+            if kind=='document':await handle_document_message(projected,context)
+            elif kind=='photo':await handle_photo_message(projected,context)
+            else:await handle_media_message(projected,context)
+        return
+
     # 完整原始字典和 api_kwargs 写入日志
     try:
         msg_dict = msg.to_dict() if hasattr(msg, 'to_dict') else {}
-        logger.warning(f"handle_other_message raw dict: {msg_dict}")
         extra = getattr(msg, 'api_kwargs', None) or {}
         if extra:
             logger.warning(f"handle_other_message api_kwargs keys: {list(extra.keys())}")
-            for k, v in extra.items():
-                if isinstance(v, str) and len(v) > 3:
-                    logger.warning(f"handle_other_message api_kwargs['{k}'] = {v[:200]}")
     except Exception:
         msg_dict = {}
 

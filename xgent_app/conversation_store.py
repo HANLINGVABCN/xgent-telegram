@@ -355,6 +355,14 @@ class ConversationStore(QueueStore):
                 await migrate_message_policies(conn)
                 await _set_config(conn, 'conversation_schema_version', 8)
                 await conn.execute("DELETE FROM config WHERE key='message_policy_import_pending'")
+            if version < 9:
+                await conn.execute('''CREATE TABLE IF NOT EXISTS telegram_topics (
+                    bot_id INTEGER NOT NULL,chat_id INTEGER NOT NULL,conversation_id TEXT NOT NULL,
+                    thread_id INTEGER,status TEXT NOT NULL,title TEXT NOT NULL,updated_at REAL NOT NULL,
+                    PRIMARY KEY(bot_id,chat_id,conversation_id))''')
+                await conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_topic_thread '
+                    'ON telegram_topics(bot_id,chat_id,thread_id) WHERE thread_id IS NOT NULL')
+                await _set_config(conn,'conversation_schema_version',9)
         self._config_cache.clear()
 
     async def get_conversation_groups(self):

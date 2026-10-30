@@ -121,3 +121,59 @@ async def disconnected_submit(bot, root):
                 snapshot=await service.handle('POST','mini-ask',data)
                 assert snapshot['status']=='submitted' and len(calls)==2
             return {'submitted':True,'resumed_once':len(calls)==2}
+
+
+async def capability_pages(bot, root):
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    async with Harness(bot,root) as h:
+        body='原始回复  保留空格\n| 项目 | 结果 |\n|---|---|\n| 测试 | 通过 |'
+        async def complete(*args,**kwargs):return body,None
+        with patch.object(bot.ModelClient,'think_and_reply',complete):await h.turn('阅读测试')
+        record=next(row for row in await h.db.get_display_history(100) if row['msg_type']=='ai_reply')
+        cid=record['session_id'];service=Workbench(vars(bot))
+        config=WebChatConfig(host='127.0.0.1',port=0,password_hash=hash_password('capability-test-only'),
+            bot_token='123456:capability-test-only',authorized_user_id=1,loop=asyncio.get_running_loop(),
+            submit_message=lambda *a:None,read_history=bot._web_read_history,read_settings=bot._web_read_settings,
+            write_setting=bot._web_write_setting,request_stop=bot._web_request_stop,is_busy=bot._web_is_busy,
+            read_conversations=bot.get_conversations().state,workbench=service.handle)
+        server=WebChatServer(config);server.outbox=h.outbox;server.start();base='http://127.0.0.1:'+str(server._httpd.server_address[1])
+        opener=build_opener(ProxyHandler({}))
+        def fetch(path,data=None,token=None):
+            headers={'Origin':base,'Content-Type':'application/json'}
+            if token:headers['Authorization']='Bearer '+token
+            try:
+                with opener.open(Request(base+path,data=json.dumps(data).encode() if data is not None else None,headers=headers),timeout=10) as response:
+                    raw=response.read();return response.status,json.loads(raw) if 'application/json' in response.headers.get('Content-Type','') else raw
+            except HTTPError as exc:return exc.code,json.loads(exc.read())
+        async def request(*args):return await asyncio.to_thread(fetch,*args)
+        async def login(page,identifier=''):
+            code,value=await request('/api/mini/session',{'page':page,'id':str(identifier),'conversation_id':cid,'init_data':init_data(config.bot_token)})
+            assert code==200,(code,value)
+            return value['token'],value['snapshot']
+        file=Path(root)/'report.txt';file.write_text('DOWNLOAD-EXACT',encoding='utf-8')
+        async def artifact(data):
+            if data.get('id')!='1:0':raise ValueError('unknown file')
+            return {'path':str(file),'filename':file.name}
+        share=SimpleNamespace(_post=AsyncMock(return_value={'id':'prepared-share'}))
+        try:
+            reader,snapshot=await login('read',record['id']);assert snapshot['text']==body
+            assert (await request('/api/mini/resource',None,reader))[1]['text']==body
+            assert (await request('/api/mini/form',None,reader))[0]==401
+            settings,snapshot=await login('settings')
+            assert 'values' in snapshot['settings']
+            assert (await request('/api/mini/resource',{'key':'response_mode','value':'background'},settings))[0]==200
+            assert (await request('/api/mini/resource',{'key':'telegram_reactions','value':False},settings))[0]==200
+            files,_=await login('files')
+            with patch.object(service,'_artifact_item',artifact):
+                code,ticket=await request('/api/mini/file-ticket',{'id':'1:0'},files);assert code==200,(code,ticket)
+                relative='/api/mini/download?'+ticket['url'].split('?',1)[1]
+                code,content=await request(relative);assert code==200 and content==b'DOWNLOAD-EXACT',(code,content)
+                assert (await request(relative+'x'))[0]==401
+            with patch.object(bot,'_web_real_bot',share):
+                code,prepared=await request('/api/mini/share',{},reader);assert code==200 and prepared['id']=='prepared-share'
+                assert share._post.await_count==1
+            assert (await request('/api/workbench/providers',None,settings))[0]==401
+            return {'read_exact':True,'settings_scoped':True,'download_signed':True,'share_requested':True}
+        finally:await asyncio.to_thread(server.stop)

@@ -207,6 +207,8 @@ async def execute_sendfile_protocol(
         except Exception:
             pass
         with open(resolved_path, "rb") as sendfile:
+            from .telegram_files import native_kind
+            media_kind=native_kind(resolved_path) if getattr(context.bot,'_queues_telegram_output',False) is True else None
             await context.bot.send_document(
                 chat_id=chat_id,
                 document=sendfile,
@@ -214,6 +216,7 @@ async def execute_sendfile_protocol(
                 caption=f"📄 {filename} ({file_size} bytes)",
                 read_timeout=120,
                 write_timeout=120,
+                **({'native_media':media_kind} if media_kind else {}),
             )
         delivery_status = ('已加入 Telegram 发送队列'
                            if getattr(context.bot, '_queues_telegram_output', False) is True
