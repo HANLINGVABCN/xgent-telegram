@@ -132,8 +132,12 @@ def is_stop_requested() -> bool:
 def build_stop_keyboard() -> InlineKeyboardMarkup:
     scope = current_scope(required=False)
     action = 'act_stop_generation' + (':' + scope.run_id if scope and scope.run_id else '')
+    from xgent_app.stop_targets import phase_ref
+    ref = phase_ref(scope.run_id) if scope else None
+    if ref:
+        action += ':' + ref
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ 停止回答", callback_data=action)]
+        [InlineKeyboardButton("❌ 停止回答", callback_data=CallbackDataStore.store(action))]
     ])
 
 # --- ☆ 访问配置 ☆ ---

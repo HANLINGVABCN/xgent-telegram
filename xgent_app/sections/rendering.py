@@ -23,6 +23,12 @@ def _should_hide_protocol_blocks() -> bool:
     # Both new modes use semantic protocol cards. The old raw protocol view is retired.
     return True
 
+
+def _begin_telegram_generation(context, mode):
+    begin = getattr(context.bot, 'begin_telegram_generation', None)
+    if callable(begin):
+        begin(mode)
+
 async def keep_typing_while_waiting(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
                                     stop_event: asyncio.Event, interval: float = 4.0,
                                     max_duration: Optional[float] = None,
@@ -61,77 +67,20 @@ async def keep_typing_while_waiting(context: ContextTypes.DEFAULT_TYPE, chat_id:
 RICH_MESSAGE_CHAR_LIMIT = 32000
 
 class TelegramRichAPI:
-    """直接调用 Telegram Bot API 的 Rich Message 端点（绕过 python-telegram-bot 库版本限制）。"""
+    """Retired direct gateway; legacy callers fall back into the delivery facade."""
 
     _client: Optional[httpx.AsyncClient] = None
-
-    @classmethod
-    def _get_client(cls) -> httpx.AsyncClient:
-        if cls._client is None or cls._client.is_closed:
-            cls._client = httpx.AsyncClient(timeout=30.0)
-        return cls._client
-
-    @classmethod
-    def _api_url(cls, method: str) -> str:
-        base = BotConfig.API_BASE_URL or "https://api.telegram.org"
-        return f"{base}/bot{BotConfig.TOKEN}/{method}"
 
     @classmethod
     async def send_rich_message(cls, chat_id: int, text: str,
                                  reply_markup: Optional[Dict] = None,
                                  reply_to_message_id: Optional[int] = None) -> Dict:
-        """发送完整的 Rich Message。返回 Telegram API 响应 JSON。
-
-        Bot API 10.1 的 rich_message 参数接受 {"markdown": "..."} 格式，
-        由 Telegram 服务端自行解析 Markdown 为原生 RichBlock（表格/标题/列表等），
-        无需客户端自行构建 block_tree。
-        """
-        from xgent_app.telegram_presentation import render_telegram_text
-        text = await render_telegram_text(text, 'MarkdownV2', limit=RICH_MESSAGE_CHAR_LIMIT + 512)
-        payload: Dict[str, Any] = {
-            "chat_id": chat_id,
-            "rich_message": {"markdown": text or " "},
-        }
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-        if reply_to_message_id:
-            payload["reply_to_message_id"] = reply_to_message_id
-        client = cls._get_client()
-        resp = await client.post(cls._api_url("sendRichMessage"), json=payload)
-        result = resp.json()
-        if not result.get("ok"):
-            raise TelegramError(f"sendRichMessage failed: {result.get('description', result)}")
-        return result
+        raise TelegramError('Rich messages must use the Telegram delivery channel')
 
     @classmethod
     async def send_rich_message_draft(cls, chat_id: int, text: str,
                                        draft_id: int) -> Dict:
-        """发送/更新流式 Rich Message Draft。
-
-        Bot API 10.1: sendRichMessageDraft 在私聊中创建一个 30 秒临时的 Draft 预览。
-        相同 draft_id 的后续调用会以动画过渡更新内容。
-        完成后必须调用 send_rich_message 发送最终消息以持久化。
-        API 返回 True（非 Message 对象），draft_id 由调用方生成。
-        """
-        from xgent_app.telegram_presentation import render_telegram_text
-        text = await render_telegram_text(text, 'MarkdownV2', limit=RICH_MESSAGE_CHAR_LIMIT + 512)
-        payload: Dict[str, Any] = {
-            "chat_id": chat_id,
-            "draft_id": draft_id,
-            "rich_message": {"markdown": text or " "},
-        }
-        client = cls._get_client()
-        resp = await client.post(cls._api_url("sendRichMessageDraft"), json=payload)
-        result = resp.json()
-        if not result.get("ok"):
-            # 429 限流：Telegram 返回 parameters.retry_after，抛 RetryAfter
-            # 让上层 append() 捕获后永久降级到 HTML edit，避免后续 chunk 反复撞 429
-            params = result.get("parameters") or {}
-            retry_after = params.get("retry_after")
-            if retry_after is not None:
-                raise RetryAfter(retry_after=retry_after)
-            raise TelegramError(f"sendRichMessageDraft failed: {result.get('description', result)}")
-        return result
+        raise TelegramError('Rich drafts must use the Telegram delivery channel')
 
 @without_ui_history
 @web_text_response
@@ -1547,6 +1496,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
 
     try:
         generated_reply = await _ensure_generated_reply(generated_reply, chat_id, prov_name, model)
+        _begin_telegram_generation(context, 'foreground')
         stop_kb = build_stop_keyboard()
         with telegram_label(False), message_presentation({'kind':'ai_reply','purpose':'generation','transient':True}):
             msg = await context.bot.send_message(
@@ -1919,6 +1869,7 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
 
     try:
         generated_reply = await _ensure_generated_reply(generated_reply, chat_id, prov_name, model)
+        _begin_telegram_generation(context, 'background')
         stop_kb = build_stop_keyboard()
         with telegram_label(False), message_presentation({'kind':'ai_reply','purpose':'generation','transient':True}):
             msg = await context.bot.send_message(
@@ -2249,6 +2200,7 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
 
     try:
         generated_reply = await _ensure_generated_reply(generated_reply, chat_id, prov_name, model)
+        _begin_telegram_generation(context, 'nonstream')
         stop_kb = build_stop_keyboard()
         with telegram_label(False), message_presentation({'kind':'ai_reply','purpose':'generation','transient':True}):
             msg = await context.bot.send_message(

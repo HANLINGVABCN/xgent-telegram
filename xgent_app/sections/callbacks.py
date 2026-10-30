@@ -270,8 +270,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer(str(exc), show_alert=True, cache_time=0)
         return
     if data == 'act_stop_generation' or data.startswith('act_stop_generation:'):
-        run_id = data.partition(':')[2]
-        accepted = await get_conversations().request_stop(run_id) if run_id else False
+        from xgent_app.stop_targets import active_target
+        target = data.split(':', 2)
+        run_id = target[1] if len(target) > 1 else ''
+        ref = target[2] if len(target) > 2 else None
+        accepted = await get_conversations().request_stop(run_id) if run_id and (
+            ref is None or active_target(run_id, ref)) else False
         await query.answer('已收到停止请求' if accepted else '该回合已结束，停止按钮已失效。')
         return
 

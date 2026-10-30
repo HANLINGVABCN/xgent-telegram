@@ -805,6 +805,9 @@ async def deliver_op_to_bot(bot: Any, op: Op, native_id: Optional[int], *,
         return native_call
 
     try:
+        from .telegram_native import NATIVE_KINDS, deliver_native
+        if kind in NATIVE_KINDS:
+            return await deliver_native(bot, op, native_id, markup(), extra)
         if payload.get('queue_receipt'):
             from .conversations import get_conversations
             from .message_queue import queue_card_text
@@ -1052,11 +1055,19 @@ class MirrorBot:
         native_payload = chat_payload(payload)
         if native_payload is None:
             return
+        from .telegram_native import native_offer_kind, OP_NATIVE_CONTROL, OP_NATIVE_DRAFT
+        kind = native_offer_kind(kind, native_payload, self.real_bot)
+        if kind is None:
+            return
+        if kind in {OP_NATIVE_CONTROL, OP_NATIVE_DRAFT}:
+            durable = False
         if native_payload.get('reply_markup') != (payload or {}).get('reply_markup'):
             transient = {**(transient or {}), 'reply_markup': markup_from_frame(native_payload.get('reply_markup'))}
         op = Op(kind, logical_id=logical_id,
                 chat_id=int(chat_id) if chat_id is not None else self.chat_id,
                 payload=native_payload, transient=transient, durable=durable)
+        from .stop_targets import admit_remote_phase
+        admit_remote_phase(op.conversation_context, native_payload.get('telegram_native') or {})
         if delivery is not None:
             delivery.offer(self, op)
         else:

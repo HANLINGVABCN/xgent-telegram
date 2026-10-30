@@ -131,7 +131,8 @@ async def display_matrix(bot, root):
                         all_text = '\n'.join(message['text'] for message in native.messages.values())
                         assert all_text.count('<b>回复详情</b>')==1,all_text
                         assert not any(buttons(message) for message in native.messages.values())
-                        assert all(len(message['text'].encode('utf-16-le'))//2 <=4096 for message in native.messages.values())
+                        assert all(len(message['text'].encode('utf-16-le'))//2 <= (32768 if message.get('rich') else 4096)
+                                   for message in native.messages.values())
                         assert '↑ '+('333' if outcome=='success' else '111')+' ·' in all_text
                         assert 'cache 0' in all_text
                         assert any(('🟢 run-x' if outcome!='stopped' else '⚪ run-x') in message['text'] for message in native.messages.values())

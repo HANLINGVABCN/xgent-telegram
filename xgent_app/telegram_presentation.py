@@ -47,7 +47,7 @@ def chat_payload(payload):
     if display.get('skip'):
         return None
     result = dict(payload or {})
-    for key in ('text', 'parse_mode', 'reply_markup'):
+    for key in ('text', 'parse_mode', 'reply_markup', 'telegram_native'):
         if key in display:
             result[key] = deepcopy(display[key])
     rows = result.get('reply_markup')

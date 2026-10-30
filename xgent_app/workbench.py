@@ -114,16 +114,16 @@ class Workbench:
         from xgent_app.interaction import interaction
         try:
             with interaction('web', 'management'):
-                async with conversation_operation(cid, expected=method != 'GET' and not navigation and not version_operation, allow_archived=method=='GET' and (version_operation or resource in {'history','search','artifacts/preview','artifacts/cover'}), fresh=True, selector='shared'):
+                async with conversation_operation(cid, expected=method != 'GET' and not navigation and not version_operation and resource!='mini-ask', allow_archived=method=='GET' and (version_operation or resource in {'history','search','artifacts/preview','artifacts/cover'}), fresh=True, selector='shared'):
                     return await self._handle_scoped(method, resource, data)
         except ConversationError as exc:
             raise WorkbenchError(str(exc), exc.status) from exc
 
     async def _handle_scoped(self, method, resource, data):
         await self.db()
-        if resource == 'ask':
+        if resource in {'ask','mini-ask'}:
             from .web_ask import handle_ask
-            return await handle_ask(self.ns,method,data,self.background)
+            return await handle_ask(self.ns,method,data,self.background,idempotent=resource=='mini-ask')
         if resource.startswith('data/'):
             if self._data_operations is None:
                 self._data_operations = DataOperations(self.ns)

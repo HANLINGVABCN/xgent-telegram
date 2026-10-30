@@ -256,6 +256,10 @@ class PresentationTurn:
                                  'started_at': time.monotonic(), 'command': str(block.get('body') or ''),
                                  'path': block.get('path'), 'state': 'running',
                                  'reply_record_id': self.replies[-1].get('record_id') if self.replies else None}
+        from .conversations import current_scope
+        from .stop_targets import begin_phase
+        scope = current_scope(required=False)
+        self.active_operation['_stop_phase'] = begin_phase(scope.run_id if scope else None, 'operation')
         self.operations.append(self.active_operation)
 
     def observe_operation(self, result, detailed_html=None):
@@ -271,6 +275,11 @@ class PresentationTurn:
             if result.get('stopped'):
                 self.active_operation['state'] = 'stopped'
             self.active_operation['state'] = operation_state(self.active_operation)
+            if not self.active_operation.get('running'):
+                from .conversations import current_scope
+                from .stop_targets import end_phase
+                scope = current_scope(required=False)
+                end_phase(scope.run_id if scope else None, self.active_operation.get('_stop_phase'))
 
     def summary(self):
         return {'rounds': len(self.replies), 'operations': len(self.operations),

@@ -310,6 +310,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         try:
             if path.startswith("/assets/"):
                 self._serve_workbench_asset(path)
+            elif path.startswith('/mini/'):
+                self._serve_mini(path.removeprefix('/mini/'))
+            elif path.startswith('/api/mini/'):
+                self._handle_mini('GET',path.removeprefix('/api/mini/'))
             elif path.startswith("/api/workbench/"):
                 self._handle_workbench("GET", path[len("/api/workbench/"):])
             elif path == "/api/term/sessions":
@@ -360,7 +364,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         try:
             if not self._require_same_origin():
                 return
-            if path.startswith("/api/workbench/"):
+            if path == '/api/mini/session':
+                self._handle_mini_session()
+            elif path.startswith('/api/mini/'):
+                self._handle_mini('POST',path.removeprefix('/api/mini/'))
+            elif path.startswith("/api/workbench/"):
                 if path == '/api/workbench/data/import':
                     self._handle_data_import()
                 else:
@@ -415,7 +423,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     # --- 处理器 ---
 
     def _serve_workbench_asset(self, path: str) -> None:
-        allowed = {"ask-form.js", "knowledge.js", "knowledge.css", "appearance.js", "composer-controls.js", "reading.css", "chat.js", "chat.css", "conversations.js", "conversations.css", "global-search.js", "global-search.css", "workbench.js", "workbench.css", "components.js", "page-cache.js", "settings.js", "data-backups.js", "usage.js", "terminal.js", "terminal.css"}
+        allowed = {"mini.js", "mini.css", "ask-form.js", "knowledge.js", "knowledge.css", "appearance.js", "composer-controls.js", "reading.css", "chat.js", "chat.css", "conversations.js", "conversations.css", "global-search.js", "global-search.css", "workbench.js", "workbench.css", "components.js", "page-cache.js", "settings.js", "data-backups.js", "usage.js", "terminal.js", "terminal.css"}
         name = path.removeprefix("/assets/")
         if name not in allowed:
             self._send_json({"error": "not found"}, status=404)
@@ -606,6 +614,81 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             secure=web_auth.is_https_request(self._headers_dict()),
         )
         self._send_json({"ok": True}, extra_headers={"Set-Cookie": cookie})
+
+    def _serve_mini(self, page):
+        from .miniapps import SESSION_KINDS
+        if page not in SESSION_KINDS or not self._require_web_enabled():
+            if page not in SESSION_KINDS:self._send_json({'error':'not found'},status=404)
+            return
+        with open(os.path.join(STATIC_DIR,'mini.html'),'rb') as source:
+            body=source.read().replace(b'data-page="form"',('data-page="'+page+'"').encode())
+        self._send_html(_version_asset_references(body))
+
+    def _handle_mini_session(self):
+        from .miniapps import make_session
+        if not self._require_web_enabled():return
+        limiter=self.server.limiter
+        ip=self._client_ip()
+        if limiter.is_locked(ip):
+            self._send_json({'error':'请稍后再登录'},status=429);return
+        data=self._read_json(65536)
+        if data is None:return
+        parsed=web_auth.verify_telegram_init_data(str(data.get('init_data') or ''),self.config.bot_token)
+        user_id=web_auth.init_data_user_id(parsed)
+        if not user_id or user_id!=self.config.authorized_user_id:
+            limiter.record_failure(ip)
+            self._send_json({'error':'请从自己的 Telegram Bot 打开此页面'},status=401);return
+        if data.get('page')!='form' or self.config.workbench is None:
+            self._send_json({'error':'此页面尚不可用'},status=404);return
+        resource={'id':str(data.get('id') or ''),'conversation_id':str(data.get('conversation_id') or '')}
+        if not resource['id'] or not resource['conversation_id']:
+            self._send_json({'error':'缺少表单入口'},status=400);return
+        try:
+            snapshot=self._run_coro(self.config.workbench('GET','mini-ask',resource))
+            if snapshot.get('id')!=resource['id'] or snapshot.get('conversation_id')!=resource['conversation_id']:
+                self._send_json({'error':'表单入口无效'},status=403);return
+            resource['generation']=snapshot['generation']
+            token=make_session(self.server.session_key,user_id,'form',resource)
+            limiter.record_success(ip)
+            self._send_json({'token':token,'snapshot':snapshot})
+        except (ValueError,WorkbenchError) as exc:
+            self._send_json({'error':str(exc)},status=getattr(exc,'status',409))
+
+    def _mini_claims(self, kind):
+        from .miniapps import verify_session
+        authorization=self.headers.get('Authorization','')
+        token=authorization.removeprefix('Bearer ') if authorization.startswith('Bearer ') else ''
+        claims=verify_session(self.server.session_key,token,self.config.authorized_user_id,kind=kind)
+        if claims is None:
+            self._send_json({'error':'页面登录已失效，请重新打开'},status=401)
+        return claims
+
+    def _handle_mini(self, method, resource):
+        if resource!='form':
+            self._send_json({'error':'not found'},status=404);return
+        if not self._require_web_enabled():return
+        if self.config.workbench is None:
+            self._send_json({'error':'此页面尚不可用'},status=503);return
+        claims=self._mini_claims('form')
+        if claims is None:return
+        target=claims['resource']
+        try:
+            current=self._run_coro(self.config.workbench('GET','mini-ask',target))
+            if current.get('generation')!=target.get('generation'):
+                self._send_json({'error':'表单已失效，请重新打开'},status=409);return
+            if method=='GET':
+                self._send_json(current);return
+            data=self._read_json()
+            if data is None:return
+            if (set(data)-{'id','conversation_id','revision','action','draft','secrets'}
+                    or 'id' in data and data['id']!=target['id']
+                    or 'conversation_id' in data and data['conversation_id']!=target['conversation_id']):
+                self._send_json({'error':'此入口只能操作原表单'},status=403);return
+            result=self._run_coro(self.config.workbench('POST','mini-ask',{**data,
+                'id':target['id'],'conversation_id':target['conversation_id']}))
+            self._send_json(result)
+        except (ValueError,WorkbenchError) as exc:
+            self._send_json({'error':str(exc)},status=getattr(exc,'status',409))
 
     def _handle_logout(self) -> None:
         self._send_json({"ok": True}, extra_headers={"Set-Cookie": web_auth.build_clear_cookie()})

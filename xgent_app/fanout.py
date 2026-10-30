@@ -154,14 +154,16 @@ OP_DELETE = "delete_message"
 OP_CHAT_ACTION = "send_chat_action"
 OP_DOCUMENT = "send_document"
 OP_PHOTO = "send_photo"
+from .telegram_native import (OP_NATIVE_RENDER, OP_NATIVE_DRAFT, OP_NATIVE_CONTROL,
+                             OP_NATIVE_DELETE, NATIVE_KINDS)
 
 # 会产生一个新的原生消息 id 的操作。
-CREATING_KINDS = frozenset({OP_SEND, OP_DOCUMENT, OP_PHOTO})
+CREATING_KINDS = frozenset({OP_SEND, OP_DOCUMENT, OP_PHOTO, OP_NATIVE_RENDER})
 # 需要先知道目标原生 id 才能投递的操作。目标不存在时**丢弃**，绝不退化成
 # "新发一条"——那正是"上一条消息无限刷屏"的成因。
 TARGETING_KINDS = frozenset({OP_EDIT, OP_EDIT_MARKUP, OP_DELETE})
 # 后来者可以整个盖掉前者的操作：同一条消息的连续编辑只有最后一次有信息量。
-SUPERSEDABLE_KINDS = frozenset({OP_EDIT, OP_EDIT_MARKUP, OP_CHAT_ACTION})
+SUPERSEDABLE_KINDS = frozenset({OP_EDIT, OP_EDIT_MARKUP, OP_CHAT_ACTION, OP_NATIVE_DRAFT, OP_NATIVE_CONTROL})
 # 大文件上传：合法地会超过普通超时（idle.py 里 read_timeout 最高开到 1800s），
 # 不套统一的 wait_for，靠 PTB 自己的超时 + 熔断计数收口。
 UPLOAD_KINDS = frozenset({OP_DOCUMENT, OP_PHOTO})
@@ -526,6 +528,8 @@ class ChannelWorker:
                 return
 
         native: Optional[int] = None
+        if op.kind in NATIVE_KINDS:
+            native = self._resolve_native(op)
         if op.kind in TARGETING_KINDS:
             if op.logical_id in self._failed:
                 self._orphaned += 1
@@ -594,7 +598,7 @@ class ChannelWorker:
 
         if op.kind in CREATING_KINDS and op.logical_id is not None and result is not None:
             self._remember(op.logical_id, result)
-        elif op.kind == OP_DELETE and op.logical_id is not None:
+        elif op.kind in {OP_DELETE, OP_NATIVE_DELETE} and op.logical_id is not None:
             self._forget_id(op.logical_id)
         self._delivered += 1
         await self._forget(op)
@@ -730,6 +734,8 @@ class ChannelWorker:
                     await self._deadletter(op, self._last_error or "重试次数已达上限")
                     continue
                 native: Optional[int] = None
+                if op.kind in NATIVE_KINDS:
+                    native = self._resolve_native(op)
                 if op.kind in TARGETING_KINDS:
                     native = self._resolve_native(op)
                     if native is None:
@@ -778,7 +784,7 @@ class ChannelWorker:
                 bad_streak = 0
                 if op.kind in CREATING_KINDS and op.logical_id is not None and result is not None:
                     self._remember(op.logical_id, result)
-                elif op.kind == OP_DELETE and op.logical_id is not None:
+                elif op.kind in {OP_DELETE, OP_NATIVE_DELETE} and op.logical_id is not None:
                     self._forget_id(op.logical_id)
                 await self._forget(op)
                 self._breaker.record_success()

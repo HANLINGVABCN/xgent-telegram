@@ -1760,8 +1760,12 @@ def telegram_entry(handler):
                         break
                     action = resolved
                 if action.startswith('act_stop_generation'):
-                    run_id = action.partition(':')[2]
-                    accepted = await manager.request_stop(run_id) if run_id else False
+                    from xgent_app.stop_targets import active_target
+                    target = action.split(':', 2)
+                    run_id = target[1] if len(target)>1 else ''
+                    ref = target[2] if len(target)>2 else None
+                    accepted = await manager.request_stop(run_id) if run_id and (
+                        ref is None or active_target(run_id,ref)) else False
                     await query.answer('已收到停止请求' if accepted else '该回合已结束，停止按钮已失效。')
                     return
                 chooser = action.startswith('tn:')

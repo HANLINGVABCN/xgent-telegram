@@ -164,7 +164,12 @@ def web_text_response(function):
             turn = current_turn()
             mode = ns['_presentation_mode']() if ns and '_presentation_mode' in ns else (turn.mode if turn is not None else 'folded')
             display = build_web_display(response, fold=fold, reply_message_id=ids[0], mode=mode)
-        with web_display_scope(display):
+        hint = dict(current_message_presentation() or {})
+        hint.setdefault('kind', 'ai_reply')
+        hint.setdefault('telegram_content', {'raw': response, 'complete': True,
+            'owner_id': display.get('reply_message_id')})
+        from .presentation import message_presentation
+        with web_display_scope(display), message_presentation(hint):
             return await function(context, chat_id, msg, response, *args, **kwargs)
     return wrapped
 
@@ -175,6 +180,7 @@ def web_stream_display(*, final=False, stopped=False):
         @wraps(function)
         async def wrapped(renderer, *args, **kwargs):
             text = ''.join(renderer.response_parts)
+            raw = text
             if stopped:
                 text += ('\n\n⏹️ 已停止，保留以上已生成内容。' if text.strip() else
                          '⏹️ 已停止，还没有生成可保留的内容。')
@@ -182,7 +188,11 @@ def web_stream_display(*, final=False, stopped=False):
                                         hide_unclosed=not final,
                                         reply_message_id=renderer.message_ids[0],
                                         mode=getattr(renderer, '_presentation_mode', 'folded'))
-            with web_display_scope(display):
+            hint = dict(current_message_presentation() or {})
+            hint.update(kind='ai_reply', telegram_content={'raw': raw, 'complete': final,
+                'owner_id': renderer.message_ids[0], 'stopped': stopped})
+            from .presentation import message_presentation
+            with web_display_scope(display), message_presentation(hint):
                 return await function(renderer, *args, **kwargs)
         return wrapped
     return decorate

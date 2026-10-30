@@ -2,7 +2,10 @@
 # version every run, and a jump like python-telegram-bot 23.x or openai 3.x
 # would break both the runtime and CI without warning.
 # Widen these deliberately, and run the full test suite when you do.
-python-telegram-bot[job-queue]>=20.0,<23.0
+python-telegram-bot[job-queue]>=22.8,<23.0
+# Telegram Rich HTML is rendered from Markdown tokens, never by splitting pipes.
+markdown-it-py>=4.2,<5.0
+mdit-py-plugins>=0.6,<0.7
 openai>=1.0.0,<3.0
 python-dotenv>=1.0.0,<2.0
 aiosqlite>=0.19.0,<1.0

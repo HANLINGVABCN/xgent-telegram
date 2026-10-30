@@ -87,7 +87,8 @@ async def _sync_presentation_footer(context, row_id, reply):
             reply_message_id=ids[0], presentation=presentation)
         stop = bool(AgentExecutor.extract_protocol_blocks(row['content'])) and getattr(turn, 'agent_enabled', False) and not presentation.get('summary')
         with web_display_scope(display), message_presentation({'kind': 'ai_reply', 'mode': turn.mode,
-                'telegram_display': {'text': base, 'parse_mode': 'HTML', 'remove_stop': True}}):
+                'telegram_display': {'text': base, 'parse_mode': 'HTML', 'remove_stop': True,
+                    'raw_markdown': row['content'], 'owner_id': ids[0] if ids else None}}):
             chunks = split_html_for_telegram(base + '\n\n' + footer, 3900)
             presentation['footer_message_html'] = chunks[-1]
             await safe_edit_text(message, chunks[0], parse_mode=constants.ParseMode.HTML,
@@ -136,6 +137,7 @@ async def _sync_protocol_states(context, *, terminal=False):
 
 async def _finish_presentation(context, turn):
     await _finish_shared_presentation(context, turn)
+    await context.bot.finish_telegram_controls()
     if not turn.replies or getattr(turn, 'awaiting_input', False):
         return
     facts = turn.replies[-1]
@@ -2560,7 +2562,10 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             "（提交前可以反复改；密钥项的内容只进环境变量，绝不会发给 AI。）"
                         )
                         PENDING_ASKS.put(pending)
-                        with message_presentation({'kind': 'agent_result', 'mode': current_turn().mode, 'ask_id': ask_id}):
+                        from xgent_app.miniapps import form_display
+                        mini_display = form_display(globals(), pending)
+                        with message_presentation({'kind': 'agent_result', 'mode': current_turn().mode, 'ask_id': ask_id,
+                                **({'telegram_display':mini_display} if mini_display else {})}):
                             form_msg = await context.bot.send_message(
                                 chat_id=update.effective_chat.id, text=form_header,
                                 reply_markup=ask_form.build_keyboard(ask_id, pending.draft))

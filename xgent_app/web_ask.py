@@ -4,6 +4,9 @@ from __future__ import annotations
 from .agent_ask import PENDING_ASKS, SECRET_STORE
 from .conversations import current_scope
 from .ui_history import without_ui_history
+import asyncio
+
+_settling = set()
 
 
 @without_ui_history
@@ -22,8 +25,22 @@ async def sync_ask(namespace, pending, *, status='pending'):
     bot = pending.form_bot or namespace['build_trigger_delivery_bot'](int(pending.chat_id))
     if pending.form_message_id is not None:
         try:
-            await bot.edit_message_reply_markup(chat_id=pending.chat_id, message_id=pending.form_message_id,
-                reply_markup=pending.form.build_keyboard(pending.ask_id, pending.draft) if status=='pending' else None)
+            from .miniapps import form_display
+            from .presentation import message_presentation
+            display = form_display(namespace, pending, status)
+            hint = {'kind':'agent_result','mode':'folded','ask_id':pending.ask_id,'purpose':'form'}
+            if display:
+                hint['telegram_display'] = display
+            with message_presentation(hint):
+                await bot.edit_message_reply_markup(chat_id=pending.chat_id, message_id=pending.form_message_id,
+                    reply_markup=pending.form.build_keyboard(pending.ask_id, pending.draft) if status=='pending' else None)
+                if display:
+                    # Text changes are Telegram-only; other endpoints keep their
+                    # existing form object and original local controls.
+                    from .telegram_presentation import chat_display
+                    with message_presentation({**hint,'audience':['telegram']}), chat_display(display):
+                        await bot.edit_message_text(chat_id=pending.chat_id, message_id=pending.form_message_id,
+                            text=display['text'], reply_markup=None, parse_mode=None)
         except Exception:
             import logging
             logging.getLogger(__name__).warning('原表单按钮更新失败，草稿已保留；不重发表单', exc_info=True)
@@ -59,10 +76,55 @@ def validated_draft(pending, value):
     return result
 
 
-async def handle_ask(namespace, method, data, background):
+async def saved_form(namespace, form_id):
+    from .presentation import metadata_dict
+    from copy import deepcopy
+    scope = current_scope()
+    db = await namespace['BotMemoryDB'].get_instance()
+    conn = await db._get_conn()
+    cursor = await conn.execute("SELECT metadata FROM global_messages WHERE session_id=? AND withdrawn=0 "
+        "AND json_extract(metadata,'$.ask_form.id')=? ORDER BY id DESC LIMIT 1", (scope.conversation_id, form_id))
+    try:
+        row = await cursor.fetchone()
+    finally:
+        await cursor.close()
+    if not row:
+        return None
+    snapshot = deepcopy(metadata_dict(row['metadata']).get('ask_form'))
+    if not isinstance(snapshot,dict) or snapshot.get('conversation_id')!=scope.conversation_id:
+        return None
+    if snapshot.get('generation')!=scope.generation or snapshot.get('status')=='pending':
+        # The only continuation lives in PendingAsk. A saved pending form alone
+        # cannot resume work after a process restart.
+        snapshot['status']='expired'
+    return snapshot
+
+
+async def handle_ask(namespace, method, data, background, *, idempotent=False):
+    if idempotent and method=='POST':
+        # The HTTP caller may disappear after the database commit. Finish the
+        # same locked submission and schedule its continuation exactly once.
+        task = asyncio.create_task(_handle_ask(namespace,method,data,background,idempotent=True))
+        _settling.add(task)
+        def done(value):
+            _settling.discard(value)
+            if not value.cancelled():
+                value.exception()
+        task.add_done_callback(done)
+        return await asyncio.shield(task)
+    return await _handle_ask(namespace,method,data,background,idempotent=idempotent)
+
+
+async def _handle_ask(namespace, method, data, background, *, idempotent=False):
     pending = PENDING_ASKS.get(str(data.get('id') or ''))
     scope = current_scope()
-    if pending is None or pending.conversation_id!=scope.conversation_id or pending.generation!=scope.generation:
+    if pending is None:
+        if idempotent:
+            snapshot = await saved_form(namespace,str(data.get('id') or ''))
+            if snapshot:
+                return snapshot
+        raise ValueError('这个表单已处理或失效，请刷新当前对话')
+    if pending.conversation_id!=scope.conversation_id or pending.generation!=scope.generation:
         raise ValueError('这个表单已处理或失效，请刷新当前对话')
     if method=='GET':
         return pending.web_snapshot()
@@ -70,6 +132,8 @@ async def handle_ask(namespace, method, data, background):
     if action not in {'save','submit','cancel'}:
         raise ValueError('不支持的表单操作')
     async with pending.lock:
+        if idempotent and pending.status!='pending':
+            return pending.web_snapshot()
         if PENDING_ASKS.get(pending.ask_id) is not pending:
             raise ValueError('这个表单已处理，请刷新当前对话')
         if type(data.get('revision')) is not int or data['revision']!=pending.revision:
