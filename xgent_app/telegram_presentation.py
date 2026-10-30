@@ -2,10 +2,12 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
+from copy import deepcopy
 
 _policy = ContextVar('telegram_presentation', default='auto')
 _UNKNOWN = object()
 _receiver = ContextVar('telegram_receiver', default=_UNKNOWN)
+_chat_display = ContextVar('telegram_chat_display', default=_UNKNOWN)
 
 
 def presentation_mode():
@@ -23,7 +25,51 @@ def should_label(scope):
 
 
 def presentation_snapshot():
-    return {'mode': presentation_mode()}
+    snapshot = {'mode': presentation_mode()}
+    display = current_chat_display()
+    if display:
+        snapshot['chat_display'] = display
+    return snapshot
+
+
+def current_chat_display():
+    replayed = _chat_display.get()
+    if replayed is not _UNKNOWN:
+        return deepcopy(replayed or {})
+    from .presentation import current_message_presentation
+    hint = current_message_presentation() or {}
+    return deepcopy(hint.get('telegram_display') or {})
+
+
+def chat_payload(payload):
+    """Freeze a Telegram-only override before a call enters the durable queue."""
+    display = current_chat_display()
+    if display.get('skip'):
+        return None
+    result = dict(payload or {})
+    for key in ('text', 'parse_mode', 'reply_markup'):
+        if key in display:
+            result[key] = deepcopy(display[key])
+    rows = result.get('reply_markup')
+    if rows and (display.get('compact_chat') or display.get('remove_stop')):
+        def keep(button):
+            action = str(button.get('callback_action') or button.get('callback_data') or '')
+            if display.get('compact_chat') and (action.startswith(('present_usage:', 'present_output:'))
+                    or button.get('text') in {'用量详情', '收起用量详情', '完整输出'}):
+                return False
+            return not (display.get('remove_stop') and action.split(':', 1)[0] == 'act_stop_generation')
+        result['reply_markup'] = [kept for row in rows if (kept := [button for button in row if keep(button)])] or None
+    return result
+
+
+@contextmanager
+def chat_display(value):
+    """A new producer's override also works inside a replayed display context."""
+    token = _chat_display.set(deepcopy(value))
+    try:
+        yield
+    finally:
+        _chat_display.reset(token)
 
 
 @contextmanager
@@ -42,7 +88,7 @@ def telegram_label(enabled=True):
 def replay_presentation(snapshot):
     snapshot = snapshot or {}
     mode = snapshot.get('mode', 'auto' if snapshot.get('label', True) else 'inline')
-    with telegram_label(mode):
+    with telegram_label(mode), chat_display(snapshot.get('chat_display')):
         yield
 
 

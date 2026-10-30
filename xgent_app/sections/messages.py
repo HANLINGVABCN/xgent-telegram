@@ -72,6 +72,7 @@ async def _sync_presentation_footer(context, row_id, reply):
     metadata['web_display'] = build_web_display(row['content'], fold=True,
         mode=turn.mode, presentation=presentation)
     ids = facts.get('message_ids') or []
+    context.bot.complete_telegram_reply(facts)
     message = next((context.bot.messages.get(mid) for mid in reversed(ids)
                     if context.bot.messages.get(mid) is not None), None)
     if turn.folded and footer and message is not None:
@@ -85,7 +86,8 @@ async def _sync_presentation_footer(context, row_id, reply):
         display = build_web_display(row['content'], fold=True, mode=turn.mode,
             reply_message_id=ids[0], presentation=presentation)
         stop = bool(AgentExecutor.extract_protocol_blocks(row['content'])) and getattr(turn, 'agent_enabled', False) and not presentation.get('summary')
-        with web_display_scope(display), message_presentation({'kind': 'ai_reply', 'mode': turn.mode}):
+        with web_display_scope(display), message_presentation({'kind': 'ai_reply', 'mode': turn.mode,
+                'telegram_display': {'text': base, 'parse_mode': 'HTML', 'remove_stop': True}}):
             chunks = split_html_for_telegram(base + '\n\n' + footer, 3900)
             presentation['footer_message_html'] = chunks[-1]
             await safe_edit_text(message, chunks[0], parse_mode=constants.ParseMode.HTML,
@@ -93,16 +95,18 @@ async def _sync_presentation_footer(context, row_id, reply):
             extra_ids = facts.setdefault('footer_fragment_ids', [])
             for index, chunk in enumerate(chunks[1:]):
                 extra = context.bot.messages.get(extra_ids[index]) if index < len(extra_ids) else None
-                if extra is not None:
-                    await safe_edit_text(extra, chunk, parse_mode=constants.ParseMode.HTML,
-                        reply_markup=_presentation_buttons(row_id, stop=stop) if index==len(chunks)-2 else None)
-                else:
-                    sent = await safe_send_message(context, message.chat_id, chunk, parse_mode=constants.ParseMode.HTML,
-                        reply_markup=_presentation_buttons(row_id, stop=stop) if index==len(chunks)-2 else None)
-                    for item in sent or []:
-                        extra_ids.append(item.message_id)
-                        if item.message_id not in ids:
-                            ids.append(item.message_id)
+                with message_presentation({'kind': 'ai_reply', 'mode': turn.mode,
+                        'telegram_display': {'skip': True}}):
+                    if extra is not None:
+                        await safe_edit_text(extra, chunk, parse_mode=constants.ParseMode.HTML,
+                            reply_markup=_presentation_buttons(row_id, stop=stop) if index==len(chunks)-2 else None)
+                    else:
+                        sent = await safe_send_message(context, message.chat_id, chunk, parse_mode=constants.ParseMode.HTML,
+                            reply_markup=_presentation_buttons(row_id, stop=stop) if index==len(chunks)-2 else None)
+                        for item in sent or []:
+                            extra_ids.append(item.message_id)
+                            if item.message_id not in ids:
+                                ids.append(item.message_id)
         message.record_id = row_id
     live = metadata.get('web_live')
     if isinstance(live, dict):
@@ -131,6 +135,21 @@ async def _sync_protocol_states(context, *, terminal=False):
 
 
 async def _finish_presentation(context, turn):
+    await _finish_shared_presentation(context, turn)
+    if not turn.replies or getattr(turn, 'awaiting_input', False):
+        return
+    facts = turn.replies[-1]
+    db = await BotMemoryDB.get_instance()
+    row = await db.get_display_message(facts['record_id'])
+    if row is None:
+        return
+    telegram_reply = await context.bot.finish_telegram_reply(row, facts, turn.summary() if turn.operations else None)
+    metadata = metadata_dict(row.get('metadata'))
+    metadata['telegram_reply'] = telegram_reply
+    await db.backfill_attachment_metadata(row['id'], row.get('metadata'), metadata)
+
+
+async def _finish_shared_presentation(context, turn):
     await _sync_protocol_states(context, terminal=True)
     if not turn.operations:
         return
@@ -148,7 +167,8 @@ async def _finish_presentation(context, turn):
         note_presentation = {'version': 1, 'mode': turn.mode, 'kind': 'presentation_note', 'summary': {**summary, 'reason': ''}}
         row_id = await GlobalRecorder.record('presentation_note', 'assistant', notice, chat_id=message.chat_id,
             metadata={'presentation': note_presentation})
-        with message_presentation({'kind': 'presentation_note', 'mode': turn.mode}), web_display_scope(build_web_display(notice, mode=turn.mode, presentation=note_presentation)):
+        with message_presentation({'kind': 'presentation_note', 'mode': turn.mode,
+                'telegram_display': {'text': notice, 'parse_mode': None}}), web_display_scope(build_web_display(notice, mode=turn.mode, presentation=note_presentation)):
             await safe_send_message(context, message.chat_id,
                 html.escape(notice) + '\n<i>' + html.escape(summary_line({**summary, 'reason': ''})) + '</i>', parse_mode=constants.ParseMode.HTML)
         await publish_saved_reply(context, row_id)
@@ -177,7 +197,9 @@ async def _finish_presentation(context, turn):
     if turn.folded:
         base = message.base_text if 'html' in str(message.parse_mode).lower() else html.escape(message.base_text)
         display = base + '\n\n<i>' + html.escape(summary_line(presentation['summary'])) + '</i>'
-        with message_presentation({'kind': message.kind, 'mode': turn.mode}):
+        telegram_base = message.telegram_body if message.kind == 'agent_result' else base
+        with message_presentation({'kind': message.kind, 'mode': turn.mode,
+                'telegram_display': {'text': telegram_base, 'parse_mode': 'HTML'}}):
             await safe_edit_text(message, display, parse_mode=constants.ParseMode.HTML,
                                  reply_markup=message.reply_markup)
         metadata['display'] = {'content': display, 'parse_mode': 'HTML'}
@@ -2735,6 +2757,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             # ask 表单已弹出：本轮到此结束，释放锁，等用户在任一端提交后由
             # resume_from_ask 重新进入。把"进行中"状态改成"等待填写"，不再叫模型。
             if form_shown:
+                current_turn().awaiting_input = True
                 with contextlib.suppress(Exception):
                     await safe_edit_text(
                         agent_stop_msg,

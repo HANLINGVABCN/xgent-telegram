@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from .agent_status import compact_agent_round_status
 from .presentation import current_message_presentation, message_presentation, operation_html
+from .telegram_presentation import chat_display
 
 
 class PresentationMessage:
@@ -13,6 +14,12 @@ class PresentationMessage:
         self.base_text = text
         self.record_id = None
         self.policy = None
+        self.telegram_body = text
+        self.telegram_parse_mode = parse_mode
+        self.telegram_complete = False
+        self.telegram_extra_messages = []
+        self.telegram_extra_texts = []
+        self.telegram_suppressed = False
 
     def __getattr__(self, name):
         return getattr(self.original, name)
@@ -49,6 +56,7 @@ class PresentationBot:
     def __init__(self, bot, turn):
         self.original, self.turn = bot, turn
         self.messages = {}
+        self._telegram_final_replies = {}
 
     def __getattr__(self, name):
         return getattr(self.original, name)
@@ -58,12 +66,106 @@ class PresentationBot:
         operation = self.turn.active_operation
         if not operation or operation.get('kind') != 'run':
             return
-        with message_presentation({'kind': 'agent_result', 'mode': self.turn.mode, 'transient': True}):
+        with message_presentation({'kind': 'agent_result', 'mode': self.turn.mode, 'transient': True,
+                'telegram_operation': {**operation, 'running': True, 'output': '等待命令返回…'}}):
             message = await self.send_message(chat_id=chat_id,
                 text=operation_html({'kind': 'run', 'running': True, 'notice': '等待命令返回…'}),
                 parse_mode='HTML', reply_markup=reply_markup)
         message.finalized = False
         self.turn.operation_messages[operation['sequence']] = message
+
+    def _telegram_hint(self, hint, kind, previous=None):
+        hint = dict(hint)
+        display = {'compact_chat': True, **hint.get('telegram_display', {})}
+        if previous is not None and previous.telegram_complete:
+            display['remove_stop'] = True
+        chunks = None
+        operation = hint.get('telegram_operation') or self.turn.active_operation
+        policy = hint.get('message_policy') or {}
+        if (kind == 'agent_result' and operation and operation.get('kind') != 'ask'
+                and policy.get('purpose', 'tool_result') == 'tool_result'
+                and 'text' not in display and not display.get('skip')):
+            from .telegram_chat import output_chunks
+            from .web_display import operation_state
+            chunks = output_chunks(operation)
+            display.update(text=chunks[0], parse_mode='HTML', remove_stop=operation_state(operation) != 'running')
+        hint['telegram_display'] = display
+        return hint, chunks
+
+    @staticmethod
+    def _remember_telegram_body(message, hint, text, parse_mode):
+        display = hint.get('telegram_display') or {}
+        message.telegram_suppressed = bool(display.get('skip'))
+        if not message.telegram_suppressed:
+            message.telegram_body = display.get('text', text)
+            message.telegram_parse_mode = display.get('parse_mode', parse_mode)
+
+    def complete_telegram_reply(self, facts):
+        for mid in facts.get('message_ids') or []:
+            message = self.messages.get(mid)
+            if message is not None:
+                message.telegram_complete = True
+
+    async def _telegram_only(self, method, *, kind='ai_reply', **kwargs):
+        display = {'compact_chat': True, 'remove_stop': True}
+        with message_presentation({'kind': kind, 'mode': self.turn.mode, 'audience': ['telegram'],
+                'telegram_display': display}), chat_display(display):
+            return await getattr(self.original, method)(**kwargs)
+
+    async def _update_telegram_tail(self, message, chunks):
+        for index, text in enumerate(chunks):
+            if index < len(message.telegram_extra_messages):
+                extra = message.telegram_extra_messages[index]
+                if text != message.telegram_extra_texts[index]:
+                    await self._telegram_only('edit_message_text', kind=message.kind,
+                        chat_id=message.chat_id, message_id=extra.message_id, text=text, parse_mode='HTML', reply_markup=None)
+            else:
+                extra = await self._telegram_only('send_message', kind=message.kind,
+                    chat_id=message.chat_id, text=text, parse_mode='HTML', reply_markup=None)
+                message.telegram_extra_messages.append(extra)
+        for extra in message.telegram_extra_messages[len(chunks):]:
+            await self._telegram_only('delete_message', kind=message.kind,
+                chat_id=message.chat_id, message_id=extra.message_id)
+        del message.telegram_extra_messages[len(chunks):]
+        message.telegram_extra_texts = list(chunks)
+
+    async def finish_telegram_reply(self, row, facts, summary=None):
+        """Append once to the last AI reply; all edits stay on Telegram only."""
+        from .telegram_chat import append_details, reply_details
+        from .protocols import ProtocolParser
+        import html
+
+        details = reply_details(row, facts, summary)
+        saved = self._telegram_final_replies.get(row['id'])
+        if saved is None:
+            ids = facts.get('message_ids') or []
+            target_id = facts.get('footer_message_id')
+            message = self.messages.get(target_id) if target_id is not None else next(
+                (self.messages[mid] for mid in reversed(ids) if mid in self.messages
+                 and not self.messages[mid].telegram_suppressed), None)
+            if message is None or message.hidden or getattr(message, 'media', False):
+                # Media captions have their own 1024-character limit. A detail
+                # continuation remains attached to this actual AI reply.
+                original = await self._telegram_only('send_message', chat_id=row['chat_id'] if message is None else message.chat_id,
+                    text=details[0], parse_mode='HTML', reply_markup=None)
+                message = PresentationMessage(self, original, '', 'HTML')
+                message.telegram_body = details[0]
+                base = ''
+            else:
+                base = message.telegram_body
+                if 'html' not in str(message.telegram_parse_mode).lower():
+                    base = html.escape(base)
+            saved = self._telegram_final_replies[row['id']] = (message, base)
+        message, base = saved
+        chunks = append_details(base, details)
+        if ProtocolParser.to_telegram_html(message.telegram_body) != chunks[0]:
+            await self._telegram_only('edit_message_text', chat_id=message.chat_id,
+                message_id=message.message_id, text=chunks[0], parse_mode='HTML', reply_markup=None)
+            message.telegram_body = chunks[0]
+            message.telegram_parse_mode = 'HTML'
+        await self._update_telegram_tail(message, chunks[1:])
+        return {'version': 1, 'record_id': row['id'], 'message_ids': [message.message_id,
+                *[extra.message_id for extra in message.telegram_extra_messages]], 'details': details}
 
     def remember_notice(self, text):
         if any(word in str(text) for word in ('停止', '失败', '超过', '超限')):
@@ -140,6 +242,7 @@ class PresentationBot:
         elif (kind == 'agent_status' and record_ids.get(kind)
               and getattr(self.turn, 'record_contents', {}).get(kind) == str(text)):
             hint['record_id'] = record_ids[kind]
+        hint, telegram_chunks = self._telegram_hint(hint, kind)
         progress = self.turn.operation_messages.get(op.get('sequence')) if op else None
         if (kind == 'agent_result' and progress is not None and not progress.finalized
                 and not transient and (not explicit or explicit['message_policy']['purpose'] == 'tool_result')):
@@ -148,7 +251,7 @@ class PresentationBot:
                 message_id=progress.message_id, reply_markup=reply_markup, parse_mode=parse_mode, **kwargs)
             progress.finalized = True
             return result
-        with message_presentation(hint):
+        with message_presentation(hint), chat_display(hint['telegram_display']):
             original = await self.original.send_message(chat_id=chat_id, text=prepared,
                 reply_markup=reply_markup, parse_mode=parse_mode, **kwargs)
         message = PresentationMessage(self, original, prepared, parse_mode, kind)
@@ -156,8 +259,11 @@ class PresentationBot:
         message.policy = new_policy(kind, hint=hint)
         message.record_id = hint.get('record_id')
         message.reply_markup = reply_markup
+        self._remember_telegram_body(message, hint, prepared, parse_mode)
         self.messages[message.message_id] = message
         self.turn.last_message = message
+        if telegram_chunks is not None:
+            await self._update_telegram_tail(message, telegram_chunks[1:])
         return message
 
     async def edit_message_text(self, text, chat_id=None, message_id=None,
@@ -172,7 +278,8 @@ class PresentationBot:
         hint.update(kind=kind, mode=self.turn.mode)
         if previous is not None and previous.record_id is not None:
             hint['record_id'] = previous.record_id
-        with message_presentation(hint):
+        hint, telegram_chunks = self._telegram_hint(hint, kind, previous)
+        with message_presentation(hint), chat_display(hint['telegram_display']):
             original = await self.original.edit_message_text(prepared, chat_id=chat_id,
                 message_id=message_id, reply_markup=reply_markup, parse_mode=parse_mode, **kwargs)
         if previous is None:
@@ -183,7 +290,10 @@ class PresentationBot:
         from .message_policy import new_policy
         previous.policy = new_policy(kind, hint=hint)
         previous.base_text = prepared
+        self._remember_telegram_body(previous, hint, prepared, parse_mode)
         self.turn.last_message = previous
+        if telegram_chunks is not None:
+            await self._update_telegram_tail(previous, telegram_chunks[1:])
         return previous
 
     async def edit_message_reply_markup(self, **kwargs):
@@ -193,7 +303,11 @@ class PresentationBot:
             hint['message_policy'] = message.policy.to_dict()
         if message is not None and message.record_id is not None:
             hint['record_id'] = message.record_id
-        with message_presentation(hint):
+        hint, _ = self._telegram_hint(hint, hint['kind'], message)
+        # Keyboard-only updates never rewrite a command's text.
+        hint['telegram_display'].pop('text', None)
+        hint['telegram_display'].pop('parse_mode', None)
+        with message_presentation(hint), chat_display(hint['telegram_display']):
             result = await self.original.edit_message_reply_markup(**kwargs)
         if message is not None:
             message.reply_markup = kwargs.get('reply_markup')
@@ -202,6 +316,8 @@ class PresentationBot:
     async def delete_message(self, chat_id=None, message_id=None, **kwargs):
         result = await self.original.delete_message(chat_id=chat_id, message_id=message_id, **kwargs)
         message = self.messages.pop(message_id, None)
+        if message is not None and message.telegram_extra_messages:
+            await self._update_telegram_tail(message, [])
         if self.turn.last_message is message:
             self.turn.last_message = None
         return result

@@ -247,7 +247,8 @@ async def _handle_presentation_callback(update, context, data):
     if stop_rows:
         markup = InlineKeyboardMarkup([*markup.inline_keyboard, *stop_rows])
     await query.answer()
-    await safe_edit_text(query.message, text, parse_mode=constants.ParseMode.HTML, reply_markup=markup)
+    with message_presentation({'kind': 'ai_reply', 'telegram_display': {'remove_stop': True}}):
+        await safe_edit_text(query.message, text, parse_mode=constants.ParseMode.HTML, reply_markup=markup)
 
 
 @conversation_entry()

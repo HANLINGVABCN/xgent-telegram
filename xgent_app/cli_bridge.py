@@ -621,6 +621,10 @@ class CliBot:
         编辑那一刻从"◇ 命令 + 灰底"翻成"◆ XGent 双横线块"，中途换皮。
         """
         kind = _render_kind_for(text)
+        from .message_policy import current_policy
+        policy = current_policy()
+        if policy is not None and not policy.allows('cli'):
+            return [], kind
         from .web_display import current_web_display
         display = current_web_display() or {}
         if display.get('usage_details') and display.get('presentation_mode') == 'folded':
