@@ -53,6 +53,8 @@
 
 服务端与所有 CLI 需一起升级，数据库会自动备份并迁移到 schema v8。实现范围、验证结果和升级说明见 [本次更新说明](docs/chat-controls-update.md)。
 
+Telegram 新旧能力的官方核查、当前接线缺口及改进优先级见 [Bot API 与 Mini App 能力清单](docs/telegram-capabilities-review.md)。其中独立表单页、原生草稿、Rich 排版与私聊话题是后续设计，文档列出实际接口、长度限制和旧流程替换方式。
+
 ## 它能做什么
 
 | 场景 | 你可以直接在 Telegram 里说 |
