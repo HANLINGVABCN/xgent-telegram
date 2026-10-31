@@ -209,6 +209,35 @@ def test_no_reasoning_or_whitespace_does_not_show_a_thinking_block(queue_browser
     assert not page.locator('.thinking-block').count()
 
 
+def test_runtime_error_is_plain_text_and_does_not_change_after_refresh(queue_browser):
+    import html
+    server, page, _, base, _ = queue_browser
+    ready(page, base)
+    raw = '⚠️ {"finish_reason": "prohibited_content", "detail": "<b>raw</b> `literal`"}\n原始第二行'
+    display = {'version': 1, 'plain_text': raw, 'segments': [
+        {'kind': 'html', 'text': html.escape(raw).replace('\n', '<br>')}]}
+    frame = {'conversation_id': 'A', 'run_id': 'plain-error-test', 'ui_generation': 7,
+             'message_id': 99995, 'record_id': 99995, 'msg_type': 'runtime_error'}
+    server.outbox.put({**frame, 'type': 'message', 'text': html.escape(raw), 'parse_mode': 'HTML', 'web_display': display})
+    bubble = page.locator('.msg-row[data-record-id="99995"] .body')
+    bubble.wait_for()
+    assert bubble.inner_text() == raw
+    assert not bubble.locator('pre,code,.code-block-wrap,.pb-header,b').count()
+    before = bubble.evaluate('(node)=>node.innerHTML')
+    def history(route):
+        route.fulfill(json={'conversation_id': 'A', 'ui_generation': 7, 'busy': True,
+            'messages': [{'id': 99995, 'role': 'user', 'msg_type': 'runtime_error', 'content': raw,
+                          'timestamp': 1, 'parse_mode': None, 'web_display': display,
+                          'web_live': {'epoch': server.outbox.snapshot()['epoch'], 'message_ids': [99995]}}],
+            'live': server.outbox.snapshot(), 'next_cursor': None})
+    page.route('**/api/workbench/history?*', history)
+    page.reload()
+    bubble.wait_for()
+    assert bubble.inner_text() == raw
+    assert bubble.evaluate('(node)=>node.innerHTML') == before
+    assert not bubble.locator('pre,code,.code-block-wrap,.pb-header,b').count()
+
+
 def test_nonstream_reasoning_has_content_below_author_and_zero_missing_time(queue_browser):
     server, page, _, base, _ = queue_browser
     ready(page, base)

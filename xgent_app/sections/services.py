@@ -246,7 +246,7 @@ class GlobalRecorder:
         if not text.startswith('⚠️ '):
             text = '⚠️ ' + text
         metadata = {**(display_metadata or {}), 'error_source': source, 'error_type': type(error).__name__ if isinstance(error, BaseException) else 'reported_error',
-                    'display': {'content': '<pre>' + html.escape(text) + '</pre>', 'parse_mode': 'HTML'}}
+                    'display': {'content': text, 'parse_mode': None}}
         if source in {'web_menu', 'workbench'}:
             metadata['ui_only'] = True
         if context and context[0] == chat_id:

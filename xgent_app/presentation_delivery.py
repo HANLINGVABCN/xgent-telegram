@@ -113,8 +113,8 @@ class PresentationBot:
             raw = hint['telegram_error']
             owner_id = hint.get('error_owner_id')
             result = {'phase': 'reply', 'record_id': hint.get('record_id'),
-                      'html': split_blocks([Block('pre', text=raw)]),
-                      'fallback': split_blocks([Block('pre', text=raw)], budget=3800),
+                      'html': split_blocks([Block('p', text=raw)]),
+                      'fallback': split_blocks([Block(text=raw)], budget=3800),
                       'owner_id': owner_id}
             if owner_id is not None:
                 result['auxiliary'] = previous is None or previous.message_id != owner_id

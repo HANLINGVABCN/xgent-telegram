@@ -1457,8 +1457,8 @@ async def finalize_reported_error(context, chat_id, msg, text):
     record_id = getattr(turn, 'record_ids', {}).get('runtime_error')
     hint = {'kind': 'runtime_error', 'record_id': record_id,
             'telegram_error': str(text), 'error_owner_id': getattr(msg, 'message_id', None)}
-    display = {'version': 1, 'segments': [{'kind': 'html',
-               'text': '<pre class="literal-diagnostic">' + html.escape(str(text)) + '</pre>'}]}
+    display = {'version': 1, 'plain_text': str(text), 'segments': [{'kind': 'html',
+               'text': html.escape(str(text)).replace('\n', '<br>')}]}
     if hint['error_owner_id'] is not None:
         display['reply_message_id'] = hint['error_owner_id']
     with message_presentation(hint), web_display_scope(display):

@@ -423,13 +423,16 @@ import {syncAskForm} from './ask-form.js';
   // 输入，Web 对齐）。其余角色照常走 renderText。初始渲染(makeBubble)与流式/编辑
   // 更新(putTextFrame)两处共用，避免规则失步。
   function renderBubbleBody(role, text, parseMode, webDisplay) {
+    if(webDisplay?.version===1 && typeof webDisplay.plain_text==='string'){
+      return escapeHtml(webDisplay.plain_text).replace(/\n/g,'<br>');
+    }
     if (role === "user") {
       return escapeHtml(text == null ? "" : String(text)).replace(/\n/g, "<br>");
     }
     // Reported errors are literal diagnostics both live and in durable history.
     // Do not turn upstream Markdown, HTML or stack traces into different layouts.
     if(role==='sys'&&!parseMode&&/^⚠️(?:\s|$)/.test(String(text||''))){
-      return '<pre class="literal-diagnostic">'+escapeHtml(String(text||''))+'</pre>';
+      return escapeHtml(String(text||'')).replace(/\n/g,'<br>');
     }
     if(webDisplay?.version===1 && Array.isArray(webDisplay.segments) &&
        webDisplay.segments.every(s=>s && ['markdown','html'].includes(s.kind) && typeof s.text==='string')){

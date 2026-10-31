@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import html as _html
 import mimetypes
 import re
 from pathlib import Path
@@ -443,7 +444,13 @@ def build_history_message(
         web_display = metadata.get('web_display')
         message['web_display'] = (web_display if isinstance(web_display, dict) else
                                   history_web_display(content, display))
-    if isinstance(display, dict) and isinstance(display.get("content"), str):
+    if kind == 'runtime_error':
+        # The durable body is authoritative, including rows saved with an old
+        # presentation-only <pre> wrapper. Error JSON is literal chat text.
+        message.update(content=content, parse_mode=None,
+                       web_display={'version': 1, 'plain_text': content,
+                                    'segments': [{'kind': 'html', 'text': _html.escape(content).replace('\n', '<br>')}]})
+    elif isinstance(display, dict) and isinstance(display.get("content"), str):
         from .protocols import ProtocolParser
         from .output_archive import attach_archive_path
         message.update(content=attach_archive_path(ProtocolParser.restore_folded_html(display["content"])),

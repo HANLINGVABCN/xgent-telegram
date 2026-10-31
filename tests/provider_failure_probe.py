@@ -66,12 +66,19 @@ async def exercise(bot, root):
                     messages = [message for message in native.messages.values() if 'RAW REFUSAL DETAIL' in message['text']]
                     assert len(messages) == 1, native.messages
                     assert not messages[0]['reply_markup'], messages
+                    assert '<pre' not in messages[0]['text'] and '<code' not in messages[0]['text'], messages
                     assert reason in html.unescape(messages[0]['text'])
                     metadata = json.loads(error['metadata']) if isinstance(error['metadata'], str) else error['metadata']
                     saved = metadata['telegram_native_parts']['ids']
                     assert saved and all(mid in native.messages for mid in saved), metadata
                     frames = html.unescape(json.dumps(h.drain_frames(), ensure_ascii=False))
                     assert 'RAW REFUSAL DETAIL' in frames, frames
+                    from xgent_app.web_history import build_history_message
+                    legacy = {**error, 'metadata': {**metadata, 'display': {
+                        'content': '<pre>' + html.escape(error['content']) + '</pre>', 'parse_mode': 'HTML'}}}
+                    restored = build_history_message(legacy, bot.ArtifactManager.ROOT_DIR, str(root))
+                    assert restored['content'] == error['content'] and restored['parse_mode'] is None, restored
+                    assert restored['web_display']['plain_text'] == error['content'], restored
                     h.refused = False
                     await h.turn('explain the raw error')
                     assert await bot.telegram_channel().wait_idle(5)
@@ -100,6 +107,7 @@ async def exercise(bot, root):
             from xgent_app.web_history import build_history_message
             history = build_history_message(error, bot.ArtifactManager.ROOT_DIR, str(root))
             assert error['content'] in html.unescape(history['content']), history
+            assert history['content'] == error['content'] and history['web_display']['plain_text'] == error['content'], history
             results['long_error_live_and_history'] = True
             h.refused = False
             h.error = (500, 'ORIGINAL HTTP 500 EOF')
