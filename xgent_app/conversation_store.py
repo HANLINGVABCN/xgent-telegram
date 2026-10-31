@@ -194,6 +194,8 @@ class ConversationStore(QueueStore):
             version = int(await _config(conn, 'conversation_schema_version', 0))
             if version > SCHEMA_VERSION:
                 raise ConversationError('数据库版本较新，请升级程序。')
+            if version >= 5:
+                await conn.execute("UPDATE conversation_groups SET name='默认分组' WHERE id='ungrouped' AND name='未分组'")
             if version == SCHEMA_VERSION:
                 await self._repair_turn_and_branch_tokens(conn)
                 if not await _config(conn, 'message_policy_import_pending'):
@@ -228,7 +230,7 @@ class ConversationStore(QueueStore):
                     'created_at REAL NOT NULL,updated_at REAL NOT NULL)')
                 now = time.time()
                 await conn.execute('INSERT OR IGNORE INTO conversation_groups VALUES(?,?,?,?,?)',
-                                   ('ungrouped', '未分组', 0, now, now))
+                                   ('ungrouped', '默认分组', 0, now, now))
                 cursor = await conn.execute('PRAGMA table_info(chat_sessions)')
                 columns = {row['name'] for row in await cursor.fetchall()}
                 for column, definition in (('group_id', "TEXT NOT NULL DEFAULT 'ungrouped'"), ('pinned', 'INTEGER NOT NULL DEFAULT 0')):
@@ -392,7 +394,7 @@ class ConversationStore(QueueStore):
                                    (gid, name, now, now))
             elif action in {'rename_group', 'delete_group'}:
                 if gid == 'ungrouped':
-                    raise ConversationError('“未分组”是保留分组，不能重命名或删除。')
+                    raise ConversationError('“默认分组”是保留分组，不能重命名或删除。')
                 if action == 'rename_group':
                     await conn.execute('UPDATE conversation_groups SET name=?,updated_at=? WHERE id=?', (name, time.time(), gid))
                 else:

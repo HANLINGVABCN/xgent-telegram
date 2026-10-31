@@ -17,12 +17,15 @@ const paths = {
   archive: 'M4 8h16v12H4zM3 4h18v4H3zM10 12h4',
   restore: 'M4 8h16v12H4zM3 4h18v4H3zM12 17v-6m-3 3 3-3 3 3',
   close: 'm6 6 12 12M6 18 18 6',
+  export: 'M12 3v12m-4-4 4 4 4-4M4 17v4h16v-4',
   branch: 'M6 3v12M18 9a9 9 0 0 1-9 9M15 6a3 3 0 1 0 6 0 3 3 0 1 0-6 0M3 18a3 3 0 1 0 6 0 3 3 0 1 0-6 0',
 };
 let state = {current_chat_id: null, telegram_conversation_id: null, revision: -1, items: [], running: null};
 let authenticated = false, authEpoch = 0, request = null, mutation = null;
 let view = 'recent', listSignature = '', menuTarget = null, menuTrigger = null;
-let groupView = 'all';
+let groupView = 'ungrouped';
+let moveSubmenu = null, moveTrigger = null, moveHideTimer = null;
+const exporting = new Set();
 let drawerOpen = false, drawerReturn = null, previousInert = null;
 let renameTarget = null, renameReturn = null, renameSaving = false;
 let feedbackTimer = null;
@@ -59,8 +62,11 @@ function timestamp(item) { return Number(item.activity_at ?? item.last_active ??
 function itemById(id) { return itemIndex.get(id); }
 function activeRuns() { return state.runs ? Object.values(state.runs) : state.running ? [state.running] : []; }
 function runningFor(id) { return state.runs ? state.runs[id] || null : state.running?.conversation_id === id ? state.running : null; }
-function groups() { return Array.isArray(state.groups) ? state.groups : [{id:'ungrouped',name:'未分组'}]; }
-function groupName(id) { return groups().find(group => group.id === id)?.name || '未分组'; }
+function groups() {
+  const values=Array.isArray(state.groups)?state.groups:[];
+  return [{...(values.find(group=>group.id==='ungrouped')||{}),id:'ungrouped',name:'默认分组'},...values.filter(group=>group.id!=='ungrouped')];
+}
+function groupName(id) { return groups().find(group => group.id === id)?.name || '默认分组'; }
 function isArchived(item) { return item.archived === true || Number(item.archived) === 1; }
 function isBranch(item) { return Boolean(item?.parent_conversation_id || item?.branch_mode); }
 function groupFor(item) {
@@ -253,13 +259,13 @@ function renderList() {
   if (globalResults.options) globalResults.reset();
   const query = search.value.trim().toLocaleLowerCase();
   const visible = state.items.filter(item => isArchived(item) === (view === 'archived')
-      && (groupView === 'all' || item.group_id === groupView)
+      && (groupView === 'all' || (item.group_id||'ungrouped') === groupView)
       && title(item).toLocaleLowerCase().includes(query))
     .sort((a, b) => {
-      const pinned = !query && groupView !== 'all' ? Number(b.pinned || 0) - Number(a.pinned || 0) : 0;
+      const pinned = !query ? Number(b.pinned || 0) - Number(a.pinned || 0) : 0;
       return pinned || timestamp(b) - timestamp(a) || a.id.localeCompare(b.id);
     });
-  const signature = JSON.stringify([view, groupView, query, state.current_chat_id, state.telegram_conversation_id, activeRuns(), mutation,
+  const signature = JSON.stringify([view, groupView, query, groups().map(group=>[group.id,group.name]), state.current_chat_id, state.telegram_conversation_id, activeRuns(), mutation,
     visible.map(item => [item.id, title(item), groupFor(item), item.group_id, item.pinned, item.parent_conversation_id, item.branch_mode])]);
   if (signature === listSignature) return;
   listSignature = signature;
@@ -269,7 +275,7 @@ function renderList() {
   let group = '';
   for (const item of visible) {
     const next = query ? '搜索结果 · ' + visible.length : view === 'archived' ? '已归档的对话' :
-      (groupView === 'all' ? groupFor(item) : groupName(groupView));
+      (item.pinned ? '置顶' : groupFor(item));
     if (next !== group) { group = next; children.push(node('h3', {class: 'conv-date-group'}, group)); }
     const entry = rows.get(item.id) || createRow(item);
     rows.set(item.id, entry);
@@ -278,7 +284,7 @@ function renderList() {
     entry.row.classList.toggle('is-current', current);
     entry.row.classList.toggle('is-archived', isArchived(item));
     entry.row.classList.toggle('is-branch', branched);
-    entry.row.classList.toggle('is-pinned',!!item.pinned&&groupView!=='all'&&!query);
+    entry.row.classList.toggle('is-pinned',!!item.pinned&&!query);
     entry.row.classList.toggle('is-pending', mutation?.name === 'switch' && mutation.id === item.id);
     entry.branch.hidden = !branched;
     if (branched) {
@@ -348,7 +354,7 @@ function render() {
   $('conversation-new').disabled = !state.current_chat_id || !!mutation;
   $('conversation-new').setAttribute('aria-busy', String(mutation?.name === 'create'));
   $('conversation-search-clear').hidden = !search.value;
-  $('conversation-list-title').textContent = search.value.trim() ? '全局搜索' : view === 'archived' ? '已归档' : groupView === 'all' ? '最近对话' : groupName(groupView);
+  $('conversation-list-title').textContent = search.value.trim() ? '全局搜索' : view === 'archived' ? '已归档' : groupView === 'all' ? '全部对话' : groupName(groupView);
   $('conversation-view-back').hidden = view !== 'archived';
   $('conversation-archive-view').setAttribute('aria-pressed', String(view === 'archived'));
   const count = state.items.filter(isArchived).length;
@@ -356,9 +362,9 @@ function render() {
   $('conversation-archive-count').hidden = !count;
   const select = $('conversation-group-select');
   if (select) {
-    const options = [{id:'all',name:'全部对话'}, ...groups()];
+    const options = [groups()[0],{id:'all',name:'全部对话'},...groups().slice(1)];
     select.replaceChildren(...options.map(item => node('option',{value:item.id},item.name)));
-    if(!options.some(item => item.id === groupView))groupView='all';
+    if(!options.some(item => item.id === groupView))groupView='ungrouped';
     select.value = groupView;
   }
   if (state.current_chat_id) renderList();
@@ -369,13 +375,53 @@ function closeMenu(restore = true) {
   const trigger = menuTrigger;
   if (trigger) trigger.setAttribute('aria-expanded', 'false');
   menu.hidden = true; menuTarget = null; menuTrigger = null;
+  clearTimeout(moveHideTimer);moveSubmenu=null;moveTrigger=null;
   if (restore && trigger?.isConnected) trigger.focus({preventScroll: true});
 }
 function positionMenu() {
-  if (!menuTrigger?.isConnected || menu.hidden) return;
+  if(menu.hidden)return;
+  if(!menuTrigger?.isConnected){closeMenu(false);return;}
   const anchor = menuTrigger.getBoundingClientRect(), bounds = menu.getBoundingClientRect();
   menu.style.left = Math.max(8, Math.min(innerWidth - bounds.width - 8, anchor.right - bounds.width)) + 'px';
   menu.style.top = Math.max(8, Math.min(innerHeight - bounds.height - 8, anchor.bottom + 5)) + 'px';
+  positionMoveMenu();
+}
+function positionMoveMenu(){
+  if(!moveSubmenu||moveSubmenu.hidden||!moveTrigger?.isConnected)return;
+  const anchor=moveTrigger.getBoundingClientRect();
+  moveSubmenu.style.position=mobile.matches?'static':'fixed';moveSubmenu.style.width=mobile.matches?'100%':'180px';
+  if(mobile.matches)return;
+  const bounds=moveSubmenu.getBoundingClientRect(),right=anchor.right+5;
+  moveSubmenu.style.left=Math.max(8,Math.min(innerWidth-bounds.width-8,right+bounds.width<=innerWidth-8?right:anchor.left-bounds.width-5))+'px';
+  moveSubmenu.style.top=Math.max(8,Math.min(innerHeight-bounds.height-8,anchor.top))+'px';
+}
+function showMoveMenu(focus=false){
+  if(!moveSubmenu)return;clearTimeout(moveHideTimer);moveSubmenu.hidden=false;moveTrigger.setAttribute('aria-expanded','true');positionMenu();
+  if(focus)(moveSubmenu.querySelector('button:not(:disabled)')||moveSubmenu).focus();
+}
+function hideMoveMenu(focus=false){
+  clearTimeout(moveHideTimer);if(moveSubmenu)moveSubmenu.hidden=true;if(moveTrigger)moveTrigger.setAttribute('aria-expanded','false');
+  if(focus)moveTrigger?.focus();positionMenu();
+}
+async function exportConversation(item){
+  if(exporting.has(item.id))return;
+  closeMenu(false);exporting.add(item.id);
+  const controller=new AbortController(),epoch=authEpoch;controllers.add(controller);
+  const timeout=setTimeout(()=>controller.abort(),120000);
+  notify('正在导出「'+title(item)+'」…');
+  try{
+    const response=await fetch('/api/workbench/conversations/export',{method:'POST',credentials:'same-origin',signal:controller.signal,
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({id:item.id})});
+    if(response.status===401){window.dispatchEvent(new Event('xgent-auth-expired'));return;}
+    if(!response.ok){const error=await response.json().catch(()=>({}));throw new Error(error.error||'导出失败');}
+    if(!(response.headers.get('Content-Type')||'').includes('application/zip'))throw new Error('导出未返回ZIP文件，请检查登录后重试');
+    const blob=await response.blob();if(epoch!==authEpoch||!authenticated)return;
+    const match=/filename\*=UTF-8''([^;]+)/i.exec(response.headers.get('Content-Disposition')||'');
+    const url=URL.createObjectURL(blob),link=node('a',{href:url,download:match?decodeURIComponent(match[1]):'系统记忆.zip'});
+    document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);
+    notify('「'+title(item)+'」的完整记忆已下载');
+  }catch(error){if(epoch===authEpoch)notify(error.name==='AbortError'?'导出超时，请重试':error.message,{error:true});}
+  finally{clearTimeout(timeout);controllers.delete(controller);exporting.delete(item.id);}
 }
 function openMenu(id, trigger) {
   if (mutation) return;
@@ -389,7 +435,7 @@ function openMenu(id, trigger) {
   const other = isArchived(item)
     ? button([icon('restore'), node('span', {}, '恢复对话')], () => restoreConversation(id), {role: 'menuitem'})
     : button([icon('archive'), node('span', {}, '归档对话')], () => archiveConversation(id), {role: 'menuitem'});
-  const reset=button('🧹 重置上下文',()=>confirmConversationAction('reset_context',id),{role:'menuitem'});
+  const download=button([icon('export'),node('span',{},'导出')],()=>exportConversation(item),{role:'menuitem'});download.disabled=exporting.has(id);
   const remove=button('🗑 删除对话',()=>confirmConversationAction('delete',id),{role:'menuitem',class:'danger'});
   const botCurrent=state.telegram_conversation_id===id;
   const setBot=button(botCurrent?'🤖 Bot 当前对话':'🤖 设为 Bot 当前对话',()=>setBotConversation(item),{role:'menuitem'});
@@ -397,15 +443,22 @@ function openMenu(id, trigger) {
   setBot.title=!state.telegram_configured?'此部署未配置 Telegram Bot':isArchived(item)?'请先恢复已归档会话':botCurrent?'Bot 已使用此对话':'只改变 Bot 的选择，不切换网页或终端，不改投运行任务';
   const pin=button(item.pinned?'📌 取消组内置顶':'📌 组内置顶',async()=>{
     closeMenu(false);
-    try{await groupMutation('/api/workbench/conversations/'+(item.pinned?'unpin':'pin'),{id:item.id,group_id:item.group_id});notify(item.pinned?'已取消组内置顶':'已在当前分组置顶');}
+    try{await groupMutation('/api/workbench/conversations/'+(item.pinned?'unpin':'pin'),{id:item.id,group_id:item.group_id||'ungrouped'});notify(item.pinned?'已取消组内置顶':'已在「'+groupName(item.group_id||'ungrouped')+'」置顶');}
     catch(error){notify(error.message,{error:true,retry:refresh});}
   },{role:'menuitem'});
-  const moveButtons=groups().filter(group=>group.id!==item.group_id).map(group=>button('移动到：'+group.name,async()=>{
+  pin.title='所属分组：'+groupName(item.group_id||'ungrouped');
+  const moveWrapper=node('div',{class:'conv-move-menu'});
+  moveTrigger=button([node('span',{},'移动到'),node('span',{class:'conv-menu-caret','aria-hidden':'true'},'›')],()=>moveSubmenu.hidden?showMoveMenu():hideMoveMenu(),{role:'menuitem','aria-haspopup':'menu','aria-expanded':'false'});
+  moveSubmenu=node('div',{class:'conv-group-submenu',role:'menu','aria-label':'移动到分组',tabindex:'-1',hidden:''});
+  const moveButtons=groups().map(group=>button((group.id===(item.group_id||'ungrouped')?'✓ ':'')+group.name,async()=>{
     closeMenu(false);
     try{await groupMutation('/api/workbench/conversations/move',{id:item.id,group_id:group.id});notify('已移动到「'+group.name+'」');}
     catch(error){notify(error.message,{error:true,retry:refresh});}
-  },{role:'menuitem'}));
-  menu.replaceChildren(rename, other, pin, ...moveButtons, setBot, reset, remove); menu.hidden = false; positionMenu();
+  },{role:'menuitem',disabled:group.id===(item.group_id||'ungrouped')?'':null}));
+  moveSubmenu.append(...moveButtons);moveWrapper.append(moveTrigger,moveSubmenu);
+  moveWrapper.addEventListener('pointerenter',event=>{if(event.pointerType!=='touch')showMoveMenu();});
+  moveWrapper.addEventListener('pointerleave',event=>{if(event.pointerType!=='touch')moveHideTimer=setTimeout(()=>hideMoveMenu(),150);});
+  menu.replaceChildren(rename, other, download, pin, moveWrapper, setBot, remove); menu.hidden = false; positionMenu();
   rename.focus({preventScroll: true});
 }
 async function setBotConversation(item){
@@ -541,9 +594,13 @@ document.addEventListener('keydown', event => {
   if (!$('workspace-menu').hidden) { if(event.key==='Escape'){event.preventDefault();event.stopImmediatePropagation();window.XGentWorkspaceMenu?.close(true);}return; }
   if (event.isComposing || renameDialog.open) return;
   if (!menu.hidden) {
-    const choices = Array.from(menu.querySelectorAll('button')).filter(button=>!button.disabled);
+    const insideMove=moveSubmenu&&!moveSubmenu.hidden&&moveSubmenu.contains(document.activeElement);
+    if(event.key==='ArrowRight'&&document.activeElement===moveTrigger){event.preventDefault();showMoveMenu(true);return;}
+    if(insideMove&&['ArrowLeft','Escape'].includes(event.key)){event.preventDefault();event.stopImmediatePropagation();hideMoveMenu(true);return;}
+    const choices = Array.from((insideMove?moveSubmenu:menu).querySelectorAll('button')).filter(button=>!button.disabled&&button.getClientRects().length&&(insideMove||!button.closest('.conv-group-submenu')));
     if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
       event.preventDefault();
+      if(!choices.length)return;
       let index = choices.indexOf(document.activeElement);
       index = event.key === 'Home' ? 0 : event.key === 'End' ? choices.length - 1 : (index + (event.key === 'ArrowDown' ? 1 : -1) + choices.length) % choices.length;
       choices[index].focus(); return;
@@ -567,9 +624,9 @@ window.XGentConversations = {
   get current() { return state.current_chat_id; }, get running() { return runningFor(state.current_chat_id); }, get runs() { return activeRuns(); },
 };
 const groupSelect = $('conversation-group-select');
-groupSelect?.addEventListener('change', () => { groupView = groupSelect.value || 'all'; render(); scroll.scrollTop = 0; });
+groupSelect?.addEventListener('change', () => { closeMenu(false);search.value='';groupView = groupSelect.value || 'ungrouped'; render(); scroll.scrollTop = 0; });
 function groupDialog(group = null) {
-  if(group?.id==='ungrouped'){notify('“未分组”是保留分组，不能删除或重命名');return;}
+  if(group?.id==='ungrouped'){notify('“默认分组”是保留分组，不能删除或重命名');return;}
   const dialog=node('dialog',{class:'conv-dialog','aria-label':group?'管理分组':'新建分组'});
   const input=node('input',{type:'text',maxlength:80,required:'', 'aria-label':'分组名称'});input.value=group?.name||'';
   const error=node('p',{role:'alert'}),form=node('form',{},node('h2',{},group?'管理分组':'新建分组'),node('label',{},'分组名称',input),error);
@@ -581,7 +638,7 @@ function groupDialog(group = null) {
   };
   const controls=node('div',{class:'conv-dialog-actions'},cancel,save);
   if(group)controls.prepend(button('删除分组',async()=>{
-    if(!confirm('删除「'+group.name+'」？其中对话将移到“未分组”，组内置顶会清除，不会删除对话。'))return;
+    if(!confirm('删除「'+group.name+'」？其中对话将移到“默认分组”，组内置顶会清除，不会删除对话。'))return;
     try{await groupMutation('/api/workbench/conversation-groups/delete',{group_id:group.id});groupView='ungrouped';dialog.close();render();}
     catch(exc){error.textContent=exc.message;}
   },{class:'danger'}));

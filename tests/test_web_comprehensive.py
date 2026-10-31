@@ -44,11 +44,11 @@ def test_group_pins_are_isolated_and_switching_groups_never_switches_chat(
     assert page.locator(".conv-row").count() == 0
     assert page.evaluate("window.XGentConversations.current") == selected
     page.locator("#conversation-group-select").select_option("all")
-    assert page.locator(".conv-row.is-pinned").count() == 0
+    assert page.locator(".conv-row.is-pinned").count() == 1
     ids = page.locator(".conv-row").evaluate_all(
         "(rows)=>rows.map(row=>row.dataset.conversationId)"
     )
-    assert ids.index(b) < ids.index(a)
+    assert ids.index(a) < ids.index(b)
     page.locator("#conversation-search").fill("pin isolation")
     result = page.locator(".global-search-hit").first
     result.wait_for()

@@ -457,7 +457,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # after this watermark is replayable even when DB/HTTP reads are slow.
             live = self.server.outbox.snapshot() if method == 'GET' and resource == 'history' else None
             if self.config.workbench is not None:
-                result = self._run_coro(self.config.workbench(method, resource, data), timeout=45)
+                result = self._run_coro(self.config.workbench(method, resource, data), timeout=120 if resource=='conversations/export' else 45)
+                from .conversation_export import ConversationDownload
+                if isinstance(result, ConversationDownload):
+                    self._serve_media_file(str(result.path), result.filename, 'application/zip')
+                    return
                 from .data_operations import BackupDownload
                 if isinstance(result, BackupDownload):
                     self._serve_media_file(str(result.path), result.path.name, 'application/zip')

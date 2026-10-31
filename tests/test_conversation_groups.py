@@ -4,6 +4,29 @@ from tests.test_external_sync import SectionsProbeMixin
 
 
 class ConversationGroupsTests(SectionsProbeMixin, unittest.TestCase):
+    def test_default_group_name_is_normalized_without_moving_or_unpinning_conversations(self):
+        result = self.run_probe(self.SECTIONS_PREAMBLE + r'''
+import asyncio
+from xgent_app.workbench import Workbench
+async def main():
+    await ns['UserDataManager'].init(); w=Workbench(ns); db=await w.db(); conn=await db._get_conn()
+    await conn.execute("UPDATE conversation_groups SET name='未分组' WHERE id='ungrouped'")
+    await conn.execute("UPDATE chat_sessions SET pinned=1 WHERE id='global_memory'")
+    before=await db.get_conversation_state()
+    await db.migrate_conversations()
+    groups=await db.get_conversation_groups()
+    item=await (await conn.execute("SELECT group_id,pinned FROM chat_sessions WHERE id='global_memory'")).fetchone()
+    after=await db.get_conversation_state()
+    print(json.dumps({'name':next(g['name'] for g in groups if g['id']=='ungrouped'),
+                      'group':item['group_id'],'pinned':item['pinned'],'selectors':before==after}))
+    await db.close()
+asyncio.run(main())
+''')
+        self.assertEqual('默认分组', result['name'])
+        self.assertEqual('ungrouped', result['group'])
+        self.assertEqual(1, result['pinned'])
+        self.assertTrue(result['selectors'])
+
     def test_groups_are_transactional_scoped_and_never_change_selectors(self):
         result = self.run_probe(
             self.SECTIONS_PREAMBLE

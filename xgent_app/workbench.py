@@ -107,6 +107,13 @@ class Workbench:
         version_operation = resource in {'artifacts/versions', 'artifacts/version_preview', 'artifacts/version_download', 'artifacts/restore_version'}
         navigation = resource in {'conversations', 'global-search'} or resource.startswith(('conversations/', 'conversation-groups','data/')) or resource in {'tasks','tasks/cancel','skills','memories'} or resource.startswith(('skills/','memories/'))
         cid = None if navigation else data.get('conversation_id')
+        conversation_export = resource == 'conversations/export'
+        if conversation_export:
+            if method != 'POST':
+                raise WorkbenchError('请使用 POST 导出对话', 405)
+            cid = data.get('id')
+            if not isinstance(cid, str) or not cid:
+                raise WorkbenchError('缺少导出目标对话', 400)
         if version_operation and not cid:
             raise WorkbenchError('缺少附件所属会话', 409)
         if method != 'GET' and resource in {'memory/clear','tasks/create'} and not cid:
@@ -114,13 +121,20 @@ class Workbench:
         from xgent_app.interaction import interaction
         try:
             with interaction('web', 'management'):
-                async with conversation_operation(cid, expected=method != 'GET' and not navigation and not version_operation and resource != 'ask', allow_archived=method=='GET' and (version_operation or resource in {'history','search','artifacts/preview','artifacts/cover'}), fresh=True, selector='shared'):
+                async with conversation_operation(cid, expected=method != 'GET' and not navigation and not version_operation and resource != 'ask', allow_archived=conversation_export or method=='GET' and (version_operation or resource in {'history','search','artifacts/preview','artifacts/cover'}), fresh=True, selector='shared'):
                     return await self._handle_scoped(method, resource, data)
         except ConversationError as exc:
             raise WorkbenchError(str(exc), exc.status) from exc
 
     async def _handle_scoped(self, method, resource, data):
         await self.db()
+        if resource == 'conversations/export':
+            from .conversation_export import export_conversation
+            from .compression import CompressionError
+            try:
+                return await export_conversation(self.ns)
+            except (CompressionError, OSError) as exc:
+                raise WorkbenchError(str(exc), 409) from exc
         if resource == 'ask':
             from .web_ask import handle_ask
             return await handle_ask(self.ns,method,data,self.background,idempotent=True)

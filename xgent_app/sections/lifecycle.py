@@ -31,7 +31,7 @@ TELEGRAM_COMMAND_DESCRIPTIONS = (
     ("blacklist", "管理 Agent 命令黑名单"),
     ("stream", "开关流式输出"),
     ("status", "查看状态"),
-    ("export", "导出全部记忆"),
+    ("export", "导出当前对话完整记忆"),
     ("stats", "Token统计报表"),
     ("restart", "重启 Bot"),
     ("show_chat_info", "查看状态与记忆统计"),

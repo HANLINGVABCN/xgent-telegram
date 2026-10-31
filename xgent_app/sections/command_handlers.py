@@ -347,12 +347,12 @@ async def cmd_export_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await GlobalRecorder.record_user_message(update.message.text, MessageType.COMMAND, update.effective_chat.id)
         
     message = update.message or update.callback_query.message
-    status_msg = await message.reply_text("📦 正在整理并导出数据...")
+    status_msg = await message.reply_text("📦 正在导出当前对话的完整记忆...")
     try:
         _, bundle = await create_conversation_export()
-        await GlobalRecorder.record_system_op('导出全部数据')
+        await GlobalRecorder.record_system_op('导出当前对话完整记忆')
         row_id = await GlobalRecorder.record_system_message(
-            f"已生成全部数据导出文件。服务器文件路径：{bundle['archive_path']}（{bundle['size']} bytes）\n"
+            f"已生成当前对话完整记忆导出文件。服务器文件路径：{bundle['archive_path']}（{bundle['size']} bytes）\n"
             f"文本记录：{bundle['text_dir']}", update.effective_chat.id,
             metadata={'display_media': [display_media_reference(bundle['archive_path'], '系统记忆.zip')]},
         )
