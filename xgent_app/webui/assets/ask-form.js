@@ -69,7 +69,7 @@ export function syncAskForm(entry,snapshot,options={}){
         }
         else saveLocal();
         if(data.status!=='pending'){sessionStorage.removeItem(key);for(const field of state.fields)if(field.q.type==='secret')field.input.value='';}
-        notice.textContent=data.status==='submitted'?'已提交':data.status==='cancelled'?'已取消':state.unsavedFields.size?'文字尚未保存，点击 ✓ 确认':'已保存';
+        notice.textContent=data.status==='submitted'?'已提交':data.status==='cancelled'?'已取消':state.unsavedFields.size?'填写完成后点击保存确认':'已保存';
       }catch(error){
         notice.textContent=error.message;
         try{
@@ -84,7 +84,7 @@ export function syncAskForm(entry,snapshot,options={}){
     return state.writes;
   }
   function changed(qid=null){state.dirty=true;state.serial++;if(qid)state.unsavedFields.add(qid);
-    notice.textContent=qid?'文字尚未保存，点击 ✓ 确认':'正在保存…';saveLocal();state.paint();
+    notice.textContent=qid?'填写完成后点击保存确认':'正在保存…';saveLocal();state.paint();
     if(!qid){clearTimeout(state.timer);state.timer=setTimeout(()=>request('save'),400);}}
   for(const q of snapshot.questions){
     const group=document.createElement('fieldset');group.className='web-ask-question';
@@ -105,17 +105,20 @@ export function syncAskForm(entry,snapshot,options={}){
     if(q.type==='text'||q.type==='secret'||q.other){
       const label=document.createElement('label');label.className='web-ask-input';
       const title=document.createElement('span');title.textContent=q.type==='secret'?'密钥 $'+q.var:q.type==='text'?'填写答案':'自定义答案';
+      const controls=document.createElement('span');controls.className='web-ask-entry';
       const input=document.createElement(q.type==='secret'?'input':'textarea');
       if(q.type==='secret'){input.type='password';input.autocomplete='off';}else{input.rows=2;input.value=state.draft[q.id]?.custom||'';}
       input.setAttribute('aria-label',q.prompt+(q.other?' · 自定义答案':''));input.maxLength=20000;
       input.oninput=()=>{if(q.type==='secret'){state.paint();return;}const answer=state.draft[q.id]||={};answer.custom=input.value;if(q.type==='single')answer.selected=[];changed(q.id);};
+      controls.append(input);
       if(q.type!=='secret'){
-        const save=document.createElement('button');save.type='button';save.className='web-ask-save';save.textContent='✓';
+        const save=document.createElement('button');save.type='button';save.className='web-ask-save';save.textContent='保存';
         save.title='保存答案';save.setAttribute('aria-label','保存 '+q.prompt);field.save=save;
         save.onclick=()=>request('save',{id:q.id,draft:structuredClone(state.draft[q.id]||{})});
-        title.append(save);
+        const saved=document.createElement('span');saved.className='web-ask-saved';saved.textContent='✓';saved.title='已保存';saved.setAttribute('aria-hidden','true');field.saved=saved;
+        controls.append(save,saved);
       }
-      label.append(title,input);group.append(label);field.input=input;
+      label.append(title,controls);group.append(label);field.input=input;
     }
     node.append(group);
   }
@@ -132,7 +135,9 @@ export function syncAskForm(entry,snapshot,options={}){
       if(field.input&&field.q.type!=='secret'&&document.activeElement!==field.input)field.input.value=state.draft[field.q.id]?.custom||'';
       if(field.input&&field.q.type==='secret'&&state.snapshot.draft[field.q.id]?.filled)field.input.placeholder='✓ 已录入';
       if(field.save){const pending=state.unsavedFields.has(field.q.id);field.save.disabled=closed||state.busy||!pending;
-        field.save.classList.toggle('pending',pending);field.save.title=pending?'保存答案':state.snapshot.draft[field.q.id]?.custom?'已保存':'填写后保存';}
+        const saved=!pending&&!!state.snapshot.draft[field.q.id]?.custom?.trim();
+        field.save.classList.toggle('pending',pending);field.save.title=pending?'保存答案':saved?'已保存':'填写后保存';
+        field.saved.classList.toggle('confirmed',saved);field.saved.setAttribute('aria-hidden',String(!saved));}
     }
     actions.hidden=closed||!!options.nativeButtons;submit.disabled=cancel.disabled=state.busy;
     if(closed){clearTimeout(state.timer);sessionStorage.removeItem(key);for(const field of state.fields)if(field.q.type==='secret')field.input.value='';notice.textContent={submitted:'已提交',cancelled:'已取消',expired:'表单已失效，请让 AI 重新发起'}[state.snapshot.status]||'已结束';}

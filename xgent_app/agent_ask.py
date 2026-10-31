@@ -7,11 +7,11 @@
 - ``AskForm.assemble_answer(draft)``  提交时把所有答案拼成一条回灌给模型的文本
   （密钥题只写变量名，绝不含明文）。
 - ``PendingAsk`` / ``PendingAskStore``  挂起中的表单（含发起时的对话历史快照）。
-- ``SecretStore``  进程内密钥存储：写 os.environ 供后续 shell ``$VAR`` 引用，
-  并通过注册钩子把明文登记进脱敏名单。**明文只在这里，从不进 draft、不进模型、不写库。**
+- ``SecretStore``  进程内私密变量，供后续 shell ``$VAR`` 引用，并登记日志脱敏。
+  明文不进 draft、模型或数据库；用户明确授权的 Bot 回执在投递时解析变量引用。
 
 设计约束见计划文件：草稿式（提交前可反复改）、三端统一（同一套 InlineKeyboardMarkup）、
-密钥明文绝不进模型/API、恢复靠历史快照而非重建（保住 readx 多模态）。
+密钥明文不进模型 API，恢复靠历史快照而非重建（保住 readx 多模态）。
 """
 
 from __future__ import annotations
@@ -327,6 +327,7 @@ class SecretStore:
     """Process-local, conversation-private values; never mutate os.environ."""
     def __init__(self) -> None:
         self._by_gen: Dict[Any, Dict[str, str]] = {}
+        self._versions = {}
         self.register_hook: Optional[Callable[[str], None]] = None
         self.unregister_hook: Optional[Callable[[str], None]] = None
 
@@ -337,6 +338,9 @@ class SecretStore:
         values = self._by_gen.setdefault(conversation_id, {})
         previous = values.get(name)
         values[name] = value
+        if previous != value or name not in self._versions.get(conversation_id, {}):
+            import uuid
+            self._versions.setdefault(conversation_id, {})[name] = uuid.uuid4().hex
         if previous and previous != value and not self._still_used(previous) and self.unregister_hook:
             self.unregister_hook(previous)
         if self.register_hook and value:
@@ -345,11 +349,15 @@ class SecretStore:
     def has(self, conversation_id, name: str) -> bool:
         return name in self._by_gen.get(conversation_id, {})
 
+    def version(self, conversation_id, name):
+        return self._versions.get(conversation_id, {}).get(name)
+
     def environment(self, conversation_id) -> Dict[str, str]:
         return dict(self._by_gen.get(conversation_id, {}))
 
     def purge(self, conversation_id) -> List[str]:
         removed = self._by_gen.pop(conversation_id, {})
+        self._versions.pop(conversation_id, None)
         for value in set(removed.values()):
             if value and not self._still_used(value) and self.unregister_hook:
                 self.unregister_hook(value)

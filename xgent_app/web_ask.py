@@ -31,8 +31,18 @@ async def sync_ask(namespace, pending, *, status='pending', require_delivery=Fal
             hint = {'kind':'agent_result','mode':'folded','ask_id':pending.ask_id,'purpose':'form'}
             route = replay_conversation(pending.conversation_context) if pending.conversation_context else nullcontext()
             with route, message_presentation(hint):
-                await bot.edit_message_reply_markup(chat_id=pending.chat_id, message_id=pending.form_message_id,
-                    reply_markup=pending.form.build_keyboard(pending.ask_id, pending.draft) if status=='pending' else None)
+                if status == 'submitted':
+                    from .telegram_form_receipts import build
+                    from .telegram_presentation import chat_display
+                    spec = build(pending)
+                    spec['owner_id'] = pending.form_message_id
+                    hint.update(audience=['telegram'], model_context=False, record_id=pending.form_record_id)
+                    with message_presentation(hint), chat_display({'telegram_native': spec}):
+                        await bot.edit_message_text(chat_id=pending.chat_id, message_id=pending.form_message_id,
+                            text=spec['fallback'][0], parse_mode='HTML', reply_markup=None)
+                else:
+                    await bot.edit_message_reply_markup(chat_id=pending.chat_id, message_id=pending.form_message_id,
+                        reply_markup=pending.form.build_keyboard(pending.ask_id, pending.draft) if status=='pending' else None)
             if require_delivery and hasattr(bot, '_tg_channel'):
                 channel = bot._tg_channel()
                 if not await channel.wait_idle(timeout=5):

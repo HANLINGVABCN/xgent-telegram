@@ -1114,6 +1114,8 @@
 .thinking-block{border-left:2px solid var(--line-2);margin:0 0 4px;padding:6px 10px;min-width:0}
 .thinking-head{display:flex;gap:8px;cursor:pointer;align-items:center;font-size:12px;line-height:17px;color:var(--text-3)}
 .thinking-label{flex-shrink:0}.thinking-preview{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.thinking-caret{display:flex;flex:0 0 12px;transition:transform .12s}.thinking-caret svg{width:12px;height:12px}
+.thinking-head[aria-expanded=true] .thinking-caret{transform:rotate(90deg)}
 .bubble pre.thinking-body{font:12px/17px var(--mono);padding:6px 0;margin:0;border:0;box-shadow:none;background:transparent;white-space:pre-wrap;overflow-wrap:anywhere}
 
 .message-media.generated-gallery{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:4px}

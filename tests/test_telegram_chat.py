@@ -56,13 +56,15 @@ def test_final_details_use_last_reply_and_missing_values_remain_explicit():
     facts = {'model':'incorrect-fallback','round':3,'usage':{'input_tokens':333,'output_tokens':33},'elapsed_seconds':2}
     summary = {'rounds':3,'operations':2,'elapsed_seconds':5,'reason':'stopped'}
     details = reply_details(row, facts, summary)[0]
-    assert details.startswith('<blockquote expandable><b>回复详情</b>\n')
-    assert '模型：P&lt;&amp; / actual-model' in details
-    assert '时间：2023-11-15 06:13:20' in details
-    assert '↑ 333 · ↓ 33 · cache 0 · 约 2.0 秒' in details
+    assert details.startswith('<blockquote expandable>↑ 333 · ↓ 33 · cache 0 · 2s\n')
+    assert 'P&lt;&amp; / actual-model' in details
+    assert details.endswith('2023-11-15 06:13:20</blockquote>')
+    assert '回复详情' not in details and '模型：' not in details and '时间：' not in details
+    assert details.index('↑ 333') < details.index('actual-model') < details.index('2023-11-15')
+    assert '总耗时5s' in details
     assert '共执行 3 轮，2 个操作' in details and 'stopped' not in details
     missing = reply_details({'metadata':{}}, {})[0]
-    assert '模型：未提供' in missing and '时间：未记录' in missing
+    assert missing.endswith('\n未提供\n未记录</blockquote>')
     assert '↑ 未提供 · ↓ 未提供 · cache 0 · 耗时未记录' in missing
 
 
@@ -71,7 +73,7 @@ def test_details_overflow_becomes_only_the_final_continuation():
     assert len(append_details('body', details)) == 1
     chunks = append_details('a'*3850, details)
     assert chunks == ['a'*3850, *details]
-    assert sum(chunk.count('<b>回复详情</b>') for chunk in chunks) == 1
+    assert sum(chunk.count('<blockquote expandable>↑') for chunk in chunks) == 1
     assert all(_telegram_units(chunk) <= 3900 for chunk in chunks)
 
 
@@ -168,7 +170,7 @@ def test_media_caption_is_not_changed_when_final_detail_needs_a_continuation():
         assert len(native.calls)==calls
         assert media.base_text=='caption '*120
         assert len(native.messages)==1
-        assert next(iter(native.messages.values()))['text'].count('<b>回复详情</b>')==1
+        assert next(iter(native.messages.values()))['text'].count('<blockquote expandable>↑')==1
     asyncio.run(scenario())
 
 

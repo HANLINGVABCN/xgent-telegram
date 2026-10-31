@@ -377,6 +377,7 @@ PROVIDER_HTTP_HEADERS = {
 
 
 def redact_sensitive_text(text: str) -> str:
+    from html import escape
     if not text:
         return text
 
@@ -391,7 +392,8 @@ def redact_sensitive_text(text: str) -> str:
     # provider 的 api_key 存在数据库里，不是环境变量常量，但它同样会出现在
     # 错误响应体、trace 日志里，必须一起脱敏。
     for secret in _runtime_secrets():
-        text = text.replace(secret, "[REDACTED_API_KEY]")
+        for variant in {secret, escape(secret, quote=False), escape(secret, quote=True)}:
+            text = text.replace(variant, "[REDACTED_API_KEY]")
     return text
 
 

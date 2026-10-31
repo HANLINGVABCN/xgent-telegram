@@ -26,7 +26,7 @@ async def exercise(bot, root):
             assert len(media) == 1, texts
             assert media[0].count('图片文字只出现一次') == 1, texts
             assert '系统自动生成' not in ''.join(texts), texts
-            assert sum(text.count('回复详情') for text in texts) == 1, texts
-            assert '回复详情' in media[0], texts
+            assert sum(text.count('<blockquote expandable>↑') for text in texts) == 1, texts
+            assert '<blockquote expandable>↑' in media[0] and '回复详情' not in media[0], texts
         await get_channel_registry().aclose_all()
         return {'media_messages':len(media),'details':1}

@@ -55,7 +55,11 @@ def native_offer_kind(kind, payload, bot):
     """Convert only Telegram's projection; the original UI frame keeps its kind."""
     from .fanout import OP_SEND, OP_EDIT, OP_EDIT_MARKUP, OP_DELETE
     spec = payload.get('telegram_native')
-    if not isinstance(spec, dict) or not request_capable(bot):
+    if not isinstance(spec, dict):
+        return kind
+    if spec.get('form_receipt') and kind in {OP_SEND, OP_EDIT}:
+        return OP_NATIVE_RENDER
+    if not request_capable(bot):
         return kind
     if spec.get('auxiliary'):
         return None
@@ -108,6 +112,12 @@ async def _post(bot, method, data, extra):
     if method=='editMessageText':
         data={key:value for key,value in data.items() if key in {'chat_id','message_id','text','rich_message',
             'parse_mode','entities','reply_markup','link_preview_options'}}
+    if not request_capable(bot):
+        names = {'sendMessage':'send_message', 'editMessageText':'edit_message_text',
+                 'deleteMessage':'delete_message', 'editMessageReplyMarkup':'edit_message_reply_markup'}
+        result = await getattr(bot, names[method])(**deepcopy(data))
+        mid = getattr(result, 'message_id', None)
+        return {'message_id':mid} if mid is not None else result
     return await bot._post(method, deepcopy(data), **{key: value for key, value in extra.items()
         if key in {'read_timeout', 'write_timeout', 'connect_timeout', 'pool_timeout'}})
 
@@ -155,6 +165,8 @@ async def deliver_native(bot, op, native_id, markup, extra):
         await _stored_parts(bot, op, op.payload.get('_native_parts', []))
         return result
     spec = op.payload['telegram_native']
+    if spec.get('form_receipt') and not request_capable(bot):
+        state['rich'] = False
     context = op.conversation_context or {}
     key = (op.chat_id, op.logical_id, context.get('conversation_id'), context.get('generation'))
     entry = state['messages'].setdefault(key, {'ids': [], 'html': [], 'control_id': None})
@@ -240,6 +252,9 @@ async def deliver_native(bot, op, native_id, markup, extra):
         from .telegram_presentation import render_telegram_text
         if not delivery.get('message_thread_id'):
             body = await render_telegram_text(body, 'HTML', limit=2**31)
+        if spec.get('form_receipt'):
+            from .telegram_form_receipts import materialize
+            body = materialize(body, spec, op)
         data = {'chat_id': op.chat_id, **delivery,
                 'reply_markup': keyboard if index == len(values) - 1 else None}
         data.update({'rich_message': {'html': body}} if use_rich else

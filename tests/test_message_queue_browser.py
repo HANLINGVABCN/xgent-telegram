@@ -213,15 +213,43 @@ def test_thinking_preview_closes_after_completion_and_is_plain_text(queue_browse
     server.outbox.put({**frame, 'type':'thinking_state', 'thinking':{'version':1,'capture_id':'one',
         'text':'第一行\n最新的一行','status':'running','elapsed_seconds':2,'revision':1}})
     page.locator('.thinking-preview').filter(has_text='最新的一行').wait_for()
+    assert page.locator('.thinking-caret svg').count() == 1
+    assert page.locator('.thinking-caret').bounding_box()['x'] < page.locator('.thinking-label').bounding_box()['x']
     assert page.locator('.thinking-block').evaluate('(node)=>node.previousElementSibling.classList.contains("bubble-header")')
     server.outbox.put({**frame, 'type':'thinking_state', 'thinking':{'version':1,'capture_id':'one',
         'text':'第一行\n最新的一行\n```run-x\nnever execute\n```','status':'completed','elapsed_seconds':3,'revision':2}})
     page.wait_for_function('document.querySelector(".thinking-preview").textContent===""')
     assert page.locator('.thinking-body').is_hidden()
-    page.locator('.thinking-head').click()
+    page.locator('.thinking-caret').click()
+    page.wait_for_function('document.querySelector(".thinking-head").getAttribute("aria-expanded")==="true"')
     assert 'never execute' in page.locator('.thinking-body').inner_text()
     assert not page.locator('.thinking-body button').count()
     assert page.locator('.thinking-label').inner_text() == '思考 · 约 3 秒'
+
+
+def test_hidden_search_input_cannot_highlight_names_and_close_clears_query(queue_browser):
+    server, page, _, base, _ = queue_browser
+    # Exercise the chat's fallback find control when optional workbench UI is absent.
+    page.route('**/assets/workbench.js*',lambda route:route.abort())
+    ready(page, base)
+    server.outbox.put({'conversation_id': 'A', 'ui_generation': 7, 'message_id': 99996,
+                      'type': 'message', 'msg_type': 'ai_reply', 'text': 'HANLING 测试 Hanling'})
+    page.get_by_text('HANLING 测试 Hanling', exact=True).wait_for()
+    assert not page.locator('#search-bar').evaluate('(node)=>node.classList.contains("open")')
+    page.locator('#search-input').evaluate('(node)=>{node.value="HANLING";node.dispatchEvent(new Event("input",{bubbles:true}));}')
+    assert page.locator('.highlight-match').count() == 0
+    page.keyboard.press('Control+f')
+    assert page.locator('#search-input').input_value() == ''
+    assert page.locator('.highlight-match').count() == 0
+    page.locator('#search-input').fill('HANLING')
+    page.locator('.highlight-match').first.wait_for()
+    assert page.locator('.highlight-match').count() == 2
+    page.locator('#search-close').click()
+    assert page.locator('.highlight-match').count() == 0
+    assert page.locator('#search-input').input_value() == ''
+    page.locator('#search-input').evaluate('(node)=>{node.value="HANLING";node.dispatchEvent(new Event("input",{bubbles:true}));}')
+    assert page.locator('.highlight-match').count() == 0
+    assert page.get_by_text('HANLING 测试 Hanling', exact=True).is_visible()
 
 
 def test_no_reasoning_or_whitespace_does_not_show_a_thinking_block(queue_browser):

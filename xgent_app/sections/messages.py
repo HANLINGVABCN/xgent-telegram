@@ -2405,8 +2405,8 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             form_bot=context.bot.original,
                         )
                         form_header = (
-                            "📝 需要你的输入：请在下面选择/填写后点「✅ 提交」。\n"
-                            "（提交前可以反复改；密钥项的内容只进环境变量，绝不会发给 AI。）"
+                            "📝 需要你的输入：填好后点「✅ 提交」。\n"
+                            "🔒 密钥不发送给 AI。"
                         )
                         PENDING_ASKS.put(pending)
                         with message_presentation({'kind': 'agent_result', 'mode': current_turn().mode, 'ask_id': ask_id, 'purpose': 'form'}):

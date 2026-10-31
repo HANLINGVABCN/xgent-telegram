@@ -87,6 +87,13 @@ async def main():
                                 await form.get_by_role('textbox',name='补充说明',exact=True).fill('原地填写  <tag>  保留两个空格')
                                 await page.wait_for_timeout(600)
                                 assert pending.revision==before_typing
+                                save_button=form.get_by_role('button',name='保存 补充说明',exact=True)
+                                assert await save_button.inner_text()=='保存'
+                                input_box=await form.get_by_role('textbox',name='补充说明',exact=True).bounding_box()
+                                save_box=await save_button.bounding_box()
+                                assert save_box['x']>=input_box['x']+input_box['width']
+                                saved_mark=save_button.locator('..').locator('.web-ask-saved')
+                                assert not await saved_mark.is_visible()
                                 assert pending.draft['0'].get('custom','')=='' and pending.draft['2'].get('custom','')==''
                                 await page.reload();await form.wait_for()
                                 assert await form.get_by_role('textbox',name='选择环境 · 自定义答案',exact=True).input_value()=='预发布环境'
@@ -105,6 +112,8 @@ async def main():
                                 assert pending.draft['2'].get('custom','')==''
                                 await form.get_by_role('button',name='保存 补充说明',exact=True).click()
                                 await page.wait_for_function('document.querySelector(".web-ask-notice").textContent==="已保存"')
+                                assert await saved_mark.is_visible()
+                                assert await saved_mark.evaluate('(node)=>getComputedStyle(node).color')=='rgb(34, 197, 94)'
                                 assert await single.get_attribute('aria-checked')=='false'
                                 await page.reload();await form.wait_for()
                                 assert await form.get_by_role('textbox',name='选择环境 · 自定义答案',exact=True).input_value()=='预发布环境'

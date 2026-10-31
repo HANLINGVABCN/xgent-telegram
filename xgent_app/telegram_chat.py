@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -81,11 +82,15 @@ def reply_details(row, facts, summary=None, *, timezone='Asia/Shanghai'):
     usage = facts.get('usage') or presentation.get('usage') or {}
     line = usage_line({**presentation, **facts, 'usage': {'input_tokens': usage.get('input_tokens'),
         'output_tokens': usage.get('output_tokens'), 'cached_tokens': usage.get('cached_tokens')}})
-    lines = ['模型：' + model_name, '时间：' + generated_at, line]
+    def compact_time(text):
+        return re.sub(r'约 (\d+(?:\.\d+)?) 秒', lambda match: match[1].rstrip('0').rstrip('.') + 's'
+                      if '.' in match[1] else match[1] + 's', text)
+    lines = [compact_time(line)]
     if summary:
         # The separate terminal notice already states stop/failure once.
-        lines.append(summary_line({**summary, 'reason': ''}))
-    return quote_chunks('\n'.join(lines), heading='回复详情')
+        lines.append(compact_time(summary_line({**summary, 'reason': ''})))
+    lines.extend([model_name, generated_at])
+    return quote_chunks('\n'.join(lines))
 
 
 def append_details(base_html, details):
