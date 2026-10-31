@@ -111,6 +111,8 @@ body,body.dark { --code-bg:#182334; --code-header:#101827; --code-fg:#eef3f9; --
 .web-ask-choice[aria-checked=true]{border-color:var(--accent);background:var(--wb-tint)}
 .web-ask-check{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;flex:0 0 16px;border:1px solid var(--text-3);border-radius:3px;color:var(--accent)}
 .web-ask-input{display:block;margin:6px 0;color:var(--text-2)}
+.web-ask-save{margin-left:6px;padding:0 5px;border:0;background:transparent;color:var(--text-3);font:inherit;line-height:22px;cursor:pointer}
+.web-ask-save.pending{color:var(--accent)}.web-ask-save:disabled{opacity:.45;cursor:default}
 .web-ask-input textarea,.web-ask-input input{display:block;width:100%;min-height:38px;padding:7px 9px;margin-top:4px;background:var(--surface-2);color:var(--text);border:1px solid var(--line);border-radius:6px;font:inherit;resize:vertical}
 .web-ask-actions{display:flex;gap:8px}.web-ask-actions[hidden]{display:none}
 .web-ask-actions button{padding:7px 16px;font:inherit;border:1px solid var(--line);border-radius:6px;background:var(--surface-2);color:var(--text);cursor:pointer}

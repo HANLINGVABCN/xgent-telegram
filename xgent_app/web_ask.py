@@ -26,8 +26,11 @@ async def sync_ask(namespace, pending, *, status='pending', require_delivery=Fal
     if pending.form_message_id is not None:
         try:
             from .presentation import message_presentation
+            from .conversations import replay_conversation
+            from contextlib import nullcontext
             hint = {'kind':'agent_result','mode':'folded','ask_id':pending.ask_id,'purpose':'form'}
-            with message_presentation(hint):
+            route = replay_conversation(pending.conversation_context) if pending.conversation_context else nullcontext()
+            with route, message_presentation(hint):
                 await bot.edit_message_reply_markup(chat_id=pending.chat_id, message_id=pending.form_message_id,
                     reply_markup=pending.form.build_keyboard(pending.ask_id, pending.draft) if status=='pending' else None)
             if require_delivery and hasattr(bot, '_tg_channel'):

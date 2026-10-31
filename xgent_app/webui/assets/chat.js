@@ -2439,12 +2439,12 @@ import {syncAskForm} from './ask-form.js';
     var items=queueState?.conversation_id===selectedConversationId?queueState.items:[];
     var recovering=Array.from(queueActions.values()).filter(p=>['cancel','edit'].includes(p.action)&&p.item?.conversation_id===selectedConversationId&&!items?.some(i=>i.id===p.item.id));
     var anchor=scrollAnchor();
-    panel.replaceChildren();panel.hidden=!items?.length&&!error&&!queueState?.paused&&!recovering.length;
+    panel.replaceChildren();panel.hidden=!items?.length&&!error&&!recovering.length;
     if(panel.hidden)return;
     var head=document.createElement('div');head.className='queue-head';
     var title=document.createElement('strong');title.textContent='待发消息 · '+(items?.length||0)+' 条';head.appendChild(title);
     function button(label,fn){var b=document.createElement('button');b.type='button';b.textContent=label;b.onclick=fn;return b;}
-    if(queueState?.paused&&queueState.reason!=='ask')head.appendChild(button('继续发送',()=>changeQueue(null,'resume')));
+    if(items?.length&&queueState?.paused&&queueState.reason!=='ask')head.appendChild(button('继续发送',()=>changeQueue(null,'resume')));
     if(items?.length>3)head.appendChild(button(queueExpanded?'收起':'展开全部',()=>{queueExpanded=!queueExpanded;drawQueue();}));
     panel.appendChild(head);
     var list=document.createElement('div');list.className='queue-list';

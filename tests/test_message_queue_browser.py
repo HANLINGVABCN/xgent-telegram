@@ -17,7 +17,7 @@ def queue_browser(full_output_server):
         state['calls'].append((action, cid, data))
         if action == 'list':
             return {'conversation_id': cid, 'generation': 7, 'revision': state['revision'],
-                    'items': copy.deepcopy(state['items'][cid]), 'paused': False, 'reason': ''}
+                    'items': copy.deepcopy(state['items'][cid]), 'paused': state.get('paused', False), 'reason': state.get('reason', '')}
         if action == 'status':
             result=state['actions'].get(data.get('request_id'))
             return {'state':'recovered','item':result} if result else {'state':'already_started'}
@@ -37,7 +37,8 @@ def queue_browser(full_output_server):
             return state['requests'][request_id]
         state['revision'] += 1
         item = {'id': f"{state['revision']:032x}", 'seq': state['revision'], 'conversation_id': cid, 'generation': 7,
-                'revision': 1, 'origin': 'web', 'text': text, 'status': 'pending', 'reason': 'waiting'}
+                'revision': 1, 'origin': 'web', 'text': text, 'status': 'paused' if state.get('paused') else 'pending',
+                'reason': state.get('reason', '') or 'waiting'}
         state['items'][cid].append(item)
         state['requests'][request_id] = {'ok': True, 'queued': True, **item}
         return state['requests'][request_id]
@@ -73,6 +74,32 @@ def enqueue(page, text):
     page.locator('#input').fill(text)
     page.locator('#btn-send').click()
     page.wait_for_function('document.querySelector("#input").value===""')
+
+
+@pytest.mark.parametrize('reason', ['ask', 'stopped', 'restart'])
+def test_empty_paused_queue_hides_until_a_real_message_is_queued(queue_browser, reason):
+    _, page, _, base, state = queue_browser
+    state.update(paused=True, reason=reason)
+    ready(page, base)
+    assert page.locator('#message-queue').is_hidden()
+    page.reload()
+    page.wait_for_function('!document.querySelector("#btn-send").disabled')
+    assert page.locator('#message-queue').is_hidden()
+    enqueue(page, '确实等待发送的消息')
+    page.get_by_text('待发消息 · 1 条', exact=True).wait_for()
+    assert page.locator('.queue-preview p').inner_text() == '确实等待发送的消息'
+    if reason == 'ask':
+        assert not page.get_by_role('button', name='继续发送', exact=True).count()
+        assert '等待表单提交' in page.locator('.queue-preview small').inner_text()
+    else:
+        assert page.get_by_role('button', name='继续发送', exact=True).is_visible()
+    page.locator('.queue-item').get_by_role('button', name='❌ 取消', exact=True).click()
+    page.wait_for_function('document.querySelector("#message-queue").hidden')
+    assert state['paused'] and not state['items']['A']
+    assert page.locator('#input').input_value() == '确实等待发送的消息'
+    page.reload()
+    page.wait_for_function('!document.querySelector("#btn-send").disabled')
+    assert page.locator('#message-queue').is_hidden()
 
 
 def test_busy_submit_cancel_edit_batch_preview_and_no_log_jump(queue_browser, tmp_path):
