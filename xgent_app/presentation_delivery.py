@@ -108,6 +108,17 @@ class PresentationBot:
             return {'phase': 'reply', 'html': output_rich(operation), 'fallback': output_chunks(operation),
                     'ref': operation.get('_stop_phase'), 'running': bool(operation.get('running')),
                     'run_id': scope.run_id if scope else None, 'record_id': hint.get('record_id')}
+        if kind == 'runtime_error' and 'telegram_error' in hint:
+            from .telegram_rich import Block, split_blocks
+            raw = hint['telegram_error']
+            owner_id = hint.get('error_owner_id')
+            result = {'phase': 'reply', 'record_id': hint.get('record_id'),
+                      'html': split_blocks([Block('pre', text=raw)]),
+                      'fallback': split_blocks([Block('pre', text=raw)], budget=3800),
+                      'owner_id': owner_id}
+            if owner_id is not None:
+                result['auxiliary'] = previous is None or previous.message_id != owner_id
+            return result
         if kind != 'ai_reply':
             return previous.telegram_native if previous is not None else None
         generation = self._telegram_generation
@@ -414,14 +425,15 @@ class PresentationBot:
     async def edit_message_text(self, text, chat_id=None, message_id=None,
                                 reply_markup=None, parse_mode=None, **kwargs):
         previous = self.messages.get(message_id)
-        kind = previous.kind if previous is not None else self._kind(text)
+        explicit = current_message_presentation() or {}
+        kind = ('runtime_error' if explicit.get('kind') == 'runtime_error' else
+                previous.kind if previous is not None else self._kind(text))
         prepared = self._prepare(text, kind, reply_markup, parse_mode)
         if prepared is None:
             return previous
-        explicit = current_message_presentation() or {}
         hint = ({**explicit} if explicit.get('kind') == kind else {})
         hint.update(kind=kind, mode=self.turn.mode)
-        if previous is not None and previous.record_id is not None:
+        if previous is not None and previous.kind == kind and previous.record_id is not None:
             hint['record_id'] = previous.record_id
         hint, telegram_chunks = self._telegram_hint(hint, kind, previous)
         with message_presentation(hint), chat_display(hint['telegram_display']):
@@ -431,6 +443,7 @@ class PresentationBot:
             previous = PresentationMessage(self, original, prepared, parse_mode, kind)
             self.messages[message_id] = previous
         previous.text, previous.parse_mode = prepared, parse_mode
+        previous.kind, previous.record_id = kind, hint.get('record_id')
         previous.reply_markup = reply_markup
         from .message_policy import new_policy
         previous.policy = new_policy(kind, hint=hint)

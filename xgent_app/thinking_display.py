@@ -14,6 +14,7 @@ class ThinkingCapture:
     def __init__(self, outbox=None, message_id=None):
         self.outbox, self.message_id = outbox, message_id
         self.parts = []
+        self.has_content = False
         self.elapsed = 0.0
         self.start = None
         self.streaming = True
@@ -33,9 +34,10 @@ class ThinkingCapture:
             text = redact(text)
         if self.status != 'running':
             self.status = 'running'
-        if self.streaming and self.start is None:
+        if self.streaming and self.start is None and text.strip():
             self.start = time.monotonic()
         self.parts.append(text)
+        self.has_content = self.has_content or bool(text.strip())
         self.revision += 1
         self.emit()
 
@@ -49,7 +51,7 @@ class ThinkingCapture:
         self.emit(force=True)
 
     def snapshot(self):
-        if not self.parts:
+        if not self.has_content:
             return None
         return {'version': 1, 'capture_id': self.capture_id, 'text': ''.join(self.parts), 'status': self.status,
                 'elapsed_seconds': self.elapsed + (time.monotonic() - self.start if self.start is not None else 0)
@@ -57,7 +59,7 @@ class ThinkingCapture:
 
     def emit(self, force=False):
         now = time.monotonic()
-        if self.outbox is None or not self.parts or (not force and now-self.last_emit < .3):
+        if self.outbox is None or not self.has_content or (not force and now-self.last_emit < .3):
             return
         self.last_emit = now
         self.outbox.put({'type': 'thinking_state', 'message_id': self.message_id, 'thinking': self.snapshot()})

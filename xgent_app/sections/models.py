@@ -108,6 +108,12 @@ class ModelClient:
                 detail = redact_media_data(detail, parts)
             raise AttachmentContextError(redact_sensitive_text(detail))
 
+    @staticmethod
+    def _provider_response_error(data: Any) -> str:
+        """Keep upstream diagnostics within the existing 2000-character budget."""
+        raw = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
+        return redact_sensitive_text(redact_media_data(raw))[:2000]
+
     @classmethod
     async def _get_http_client(cls) -> Any:
         """获取进程级共享 HTTP 客户端，复用连接池与 TLS 会话。"""
@@ -422,6 +428,8 @@ class ModelClient:
         text_parts = []
         for part in candidates[0].get('content', {}).get('parts', []):
             if not isinstance(part, dict):
+                continue
+            if part.get('thought') is True:
                 continue
             text = ModelClient._model_content_to_text(part)
             if text:
@@ -895,8 +903,7 @@ class ModelClient:
                     "usage": usage_sink[0] if usage_sink else None,
                 })
                 return text, None
-            reasons = [str(choice.get('finish_reason') or '') for choice in data.get('choices', [])]
-            error = '上游模型拒绝生成，本次没有生成正文或图片。' if 'prohibited_content' in reasons else '模型没有返回可用正文或图片。'
+            error = ModelClient._provider_response_error(data)
             ModelClient._raise_conversation_request_error(history, error)
             return None, error
         except AttachmentContextError:
@@ -950,6 +957,7 @@ class ModelClient:
 
         yielded_any_text = False
         finished = False
+        last_response = None
         try:
             async with ModelClient._http_client_context() as client:
                 # 最多两轮：第一轮带思考参数，被拒时去掉参数重开一次流。
@@ -999,6 +1007,8 @@ class ModelClient:
                                 continue
                             if data.get("error"):
                                 ModelClient._raise_conversation_request_error(history, data["error"])
+                            if data.get('choices'):
+                                last_response = data
                             record_token_usage(usage_sink, data.get("usage"))
                             for choice in (data.get('choices') or [])[:1]:
                                 reason = choice.get('finish_reason')
@@ -1015,6 +1025,11 @@ class ModelClient:
 
             ModelClient._check_compression_stream_end(history, finished)
             if not yielded_any_text:
+                if last_response is not None:
+                    error = ModelClient._provider_response_error(last_response)
+                    ModelClient._raise_conversation_request_error(history, error)
+                    yield error
+                    return
                 ModelClient._raise_conversation_request_error(history, "模型未返回有效内容。")
                 text, error = await ModelClient._complete_openai_compatible_http(
                     api_key, base_url, model, system_prompt, history, max_tokens, usage_sink, trace_id, prov_name
@@ -1170,11 +1185,9 @@ class ModelClient:
                 logger.warning(
                     f"Gemini non-stream returned no text; finishReason={finish_reason}, keys={list(data.keys())[:5]}"
                 )
-                if finish_reason and finish_reason != 'STOP':
-                    ModelClient._raise_conversation_request_error(history, data)
-                    return None, json.dumps(data, ensure_ascii=False)
-                ModelClient._raise_conversation_request_error(history, "模型未返回有效内容。")
-                return None, "对方暂时没反应，用户稍后再试试？"
+                error = ModelClient._provider_response_error(data)
+                ModelClient._raise_conversation_request_error(history, error)
+                return None, error
         except AttachmentContextError:
             raise
         except httpx.ReadTimeout as e:
@@ -1295,11 +1308,9 @@ class ModelClient:
                 logger.warning(
                     f"Claude non-stream returned no text; stop_reason={stop_reason}, keys={list(data.keys())[:5]}"
                 )
-                if stop_reason:
-                    ModelClient._raise_conversation_request_error(history, data)
-                    return None, json.dumps(data, ensure_ascii=False)
-                ModelClient._raise_conversation_request_error(history, "模型未返回有效内容。")
-                return None, "对方暂时没反应，用户稍后再试试？"
+                error = ModelClient._provider_response_error(data)
+                ModelClient._raise_conversation_request_error(history, error)
+                return None, error
         except AttachmentContextError:
             raise
         except httpx.ReadTimeout as e:
@@ -1513,6 +1524,7 @@ class ModelClient:
 
         yielded_any_text = False
         finished = False
+        last_response = None
         try:
             request_kwargs = {
                 "model": model,
@@ -1567,6 +1579,7 @@ class ModelClient:
                 async for chunk in stream:
                     record_token_usage(usage_sink, _value_from_obj(chunk, 'usage'))
                     if chunk.choices:
+                        last_response = chunk.model_dump()
                         reason = getattr(chunk.choices[0], 'finish_reason', None)
                         ModelClient._check_compression_completion(history, reason)
                         finished = finished or reason is not None
@@ -1580,7 +1593,9 @@ class ModelClient:
                             yield ''
             ModelClient._check_compression_stream_end(history, finished)
             if not yielded_any_text:
-                ModelClient._raise_conversation_request_error(history, "模型未返回有效内容。")
+                error = ModelClient._provider_response_error(last_response) if last_response is not None else '模型未返回有效内容。'
+                ModelClient._raise_conversation_request_error(history, error)
+                yield error
 
         except AttachmentContextError:
             raise
@@ -1650,6 +1665,7 @@ class ModelClient:
             event_count = 0
             text_event_count = 0
             finished = False
+            last_response = None
             last_payload_time = time.monotonic()
             async with ModelClient._http_client_context() as client:
               # 最多两轮：第一轮带思考参数，被拒时去掉参数重开一次流。
@@ -1707,6 +1723,8 @@ class ModelClient:
 
                         if data.get("error"):
                             ModelClient._raise_conversation_request_error(history, data["error"])
+                        if data.get('candidates') or data.get('promptFeedback'):
+                            last_response = data
                         thought_event = observe_thinking(data, 'gemini')
                         if thought_event:
                             yield ''
@@ -1724,6 +1742,8 @@ class ModelClient:
                             parts = candidates[0].get('content', {}).get('parts', [])
                             yielded_any_text = False
                             for part in parts:
+                                if isinstance(part, dict) and part.get('thought') is True:
+                                    continue
                                 text = ModelClient._model_content_to_text(part)
                                 if text:
                                     yielded_any_text = True
@@ -1744,7 +1764,9 @@ class ModelClient:
             ModelClient._check_compression_stream_end(history, finished)
             from xgent_app.media_response import current_media
             if not text_event_count and not (current_media.get() and current_media.get().parts):
-                ModelClient._raise_conversation_request_error(history, "Gemini 未返回有效内容。")
+                error = ModelClient._provider_response_error(last_response) if last_response is not None else 'Gemini 未返回有效内容。'
+                ModelClient._raise_conversation_request_error(history, error)
+                yield error
         except AttachmentContextError:
             raise
         except httpx.ReadTimeout as e:
@@ -1816,6 +1838,7 @@ class ModelClient:
 
         yielded_any_text = False
         finished = False
+        last_response = None
         try:
             async with ModelClient._http_client_context() as client:
               # 最多两轮：第一轮带思考参数，被拒时去掉参数重开一次流。
@@ -1867,6 +1890,8 @@ class ModelClient:
 
                         if data.get("error"):
                             ModelClient._raise_conversation_request_error(history, data["error"])
+                        if data.get('message') or data.get('delta', {}).get('stop_reason'):
+                            last_response = data
                         if observe_thinking(data, 'claude'):
                             yield ''
                         if data.get('type') == 'message_start':
@@ -1895,7 +1920,9 @@ class ModelClient:
                 break
             ModelClient._check_compression_stream_end(history, finished)
             if not yielded_any_text:
-                ModelClient._raise_conversation_request_error(history, "Claude 未返回有效内容。")
+                error = ModelClient._provider_response_error(last_response) if last_response is not None else 'Claude 未返回有效内容。'
+                ModelClient._raise_conversation_request_error(history, error)
+                yield error
         except AttachmentContextError:
             raise
         except httpx.ReadTimeout as e:
@@ -2001,8 +2028,9 @@ class ModelClient:
             choice = completion.choices[0]
             content = ModelClient._openai_sdk_message_text(choice.message)
             if not content:
-                ModelClient._raise_conversation_request_error(history, "模型未返回有效内容。")
-                return None, "对方暂时没反应，用户稍后再试试？"
+                error = ModelClient._provider_response_error(completion.model_dump())
+                ModelClient._raise_conversation_request_error(history, error)
+                return None, error
 
             finish_reason = getattr(choice, 'finish_reason', None)
             ModelClient._check_compression_completion(history, finish_reason)

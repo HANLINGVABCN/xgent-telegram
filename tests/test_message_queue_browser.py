@@ -186,6 +186,7 @@ def test_thinking_preview_closes_after_completion_and_is_plain_text(queue_browse
     server.outbox.put({**frame, 'type':'thinking_state', 'thinking':{'version':1,'capture_id':'one',
         'text':'第一行\n最新的一行','status':'running','elapsed_seconds':2,'revision':1}})
     page.locator('.thinking-preview').filter(has_text='最新的一行').wait_for()
+    assert page.locator('.thinking-block').evaluate('(node)=>node.previousElementSibling.classList.contains("bubble-header")')
     server.outbox.put({**frame, 'type':'thinking_state', 'thinking':{'version':1,'capture_id':'one',
         'text':'第一行\n最新的一行\n```run-x\nnever execute\n```','status':'completed','elapsed_seconds':3,'revision':2}})
     page.wait_for_function('document.querySelector(".thinking-preview").textContent===""')
@@ -193,6 +194,50 @@ def test_thinking_preview_closes_after_completion_and_is_plain_text(queue_browse
     page.locator('.thinking-head').click()
     assert 'never execute' in page.locator('.thinking-body').inner_text()
     assert not page.locator('.thinking-body button').count()
+    assert page.locator('.thinking-label').inner_text() == '思考 · 约 3 秒'
+
+
+def test_no_reasoning_or_whitespace_does_not_show_a_thinking_block(queue_browser):
+    server, page, _, base, _ = queue_browser
+    ready(page, base)
+    frame = {'conversation_id': 'A', 'run_id': 'no-thinking-test', 'ui_generation': 7, 'message_id': 99992}
+    server.outbox.put({**frame, 'type': 'message', 'text': '无思考正文', 'msg_type': 'ai_reply'})
+    page.get_by_text('无思考正文', exact=True).wait_for()
+    server.outbox.put({**frame, 'type': 'thinking_state', 'thinking': {'version': 1, 'capture_id': 'blank',
+        'text': '  \n\t', 'status': 'completed', 'elapsed_seconds': None, 'revision': 1}})
+    page.wait_for_timeout(350)
+    assert not page.locator('.thinking-block').count()
+
+
+def test_nonstream_reasoning_has_content_below_author_and_zero_missing_time(queue_browser):
+    server, page, _, base, _ = queue_browser
+    ready(page, base)
+    frame = {'conversation_id': 'A', 'run_id': 'complete-thinking-test', 'ui_generation': 7, 'message_id': 99993}
+    value = {'version': 1, 'capture_id': 'complete', 'text': '确实返回的思考内容',
+             'status': 'completed', 'elapsed_seconds': None, 'revision': 1}
+    server.outbox.put({**frame, 'type': 'message', 'text': '回答正文', 'msg_type': 'ai_reply', 'thinking': value})
+    page.get_by_text('思考 · 0 秒', exact=True).wait_for()
+    assert page.locator('.thinking-block').evaluate('(node)=>node.previousElementSibling.classList.contains("bubble-header")')
+    assert page.locator('.thinking-body').is_hidden()
+    page.locator('.thinking-head').click()
+    page.wait_for_function('!document.querySelector(".thinking-body").hidden')
+    assert page.locator('.thinking-body').inner_text() == value['text']
+    page.locator('.thinking-head').click()
+    page.wait_for_function('document.querySelector(".thinking-body").hidden')
+    def restored_history(route):
+        route.fulfill(json={'conversation_id': 'A', 'ui_generation': 7, 'busy': True,
+            'messages': [{'id': 99993, 'role': 'assistant', 'msg_type': 'ai_reply', 'content': '回答正文',
+                          'timestamp': 1, 'thinking': value,
+                          'web_live': {'epoch': server.outbox.snapshot()['epoch'], 'message_ids': [99993]}}],
+            'live': server.outbox.snapshot(), 'next_cursor': None})
+    page.route('**/api/workbench/history?*', restored_history)
+    page.reload()
+    page.get_by_text('思考 · 0 秒', exact=True).wait_for()
+    assert page.locator('.thinking-block').count() == 1
+    assert page.locator('.thinking-body').is_hidden()
+    page.locator('.thinking-head').click()
+    page.wait_for_function('!document.querySelector(".thinking-body").hidden')
+    assert page.locator('.thinking-body').inner_text() == value['text']
 
 
 @pytest.mark.parametrize('action,label', [('edit','编辑'),('cancel','❌ 取消')])

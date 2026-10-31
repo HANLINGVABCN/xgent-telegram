@@ -1438,7 +1438,7 @@ import {syncAskForm} from './ask-form.js';
 
   const thinkingStates=new Map();
   function syncThinking(entry,value){
-    if(!entry||!value?.text||value.version!==1)return;
+    if(!entry||typeof value?.text!=='string'||!value.text.trim()||value.version!==1)return;
     if(entry.thinking&&value.capture_id===entry.thinking.capture_id&&value.revision<entry.thinking.revision)return;
     const finished=value.status!=='running',wasRunning=entry.thinking?.status==='running';
     entry.thinking=value;
@@ -1448,14 +1448,15 @@ import {syncAskForm} from './ask-form.js';
       const label=document.createElement('span');label.className='thinking-label';
       const preview=document.createElement('span');preview.className='thinking-preview';
       const body=document.createElement('pre');body.className='thinking-body';body.hidden=true;
-      head.append(label,preview);block.append(head,body);entry.bubble.insertBefore(block,entry.bubble.firstChild);
+      head.append(label,preview);block.append(head,body);entry.bubble.insertBefore(block,entry.body);
       let timer;function toggle(event){clearTimeout(timer);if(event.detail>1||getSelection()?.toString())return;const apply=()=>{if(getSelection()?.toString())return;body.hidden=!body.hidden;head.setAttribute('aria-expanded',String(!body.hidden));};if(event.type==='keydown')apply();else timer=setTimeout(apply,240);}
       head.onclick=toggle;body.onclick=toggle;head.ondblclick=body.ondblclick=()=>clearTimeout(timer);head.onkeydown=event=>{if(['Enter',' '].includes(event.key)){event.preventDefault();toggle(event);}};
       head.setAttribute('aria-expanded','false');
     }
     const block=entry.thinkingBlock,body=block.querySelector('.thinking-body'),head=block.querySelector('.thinking-head');
     const elapsed=value.elapsed_seconds;
-    const time=elapsed==null?'耗时未记录':elapsed<1?'不足1秒':'约 '+Math.round(elapsed)+' 秒';
+    const time=elapsed==null?'0 秒':elapsed<1?'不足1秒':'约 '+Math.round(elapsed)+' 秒';
+    head.title=elapsed==null?'提供商未提供独立思考耗时，按 0 秒显示。':'思考阶段耗时。';
     block.querySelector('.thinking-label').textContent=({running:'思考中',completed:'思考',stopped:'思考已停止',failed:'思考未完成'}[value.status]||'思考')+' · '+time;
     block.querySelector('.thinking-preview').textContent=finished?'':value.text.split('\n').filter(line=>line.trim()).at(-1)||'';
     body.textContent=value.text;
