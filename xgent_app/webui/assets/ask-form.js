@@ -15,6 +15,7 @@ export function syncAskForm(entry,snapshot,options={}){
     if(!state.busy&&(!state.dirty||state.unsavedFields?.size)){
       state.draft=mergeDraft(snapshot,state.draft,state.unsavedFields);
     }
+    if(state.unsavedFields.size)state.saveLocal();
     state.paint();return;
   }
   entry.askNode?.remove();
@@ -25,12 +26,17 @@ export function syncAskForm(entry,snapshot,options={}){
   entry.askState=state;entry.askNode=node;
   try{
     const local=JSON.parse(sessionStorage.getItem(key)||'null');
-    if(local?.revision===snapshot.revision&&local.draft){state.draft=local.draft;state.dirty=true;
+    if(snapshot.status==='pending'&&local?.revision===snapshot.revision&&local.draft){state.draft=local.draft;state.dirty=true;
       for(const q of snapshot.questions)if(q.type!=='secret'&&(q.type==='text'||q.other)&&
         (state.draft[q.id]?.custom||'')!==(snapshot.draft[q.id]?.custom||''))state.unsavedFields.add(q.id);}
+    else if(snapshot.status==='pending'&&local?.draft&&Array.isArray(local.unsaved_fields)){
+      for(const q of snapshot.questions)if((q.type==='text'||q.other)&&local.unsaved_fields.includes(q.id))state.unsavedFields.add(q.id);
+      state.draft=mergeDraft(snapshot,local.draft,state.unsavedFields);state.dirty=state.unsavedFields.size>0;
+      if(!state.dirty)sessionStorage.removeItem(key);
+    }
     else if(local)sessionStorage.removeItem(key);
   }catch{}
-  const saveLocal=()=>{const safe={};for(const q of snapshot.questions)if(q.type!=='secret')safe[q.id]=state.draft[q.id]||{};try{sessionStorage.setItem(key,JSON.stringify({revision:state.snapshot.revision,draft:safe}));}catch{}};
+  const saveLocal=state.saveLocal=()=>{const safe={};for(const q of snapshot.questions)if(q.type!=='secret')safe[q.id]=state.draft[q.id]||{};try{sessionStorage.setItem(key,JSON.stringify({revision:state.snapshot.revision,draft:safe,unsaved_fields:[...state.unsavedFields]}));}catch{}};
   const notice=document.createElement('p');notice.className='web-ask-notice';notice.setAttribute('role','status');
   async function request(action,fieldSave=null){
     clearTimeout(state.timer);

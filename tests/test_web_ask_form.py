@@ -118,6 +118,7 @@ async def main():
                                     'id':pending.ask_id,'conversation_id':pending.conversation_id,'action':'submit',
                                     'revision':pending.revision,'draft':{qid:answer for qid,answer in pending.draft.items() if qid!='3'}})
                                 assert not incomplete.ok and PENDING_ASKS.get(pending.ask_id) is pending and len(calls)==1
+                                await form.get_by_role('textbox',name='选择项目 · 自定义答案',exact=True).fill('跨端更新前未保存的草稿')
                                 class LocalInputBot:
                                     def __init__(self):self.notices=[];self.deleted=[]
                                     async def send_message(self,**kwargs):
@@ -147,6 +148,11 @@ async def main():
                                 assert await page.locator('.msg-row.user').filter(has_text='测试').count()==0
                                 await page.reload();await form.wait_for()
                                 assert await form.get_by_role('textbox',name='补充说明',exact=True).input_value()=='测试'
+                                assert await form.get_by_role('textbox',name='选择项目 · 自定义答案',exact=True).input_value()=='跨端更新前未保存的草稿'
+                                assert pending.draft['1'].get('custom','')==''
+                                await form.get_by_role('button',name='保存 选择项目',exact=True).click()
+                                await page.wait_for_function('document.querySelector(".web-ask-notice").textContent==="已保存"')
+                                assert pending.draft['1']['custom']=='跨端更新前未保存的草稿'
                                 assert '请填写：' not in await page.locator('#log').inner_text()
                                 assert '回到表单继续' not in await page.locator('#log').inner_text()
                                 assert await page.locator('.msg-row.user').filter(has_text='测试').count()==0
