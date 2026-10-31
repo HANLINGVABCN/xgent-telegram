@@ -72,21 +72,15 @@ from xgent_app.web_media import build_media_presentation, current_media_presenta
 _RECORDER_SOURCE_ID = f"pid{os.getpid()}-{uuid.uuid4().hex[:6]}"
 
 
-async def _delete_withdrawn_telegram(native_ids, logical_ids):
-    """Best effort only; local history/file withdrawal is already committed."""
+async def _delete_withdrawn_telegram(native_ids, logical_ids, request_id=None):
     if not BotConfig.TOKEN:
         return
-    bot = globals().get('_web_real_bot')
-    for message_id in native_ids or []:
-        if bot is not None:
-            with contextlib.suppress(Exception):
-                await bot.delete_message(chat_id=BotConfig.AUTHORIZED_USER_ID, message_id=int(message_id))
     channel = telegram_channel()
     channel.ensure_started()
-    for logical_id in logical_ids or []:
-        with contextlib.suppress(Exception):
-            channel.offer(Op(OP_DELETE, logical_id=int(logical_id),
-                             chat_id=BotConfig.AUTHORIZED_USER_ID, payload={}))
+    for mid in native_ids or []:
+        channel.offer(Op(OP_DELETE, chat_id=BotConfig.AUTHORIZED_USER_ID, payload={'native_id': int(mid), '_withdrawal': request_id}))
+    for mid in logical_ids or []:
+        channel.offer(Op(OP_DELETE, logical_id=int(mid), chat_id=BotConfig.AUTHORIZED_USER_ID, payload={'_withdrawal': request_id}))
 
 
 def current_ui_workflow_guard() -> str:
@@ -167,6 +161,11 @@ class GlobalRecorder:
         stamped_metadata.setdefault('src', _RECORDER_SOURCE_ID)
         if current_scope().run_id:
             stamped_metadata.setdefault('run_id', current_scope().run_id)
+        if current_scope().telegram_delivery is False:
+            stamped_metadata['telegram_route_enabled'] = False
+        if current_scope().origin == 'telegram':
+            from xgent_app.telegram_records import source_bot_id
+            stamped_metadata.setdefault('telegram_source_bot_id', source_bot_id())
         ui_generation = active_ui_generation()
         if ui_generation is not None:
             stamped_metadata.setdefault('ui_generation', ui_generation)
@@ -827,7 +826,16 @@ def download_and_apply_project_update(overwrite_local_custom_files: bool = True)
         MAX_UPDATE_DECOMPRESSED_SIZE = 500 * 1024 * 1024  # 500 MB
         total_decompressed = 0
 
+        code_revision = None
         with zipfile.ZipFile(zip_path) as archive:
+            comment = archive.comment.decode('ascii', 'ignore').strip()
+            if re.fullmatch(r'[a-f0-9]{40}', comment):
+                code_revision = comment
+            roots = {member.filename.split('/')[0] for member in archive.infolist()}
+            if not code_revision and len(roots) == 1:
+                match = re.search(r'-([a-f0-9]{7,40})$', next(iter(roots)))
+                if match:
+                    code_revision = match[1]
             for member in archive.infolist():
                 if member.is_dir():
                     continue
@@ -875,6 +883,9 @@ def download_and_apply_project_update(overwrite_local_custom_files: bool = True)
                         os.chmod(target_path, os.stat(target_path).st_mode | 0o755)
 
                 copied_files.append(rel_path)
+        if code_revision:
+            with open(os.path.join(PROJECT_ROOT, '.xgent-version'), 'w', encoding='utf-8') as handle:
+                handle.write(code_revision)
 
     return {
         "source": BotConfig.UPDATE_ZIP_URL,
@@ -1513,6 +1524,12 @@ async def publish_saved_reply(context, row_id, reply=None):
         row = await db.get_display_message(row_id)
         if row is None:
             return
+        from xgent_app.telegram_records import bind_record
+        live_ids = (row.get('metadata') or '{}')
+        live_ids = json.loads(live_ids) if isinstance(live_ids, str) else live_ids
+        ids = list(getattr(reply, 'presentation_message_ids', [])) or live_ids.get('web_live', {}).get('message_ids', [])
+        await bind_record(db, row, ids)
+        row = await db.get_display_message(row_id)
         message = await asyncio.to_thread(
             build_history_message, row, ArtifactManager.ROOT_DIR,
             os.path.join(AgentExecutor.WORK_DIR, 'workspace'),
@@ -1718,7 +1735,7 @@ def build_external_media_prompt(kind: str, prompt: str) -> str:
         f"你是{EXTERNAL_MEDIA_SPEAKER}，不是当前聊天助手本人。"
         f"你的任务是根据用户提示直接生成{kind}，可以附带简短中文说明。"
         "你和聊天模块使用同一套模型接口；如果模型原生支持媒体输出，请直接输出媒体。"
-        "如果需要用文本承载媒体，请返回 markdown data URL 或直接 data URL。"
+        "请通过接口原生图片字段返回媒体，不要手写图片编码或示例。"
         "不要只返回提示词，不要要求用户再调用其他工具。\n\n"
         f"请根据下面提示直接生成{kind}。\n\n{prompt}"
     )
@@ -1975,40 +1992,22 @@ def _extension_for_mime(mime_type: str) -> str:
 
 
 def _image_content_fingerprint(media_bytes: bytes, mime_type: str) -> str:
-    """同一张图可能被网关重编码两遍、字节不同（C2PA 来源水印含时间戳/签名，
-    每次编码都变），但图像像素完全一样。按整字节或 base64 去重合并不了它们。
-
-    PNG：跳过所有元数据 chunk（C2PA 塞在 tEXt/itxt/匿名 chunk 里），只取 IDAT
-    解压后的图像数据做哈希——同图不同水印的 IDAT 一致，能合并；真不同图
-    的 IDAT 不同，不误杀。
-    其他格式（JPEG 等）退化成整字节哈希：这些网关目前不带可变水印。
-    解析失败也退化成整字节哈希，保证绝不误合并。
-    """
-    if mime_type == 'image/png' and media_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+    if mime_type.startswith('image/'):
         try:
-            idat = bytearray()
-            pos = 8
-            while pos + 8 <= len(media_bytes):
-                length = struct.unpack('>I', media_bytes[pos:pos + 4])[0]
-                ctype = media_bytes[pos + 4:pos + 8]
-                if ctype == b'IDAT':
-                    idat.extend(media_bytes[pos + 8:pos + 8 + length])
-                pos += 12 + length
-                if ctype == b'IEND':
-                    break
-            if idat:
-                raw = zlib.decompress(bytes(idat))
-                return 'png:' + hashlib.sha256(raw).hexdigest()
+            from PIL import Image
+            with Image.open(io.BytesIO(media_bytes)) as image:
+                if image.width * image.height <= 16_000_000:
+                    return 'pixels:' + hashlib.sha256(image.convert('RGBA').tobytes()).hexdigest()
         except Exception:
             pass
     return 'raw:' + hashlib.sha256(media_bytes).hexdigest()
 
 
-def _save_inline_generated_media(mime_type: str, data_b64: str) -> Dict[str, Any]:
+def _save_inline_generated_media(mime_type: str, data_b64: str = "", *, decoded=None) -> Dict[str, Any]:
     mime_type = mime_type.lower()
     compact_b64 = ''.join((data_b64 or '').split())
     padding = '=' * (-len(compact_b64) % 4)
-    media_bytes = base64.b64decode(compact_b64 + padding, altchars=b'-_', validate=True)
+    media_bytes = decoded if decoded is not None else base64.b64decode(compact_b64 + padding, altchars=b'-_', validate=True)
     if mime_type.startswith('image/'):
         mime_type = inspect_payload(
             media_bytes, "generated_image", mime_type, expected_image=True,
@@ -2037,6 +2036,26 @@ def _save_inline_generated_media(mime_type: str, data_b64: str) -> Dict[str, Any
 def extract_inline_generated_media(response: str, append_notices: bool = True,
                                     *, partial: bool = False) -> Tuple[str, List[Dict[str, Any]]]:
     """Save inline data-url media and remove raw media payloads from the text reply."""
+    if getattr(response, 'media', None):
+        artifacts, failures, seen = [], [], set()
+        for part in response.media:
+            try:
+                data = part['data']; decoded = base64.b64decode(data + '=' * (-len(data) % 4), altchars=b'-_', validate=True)
+                fingerprint = _image_content_fingerprint(decoded, part['mime_type'])
+                if fingerprint in seen:
+                    continue
+                saved = _save_inline_generated_media(part['mime_type'], decoded=decoded)
+                saved['source_field'] = part.get('source_field')
+                artifacts.append(saved); seen.add(fingerprint)
+            except OSError:
+                failures.append('一份图片保存失败，请检查磁盘空间与写入权限。')
+            except Exception:
+                failures.append('一份图片数据无效，未保存该图片。')
+        text = DATA_MEDIA_MARKDOWN_RE.sub('', str(response))
+        text = DATA_MEDIA_URL_RE.sub('', text).strip()
+        if failures:
+            text = (text + '\n' + ('部分图片生成失败：' if artifacts else '图片生成失败：') + failures[0]).strip()
+        return (build_generated_media_reply_text(text, artifacts) if append_notices else text), artifacts
     if not response or not contains_inline_generated_media(response):
         return response, []
 
@@ -2049,6 +2068,10 @@ def extract_inline_generated_media(response: str, append_notices: bool = True,
     seen_fingerprints: set = set()
 
     def replace_match(match: re.Match) -> str:
+        # Inline-code explanations and fenced examples are prose, not media.
+        prefix = response[:match.start()]
+        if prefix.count('```') % 2 or (prefix.rsplit('\n', 1)[-1].count('`') % 2):
+            return '[图片编码示例]'
         mime_type = (match.group(1) or match.group(3)).lower()
         data_b64 = match.group(2) or match.group(4)
         try:
@@ -2058,7 +2081,7 @@ def extract_inline_generated_media(response: str, append_notices: bool = True,
             fingerprint = _image_content_fingerprint(media_bytes, mime_type)
             if fingerprint in seen_fingerprints:
                 return ""
-            artifact = _save_inline_generated_media(mime_type, data_b64)
+            artifact = _save_inline_generated_media(mime_type, decoded=media_bytes)
             seen_fingerprints.add(fingerprint)
             artifacts.append(artifact)
             return ""
@@ -2066,7 +2089,7 @@ def extract_inline_generated_media(response: str, append_notices: bool = True,
             logger.error(f"保存模型内联媒体失败: {e}")
             if partial:
                 return "[媒体未完整接收或无法解析，未作为成功生成的图片保留]"
-            return "[模型返回了内联图片数据，但保存失败；原始base64已阻止直发以避免刷屏]"
+            return "[一份图片数据无法解析，未保存该图片]"
 
     # A single pass preserves ordering when Markdown and bare data URLs are mixed.
     combined_pattern = re.compile(
@@ -2123,6 +2146,12 @@ async def _send_generated_media_artifacts(context: ContextTypes.DEFAULT_TYPE, ch
     # 否则两张图每条消息下面都列两个路径，看着像重复。正文（"这里是根据
     # 您的描述生成的图片："之类）只在第一张上保留，避免后续图重复刷正文。
     body_text = _media_caption_body(caption)
+    sender = getattr(context.bot, 'send_generated_group', None)
+    from xgent_app.telegram_native import request_capable
+    target = getattr(getattr(context.bot, 'original', context.bot), 'real_bot', None)
+    if callable(sender) and request_capable(target):
+        await sender(chat_id, artifacts, body_text)
+        return
     for index, artifact in enumerate(artifacts):
         path = str(artifact.get('path') or '')
         mime_type = str(artifact.get('mime_type') or 'application/octet-stream')
@@ -2130,7 +2159,7 @@ async def _send_generated_media_artifacts(context: ContextTypes.DEFAULT_TYPE, ch
             if mime_type.startswith('image/'):
                 raise AttachmentContextError(f"生成图片原件缺失，未发送：{path or '(无路径)'}")
             continue
-        per_caption = _artifact_caption(body_text, artifact, first=(index == 0))
+        per_caption = to_display_path(str(artifact.get('path') or ''))
         media_caption = fit_media_caption(per_caption)
         if mime_type.startswith('image/'):
             await send_generated_media_file_to_user(context, chat_id, path, mime_type, media_caption)
@@ -2142,6 +2171,8 @@ async def _send_generated_media_artifacts(context: ContextTypes.DEFAULT_TYPE, ch
                     filename=os.path.basename(path),
                     caption=media_caption
                 )
+    if body_text:
+        await safe_send_message(context, chat_id, body_text)
 
 
 def build_media_artifact(kind: str, path: str, mime_type: str,
@@ -2239,6 +2270,8 @@ async def generated_image_metadata(artifacts: List[Dict[str, Any]],
         'display_media': display_media,
         'attachment_generation': generation,
         'attachment_received_at_ns': received_at,
+        'generated_media': {'version': 1, 'items': [{key: artifact.get(key) for key in
+            ('path', 'mime_type', 'size', 'source_field') if artifact.get(key) is not None} for artifact in artifacts]},
     }
     if references:
         metadata['attachments'] = references

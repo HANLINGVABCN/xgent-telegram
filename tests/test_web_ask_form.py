@@ -96,9 +96,10 @@ async def main():
                                     'revision':pending.revision,'draft':{qid:answer for qid,answer in pending.draft.items() if qid!='3'}})
                                 assert not incomplete.ok and PENDING_ASKS.get(pending.ask_id) is pending and len(calls)==1
                                 class LocalInputBot:
-                                    def __init__(self):self.notices=[]
+                                    def __init__(self):self.notices=[];self.deleted=[]
                                     async def send_message(self,**kwargs):
                                         self.notices.append(kwargs['text']);return SimpleNamespace(message_id=500+len(self.notices),chat_id=1)
+                                    async def delete_message(self,**kwargs):self.deleted.append(kwargs['message_id']);return True
                                 native=LocalInputBot()
                                 restore=install_tg_to_web_mirror(native,h.outbox)
                                 try:
@@ -109,14 +110,15 @@ async def main():
                                             await bot._dispatch_ask_callback(SimpleNamespace(callback_query=query),bot._SelfTriggerContext(native),
                                                 f'{action}:{pending.ask_id}:{qid}')
                                             update=bot._SelfTriggerUpdate(native,1);update.effective_user=SimpleNamespace(id=1)
-                                            update.message.text=text;update.message.message_id=700
+                                            update.message.text=text;update.message.message_id=700+int(qid)
                                             await bot.handle_text_message(update,bot._SelfTriggerContext(native))
                                 finally:restore()
                                 assert pending.draft['2'].get('custom')=='测试',pending.web_snapshot()
                                 await page.wait_for_function('document.querySelector("textarea[aria-label=补充说明]")?.value==="测试"')
-                                assert len(native.notices)==4
+                                assert len(native.notices)==2
+                                assert {501,502,702,703}.issubset(set(native.deleted))
                                 assert any('请填写：' in text for text in native.notices)
-                                assert any('已填入' in text for text in native.notices)
+                                assert not any('已填入' in text for text in native.notices)
                                 text_before=await page.locator('#log').inner_text()
                                 assert '请填写：' not in text_before and '回到表单继续' not in text_before
                                 assert await page.locator('.msg-row.user').filter(has_text='测试').count()==0
@@ -149,7 +151,7 @@ async def main():
                                 duplicate=await context.request.post(base+'/api/workbench/ask',data={
                                     'id':pending.ask_id,'conversation_id':pending.conversation_id,'action':'submit',
                                     'revision':pending.revision,'draft':{}})
-                                assert not duplicate.ok and len(calls)==2
+                                assert duplicate.ok and (await duplicate.json())['status']=='submitted' and len(calls)==2
                                 assert await password.input_value()==''
                                 assert await form.get_by_role('button',name='提交',exact=True).count()==0
                                 assert not await form.get_by_role('button',name='提交',exact=True).is_visible()

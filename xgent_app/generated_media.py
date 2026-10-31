@@ -28,6 +28,8 @@ class GeneratedMediaReply:
         extract: Callable[..., tuple[str, list[dict]]],
         persist: Callable[[str, list[dict], bool], Awaitable[Any]],
     ):
+        from .media_response import MediaCapture
+        self.media_capture = MediaCapture()
         self.extract = extract
         self.persist = persist
         self.text = ""
@@ -48,7 +50,7 @@ class GeneratedMediaReply:
 
     async def _prepare(self, raw: str, stopped: bool, partial: bool) -> tuple[str, list[dict]]:
         self.text, self.artifacts = await asyncio.to_thread(
-            self.extract, raw, partial=partial,
+            self.extract, self.media_capture.reply(raw), partial=partial,
         )
         if any(str(item.get("mime_type") or "").startswith("image/")
                for item in self.artifacts):

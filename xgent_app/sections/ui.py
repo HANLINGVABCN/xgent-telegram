@@ -131,14 +131,6 @@ def get_main_menu():
          InlineKeyboardButton("📝 提示词", callback_data="menu_prompts")],
         [InlineKeyboardButton("⚙️ 更多", callback_data="menu_more_settings")]
     ]
-    from xgent_app.miniapps import page_url
-    scope=current_scope(required=False)
-    if scope:
-        pages=[]
-        for page,label in (('settings','设置与模型'),('tasks','任务'),('files','文件')):
-            url=page_url(globals(),page,conversation_id=scope.conversation_id)
-            if url:pages.append(InlineKeyboardButton(label,web_app=WebAppInfo(url=url)))
-        if pages:keyboard.append(pages)
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -172,33 +164,6 @@ def _build_web_open_button():
 
     port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
     return InlineKeyboardButton("🌐 浏览器打开", url=f"http://{DEFAULT_WEB_HOST}:{port}")
-
-
-def _build_terminal_open_button():
-    """终端开启时的「打开终端」按钮。复用 Web 的公开地址 + /terminal 路径。
-
-    终端与 Web 共享同一端口和认证，但开关独立。只要 terminal_enabled
-    即返回按钮。终端是任意命令执行，默认关闭，必须显式开启。
-    密码缺失时同 _build_web_open_button：服务不会启动，给回调按钮而不是死链接。
-    """
-    term_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
-    if not term_on:
-        return None
-
-    if not normalize_bool(UserDataManager.get('_web_has_password', False), False):
-        return InlineKeyboardButton(
-            "🖥 打开终端（未设密码）", callback_data="web_need_password"
-        )
-
-    public_url = str(UserDataManager.get('web_public_url', '') or '')
-    if public_url.startswith("https://"):
-        return InlineKeyboardButton(
-            "🖥 打开终端", web_app=WebAppInfo(url=public_url.rstrip("/") + "/terminal")
-        )
-    port = normalize_web_port(UserDataManager.get('web_port', DEFAULT_WEB_PORT))
-    return InlineKeyboardButton(
-        "🖥 浏览器打开终端", url=f"http://{DEFAULT_WEB_HOST}:{port}/terminal"
-    )
 
 
 def get_web_menu():
@@ -239,9 +204,6 @@ def get_web_menu():
         rows.append([InlineKeyboardButton("🧹 清除公开地址", callback_data="do_clear_web_public_url")])
     # 终端开关 + 打开按钮。终端与 Web 独立开关，共享同一服务器。
     term_on = normalize_bool(UserDataManager.get('terminal_enabled', False), False)
-    term_button = _build_terminal_open_button()
-    if term_button is not None:
-        rows.append([term_button])
     rows.append([InlineKeyboardButton(
         f"🖥 终端：{'🟢 开' if term_on else '🔴 关'}　点击{'关闭' if term_on else '开启'}",
         callback_data="toggle_terminal_enabled"

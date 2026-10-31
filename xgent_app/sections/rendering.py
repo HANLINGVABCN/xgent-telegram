@@ -1439,11 +1439,15 @@ def _remember_live_reply(reply, context, message_ids):
     outbox = getattr(context.bot, 'outbox', None) or get_web_outbox()
     if reply is not None and outbox is not None:
         reply.web_live = {'epoch': outbox.snapshot()['epoch'], 'message_ids': message_ids}
+    if reply is not None:
+        from xgent_app.thinking_display import ThinkingCapture
+        reply.thinking = ThinkingCapture(outbox, message_ids[0] if message_ids else None)
 
 
 def live_reply_metadata(reply):
     live = getattr(reply, 'web_live', None)
-    return {'web_live': live} if live else {}
+    thinking = getattr(reply, 'thinking', None)
+    return {**({'web_live': live} if live else {}), **({'thinking': thinking.snapshot()} if thinking and thinking.snapshot() else {})}
 
 
 async def _preserve_media_after_error(generated_reply, raw, *, stopped=False):
@@ -1522,6 +1526,8 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             usage_sink=usage_sink,
             trace_id=trace_id,
             conversation_context=True,
+            thinking_sink=getattr(generated_reply, 'thinking', None),
+            media_sink=generated_reply.media_capture,
         ).__aiter__()
         stop_task = asyncio.create_task(stop_event.wait())
         stream_timed_out = False
@@ -1567,7 +1573,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
                     continue
 
                 detection_window = (media_detection_tail + chunk).lower()
-                if contains_inline_generated_media(detection_window):
+                if contains_inline_generated_media(detection_window) or generated_reply.media_capture.parts:
                     native_media_detected = True
                     if renderer:
                         await renderer.cancel()
@@ -1627,6 +1633,8 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
             return None
 
         if stream_timed_out:
+            if getattr(generated_reply, 'thinking', None):
+                generated_reply.thinking.finish('failed')
             from xgent_app.message_queue import mark_outcome
             mark_outcome('failed')
             waited = int(_stream_chunk_idle_timeout_seconds())
@@ -1698,7 +1706,7 @@ async def send_streaming_response(update: Update, context: ContextTypes.DEFAULT_
                 stopped_partial_sink.append(full_response)
             return None
 
-        if full_response:
+        if full_response or generated_reply.media_capture.parts:
             full_response, media_artifacts = await generated_reply.prepare(full_response)
             full_response = append_external_media_notices_to_response(full_response, extra_media_artifacts)
             write_model_trace("model_response", {
@@ -1893,6 +1901,8 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
             usage_sink=usage_sink,
             trace_id=trace_id,
             conversation_context=True,
+            thinking_sink=getattr(generated_reply, 'thinking', None),
+            media_sink=generated_reply.media_capture,
         ).__aiter__()
         stop_task = asyncio.create_task(stop_event.wait())
         next_chunk_task = None
@@ -1985,6 +1995,8 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
             return None
 
         if stream_timed_out:
+            if getattr(generated_reply, 'thinking', None):
+                generated_reply.thinking.finish('failed')
             from xgent_app.message_queue import mark_outcome
             mark_outcome('failed')
             waited = int(_stream_chunk_idle_timeout_seconds())
@@ -2029,7 +2041,7 @@ async def send_background_streaming_response(update: Update, context: ContextTyp
             return partial or timeout_notice.strip()
 
         # 正常完成
-        if partial:
+        if partial or generated_reply.media_capture.parts:
             partial, media_artifacts = await generated_reply.prepare(partial)
             partial = append_external_media_notices_to_response(partial, extra_media_artifacts)
             write_model_trace("model_response", {
@@ -2224,6 +2236,8 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
             usage_sink=usage_sink,
             trace_id=trace_id,
             conversation_context=True,
+            thinking_sink=getattr(generated_reply, 'thinking', None),
+            media_sink=generated_reply.media_capture,
         ))
         stop_task = asyncio.create_task(stop_event.wait())
         # 兜底硬上限必须加在这个 wait 上：模型无响应时 response_task 和
@@ -2395,6 +2409,8 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
         return None
 
     except asyncio.CancelledError:
+        if getattr(generated_reply, 'thinking', None):
+            generated_reply.thinking.finish('stopped')
         await cancel_task_quietly(response_task, timeout=1.0)
         if response_task is not None and response_task.done() and not response_task.cancelled():
             with contextlib.suppress(Exception):
@@ -2412,6 +2428,8 @@ async def send_non_streaming_response(update: Update, context: ContextTypes.DEFA
             stopped_partial_sink.append(partial)
         raise
     except Exception as e:
+        if getattr(generated_reply, 'thinking', None):
+            generated_reply.thinking.finish('failed')
         logger.error(f"非流式响应错误: {e}")
         if getattr(generated_reply, 'text_only', False):
             generated_reply.error = str(e)

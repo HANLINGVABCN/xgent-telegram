@@ -333,7 +333,7 @@ class WebOutbox:
                     self._inflight_bytes -= size
             return
         key = frame.get('message_id')
-        if key is None or kind not in {'message', 'edit', 'edit_markup', 'delete'}:
+        if key is None or kind not in {'message', 'edit', 'edit_markup', 'delete', 'thinking_state'}:
             return
         key = (frame.get('conversation_id'), frame.get('run_id'), key)
         previous = self._inflight.pop(key, None)
@@ -765,7 +765,10 @@ class WebContext:
         self.args: List[str] = []
 
 
+from .telegram_records import track_delivery
+
 @_without_reverse_mirror
+@track_delivery
 async def deliver_op_to_bot(bot: Any, op: Op, native_id: Optional[int], *,
                             markup_builder: Optional[Any] = None) -> Any:
     """把一个 Op 真的打到某个 PTB bot 上；创建类操作返回原生 message_id。
@@ -1331,6 +1334,33 @@ class MirrorBot:
                         "kwargs": self._passthrough(kwargs),
                     }, transient={} if local_path is not None else {"photo": photo})
         return WebMessage(self, message_id, target, str(caption or ""))
+
+    async def finalize_generated_group(self, chat_id, message_id, artifacts, text, details, target_record_id):
+        from .telegram_native import OP_NATIVE_MEDIA
+        self._offer(OP_NATIVE_MEDIA, logical_id=message_id, chat_id=chat_id,
+            payload={'artifacts': list(artifacts), 'text': text, 'details_html': details, '_edit': True,
+                     'kwargs': {}, 'telegram_native': {'phase': 'media', 'owner_id': message_id, 'record_id': target_record_id}})
+
+    async def send_generated_group(self, chat_id, artifacts, text=''):
+        from .telegram_native import OP_NATIVE_MEDIA
+        from .web_media import build_media_presentation
+        from .reply_presentation import remember_reply_messages
+        mid = _allocate_web_message_id()
+        view = build_media_presentation(text, artifacts)
+        descriptors = []
+        for item in view['media']:
+            token = MEDIA_TOKEN_REGISTRY.register(item['path'], item['filename'])
+            descriptors.append({**item, 'download_url': '/api/media/'+token})
+        await emit_ui_frame(self.outbox, self.chat_id, 'message', source=self._ui_source, message_id=mid,
+            text=view['text'], media=descriptors, media_group_id=view['media_group_id'])
+        from .presentation import current_turn
+        record_id = current_turn().last_record_id if current_turn() else None
+        self._offer(OP_NATIVE_MEDIA, logical_id=mid, chat_id=chat_id,
+            payload={'artifacts': list(artifacts), 'text': view['text'], 'kwargs': {},
+                     'telegram_native': {'phase': 'media', 'owner_id': mid, 'record_id': record_id}})
+        message = WebMessage(self, mid, chat_id, view['text'])
+        remember_reply_messages([message])
+        return message
 
     async def get_file(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError("Web 端不支持下载 Telegram 文件")

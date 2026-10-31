@@ -644,6 +644,16 @@ async def run_app() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        manager = get_conversations()
+        for run in list(manager._runs.values()):
+            if run.scope.run_id:
+                await manager.request_stop(run.scope.run_id, run.scope.conversation_id)
+        with contextlib.suppress(Exception):
+            await get_text_queue().close()
+        with contextlib.suppress(Exception):
+            await manager.close()
+        with contextlib.suppress(Exception):
+            await telegram_channel().wait_idle(timeout=2)
         if tg_task is not None:
             tg_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):

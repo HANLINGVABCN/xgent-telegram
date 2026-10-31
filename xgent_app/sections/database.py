@@ -1006,6 +1006,30 @@ class BotMemoryDB(ConversationStore):
             ''', (json.dumps(metadata, ensure_ascii=False), row_id, previous, self._conversation_id(), await self._context_start(conn)))
             return cursor.rowcount == 1
 
+    async def patch_display_metadata(self, row_id, changes):
+        """Merge display fields atomically without replacing attachment/model fields."""
+        async with self._write() as conn:
+            await self._validate_conversation_write(conn)
+            cursor = await conn.execute('SELECT metadata FROM global_messages WHERE id=? AND session_id=? '
+                'AND withdrawn=0 AND id>=?', (row_id, self._conversation_id(), await self._context_start(conn)))
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                return False
+            value = json.loads(row['metadata'] or '{}')
+            old_instance = value.get('telegram_logical_instance')
+            for key, item in changes.items():
+                if key == 'telegram_logical_ids' and old_instance == changes.get('telegram_logical_instance'):
+                    item = list(dict.fromkeys([*value.get(key, []), *item]))
+                elif key == 'telegram_delivery':
+                    previous = value.get(key) or {}
+                    if previous.get('bot_id') == item.get('bot_id'):
+                        item = {**item, 'ids': list(dict.fromkeys([*previous.get('ids', []), *item.get('ids', [])]))}
+                value[key] = item
+            await conn.execute('UPDATE global_messages SET metadata=? WHERE id=?',
+                               (json.dumps(value, ensure_ascii=False), row_id))
+            return True
+
     async def get_display_history(self, limit: int = 50) -> List[Dict]:
         """供 web 前端显示用的历史。与 get_conversation_messages（给模型上下文）解耦：
 

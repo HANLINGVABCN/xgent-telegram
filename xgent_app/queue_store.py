@@ -8,6 +8,12 @@ import uuid
 from .conversations import ConversationChanged, ConversationError, current_scope
 
 WAITING = ('pending', 'paused', 'invalid')
+
+
+class QueueConflict(ConversationChanged):
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
 REASONS = {
     'waiting': '等待当前任务的安全接入点', 'stopped': '已停止，等待手动继续',
     'failed': '上一轮异常结束，待发消息已保留', 'restart': '来源进程已退出，等待手动继续',
@@ -171,15 +177,15 @@ class QueueStore:
             await self._queue_sync(conn)
             item = await one(conn, 'SELECT * FROM message_queue WHERE id=? AND conversation_id=?', (identifier, cid))
             if not item or item['generation'] != generation:
-                raise ConversationChanged('排队消息已失效。')
+                raise QueueConflict('排队消息已失效。', 'unavailable')
             if item['status'] == 'edited' and action == 'edit' and request_id and item['edit_request_id'] == request_id:
                 return item  # A lost HTTP response must not lose the recovered text.
             if item['status'] == 'cancelled' and action == 'cancel':
                 return item
             if item['status'] not in WAITING:
-                raise ConversationChanged('消息已接入本轮，无法撤回。')
+                raise QueueConflict('消息已接入当前回合，无法取消排队。', 'already_started')
             if item['revision'] != revision:
-                raise ConversationChanged('队列已更新，请在当前消息上重试。')
+                raise QueueConflict('队列已更新，请在当前消息上重试。', 'stale_revision')
             await conn.execute('UPDATE message_queue SET status=?,reason=?,revision=revision+1,updated_at=?,edit_request_id=? WHERE id=?',
                                ('edited' if action == 'edit' else 'cancelled', '', time.time(), request_id, identifier))
             await bump(conn)
@@ -272,6 +278,8 @@ class QueueStore:
                 metadata = {'queue_id': item['id'], 'queue_origin': item['origin'], 'queue_created_at': item['created_at'],
                             'queue_run_id': scope.run_id, 'src': 'message-queue'}
                 if item['origin'] == 'telegram':
+                    from .telegram_records import source_bot_id
+                    metadata['telegram_source_bot_id'] = scope.telegram_bot_id or source_bot_id()
                     parts = str(item.get('request_key') or '').split(':')
                     if len(parts) == 3 and parts[0] == 'telegram' and parts[1].isdigit() and parts[2].isdigit():
                         metadata['source_message_id'] = int(parts[2])

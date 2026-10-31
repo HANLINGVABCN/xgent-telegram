@@ -126,6 +126,14 @@ async def _dispatch_ask_callback_inner(update: Any, context: Any, data: str) -> 
         with contextlib.suppress(Exception):
             await query.answer("已切换")
     elif action in ("asko", "askk"):  # 自定义文本 / 密钥：进状态机，等用户下一条消息
+        if (action == 'askk' and question.qtype != 'secret') or (action == 'asko' and not question.allows_custom):
+            await query.answer('此字段不能这样录入。', show_alert=True)
+            return
+        from xgent_app.ask_presentation import cleanup_input
+        for notices in pending.input_notices.values():
+            for actor, mid in notices:
+                await cleanup_input(actor, pending.chat_id, [mid])
+        pending.input_notices.clear()
         state = BotState.ASK_SECRET_INPUT if action == "askk" else BotState.ASK_FIELD_INPUT
         UserDataManager.set("state", state)
         UserDataManager.set("ask_input_target", {"ask_id": ask_id, "qid": qid})
@@ -138,10 +146,11 @@ async def _dispatch_ask_callback_inner(update: Any, context: Any, data: str) -> 
             # 客户端把「回复某条消息」的草稿粘在输入框上——用户若没回而是点了别的按钮，
             # 这条草稿就一直挂着，每次进聊天都弹，故去掉。
             from xgent_app.ask_presentation import send_ask_input_notice
-            await send_ask_input_notice(query.message,
+            notice = await send_ask_input_notice(query.message,
                 f"请填写：{question.prompt}{hint}\n（直接发一条消息即可；发 cancel 取消录入）",
                 form_id=ask_id, field_id=qid,
             )
+            pending.input_notices.setdefault(qid, []).append((context.bot, getattr(notice, 'message_id', None)))
         return  # 不重画键盘，等用户把内容发进来再重画
 
     # 选项类：原地重画键盘反映最新草稿（Telegram 可靠；其它端草稿已存服务端，提交照样对）。

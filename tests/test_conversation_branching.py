@@ -211,6 +211,20 @@ class ConversationBranchingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(preview['can_withdraw'])
         self.assertIn('待发消息', preview['reason'])
 
+    async def test_withdraw_collects_reply_parts_media_and_footer_ids(self):
+        from xgent_app.telegram_records import INSTANCE
+        scope = await self.manager.resolve()
+        async with self.manager.operation(scope, execution=True):
+            user = await self.db.record_global_message(1, 1, 'user_text', 'user', '问题',
+                metadata={'source_message_id': 41})
+            await self.db.record_global_message(1, 0, 'ai_reply', 'assistant', '回复',
+                metadata={'telegram_logical_instance': INSTANCE, 'telegram_native_parts': {'ids': [42, 43]},
+                          'telegram_reply': {'message_ids': [100001, 100002]},
+                          'telegram_delivery': {'ids': [44]}, 'telegram_logical_ids': [100003]})
+        _, result = await self._withdraw(user, 'withdraw-all-parts')
+        self.assertEqual([41, 42, 43, 44], result['telegram_native_message_ids'])
+        self.assertEqual([100001, 100002, 100003], result['telegram_logical_message_ids'])
+
     async def test_stale_preview_is_rejected(self):
         scope = await self.manager.resolve()
         async with self.manager.operation(scope, execution=True):

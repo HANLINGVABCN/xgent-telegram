@@ -196,7 +196,7 @@ def runtime_code_version() -> str:
             with open(stamped_path, encoding="utf-8") as handle:
                 stamped = handle.read().strip()
             if stamped:
-                return stamped[:10]
+                return stamped
     except Exception:
         pass
     return "dev"
@@ -672,21 +672,29 @@ _TRACE_QUEUE: "queue.Queue[Optional[str]]" = queue.Queue(maxsize=2000)
 _TRACE_WRITER_THREAD: Optional[threading.Thread] = None
 _TRACE_WRITER_LOCK = threading.Lock()
 _TRACE_DROPPED = 0
+_TRACE_BYTES = 0
+_TRACE_BYTE_LOCK = threading.Lock()
+_TRACE_MAX_BYTES = 8 * 1024 * 1024
 
 
 def _trace_writer_loop():
     """后台线程：串行地把 trace 行落盘。"""
+    handler = RotatingFileHandler(FULL_TRACE_LOG_FILE, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
+    handler.setFormatter(logging.Formatter('%(message)s'))
     while True:
         line = _TRACE_QUEUE.get()
         try:
             if line is None:
                 return
             with FULL_TRACE_LOCK:
-                with open(FULL_TRACE_LOG_FILE, "a", encoding="utf-8") as f:
-                    f.write(line + "\n")
+                handler.emit(logging.LogRecord('model-trace', logging.INFO, '', 0, line, (), None))
         except Exception as e:
             logger.debug(f"模型全量日志写入失败: {e}")
         finally:
+            if line is not None:
+                global _TRACE_BYTES
+                with _TRACE_BYTE_LOCK:
+                    _TRACE_BYTES -= len(line.encode('utf-8'))
             _TRACE_QUEUE.task_done()
 
 
@@ -713,12 +721,13 @@ def write_model_trace(event: str, payload: Dict[str, Any]):
     而 FULL_TRACE_LOCK 是 threading.Lock——直接在事件循环里持锁写文件会把
     整个 bot 卡住。队列满时丢弃并计数，日志不能反过来拖垮主流程。
     """
-    global _TRACE_DROPPED
+    global _TRACE_DROPPED, _TRACE_BYTES
     try:
+        from xgent_app.trace_payload import summarize
         record = {
             "ts": datetime.now().isoformat(timespec="milliseconds"),
             "event": event,
-            **trace_json_safe(payload),
+            **summarize(trace_json_safe(payload)),
         }
         line = json.dumps(record, ensure_ascii=False, default=repr)
         # 落盘前脱敏：trace 里包含完整 prompt 和响应体，provider 的 api_key
@@ -726,7 +735,12 @@ def write_model_trace(event: str, payload: Dict[str, Any]):
         line = redact_sensitive_text(line)
         _ensure_trace_writer()
         try:
-            _TRACE_QUEUE.put_nowait(line)
+            size = len(line.encode('utf-8'))
+            with _TRACE_BYTE_LOCK:
+                if size > _TRACE_MAX_BYTES - _TRACE_BYTES:
+                    raise queue.Full
+                _TRACE_QUEUE.put_nowait(line)
+                _TRACE_BYTES += size
         except queue.Full:
             _TRACE_DROPPED += 1
             if _TRACE_DROPPED % 100 == 1:

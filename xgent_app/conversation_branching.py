@@ -1308,22 +1308,58 @@ class ConversationBranchService:
         if ids:
             placeholders = ','.join('?' for _ in ids)
             cursor = await conn.execute(
-                f'SELECT metadata FROM global_messages WHERE session_id=? AND withdrawn=0 AND (id>=? OR turn_id IN ({placeholders}))',
+                f'SELECT metadata,msg_type FROM global_messages WHERE session_id=? AND withdrawn=0 AND (id>=? OR turn_id IN ({placeholders}))',
                 (conversation_id, record_id, *ids),
             )
         else:
             cursor = await conn.execute(
-                'SELECT metadata FROM global_messages WHERE session_id=? AND withdrawn=0 AND id>=?',
+                'SELECT metadata,msg_type FROM global_messages WHERE session_id=? AND withdrawn=0 AND id>=?',
                 (conversation_id, record_id),
             )
         native_ids, logical_ids = set(), set()
+        from .web_history import _section_ns
+        from .telegram_records import _bot_id, source_bot_id
+        namespace = _section_ns() or {}
+        expected_bot = _bot_id(namespace.get('_web_real_bot')) or source_bot_id()
+        invalid_delivery = False
+        missing_delivery = False
         for row in await cursor.fetchall():
             metadata = _metadata(row['metadata'])
+            previous_targets = len(native_ids) + len(logical_ids)
             if type(metadata.get('source_message_id')) is int:
-                native_ids.add(metadata['source_message_id'])
+                if expected_bot is None or metadata.get('telegram_source_bot_id') == expected_bot:
+                    native_ids.add(metadata['source_message_id'])
+                else:
+                    missing_delivery = True
+            for key in ('telegram_delivery', 'telegram_native_parts'):
+                delivery = metadata.get(key) or {}
+                if isinstance(delivery, dict) and expected_bot is not None and delivery.get('bot_id') not in {None, expected_bot}:
+                    invalid_delivery = True
+                    continue
+                if isinstance(delivery, dict):
+                    native_ids.update(mid for mid in delivery.get('ids', []) if type(mid) is int and mid > 0)
+            from .telegram_records import INSTANCE
+            if metadata.get('telegram_logical_instance') == INSTANCE:
+                logical_ids.update(mid for mid in metadata.get('telegram_logical_ids', []) if type(mid) is int)
+            reply = metadata.get('telegram_reply') or {}
+            if isinstance(reply, dict) and metadata.get('telegram_logical_instance') == INSTANCE:
+                logical_ids.update(mid for mid in reply.get('message_ids', []) if type(mid) is int)
+            for attachment in metadata.get('attachments', []):
+                if isinstance(attachment, dict) and type(attachment.get('source_message_id')) is int:
+                    if expected_bot is None or metadata.get('telegram_source_bot_id') == expected_bot:
+                        native_ids.add(attachment['source_message_id'])
+                    else:
+                        missing_delivery = True
             live = metadata.get('web_live')
-            if isinstance(live, dict):
+            from .web_history import _section_ns
+            namespace = _section_ns() or {}
+            outbox = namespace.get('get_web_outbox', lambda: None)()
+            if isinstance(live, dict) and outbox and live.get('epoch') == outbox.snapshot()['epoch']:
                 logical_ids.update(mid for mid in live.get('message_ids', []) if type(mid) is int)
+            if (getattr(namespace.get('BotConfig'), 'TOKEN', '') and row['msg_type'] in {'ai_reply','media_reply','agent_result','agent_status'}
+                    and metadata.get('telegram_route_enabled') is not False
+                    and len(native_ids) + len(logical_ids) == previous_targets):
+                missing_delivery = True
         await cursor.close()
         async with self.db._transaction() as conn:
             await conn.execute('UPDATE global_messages SET withdrawn=1 WHERE session_id=? AND id>=?',
@@ -1350,6 +1386,7 @@ class ConversationBranchService:
                     'restored_files': 0, 'conversation_id': conversation_id,
                     'draft': {'text': record['content']},
                     'warnings': preview['warnings'],
+                    'telegram_sync_warning': '部分电报关联属于其他Bot，未删除对应消息。' if invalid_delivery else ('部分旧记录没有可靠的电报消息关联，电报里可能有残留。' if missing_delivery else None),
                     'telegram_native_message_ids': sorted(native_ids),
                     'telegram_logical_message_ids': sorted(logical_ids)}
         await self._save_request(data.get('request_id'), 'withdraw', conversation_id, response)

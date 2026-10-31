@@ -695,7 +695,7 @@ async def check_generated_clear_races(bot, root):
 
                 async def think(*args, **kwargs):
                     response = await original_think(*args, **kwargs)
-                    if response[0] and "data:image/" in response[0] and phase == "generation":
+                    if response[0] and (getattr(response[0], "media", None) or "data:image/" in response[0]) and phase == "generation":
                         await clear_once()
                     return response
 

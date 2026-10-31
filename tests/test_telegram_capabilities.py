@@ -1,10 +1,8 @@
 import asyncio
-import tempfile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from telegram import InlineKeyboardButton,InlineKeyboardMarkup,CopyTextButton,LoginUrl
-from tests.test_thinking_params import run_in_app
 from xgent_app.web_bridge import _markup_to_frame,markup_from_frame,deliver_op_to_bot
 from xgent_app.rich_input import block,text,media
 from xgent_app.fanout import Op,OP_DOCUMENT
@@ -35,10 +33,3 @@ def test_playable_media_delivery_uses_own_native_method_and_keeps_logical_identi
         assert await deliver_op_to_bot(native,op,None)==7
         native.send_video.assert_awaited_once();native.send_document.assert_not_called()
     asyncio.run(main())
-
-
-def test_scoped_read_settings_download_and_user_requested_share():
-    with tempfile.TemporaryDirectory() as root:
-        result=run_in_app('import asyncio\nfrom tests.miniapp_probe import capability_pages\n'
-                          +f'print(json.dumps(asyncio.run(capability_pages(bot,{root!r}))))')
-    assert all(result.values()),result

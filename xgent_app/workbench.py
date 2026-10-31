@@ -114,18 +114,16 @@ class Workbench:
         from xgent_app.interaction import interaction
         try:
             with interaction('web', 'management'):
-                async with conversation_operation(cid, expected=method != 'GET' and not navigation and not version_operation and resource not in {'mini-ask','mini-resource'}, allow_archived=method=='GET' and (version_operation or resource in {'mini-resource','history','search','artifacts/preview','artifacts/cover'}), fresh=True, selector='shared'):
+                async with conversation_operation(cid, expected=method != 'GET' and not navigation and not version_operation and resource != 'ask', allow_archived=method=='GET' and (version_operation or resource in {'history','search','artifacts/preview','artifacts/cover'}), fresh=True, selector='shared'):
                     return await self._handle_scoped(method, resource, data)
         except ConversationError as exc:
             raise WorkbenchError(str(exc), exc.status) from exc
 
     async def _handle_scoped(self, method, resource, data):
         await self.db()
-        if resource=='mini-resource':
-            return await self.mini_resource(method,data)
-        if resource in {'ask','mini-ask'}:
+        if resource == 'ask':
             from .web_ask import handle_ask
-            return await handle_ask(self.ns,method,data,self.background,idempotent=resource=='mini-ask')
+            return await handle_ask(self.ns,method,data,self.background,idempotent=True)
         if resource.startswith('data/'):
             if self._data_operations is None:
                 self._data_operations = DataOperations(self.ns)
@@ -252,7 +250,7 @@ class Workbench:
                     deleter = self.ns.get('_delete_withdrawn_telegram')
                     if callable(deleter):
                         self.background(deleter(result.get('telegram_native_message_ids', []),
-                                                result.get('telegram_logical_message_ids', [])))
+                                                result.get('telegram_logical_message_ids', []), data.get('request_id')))
                     await get_conversations().poll_once()
                     return result
                 raise WorkbenchError('对话分支接口不存在', 404)
@@ -900,80 +898,6 @@ class Workbench:
             if not math.isfinite(number) or number < 0 or int(number) != number:
                 raise WorkbenchError('请输入非负整数')
         return await self.ns['_web_write_setting'](key, value)
-
-    async def mini_resource(self,method,data):
-        from .message_policy import record_policy
-        resource=data.get('resource')
-        scope=current_scope()
-        if resource=='read' and method=='GET':
-            record=await (await self.db()).get_display_message(int(data.get('record_id') or 0))
-            if not record or record_policy(record).purpose not in {'chat','media','tool_result','status'}:
-                raise WorkbenchError('这条消息不存在或不能在阅读页展示',404)
-            return {'id':record['id'],'text':record['content'],'title':scope.name,'timestamp':record['timestamp'],
-                    'generation':scope.generation,'conversation_id':scope.conversation_id}
-        if resource=='share' and method=='POST':
-            from .telegram_rich import render_rich
-            record=await self.mini_resource('GET',{**data,'resource':'read'})
-            chunks=render_rich(record['text'])
-            if len(chunks)>1:raise WorkbenchError('内容超过一次分享长度，请复制全文或下载',400)
-            bot=self.ns.get('_web_real_bot')
-            if bot is None:raise WorkbenchError('Telegram 尚未连接',503)
-            result={'type':'article','id':'message-'+str(record['id']),'title':record['title'] or 'XGent 回复',
-                    'input_message_content':{'rich_message':{'html':chunks[0]}}}
-            prepared=await bot._post('savePreparedInlineMessage',{'user_id':self.ns['BotConfig'].AUTHORIZED_USER_ID,
-                'result':result,'allow_user_chats':True,'allow_group_chats':True,'allow_channel_chats':True})
-            return {'id':prepared['id']}
-        if resource=='settings' and method=='GET':
-            settings=await self.ns['_web_read_settings']()
-            providers=await self.providers({})
-            settings['values']['telegram_reactions']=self.ns['UserDataManager'].get('telegram_reactions',False)
-            return {'settings':settings,'providers':providers,'generation':scope.generation,'conversation_id':scope.conversation_id}
-        if resource=='settings' and method=='POST':
-            if data.get('key')=='telegram_reactions':
-                if type(data.get('value')) is not bool:raise WorkbenchError('开关必须是布尔值')
-                await (await self.db()).set_config('telegram_reactions',data['value'])
-                self.ns['UserDataManager'].set('telegram_reactions',data['value'])
-                return {'ok':True}
-            if data.get('action')=='select_model':return await self.select_model(data)
-            if data.get('action')=='save_provider':return await self.save_provider(data)
-            if data.get('action')=='fetch_models':return await self.fetch_models(data)
-            allowed={'agent_mode','response_mode','thinking_level','global_depth','agent_max_iterations',
-                     'agent_command_timeout','stream_timeout','telegram_reactions'}
-            if data.get('key') not in allowed:raise WorkbenchError('此页面不支持这项设置',403)
-            return await self.settings(data)
-        if resource=='tasks':
-            if method=='GET':
-                result=await self.tasks({**data,'source_conversation_id':scope.conversation_id})
-                return {**result,'generation':scope.generation,'conversation_id':scope.conversation_id}
-            if data.get('action')=='cancel':
-                for identifier in data.get('ids') or []:
-                    task=await (await self.db()).get_trigger_task(str(identifier))
-                    if not task or task['conversation_id']!=scope.conversation_id:
-                        raise WorkbenchError('任务不属于此页面',403)
-                return await self.cancel_tasks({**data,'source_conversation_id':scope.conversation_id})
-            raise WorkbenchError('未知任务操作',400)
-        if resource=='files' and method=='GET':
-            result=await self.artifacts({**data,'source_conversation_id':scope.conversation_id})
-            return {**result,'generation':scope.generation,'conversation_id':scope.conversation_id}
-        if resource=='download' and method=='GET':
-            from .data_operations import BackupDownload
-            kind=data.get('kind','files')
-            if kind=='backup':
-                if self._data_operations is None:self._data_operations=DataOperations(self.ns)
-                return self._data_operations.download_backup(data['id'])
-            if kind=='outputs':
-                root=Path(self.ns['COMMAND_OUTPUT_DIR']).resolve();relative=Path(str(data.get('id') or ''))
-                if relative.is_absolute() or '..' in relative.parts or not relative.parts:raise WorkbenchError('输出标识无效',404)
-                path=(root/relative).resolve()
-                if not path.is_relative_to(root) or path.suffix!='.txt' or path.is_symlink():raise WorkbenchError('输出标识无效',404)
-                conn=await (await self.db())._get_conn();owners=await resource_owners(conn)
-                refs=await output_sources(conn,root,owners)
-                if (refs.get(relative.as_posix(),{}).get('source') or {}).get('conversation_id')!=scope.conversation_id:
-                    raise WorkbenchError('输出不属于当前页面',403)
-                return BackupDownload(path)
-            item=await self._artifact_item(data)
-            return BackupDownload(Path(item['path']))
-        raise WorkbenchError('此页面不支持该操作',403)
 
     async def blacklist(self, data):
         manager=self.ns['AgentCommandBlacklist']

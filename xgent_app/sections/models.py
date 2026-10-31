@@ -11,6 +11,9 @@ from xgent_app.context_limits import (
 from xgent_app.compression import FrozenConversation
 from xgent_app.media_inputs import MediaInputError, native_binary_kind, redact_media_data
 
+from xgent_app.media_response import separate as separate_media, reply as provider_reply
+from xgent_app.thinking_display import capture_stream, capture_complete, observe as observe_thinking
+
 class ModelClient:
     _VALID_ROLES = {'user', 'assistant', 'system'}
     _http_client: Optional[Any] = None
@@ -95,6 +98,8 @@ class ModelClient:
 
     @staticmethod
     def _raise_conversation_request_error(history: list, error: Any) -> None:
+        from xgent_app.thinking_display import mark_failed
+        mark_failed()
         if isinstance(history, ConversationRequest):
             detail = error if isinstance(error, str) else json.dumps(error, ensure_ascii=False)
             if getattr(history, 'explicit_media', False):
@@ -408,6 +413,8 @@ class ModelClient:
 
     @staticmethod
     def _extract_gemini_text_response(data: Dict[str, Any]) -> Optional[str]:
+        observe_thinking(data, 'gemini')
+        data = separate_media(data, 'gemini')
         candidates = data.get('candidates', [])
         if not candidates:
             return None
@@ -421,10 +428,11 @@ class ModelClient:
                 text_parts.append(text)
 
         full_text = '\n'.join(text_parts).strip()
-        return full_text or None
+        return provider_reply(full_text) or None
 
     @staticmethod
     def _extract_claude_text_response(data: Dict[str, Any]) -> Optional[str]:
+        observe_thinking(data, 'claude')
         text_parts = []
         for block in data.get('content', []):
             if not isinstance(block, dict):
@@ -607,6 +615,8 @@ class ModelClient:
 
     @staticmethod
     def _extract_openai_compatible_text(data: Dict[str, Any], *, stream: bool = False) -> str:
+        observe_thinking(data)
+        data = separate_media(data)
         texts: List[str] = []
         media_urls: List[str] = []
         structured_media = False
@@ -654,7 +664,7 @@ class ModelClient:
             combined_text = f"{combined_text}\n{media_text}" if combined_text else media_text
         if stream and (media_urls or structured_media):
             return f"\n{combined_text}\n"
-        return combined_text
+        return provider_reply(combined_text)
 
     @staticmethod
     def _openai_sdk_message_text(message: Any, *, stream: bool = False) -> str:
@@ -705,7 +715,7 @@ class ModelClient:
                 texts.append(chunk_text)
         if getattr(history, 'require_complete', False) and not finished:
             raise AttachmentContextError('压缩响应中途结束，原文归档保留，可手动重试。')
-        return "".join(texts)
+        return provider_reply("".join(texts))
 
     @staticmethod
     async def _fetch_openai_compatible_models(api_key: str, base_url: str) -> Tuple[list, Optional[str]]:
@@ -885,7 +895,8 @@ class ModelClient:
                     "usage": usage_sink[0] if usage_sink else None,
                 })
                 return text, None
-            error = json.dumps(data, ensure_ascii=False)[:2000] or "对方暂时没反应，用户稍后再试试？"
+            reasons = [str(choice.get('finish_reason') or '') for choice in data.get('choices', [])]
+            error = '上游模型拒绝生成，本次没有生成正文或图片。' if 'prohibited_content' in reasons else '模型没有返回可用正文或图片。'
             ModelClient._raise_conversation_request_error(history, error)
             return None, error
         except AttachmentContextError:
@@ -997,6 +1008,8 @@ class ModelClient:
                             if text:
                                 yielded_any_text = True
                                 yield text
+                            elif any((c.get('delta') or {}).get('reasoning_content') or (c.get('delta') or {}).get('reasoning') or (c.get('delta') or {}).get('reasoning_details') for c in data.get('choices', [])):
+                                yield ''
                     # 流正常跑完，不要进入第二轮重试。
                     break
 
@@ -1464,6 +1477,7 @@ class ModelClient:
         ]
 
     @staticmethod
+    @capture_stream
     async def think_and_reply_stream(prov_name: str, api_key: str, base_url: str,
                                       model: str, system_prompt: str, history: list,
                                       max_tokens: Optional[int] = None, api_format: str = 'openai',
@@ -1562,6 +1576,8 @@ class ModelClient:
                         if chunk_text:
                             yielded_any_text = True
                             yield chunk_text
+                        elif (_value_from_obj(chunk.choices[0].delta, 'reasoning_content') or _value_from_obj(chunk.choices[0].delta, 'reasoning_details')):
+                            yield ''
             ModelClient._check_compression_stream_end(history, finished)
             if not yielded_any_text:
                 ModelClient._raise_conversation_request_error(history, "模型未返回有效内容。")
@@ -1691,8 +1707,15 @@ class ModelClient:
 
                         if data.get("error"):
                             ModelClient._raise_conversation_request_error(history, data["error"])
+                        thought_event = observe_thinking(data, 'gemini')
+                        if thought_event:
+                            yield ''
                         record_token_usage(usage_sink, data.get('usageMetadata'))
 
+                        data = separate_media(data, 'gemini')
+                        from xgent_app.media_response import current_media
+                        if current_media.get() and current_media.get().parts:
+                            yield ''
                         candidates = data.get('candidates', [])
                         if candidates:
                             reason = candidates[0].get('finishReason')
@@ -1719,7 +1742,8 @@ class ModelClient:
                 # 流正常跑完，不要进入第二轮重试。
                 break
             ModelClient._check_compression_stream_end(history, finished)
-            if not text_event_count:
+            from xgent_app.media_response import current_media
+            if not text_event_count and not (current_media.get() and current_media.get().parts):
                 ModelClient._raise_conversation_request_error(history, "Gemini 未返回有效内容。")
         except AttachmentContextError:
             raise
@@ -1843,6 +1867,8 @@ class ModelClient:
 
                         if data.get("error"):
                             ModelClient._raise_conversation_request_error(history, data["error"])
+                        if observe_thinking(data, 'claude'):
+                            yield ''
                         if data.get('type') == 'message_start':
                             message = data.get('message') or {}
                             record_token_usage(usage_sink, message.get('usage'))
@@ -1889,6 +1915,7 @@ class ModelClient:
             yield f"Claude 连接失败: {str(e)[:150]}"
 
     @staticmethod
+    @capture_complete
     async def think_and_reply(prov_name: str, api_key: str, base_url: str,
                               model: str, system_prompt: str, history: list,
                               max_tokens: Optional[int] = None,

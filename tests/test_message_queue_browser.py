@@ -18,6 +18,9 @@ def queue_browser(full_output_server):
         if action == 'list':
             return {'conversation_id': cid, 'generation': 7, 'revision': state['revision'],
                     'items': copy.deepcopy(state['items'][cid]), 'paused': False, 'reason': ''}
+        if action == 'status':
+            result=state['actions'].get(data.get('request_id'))
+            return {'state':'recovered','item':result} if result else {'state':'already_started'}
         item = next((i for i in state['items'][cid] if i['id'] == data['id']), None)
         key = data.get('request_id')
         if key in state['actions']:
@@ -161,6 +164,37 @@ def test_queue_api_auth_origin_validation_and_refresh(queue_browser):
     assert context.request.get(base + '/api/queue?conversation_id=A').status == 401
 
 
+def test_cancel_after_claim_clears_failure_and_refresh_residue(queue_browser):
+    _, page, _, base, state = queue_browser
+    ready(page, base)
+    enqueue(page, 'already claimed')
+    page.locator('.queue-item').wait_for()
+    state['items']['A'].clear()
+    page.locator('.queue-item').get_by_role('button', name='❌ 取消', exact=True).click()
+    page.wait_for_function('document.querySelector("#message-queue").hidden')
+    assert page.evaluate('JSON.parse(sessionStorage.getItem("xgent_queue_edits"))') == []
+    page.reload()
+    page.wait_for_function('!document.querySelector("#btn-send").disabled')
+    assert page.locator('#message-queue').is_hidden()
+
+
+def test_thinking_preview_closes_after_completion_and_is_plain_text(queue_browser):
+    server, page, _, base, _ = queue_browser
+    ready(page, base)
+    frame = {'conversation_id': 'A', 'run_id': 'thinking-test', 'ui_generation': 7, 'message_id': 99991}
+    server.outbox.put({**frame, 'type':'message', 'text':'回答正文', 'msg_type':'ai_reply'})
+    server.outbox.put({**frame, 'type':'thinking_state', 'thinking':{'version':1,'capture_id':'one',
+        'text':'第一行\n最新的一行','status':'running','elapsed_seconds':2,'revision':1}})
+    page.locator('.thinking-preview').filter(has_text='最新的一行').wait_for()
+    server.outbox.put({**frame, 'type':'thinking_state', 'thinking':{'version':1,'capture_id':'one',
+        'text':'第一行\n最新的一行\n```run-x\nnever execute\n```','status':'completed','elapsed_seconds':3,'revision':2}})
+    page.wait_for_function('document.querySelector(".thinking-preview").textContent===""')
+    assert page.locator('.thinking-body').is_hidden()
+    page.locator('.thinking-head').click()
+    assert 'never execute' in page.locator('.thinking-body').inner_text()
+    assert not page.locator('.thinking-body button').count()
+
+
 @pytest.mark.parametrize('action,label', [('edit','编辑'),('cancel','❌ 取消')])
 def test_lost_recovery_response_remains_recoverable_after_refresh_without_duplicate_draft(queue_browser, action, label):
     server, page, _, base, state = queue_browser
@@ -179,11 +213,9 @@ def test_lost_recovery_response_remains_recoverable_after_refresh_without_duplic
     page.locator('.queue-item').get_by_role('button', name=label, exact=True).click()
     page.wait_for_timeout(100)
     server.outbox.put({'type': 'queue_state', 'revision': state['revision']})
-    page.get_by_role('button', name='重试取回', exact=True).wait_for()
     page.reload()
-    page.get_by_role('button', name='重试取回', exact=True).click()
     page.wait_for_function('document.querySelector("#input").value==="must recover exact text\\n\\nkeep draft"')
-    assert requests[0]['request_id'] == requests[1]['request_id']
+    assert state['actions'][requests[0]['request_id']]['text']=='must recover exact text'
     page.reload()
     page.wait_for_function('!document.querySelector("#btn-send").disabled')
     assert page.locator('#input').input_value() == 'must recover exact text\n\nkeep draft'

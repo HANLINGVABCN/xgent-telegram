@@ -1248,58 +1248,15 @@ class AgentExecutor:
             msg = f"正则编译失败: {str(e)[:150]}"
             return {'success': False, 'error': msg, 'output': msg}
 
-        # 收集目标文件列表
-        if os.path.isfile(search_path):
-            files = [search_path]
-        else:
-            files = []
-            for root, dirs, fnames in os.walk(search_path):
-                # 跳过常见噪声目录
-                dirs[:] = [d for d in dirs if d not in cls.GREP_SKIP_DIRS]
-                for fn in fnames:
-                    if glob_pat and not fnmatch.fnmatch(fn, glob_pat):
-                        continue
-                    files.append(os.path.join(root, fn))
-                if len(files) > cls.GREP_MAX_FILES:
-                    msg = (
-                        f"命中文件过多（>{cls.GREP_MAX_FILES}），请缩小 path 或加 glob 过滤。"
-                    )
-                    return {'success': False, 'error': msg, 'output': msg}
-
-        results: List[Dict[str, Any]] = []
-        total_hits = 0
-        truncated = False
-        loop = asyncio.get_running_loop()
-
-        def _scan():
-            nonlocal total_hits, truncated
-            for fpath in files:
-                if truncated:
-                    break
-                try:
-                    with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
-                        all_lines = f.readlines()
-                except (OSError, UnicodeDecodeError):
-                    continue
-                # 统一去行尾换行用于匹配，但展示保留原样
-                stripped = [l.rstrip('\n').rstrip('\r') for l in all_lines]
-                for ln, line in enumerate(stripped, start=1):
-                    if matcher(line):
-                        if total_hits >= max_hits:
-                            truncated = True
-                            break
-                        ctx_before = stripped[max(0, ln - 1 - context_n): ln - 1]
-                        ctx_after = stripped[ln: ln + context_n]
-                        results.append({
-                            'path': fpath,
-                            'line': ln,
-                            'match': line[:500],
-                            'before': list(enumerate(ctx_before, start=max(1, ln - context_n))),
-                            'after': list(enumerate(ctx_after, start=ln + 1)),
-                        })
-                        total_hits += 1
-
-        await loop.run_in_executor(None, _scan)
+        from xgent_app.file_scan import run as scan_files
+        try:
+            scanned = await scan_files({**opts, 'kind': 'grep', 'path': search_path},
+                                       get_or_create_stop_event(), cls.TIMEOUT)
+        except ValueError as exc:
+            return {'success': False, 'error': str(exc), 'output': str(exc)}
+        results = scanned['results']
+        total_hits = len(results)
+        truncated = scanned['truncated']
 
         display_path = to_display_path(search_path)
         mode = 'regex' if regex else 'literal'
@@ -1408,22 +1365,22 @@ class AgentExecutor:
         basename = os.path.basename(target_path) or 'unnamed_file'
         display_path = to_display_path(target_path)
 
-        if not cls.is_text_file(target_path, mime_type):
-            # 非文本走原 read_path_for_model 逻辑（图片/二进制等）
+        text_file = cls.is_text_file(target_path, mime_type)
+        if not text_file and file_size <= cls.TEXT_INLINE_MAX_BYTES:
+            with open(target_path, 'rb') as handle:
+                sample = handle.read(4096)
+            try:
+                decoded = sample.decode('utf-8')
+                text_file = b'\0' not in sample and all(char.isprintable() or char in '\n\r\t' for char in decoded)
+            except UnicodeDecodeError:
+                pass
+        if not text_file:
             return await cls.read_path_for_model(path_part, api_format=api_format)
-
-        def _read_full() -> str:
-            with open(target_path, 'r', encoding='utf-8', errors='replace') as f:
-                return f.read()
-
-        loop = asyncio.get_running_loop()
-        full_text = await loop.run_in_executor(None, _read_full)
-        all_lines = full_text.split('\n')
-        total_lines = len(all_lines)
-
-        start, end = cls._resolve_range(range_part, total_lines)
-        # 区间读取不校验总大小（只取片段）；全量读取仍校验
-        sliced = all_lines[start - 1:end]
+        from xgent_app.file_scan import run as scan_files
+        scanned = await scan_files({'kind': 'read', 'path': target_path, 'range': range_part},
+                                   get_or_create_stop_event(), cls.TIMEOUT)
+        total_lines, start, end = scanned['total'], scanned['start'], scanned['end']
+        sliced = scanned['lines']
         # 行号格式：6位右对齐 + tab + 内容（cat -n 风格，和 grep 输出对齐）
         numbered = []
         for offset, text in enumerate(sliced):

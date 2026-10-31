@@ -1,5 +1,4 @@
 import {syncAskForm} from './ask-form.js';
-import {installTelegramHost} from './telegram-host.js';
 (function () {
   "use strict";
 
@@ -79,7 +78,7 @@ import {installTelegramHost} from './telegram-host.js';
     if(observedRuns.get(frame.conversation_id)?.run_id===frame.run_id)observedRuns.delete(frame.conversation_id);
   }
   try{
-    JSON.parse(sessionStorage.getItem('xgent_queue_edits')||'[]').forEach(saved=>queueActions.set(saved.item.id,{...saved,busy:false,error:'取回结果待确认'}));
+    JSON.parse(sessionStorage.getItem('xgent_queue_edits')||'[]').forEach(saved=>queueActions.set(saved.item.id,{...saved,busy:false,error:'连接中断，正在核对消息'}));
     recoveredEdits=new Set(JSON.parse(sessionStorage.getItem('xgent_queue_recovered')||'[]'));
   }catch(e){}
 
@@ -1296,6 +1295,7 @@ import {installTelegramHost} from './telegram-host.js';
       entry.mediaContainer.className = "message-media";
       entry.bubble.insertBefore(entry.mediaContainer, entry.body);
     }
+    entry.mediaContainer.classList.toggle('generated-gallery',entry.role!=='user'&&items.length>1);
     var previousItems=Array.from(entry.mediaContainer.children),retainedItems=new Set();
     var paths = [];
     var displayedText = String(entry.rawText || "").replace(/\\/g, "/");
@@ -1303,6 +1303,11 @@ import {installTelegramHost} from './telegram-host.js';
       var content=previousItems.find(node=>!retainedItems.has(node)&&canReuseMediaContent(node,item));
       if(content)updateMediaContent(content,item);
       else content=makeMediaContent(item);
+      if(entry.role!=='user'&&item.path){
+        let path=content.querySelector('.generated-path');
+        if(!path){path=document.createElement('button');path.type='button';path.className='generated-path';content.appendChild(path);}
+        path.textContent=item.path;path.title=item.path;path.onclick=()=>copyText(item.path).then(()=>toast('已复制路径'));
+      }
       retainedItems.add(content);
       if(entry.mediaContainer.children[index]!==content)entry.mediaContainer.insertBefore(content,entry.mediaContainer.children[index]||null);
       if (item.path && displayedText.indexOf(item.path.replace(/\\/g, "/")) < 0) paths.push(item.path);
@@ -1311,7 +1316,7 @@ import {installTelegramHost} from './telegram-host.js';
     entry.bubble.classList.toggle("has-media", items.length > 0);
     if (entry.mediaPaths) entry.mediaPaths.remove();
     entry.mediaPaths = null;
-    if (paths.length) {
+    if (paths.length && entry.role==='user') {
       entry.mediaPaths = document.createElement("div");
       entry.mediaPaths.className = "media-paths";
       if(entry.role==='user'){
@@ -1431,6 +1436,32 @@ import {installTelegramHost} from './telegram-host.js';
     updateEmptyState();
   }
 
+  const thinkingStates=new Map();
+  function syncThinking(entry,value){
+    if(!entry||!value?.text||value.version!==1)return;
+    if(entry.thinking&&value.capture_id===entry.thinking.capture_id&&value.revision<entry.thinking.revision)return;
+    const finished=value.status!=='running',wasRunning=entry.thinking?.status==='running';
+    entry.thinking=value;
+    if(!entry.thinkingBlock){
+      const block=entry.thinkingBlock=document.createElement('div');block.className='thinking-block';
+      const head=document.createElement('div');head.className='thinking-head';head.tabIndex=0;head.setAttribute('role','button');
+      const label=document.createElement('span');label.className='thinking-label';
+      const preview=document.createElement('span');preview.className='thinking-preview';
+      const body=document.createElement('pre');body.className='thinking-body';body.hidden=true;
+      head.append(label,preview);block.append(head,body);entry.bubble.insertBefore(block,entry.bubble.firstChild);
+      let timer;function toggle(event){clearTimeout(timer);if(event.detail>1||getSelection()?.toString())return;const apply=()=>{if(getSelection()?.toString())return;body.hidden=!body.hidden;head.setAttribute('aria-expanded',String(!body.hidden));};if(event.type==='keydown')apply();else timer=setTimeout(apply,240);}
+      head.onclick=toggle;body.onclick=toggle;head.ondblclick=body.ondblclick=()=>clearTimeout(timer);head.onkeydown=event=>{if(['Enter',' '].includes(event.key)){event.preventDefault();toggle(event);}};
+      head.setAttribute('aria-expanded','false');
+    }
+    const block=entry.thinkingBlock,body=block.querySelector('.thinking-body'),head=block.querySelector('.thinking-head');
+    const elapsed=value.elapsed_seconds;
+    const time=elapsed==null?'耗时未记录':elapsed<1?'不足1秒':'约 '+Math.round(elapsed)+' 秒';
+    block.querySelector('.thinking-label').textContent=({running:'思考中',completed:'思考',stopped:'思考已停止',failed:'思考未完成'}[value.status]||'思考')+' · '+time;
+    block.querySelector('.thinking-preview').textContent=finished?'':value.text.split('\n').filter(line=>line.trim()).at(-1)||'';
+    body.textContent=value.text;
+    if(finished&&wasRunning){body.hidden=true;head.setAttribute('aria-expanded','false');}
+  }
+
   function putTextFrame(role, frame) {
     var id = frame.ui_message_id ? "ui:" + frame.ui_message_id :
       (frame.media_group_id || (frame.record_id != null ? "history:" + frame.record_id :
@@ -1476,6 +1507,7 @@ import {installTelegramHost} from './telegram-host.js';
     if(frame.record_id!=null&&!frame.ui_message_id){entry.durable=true;entry.row.dataset.recordId=String(frame.record_id);}
     applyAiGeneration(entry, frame.timestamp??frame.ts, frame.ai_generation);
     syncMessageChrome(entry);
+    syncThinking(entry,frame.thinking||thinkingStates.get(frame.message_id));
     const hidden=!!frame.hidden||!!entry.messagePolicy&&
       (entry.messagePolicy.version!==1||!entry.messagePolicy.audience?.includes('web'));
     entry.row.classList.toggle('presentation-hidden',hidden);entry.row.classList.toggle('msg-row',!hidden);
@@ -1626,7 +1658,7 @@ import {installTelegramHost} from './telegram-host.js';
           var requestId=confirm.dataset.requestId||(confirm.dataset.requestId=queueRequestId());
           var result=await api('/api/workbench/conversations/withdraw',{method:'POST',body:JSON.stringify({conversation_id:cid,record_id:message.id,turn_id:preview.turn_id,current_digest:preview.current_digest,confirm:true,request_id:requestId})});
           restoreQueuedDraft(cid,result.draft?.text??message.content??message.text??'','withdraw:'+requestId);
-          closeAction();if(cid===selectedConversationId)await resync(true);toast('消息已撤回，原文已放回输入框');
+          closeAction();if(cid===selectedConversationId)await resync(true);toast(result.telegram_sync_warning||'消息已撤回，原文已放回输入框',!!result.telegram_sync_warning);
         }finally{confirm.disabled=false;}
       },'danger');controls.append(actionButton('取消',closeAction),confirm);box.append(controls);
     }catch(error){box.replaceChildren(actionMessage(error.message,true),actionButton('关闭',closeAction));}
@@ -1748,6 +1780,13 @@ import {installTelegramHost} from './telegram-host.js';
       }
       return;
     }
+    if(frame.type==='thinking_state'){
+      if(frame.conversation_id!==selectedConversationId||finishedRuns.has(frame.run_id)||frame.ui_generation!=null&&frame.ui_generation!==uiGeneration)return;
+      const old=thinkingStates.get(frame.message_id);if(old&&old.capture_id===frame.thinking.capture_id&&old.revision>=frame.thinking.revision)return;
+      thinkingStates.set(frame.message_id,frame.thinking);if(thinkingStates.size>1000)thinkingStates.delete(thinkingStates.keys().next().value);
+      syncThinking(byMessageId[frame.message_id],frame.thinking);return;
+    }
+    if(frame.type==='withdrawal_sync'){toast(frame.text,true);return;}
     if(frame.type==='queue_state'){refreshQueue();return;}
     if(frame.queue_id)refreshQueue();
     if(frame.type==='settings_state'){window.XGentAppearance?.accept(frame);return;}
@@ -2346,6 +2385,7 @@ import {installTelegramHost} from './telegram-host.js';
   }
 
   function appendHistoryMedia(entry, message, role) {
+    syncThinking(entry,message.thinking);
     var previousMedia=entry.mediaEntries||[];
     entry.mediaEntries = [];
     if (role === 'user' || message.media_group_id || message.msg_type === "ai_reply" || message.msg_type === "media_reply") {
@@ -2416,7 +2456,7 @@ import {installTelegramHost} from './telegram-host.js';
     });panel.appendChild(list);
     recovering.forEach(p=>{
       var row=document.createElement('div');row.className='queue-actions';
-      var text=document.createElement('span');text.textContent=p.busy?'正在取回消息…':'取回结果待确认，原文仍安全保留。';row.appendChild(text);
+      var text=document.createElement('span');text.textContent=p.busy?'正在取回消息…':'尚未确认是否取回，请重试。';row.appendChild(text);
       var retry=button('重试取回',()=>changeQueue(p.item,p.action));retry.disabled=p.busy;row.appendChild(retry);panel.appendChild(row);
     });
     if(error){var note=document.createElement('p');note.className='queue-error';note.textContent=error;panel.append(note,button('刷新队列',()=>refreshQueue(true)));}
@@ -2435,8 +2475,26 @@ import {installTelegramHost} from './telegram-host.js';
       if(version!==queueVersion||cid!==selectedConversationId||data.conversation_id!==cid)return;
       queueEnabled=true;
       if(!queueState||JSON.stringify(queueState)!==JSON.stringify(data)){queueState=data;drawQueue();}
+      await reconcileQueueEdits(cid);
     }catch(e){if(e.name!=='AbortError'&&version===queueVersion)drawQueue(e.message);}
     finally{if(queueController===controller){queueController=null;if(queueRefreshPending)refreshQueue();}updateSendAvailability();}
+  }
+
+  async function reconcileQueueEdits(cid){
+    for(const [key,p] of Array.from(queueActions)){
+      if(p.busy||p.checking||p.item?.conversation_id!==cid||!['edit','cancel'].includes(p.action))continue;
+      p.checking=true;
+      try{
+        const response=await fetch('/api/queue/status?'+new URLSearchParams({conversation_id:cid,id:p.item.id,request_id:p.request_id}),{credentials:'same-origin'});
+        if(!response.ok)continue;
+        const result=await response.json();
+        if(result.state==='recovered')restoreQueuedDraft(cid,result.item.text,p.request_id);
+        if(['recovered','settled','already_started','unavailable','waiting'].includes(result.state)){
+          queueActions.delete(key);persistQueueEdits();
+          if(cid===selectedConversationId)drawQueue();
+        }
+      }catch{}finally{p.checking=false;}
+    }
   }
 
   function restoreQueuedDraft(cid,text,key){
@@ -2458,7 +2516,7 @@ import {installTelegramHost} from './telegram-host.js';
         generation:item?.generation??queueState.generation,revision:item?.revision??queueState.revision,request_id:pending.request_id})});
       if(action==='edit'||action==='cancel')restoreQueuedDraft(cid,data.text,pending.request_id);
       queueActions.delete(key);persistQueueEdits();await refreshQueue(true);drawQueue();
-    }catch(e){pending.busy=false;pending.error=e.message;if(e.status===409&&action==='resume'){queueActions.delete(key);refreshQueue(true);}if(cid===selectedConversationId)drawQueue(e.message);else toast(e.message,true);}
+    }catch(e){pending.busy=false;pending.error=e.message;if(e.status===409){queueActions.delete(key);persistQueueEdits();await refreshQueue(true);toast(e.message,true);if(cid===selectedConversationId)drawQueue();}else if(cid===selectedConversationId)drawQueue(e.message);else toast(e.message,true);}
   }
 
   function persistQueueEdits(){
@@ -3711,7 +3769,6 @@ import {installTelegramHost} from './telegram-host.js';
     enhance: enhanceBubbleContent
   };
   try { input.value=sessionStorage.getItem(draftKey())||""; syncSendState(); } catch(e) {}
-  installTelegramHost({input,getConversation:()=>selectedConversationId});
   input.addEventListener("input",function(){try{sessionStorage.setItem(draftKey(),input.value);}catch(e){}});
   window.addEventListener('xgent-auth-expired',function(){
     closeCommands(false);

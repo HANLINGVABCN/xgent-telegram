@@ -310,10 +310,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         try:
             if path.startswith("/assets/"):
                 self._serve_workbench_asset(path)
-            elif path.startswith('/mini/'):
-                self._serve_mini(path.removeprefix('/mini/'))
-            elif path.startswith('/api/mini/'):
-                self._handle_mini('GET',path.removeprefix('/api/mini/'))
             elif path.startswith("/api/workbench/"):
                 self._handle_workbench("GET", path[len("/api/workbench/"):])
             elif path == "/api/term/sessions":
@@ -330,6 +326,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"authenticated": self._is_authenticated()})
             elif path == '/api/queue':
                 self._handle_queue('list')
+            elif path == '/api/queue/status':
+                self._handle_queue('status')
             elif path == "/healthz":
                 self._handle_liveness()
             elif path == "/api/health":
@@ -364,11 +362,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         try:
             if not self._require_same_origin():
                 return
-            if path == '/api/mini/session':
-                self._handle_mini_session()
-            elif path.startswith('/api/mini/'):
-                self._handle_mini('POST',path.removeprefix('/api/mini/'))
-            elif path.startswith("/api/workbench/"):
+            if path.startswith("/api/workbench/"):
                 if path == '/api/workbench/data/import':
                     self._handle_data_import()
                 else:
@@ -615,140 +609,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         )
         self._send_json({"ok": True}, extra_headers={"Set-Cookie": cookie})
 
-    def _serve_mini(self, page):
-        from .miniapps import SESSION_KINDS
-        if page not in SESSION_KINDS or not self._require_web_enabled():
-            if page not in SESSION_KINDS:self._send_json({'error':'not found'},status=404)
-            return
-        with open(os.path.join(STATIC_DIR,'mini.html'),'rb') as source:
-            body=source.read().replace(b'data-page="form"',('data-page="'+page+'"').encode())
-        self._send_html(_version_asset_references(body))
-
-    def _handle_mini_session(self):
-        from .miniapps import make_session
-        if not self._require_web_enabled():return
-        limiter=self.server.limiter
-        ip=self._client_ip()
-        if limiter.is_locked(ip):
-            self._send_json({'error':'请稍后再登录'},status=429);return
-        data=self._read_json(65536)
-        if data is None:return
-        parsed=web_auth.verify_telegram_init_data(str(data.get('init_data') or ''),self.config.bot_token)
-        user_id=web_auth.init_data_user_id(parsed)
-        if not user_id or user_id!=self.config.authorized_user_id:
-            limiter.record_failure(ip)
-            self._send_json({'error':'请从自己的 Telegram Bot 打开此页面'},status=401);return
-        from .miniapps import SESSION_KINDS
-        page=data.get('page')
-        if page not in SESSION_KINDS or self.config.workbench is None:
-            self._send_json({'error':'此页面尚不可用'},status=404);return
-        resource={'id':str(data.get('id') or ''),'conversation_id':str(data.get('conversation_id') or '')}
-        if not resource['conversation_id'] and self.config.read_conversations:
-            resource['conversation_id']=self._run_coro(self.config.read_conversations()).get('telegram_conversation_id') or ''
-        if not resource['conversation_id'] or page in {'form','read'} and not resource['id']:
-            self._send_json({'error':'缺少表单入口'},status=400);return
-        try:
-            request={**resource,'resource':page,'record_id':resource['id']}
-            snapshot=self._run_coro(self.config.workbench('GET','mini-ask' if page=='form' else 'mini-resource',request))
-            if page=='form' and snapshot.get('id')!=resource['id'] or snapshot.get('conversation_id')!=resource['conversation_id']:
-                self._send_json({'error':'表单入口无效'},status=403);return
-            resource['generation']=snapshot['generation']
-            token=make_session(self.server.session_key,user_id,page,resource)
-            limiter.record_success(ip)
-            self._send_json({'token':token,'snapshot':snapshot})
-        except (ValueError,WorkbenchError) as exc:
-            self._send_json({'error':str(exc)},status=getattr(exc,'status',409))
-
-    def _mini_claims(self, kind):
-        from .miniapps import verify_session
-        authorization=self.headers.get('Authorization','')
-        token=authorization.removeprefix('Bearer ') if authorization.startswith('Bearer ') else ''
-        claims=verify_session(self.server.session_key,token,self.config.authorized_user_id,kind=kind)
-        if claims is None:
-            self._send_json({'error':'页面登录已失效，请重新打开'},status=401)
-        return claims
-
-    def _handle_mini(self, method, resource):
-        if resource=='download' and method=='GET':
-            self._mini_download();return
-        if resource not in {'form','resource','file-ticket','share'}:
-            self._send_json({'error':'not found'},status=404);return
-        if not self._require_web_enabled():return
-        if self.config.workbench is None:
-            self._send_json({'error':'此页面尚不可用'},status=503);return
-        claims=self._mini_claims('form' if resource=='form' else None)
-        if claims is None:return
-        target=claims['resource']
-        try:
-            if resource!='form':
-                page=claims['kind']
-                if page=='form':self._send_json({'error':'此入口只能操作原表单'},status=403);return
-                if resource=='resource':
-                    data=({k:v[0] for k,v in urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).items()}
-                          if method=='GET' else self._read_json())
-                    if data is None:return
-                    data.pop('resource',None)
-                    if 'conversation_id' in data and data['conversation_id']!=target['conversation_id']:
-                        self._send_json({'error':'页面范围不匹配'},status=403);return
-                    data={**data,'resource':page,'conversation_id':target['conversation_id'],'record_id':target['id']}
-                    result=self._run_coro(self.config.workbench(method,'mini-resource',data))
-                    self._send_json(result);return
-                data=self._read_json()
-                if data is None:return
-                if resource=='share':
-                    if page!='read':self._send_json({'error':'只能分享当前阅读的回复'},status=403);return
-                    result=self._run_coro(self.config.workbench('POST','mini-resource',{
-                        'resource':'share','conversation_id':target['conversation_id'],'record_id':target['id']}))
-                    self._send_json(result);return
-                if page!='files':self._send_json({'error':'此页面不能签发文件下载'},status=403);return
-                file_target={'conversation_id':target['conversation_id'],'id':str(data.get('id') or ''),
-                             'kind':data.get('kind') or 'files','download':True,'generation':target['generation']}
-                checked=self._run_coro(self.config.workbench('GET','mini-resource',{**file_target,'resource':'download'}))
-                from .miniapps import make_session
-                ticket=make_session(self.server.session_key,claims['user_id'],'files',file_target,ttl=600)
-                base=self._headers_dict().get('Host') or self.headers.get('Host','')
-                self._send_json({'url':'https://'+base+'/api/mini/download?ticket='+urllib.parse.quote(ticket),
-                                 'file_name':checked.path.name});return
-            current=self._run_coro(self.config.workbench('GET','mini-ask',target))
-            if current.get('generation')!=target.get('generation'):
-                self._send_json({'error':'表单已失效，请重新打开'},status=409);return
-            if method=='GET':
-                self._send_json(current);return
-            data=self._read_json()
-            if data is None:return
-            if (set(data)-{'id','conversation_id','revision','action','draft','secrets'}
-                    or 'id' in data and data['id']!=target['id']
-                    or 'conversation_id' in data and data['conversation_id']!=target['conversation_id']):
-                self._send_json({'error':'此入口只能操作原表单'},status=403);return
-            result=self._run_coro(self.config.workbench('POST','mini-ask',{**data,
-                'id':target['id'],'conversation_id':target['conversation_id']}))
-            self._send_json(result)
-        except (ValueError,WorkbenchError) as exc:
-            self._send_json({'error':str(exc)},status=getattr(exc,'status',409))
-
-    def _mini_download(self):
-        from .miniapps import verify_session
-        ticket=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get('ticket',[''])[0]
-        claims=verify_session(self.server.session_key,ticket,self.config.authorized_user_id,kind='files')
-        if claims is None or claims['resource'].get('download') is not True:
-            self._send_json({'error':'下载地址已失效'},status=401);return
-        target=claims['resource']
-        try:
-            result=self._run_coro(self.config.workbench('GET','mini-resource',{**target,'resource':'download'}))
-            path=result.path
-            import stat
-            descriptor=os.open(path,os.O_RDONLY|getattr(os,'O_BINARY',0)|getattr(os,'O_NOFOLLOW',0))
-            with os.fdopen(descriptor,'rb') as source:
-                info=os.fstat(source.fileno())
-                if not stat.S_ISREG(info.st_mode):raise ValueError('文件不可下载')
-                self.send_response(200);self.send_header('Content-Type',mimetypes.guess_type(path.name)[0] or 'application/octet-stream')
-                self.send_header('Content-Length',str(info.st_size));self.send_header('Cache-Control','private, no-store')
-                self.send_header('Content-Disposition',"attachment; filename*=UTF-8''"+urllib.parse.quote(path.name))
-                self.send_header('Access-Control-Allow-Origin','https://web.telegram.org');self.end_headers()
-                while chunk:=source.read(65536):self.wfile.write(chunk)
-        except (ValueError,WorkbenchError,OSError) as exc:
-            self._send_json({'error':str(exc)},status=getattr(exc,'status',404))
-
     def _handle_logout(self) -> None:
         self._send_json({"ok": True}, extra_headers={"Set-Cookie": web_auth.build_clear_cookie()})
 
@@ -906,7 +766,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if self.config.queue_api is None:
             self._send_json({'error': '消息队列未启用'}, status=404)
             return
-        if action == 'list':
+        if action in {'list', 'status'}:
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             data = {key: values[0] for key, values in query.items()}
         else:
@@ -924,7 +784,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         try:
             result = self._run_coro(self.config.queue_api(action, cid, data))
         except ValueError as exc:
-            self._send_json({'error': str(exc)}, status=409)
+            self._send_json({'error': str(exc), 'code': getattr(exc, 'code', 'conflict')}, status=409)
             return
         self._send_json(result)
 

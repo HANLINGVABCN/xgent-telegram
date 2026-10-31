@@ -819,8 +819,7 @@ class WebOpenButtonTests(unittest.TestCase):
 
     def test_terminal_button_same_guard(self):
         ns = self._build(terminal_enabled=True, _web_has_password=False)
-        btn = ns["_build_terminal_open_button"]()
-        self.assertEqual("web_need_password", btn.callback_data)
+        self.assertNotIn("_build_terminal_open_button", ns)
 
 
 class WebSwitchLockoutTests(unittest.TestCase):

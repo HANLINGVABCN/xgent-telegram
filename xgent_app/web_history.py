@@ -457,6 +457,8 @@ def build_history_message(
             message.update(content=html, parse_mode="HTML")
     elif kind not in {"user_text", "user_file", "user_photo"} and _HTML_PRESENTATION.search(content):
         message["parse_mode"] = "HTML"
+    if isinstance(metadata.get('thinking'), dict) and metadata['thinking'].get('text'):
+        message['thinking'] = metadata['thinking']
     task = metadata.get('compression_task')
     if (isinstance(task, dict) and re.fullmatch(r'[a-f0-9]{32}', str(task.get('id', '')))
             and task.get('status') in {'pending', 'running', 'failed', 'stopped'}):
@@ -465,6 +467,11 @@ def build_history_message(
         }]]
     apply_history_presentation(message, record, metadata,
         namespace=presentation_namespace, mode_override=presentation_mode)
+    if kind in {'ai_reply', 'media_reply'}:
+        notice = r'【系统自动生成：本(?:图片|视频|音频|媒体).*?】'
+        message['content'] = re.sub(notice, '', message['content']).strip()
+        for segment in (message.get('web_display') or {}).get('segments', []):
+            segment['text'] = re.sub(notice, '', segment.get('text', '')).strip()
     if kind not in _FILE_TYPES and not metadata.get('server_uploads'):
         return message
     if (metadata.get("attachment_purpose") == "configuration"

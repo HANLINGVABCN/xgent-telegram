@@ -14,8 +14,9 @@ OP_NATIVE_RENDER = 'telegram_rich_render'
 OP_NATIVE_MARKUP = 'telegram_native_markup'
 OP_NATIVE_DELETE = 'telegram_native_delete'
 OP_NATIVE_CLEANUP = 'telegram_generation_cleanup'
+OP_NATIVE_MEDIA = 'telegram_media_reply'
 NATIVE_KINDS = frozenset({OP_NATIVE_CONTROL, OP_NATIVE_DRAFT, OP_NATIVE_RENDER,
-                         OP_NATIVE_MARKUP, OP_NATIVE_DELETE, OP_NATIVE_CLEANUP})
+                         OP_NATIVE_MARKUP, OP_NATIVE_DELETE, OP_NATIVE_CLEANUP, OP_NATIVE_MEDIA})
 
 _states = weakref.WeakKeyDictionary()
 _fallback_states = {}
@@ -99,7 +100,7 @@ async def _stored_parts(bot, op, value=None):
     if value is None:
         return saved.get('ids') if saved.get('bot_id') == _bot_id(bot) and saved.get('owner_id') == op.logical_id else None
     metadata['telegram_native_parts'] = {'bot_id': _bot_id(bot), 'owner_id': op.logical_id, 'ids': list(value)}
-    await db.backfill_attachment_metadata(record_id, row.get('metadata'), metadata)
+    await db.patch_display_metadata(record_id, {'telegram_native_parts': metadata['telegram_native_parts']})
     return value
 
 
@@ -135,6 +136,24 @@ async def _delete_control(bot, chat_id, entry, extra):
 
 async def deliver_native(bot, op, native_id, markup, extra):
     state = _state(bot)
+    if op.kind == OP_NATIVE_MEDIA:
+        from .telegram_media_reply import send
+        media_key = (op.chat_id, op.logical_id)
+        cache = state.setdefault('media', {})
+        previous = cache.get(media_key)
+        if previous:
+            op.payload = {**previous, **op.payload, '_native_parts': previous.get('_native_parts', []),
+                          '_page_html': previous.get('_page_html', [])}
+        if not op.payload.get('_native_parts'):
+            op.payload['_native_parts'] = list(await _stored_parts(bot, op) or ([native_id] if native_id else []))
+        result = await send(bot, op, extra, rich=state['rich'] is not False and not op.payload.get('_fallback'))
+        cache[media_key] = op.payload.copy()
+        if op.payload.get('_fallback'):
+            state['rich'] = False
+        while len(cache)>1000:
+            cache.pop(next(iter(cache)))
+        await _stored_parts(bot, op, op.payload.get('_native_parts', []))
+        return result
     spec = op.payload['telegram_native']
     context = op.conversation_context or {}
     key = (op.chat_id, op.logical_id, context.get('conversation_id'), context.get('generation'))

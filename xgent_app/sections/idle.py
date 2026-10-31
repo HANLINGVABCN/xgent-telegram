@@ -81,7 +81,7 @@ async def _check_and_send_idle_message(context: ContextTypes.DEFAULT_TYPE):
                 conversation_context=True,
             )
             media_artifacts = []
-            if response and not error and 'data:image/' in response.lower():
+            if response and not error and (getattr(response, 'media', None) or 'data:image/' in response.lower()):
                 response, media_artifacts = await generated_reply.prepare(response)
             return response, error, media_artifacts
 
@@ -315,6 +315,15 @@ async def queue_api(action, conversation_id, data=None):
             if action == 'list':
                 return await queue.snapshot(scope.conversation_id)
             db = await BotMemoryDB.get_instance()
+            if action == 'status':
+                item = await db.queue_item(data.get('id'))
+                if item is None or item['conversation_id'] != scope.conversation_id:
+                    return {'state': 'unavailable'}
+                if item['status'] in {'edited', 'cancelled'}:
+                    return {'state': 'recovered' if item.get('edit_request_id') == data.get('request_id') else 'settled',
+                            'item': public_item(item)}
+                return {'state': 'waiting' if item['status'] in {'pending', 'paused', 'invalid'} else 'already_started',
+                        'item': public_item(item)}
             if action == 'resume':
                 if data.get('generation') != scope.generation or type(data.get('revision')) is not int or not data.get('request_id'):
                     raise ConversationChanged('上下文已改变，请刷新队列。')

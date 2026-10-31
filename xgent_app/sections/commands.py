@@ -39,18 +39,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     await UserDataManager.init()
-    args=list(getattr(context,'args',[]) or [])
-    if args and args[0].startswith('read_') and args[0][5:].isdigit():
-        identifier=int(args[0][5:]);db=await BotMemoryDB.get_instance();conn=await db._get_conn()
-        row=await (await conn.execute('SELECT session_id FROM global_messages WHERE id=? AND withdrawn=0',(identifier,))).fetchone()
-        if row:
-            from xgent_app.miniapps import page_url
-            url=page_url(globals(),'read',id=identifier,conversation_id=row['session_id'])
-            if url:
-                await context.bot.send_message(chat_id=update.effective_chat.id,text='打开此回复',
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('阅读／复制全文',web_app=WebAppInfo(url=url))]]))
-                return
-    
     # 记录用户命令
     if update.message and update.message.text:
         await GlobalRecorder.record_user_message(update.message.text, MessageType.COMMAND, update.effective_chat.id)

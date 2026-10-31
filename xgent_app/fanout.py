@@ -154,11 +154,11 @@ OP_DELETE = "delete_message"
 OP_CHAT_ACTION = "send_chat_action"
 OP_DOCUMENT = "send_document"
 OP_PHOTO = "send_photo"
-from .telegram_native import (OP_NATIVE_RENDER, OP_NATIVE_DRAFT, OP_NATIVE_CONTROL,
+from .telegram_native import (OP_NATIVE_RENDER, OP_NATIVE_DRAFT, OP_NATIVE_CONTROL, OP_NATIVE_MEDIA,
                              OP_NATIVE_DELETE, NATIVE_KINDS)
 
 # 会产生一个新的原生消息 id 的操作。
-CREATING_KINDS = frozenset({OP_SEND, OP_DOCUMENT, OP_PHOTO, OP_NATIVE_RENDER})
+CREATING_KINDS = frozenset({OP_SEND, OP_DOCUMENT, OP_PHOTO, OP_NATIVE_RENDER, OP_NATIVE_MEDIA})
 # 需要先知道目标原生 id 才能投递的操作。目标不存在时**丢弃**，绝不退化成
 # "新发一条"——那正是"上一条消息无限刷屏"的成因。
 TARGETING_KINDS = frozenset({OP_EDIT, OP_EDIT_MARKUP, OP_DELETE})
@@ -166,7 +166,7 @@ TARGETING_KINDS = frozenset({OP_EDIT, OP_EDIT_MARKUP, OP_DELETE})
 SUPERSEDABLE_KINDS = frozenset({OP_EDIT, OP_EDIT_MARKUP, OP_CHAT_ACTION, OP_NATIVE_DRAFT, OP_NATIVE_CONTROL})
 # 大文件上传：合法地会超过普通超时（idle.py 里 read_timeout 最高开到 1800s），
 # 不套统一的 wait_for，靠 PTB 自己的超时 + 熔断计数收口。
-UPLOAD_KINDS = frozenset({OP_DOCUMENT, OP_PHOTO})
+UPLOAD_KINDS = frozenset({OP_DOCUMENT, OP_PHOTO, OP_NATIVE_MEDIA})
 
 
 class Op:

@@ -8,6 +8,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 from pathlib import Path
 
 
@@ -40,7 +41,7 @@ def build_media_presentation(text: str, artifacts: list[dict], *,
     if not media:
         return None
     return {'media_group_id': generated_media_group_id([item['path'] for item in media]),
-            'text': text, 'media': media,
+            'text': re.sub(r'【系统自动生成：本(?:图片|视频|音频|媒体).*?】', '', text).strip(), 'media': media,
             'replace_message_ids': [value for value in (replace_message_ids or []) if value is not None]}
 
 

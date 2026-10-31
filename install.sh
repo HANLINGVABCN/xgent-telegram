@@ -498,9 +498,13 @@ fix_line_endings() {
     done
     # 版本标记：部署目录不是 git 检出（zip 解压）时 CLI banner 拿不到哈希，
     # 这里写一份到 .xgent-version 兜底。CLI 读它显示 vXxx。
-    git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null \
-        | head -c 10 > "$SCRIPT_DIR/.xgent-version" || true
-    [ -s "$SCRIPT_DIR/.xgent-version" ] || printf 'installed-%s' "$(date +%Y%m%d)" > "$SCRIPT_DIR/.xgent-version"
+    local code_revision
+    code_revision="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || true)"
+    if [ -n "$code_revision" ]; then
+        printf '%s' "$code_revision" > "$SCRIPT_DIR/.xgent-version"
+    elif [ ! -s "$SCRIPT_DIR/.xgent-version" ]; then
+        printf 'unknown' > "$SCRIPT_DIR/.xgent-version"
+    fi
 }
 
 python_version_ok() {
@@ -2145,6 +2149,8 @@ update_via_download() {
         return 1
     fi
 
+    local code_revision
+    code_revision="$(python3 -c 'import re,sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); v=z.comment.decode("ascii", "ignore").strip(); print(v if re.fullmatch("[a-f0-9]{40}",v) else "unknown")' "$tmp_zip")"
     # 解压 (使用 Python 内置库，避免依赖 unzip)
     info "[更新] 正在解压..."
     if ! python3 -c "import zipfile; zipfile.ZipFile('$tmp_zip', 'r').extractall('$tmp_dir')" 2>/dev/null; then
@@ -2197,6 +2203,7 @@ update_via_download() {
         done
     fi
 
+    printf '%s' "$code_revision" > "$SCRIPT_DIR/.xgent-version"
     rm -rf "$tmp_dir"
     success "代码文件已覆盖完成。"
     echo "   旧 install.sh 已备份为 install.sh.bak"
@@ -2219,7 +2226,7 @@ update_code() {
     update_via_download || return 1
 
     # 更新 .xgent-version
-    printf 'updated-%s' "$(date +%Y%m%d)" > "$SCRIPT_DIR/.xgent-version"
+    # update_via_download 已从归档标记写入确切提交；不能用日期覆盖。
     chmod +x "$SCRIPT_DIR/install.sh" "$SCRIPT_DIR/bin/xgent" 2>/dev/null || true
 
     # install.sh 自身刚被覆盖。bash 是边读边执行脚本的，继续跑旧进程既可能

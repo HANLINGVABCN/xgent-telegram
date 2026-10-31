@@ -148,7 +148,7 @@ async def _finish_presentation(context, turn):
     telegram_reply = await context.bot.finish_telegram_reply(row, facts, turn.summary() if turn.operations else None)
     metadata = metadata_dict(row.get('metadata'))
     metadata['telegram_reply'] = telegram_reply
-    await db.backfill_attachment_metadata(row['id'], row.get('metadata'), metadata)
+    await db.patch_display_metadata(row['id'], {'telegram_reply': telegram_reply})
 
 
 async def _finish_shared_presentation(context, turn):
@@ -514,6 +514,9 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         return
 
     await UserDataManager.init()
+    from xgent_app.ask_presentation import consumed_input
+    if consumed_input(update.message):
+        return
     state = UserDataManager.get('state')
     configuration_upload = is_prompt_edit_state(state) or state in {
         BotState.SET_COMMAND_BLACKLIST, BotState.SET_MEMORY, BotState.IMPORT_PROVIDER_CONFIG,
@@ -719,7 +722,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             except Exception:
                 pass
             if text:
-                logger.warning(f"handle_text_message: extracted via forwardMessage, len={len(text)}: {text[:200]}")
+                logger.warning(f"handle_text_message: extracted via forwardMessage, len={len(text)}")
             else:
                 logger.warning("handle_text_message: forwardMessage returned but no text/caption found")
         except Exception as e:
@@ -733,7 +736,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             text = _extract_rich_message_text(update.message).strip()
         if text:
-            logger.warning(f"handle_text_message: extracted via rich_message.blocks, len={len(text)}: {text[:200]}")
+            logger.warning(f"handle_text_message: extracted via rich_message.blocks, len={len(text)}")
 
     # 仍然没有文字：不是文字消息（如转发的语音/视频/位置等），交给 handle_other_message
     if not text:
@@ -752,7 +755,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if expected_state is not None and UserDataManager.get('state') != expected_state:
         raise ConversationChanged('录入状态已改变，本次内容未提交，请重新操作。')
     if state in (BotState.ASK_FIELD_INPUT, BotState.ASK_SECRET_INPUT):
-        await _handle_ask_text_input(update, context, state, text)
+        await _handle_ask_text_input(update, context, state, update.message.text if update.message.text is not None else text)
         return
 
     # Consume management values before ordinary recording/title/model admission.
@@ -2406,10 +2409,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
                             "（提交前可以反复改；密钥项的内容只进环境变量，绝不会发给 AI。）"
                         )
                         PENDING_ASKS.put(pending)
-                        from xgent_app.miniapps import form_display
-                        mini_display = form_display(globals(), pending)
-                        with message_presentation({'kind': 'agent_result', 'mode': current_turn().mode, 'ask_id': ask_id,
-                                **({'telegram_display':mini_display} if mini_display else {})}):
+                        with message_presentation({'kind': 'agent_result', 'mode': current_turn().mode, 'ask_id': ask_id, 'purpose': 'form'}):
                             form_msg = await context.bot.send_message(
                                 chat_id=update.effective_chat.id, text=form_header,
                                 reply_markup=ask_form.build_keyboard(ask_id, pending.draft))
@@ -2624,7 +2624,7 @@ async def _process_conversation_inner(update: Update, context: ContextTypes.DEFA
             # 就把回灌载荷丢掉，让下面的协调器落到"没有新上下文"那条既有分支——正常收尾、
             # 不再叫一次模型。该发的结果已经发了，该落库的也已经落库了。
             round_status_text = build_agent_round_status(
-                operation_iteration, 'completed', origin=agent_origin,
+                operation_iteration, 'failed' if any(op.get('success') is False for op in current_turn().operations if op.get('reply_record_id') == current_turn().replies[-1].get('record_id')) else 'completed', origin=agent_origin,
                 operation_count=len(protocol_blocks))
             completion_sent = False
             # Finish this operation round before claiming another user input.
@@ -2928,66 +2928,48 @@ async def cancel_ask(ask_id: str) -> str:
 
 async def _handle_ask_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                  state: str, text: str) -> None:
-    """处理 ask 表单里「自定义文本 / 密钥」的一条录入。自包含：不落通用状态机。
-
-    - 密钥（ASK_SECRET_INPUT）：明文只写 SecretStore（os.environ + 脱敏名单），
-      draft 只标记「已录入」，落库是占位符——明文绝不进 draft/模型/库。
-    - 自定义（ASK_FIELD_INPUT）：仅更新 draft，提交时再进入模型上下文。
-    录完清状态，只更新原表单键盘，不重发另一张表单。
-    """
+    from xgent_app.ask_presentation import cleanup_input, mark_input_consumed, send_ask_input_notice
     target = UserDataManager.get('ask_input_target') or {}
-    from xgent_app.ask_presentation import send_ask_input_notice
-    ask_id = target.get('ask_id', '')
-    qid = target.get('qid', '')
+    ask_id, qid = target.get('ask_id', ''), target.get('qid', '')
     pending = PENDING_ASKS.get(ask_id)
-
-    # 录入期间输 cancel：只取消这一项录入，回到表单（表单本身还在）。
-    is_cancel = text.strip().lower() == 'cancel'
-
-    if pending is None:
+    secret = state == BotState.ASK_SECRET_INPUT
+    if secret:
+        await cleanup_input(context.bot, update.effective_chat.id, [update.message.message_id])
+    if (pending is None or pending.conversation_id != current_scope().conversation_id
+            or pending.status != 'pending' or pending.generation != current_scope().generation):
         UserDataManager.set('state', BotState.IDLE)
         UserDataManager.set('ask_input_target', None)
-        await send_ask_input_notice(update.message, "这个表单已失效，请让 AI 重新发起提问。", form_id=ask_id, field_id=qid)
+        await send_ask_input_notice(update.message, '表单已失效，本次内容未填入。', form_id=ask_id, field_id=qid)
         return
-
-    if pending.conversation_id!=current_scope().conversation_id or pending.status!='pending':
+    async with pending.lock:
+        question = pending.form.question(qid)
+        cancelled = text.strip().lower() == 'cancel'
+        if question is None:
+            return
+        try:
+            if not cancelled:
+                if secret:
+                    SECRET_STORE.set(pending.conversation_id, question.var, text)
+                    pending.ensure_entry(qid)['filled'] = True
+                else:
+                    entry = pending.ensure_entry(qid)
+                    entry['custom'] = text
+                    if question.qtype == 'single':
+                        entry['selected'] = []
+                pending.revision += 1
+            from xgent_app.web_ask import sync_ask
+            await sync_ask(globals(), pending, require_delivery=True)
+        except Exception:
+            notice = await send_ask_input_notice(update.message, '表单更新失败，请重试填写；原有答案已保留。', form_id=ask_id, field_id=qid)
+            pending.input_notices.setdefault(qid, []).append((context.bot, getattr(notice, 'message_id', None)))
+            return
         UserDataManager.set('state', BotState.IDLE)
         UserDataManager.set('ask_input_target', None)
-        await send_ask_input_notice(update.message, '表单已提交或不属于当前会话，请回到表单所属会话。', form_id=ask_id, field_id=qid)
-        return
+        mark_input_consumed(update.message)
+        if not secret:
+            await cleanup_input(context.bot, pending.chat_id, [update.message.message_id])
+        for actor, mid in pending.input_notices.pop(qid, []):
+            await cleanup_input(actor, pending.chat_id, [mid])
 
-    question = pending.form.question(qid)
-    if question is None or is_cancel:
-        UserDataManager.set('state', BotState.IDLE)
-        UserDataManager.set('ask_input_target', None)
-        if is_cancel:
-            await send_ask_input_notice(update.message, "已取消这一项的录入，其它选项不受影响。", form_id=ask_id, field_id=qid)
-        return
-
-    if state == BotState.ASK_SECRET_INPUT:
-        # 明文只进 SecretStore：写 os.environ + 登记脱敏名单；draft 只留「已录入」。
-        db = await BotMemoryDB.get_instance()
-        generation = await db.get_attachment_generation()
-        SECRET_STORE.set(current_scope().conversation_id, question.var, text)
-        pending.ensure_entry(qid)['filled'] = True
-        # 录库占位符已在上游 masking 段记过；这里给用户一句可见回执（不含明文）。
-        await send_ask_input_notice(update.message,
-            f"🔒 已录入变量 ${question.var}，内容只进了环境变量，没有发给 AI。回到表单继续。", form_id=ask_id, field_id=qid,
-        )
-    else:
-        entry = pending.ensure_entry(qid)
-        entry['custom'] = text
-        # 选择题填了自定义 → 视为改选自定义，清掉预设勾选，避免二义。
-        if question.qtype in ('single', 'multi'):
-            entry['selected'] = []
-        await send_ask_input_notice(update.message, "✅ 已填入，回到表单继续。", form_id=ask_id, field_id=qid)
-
-    UserDataManager.set('state', BotState.IDLE)
-    UserDataManager.set('ask_input_target', None)
-
-    # 原地重画表单键盘反映「已填/已录入」。
-    pending.revision += 1
-    from xgent_app.web_ask import sync_ask
-    await sync_ask(globals(), pending)
 
 # --- ☆ 命令函数 ☆ ---

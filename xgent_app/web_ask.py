@@ -10,7 +10,7 @@ _settling = set()
 
 
 @without_ui_history
-async def sync_ask(namespace, pending, *, status='pending'):
+async def sync_ask(namespace, pending, *, status='pending', require_delivery=False):
     """Save only safe form state; the model-history snapshot remains in memory."""
     db = await namespace['BotMemoryDB'].get_instance()
     if pending.form_record_id is not None:
@@ -25,23 +25,18 @@ async def sync_ask(namespace, pending, *, status='pending'):
     bot = pending.form_bot or namespace['build_trigger_delivery_bot'](int(pending.chat_id))
     if pending.form_message_id is not None:
         try:
-            from .miniapps import form_display
             from .presentation import message_presentation
-            display = form_display(namespace, pending, status)
             hint = {'kind':'agent_result','mode':'folded','ask_id':pending.ask_id,'purpose':'form'}
-            if display:
-                hint['telegram_display'] = display
             with message_presentation(hint):
                 await bot.edit_message_reply_markup(chat_id=pending.chat_id, message_id=pending.form_message_id,
                     reply_markup=pending.form.build_keyboard(pending.ask_id, pending.draft) if status=='pending' else None)
-                if display:
-                    # Text changes are Telegram-only; other endpoints keep their
-                    # existing form object and original local controls.
-                    from .telegram_presentation import chat_display
-                    with message_presentation({**hint,'audience':['telegram']}), chat_display(display):
-                        await bot.edit_message_text(chat_id=pending.chat_id, message_id=pending.form_message_id,
-                            text=display['text'], reply_markup=None, parse_mode=None)
+            if require_delivery and hasattr(bot, '_tg_channel'):
+                channel = bot._tg_channel()
+                if not await channel.wait_idle(timeout=5):
+                    raise RuntimeError('表单更新尚未送达，输入保留。')
         except Exception:
+            if require_delivery:
+                raise
             import logging
             logging.getLogger(__name__).warning('原表单按钮更新失败，草稿已保留；不重发表单', exc_info=True)
     context = namespace['_SelfTriggerContext'](bot)

@@ -27,9 +27,9 @@ from xgent_app.web_bridge import install_tg_to_web_mirror
 from xgent_app.ui_history import ui_operation
 
 class NativeBot:
-    def __init__(self):self.messages={};self.edits=[];self.replies=[];self.bad_edits=0
+    def __init__(self):self.messages={};self.edits=[];self.replies=[];self.bad_edits=0;self.next_id=0;self.deleted=[]
     async def send_message(self,**kwargs):
-        mid=len(self.messages)+1;self.messages[mid]=kwargs
+        self.next_id+=1;mid=self.next_id;self.messages[mid]=kwargs
         return SimpleNamespace(message_id=mid)
     async def edit_message_text(self,**kwargs):
         assert kwargs['message_id'] in self.messages
@@ -41,7 +41,8 @@ class NativeBot:
         self.messages[kwargs['message_id']]['reply_markup']=kwargs.get('reply_markup')
         self.edits.append(kwargs['message_id'])
         return True
-    async def delete_message(self,**kwargs):return True
+    async def delete_message(self,**kwargs):
+        self.deleted.append(kwargs['message_id']);self.messages.pop(kwargs['message_id'],None);return True
     async def send_chat_action(self,**kwargs):return True
 
 async def main():
@@ -105,8 +106,9 @@ async def main():
                         assert not any(row['content'] in ('不保证','保证') for row in rows_before)
                         ui_after=await (await (await h.db._get_conn()).execute('SELECT COUNT(*) n FROM ui_messages')).fetchone()
                         assert ui_after['n']==ui_before['n']
-                        assert any(str(record['text']).startswith('请填写：') for record in native.messages.values())
-                        assert any(record['text']=='✅ 已填入，回到表单继续。' for record in native.messages.values())
+                        assert not any(str(record['text']).startswith('请填写：') for record in native.messages.values())
+                        assert 200 in native.deleted
+                        assert not any(record['text']=='✅ 已填入，回到表单继续。' for record in native.messages.values())
                         await bot.resume_from_ask(pending.ask_id)
                         assert await pending.form_bot.flush_telegram(timeout=3)
                         assert native.messages[form_mid]['reply_markup'] is None
@@ -161,7 +163,7 @@ def test_cli_tui_form_buttons_update_original_message_without_another_form():
                 assert len(screen.model.messages)==1
                 rows='\n'.join(line for line,_ in screen.model.render_rows())
                 assert rows.count('📝 需要你的输入：填写原表单')==1
-                assert '✓ 已填：'+text in rows and '✅ 生产' in rows
+                assert '✅ 已填：'+text in rows and '✅ 生产' in rows
                 assert any('✅ 生产' in label for label in get_last_menu_labels())
             await bot.edit_message_reply_markup(1,message.message_id,None)
             assert len(screen.model.messages)==1

@@ -91,7 +91,7 @@ def test_output_status_preview_and_archive_position_are_preserved():
     value = ''.join(output_rich({'kind':'run','success':False,'output':'\n'.join(str(i) for i in range(57)),
                                'output_path':'/tmp/结果.txt'}))
     assert '🔴 run-x · 输出 · 失败' in parsed(value)
-    assert '<pre>' in value and '已折叠 7 行 · 存档：/tmp/结果.txt' in parsed(value)
+    assert '<pre>' not in value and '<code>' in value and '已折叠 7 行 · 存档：/tmp/结果.txt' in parsed(value)
     assert '50\n' not in parsed(value)
 
 

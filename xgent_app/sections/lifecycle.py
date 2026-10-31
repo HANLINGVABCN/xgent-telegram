@@ -150,13 +150,11 @@ async def _telegram_ready(app) -> None:
     from xgent_app.telegram_presentation import render_telegram_text
     from xgent_app.conversations import bind_callback_markup
     global _startup_commands_synced, _startup_menu_sent
-    from xgent_app.miniapps import page_url
-    if page_url(globals(),'settings'):
-        from telegram import MenuButtonWebApp
-        try:
-            await app.bot.set_chat_menu_button(chat_id=BotConfig.AUTHORIZED_USER_ID,
-                menu_button=MenuButtonWebApp('工作台',WebAppInfo(url=str(UserDataManager.get('web_public_url')).rstrip('/'))))
-        except Exception as exc:logger.warning('同步主工作台菜单入口失败：%s',exc)
+    from telegram import MenuButtonCommands
+    try:
+        await app.bot.set_chat_menu_button(chat_id=BotConfig.AUTHORIZED_USER_ID, menu_button=MenuButtonCommands())
+    except Exception as exc:
+        logger.warning('恢复命令菜单失败：%s', exc)
     from xgent_app.telegram_native import request_capable
     if request_capable(app.bot):
         from xgent_app.telegram_topics import TopicManager

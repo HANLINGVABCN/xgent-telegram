@@ -185,7 +185,7 @@ async def main():
             SimpleNamespace(bot=WebBot(outbox, 1)), 1, artifacts, caption=notice,
         )
         frames = [stream.get(1), stream.get(1)]
-        assert all(frame['text'] == notice and len(frame['media']) == 2 for frame in frames)
+        assert all(frame['text'] == text and len(frame['media']) == 2 for frame in frames)
         assert frames[0]['media_group_id'] == frames[1]['media_group_id']
         assert all(len(frame['caption']) <= 1024 for frame in frames)
         await ns['_replay_relay_op'](MirrorBot(outbox, 1), 'send_photo', {
@@ -193,8 +193,10 @@ async def main():
             'media_presentation': build_media_presentation(notice, artifacts),
         })
         replay = stream.get(1)
+        while not replay.get('media_group_id'):
+            replay = stream.get(1)
         assert replay['media_group_id'] == frames[0]['media_group_id']
-        assert replay['text'] == notice and len(replay['media']) == 2
+        assert replay['text'] == text and len(replay['media']) == 2
     await (await ns['BotMemoryDB'].get_instance()).close()
     print(json.dumps({'delivery': True, 'long_text': True, 'cli_replay': True}))
 

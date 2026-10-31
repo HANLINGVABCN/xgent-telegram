@@ -115,16 +115,16 @@ class AskForm:
                         callback_data=f"{act}:{ask_id}:{q.qid}:{idx}",
                     )])
                 if q.other:
-                    tail = f"✏️ 自定义：{_ellipsis(custom, 24)}" if custom else "✏️ 自定义…"
+                    tail = f"✅ 自定义：{_ellipsis(custom, 24)}" if custom else "✏️ 自定义…"
                     rows.append([InlineKeyboardButton(
                         tail, callback_data=f"asko:{ask_id}:{q.qid}")])
             elif q.qtype == "text":
-                tail = f"✓ 已填：{_ellipsis(custom, 30)}" if custom else "✏️ 点此填写…"
+                tail = f"✅ 已填：{_ellipsis(custom, 30)}" if custom else "✏️ 点此填写…"
                 rows.append([InlineKeyboardButton(
                     tail, callback_data=f"asko:{ask_id}:{q.qid}")])
             elif q.qtype == "secret":
                 filled = bool(entry.get("filled"))
-                tail = f"✓ 已录入 ${q.var}" if filled else f"🔐 点此录入 ${q.var}…"
+                tail = f"✅ 已录入 ${q.var}" if filled else f"🔐 点此录入 ${q.var}…"
                 rows.append([InlineKeyboardButton(
                     tail, callback_data=f"askk:{ask_id}:{q.qid}")])
 
@@ -271,6 +271,7 @@ class PendingAsk:
     revision: int = 0
     status: str = 'pending'
     lock: Any = field(default_factory=asyncio.Lock, repr=False)
+    input_notices: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     def ensure_entry(self, qid: str) -> Dict[str, Any]:
         return self.draft.setdefault(qid, {})

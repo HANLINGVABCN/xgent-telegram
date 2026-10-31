@@ -237,7 +237,7 @@ def rich_blocks(text, *, generating=False):
                 header = '<b>' + escape(protocol + (' ' + path if path else '')) + '</b> · '
                 header += str((segment.get('body') or '').count('\n') + 1) + ' 行<br>'
                 result.append(Block('blockquote', attrs={'expandable': True}, children=[
-                    Block(text=header, inline=True), Block('pre', children=[Block(text=preview, inline=True)]),
+                    Block(text=header, inline=True), Block('code', children=[Block(text=preview, inline=True)]),
                     Block(text=note, inline=True)]))
     return result
 
@@ -368,5 +368,5 @@ def output_rich(operation):
     path = operation.get('output_path')
     suffix = ((' · ' if note else '<br>') + '存档：' + escape(str(path), quote=False)) if path else ''
     return split_blocks([Block('blockquote', {'expandable': True}, children=[
-        Block(text=header, inline=True), Block('pre', children=[Block(text=preview, inline=True)]),
+        Block(text=header, inline=True), Block('code', children=[Block(text=preview, inline=True)]),
         Block(text=note + suffix, inline=True)])])

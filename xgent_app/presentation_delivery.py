@@ -61,6 +61,15 @@ class PresentationBot:
         self._telegram_final_replies = {}
         self._telegram_generation = None
 
+    async def send_generated_group(self, chat_id, artifacts, text=''):
+        original = await self.original.send_generated_group(chat_id, artifacts, text)
+        message = PresentationMessage(self, original, text, kind='media_reply')
+        message.media = True
+        message.media_payload = {'artifacts': artifacts, 'text': text}
+        message.record_id = self.turn.last_record_id
+        self.messages[message.message_id] = message
+        return message
+
     def _native_enabled(self):
         from .telegram_native import request_capable
         bot = self.original
@@ -240,20 +249,23 @@ class PresentationBot:
 
         details = reply_details(row, facts, summary)
         if self._native_enabled():
+            for mid in reversed(facts.get('message_ids') or []):
+                media = self.messages.get(mid)
+                if media is not None and getattr(media, 'media', False) and media.record_id == row['id']:
+                    await self._telegram_only('finalize_generated_group', chat_id=media.chat_id, message_id=mid,
+                        artifacts=media.media_payload['artifacts'], text=media.media_payload['text'],
+                        details=''.join(details), target_record_id=row['id'], record_id=row['id'])
+                    return {'version': 1, 'record_id': row['id'], 'message_ids': [mid], 'details': details, 'native_format': 'rich_media'}
             from .telegram_rich import render_rich, legacy_chunks
             from .telegram_chat import append_details
             ids = facts.get('message_ids') or []
             owner_id = ids[0] if ids else None
             message = self.messages.get(owner_id)
             if message is not None and not getattr(message, 'media', False):
-                from .miniapps import page_url
-                from .web_history import _section_ns
-                from telegram import InlineKeyboardButton,InlineKeyboardMarkup,CopyTextButton,WebAppInfo
+                from telegram import InlineKeyboardButton,InlineKeyboardMarkup,CopyTextButton
                 rows=[]
                 if 0<len(row['content'])<=256:
                     rows.append([InlineKeyboardButton('复制',copy_text=CopyTextButton(row['content']))])
-                url=page_url(_section_ns() or {},'read',id=row['id'],conversation_id=row.get('session_id'))
-                if url:rows.append([InlineKeyboardButton('阅读／复制全文',web_app=WebAppInfo(url=url))])
                 buttons=InlineKeyboardMarkup(rows) if rows else None
                 native = {'phase': 'reply', 'owner_id': owner_id, 'record_id': row['id'],
                           'html': render_rich(row['content'], details=''.join(details)),
@@ -276,7 +288,7 @@ class PresentationBot:
             if message is None or message.hidden or getattr(message, 'media', False):
                 # Media captions have their own 1024-character limit. A detail
                 # continuation remains attached to this actual AI reply.
-                original = await self._telegram_only('send_message', chat_id=row['chat_id'] if message is None else message.chat_id,
+                original = await self._telegram_only('send_message', chat_id=getattr(self.original, 'chat_id', None) if message is None else message.chat_id,
                     text=details[0], parse_mode='HTML', reply_markup=None)
                 message = PresentationMessage(self, original, '', 'HTML')
                 message.telegram_body = details[0]

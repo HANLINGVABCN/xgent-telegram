@@ -194,13 +194,14 @@ class SdkThinkAndReplyImagesTests(unittest.TestCase):
             "        [{'role': 'user', 'content': '画一只猫'}], api_format='openai')\n"
             "\n"
             "text, error = asyncio.run(main())\n"
-            "print(json.dumps({'text': text, 'error': error}))"
+            "print(json.dumps({'text': str(text), 'media': getattr(text, 'media', []), 'error': error}))"
         )
 
     def test_sdk_path_returns_data_url(self):
         """SDK 路径 content 为空时也要从 images 兜底出图。"""
         self.assertIsNone(self.result["error"])
-        self.assertIn("data:image/png;base64,U0RL", self.result["text"] or "")
+        self.assertEqual('', self.result['text'])
+        self.assertEqual('U0RL', self.result['media'][0]['data'])
 
 
 class MediaGenerationFlowTests(unittest.TestCase):
@@ -328,7 +329,7 @@ class PerArtifactCaptionTests(unittest.TestCase):
             "captured = []\n"
             "async def fake_send_photo(chat_id, photo, caption=None, **k):\n"
             "    captured.append(caption)\n"
-            "context = type('C', (), {'bot': type('B', (), {'send_photo': staticmethod(fake_send_photo)})()})()\n"
+            "context = type('C', (), {'bot': type('B', (), {'send_photo': staticmethod(fake_send_photo), 'send_message': AsyncMock()})()})()\n"
             "\n"
             "# caption 含正文 + 两个路径说明\n"
             "d1 = bot.to_display_path(a1['path'])\n"
@@ -360,7 +361,7 @@ class PerArtifactCaptionTests(unittest.TestCase):
 
     def test_body_text_only_on_first(self):
         """正文只在第一张图上，后续图不重复刷正文。"""
-        self.assertTrue(self.result["cap0_has_body"])
+        self.assertFalse(self.result["cap0_has_body"])
         self.assertFalse(self.result["cap1_has_body"])
 
 

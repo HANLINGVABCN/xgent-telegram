@@ -1,6 +1,4 @@
 import './appearance.js';
-import {installTelegramHost} from './telegram-host.js';
-installTelegramHost({kind:'terminal'});
 
 var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
 if (tg) { try { tg.ready(); tg.expand(); } catch (e) {} }
